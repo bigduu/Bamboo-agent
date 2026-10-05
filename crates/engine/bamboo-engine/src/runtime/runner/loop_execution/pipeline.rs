@@ -300,7 +300,10 @@ fn scope_discovered_gateway_schema(
 
 struct CompleteCapabilityDiscovery {
     catalog: Vec<ClassifiedToolSchema>,
-    index: crate::capability_discovery::CapabilityDiscoveryIndex,
+    tools: bamboo_tools::tool_search::ToolSearchIndex,
+    // Temporary instruction Skill/Workflow adapter, requested explicitly by
+    // compatibility callers until their separate migration is complete.
+    commands: Option<crate::capability_discovery::CapabilityDiscoveryIndex>,
 }
 
 impl CompleteCapabilityDiscovery {
@@ -309,34 +312,27 @@ impl CompleteCapabilityDiscovery {
         config: &AgentLoopConfig,
         tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
         browser_only: bool,
+        include_commands: bool,
     ) -> Result<Self, AgentError> {
         let catalog = tool_schemas
             .iter()
             .cloned()
             .filter_map(ClassifiedToolSchema::new)
             .collect::<Vec<_>>();
-        let searchable_tool_catalog = catalog
-            .iter()
-            .filter(|entry| {
-                entry.loading_class() == CapabilityLoadingClass::Deferred
-                    && (!browser_only || entry.execution_name() == "browser")
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if browser_only {
-            // The compatibility gateway exposes only a chat-eligible browser tool.
-            // Skill and workflow stores must not gate access to that browser.
-            let empty_skills = bamboo_skills::WorkflowCatalogSnapshot::default();
-            let empty_workflows = bamboo_skills::WorkflowCatalogSnapshot::default();
-            let index = crate::capability_discovery::CapabilityDiscoveryIndex::from_snapshots(
-                crate::capability_discovery::project_classified_tool_capability_metadata(
-                    &searchable_tool_catalog,
-                ),
-                &empty_skills,
-                &empty_workflows,
-                &Default::default(),
-            );
-            return Ok(Self { catalog, index });
+        let searchable_tool_catalog = catalog.iter().filter(|entry| {
+            entry.loading_class() == CapabilityLoadingClass::Deferred
+                && (!browser_only || entry.execution_name() == "browser")
+        });
+        let tools = bamboo_tools::tool_search::ToolSearchIndex::from_resolved_catalog(
+            searchable_tool_catalog,
+        );
+        if browser_only || !include_commands {
+            // Tool search does not depend on Skill applicability or its store.
+            return Ok(Self {
+                catalog,
+                tools,
+                commands: None,
+            });
         }
         let (_, disabled_skill_ids) = config.resolve_disabled_filters();
         let catalog_names = catalog
@@ -353,7 +349,7 @@ impl CompleteCapabilityDiscovery {
             workflow_gateway_available: catalog_names.contains("workflow_run"),
             ..Default::default()
         };
-        let index = match crate::runtime::runner::session_setup::skill_context::resolve_skill_store_for_session(
+        let commands = match crate::runtime::runner::session_setup::skill_context::resolve_skill_store_for_session(
             config, session,
         )
         .await
@@ -361,7 +357,7 @@ impl CompleteCapabilityDiscovery {
         {
             Some(store) => {
                 crate::capability_discovery::CapabilityDiscoveryIndex::from_resolved_classified_store(
-                    &searchable_tool_catalog,
+                    &[],
                     store.as_ref(),
                     &eligibility,
                 )
@@ -371,26 +367,74 @@ impl CompleteCapabilityDiscovery {
                 let empty_skills = bamboo_skills::WorkflowCatalogSnapshot::default();
                 let empty_workflows = bamboo_skills::WorkflowCatalogSnapshot::default();
                 crate::capability_discovery::CapabilityDiscoveryIndex::from_snapshots(
-                    crate::capability_discovery::project_classified_tool_capability_metadata(
-                        &searchable_tool_catalog,
-                    ),
+                    Vec::new(),
                     &empty_skills,
                     &empty_workflows,
                     &eligibility,
                 )
             }
         };
-        Ok(Self { catalog, index })
+        Ok(Self {
+            catalog,
+            tools,
+            commands: Some(commands),
+        })
     }
 
     fn discover_complete_schemas(
         &self,
         request: &DiscoverCapabilitiesRequest,
     ) -> Result<Vec<bamboo_agent_core::tools::ToolSchema>, AgentError> {
-        let result = self
-            .index
-            .discover(request)
-            .map_err(|error| AgentError::LLM(format!("capability discovery failed: {error}")))?;
+        if request.kinds.as_ref().is_some_and(|kinds| kinds.len() > 3) {
+            return Err(AgentError::LLM(
+                "capability discovery accepts at most three kinds".to_string(),
+            ));
+        }
+        let search_tools = request
+            .kinds
+            .as_ref()
+            .is_none_or(|kinds| kinds.contains(&bamboo_domain::CapabilityKind::Tool));
+        let mut tools = if search_tools {
+            self.tools
+                .search(&request.query, request.limit)
+                .map_err(|error| AgentError::LLM(format!("tool search failed: {error}")))?
+                .into_iter()
+                .filter_map(|name| {
+                    self.catalog
+                        .iter()
+                        .find(|entry| entry.execution_name() == name)
+                        .map(|entry| entry.schema().clone())
+                })
+                .collect::<Vec<_>>()
+        } else {
+            // Validate shared bounds even for an explicitly empty kind list.
+            self.tools
+                .search(&request.query, request.limit)
+                .map_err(|error| AgentError::LLM(format!("tool search failed: {error}")))?;
+            Vec::new()
+        };
+        let limit = request
+            .limit
+            .unwrap_or(bamboo_domain::MAX_DISCOVERY_RESULTS);
+        let Some(commands) = self.commands.as_ref() else {
+            return Ok(tools);
+        };
+        let mut command_request = request.clone();
+        command_request.kinds = request.kinds.as_ref().map(|kinds| {
+            kinds
+                .iter()
+                .copied()
+                .filter(|kind| *kind != bamboo_domain::CapabilityKind::Tool)
+                .collect()
+        });
+        // Keep the legacy lookup bounded independently of new schema slots:
+        // even a full Tools result can contain a gateway that needs tightening.
+        command_request.limit = Some(bamboo_domain::MAX_DISCOVERY_RESULTS);
+        // Scores belong to different algorithms. Tools keep BM25 order, then
+        // explicit compatibility command matches keep their own lexical order.
+        let result = commands
+            .discover(&command_request)
+            .map_err(|error| AgentError::LLM(format!("command discovery failed: {error}")))?;
         let mut matches_by_function = Vec::<(String, Vec<_>)>::new();
         for matched in &result.matches {
             let name = match &matched.invocation_target {
@@ -407,7 +451,7 @@ impl CompleteCapabilityDiscovery {
                 matches_by_function.push((name.clone(), vec![matched]));
             }
         }
-        let tools = matches_by_function
+        let command_tools = matches_by_function
             .into_iter()
             .filter_map(|(name, matches)| {
                 let entry = self
@@ -420,6 +464,20 @@ impl CompleteCapabilityDiscovery {
                 Some(scope_discovered_gateway_schema(entry, &matches))
             })
             .collect::<Vec<_>>();
+        for command in command_tools {
+            if let Some(existing) = tools
+                .iter_mut()
+                .find(|tool| tool.function.name == command.function.name)
+            {
+                // An explicit legacy command match tightens its generic
+                // gateway at the existing Tools-ranked position. Keep the
+                // bounded IDs/revision metadata rather than widening the
+                // compatibility result to a generic gateway definition.
+                *existing = command;
+            } else if tools.len() < limit {
+                tools.push(command);
+            }
+        }
         Ok(tools)
     }
 }
@@ -651,9 +709,20 @@ async fn commit_sticky_fallback_discovery_round(
                 .map_err(|error| format!("invalid discovery arguments: {error}"));
         let definitions = match discovery_result {
             Ok(request) => {
-                match CompleteCapabilityDiscovery::new(session, config, tool_schemas, browser_only)
-                    .await
-                    .and_then(|discovery| discovery.discover_complete_schemas(&request))
+                let include_commands = request.kinds.as_ref().is_some_and(|kinds| {
+                    kinds
+                        .iter()
+                        .any(|kind| *kind != bamboo_domain::CapabilityKind::Tool)
+                });
+                match CompleteCapabilityDiscovery::new(
+                    session,
+                    config,
+                    tool_schemas,
+                    browser_only,
+                    include_commands,
+                )
+                .await
+                .and_then(|discovery| discovery.discover_complete_schemas(&request))
                 {
                     Ok(mut schemas) => {
                         if browser_only {
@@ -729,9 +798,19 @@ async fn build_openai_client_tool_search_outputs(
     provider_items: &[ProviderTranscriptItem],
 ) -> Result<Vec<ProviderTranscriptItem>, AgentError> {
     let requests = openai_client_tool_search_requests(provider_items)?;
-    let discovery = CompleteCapabilityDiscovery::new(session, config, tool_schemas, false).await?;
+    let discovery =
+        CompleteCapabilityDiscovery::new(session, config, tool_schemas, false, false).await?;
     let mut outputs = Vec::with_capacity(requests.len());
     for (call_id, request) in requests {
+        if request.kinds.as_ref().is_some_and(|kinds| {
+            kinds
+                .iter()
+                .any(|kind| *kind != bamboo_domain::CapabilityKind::Tool)
+        }) {
+            return Err(AgentError::LLM(
+                "native tool search accepts Tools only".to_string(),
+            ));
+        }
         let tools = discovery
             .discover_complete_schemas(&request)?
             .iter()
@@ -4789,6 +4868,594 @@ mod tests {
             .is_err()
         );
         assert_eq!(source.lookups.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn codex_native_tool_search_reads_parameters_without_resolving_skill_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = Arc::new(FailingBrowserDiscoveryProjectSource {
+            lookups: AtomicUsize::new(0),
+        });
+        let config = AgentLoopConfig {
+            skill_manager: Some(Arc::new(SkillManager::with_config(SkillStoreConfig {
+                skills_dir: directory.path().join("skills"),
+                ..Default::default()
+            }))),
+            project_context_resolver: Some(Arc::new(ProjectContextResolver::new(source.clone()))),
+            ..Default::default()
+        };
+        let mut session = Session::new("native-search-with-broken-skills", "gpt-5.6");
+        session.set_project_id_meta("browser-discovery-project".to_string());
+        let mut tool = loading_test_schema_with_description("lookup", "Search records");
+        tool.function.parameters = serde_json::json!({
+            "type":"object", "properties":{
+                "entries":{"type":"array", "items":{"anyOf":[
+                    {"type":"string", "description":"Meteorological forecast"},
+                    {"type":"object", "properties":{"timezone":{"type":"string"}}}
+                ]}}
+            }, "required":["entries"], "additionalProperties":false
+        });
+        let outputs = build_openai_client_tool_search_outputs(
+            &session,
+            &config,
+            std::slice::from_ref(&tool),
+            &[native_client_search_item_for(
+                "search_parameters",
+                "meteorological!",
+            )],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outputs[0].payload()["tools"],
+            serde_json::json!([
+                bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json(
+                    &tool
+                )
+            ])
+        );
+        assert_eq!(source.lookups.load(Ordering::SeqCst), 0);
+        tool.function.parameters = serde_json::json!({
+            "type":"object", "properties":{"postal_code":{"type":"string", "description":"District address"}},
+            "required":["postal_code"]
+        });
+        let refreshed = build_openai_client_tool_search_outputs(
+            &session,
+            &config,
+            std::slice::from_ref(&tool),
+            &[native_client_search_item_for(
+                "refreshed_parameters",
+                "district",
+            )],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            refreshed[0].payload()["tools"],
+            serde_json::json!([
+                bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json(
+                    &tool
+                )
+            ])
+        );
+        let missing = build_openai_client_tool_search_outputs(
+            &session,
+            &config,
+            std::slice::from_ref(&tool),
+            &[native_client_search_item_for(
+                "old_parameters",
+                "meteorological",
+            )],
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing[0].payload()["tools"], serde_json::json!([]));
+        let invalid_kind = native_client_search_item_with_arguments(
+            "search_skill",
+            serde_json::json!({
+                "query":"review", "kinds":["skill"]
+            }),
+        );
+        assert!(build_openai_client_tool_search_outputs(
+            &session,
+            &config,
+            &[tool],
+            &[invalid_kind]
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("Tools only"));
+        assert_eq!(source.lookups.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn codex_search_explicit_legacy_commands_follow_tools_without_score_mixing() {
+        use bamboo_skills::{
+            WorkflowCatalogEntry, WorkflowCatalogSnapshot, WorkflowKind, WorkflowSource,
+            WorkflowStatus,
+        };
+        let entry = WorkflowCatalogEntry {
+            id: "calendar-review".into(),
+            name: "Calendar review".into(),
+            description: "Review calendar events".into(),
+            kind: WorkflowKind::Instruction,
+            source: WorkflowSource::User,
+            revision: 1,
+            content_digest: "digest".into(),
+            version: "1".into(),
+            invocation_policy: serde_json::json!({"explicit":true,"automatic":true}),
+            argument_schema: serde_json::json!({"type":"object"}),
+            status: WorkflowStatus::Valid,
+            legacy: false,
+            migration_status: None,
+            last_error: None,
+            winner: true,
+            shadowed_candidates: Vec::new(),
+        };
+        let mut skills = WorkflowCatalogSnapshot::default();
+        skills.entries.push(entry);
+        let tool =
+            loading_test_schema_with_description("calendar_lookup", "Look up calendar events");
+        let mut gateway = loading_test_schema_with_description("load_skill", "Load instructions");
+        gateway.function.parameters = serde_json::json!({"type":"object","properties":{"skill_id":{"type":"string"}},"required":["skill_id"]});
+        let catalog = [tool.clone(), gateway]
+            .into_iter()
+            .filter_map(bamboo_domain::ClassifiedToolSchema::new)
+            .collect::<Vec<_>>();
+        let discovery = super::CompleteCapabilityDiscovery {
+            tools: bamboo_tools::tool_search::ToolSearchIndex::from_resolved_catalog(&catalog),
+            commands: Some(
+                crate::capability_discovery::CapabilityDiscoveryIndex::from_snapshots(
+                    Vec::new(),
+                    &skills,
+                    &WorkflowCatalogSnapshot::default(),
+                    &Default::default(),
+                ),
+            ),
+            catalog,
+        };
+        let request = bamboo_domain::DiscoverCapabilitiesRequest {
+            query: "calendar".into(),
+            kinds: Some(vec![
+                bamboo_domain::CapabilityKind::Tool,
+                bamboo_domain::CapabilityKind::Skill,
+            ]),
+            limit: Some(2),
+        };
+        let schemas = discovery.discover_complete_schemas(&request).unwrap();
+        assert_eq!(schemas.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&schemas[0]).unwrap(),
+            serde_json::to_value(&tool).unwrap()
+        );
+        assert_eq!(schemas[1].function.name, "load_skill");
+        assert_eq!(
+            schemas[1].function.parameters["properties"]["skill_id"]["enum"],
+            serde_json::json!(["calendar-review"])
+        );
+        let bounded = discovery
+            .discover_complete_schemas(&bamboo_domain::DiscoverCapabilitiesRequest {
+                limit: Some(1),
+                ..request.clone()
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(bounded).unwrap(),
+            serde_json::json!([tool])
+        );
+        let mut overlapping_catalog = discovery.catalog.clone();
+        let mut overlapping_gateway = overlapping_catalog[1].schema().clone();
+        overlapping_gateway.function.description = "Calendar instructions".into();
+        overlapping_catalog[1] =
+            bamboo_domain::ClassifiedToolSchema::new(overlapping_gateway).unwrap();
+        let overlapping = super::CompleteCapabilityDiscovery {
+            tools: bamboo_tools::tool_search::ToolSearchIndex::from_resolved_catalog(
+                &overlapping_catalog,
+            ),
+            commands: discovery.commands.clone(),
+            catalog: overlapping_catalog,
+        };
+        for limit in [1, 2, 3] {
+            let tool_request = bamboo_domain::DiscoverCapabilitiesRequest {
+                limit: Some(limit),
+                kinds: Some(vec![bamboo_domain::CapabilityKind::Tool]),
+                ..request.clone()
+            };
+            let complete_tools = overlapping
+                .discover_complete_schemas(&tool_request)
+                .unwrap();
+            let expected_names = if limit == 1 {
+                vec!["calendar_lookup"]
+            } else {
+                vec!["calendar_lookup", "load_skill"]
+            };
+            assert_eq!(
+                complete_tools
+                    .iter()
+                    .map(|schema| schema.function.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected_names,
+                "the BM25 winner/order must stay explicit at limit={limit}"
+            );
+            for schema in &complete_tools {
+                let original = overlapping
+                    .catalog
+                    .iter()
+                    .find(|entry| entry.execution_name() == schema.function.name)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(schema).unwrap(),
+                    serde_json::to_value(original.schema()).unwrap(),
+                    "Tool-only {name} must keep its complete original definition",
+                    name = schema.function.name
+                );
+            }
+            let mixed = overlapping
+                .discover_complete_schemas(&bamboo_domain::DiscoverCapabilitiesRequest {
+                    limit: Some(limit),
+                    ..request.clone()
+                })
+                .unwrap();
+            assert!(mixed.len() <= limit);
+            assert_eq!(
+                mixed
+                    .iter()
+                    .map(|schema| schema.function.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected_names,
+                "command replacement must preserve Tools positions at limit={limit}"
+            );
+            assert_eq!(
+                serde_json::to_value(&mixed[0]).unwrap(),
+                serde_json::to_value(&complete_tools[0]).unwrap(),
+                "limit=1 admits calendar_lookup and cannot add the unrelated gateway"
+            );
+            if limit >= 2 {
+                let gateway = &mixed[1];
+                assert_eq!(
+                    gateway.function.parameters["properties"]["skill_id"]["enum"],
+                    serde_json::json!(["calendar-review"])
+                );
+                assert!(gateway.function.description.contains("revision=1"));
+                assert!(gateway.function.description.contains("source=user"));
+                assert_ne!(serde_json::to_value(gateway).unwrap(), serde_json::to_value(&complete_tools[1]).unwrap(),
+                    "explicit command must narrow an existing generic gateway even at the full limit=2");
+            }
+        }
+    }
+
+    struct CodexSearchLoopProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for CodexSearchLoopProvider {
+        async fn capability_loading_mode(
+            &self,
+            _: &str,
+            _: Option<&str>,
+        ) -> bamboo_domain::CapabilityLoadingMode {
+            bamboo_domain::CapabilityLoadingMode::StickyFallback
+        }
+
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            // The actual runner request always contains only Core + search;
+            // discovered complete definitions arrive in canonical history.
+            assert!(tools.iter().all(
+                |tool| tool.function.name != "lookup" && tool.function.name != "hidden_lookup"
+            ));
+            assert!(tools
+                .iter()
+                .any(|tool| tool.function.name
+                    == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
+            let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = match count {
+                0 => vec![
+                    Ok(LLMChunk::ToolCalls(vec![activation_call(
+                        "codex-search",
+                        bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                        r#"{"query":"timezone!","limit":1}"#,
+                    )])),
+                    Ok(LLMChunk::Done),
+                ],
+                1 => {
+                    let result = messages
+                        .iter()
+                        .find(|message| message.tool_call_id.as_deref() == Some("codex-search"))
+                        .unwrap();
+                    let definitions = sticky_result_definition_values(result).unwrap();
+                    assert_eq!(definitions.len(), 1);
+                    assert_eq!(definitions[0]["function"]["name"], "lookup");
+                    assert_eq!(
+                        definitions[0]["function"]["parameters"]["required"],
+                        serde_json::json!(["timezone"])
+                    );
+                    vec![
+                        Ok(LLMChunk::ToolCalls(vec![activation_call(
+                            "codex-lookup",
+                            "lookup",
+                            r#"{"timezone":"UTC"}"#,
+                        )])),
+                        Ok(LLMChunk::Done),
+                    ]
+                }
+                2 => {
+                    assert!(messages
+                        .iter()
+                        .any(
+                            |message| message.tool_call_id.as_deref() == Some("codex-lookup")
+                                && message.tool_success == Some(true)
+                        ));
+                    vec![Ok(LLMChunk::Token("done".to_string())), Ok(LLMChunk::Done)]
+                }
+                _ => panic!("unexpected request {count}"),
+            };
+            Ok(Box::pin(stream::iter(chunks)))
+        }
+    }
+
+    struct CodexSearchLoopExecutor {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for CodexSearchLoopExecutor {
+        async fn execute(
+            &self,
+            call: &ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<bamboo_agent_core::tools::ToolResult>
+        {
+            assert_eq!(call.function.name, "lookup");
+            assert_eq!(call.function.arguments, r#"{"timezone":"UTC"}"#);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(bamboo_agent_core::tools::ToolResult::text(
+                true,
+                "verified UTC record",
+            ))
+        }
+
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            ["lookup", "hidden_lookup"].into_iter().map(|name| {
+                let mut schema = loading_test_schema_with_description(name, "Search records");
+                schema.function.parameters = serde_json::json!({
+                    "type":"object", "properties":{"timezone":{"type":"string", "description":"Regional clock offset"}},
+                    "required":["timezone"], "additionalProperties":false
+                });
+                schema
+            }).collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_search_real_runner_hides_then_loads_schema_and_accepts_next_call() {
+        let mut session = Session::new("codex-search-runner", "model");
+        session.add_message(Message::user("Read the UTC record"));
+        let provider = Arc::new(CodexSearchLoopProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let executor = Arc::new(CodexSearchLoopExecutor {
+            calls: AtomicUsize::new(0),
+        });
+        let config = AgentLoopConfig {
+            disabled_tools: std::collections::BTreeSet::from(["hidden_lookup".to_string()]),
+            ..delegation_loop_config()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let mut state = e2e_loop_state(&session.id);
+        assert!(super::run_pipeline(
+            &mut session,
+            &tx,
+            provider.clone(),
+            executor.clone(),
+            &tokio_util::sync::CancellationToken::new(),
+            &config,
+            &mut state
+        )
+        .await
+        .unwrap());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        let mut resumed: Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        let current =
+            super::resolve_tool_schemas_for_round(&config, executor.as_ref(), &mut resumed);
+        let callable = effective_callable_set_for_round(
+            &resumed,
+            &current,
+            bamboo_domain::CapabilityLoadingMode::StickyFallback,
+        );
+        assert!(callable.contains_execution_name("lookup"));
+        assert!(!callable.contains_execution_name("hidden_lookup"));
+        let removed = effective_callable_set_for_round(
+            &resumed,
+            &[],
+            bamboo_domain::CapabilityLoadingMode::StickyFallback,
+        );
+        assert!(!removed.contains_execution_name("lookup"));
+    }
+
+    struct CodexNativeSearchLoopProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for CodexNativeSearchLoopProvider {
+        async fn capability_loading_mode(
+            &self,
+            _: &str,
+            _: Option<&str>,
+        ) -> bamboo_domain::CapabilityLoadingMode {
+            bamboo_domain::CapabilityLoadingMode::Progressive
+        }
+
+        async fn provider_visible_tool_footprint(
+            &self,
+            ir: &bamboo_llm::PromptIR,
+            tools: &[bamboo_agent_core::tools::ToolSchema],
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<bamboo_llm::ProviderVisibleToolFootprint, LLMError> {
+            bamboo_llm::providers::openai::OpenAIProvider::new("test")
+                .with_responses_only_models(vec!["gpt-5*".into()])
+                .with_tool_search_execution(bamboo_llm::providers::common::openai_responses::ResponsesToolSearchExecution::Client)
+                .provider_visible_tool_footprint(ir, tools, "gpt-5.6", None)
+                .await
+        }
+
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            panic!("native test must consume the actual PromptIR")
+        }
+
+        async fn chat_stream_ir(
+            &self,
+            ir: &bamboo_llm::PromptIR,
+            tools: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+            _: Option<&bamboo_llm::LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            let response_options = ir.responses_request_options(None);
+            let body = bamboo_llm::providers::common::openai_responses::build_responses_body_with_capability_loading(
+                "gpt-5.6", &ir.flatten(), tools, None, None, Some(&response_options), None, None,
+                bamboo_domain::CapabilityLoadingMode::Progressive,
+                bamboo_llm::providers::common::openai_responses::ResponsesToolSearchExecution::Client);
+            let initial = body["tools"].as_array().unwrap();
+            assert!(initial
+                .iter()
+                .all(|tool| tool["name"] != "lookup" && tool["name"] != "hidden_lookup"));
+            assert!(initial
+                .iter()
+                .any(|tool| tool["type"] == "tool_search" && tool["execution"] == "client"));
+            let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = match count {
+                0 => vec![
+                    Ok(LLMChunk::ProviderTranscriptItem(
+                        native_client_search_item_for("codex-native-search", "timezone!"),
+                    )),
+                    Ok(LLMChunk::Done),
+                ],
+                1 => {
+                    let output = ir
+                        .provider_transcript_groups
+                        .iter()
+                        .flat_map(|group| group.items())
+                        .find(|item| item.payload()["type"] == "tool_search_output")
+                        .unwrap();
+                    assert_eq!(output.payload()["tools"].as_array().unwrap().len(), 1);
+                    assert_eq!(output.payload()["tools"][0]["name"], "lookup");
+                    assert_eq!(
+                        output.payload()["tools"][0]["parameters"]["required"],
+                        serde_json::json!(["timezone"])
+                    );
+                    let call = activation_call("codex-lookup", "lookup", r#"{"timezone":"UTC"}"#);
+                    // The real Responses adapter retains raw transcript groups
+                    // only for discovery; ordinary calls use normalized chunks.
+                    vec![Ok(LLMChunk::ToolCalls(vec![call])), Ok(LLMChunk::Done)]
+                }
+                2 => {
+                    assert!(body["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|item| item["type"] == "function_call_output"
+                            && item["call_id"] == "codex-lookup"
+                            && item["output"].to_string().contains("verified UTC record")));
+                    vec![Ok(LLMChunk::Token("done".to_string())), Ok(LLMChunk::Done)]
+                }
+                _ => panic!("unexpected native request {count}"),
+            };
+            Ok(Box::pin(stream::iter(chunks)))
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_native_search_real_runner_reveals_complete_schema_on_next_request() {
+        let mut session = Session::new("codex-native-search-runner", "gpt-5.6");
+        session.add_message(Message::user("Read the UTC record"));
+        let provider = Arc::new(CodexNativeSearchLoopProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let executor = Arc::new(CodexSearchLoopExecutor {
+            calls: AtomicUsize::new(0),
+        });
+        let config = AgentLoopConfig {
+            disabled_tools: std::collections::BTreeSet::from(["hidden_lookup".to_string()]),
+            provider_name: Some("codex-search-test".to_string()),
+            provider_type: Some("openai".to_string()),
+            model_name: Some("gpt-5.6".to_string()),
+            ..delegation_loop_config()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let mut state = e2e_loop_state(&session.id);
+        state.model_name = "gpt-5.6".to_string();
+        assert!(super::run_pipeline(
+            &mut session,
+            &tx,
+            provider.clone(),
+            executor.clone(),
+            &tokio_util::sync::CancellationToken::new(),
+            &config,
+            &mut state
+        )
+        .await
+        .unwrap());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn codex_search_keeps_completed_legacy_command_transcripts_replayable() {
+        let mut session = Session::new("old-command-search", "gpt-5.6");
+        session
+            .activate_provider_transcript_route(
+                bamboo_domain::ProviderFamily::OpenAi,
+                bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                &"a".repeat(64),
+            )
+            .unwrap();
+        let assistant = Message::assistant("", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        let call = native_client_search_item_with_arguments(
+            "old-skill-search",
+            serde_json::json!({
+                "query":"review", "kinds":["skill"]
+            }),
+        );
+        session
+            .append_provider_transcript_group(&anchor, None, vec![call])
+            .unwrap();
+        let gateway = loading_test_schema("load_skill");
+        let output = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+            bamboo_domain::ProviderFamily::OpenAi, bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            bamboo_domain::ProviderTranscriptOrigin::HostToolSearch, bamboo_domain::ProviderTranscriptAuthor::ToolResult,
+            serde_json::json!({"type":"tool_search_output","execution":"client","call_id":"old-skill-search",
+                "status":"completed","tools":[bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json(&gateway)]})
+        ).unwrap();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![output])
+            .unwrap();
+        let resumed: Session =
+            serde_json::from_value(serde_json::to_value(session).unwrap()).unwrap();
+        assert!(effective_callable_set_for_round(
+            &resumed,
+            &[gateway],
+            bamboo_domain::CapabilityLoadingMode::Progressive
+        )
+        .contains_execution_name("load_skill"));
     }
 
     #[tokio::test]
