@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use base64::Engine as _;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -2153,7 +2152,7 @@ pub(crate) fn with_provider_mcp_migration_lock<T>(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let lock = open_migration_lock(&data_dir.join(LOCK_FILE))?;
-    lock.lock_exclusive()?;
+    lock.lock()?;
     let _lock = MigrationLock(lock);
     operation()
 }
@@ -4201,7 +4200,7 @@ fn persist_exact_credential_transaction_inner(
     }
     std::fs::create_dir_all(data_dir)?;
     let lock = open_migration_lock(&data_dir.join(LOCK_FILE))?;
-    lock.lock_exclusive()?;
+    lock.lock()?;
     let _lock = MigrationLock(lock);
 
     cleanup_orphan_transaction_dirs(data_dir)?;
@@ -15181,13 +15180,60 @@ struct MigrationLock(File);
 
 impl Drop for MigrationLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
+        let _ = self.0.unlock();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_lock_excludes_other_writers_and_releases_on_operation_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(LOCK_FILE);
+        for fail in [false, true] {
+            let result = with_provider_mcp_migration_lock(dir.path(), || {
+                let competitor = open_migration_lock(&lock_path).unwrap();
+                assert!(matches!(
+                    competitor.try_lock(),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ));
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "config_store::tests::file_lock_process_probe",
+                        "--nocapture",
+                    ])
+                    .env("BAMBOO_CONFIG_LOCK_TEST_PATH", &lock_path)
+                    .env("BAMBOO_CONFIG_LOCK_TEST_EXPECTED", "blocked")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "migration lock probe failed: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("file-lock-probe: blocked")
+                );
+                if fail {
+                    Err(injected_fault())
+                } else {
+                    Ok(())
+                }
+            });
+            if fail {
+                assert!(matches!(result, Err(ConfigStoreError::Io(_))));
+            } else {
+                result.unwrap();
+            }
+            let next_writer = open_migration_lock(&lock_path).unwrap();
+            next_writer.try_lock().unwrap();
+            next_writer.unlock().unwrap();
+        }
+    }
 
     #[cfg(unix)]
     #[test]
