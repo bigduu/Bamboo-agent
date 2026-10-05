@@ -14,6 +14,7 @@ pub mod parallel;
 mod permission_override;
 pub use bamboo_permission as permission;
 pub mod slash_commands;
+pub mod tool_search;
 #[allow(clippy::module_inception)]
 pub mod tools;
 
