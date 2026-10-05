@@ -14,3 +14,19 @@ These portions retain the [Apache-2.0 license](crates/engine/bamboo-tools/third_
 values, current host eligibility, exact-first aliases, deterministic bounds,
 and complete schema projection. The remaining project-owned code retains its
 existing license.
+
+## OpenAI Codex Skill input
+
+`crates/infra/bamboo-skills/src/store/codex_frontmatter.rs` and its six fixtures
+adapt the metadata parser from `codex-rs/skills/src/parser.rs` and
+`codex-rs/skills/src/parser_tests.rs` at the same pinned Codex revision above.
+`crates/infra/bamboo-skills/src/catalog/codex_metadata.rs` adapts short-description
+normalization and optional policy projection from
+`codex-rs/ext/skills/src/loader/metadata.rs` and `codex-rs/skills/src/interface.rs`.
+
+These portions are copyright 2025 OpenAI and retain the
+[Apache-2.0 license](crates/infra/bamboo-skills/third_party/codex/LICENSE) and
+[upstream notices](crates/infra/bamboo-skills/third_party/codex/NOTICE).
+Bamboo changes share frontmatter extraction/repair with supported host extras,
+retain safe IDs and body bytes, and intersect host invocation denies. Optional
+OpenAI descriptive errors do not discard a valid implicit invocation deny.

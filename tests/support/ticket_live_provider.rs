@@ -17,6 +17,7 @@ pub struct LiveConfig {
     secret: String,
     protected: Vec<(PathBuf, Vec<u8>)>,
     supervisor_only: bool,
+    native_worker: bool,
 }
 
 impl LiveConfig {
@@ -76,7 +77,16 @@ impl LiveConfig {
                 .expect("existing credential must decrypt"),
             protected,
             supervisor_only: true,
+            native_worker: false,
         }
+    }
+
+    /// Explicit opt-in for the existing bounded Task/Read/Write native Worker.
+    /// This changes only the fixture's forwarding gate, never Runtime authority.
+    pub fn read_with_native_worker() -> Self {
+        let mut config = Self::read();
+        config.native_worker = true;
+        config
     }
 
     pub fn provider(&self) -> OpenAIProvider {
@@ -102,7 +112,19 @@ impl LiveConfig {
             secret: "upstream-transport-fixture".into(),
             protected: vec![],
             supervisor_only: false,
+            native_worker: false,
         }
+    }
+
+    pub fn synthetic_native_transport_test(endpoint: String) -> Self {
+        let mut config = Self::synthetic_transport_test(endpoint);
+        config.supervisor_only = true;
+        config.native_worker = true;
+        config
+    }
+
+    pub fn disable_native_worker_for_transport_test(&mut self) {
+        self.native_worker = false;
     }
 }
 
@@ -127,6 +149,7 @@ async fn forward(request: HttpRequest, body: web::Bytes, state: web::Data<State>
         ("POST", "/v1/responses") => "/responses",
         _ => return HttpResponse::NotFound().finish(),
     };
+    let mut role = "models";
     let model = if request.method() == actix_web::http::Method::POST {
         let Ok(value) = serde_json::from_slice::<Value>(&body) else {
             return HttpResponse::BadRequest().finish();
@@ -145,13 +168,28 @@ async fn forward(request: HttpRequest, body: web::Bytes, state: web::Data<State>
                         .or_else(|| tool["function"]["name"].as_str())
                 })
                 .collect();
-            if !["work_overview", "work_update"]
+            if ["work_overview", "work_update"]
                 .iter()
                 .all(|name| tool_names.contains(name))
             {
-                return HttpResponse::Forbidden()
-                    .body("fixture permits Supervisor tool requests only");
+                role = "supervisor";
+            } else if state.config.native_worker
+                && value["tools"]
+                    .as_array()
+                    .is_some_and(|tools| tools.len() == 3)
+                && tool_names.len() == 3
+                && ["Task", "Read", "Write"]
+                    .iter()
+                    .all(|name| tool_names.contains(name))
+            {
+                role = "native_worker";
+            } else {
+                return HttpResponse::Forbidden().body(
+                    "fixture permits Supervisor or explicitly enabled bounded Worker requests only",
+                );
             }
+        } else {
+            role = "synthetic_transport";
         }
         value["model"].clone()
     } else {
@@ -159,11 +197,12 @@ async fn forward(request: HttpRequest, body: web::Bytes, state: web::Data<State>
     };
     let index = {
         let mut requests = state.requests.lock().unwrap();
-        if requests.len() >= 256 {
+        let limit = if state.config.native_worker { 64 } else { 256 };
+        if requests.len() >= limit {
             return HttpResponse::TooManyRequests().body("bounded fixture request limit");
         }
         let index = requests.len();
-        requests.push(json!({"path":request.path(),"model":model,
+        requests.push(json!({"path":request.path(),"model":model,"role":role,
             "request_bytes":body.len(),"request_sha256":content_hash(&body),"status":null}));
         index
     };
