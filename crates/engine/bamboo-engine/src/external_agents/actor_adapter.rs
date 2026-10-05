@@ -10570,6 +10570,7 @@ mod tests {
                 session_inbox_runtime: Some(&binding),
                 actor_directory_store: None,
                 canonical_subagent_tool: None,
+                ticket_service: None,
                 activation_run_id: Some("current"),
                 execution_epoch: 7,
                 expected_source_actor_id: "selected",
