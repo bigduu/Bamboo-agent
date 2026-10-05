@@ -576,8 +576,9 @@ fn runtime_resume_message(
     message
 }
 
-/// Only a strict v1 report from the sealed result message enters this route.
-/// Legacy text, Guardian verdicts and resident completions retain their paths.
+/// A current sealed required-packet completion always uses the bounded route.
+/// Unusable reports are unavailable, never a reason to import legacy raw text.
+/// Unbound children, Guardian verdicts and resident completions retain their paths.
 fn sealed_child_report(
     completion: &ChildCompletion,
     child: &Session,
@@ -592,19 +593,35 @@ fn sealed_child_report(
         return None;
     }
     let source = completion.source.as_ref()?;
-    if !source.matches_completion(completion) {
+    if !source.matches_completion(completion)
+        || ChildCompletionSource::from_committed_session(child).as_ref() != Some(source)
+        || !source.matches_parent(child, parent)
+    {
         return None;
     }
     let binding = bamboo_domain::ChildContextBinding::from_session(child).ok()??;
-    let content = source.result(child, parent)?;
-    let message = child
+    let Some(message) = child
         .messages
         .iter()
-        .find(|m| Some(&m.id) == source.result_message_id.as_ref())?;
+        .find(|m| Some(&m.id) == source.result_message_id.as_ref())
+    else {
+        let reason = if source.last_assistant.is_some() {
+            "report_not_current_final"
+        } else {
+            "report_absent"
+        };
+        return Some(unavailable_child_result("typed_result", reason));
+    };
     if !plain_child_report_message(message) {
-        return None;
+        return Some(unavailable_child_result(
+            "typed_result",
+            "report_not_current_final",
+        ));
     }
-    let report = decode_report(&content).ok()?;
+    let report = match decode_report(&message.content) {
+        Ok(report) => report,
+        Err(reason) => return Some(unavailable_child_result("typed_result", reason)),
+    };
     let mut observation =
         child_result_identity(parent, child, &binding, source.project_id.as_deref());
     observation.as_object_mut()?.extend(
@@ -3617,10 +3634,192 @@ mod tests {
         ChildCompletion {
             parent_session_id: child.parent_session_id.clone().unwrap(),
             child_session_id: child.id.clone(),
-            status: "completed".into(),
-            error: None,
+            status: child.last_run_status().unwrap(),
+            error: child.last_run_error(),
             completed_at: child.updated_at,
             source: ChildCompletionSource::from_committed_session(child),
+        }
+    }
+
+    fn unusable_typed_test_child(
+        parent: &Session,
+        id: &str,
+        case: &str,
+    ) -> (Session, &'static str) {
+        let mut child = typed_test_child(parent, id, &typed_test_report().to_string());
+        let mut prior = Default::default();
+        let reason = match case {
+            "prose" => {
+                child.messages.last_mut().unwrap().content = "UNUSABLE_RAW_PROSE".repeat(64);
+                "report_malformed"
+            }
+            "malformed" => {
+                child.messages.last_mut().unwrap().content =
+                    "{\"version\":1,UNUSABLE_RAW_JSON".into();
+                "report_malformed"
+            }
+            "oversized" => {
+                child
+                    .messages
+                    .last_mut()
+                    .unwrap()
+                    .content
+                    .push_str(&" ".repeat(8193));
+                "result_budget_exceeded"
+            }
+            "multipart" => {
+                child.messages.last_mut().unwrap().content_parts = Some(
+                    serde_json::from_value(
+                        serde_json::json!([{"type":"text","text":"UNUSABLE_RAW_PART"}]),
+                    )
+                    .unwrap(),
+                );
+                "report_not_current_final"
+            }
+            "commentary" => {
+                child.messages.last_mut().unwrap().phase =
+                    Some(bamboo_domain::MessagePhase::Commentary);
+                "report_not_current_final"
+            }
+            "blank" => {
+                child.messages.last_mut().unwrap().content = "  ".into();
+                "report_not_current_final"
+            }
+            "old_final" => {
+                prior = child.messages.iter().map(|m| m.id.clone()).collect();
+                "report_not_current_final"
+            }
+            "error" => {
+                prior = child.messages.iter().map(|m| m.id.clone()).collect();
+                child.set_last_run_status("error");
+                child.set_last_run_error("UNUSABLE_RAW_ERROR\"\\\n".repeat(4096));
+                "report_not_current_final"
+            }
+            "absent" => {
+                child.messages.pop();
+                "report_absent"
+            }
+            _ => panic!("unknown unusable report case"),
+        };
+        ChildCompletionSource::prepare(&mut child, "unusable-report-run", &prior);
+        (child, reason)
+    }
+
+    #[test]
+    fn sealed_unusable_reports_keep_current_source_boundary_and_escape_budget() {
+        let mut parent = Session::new("unavailable-parent", "model");
+        parent.add_message(Message::user("required source"));
+        for case in [
+            "prose",
+            "malformed",
+            "oversized",
+            "multipart",
+            "commentary",
+            "blank",
+            "old_final",
+            "error",
+            "absent",
+        ] {
+            let (child, reason) = unusable_typed_test_child(&parent, "unavailable-child", case);
+            let completion = typed_test_completion(&child);
+            assert!(completion.source.is_some(), "valid seal: {case}");
+            let mut projection = sealed_child_report(&completion, &child, &parent).unwrap();
+            assert_eq!(
+                projection,
+                unavailable_child_result("typed_result", reason),
+                "{case}"
+            );
+            let mut message = typed_child_resume_message(&completion, 0, &projection);
+            let raw = completion.source.as_ref().unwrap().result(&child, &parent);
+            let mut envelope =
+                child_completion_envelope(&completion, Utc::now(), raw.clone(), &message);
+            assert!(bound_typed_child_delivery(
+                &mut envelope,
+                &mut message,
+                &mut projection,
+                &completion,
+                0
+            ));
+            assert!(fits_child_result_budget(&envelope));
+            assert!(fits_child_result_budget(&message));
+            assert!(fits_child_result_budget(
+                &envelope.to_provider_message().unwrap()
+            ));
+            assert!(message.content.contains("SubAgent"));
+            assert_eq!(
+                message.metadata.as_ref().unwrap()["child_final_response_included"],
+                false
+            );
+            assert!(projection.get("child_report").is_none());
+            assert!(projection.get("host_observation").is_none());
+            let SessionMessageBody::ChildOutcome(outcome) = envelope.body else {
+                panic!("child outcome")
+            };
+            assert!(outcome.result.is_none());
+            assert!(outcome.error.is_none());
+            if let Some(raw) = raw {
+                assert!(!message.content.contains(&raw), "no raw report: {case}");
+            }
+            // A replaced or invalid source never turns into an unavailable
+            // completion that could clear a newer wait.
+            let mut stale = child.clone();
+            stale
+                .messages
+                .last_mut()
+                .unwrap()
+                .content
+                .push_str("changed");
+            assert!(sealed_child_report(&completion, &stale, &parent).is_none());
+        }
+    }
+
+    #[test]
+    fn unavailable_delivery_counts_escaped_wrappers_at_exact_limit() {
+        let mut parent = Session::new("unavailable-parent", "model");
+        parent.add_message(Message::user("required source"));
+        let (child, _) = unusable_typed_test_child(&parent, "unavailable-child", "oversized");
+        let completion = typed_test_completion(&child);
+        let mut projection = sealed_child_report(&completion, &child, &parent).unwrap();
+        let mut message = typed_child_resume_message(&completion, 0, &projection);
+        let mut base = child_completion_envelope(&completion, Utc::now(), None, &message);
+        assert!(bound_typed_child_delivery(
+            &mut base,
+            &mut message,
+            &mut projection,
+            &completion,
+            0
+        ));
+        let bytes = serde_json::to_vec(&base).unwrap().len().max(
+            serde_json::to_vec(&base.to_provider_message().unwrap())
+                .unwrap()
+                .len(),
+        );
+        for extra in [8192 - bytes, 8193 - bytes] {
+            let mut envelope = base.clone();
+            // Quotes count twice in the actual escaped wrappers.
+            let padding = format!("{}{}", "\"".repeat(extra / 2), "x".repeat(extra % 2));
+            envelope.correlation_id.as_mut().unwrap().push_str(&padding);
+            let mut projection = projection.clone();
+            let mut message = message.clone();
+            assert_eq!(
+                bound_typed_child_delivery(
+                    &mut envelope,
+                    &mut message,
+                    &mut projection,
+                    &completion,
+                    0
+                ),
+                bytes + extra == 8192
+            );
+            assert_eq!(
+                serde_json::to_vec(&envelope).unwrap().len().max(
+                    serde_json::to_vec(&envelope.to_provider_message().unwrap())
+                        .unwrap()
+                        .len()
+                ),
+                bytes + extra
+            );
+            assert!(fits_child_result_budget(&message));
         }
     }
 
@@ -3651,14 +3850,7 @@ mod tests {
             "passed"
         );
         assert!(projection["host_observation"].get("verified").is_none());
-        for excluded in [
-            "guardian",
-            "resident",
-            "legacy",
-            "malformed",
-            "missing_source",
-            "multipart",
-        ] {
+        for excluded in ["guardian", "resident", "legacy", "missing_source"] {
             let mut excluded_child = child.clone();
             match excluded {
                 "guardian" => {
@@ -3676,17 +3868,6 @@ mod tests {
                         Session::new_child("typed-child", &parent.id, "model", "Child");
                     excluded_child.add_message(Message::assistant(report.to_string(), None));
                     excluded_child.set_last_run_status("completed");
-                }
-                "malformed" => {
-                    excluded_child.messages.last_mut().unwrap().content = format!("prose {report}")
-                }
-                "multipart" => {
-                    excluded_child.messages.last_mut().unwrap().content_parts = Some(
-                        serde_json::from_value(
-                            serde_json::json!([{ "type":"text", "text":"not plain" }]),
-                        )
-                        .unwrap(),
-                    )
                 }
                 _ => {}
             }
@@ -3869,71 +4050,102 @@ mod tests {
 
     #[tokio::test]
     async fn typed_cold_watchdog_and_terminal_siblings_admit_each_source_once() {
-        for cold_watchdog in [false, true] {
-            let (_temp, store, inbox, coordinator, reservations, launches) =
-                completion_inbox_fixture().await;
-            let ids = vec!["typed-a".into(), "typed-b".into()];
-            save_waiting_test_parent(&store, "typed-parent", ids.clone(), ChildWaitPolicy::All)
-                .await;
-            let mut parent = store.load_session("typed-parent").await.unwrap().unwrap();
-            parent.add_message(Message::user("required source"));
-            store.save_session(&parent).await.unwrap();
-            let mut completions = Vec::new();
-            for id in &ids {
-                let child = typed_test_child(&parent, id, &typed_test_report().to_string());
-                store.save_session(&child).await.unwrap();
-                completions.push(typed_test_completion(&child));
-            }
-            if cold_watchdog {
-                // No callbacks or cached Session snapshots precede this disk-only sweep.
-                let mut wait = read_runtime_state(&parent).waiting_for_children.unwrap();
-                wait.registered_at = Utc::now() - chrono::Duration::seconds(61);
-                coordinator.sweep_child_wait(&parent.id, wait.clone()).await;
-                coordinator.sweep_child_wait(&parent.id, wait).await;
-            } else {
-                // The terminal index is ahead of the second sibling's callback.
-                coordinator.on_child_completed(completions[0].clone()).await;
-            }
-            for completion in completions {
-                coordinator.on_child_completed(completion).await;
-            }
-            let claims = inbox.claim(&parent.id, 8).await.unwrap();
-            assert_eq!(claims.len(), 2);
-            assert_eq!(reservations.load(Ordering::SeqCst), 1);
-            assert_eq!(launches.load(Ordering::SeqCst), 1);
-            for claim in claims {
-                assert!(fits_child_result_budget(&claim.envelope));
-                assert!(fits_child_result_budget(
-                    &claim.envelope.to_provider_message().unwrap()
-                ));
-                let SessionMessageBody::ChildOutcome(outcome) = claim.envelope.body else {
-                    panic!("child outcome");
-                };
-                let projection: serde_json::Value = serde_json::from_str(
-                    outcome
-                        .provider_message
-                        .as_ref()
-                        .unwrap()
-                        .content
-                        .text
-                        .split_once("Child typed result:\n")
-                        .unwrap()
-                        .1
-                        .lines()
-                        .next()
-                        .unwrap(),
-                )
-                .unwrap();
-                assert_eq!(projection["child_report"], typed_test_report());
-                assert_eq!(
-                    projection["host_observation"]["terminal_source"]["child_session_id"],
-                    outcome.child_session_id
-                );
-                assert_eq!(
-                    projection["host_observation"]["last_run_status"],
-                    "completed"
-                );
-                assert!(fits_child_result_budget(&outcome.provider_message));
+        for case in [
+            "valid",
+            "prose",
+            "malformed",
+            "oversized",
+            "multipart",
+            "commentary",
+            "blank",
+            "old_final",
+            "error",
+            "absent",
+        ] {
+            for cold_watchdog in [false, true] {
+                let (_temp, store, inbox, coordinator, reservations, launches) =
+                    completion_inbox_fixture().await;
+                let ids = vec!["typed-a".into(), "typed-b".into()];
+                save_waiting_test_parent(&store, "typed-parent", ids.clone(), ChildWaitPolicy::All)
+                    .await;
+                let mut parent = store.load_session("typed-parent").await.unwrap().unwrap();
+                parent.add_message(Message::user("required source"));
+                store.save_session(&parent).await.unwrap();
+                let mut completions = Vec::new();
+                for id in &ids {
+                    let child = if case == "valid" {
+                        typed_test_child(&parent, id, &typed_test_report().to_string())
+                    } else {
+                        unusable_typed_test_child(&parent, id, case).0
+                    };
+                    store.save_session(&child).await.unwrap();
+                    completions.push(typed_test_completion(&child));
+                }
+                if cold_watchdog {
+                    // No callbacks or cached Session snapshots precede this disk-only sweep.
+                    let mut wait = read_runtime_state(&parent).waiting_for_children.unwrap();
+                    wait.registered_at = Utc::now() - chrono::Duration::seconds(61);
+                    coordinator.sweep_child_wait(&parent.id, wait.clone()).await;
+                    coordinator.sweep_child_wait(&parent.id, wait).await;
+                } else {
+                    // The terminal index is ahead of the second sibling's callback.
+                    coordinator.on_child_completed(completions[0].clone()).await;
+                }
+                for completion in completions {
+                    coordinator.on_child_completed(completion).await;
+                }
+                let claims = inbox.claim(&parent.id, 8).await.unwrap();
+                assert_eq!(claims.len(), 2);
+                assert_eq!(reservations.load(Ordering::SeqCst), 1);
+                assert_eq!(launches.load(Ordering::SeqCst), 1);
+                for claim in claims {
+                    assert!(fits_child_result_budget(&claim.envelope));
+                    assert!(fits_child_result_budget(
+                        &claim.envelope.to_provider_message().unwrap()
+                    ));
+                    let actual = claim.envelope.to_provider_message().unwrap();
+                    assert!(!actual.content.contains("UNUSABLE_RAW"));
+                    let SessionMessageBody::ChildOutcome(outcome) = claim.envelope.body else {
+                        panic!("child outcome");
+                    };
+                    let projection: serde_json::Value = serde_json::from_str(
+                        outcome
+                            .provider_message
+                            .as_ref()
+                            .unwrap()
+                            .content
+                            .text
+                            .split_once("Child typed result:\n")
+                            .unwrap()
+                            .1
+                            .lines()
+                            .next()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    if case != "valid" {
+                        let expected =
+                            unusable_typed_test_child(&parent, &outcome.child_session_id, case).1;
+                        assert_eq!(
+                            projection,
+                            unavailable_child_result("typed_result", expected)
+                        );
+                        assert!(outcome.result.is_none());
+                        assert!(outcome.error.is_none());
+                        assert!(fits_child_result_budget(&outcome.provider_message));
+                        continue;
+                    }
+                    assert_eq!(projection["child_report"], typed_test_report());
+                    assert_eq!(
+                        projection["host_observation"]["terminal_source"]["child_session_id"],
+                        outcome.child_session_id
+                    );
+                    assert_eq!(
+                        projection["host_observation"]["last_run_status"],
+                        "completed"
+                    );
+                    assert!(fits_child_result_budget(&outcome.provider_message));
+                }
             }
         }
     }
