@@ -22,6 +22,7 @@ use std::{
 enum Case {
     Complete,
     TypedReport,
+    LargeProse,
     TinyBudget,
     HugeGuidance,
     Overflow,
@@ -29,7 +30,7 @@ enum Case {
 }
 impl Case {
     fn normal_success(self) -> bool {
-        matches!(self, Self::Complete | Self::TypedReport)
+        matches!(self, Self::Complete | Self::TypedReport | Self::LargeProse)
     }
     fn creates_child(self) -> bool {
         !matches!(self, Self::Overflow | Self::UnsupportedStartup)
@@ -58,7 +59,11 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             );
         }
         (
-            json!({"content": if probe.case == Case::TypedReport { typed_report().to_string() } else { "REAL_CHILD_PACKET_EVIDENCE".into() }}),
+            json!({"content": match probe.case {
+                Case::TypedReport => typed_report().to_string(),
+                Case::LargeProse => large_prose_report(),
+                _ => "REAL_CHILD_PACKET_EVIDENCE".into(),
+            }}),
             "stop",
         )
     } else if body["model"] == "root-packet-test" && body["tools"].to_string().contains("SubAgent")
@@ -341,7 +346,7 @@ async fn fixture(case: Case) {
                 .messages
                 .iter()
                 .any(|message| message.content.contains("REAL_ROOT_PACKET_FINISHED"))
-                && (case != Case::TypedReport
+                && (!case.normal_success()
                     || parent.last_run_status().as_deref() == Some("completed"))
             {
                 break parent;
@@ -458,6 +463,42 @@ async fn fixture(case: Case) {
                 .messages
                 .iter()
                 .any(|message| message.content.contains("REAL_CHILD_PACKET_EVIDENCE")));
+            assert_unavailable_parent_resume(&requests, &completed, &child, "report_malformed");
+            drop(host);
+            cold_typed_inspection(
+                &data,
+                &child,
+                &binding,
+                "REAL_CHILD_PACKET_EVIDENCE",
+                Some("report_malformed"),
+            )
+            .await;
+        } else if case == Case::LargeProse {
+            assert_eq!(child.last_run_status().as_deref(), Some("completed"));
+            assert_eq!(child_requests.len(), 1);
+            let stored = child
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::Assistant)
+                .unwrap();
+            assert_eq!(stored.content, large_prose_report());
+            assert!(stored.content.len() > 8192);
+            assert_unavailable_parent_resume(
+                &requests,
+                &completed,
+                &child,
+                "result_budget_exceeded",
+            );
+            drop(host);
+            cold_typed_inspection(
+                &data,
+                &child,
+                &binding,
+                &stored.content,
+                Some("result_budget_exceeded"),
+            )
+            .await;
         } else if case == Case::TypedReport {
             assert_eq!(child.last_run_status().as_deref(), Some("completed"));
             assert_eq!(child_requests.len(), 1);
@@ -493,7 +534,7 @@ async fn fixture(case: Case) {
             assert_typed_parent_resume(&requests, &completed, &child, &binding);
             // Stop the real host before observing through a cold adapter/tool.
             drop(host);
-            cold_typed_inspection(&data, &child, &binding, &stored.content).await;
+            cold_typed_inspection(&data, &child, &binding, &stored.content, None).await;
         } else {
             assert!(
                 child_requests.is_empty(),
@@ -518,6 +559,7 @@ fn real_cli_required_packet_success_and_preprovider_failure_boundaries() {
                 for case in [
                     Case::Complete,
                     Case::TypedReport,
+                    Case::LargeProse,
                     Case::TinyBudget,
                     Case::HugeGuidance,
                     Case::Overflow,
@@ -537,6 +579,13 @@ fn typed_report() -> Value {
         "reported_evidence":[{"description":"A model claim, not verified","reference":"https://invalid.example/reported-only","sha256":null}],
         "reported_verification":[{"check":"fixture","reported_status":"not_run","details":""}],
         "proposals":[],"blockers":["Root must decide"],"open_decisions":[]})
+}
+
+fn large_prose_report() -> String {
+    format!(
+        "REAL_CHILD_PACKET_EVIDENCE {}",
+        "quoted \"claim\" \\ 用户 🪷\n".repeat(1024)
+    )
 }
 
 fn resume_typed_projection(content: &str) -> Option<Value> {
@@ -633,11 +682,92 @@ fn assert_typed_parent_resume(
     assert!(runtime_message.content.contains("SubAgent"));
 }
 
+fn assert_unavailable_parent_resume(
+    requests: &[Value],
+    parent: &bamboo_domain::Session,
+    child: &bamboo_domain::Session,
+    reason: &str,
+) {
+    let source: Value =
+        serde_json::from_str(&child.metadata["runtime.child_completion_source_v1"]).unwrap();
+    assert_eq!(source["status"], "completed");
+    let root_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request["model"] == "root-packet-test")
+        .collect();
+    assert!(root_requests
+        .iter()
+        .all(|request| !request.to_string().contains("REAL_CHILD_PACKET_EVIDENCE")));
+    assert!(parent
+        .messages
+        .iter()
+        .all(|message| !message.content.contains("REAL_CHILD_PACKET_EVIDENCE")));
+    let provider_messages: Vec<_> = root_requests
+        .iter()
+        .flat_map(|request| request["messages"].as_array().unwrap())
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| {
+            Some((
+                message,
+                resume_typed_projection(message["content"].as_str()?)?,
+            ))
+        })
+        .collect();
+    assert_eq!(
+        provider_messages.len(),
+        1,
+        "one actual unavailable provider resume"
+    );
+    let (provider_message, projection) = &provider_messages[0];
+    assert!(serde_json::to_vec(provider_message).unwrap().len() <= 8192);
+    assert_eq!(
+        projection,
+        &json!({"view":"typed_result","version":1,"available":false,"reason":reason})
+    );
+    let runtime_messages: Vec<_> = parent
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == Role::User
+                && message.metadata.as_ref().is_some_and(|metadata| {
+                    metadata["runtime_kind"] == "child_completion_resume"
+                        && metadata["child_session_id"] == child.id
+                })
+        })
+        .collect();
+    assert_eq!(runtime_messages.len(), 1, "one durable unavailable resume");
+    let message = runtime_messages[0];
+    assert!(serde_json::to_vec(message).unwrap().len() <= 8192);
+    assert_eq!(
+        provider_message["content"].as_str(),
+        Some(message.content.as_str())
+    );
+    assert_eq!(
+        resume_typed_projection(&message.content).as_ref(),
+        Some(projection)
+    );
+    assert_eq!(
+        message.metadata.as_ref().unwrap()["child_typed_result_included"],
+        true
+    );
+    assert_eq!(
+        message.metadata.as_ref().unwrap()["child_final_response_included"],
+        false
+    );
+    assert!(message.content.contains("Resume the parent task"));
+    assert!(message.content.contains(&format!(
+        "SubAgent with {}",
+        json!({"intent":"inspect","target":child.id,"message":"result"})
+    )));
+    assert!(message.content.contains("follow returned cursors"));
+}
+
 async fn cold_typed_inspection(
     data: &Path,
     child: &bamboo_domain::Session,
     binding: &ChildContextBinding,
     content: &str,
+    unavailable_reason: Option<&str>,
 ) {
     use bamboo_agent::server::{
         app_state::AppState,
@@ -701,6 +831,15 @@ async fn cold_typed_inspection(
         };
         assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
         let value: Value = serde_json::from_str(&result.result).unwrap();
+        if view == "typed_result" {
+            if let Some(reason) = unavailable_reason {
+                assert_eq!(
+                    value,
+                    json!({"view":view,"version":1,"available":false,"reason":reason})
+                );
+                continue;
+            }
+        }
         assert_eq!(value["available"], true);
         if view == "typed_result" {
             assert_eq!(value["child_report"], typed_report());
