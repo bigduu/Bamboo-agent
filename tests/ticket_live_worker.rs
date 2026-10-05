@@ -12,11 +12,54 @@ use bamboo_storage::SessionStoreV2;
 use live::{LiveBridge, LiveConfig, HOST_CREDENTIAL};
 use runtime::{command, get, post, Host};
 use serde_json::{json, Value};
-use std::{os::unix::fs::MetadataExt, path::PathBuf, process::Command, time::Duration};
+use std::{
+    ffi::OsString,
+    os::unix::fs::MetadataExt,
+    path::PathBuf,
+    process::{Command, Stdio},
+    time::Duration,
+};
 
 const TITLE: &str = "单工单代码交付";
 const CODE: &str = "pub fn answer() -> u8 { 42 }\n";
 const ORIGINAL: &str = "pub fn answer() -> u8 { 0 }\n";
+
+fn native_worker_command(command: &[OsString]) -> bool {
+    // The required-context route validates exactly this fixed execution argv.
+    // Its short-lived `--print-capabilities` probes are not executing Workers.
+    command.len() == 2 && command[1] == "subagent-worker"
+}
+
+#[test]
+fn capability_probe_is_not_a_native_execution_process() {
+    let mut probe = Command::new(env!("CARGO_BIN_EXE_bamboo"));
+    probe
+        .args(["subagent-worker", "--print-capabilities"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
+    let command: Vec<_> = std::iter::once(probe.get_program())
+        .chain(probe.get_args())
+        .map(OsString::from)
+        .collect();
+    let child = probe.spawn().unwrap();
+    let pid = child.id();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["capabilities"].is_array());
+    assert!(
+        command.iter().any(|a| a == "subagent-worker"),
+        "the old selector incorrectly includes the actual capability probe"
+    );
+    assert_ne!(
+        unsafe { libc::kill(pid as i32, 0) },
+        0,
+        "the selected probe is reaped and would fail the old alive assertion"
+    );
+    assert!(!native_worker_command(&command));
+    assert!(native_worker_command(&command[..2]));
+    assert!(!native_worker_command(&[]));
+}
 
 fn model_catalog_read(request: &Value) -> bool {
     request["role"] == "models"
@@ -382,23 +425,32 @@ impl LiveWork {
             if self.worker_pid.is_none() {
                 let host = self.host.as_ref().unwrap().0.id();
                 let system = sysinfo::System::new_all();
-                let pids: Vec<_> = system
+                let workers: Vec<_> = system
                     .processes()
                     .iter()
                     .filter(|(_, p)| {
                         p.parent().is_some_and(|id| id.as_u32() == host)
-                            && p.cmd().iter().any(|a| a == "subagent-worker")
+                            && native_worker_command(p.cmd())
                     })
-                    .map(|(id, _)| id.as_u32())
+                    .map(|(id, p)| {
+                        let pid = id.as_u32();
+                        let alive = unsafe { libc::kill(pid as i32, 0) };
+                        let error = (alive != 0).then(std::io::Error::last_os_error);
+                        json!({"pid":pid,"parent_pid":host,"command":p.cmd(),
+                            "started_at":p.start_time(),"alive_result":alive,
+                            "alive_errno":error.as_ref().and_then(|e|e.raw_os_error()),
+                            "alive_error":error.map(|e|e.to_string())})
+                    })
                     .collect();
+                let pids: Vec<_> = workers.iter().map(|w| w["pid"].as_u64().unwrap()).collect();
                 if !pids.is_empty() {
                     self.save(
                         "native-worker-alive",
-                        &json!({"host_pid":host,"owned_native_pids":pids}),
+                        &json!({"host_pid":host,"owned_native_pids":pids,"workers":workers}),
                     );
                     assert_eq!(pids.len(), 1);
-                    assert_eq!(unsafe { libc::kill(pids[0] as i32, 0) }, 0);
-                    self.worker_pid = Some(pids[0]);
+                    assert_eq!(workers[0]["alive_result"], 0, "{workers:?}");
+                    self.worker_pid = Some(pids[0].try_into().unwrap());
                 }
             }
             let view = self.inspect(work).await;

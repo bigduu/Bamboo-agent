@@ -28,7 +28,10 @@ the bridge's diagnostic request-role label.
 
 The real Worker reads the baseline and creates a new small Rust code file using
 managed Write, verifies it using Read and completes its own private plan using
-Task. The test verifies the actual owned PID and reap, original/base file bytes,
+Task. The test verifies the actual owned PID and reap, excluding the Host's
+short-lived `--print-capabilities` probes. Saved liveness evidence includes the
+exact execution argv, physical parent, start time and signal-check result/error.
+The test also verifies original/base file bytes,
 managed artifact bytes/hash, successful effect, current Submission and immutable
 Assignment/run/generation/contract identity. An independent local `rustc --test`
 check verifies the fixture code's stated result. The Worker has no shell tool.
