@@ -607,6 +607,7 @@ impl BrokerChildLink {
                     self.observed_terminal_status = Some(oc.status);
                     Some(ChildFrame::Terminal {
                         status: oc.status,
+                        final_event_watermark: oc.final_event_watermark,
                         result: oc.result,
                         error: oc.error,
                         transcript: oc.transcript,
@@ -904,6 +905,17 @@ mod tests {
             (ChildOutcome::error("worker failed"), TerminalStatus::Error),
             (ChildOutcome::cancelled(), TerminalStatus::Cancelled),
         ] {
+            let mut outcome = outcome;
+            let spec: bamboo_subagent::RunSpec = serde_json::from_value(serde_json::json!({
+                "assignment":"read", "activation_run_id":"current", "execution_epoch":7,
+                "logical_session":{"session_id":"logical-child", "parent_session_id":"logical-parent", "root_session_id":"root", "creation":{"created_at":Utc::now(), "spawn_depth":1}}
+            }))
+            .unwrap();
+            outcome.final_event_watermark =
+                bamboo_subagent::ActorEventBatcher::for_run(&spec, None, None)
+                    .with_durable_events(true)
+                    .final_watermark();
+            let expected_watermark = outcome.final_event_watermark.clone();
             let (endpoint, dir) = start_broker().await;
             let mut link = connect_parent(&endpoint).await;
             let run_id = MsgId::new();
@@ -929,10 +941,16 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(matches!(
-                link.next_frame().await.unwrap(),
-                Some(ChildFrame::Terminal { status: received, .. }) if received == status
-            ));
+            let Some(ChildFrame::Terminal {
+                status: received,
+                final_event_watermark,
+                ..
+            }) = link.next_frame().await.unwrap()
+            else {
+                panic!("terminal expected")
+            };
+            assert_eq!(received, status);
+            assert_eq!(final_event_watermark, expected_watermark);
             let mailbox = bamboo_subagent::Mailbox::at(dir.path().join("mailboxes/parent"));
             assert_eq!(mailbox.pending_count().await.unwrap(), 1);
             assert!(link.durable_delivery_receipt().is_none());
