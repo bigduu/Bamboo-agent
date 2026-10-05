@@ -503,11 +503,14 @@ pub(super) fn validate_group(
         return Err(clarify("operations require exact current Human text"));
     }
     // The saved quote must still occur verbatim in the current Human text.
-    // A final Chinese sentence delimiter belongs to that quote, while the
+    // A final existing clause delimiter belongs to that quote, while the
     // existing clause validators compare the sentence content after splitting.
     // Remove only one final delimiter, never another sentence or its context.
     let quote = group.source_quote.trim();
-    let clause = quote.strip_suffix('。').unwrap_or(quote).trim_end();
+    let clause = quote
+        .strip_suffix(|c| matches!(c, '。' | '；' | ';' | '，' | ','))
+        .unwrap_or(quote)
+        .trim_end();
     let mut temporary = BTreeSet::new();
     for op in &group.operations {
         for target in operation_references(op) {
