@@ -106,7 +106,7 @@ fn redact_legacy_mcp(mcp: &mut Map<String, Value>, config: &Config) {
 
             match transport_type {
                 "stdio" => redact_legacy_stdio_transport(transport, &server_id, config),
-                "sse" | "streamable_http" => redact_legacy_sse_transport(transport),
+                "streamable_http" => redact_legacy_http_transport(transport),
                 _ => {}
             }
         }
@@ -145,7 +145,7 @@ fn redact_legacy_stdio_transport(
     transport.insert("env".to_string(), Value::Object(env_obj));
 }
 
-fn redact_legacy_sse_transport(transport: &mut Map<String, Value>) {
+fn redact_legacy_http_transport(transport: &mut Map<String, Value>) {
     if let Some(headers) = transport.get_mut("headers").and_then(|v| v.as_array_mut()) {
         for header in headers.iter_mut() {
             let Some(header_obj) = header.as_object_mut() else {

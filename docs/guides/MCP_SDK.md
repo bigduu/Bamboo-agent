@@ -11,7 +11,7 @@ Bamboo owns configuration, decrypted credentials and proxy policy, permission fi
 - `stdio`: uses the SDK child-process transport, with Bamboo's configured command, arguments, environment and working directory.
 - `streamable_http`: uses the SDK Streamable HTTP transport, with Bamboo's configured HTTP client and headers. SSE response streams within this transport are managed by the SDK.
 
-The retired two-endpoint `sse` transport has no runtime or compatibility adapter. Its configuration variant remains readable solely to preserve existing entries and return actionable migration guidance. It does not start a connection. Do not automatically replace an SSE URL: obtain the server's Streamable HTTP endpoint first.
+The retired two-endpoint `sse` transport and its configuration/API/plugin variants are removed. Explicit `sse` configurations are rejected. URL-only remote configurations now select Streamable HTTP. This is a breaking update: obtain the server's Streamable HTTP endpoint and replace old configurations; Bamboo keeps no SSE migration adapter.
 
 For a remote server, use an explicit transport in the JSON configuration:
 
