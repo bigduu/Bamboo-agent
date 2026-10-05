@@ -6,25 +6,14 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
-use super::workspace_state;
+use super::{search_traversal, workspace_state};
 
 const DEFAULT_HEAD_LIMIT: usize = 200;
 const MAX_RESULT_BYTES: usize = 256 * 1024;
 const MAX_MATCHES: usize = 2_000;
 const MAX_SCANNED_FILES: usize = 50_000;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
-const SKIP_DIRS: [&str; 8] = [
-    ".git",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    ".next",
-    ".cache",
-    "coverage",
-];
 const SEARCH_SCOPE_TOO_BROAD_ERROR: &str =
     "Search scope too broad. Add path/glob/type or reduce pattern.";
 const MULTILINE_REQUIRES_NARROWED_PATH_ERROR: &str = "Multiline grep requires narrowed path.";
@@ -64,6 +53,8 @@ struct GrepArgs {
     head_limit: Option<usize>,
     #[serde(default)]
     multiline: Option<bool>,
+    #[serde(default)]
+    include_ignored: bool,
 }
 
 pub struct GrepTool;
@@ -90,20 +81,17 @@ impl GrepTool {
         ])
     }
 
-    fn collect_files(base: &Path, type_filter: Option<&str>) -> Vec<PathBuf> {
+    fn collect_files(
+        base: &Path,
+        type_filter: Option<&str>,
+        include_ignored: bool,
+    ) -> Vec<PathBuf> {
         let ext_map = Self::extension_map();
         let allowed_ext = type_filter.and_then(|name| ext_map.get(name).copied());
 
         let mut files = Vec::new();
-        for entry in WalkDir::new(base)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| {
-                !entry.file_type().is_dir() || !Self::should_skip_dir(entry.path())
-            })
-            .filter_map(|entry| entry.ok())
-        {
-            if !entry.file_type().is_file() {
+        for entry in search_traversal::walk(base, include_ignored).filter_map(|entry| entry.ok()) {
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                 continue;
             }
             if files.len() >= MAX_SCANNED_FILES {
@@ -125,22 +113,6 @@ impl GrepTool {
         }
 
         files
-    }
-
-    fn should_skip_dir(path: &Path) -> bool {
-        if path.file_name().and_then(|name| name.to_str()) == Some("worktree")
-            && path
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|name| name.to_str())
-                == Some(".bamboo")
-        {
-            return true;
-        }
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| SKIP_DIRS.contains(&name))
-            .unwrap_or(false)
     }
 
     fn compile_glob(glob: Option<&str>) -> Result<Option<GlobSet>, ToolError> {
@@ -259,6 +231,11 @@ impl GrepTool {
         multiline: bool,
         cwd: &Path,
     ) -> Result<(), ToolError> {
+        if args.include_ignored && args.path.is_none() {
+            return Err(ToolError::InvalidArguments(
+                "include_ignored requires an explicit path.".to_string(),
+            ));
+        }
         if matches!(output_mode, OutputMode::Content)
             && args.path.is_none()
             && args.glob.is_none()
@@ -307,7 +284,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search file contents using ripgrep-style regex parameters. Start with files_with_matches or a narrowed path/glob/type before using content or multiline mode."
+        "Search file contents using ripgrep-style regex parameters. Directory searches respect repository .gitignore rules, including parent rules up to the Git root; non-repository searches do not apply ignore rules. Hidden files remain visible; global Git ignores, .ignore and .git/info/exclude are not applied. Start with files_with_matches or a narrowed path/glob/type before using content or multiline mode."
     }
 
     fn classify(&self, _args: &serde_json::Value) -> ToolClass {
@@ -319,7 +296,7 @@ impl Tool for GrepTool {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Regex pattern" },
-                "path": { "type": "string", "description": "File or directory to search. Narrow this for expensive or multiline searches." },
+                "path": { "type": "string", "description": "File or directory to search. An explicit file bypasses ignore rules. Narrow this for expensive or multiline searches." },
                 "glob": { "type": "string", "description": "Glob file filter used to limit candidate files" },
                 "output_mode": {
                     "type": "string",
@@ -333,7 +310,8 @@ impl Tool for GrepTool {
                 "-i": { "type": "boolean", "description": "Case insensitive" },
                 "type": { "type": "string", "description": "File type filter (for example rust, js, ts, py)" },
                 "head_limit": { "type": "number", "description": "Limit output entries. Keep this small for broad queries." },
-                "multiline": { "type": "boolean", "description": "Enable multiline regex. Requires a narrowed path." }
+                "multiline": { "type": "boolean", "description": "Enable multiline regex. Requires a narrowed path." },
+                "include_ignored": { "type": "boolean", "default": false, "description": "Include gitignored files. Requires an explicit path; scan/result limits and fixed directory exclusions still apply." }
             },
             "required": ["pattern"],
             "additionalProperties": false
@@ -368,7 +346,7 @@ impl Tool for GrepTool {
         let files = if root.is_file() {
             vec![root.clone()]
         } else if root.is_dir() {
-            Self::collect_files(&root, parsed.r#type.as_deref())
+            Self::collect_files(&root, parsed.r#type.as_deref(), parsed.include_ignored)
         } else {
             return Err(ToolError::Execution(format!(
                 "Path does not exist: {}",
@@ -751,5 +729,44 @@ mod tests {
 
         assert!(matches!(error, ToolError::Execution(_)));
         assert!(error.to_string().contains(RESULT_TOO_LARGE_ERROR));
+    }
+
+    #[tokio::test]
+    async fn grep_ignored_file_opt_out_keeps_type_glob_and_file_size_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        tokio::fs::write(dir.path().join(".gitignore"), "*\n")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("small.rs"), "needle\n")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("other.rs"), "needle\n")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("small.txt"), "needle\n")
+            .await
+            .unwrap();
+        let mut oversized = vec![b'x'; MAX_FILE_BYTES as usize + 1];
+        oversized[..6].copy_from_slice(b"needle");
+        tokio::fs::write(dir.path().join("large.rs"), oversized)
+            .await
+            .unwrap();
+
+        let result = run(
+            &GrepTool::new(),
+            json!({
+                "pattern": "needle",
+                "path": dir.path(),
+                "include_ignored": true,
+                "type": "rust",
+                "glob": "**/{small,large}.rs"
+            }),
+        )
+        .await
+        .unwrap();
+        let lines = result_lines(&result);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("small.rs"));
     }
 }
