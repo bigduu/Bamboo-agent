@@ -65,6 +65,8 @@ pub struct SessionExecutionReservation {
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     activation: SessionExecutionActivationOwnership,
     root_actor: Option<Box<RootActorExecution>>,
+    execution_persistence: Option<Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+    persistence_bound: bool,
     armed: bool,
 }
 
@@ -103,13 +105,43 @@ impl SessionExecutionReservation {
                 self.root_actor = Some(Box::new(RootActorExecution::start(binding)));
             }
         }
+        self.bind_execution_persistence(agent, session)
+    }
+
+    fn bind_execution_persistence(
+        &mut self,
+        agent: &Agent,
+        session: &Session,
+    ) -> std::io::Result<()> {
+        if self.session_id != session.id {
+            return Err(std::io::Error::other(
+                "execution persistence target mismatch",
+            ));
+        }
+        if self.persistence_bound {
+            return Ok(());
+        }
+        let persistence = self
+            .root_actor
+            .as_ref()
+            .map_or_else(|| agent.persistence().clone(), |owner| owner.persistence());
+        if let Some(inherited) = persistence
+            .inherited_child_wait()
+            .or_else(|| bamboo_domain::InheritedChildWait::capture(session))
+        {
+            inherited.validate_session(session)?;
+            self.execution_persistence = Some(persistence.bind_inherited_child_wait(inherited)?);
+        } else if self.root_actor.is_some() {
+            self.execution_persistence = Some(persistence);
+        }
+        self.persistence_bound = true;
         Ok(())
     }
 
     pub fn execution_persistence(
         &self,
     ) -> Option<Arc<dyn bamboo_domain::RuntimeSessionPersistence>> {
-        self.root_actor.as_ref().map(|owner| owner.persistence())
+        self.execution_persistence.clone()
     }
 
     pub fn root_actor_writer(&self) -> Option<bamboo_domain::RootActorRuntimeWrite> {
@@ -161,6 +193,8 @@ impl SessionExecutionReservation {
             runners,
             activation: SessionExecutionActivationOwnership::UnpublishedActivation(router),
             root_actor: None,
+            execution_persistence: None,
+            persistence_bound: false,
             armed: true,
         }
     }
@@ -185,6 +219,8 @@ impl SessionExecutionReservation {
             runners,
             activation,
             root_actor: None,
+            execution_persistence: None,
+            persistence_bound: false,
             armed: true,
         }
     }
@@ -477,6 +513,8 @@ pub async fn reserve_session_execution(
         runners: runners.clone(),
         activation: SessionExecutionActivationOwnership::Unrouted,
         root_actor: None,
+        execution_persistence: None,
+        persistence_bound: false,
         armed: true,
     };
 
@@ -835,11 +873,23 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 execution_reservation.abandon().await;
                 return;
             }
+            // Bind before disarming: every pre-spawn and runtime checkpoint
+            // uses one private view, and binding failure abandons this runner.
+            if let Err(error) = execution_reservation.bind_execution_persistence(&agent, &session) {
+                let _ = mpsc_tx
+                    .send(AgentEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                execution_reservation.abandon().await;
+                return;
+            }
             let mut root_actor = execution_reservation.root_actor.take().map(|owner| *owner);
             let root_actor_bound = root_actor.is_some();
-            let agent = root_actor.as_ref().map_or(agent.clone(), |owner| {
-                Arc::new(agent.with_execution_persistence(owner.persistence()))
-            });
+            let persistence = execution_reservation
+                .execution_persistence()
+                .unwrap_or_else(|| agent.persistence().clone());
+            let agent = Arc::new(agent.with_execution_persistence(persistence));
             let activation_run_id = execution_reservation.run_id().to_string();
             let prior_message_ids = session.messages.iter().map(|m| m.id.clone()).collect();
             let (cancel_token, mut activation_registration) =
@@ -886,11 +936,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // A carried untagged wait has already been persisted. Unlike a
             // newly armed safety-net wait, it must not resurrect a completed
             // child wait. Tagged tool waits are reconciled by the final writer.
-            let inherited_child_wait = session
-                .agent_runtime_state
-                .as_ref()
-                .and_then(|runtime| runtime.waiting_for_children.clone())
-                .filter(|wait| wait.registered_by_tool_call_id.is_none());
+            let inherited_child_wait = agent.persistence().inherited_child_wait();
             let execute_request = build_execute_request(
                 initial_message,
                 mpsc_tx.clone(),
@@ -1084,7 +1130,9 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             let saved = save_finalized_runtime_with_inherited_child_wait(
                 agent.persistence().as_ref(),
                 &mut session,
-                inherited_child_wait.as_ref(),
+                inherited_child_wait
+                    .as_ref()
+                    .map(|inherited| inherited.wait()),
             )
             .await;
             let history_committed = saved.is_ok();
@@ -1684,6 +1732,8 @@ mod reservation_tests {
             runners: runners.clone(),
             activation: SessionExecutionActivationOwnership::Unrouted,
             root_actor: None,
+            execution_persistence: None,
+            persistence_bound: false,
             armed: true,
         };
 
@@ -1715,6 +1765,8 @@ mod reservation_tests {
             runners: runners.clone(),
             activation: SessionExecutionActivationOwnership::RegistrationPending(router.clone()),
             root_actor: None,
+            execution_persistence: None,
+            persistence_bound: false,
             armed: true,
         };
 

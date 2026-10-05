@@ -122,6 +122,29 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Reconcile only the execution's exact inherited wait at the final
+    /// physical writer lock, preserving live run status and unrelated fields.
+    /// Root input saves retain the same owner, transcript and ACK protocol.
+    async fn save_runtime_with_inherited_child_wait(
+        &self,
+        session: &mut Session,
+        inherited: &crate::InheritedChildWait,
+        runtime_only: bool,
+        root_writer: Option<(RootActorRuntimeWrite, RootActorRuntimePublisher)>,
+        input: Option<(
+            std::sync::Arc<dyn crate::SessionInboxPort>,
+            crate::SessionInboxOwnedClaim,
+        )>,
+    ) -> std::io::Result<()> {
+        let _ = (session, inherited, runtime_only, root_writer, input);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            crate::SessionAuthorityConflict(
+                "atomic inherited child wait runtime persistence is unsupported".into(),
+            ),
+        ))
+    }
+
     /// Durable Root-mode CAS and terminal recovery at the storage writer lock.
     /// A backend without this authority protocol fails closed.
     async fn root_mode_operation(
