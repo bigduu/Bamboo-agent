@@ -1009,7 +1009,6 @@ dependencies = [
  "russh",
  "russh-sftp",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1059,7 +1058,6 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "dirs",
- "fs2",
  "futures",
  "hex",
  "libc",
@@ -1088,7 +1086,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "serde_yaml",
+ "serde_yaml_ng",
  "sha2 0.10.9",
  "thiserror 2.0.20",
  "tracing",
@@ -1489,10 +1487,9 @@ dependencies = [
  "rmp-serde",
  "rustix 1.1.4",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
- "serde_yaml",
+ "serde_yaml_ng",
  "sha2 0.11.0",
  "socket2",
  "tar",
@@ -1607,7 +1604,6 @@ dependencies = [
  "chrono",
  "futures-util",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -6326,15 +6322,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
 name = "rustls-pki-types"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6600,6 +6587,19 @@ name = "serde_yaml"
 version = "0.9.34+deprecated"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
 dependencies = [
  "indexmap",
  "itoa",
