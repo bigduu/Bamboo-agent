@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use bamboo_mcp::{
-    HeaderConfig, McpServerConfig, ReconnectConfig, SseConfig, StdioConfig, TransportConfig,
+    HeaderConfig, McpServerConfig, ReconnectConfig, StdioConfig, StreamableHttpConfig,
+    TransportConfig,
 };
 
 use super::{MainstreamServerRequest, TransportConfigApi};
@@ -22,6 +23,7 @@ fn into_internal_builds_stdio_server_with_defaults() {
         url: None,
         headers: Vec::new(),
         connect_timeout_ms: None,
+        transport_kind: None,
         request_timeout_ms: None,
         healthcheck_interval_ms: None,
         reconnect: None,
@@ -61,9 +63,10 @@ fn into_internal_rejects_conflicting_transport_fields() {
         env: HashMap::new(),
         env_encrypted: HashMap::new(),
         startup_timeout_ms: None,
-        url: Some("http://localhost:3000/sse".to_string()),
+        url: Some("http://localhost:3000/mcp".to_string()),
         headers: Vec::new(),
         connect_timeout_ms: None,
+        transport_kind: None,
         request_timeout_ms: None,
         healthcheck_interval_ms: None,
         reconnect: None,
@@ -110,13 +113,13 @@ fn to_api_config_masks_stdio_env_values() {
 }
 
 #[test]
-fn to_api_config_masks_sse_header_values() {
+fn to_api_config_masks_http_header_values() {
     let config = McpServerConfig {
-        id: "sse-server".to_string(),
+        id: "http-server".to_string(),
         name: None,
         enabled: true,
-        transport: TransportConfig::Sse(SseConfig {
-            url: "http://localhost:3000/sse".to_string(),
+        transport: TransportConfig::StreamableHttp(StreamableHttpConfig {
+            url: "http://localhost:3000/mcp".to_string(),
             headers: vec![HeaderConfig {
                 name: "Authorization".to_string(),
                 value: "Bearer abc".to_string(),
@@ -134,11 +137,35 @@ fn to_api_config_masks_sse_header_values() {
 
     let api_config = super::to_api_config(&config);
     match api_config.transport {
-        TransportConfigApi::Sse { headers, .. } => {
+        TransportConfigApi::StreamableHttp { headers, .. } => {
             assert_eq!(headers.len(), 1);
             assert_eq!(headers[0].name, "Authorization");
             assert_eq!(headers[0].value, "****...****");
         }
-        _ => panic!("expected sse transport"),
+        _ => panic!("expected Streamable HTTP transport"),
     }
+}
+
+#[test]
+fn mainstream_url_defaults_to_canonical_streamable_http() {
+    let request: MainstreamServerRequest = serde_json::from_value(
+        serde_json::json!({"id": "remote", "url": "https://example.test/mcp"}),
+    )
+    .unwrap();
+    let config = request.into_internal(None).unwrap();
+    let api = serde_json::to_value(super::to_api_config(&config)).unwrap();
+    assert_eq!(api["transport"]["type"], "streamable_http");
+    assert_eq!(api["transport"]["url"], "https://example.test/mcp");
+}
+
+#[test]
+fn api_rejects_retired_sse_without_mainstream_fallback() {
+    for body in [
+        serde_json::json!({"id": "remote", "transport": {"type": "sse", "url": "https://example.test/sse"}}),
+        serde_json::json!({"id": "remote", "transport": {"type": "sse", "url": "https://example.test/sse"}, "url": "https://example.test/mcp"}),
+    ] {
+        assert!(serde_json::from_value::<super::ServerRequest>(body).is_err());
+    }
+    let request: MainstreamServerRequest = serde_json::from_value(serde_json::json!({"id": "remote", "url": "https://example.test/sse", "transport_kind": "sse"})).unwrap();
+    assert!(request.into_internal(None).is_err());
 }

@@ -49,7 +49,7 @@
 //!   doc) to keep the contract to exactly two tokens.
 //!
 //! Tokens are substituted in `command`, each element of `args`, `cwd`, and each
-//! value in `env` (not env *keys*, and not in `url` for sse/streamable_http —
+//! value in `env` (not env *keys*, and not in `url` for streamable_http —
 //! remote endpoints have no plugin-local path to inject).
 
 use std::collections::{BTreeMap, HashMap};
@@ -136,7 +136,7 @@ fn default_true() -> bool {
 }
 
 /// Transport variants a manifest can declare. Mirrors
-/// [`bamboo_domain::mcp_config::TransportConfig`]'s three transports, minus
+/// [`bamboo_domain::mcp_config::TransportConfig`]'s two transports, minus
 /// the fields the installer fills in with sensible defaults at registration
 /// time (timeouts, reconnect policy) — a manifest author shouldn't need to
 /// know Bamboo's default timeout values.
@@ -154,11 +154,6 @@ pub enum McpTransportManifest {
         /// Values (not keys) may contain `${plugin_dir}` / `${platform_bin}`.
         #[serde(default)]
         env: HashMap<String, String>,
-    },
-    Sse {
-        url: String,
-        #[serde(default)]
-        headers: Vec<bamboo_domain::mcp_config::HeaderConfig>,
     },
     #[serde(rename = "streamable_http")]
     StreamableHttp {
@@ -184,7 +179,7 @@ impl McpServerManifestEntry {
     ) -> PluginResult<bamboo_domain::mcp_config::McpServerConfig> {
         use bamboo_domain::mcp_config::{
             default_connect_timeout, default_healthcheck_interval, default_request_timeout,
-            default_startup_timeout, McpServerConfig, ReconnectConfig, SseConfig, StdioConfig,
+            default_startup_timeout, McpServerConfig, ReconnectConfig, StdioConfig,
             StreamableHttpConfig, TransportConfig,
         };
 
@@ -224,11 +219,6 @@ impl McpServerManifestEntry {
                     startup_timeout_ms: default_startup_timeout(),
                 })
             }
-            McpTransportManifest::Sse { url, headers } => TransportConfig::Sse(SseConfig {
-                url: url.clone(),
-                headers: headers.clone(),
-                connect_timeout_ms: default_connect_timeout(),
-            }),
             McpTransportManifest::StreamableHttp { url, headers } => {
                 TransportConfig::StreamableHttp(StreamableHttpConfig {
                     url: url.clone(),
@@ -1443,6 +1433,14 @@ impl PluginManifest {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retired_sse_manifest_is_rejected() {
+        assert!(serde_json::from_value::<super::McpTransportManifest>(
+            serde_json::json!({"type": "sse", "url": "https://example.test/sse"})
+        )
+        .is_err());
+    }
+
     use super::*;
 
     fn minimal_manifest_json() -> &'static str {

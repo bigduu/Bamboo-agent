@@ -1148,13 +1148,6 @@ impl CredentialStore {
                         }
                     }
                 }
-                bamboo_domain::mcp_config::TransportConfig::Sse(http) => {
-                    collect_mcp_header_secrets(
-                        http.headers.as_slice(),
-                        intents,
-                        &mut secrets_by_ref,
-                    )?
-                }
                 bamboo_domain::mcp_config::TransportConfig::StreamableHttp(http) => {
                     collect_mcp_header_secrets(
                         http.headers.as_slice(),
@@ -1223,9 +1216,6 @@ impl CredentialStore {
                     for name in stdio.env_credential_refs.keys() {
                         stdio.env.remove(name);
                     }
-                }
-                bamboo_domain::mcp_config::TransportConfig::Sse(http) => {
-                    clear_mcp_header_plaintext(&mut http.headers)
                 }
                 bamboo_domain::mcp_config::TransportConfig::StreamableHttp(http) => {
                     clear_mcp_header_plaintext(&mut http.headers)
@@ -3063,15 +3053,6 @@ pub(crate) fn config_credential_ref_counts(
         match &server.transport {
             bamboo_domain::mcp_config::TransportConfig::Stdio(stdio) => {
                 for raw_reference in stdio.env_credential_refs.values() {
-                    add(&CredentialRef::parse(raw_reference.clone())?);
-                }
-            }
-            bamboo_domain::mcp_config::TransportConfig::Sse(config) => {
-                for raw_reference in config
-                    .headers
-                    .iter()
-                    .filter_map(|header| header.credential_ref.as_ref())
-                {
                     add(&CredentialRef::parse(raw_reference.clone())?);
                 }
             }

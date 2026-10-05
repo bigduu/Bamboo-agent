@@ -21,12 +21,7 @@ pub enum TransportConfigApi {
         env: HashMap<String, String>,
         startup_timeout_ms: u64,
     },
-    Sse {
-        url: String,
-        #[serde(default)]
-        headers: Vec<HeaderConfigApi>,
-        connect_timeout_ms: u64,
-    },
+    #[serde(rename = "streamable_http")]
     StreamableHttp {
         url: String,
         #[serde(default)]
