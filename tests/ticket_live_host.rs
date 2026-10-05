@@ -391,13 +391,68 @@ fn assess(case: &str, before: &BeforeView, after: &Snapshot, id: &str) -> Value 
         "real-model semantic mismatch ({case}); canonical proposal: {}",
         json!(proposal)
     );
-    assert!(
-        resolution.groups.iter().all(|g| matches!(
-            g.status,
-            ResolutionStatus::Committed | ResolutionStatus::NeedsClarification
-        )),
-        "nonterminal or rejected semantic group"
-    );
+    assert_eq!(resolution.groups.len(), proposal.groups.len());
+    for (planned, settled) in proposal.groups.iter().zip(&resolution.groups) {
+        if planned.operations.is_empty() {
+            assert_eq!(settled.status, ResolutionStatus::NeedsClarification);
+        } else {
+            assert_eq!(
+                settled.status,
+                ResolutionStatus::Committed,
+                "correct proposal must actually commit ({case}): {:?}",
+                settled.reason
+            );
+            assert_eq!(
+                settled.receipt.as_ref(),
+                after.receipts.get(&settled.operation_id),
+                "operation receipt must be canonical"
+            );
+            assert!(settled.receipt.is_some());
+        }
+    }
+    for op in &ops {
+        match op {
+            SemanticOperation::Answer { target, answer } => {
+                let current = &after.requests[&target.request_id];
+                assert_eq!(current.status, RequestStatus::Answered);
+                assert_eq!(current.answer.as_deref(), Some(answer.as_str()));
+            }
+            SemanticOperation::DecideApproval {
+                target, approve, ..
+            } => {
+                assert_eq!(
+                    after.requests[&target.request_id].status,
+                    if *approve {
+                        RequestStatus::Approved
+                    } else {
+                        RequestStatus::Denied
+                    }
+                );
+            }
+            SemanticOperation::Steer {
+                target: TicketReference::Existing { id, .. },
+                contract,
+            } => assert_eq!(&after.tickets[id].contract, contract),
+            SemanticOperation::Cancel {
+                target: TicketReference::Existing { id, .. },
+            } => assert_eq!(after.tickets[id].state, WorkState::Cancelled),
+            _ => {}
+        }
+    }
+    let created: Vec<_> = after
+        .tickets
+        .values()
+        .filter(|work| !before.tickets.contains_key(&work.id))
+        .collect();
+    if case == "multi_intent" {
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].kind, TicketKind::Work);
+        assert_eq!(created[0].state, WorkState::Draft);
+        assert_eq!(created[0].contract.title, "报告C");
+    } else {
+        assert!(created.is_empty(), "unexpected created Ticket ({case})");
+    }
+    assert_eq!(after.tickets.len(), before.tickets.len() + created.len());
     assert!(
         after.assignments.is_empty() && after.intents.is_empty() && after.submissions.is_empty(),
         "live fixture must not dispatch or execute external actions"

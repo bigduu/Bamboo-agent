@@ -65,13 +65,21 @@ cargo test --locked -p bamboo-agent --test ticket_live_host \
 Do not rerun failures until a source change or a specific external failure
 justifies it; retain the original attempt and keep result provenance separate.
 
-## Current checkpoint
+## Acceptance status and evidence boundary
 
-Implementation and compilation are in progress. No live Host pass, semantic
-quality, current-head review, CI completion or default enablement is claimed.
-Any production finding is classified and split before adding lifecycle,
-persistence or dispatch repairs to this test-only slice. Real-model samples
-are bounded observations, not statistical correctness or exactly-once effects.
+An initial twelve-case run at `ffa0c9c7d60f719f07a1b75f8429ffcc26367a6f`
+made 36 real `gpt-6-sol` Responses requests and observed zero wrong approvals.
+Its old 12/12 fixture result did **not** establish complete acceptance: assertions
+allowed `needs_clarification` for nonempty correct proposals. Final canonical
+state review found answerE, approveA and denyB remained Open; only 9/12 settled
+as intended. That original run and its Host logs remain preserved. The fixture
+now requires actual committed groups, canonical receipts and final request/Work
+states, including report C as one draft Work. Production Human-evidence handling
+is tracked separately in [#1527](https://github.com/bigduu/Bamboo-agent/issues/1527).
+The latest validated source, gates and results are recorded in the linked PR
+[#1525](https://github.com/bigduu/Bamboo-agent/pull/1525); this checkpoint does not
+claim CI/review completion, default enablement, statistical correctness or
+external exactly-once effects.
 
 The first live chatter attempt did persist the correct zero-operation resolution
 through three successful real `gpt-6-sol` Responses requests. Its overall test
