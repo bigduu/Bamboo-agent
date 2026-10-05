@@ -2,7 +2,8 @@
 
 This is the bounded P9 acceptance child [#1538](https://github.com/bigduu/Bamboo-agent/issues/1538)
 of Supervisor tracker #1481, exercising the existing P5 Runtime path. Its base
-is the ordinary #1525 merge `2a0b502d85413a08bd66161f6eee86e157691442`.
+includes the ordinary #1525 merge and the independently owned #1541 merge
+`7bb43c3ea8ac8027a5153e85a99580c929abe751`.
 The earlier twelve Human-resolution cases kept dispatch OFF; this case adds one
 real configured-model native Worker in an owned temporary fixture.
 
@@ -37,7 +38,7 @@ Submission. A new current Human explicitly accepts the exact Work/Submission
 after artifact verification, and the real Supervisor commits accepted. The
 first attempt, proposals, transcripts, receipts, canonical stopped snapshots,
 Host log and bounded failure data are preserved before assertions. There is no
-silent model retry or synthetic response fallback.
+fixture-level retry of a Human turn or synthetic response fallback.
 
 Restart replays the exact ingress, coding-grant and dispatch requests. They must
 retain ingress sequence, receipt, logical run, Work, Assignment, Submission and
@@ -78,6 +79,14 @@ checkpoint at 360 seconds and upstream requests at 120 seconds. Existing tests
 and product deadlines are unchanged.
 
 ## Delivery boundary
+
+All upstream attempts are retained individually. The fixture does not retry a
+Human turn or synthesize provider output. Existing production provider retries
+may recover transient transport/5xx errors: each exact path/payload hash must
+finish with HTTP 200 using the selected model within four attempts. Permanent
+errors, unfinished requests, changed payloads and duplicate success fail this
+check. Successful native IO, current Human completion, canonical acceptance and
+restart replay remain separate required assertions.
 
 Current-head live acceptance and protected CI/review gates remain pending until
 their saved receipts establish success. Exhausted GitHub Codex review was waived

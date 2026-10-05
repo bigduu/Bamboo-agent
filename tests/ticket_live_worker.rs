@@ -18,6 +18,88 @@ const TITLE: &str = "单工单代码交付";
 const CODE: &str = "pub fn answer() -> u8 { 42 }\n";
 const ORIGINAL: &str = "pub fn answer() -> u8 { 0 }\n";
 
+// Classify every actual attempt without retrying at the fixture layer. The
+// production provider already permits at most four bounded transport attempts.
+fn upstream_runs_finished(requests: &[Value], model: &str) -> bool {
+    let mut runs = std::collections::BTreeMap::<(String, String), Vec<&Value>>::new();
+    for request in requests {
+        let path = request["path"].as_str().unwrap_or_default();
+        if request["model"].is_null() {
+            if path != "/v1/models" || request["status"] != 200 {
+                return false;
+            }
+            continue;
+        }
+        let Some(hash) = request["request_sha256"].as_str() else {
+            return false;
+        };
+        if request["model"] != model
+            || !matches!(path, "/v1/responses" | "/v1/chat/completions")
+            || hash.len() != 64
+            || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return false;
+        }
+        runs.entry((path.to_owned(), hash.to_owned()))
+            .or_default()
+            .push(request);
+    }
+    !runs.is_empty()
+        && runs.values().all(|attempts| {
+            attempts.len() <= 4
+                && attempts.last().unwrap()["status"] == 200
+                && attempts[..attempts.len() - 1].iter().all(|r| {
+                    r["status"]
+                        .as_u64()
+                        .is_some_and(|s| (500..600).contains(&s))
+                        || (r["status"].is_null() && r["error"] == "upstream transport failure")
+                })
+        })
+}
+
+#[test]
+fn upstream_completion_requires_bounded_recovery_and_exact_model() {
+    let attempt = |status: u16| {
+        json!({"path":"/v1/responses","model":"selected",
+        "request_sha256":"a".repeat(64),"status":status})
+    };
+    assert!(upstream_runs_finished(&[attempt(200)], "selected"));
+    assert!(upstream_runs_finished(
+        &[attempt(500), attempt(500), attempt(200)],
+        "selected"
+    ));
+    for statuses in [
+        vec![500],
+        vec![401, 200],
+        vec![200, 200],
+        vec![500, 500, 500, 500, 200],
+    ] {
+        assert!(!upstream_runs_finished(
+            &statuses.into_iter().map(attempt).collect::<Vec<_>>(),
+            "selected"
+        ));
+    }
+    assert!(!upstream_runs_finished(&[attempt(200)], "other"));
+    let mut foreign = attempt(500);
+    foreign["request_sha256"] = json!("b".repeat(64));
+    assert!(!upstream_runs_finished(
+        &[foreign, attempt(200)],
+        "selected"
+    ));
+    let mut transport = attempt(500);
+    transport["status"] = Value::Null;
+    transport["error"] = json!("upstream transport failure");
+    assert!(upstream_runs_finished(
+        &[transport.clone(), attempt(200)],
+        "selected"
+    ));
+    transport["error"] = json!("unknown failure");
+    assert!(!upstream_runs_finished(
+        &[transport, attempt(200)],
+        "selected"
+    ));
+}
+
 #[actix_web::test]
 async fn native_bridge_requires_explicit_bounded_worker_catalog() {
     use actix_web::{web, App, HttpResponse, HttpServer};
@@ -834,10 +916,8 @@ async fn real_model_single_work_code_delivery_acceptance_and_restart() {
     let requests = f.bridge.requests();
     assert!(requests.iter().any(|r| r["role"] == "native_worker"));
     assert!(requests.iter().any(|r| r["role"] == "supervisor"));
-    assert!(requests
-        .iter()
-        .filter(|r| !r["model"].is_null())
-        .all(|r| r["model"] == f.bridge.model && r["status"] == 200));
+    assert!(upstream_runs_finished(&requests, &f.bridge.model),
+        "each exact selected-model payload must finish successfully within the existing bounded retries; attempts are retained");
     let metadata = std::fs::metadata(&file).unwrap();
     f.restart().await;
     let create_replay = post(&f.client, &f.base, "/chat", &create_request).await;
@@ -881,7 +961,8 @@ async fn real_model_single_work_code_delivery_acceptance_and_restart() {
     );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), CODE);
     f.save("summary",&json!({"pass":true,"work_id":work,"submission_id":submission,"runtime":s["runtime"],
-        "model":f.bridge.model,"requests":requests,"code_sha256":hash,"native_pid":pid,"native_pid_reaped":true,
+        "model":f.bridge.model,"transient_attempts":requests.iter().filter(|r| !r["model"].is_null() && r["status"] != 200).count(),
+        "requests":requests,"code_sha256":hash,"native_pid":pid,"native_pid_reaped":true,
         "explicit_user_coding_authority":true,"submitted_before_explicit_acceptance":true,"restart_exact_replay":true,
         "retained_owned_fixture":f.temp,"production_defaults_changed":false}));
     f.bridge.finish().await;
