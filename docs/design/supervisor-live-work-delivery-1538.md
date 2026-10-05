@@ -42,7 +42,11 @@ fixture-level retry of a Human turn or synthetic response fallback.
 
 Restart replays the exact ingress, coding-grant and dispatch requests. They must
 retain ingress sequence, receipt, logical run, Work, Assignment, Submission and
-semantic resolutions without another provider request or file rewrite. The
+semantic resolutions without another model execution request or file rewrite. A
+browser reload may read the model catalog: only successful, empty-body
+`/v1/models` metadata reads are distinguished from model execution. All requests
+are retained, and every Supervisor/Worker execution attempt must remain exactly
+unchanged across replay. Malformed/failed catalog reads fail validation. The
 owned temporary data/worktree remains available for evidence. One sample does
 not establish statistical correctness, arbitrary external exactly-once effects,
 production enablement, or the five-Work matrix.

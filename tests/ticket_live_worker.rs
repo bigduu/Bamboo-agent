@@ -18,6 +18,15 @@ const TITLE: &str = "单工单代码交付";
 const CODE: &str = "pub fn answer() -> u8 { 42 }\n";
 const ORIGINAL: &str = "pub fn answer() -> u8 { 0 }\n";
 
+fn model_catalog_read(request: &Value) -> bool {
+    request["role"] == "models"
+        && request["path"] == "/v1/models"
+        && request["model"].is_null()
+        && request["status"] == 200
+        && request["request_bytes"] == 0
+        && request["request_sha256"] == content_hash(b"")
+}
+
 // Classify every actual attempt without retrying at the fixture layer. The
 // production provider already permits at most four bounded transport attempts.
 fn upstream_runs_finished(requests: &[Value], model: &str) -> bool {
@@ -25,7 +34,7 @@ fn upstream_runs_finished(requests: &[Value], model: &str) -> bool {
     for request in requests {
         let path = request["path"].as_str().unwrap_or_default();
         if request["model"].is_null() {
-            if path != "/v1/models" || request["status"] != 200 {
+            if !model_catalog_read(request) {
                 return false;
             }
             continue;
@@ -55,6 +64,56 @@ fn upstream_runs_finished(requests: &[Value], model: &str) -> bool {
                         || (r["status"].is_null() && r["error"] == "upstream transport failure")
                 })
         })
+}
+
+fn replay_keeps_model_execution(before: &[Value], after: &[Value], model: &str) -> bool {
+    upstream_runs_finished(before, model)
+        && upstream_runs_finished(after, model)
+        && before
+            .iter()
+            .filter(|r| !model_catalog_read(r))
+            .eq(after.iter().filter(|r| !model_catalog_read(r)))
+}
+
+#[test]
+fn replay_allows_only_valid_catalog_reads_without_another_execution() {
+    let execution = |hash: char, path: &str| {
+        json!({"role":"supervisor","path":path,"model":"selected",
+            "request_sha256":hash.to_string().repeat(64),"request_bytes":100,"status":200})
+    };
+    let catalog = json!({"role":"models","path":"/v1/models","model":null,
+        "request_sha256":content_hash(b""),"request_bytes":0,"status":200});
+    let before = vec![execution('a', "/v1/responses"), catalog.clone()];
+    let mut refreshed = before.clone();
+    refreshed.push(catalog.clone());
+    assert_ne!(before, refreshed, "a browser refresh adds a catalog read");
+    assert!(replay_keeps_model_execution(
+        &before, &refreshed, "selected"
+    ));
+    for extra in [
+        execution('b', "/v1/responses"),
+        execution('b', "/v1/chat/completions"),
+        execution('a', "/v1/responses"),
+    ] {
+        let mut changed = refreshed.clone();
+        changed.push(extra);
+        assert!(!replay_keeps_model_execution(&before, &changed, "selected"));
+    }
+    assert!(!replay_keeps_model_execution(&before, &[], "selected"));
+    for (field, value) in [
+        ("role", json!("supervisor")),
+        ("path", json!("/v1/responses")),
+        ("model", json!("selected")),
+        ("status", json!(500)),
+        ("request_bytes", json!(1)),
+        ("request_sha256", json!("b".repeat(64))),
+    ] {
+        let mut invalid = catalog.clone();
+        invalid[field] = value;
+        let mut changed = before.clone();
+        changed.push(invalid);
+        assert!(!replay_keeps_model_execution(&before, &changed, "selected"));
+    }
 }
 
 #[test]
@@ -914,6 +973,7 @@ async fn real_model_single_work_code_delivery_acceptance_and_restart() {
             .all(|g| g["status"] == "committed"));
     }
     let requests = f.bridge.requests();
+    f.save("requests-before-restart", &json!(requests));
     assert!(requests.iter().any(|r| r["role"] == "native_worker"));
     assert!(requests.iter().any(|r| r["role"] == "supervisor"));
     assert!(upstream_runs_finished(&requests, &f.bridge.model),
@@ -949,11 +1009,9 @@ async fn real_model_single_work_code_delivery_acceptance_and_restart() {
     assert_eq!(json!(after.assignments), json!(before.assignments));
     assert_eq!(json!(after.submissions), json!(before.submissions));
     assert_eq!(json!(after.resolutions), json!(before.resolutions));
-    assert_eq!(
-        f.bridge.requests(),
-        requests,
-        "replay must not execute another model/Worker"
-    );
+    let replay_requests = f.bridge.requests();
+    assert!(replay_keeps_model_execution(&requests, &replay_requests, &f.bridge.model),
+        "replay must retain every model/Worker execution attempt; only validated catalog reads may be added");
     assert_eq!(std::fs::metadata(&file).unwrap().ino(), metadata.ino());
     assert_eq!(
         std::fs::metadata(&file).unwrap().mtime_nsec(),
@@ -962,7 +1020,7 @@ async fn real_model_single_work_code_delivery_acceptance_and_restart() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), CODE);
     f.save("summary",&json!({"pass":true,"work_id":work,"submission_id":submission,"runtime":s["runtime"],
         "model":f.bridge.model,"transient_attempts":requests.iter().filter(|r| !r["model"].is_null() && r["status"] != 200).count(),
-        "requests":requests,"code_sha256":hash,"native_pid":pid,"native_pid_reaped":true,
+        "requests":requests,"replay_requests":replay_requests,"code_sha256":hash,"native_pid":pid,"native_pid_reaped":true,
         "explicit_user_coding_authority":true,"submitted_before_explicit_acceptance":true,"restart_exact_replay":true,
         "retained_owned_fixture":f.temp,"production_defaults_changed":false}));
     f.bridge.finish().await;
