@@ -453,7 +453,8 @@ async fn inspect_child_report_action_inner(
     arguments: &Value,
 ) -> Result<Value, ChildSessionError> {
     use super::result_projection::{
-        decode_report, lowercase_sha256, unavailable_child_result as unavailable,
+        child_result_identity, decode_report, lowercase_sha256, plain_child_report_message,
+        project_child_report, unavailable_child_result as unavailable,
     };
     use crate::project_context::{ProjectContextResolver, SessionProjectIdentity};
     use bamboo_domain::ChildContextBinding;
@@ -540,17 +541,7 @@ async fn inspect_child_report_action_inner(
         return Ok(unavailable(view, "report_absent"));
     };
     if child.last_run_status().as_deref() != Some("completed")
-        || message.phase == Some(MessagePhase::Commentary)
-        || message.tool_calls.as_ref().is_some_and(|v| !v.is_empty())
-        || message
-            .content_parts
-            .as_ref()
-            .is_some_and(|v| !v.is_empty())
-        || message.content.trim().is_empty()
-        || message.compressed
-        || message.compressed_by_event_id.is_some()
-        || message.compression_level != 0
-        || message.content.starts_with("[post-compaction-recovery]")
+        || !plain_child_report_message(message)
         || child
             .messages
             .iter()
@@ -567,16 +558,19 @@ async fn inspect_child_report_action_inner(
         SessionProjectIdentity::Assigned(id) => Some(id.to_string()),
         _ => None,
     };
-    Ok(
-        json!({"view":view,"version":1,"available":true,"child_report":report,"host_observation":{
-        "kind":"durable_snapshot","parent_session_id":parent.id,"parent_created_at":parent.created_at,
-        "child_session_id":child.id,"child_created_at":child.created_at,"root_session_id":child.root_session_id,
-        "spawn_depth":child.spawn_depth,"current_project_id":project_id,"assignment_sha256":binding.assignment_sha256,
-        "source_contents_match":true,"required_source_count":binding.payload.sources.iter().filter(|s|s.required).count(),
-        "optional_source_count":binding.payload.sources.iter().filter(|s|!s.required).count(),
-        "message_id":inspection_message_id(message),"content_sha256":sha256(message.content.as_bytes()),
-        "last_run_status":"completed","current_run_final_snapshot":true}}),
-    )
+    let mut observation = child_result_identity(&parent, &child, &binding, project_id.as_deref());
+    observation
+        .as_object_mut()
+        .expect("identity object")
+        .extend(
+            json!({"kind":"durable_snapshot","message_id":inspection_message_id(message),
+            "content_sha256":sha256(message.content.as_bytes()),"last_run_status":"completed",
+            "current_run_final_snapshot":true})
+            .as_object()
+            .expect("snapshot object")
+            .clone(),
+        );
+    Ok(project_child_report(report, observation))
 }
 
 #[cfg(test)]
