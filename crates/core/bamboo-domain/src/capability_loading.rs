@@ -87,7 +87,7 @@ pub fn discovery_control_fallback_schema() -> ToolSchema {
         schema_type: "function".to_string(),
         function: FunctionSchema {
             name: DISCOVERY_CONTROL_FALLBACK_TOOL_NAME.to_string(),
-            description: "Search Bamboo tools, Skills, and Workflows and load complete callable definitions into conversation history.".to_string(),
+            description: "Search eligible Deferred tools by name, description, and parameter metadata; load complete callable definitions into conversation history. Explicit kinds may request the legacy Skill/Workflow catalog.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -99,7 +99,7 @@ pub fn discovery_control_fallback_schema() -> ToolSchema {
                     },
                     "kinds": {
                         "type": "array",
-                        "description": "Optional capability kinds to search.",
+                        "description": "Defaults to Tools. Include skill or workflow explicitly for compatibility catalog lookup.",
                         "items": {
                             "type": "string",
                             "enum": ["tool", "skill", "workflow"]

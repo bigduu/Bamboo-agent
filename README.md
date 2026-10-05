@@ -162,3 +162,4 @@ Project-owned code is licensed under the [MIT License](./LICENSE).
 Third-party materials retain their own licenses and copyright notices:
 
 - `builtin_skills/skill-creator` retains its [Apache-2.0 license](./builtin_skills/skill-creator/LICENSE.txt).
+- Codex-derived tool-search code retains its [Apache-2.0 license and source notices](./THIRD_PARTY_NOTICES.md).

@@ -4,23 +4,12 @@ use globset::{GlobBuilder, GlobSetBuilder};
 use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
-use super::workspace_state;
+use super::{search_traversal, workspace_state};
 
 const DEFAULT_GLOB_MATCHES: usize = 100;
 const MAX_GLOB_MATCHES: usize = 200;
 const MAX_GLOB_SCANNED_FILES: usize = 50_000;
-const SKIP_DIRS: [&str; 8] = [
-    ".git",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    ".next",
-    ".cache",
-    "coverage",
-];
 const SEARCH_SCOPE_TOO_BROAD_ERROR: &str =
     "Search scope too broad. Add path/glob/type or reduce pattern.";
 
@@ -31,6 +20,8 @@ struct GlobArgs {
     path: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    include_ignored: bool,
 }
 
 pub struct GlobTool;
@@ -47,22 +38,6 @@ impl GlobTool {
             "*" | "**" | "**/*" | "**/**" | "./**/*" | ".//**/*"
         )
     }
-
-    fn should_skip_dir(path: &Path) -> bool {
-        if path.file_name().and_then(|name| name.to_str()) == Some("worktree")
-            && path
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|name| name.to_str())
-                == Some(".bamboo")
-        {
-            return true;
-        }
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| SKIP_DIRS.contains(&name))
-            .unwrap_or(false)
-    }
 }
 
 impl Default for GlobTool {
@@ -78,7 +53,7 @@ impl Tool for GlobTool {
     }
 
     fn description(&self) -> &str {
-        "Fast file pattern matching tool. Use it to find candidate files before deeper Read or Grep steps. Avoid unbounded root patterns without narrowing path or pattern."
+        "Fast file pattern matching tool. Directory searches respect repository .gitignore rules, including parent rules up to the Git root; non-repository searches do not apply ignore rules. Hidden files remain visible; global Git ignores, .ignore and .git/info/exclude are not applied. Use it to find candidate files before deeper Read or Grep steps. Avoid unbounded root patterns without narrowing path or pattern."
     }
 
     fn classify(&self, _args: &serde_json::Value) -> ToolClass {
@@ -100,6 +75,11 @@ impl Tool for GlobTool {
                 "limit": {
                     "type": "number",
                     "description": "Maximum number of returned matches (default 100, hard cap 200). Use a smaller limit for broad searches."
+                },
+                "include_ignored": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Include gitignored files. Requires an explicit path; scan/result limits and fixed directory exclusions still apply."
                 }
             },
             "required": ["pattern"],
@@ -114,6 +94,12 @@ impl Tool for GlobTool {
     ) -> Result<ToolOutcome, ToolError> {
         let parsed: GlobArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid Glob args: {}", e)))?;
+
+        if parsed.include_ignored && parsed.path.is_none() {
+            return Err(ToolError::InvalidArguments(
+                "include_ignored requires an explicit path.".to_string(),
+            ));
+        }
 
         if parsed.path.is_none() && Self::is_unbounded_pattern(&parsed.pattern) {
             return Err(ToolError::InvalidArguments(
@@ -162,15 +148,10 @@ impl Tool for GlobTool {
         let mut scanned_files = 0usize;
         let mut scan_truncated = false;
 
-        for entry in WalkDir::new(&root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| {
-                !entry.file_type().is_dir() || !Self::should_skip_dir(entry.path())
-            })
-            .filter_map(|entry| entry.ok())
+        for entry in
+            search_traversal::walk(&root, parsed.include_ignored).filter_map(|entry| entry.ok())
         {
-            if !entry.file_type().is_file() {
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                 continue;
             }
 
@@ -264,6 +245,10 @@ mod tests {
     #[tokio::test]
     async fn glob_truncates_to_max_matches_with_notice() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        tokio::fs::write(dir.path().join(".gitignore"), "*.txt\n")
+            .await
+            .unwrap();
         for idx in 0..520 {
             let file = dir.path().join(format!("f-{idx}.txt"));
             tokio::fs::write(file, "x").await.unwrap();
@@ -275,7 +260,8 @@ mod tests {
                 json!({
                     "pattern": "**/*.txt",
                     "path": dir.path(),
-                    "limit": 120
+                    "limit": 120,
+                    "include_ignored": true
                 }),
                 ToolCtx::none("t"),
             )
@@ -292,6 +278,43 @@ mod tests {
             .copied()
             .unwrap_or_default()
             .contains("[TRUNCATED]"));
+    }
+
+    #[tokio::test]
+    async fn glob_keeps_modification_time_order_and_name_tie_breaking() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let newer = older + std::time::Duration::from_secs(20);
+        for (name, time) in [
+            ("z-old.txt", older),
+            ("b-new.txt", newer),
+            ("a-new.txt", newer),
+        ] {
+            let file = std::fs::File::create(dir.path().join(name)).unwrap();
+            file.set_modified(time).unwrap();
+        }
+
+        let ToolOutcome::Completed(result) = GlobTool::new()
+            .invoke(
+                json!({"pattern": "*.txt", "path": dir.path()}),
+                ToolCtx::none("t"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Completed")
+        };
+        let names: Vec<_> = result_lines(&result)
+            .into_iter()
+            .map(|path| {
+                std::path::Path::new(path)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(names, ["a-new.txt", "b-new.txt", "z-old.txt"]);
     }
 
     #[tokio::test]
