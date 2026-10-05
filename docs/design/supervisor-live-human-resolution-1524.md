@@ -34,11 +34,15 @@ grant. The multi-intent sample creates C as a draft; it requests no dispatch.
 Wrong or extra approvals must be zero, other pending questions must survive,
 and user-required acceptance stays enabled.
 
-Each first attempt is saved before semantic assertions. The owned Host stops
-before canonical FileStore validation of the complete manifest. It then
+Each first attempt is saved before semantic assertions. Setup reads all seeded
+Tickets/requests from one fixed, complete bounded HTTP projection while the Host
+is running. After the model turn, the owned Host stops before canonical FileStore
+validation of the complete manifest. It then
 restarts and receives the identical Human message: ingress seq, saved proposal,
 group receipts and Ticket state must replay unchanged, without another model
-request. Failures retain the isolated Host log and first-attempt JSON. A single
+request. The existing writer-epoch restart invalidates open/approved approval
+objects; replay must retain that expiry and cannot revive the old grant. Questions
+and explicit denials survive unchanged. Failures retain the isolated Host log and first-attempt JSON. A single
 filtered sample is partial evidence, never the complete twelve-case result.
 
 The ordinary transport test checks authenticated credential separation, exact
@@ -68,3 +72,11 @@ quality, current-head review, CI completion or default enablement is claimed.
 Any production finding is classified and split before adding lifecycle,
 persistence or dispatch repairs to this test-only slice. Real-model samples
 are bounded observations, not statistical correctness or exactly-once effects.
+
+The first live chatter attempt did persist the correct zero-operation resolution
+through three successful real `gpt-6-sol` Responses requests. Its overall test
+failed because the initial fixture stopped/restarted before the Human turn,
+invalidating seeded approvals by the existing writer-epoch policy. The failure
+is preserved. The fixture now reads its baseline via the fixed HTTP snapshot
+and checks safe approval expiry during the required post-resolution replay;
+no production restart/approval semantics are changed.

@@ -13,7 +13,14 @@ use bamboo_storage::SessionStoreV2;
 use live::{LiveBridge, LiveConfig, HOST_CREDENTIAL};
 use runtime::{command, get, post, Host};
 use serde_json::{json, Value};
-use std::{path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+
+#[derive(serde::Serialize)]
+struct BeforeView {
+    snapshot: Value,
+    tickets: BTreeMap<String, Ticket>,
+    requests: BTreeMap<String, PendingRequest>,
+}
 
 #[actix_web::test]
 async fn live_bridge_preserves_upstream_bytes_and_fails_without_fallback() {
@@ -199,7 +206,8 @@ impl LiveHost {
         self.host = Some(host);
     }
 
-    async fn seed(&self) {
+    async fn seed(&self) -> Vec<String> {
+        let mut ids = vec![];
         for (index, title) in [
             "报告A", "报告B", "报告D", "报告E", "付款A", "付款B", "周报", "周报",
         ]
@@ -218,8 +226,51 @@ impl LiveHost {
                     format!("批准 {title} 向独立收款人支付100 CNY？")
                 } else {format!("{title} 使用什么颜色？")},"action":action}
             ])).await;
-            post(&self.client, &self.base, "/tickets/update", &c).await;
+            let receipt = post(&self.client, &self.base, "/tickets/update", &c).await;
+            ids.push(receipt["ids"]["w"].as_str().unwrap().to_owned());
         }
+        ids
+    }
+
+    async fn before_view(&self, ids: &[String]) -> BeforeView {
+        let overview = get(&self.client, &self.base, "/tickets/overview").await;
+        assert_eq!(overview["data"]["work_count"], ids.len());
+        let inspected = post(
+            &self.client,
+            &self.base,
+            "/tickets/inspect",
+            &json!({
+                "ids":ids,"depth":0,"sections":["requests"],"budget_bytes":65536,
+                "fixed_commit":overview["snapshot"]["commit"]
+            }),
+        )
+        .await;
+        assert_eq!(inspected["snapshot"], overview["snapshot"]);
+        assert_eq!(inspected["truncated"], false);
+        assert_eq!(inspected["omitted_count"], 0);
+        assert_eq!(inspected["data"].as_array().unwrap().len(), ids.len());
+        let mut view = BeforeView {
+            snapshot: overview["snapshot"].clone(),
+            tickets: BTreeMap::new(),
+            requests: BTreeMap::new(),
+        };
+        for row in inspected["data"].as_array().unwrap() {
+            let work: Ticket = serde_json::from_value(row["ticket"].clone()).unwrap();
+            assert!(ids.contains(&work.id));
+            view.tickets.insert(work.id.clone(), work);
+            for request in row["requests"].as_array().unwrap() {
+                let request: PendingRequest = serde_json::from_value(request.clone()).unwrap();
+                assert_eq!(
+                    request.status,
+                    RequestStatus::Open,
+                    "seeded request must be live before the model turn"
+                );
+                view.requests.insert(request.id.clone(), request);
+            }
+        }
+        assert_eq!(view.tickets.len(), ids.len());
+        assert_eq!(view.requests.len(), ids.len());
+        view
     }
 
     async fn human(&self, case: &str, text: &str) -> (Value, Value) {
@@ -280,7 +331,7 @@ impl LiveHost {
     }
 }
 
-fn assess(case: &str, before: &Snapshot, after: &Snapshot, id: &str) -> Value {
+fn assess(case: &str, before: &BeforeView, after: &Snapshot, id: &str) -> Value {
     let resolution = after
         .resolutions
         .get(id)
@@ -447,9 +498,8 @@ async fn live_chinese_human_resolution_through_actual_host() {
             continue;
         }
         let mut f = LiveHost::start().await;
-        f.seed().await;
-        let before = f.stopped_snapshot();
-        f.restart().await;
+        let ids = f.seed().await;
+        let before = f.before_view(&ids).await;
         let (request, run) = f.human(case, text).await;
         let after = f.stopped_snapshot();
         let id = format!("live-{case}");
@@ -480,6 +530,39 @@ async fn live_chinese_human_resolution_through_actual_host() {
             json!(after.tickets),
             "replay must not duplicate or rewrite Tickets"
         );
+        for prior in after.requests.values() {
+            let current = &replay.requests[&prior.id];
+            if matches!(prior.kind, RequestKind::Approval { .. })
+                && matches!(prior.status, RequestStatus::Open | RequestStatus::Approved)
+            {
+                assert_eq!(
+                    current.status,
+                    RequestStatus::Expired,
+                    "writer restart must invalidate old approval grants"
+                );
+                let mut expected = prior.clone();
+                expected.status = RequestStatus::Expired;
+                expected.updated_seq = current.updated_seq;
+                assert_eq!(
+                    json!(current),
+                    json!(expected),
+                    "approval restart changes only expiry/sequence"
+                );
+            } else {
+                assert_eq!(
+                    json!(current),
+                    json!(prior),
+                    "non-approval decisions/questions survive replay exactly"
+                );
+            }
+        }
+        assert!(
+            !replay
+                .requests
+                .values()
+                .any(|r| matches!(r.status, RequestStatus::Approved | RequestStatus::Consumed)),
+            "replay cannot revive approval authority"
+        );
         assert_eq!(
             f.bridge.requests(),
             prior_requests,
@@ -488,6 +571,7 @@ async fn live_chinese_human_resolution_through_actual_host() {
         f.bridge.verify_unchanged();
         report["pass"] = json!(true);
         report["replay_ingress_seq"] = retry["ingress_seq"].clone();
+        report["restart_approval_expiry_preserved"] = json!(true);
         std::fs::write(
             evidence.join(format!("{case}.json")),
             serde_json::to_vec_pretty(&report).unwrap(),
