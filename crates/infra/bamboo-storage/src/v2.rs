@@ -73,7 +73,7 @@ pub use actor_model_context::{
 pub use actor_transcript::{
     ActorTranscriptAppend, ActorTranscriptAppendError, ActorTranscriptGroupAppend,
 };
-pub use broker_receipt::BrokerTerminalReceipt;
+pub use broker_receipt::{BrokerTerminalReceipt, BrokerTerminalRoute, HostToolYield};
 #[cfg(test)]
 mod actor_directory_lifetime_tests;
 mod actor_snapshot;
@@ -1772,7 +1772,11 @@ impl SessionStoreV2 {
     /// and directory-level read errors are logged + tolerated (never
     /// `?`-propagated) so one bad file/dir never re-introduces a boot-fatal
     /// failure or aborts recovery of the rest.
-    async fn rebuild_index_from_disk(&self) -> io::Result<()> {
+    /// Explicit recovery after a verified offline Session tree import. Reuses
+    /// the normal derived-index rebuild and its lifecycle/index publication
+    /// locks; callers must stop the importing Host before copying the tree.
+    /// This does not confer execution, Supervisor, or owned-Inbox authority.
+    pub async fn rebuild_index_from_disk(&self) -> io::Result<()> {
         let mut recovered = 0usize;
 
         let mut root_dirs = match fs::read_dir(&self.sessions_dir).await {

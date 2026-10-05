@@ -8,6 +8,7 @@ members = [
     "crates/infra/bamboo-config",
     "crates/infra/bamboo-llm",
     "crates/infra/bamboo-storage",
+    "crates/infra/bamboo-tickets",
     "crates/infra/bamboo-a2a",
     "crates/infra/bamboo-infrastructure",
     "crates/infra/bamboo-memory",
@@ -51,6 +52,7 @@ default-members = [
     "crates/infra/bamboo-config",
     "crates/infra/bamboo-llm",
     "crates/infra/bamboo-storage",
+    "crates/infra/bamboo-tickets",
     "crates/infra/bamboo-a2a",
     "crates/infra/bamboo-infrastructure",
     "crates/infra/bamboo-memory",
@@ -237,6 +239,9 @@ windows-sys = { version = "0.61", features = ["Win32_System_Threading", "Win32_F
 [[bin]]
 name = "bamboo"
 path = "src/bin/bamboo.rs"
+
+[features]
+ticket-runtime-fixtures = ["bamboo-server/ticket-runtime-fixtures"]
 
 [dev-dependencies]
 async-trait = "0.1"

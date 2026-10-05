@@ -44,13 +44,20 @@ pub enum CapabilityLoadingMode {
 /// Core guarantees exact current-Session recall after older activation traces
 /// leave the active context without making the broad Root `session_history`
 /// viewer Core.
-pub const CORE_TOOL_NAMES: [&str; 6] = [
+pub const CORE_TOOL_NAMES: [&str; 12] = [
     "Bash",
     "Read",
     "Grep",
     "Edit",
     "Write",
     "session_history_current",
+    // Host registers these only when the opt-in Supervisor scope exists.
+    "work_overview",
+    "work_search",
+    "work_inspect",
+    "work_changes",
+    "work_update",
+    "work_dispatch",
 ];
 
 /// Host protocol helpers that must not enter model catalogs or discovery.
@@ -454,7 +461,13 @@ mod tests {
                 "Grep",
                 "Edit",
                 "Write",
-                "session_history_current"
+                "session_history_current",
+                "work_overview",
+                "work_search",
+                "work_inspect",
+                "work_changes",
+                "work_update",
+                "work_dispatch",
             ]
         );
         for name in CORE_TOOL_NAMES {
@@ -527,7 +540,7 @@ mod tests {
             );
         }
         for name in SERVER_CAPABILITY_NAMES {
-            let expected = if name == "session_history_current" {
+            let expected = if CORE_TOOL_NAMES.contains(&name) {
                 CapabilityLoadingClass::Core
             } else {
                 CapabilityLoadingClass::Deferred

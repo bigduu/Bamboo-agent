@@ -2426,6 +2426,12 @@ impl ProviderConfigs {
 /// Feature flags for incremental rollout of new subsystems.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FeatureFlags {
+    /// File-authoritative Tickets for a newly bootstrapped Supervisor only.
+    #[serde(default)]
+    pub ticket_mutation: bool,
+    /// Actual fresh one-shot dispatch; independent of Ticket record writes.
+    #[serde(default)]
+    pub ticket_dispatch: bool,
     /// Enable the ProviderModelRef system (multi-provider + unified model selection).
     #[serde(default)]
     pub provider_model_ref: bool,

@@ -17,7 +17,82 @@ use super::{
 
 pub async fn create_child_action(
     port: &dyn ChildSessionPort,
+    input: CreateChildInput,
+) -> Result<CreateChildResult, ChildSessionError> {
+    if input
+        .runtime_metadata
+        .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+    {
+        return Err(ChildSessionError::InvalidArguments(
+            "Ticket LocalPlan binding requires the trusted work-child entry point".into(),
+        ));
+    }
+    create_child_action_inner(port, input, None).await
+}
+
+/// Host-only fresh work assignment creation; no model tool deserializes this port.
+pub async fn create_ticket_child_action(
+    port: &dyn ChildSessionPort,
     mut input: CreateChildInput,
+    service: &bamboo_tickets::TicketService,
+    authority: &bamboo_tickets::Authority,
+    assignment_id: &str,
+) -> Result<CreateChildResult, ChildSessionError> {
+    if !matches!(authority.principal(), bamboo_tickets::Principal::Runtime) {
+        return Err(ChildSessionError::Execution(
+            "Ticket child creation requires trusted Runtime".into(),
+        ));
+    }
+    let packet = service
+        .child_context_packet(authority, assignment_id, 65536)
+        .map_err(|e| ChildSessionError::Execution(e.to_string()))?;
+    if input.parent_session.id != packet.binding.supervisor_session_id
+        || input.auto_run
+        || input.lifecycle.as_deref() == Some("resident")
+        || input.context_fork.unwrap_or(0) > 0
+    {
+        return Err(ChildSessionError::InvalidArguments(
+            "Ticket child requires fresh one-shot, exact Supervisor and explicit dispatch".into(),
+        ));
+    }
+    input.assignment_prompt =
+        serde_json::to_string(&packet).map_err(|e| ChildSessionError::Execution(e.to_string()))?;
+    input.runtime_metadata.insert(
+        crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
+        assignment_id.into(),
+    );
+    let required_packet = bamboo_domain::ChildContextPacket {
+        version: 1,
+        objective: packet.contract.objective.clone(),
+        constraints: packet.contract.constraints.clone(),
+        acceptance: packet
+            .contract
+            .acceptance
+            .iter()
+            .cloned()
+            .chain(std::iter::once(packet.result_contract.clone()))
+            .collect(),
+        non_goals: vec![
+            "Do not change the Work contract, Supervisor TaskList or any sibling plan".into(),
+        ],
+        necessary_user_instructions: Vec::new(),
+        recorded_decisions: vec![serde_json::to_string(&packet)
+            .map_err(|e| ChildSessionError::Execution(e.to_string()))?],
+        source_user_message_ids: Vec::new(),
+        background_message_ids: Vec::new(),
+    };
+    input.runtime_metadata.insert(
+        bamboo_domain::CHILD_PACKET_INPUT_KEY.into(),
+        serde_json::to_string(&required_packet)
+            .map_err(|e| ChildSessionError::Execution(e.to_string()))?,
+    );
+    create_child_action_inner(port, input, Some(packet)).await
+}
+
+async fn create_child_action_inner(
+    port: &dyn ChildSessionPort,
+    mut input: CreateChildInput,
+    ticket_context: Option<bamboo_tickets::WorkContextPacket>,
 ) -> Result<CreateChildResult, ChildSessionError> {
     use crate::runner::refresh_prompt_snapshot;
     use bamboo_agent_core::Message;
@@ -420,7 +495,36 @@ pub async fn create_child_action(
         child.add_message(Message::user(assignment));
     }
 
-    if let Some(parent_task_list) = input.parent_session.task_list.clone() {
+    if let Some(ticket_context) = ticket_context.as_ref() {
+        // The new work path never inherits Root Tasks. Its authoritative empty
+        // LocalPlan was created atomically with Assignment + DispatchIntent.
+        child.task_list = None;
+        if !child
+            .messages
+            .iter()
+            .any(|m| m.role == bamboo_domain::Role::System)
+        {
+            child.messages.insert(0, Message::system("Only this Work's own Task steps may be written through the Host. The Work contract and inputs are readonly."));
+        }
+        let system = child
+            .messages
+            .iter_mut()
+            .find(|m| m.role == bamboo_domain::Role::System)
+            .unwrap();
+        let metadata = system.metadata.get_or_insert_with(|| json!({}));
+        metadata
+            .as_object_mut()
+            .ok_or_else(|| ChildSessionError::Execution("invalid System metadata".into()))?
+            .insert(
+                crate::ticket_worker_plan::TICKET_PLAN_PACKET_KEY.into(),
+                json!(ticket_context),
+            );
+        child.metadata.insert(
+            "ticket.work_contract_ref.v1".into(),
+            serde_json::to_string(ticket_context)
+                .map_err(|e| ChildSessionError::Execution(e.to_string()))?,
+        );
+    } else if let Some(parent_task_list) = input.parent_session.task_list.clone() {
         child.set_task_list(parent_task_list);
     }
 

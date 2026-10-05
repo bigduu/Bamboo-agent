@@ -1152,6 +1152,21 @@ async fn maybe_suspend_for_orphaned_children(
         .filter(|(_, status)| !status.as_deref().is_some_and(is_terminal_child_status))
         .map(|(id, _)| id)
         .collect();
+    if !inherited_tool_wait {
+        let mut ordinary = Vec::with_capacity(active.len());
+        for child_id in active {
+            if !crate::ticket_runtime::is_independent_ticket_child(
+                storage.as_ref(),
+                session,
+                &child_id,
+            )
+            .await
+            {
+                ordinary.push(child_id);
+            }
+        }
+        active = ordinary;
+    }
     if active.is_empty() && !inherited_tool_wait {
         return Ok(None);
     }
@@ -2025,6 +2040,14 @@ fn spawn_task_evaluation_if_needed(
     // once per Task-tool write rather than every round of tool activity (which
     // bumps `TaskLoopContext::version` without changing the plan). A task list
     // that never went through the Task tool is never auto-evaluated.
+    if config.ticket_worker_plan.is_some() {
+        // The legacy evaluator writes Session/root control planes. New Ticket
+        // plans change only through their authority-bound Task port.
+        if let Some(ctx) = state.task_context.as_mut() {
+            ctx.task_list_dirty = false;
+        }
+        return Ok(());
+    }
     let task_list_dirty = state
         .task_context
         .as_ref()
@@ -2566,7 +2589,11 @@ async fn handle_tool_calls_path(
         waiting_for_children = true;
     }
 
-    if awaiting_clarification || waiting_for_children {
+    let ticket_question_yield = frame.config.ticket_worker_plan.is_some()
+        && session
+            .metadata
+            .contains_key(crate::ticket_worker_plan::TICKET_QUESTION_YIELD_KEY);
+    if ticket_question_yield || awaiting_clarification || waiting_for_children {
         crate::runtime::runner::metrics_lifecycle::record_round_completed(
             frame.metrics_collector,
             frame.round_id,
@@ -2587,9 +2614,24 @@ async fn handle_tool_calls_path(
                 .unwrap_or(0),
             round_error,
         );
+        if ticket_question_yield {
+            session.metadata.insert(
+                "runtime.completion_reason".into(),
+                "ticket_question_yield".into(),
+            );
+            let _ = frame
+                .event_tx
+                .send(AgentEvent::Complete {
+                    usage: to_event_token_usage(
+                        round_usage.prompt_tokens,
+                        round_usage.completion_tokens,
+                    ),
+                })
+                .await;
+        }
         return Ok(TurnOutcome {
             should_break: true,
-            sent_complete: false,
+            sent_complete: ticket_question_yield,
         });
     }
 

@@ -17,6 +17,58 @@ const MAX_RECEIPT_SCAN_ROOTS: usize = 4096;
 const MAX_RECEIPT_SCAN_CHILDREN: usize = 16384;
 const MAX_RECEIPT_LEDGER_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Rust-only Host evidence; Session metadata and Worker JSON cannot construct
+/// this value. The embedding Host first verifies its authoritative question
+/// receipt, then freezes this exact Child/run/transcript for broker storage.
+pub struct HostToolYield {
+    session_id: String,
+    created_at: DateTime<Utc>,
+    activation_run_id: String,
+    messages_sha256: String,
+    call_id: String,
+}
+
+impl HostToolYield {
+    pub fn from_verified_host(session: &Session, run_id: &str, call_id: &str) -> io::Result<Self> {
+        if !exact_yield_tool(&session.messages, call_id) {
+            return Err(invalid("Host yielded tool pair is not exact"));
+        }
+        Ok(Self {
+            session_id: session.id.clone(),
+            created_at: session.created_at,
+            activation_run_id: run_id.into(),
+            messages_sha256: digest_messages(&session.messages)?,
+            call_id: call_id.into(),
+        })
+    }
+}
+
+pub struct BrokerTerminalRoute<'a> {
+    pub activation_run_id: &'a str,
+    pub broker_identity: &'a str,
+    pub parent_mailbox: &'a str,
+    pub broker_correlation_id: &'a str,
+    pub message_ids: &'a [String],
+}
+
+fn exact_yield_tool(messages: &[Message], call_id: &str) -> bool {
+    messages.last().is_some_and(|last| {
+        last.role == Role::Tool
+            && last.tool_call_id.as_deref() == Some(call_id)
+            && last.tool_success == Some(true)
+            && messages
+                .iter()
+                .flat_map(|m| m.tool_calls.iter().flatten())
+                .filter(|call| call.id == call_id)
+                .count()
+                == 1
+            && messages
+                .iter()
+                .flat_map(|m| m.tool_calls.iter().flatten())
+                .any(|call| call.id == call_id && call.function.name == "Task")
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrokerTerminalReceipt {
     pub session_id: String,
@@ -41,6 +93,8 @@ pub struct BrokerTerminalReceipt {
     /// Child may not have this marker until the same Run's final checkpoint.
     #[serde(default)]
     pub parent_question_request: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_yield_call_id: Option<String>,
     committed: bool,
 }
 
@@ -97,6 +151,13 @@ fn prefix_matches(receipt: &BrokerTerminalReceipt, session: &Session) -> io::Res
         return Ok(false);
     }
     let prefix = &session.messages[..receipt.message_count];
+    if receipt
+        .tool_yield_call_id
+        .as_deref()
+        .is_some_and(|id| !exact_yield_tool(prefix, id))
+    {
+        return Ok(false);
+    }
     if digest_messages(prefix)? == receipt.messages_sha256 {
         return Ok(true);
     }
@@ -390,6 +451,54 @@ impl SessionStoreV2 {
         broker_correlation_id: &str,
         message_ids: &[String],
     ) -> io::Result<()> {
+        self.prepare_terminal_receipt(
+            session,
+            BrokerTerminalRoute {
+                activation_run_id,
+                broker_identity,
+                parent_mailbox,
+                broker_correlation_id,
+                message_ids,
+            },
+            None,
+        )
+        .await
+    }
+
+    pub async fn prepare_broker_tool_yield_receipt(
+        &self,
+        session: &Session,
+        route: BrokerTerminalRoute<'_>,
+        proof: &HostToolYield,
+    ) -> io::Result<()> {
+        self.prepare_terminal_receipt(session, route, Some(proof))
+            .await
+    }
+
+    async fn prepare_terminal_receipt(
+        &self,
+        session: &Session,
+        route: BrokerTerminalRoute<'_>,
+        proof: Option<&HostToolYield>,
+    ) -> io::Result<()> {
+        let BrokerTerminalRoute {
+            activation_run_id,
+            broker_identity,
+            parent_mailbox,
+            broker_correlation_id,
+            message_ids,
+        } = route;
+        if let Some(proof) = proof {
+            if proof.session_id != session.id
+                || proof.created_at != session.created_at
+                || proof.activation_run_id != activation_run_id
+                || proof.messages_sha256 != digest_messages(&session.messages)?
+                || !exact_yield_tool(&session.messages, &proof.call_id)
+                || session.last_run_status().as_deref() != Some("completed")
+            {
+                return Err(invalid("Host tool yield proof changed"));
+            }
+        }
         validate_session_id(&session.id)?;
         if session.kind != SessionKind::Child
             || activation_run_id.is_empty()
@@ -424,7 +533,8 @@ impl SessionStoreV2 {
                 "Child broker terminal error proof missing or unexpected",
             ));
         }
-        if session.last_run_status().as_deref() == Some("completed")
+        if proof.is_none()
+            && session.last_run_status().as_deref() == Some("completed")
             && !session.messages.last().is_some_and(|message| {
                 message.role == Role::Assistant && !message.content.trim().is_empty()
             })
@@ -477,6 +587,7 @@ impl SessionStoreV2 {
                 .last_run_status()
                 .ok_or_else(|| invalid("Child terminal status missing"))?,
             terminal_error,
+            tool_yield_call_id: proof.map(|proof| proof.call_id.clone()),
             parent_question_request: (session.last_run_status().as_deref() == Some("suspended"))
                 .then(|| session.metadata.get(PARENT_QUESTION_REQUEST_KEY).cloned())
                 .flatten(),
@@ -987,6 +1098,95 @@ mod tests {
                 TEST_PARENT_MAILBOX,
             )
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_yield_receipt_requires_host_proof_and_retains_exact_cold_anchor() -> io::Result<()>
+    {
+        use bamboo_domain::{FunctionCall, ToolCall};
+        let (home, store, mut child) = fixture().await?;
+        child.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "question-call".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "Task".into(),
+                    arguments: "{\"question\":{\"prompt\":\"own question\"}}".into(),
+                },
+            }]),
+        ));
+        child.add_message(Message::tool_result_with_status(
+            "question-call",
+            "exact Host question result",
+            true,
+        ));
+        child.set_last_run_status("completed");
+        // An arbitrary metadata flag alone does not change the ordinary API.
+        child
+            .metadata
+            .insert("ticket.worker.question_yield.v1".into(), "true".into());
+        let broker = uuid::Uuid::new_v4().to_string();
+        let ids = ["question-event".into(), "question-outcome".into()];
+        let route = || BrokerTerminalRoute {
+            activation_run_id: "question-run",
+            broker_identity: &broker,
+            parent_mailbox: TEST_PARENT_MAILBOX,
+            broker_correlation_id: "question-correlation",
+            message_ids: &ids,
+        };
+        assert!(store
+            .prepare_broker_terminal_receipt(
+                &child,
+                "question-run",
+                &broker,
+                TEST_PARENT_MAILBOX,
+                "question-correlation",
+                &ids
+            )
+            .await
+            .is_err());
+        let proof = HostToolYield::from_verified_host(&child, "question-run", "question-call")?;
+        let mut forged = child.clone();
+        forged.messages.last_mut().unwrap().content = "different question".into();
+        assert!(store
+            .prepare_broker_tool_yield_receipt(&forged, route(), &proof)
+            .await
+            .is_err());
+        store
+            .prepare_broker_tool_yield_receipt(&child, route(), &proof)
+            .await?;
+        assert!(store
+            .commit_broker_terminal_receipt(&child, "question-run")
+            .await
+            .is_err());
+        store.save_session(&child).await?;
+        let confirmed = store
+            .commit_broker_terminal_receipt(&child, "question-run")
+            .await?;
+        assert_eq!(
+            confirmed.tool_yield_call_id.as_deref(),
+            Some("question-call")
+        );
+        drop(store);
+        let reopened = SessionStoreV2::new(home.path().into()).await?;
+        assert_eq!(
+            reopened
+                .recover_broker_terminal_receipts(&child)
+                .await?
+                .len(),
+            1
+        );
+        reopened
+            .clear_acknowledged_broker_terminal_receipt(
+                &child.id,
+                child.created_at,
+                "question-run",
+                TEST_PARENT_MAILBOX,
+            )
+            .await?;
+        assert!(reopened.save_session(&forged).await.is_err());
         Ok(())
     }
 

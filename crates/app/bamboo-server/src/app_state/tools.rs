@@ -299,9 +299,32 @@ impl bamboo_engine::external_agents::runtime::NativeToolCeilingSource for HostNa
             .iter()
             .filter_map(|name| self.resolve(name))
             .collect();
+        let ticket_child = session
+            .metadata
+            .contains_key(bamboo_engine::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY);
+        let ticket_packet = session
+            .metadata
+            .get("ticket.work_contract_ref.v1")
+            .and_then(|raw| {
+                serde_json::from_str::<
+                        bamboo_engine::ticket_worker_plan::tickets::WorkContextPacket,
+                    >(raw)
+                    .ok()
+            });
         Ok(bamboo_subagent::proto::NativeToolCeiling::NAMES
             .iter()
             .filter(|name| {
+                if (!ticket_child && **name == "Task")
+                    || (ticket_child
+                        && **name != "Task"
+                        && (!matches!(**name, "Read" | "Write")
+                            || ticket_packet.as_ref().is_none_or(|packet| {
+                                packet.workspace.is_none()
+                                    || !packet.contract.allowed_tools.contains(**name)
+                            })))
+                {
+                    return false;
+                }
                 self.native_owner(name)
                     && !disabled.contains(**name)
                     && !child_denied.contains(**name)
@@ -505,6 +528,27 @@ mod native_ceiling_tests {
             config: Arc::new(RwLock::new(Config::default())),
             projects: Arc::new(bamboo_projects::ProjectStore::open(home).unwrap()),
         }
+    }
+
+    #[tokio::test]
+    async fn ticket_ceiling_selects_only_host_builtin_task_and_legacy_keeps_five_tools() {
+        let home = tempfile::tempdir().unwrap();
+        let mut source = source(home.path());
+        let mut child = bamboo_domain::Session::new_child("ticket-child", "root", "", "");
+        assert_eq!(source.observe(&child).await.unwrap().len(), 5);
+        child.metadata.insert(
+            bamboo_engine::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
+            "assignment".into(),
+        );
+        assert_eq!(source.observe(&child).await.unwrap(), ["Task"]);
+        source.base = Arc::new(crate::tools::OverlayToolExecutor::new(
+            source.base.clone(),
+            Arc::new(Foreign("Task")),
+        ));
+        assert!(source.observe(&child).await.unwrap().is_empty());
+        source.base = source.builtin.clone();
+        source.config.write().await.tools.disabled = vec!["Task".into()];
+        assert!(source.observe(&child).await.unwrap().is_empty());
     }
     #[tokio::test]
     async fn native_owner_uses_complete_composite_overlay_exact_before_alias_and_config() {

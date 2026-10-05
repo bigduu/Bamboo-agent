@@ -360,7 +360,25 @@ async fn checkpoint_lineage_real_before_replace_detects_legal_parent_write_and_a
             assert_eq!(files(&f.target()), before);
             assert_eq!(ancestor_files(&f), after_deliberate_parent_change);
             no_temps(&f.target());
-            if matches!(port, Port::InputNew) && change == 0 {
+            if matches!(port, Port::Transcript) && change == 0 {
+                assert_eq!(
+                    rejected.unwrap_err(),
+                    ActorTranscriptAppendError::PrefixConflict.to_string()
+                );
+                let committed = f
+                    .store
+                    .append_actor_transcript(f.transcript())
+                    .await
+                    .unwrap();
+                assert_eq!(committed.messages.len(), f.current.messages.len() + 1);
+                assert_eq!(committed.messages.last().unwrap().content, "new output");
+                assert_eq!(ancestor_files(&f), after_deliberate_parent_change);
+                assert!(f
+                    .target()
+                    .join("inbox/cur")
+                    .join(&f.claim.claim.claim_id)
+                    .exists());
+            } else if matches!(port, Port::InputNew) && change == 0 {
                 assert_eq!(
                     rejected.unwrap_err(),
                     ActorInputCheckpointError::PrefixConflict.to_string()

@@ -356,6 +356,8 @@ impl From<&MemoryConfig> for PromptMemoryFlags {
 pub struct AgentLoopConfig {
     /// Keep tool guidance stable while activation updates append to model context.
     pub freeze_tool_exposure_for_cache: bool,
+    /// Host-installed exact Assignment/Run permit; never taken from model args.
+    pub(crate) ticket_worker_plan: Option<Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>>,
     pub(crate) system_prompt: Option<String>,
     /// Skill IDs that are disabled globally for this execution.
     pub(crate) disabled_skill_ids: BTreeSet<String>,
@@ -565,6 +567,7 @@ impl Default for AgentLoopConfig {
     fn default() -> Self {
         Self {
             freeze_tool_exposure_for_cache: true,
+            ticket_worker_plan: None,
             system_prompt: None,
             disabled_skill_ids: BTreeSet::new(),
             selected_skill_ids: None,
@@ -628,6 +631,12 @@ impl Default for AgentLoopConfig {
 }
 
 impl AgentLoopConfig {
+    pub fn bind_ticket_worker_plan(
+        &mut self,
+        plan: Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>,
+    ) {
+        self.ticket_worker_plan = Some(plan);
+    }
     /// Live `(disabled_tools, disabled_skill_ids)` for the current round: the
     /// resolver if one is wired (#136 — follows live global config between
     /// rounds), else the per-run snapshot (#44 frozen behavior). `Cow` avoids

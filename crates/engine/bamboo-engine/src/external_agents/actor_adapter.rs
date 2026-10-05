@@ -1025,6 +1025,7 @@ pub struct BrokerTerminalReceiptReconciler {
     store: Arc<bamboo_storage::SessionStoreV2>,
     bus: Option<bamboo_subagent::BusEndpoint>,
     remote: HashMap<String, Option<ReceiptRemoteRoute>>,
+    ticket_service: Option<Arc<bamboo_tickets::TicketService>>,
 }
 
 struct ReceiptRemoteRoute {
@@ -1057,6 +1058,7 @@ impl BrokerTerminalReceiptReconciler {
         }
         Self {
             store,
+            ticket_service: None,
             bus: subagents.broker.clone().and_then(|broker| {
                 (!broker.endpoint.trim().is_empty() && !broker.token.is_empty()).then_some(
                     bamboo_subagent::BusEndpoint {
@@ -1067,6 +1069,14 @@ impl BrokerTerminalReceiptReconciler {
             }),
             remote,
         }
+    }
+
+    pub fn with_ticket_service(
+        mut self,
+        service: Option<Arc<bamboo_tickets::TicketService>>,
+    ) -> Self {
+        self.ticket_service = service;
+        self
     }
 
     /// One physical-tree scan. Every Child is independent; a failed route,
@@ -1195,6 +1205,23 @@ impl BrokerTerminalReceiptReconciler {
             .map(String::as_str)
             .unwrap_or("worker");
         for receipt in receipts {
+            if current
+                .metadata
+                .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+            {
+                let service = self
+                    .ticket_service
+                    .as_ref()
+                    .ok_or("Ticket authority unavailable; no result ACK")?;
+                crate::ticket_runtime::checkpoint_ticket_result(
+                    service,
+                    self.store.as_ref(),
+                    &current,
+                    &receipt.activation_run_id,
+                )
+                .await
+                .map_err(|_| "Ticket result not checkpointed; broker receipt retained")?;
+            }
             let local_mailbox = format!("p-{}", child.id);
             // The committed receipt records the route used by this run. A
             // later role configuration change must not redirect its ACK.
@@ -1301,6 +1328,25 @@ enum PlacementKind {
     Local,
     Remote,
     Schedulable,
+}
+
+/// Ticket execution needs the local process-owned stop checkpoint before ACK.
+fn ensure_ticket_placement_is_enforceable(
+    session: &Session,
+    spec: &ProvisionSpec,
+) -> Result<(), AgentError> {
+    let ticket = session
+        .metadata
+        .contains_key(crate::ticket_runtime::TICKET_DISPATCH_KEY)
+        || session
+            .metadata
+            .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY);
+    if ticket && !matches!(spec.placement, Placement::Local) {
+        return Err(AgentError::LLM(
+            "Ticket execution requires local placement and owned stop proof".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// A read-only activation needs an executor and worker whose tool surface and
@@ -1421,6 +1467,7 @@ pub struct ActorChildRunner {
     session_inbox_runtime: Arc<std::sync::Mutex<Option<SessionInboxRuntimeBinding>>>,
     actor_directory_store: std::sync::Mutex<Option<Arc<bamboo_storage::SessionStoreV2>>>,
     canonical_subagent_tool: std::sync::Mutex<Option<Arc<dyn bamboo_agent_core::tools::Tool>>>,
+    ticket_service: std::sync::Mutex<Option<Arc<bamboo_tickets::TicketService>>>,
     actor_event_observer: std::sync::Mutex<Option<Arc<dyn ActorEventObserver>>>,
     /// A processed broker terminal still needs the Host's final Child Session
     /// save before its exact Event/Outcome mailbox receipts can be ACKed.
@@ -1660,6 +1707,7 @@ impl ActorChildRunner {
             session_inbox_runtime: Arc::new(std::sync::Mutex::new(None)),
             actor_directory_store: std::sync::Mutex::new(None),
             canonical_subagent_tool: std::sync::Mutex::new(None),
+            ticket_service: std::sync::Mutex::new(None),
             actor_event_observer: std::sync::Mutex::new(None),
             pending_durable_links: tokio::sync::Mutex::new(HashMap::new()),
         }
@@ -2533,6 +2581,10 @@ impl ExternalChildRunner for ActorChildRunner {
         *self.canonical_subagent_tool.lock().recover_poison() = tool;
     }
 
+    fn set_ticket_service(&self, service: Option<Arc<bamboo_tickets::TicketService>>) {
+        *self.ticket_service.lock().recover_poison() = service;
+    }
+
     fn set_actor_event_observer(&self, observer: Option<Arc<dyn ActorEventObserver>>) {
         *self.actor_event_observer.lock().recover_poison() = observer;
     }
@@ -2591,17 +2643,54 @@ impl ExternalChildRunner for ActorChildRunner {
         {
             return Err("stale Child activation cannot prepare broker receipt".into());
         }
-        store
-            .prepare_broker_terminal_receipt(
+        let ticket_service = self.ticket_service.lock().recover_poison().clone();
+        let yielded_call = if expected_status == "completed"
+            && session
+                .metadata
+                .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+        {
+            let service = ticket_service
+                .as_deref()
+                .ok_or("Ticket authority unavailable for broker question")?;
+            crate::ticket_runtime::question_terminal_call_id(service, session, activation_run_id)
+                .map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+        if let Some(call_id) = yielded_call {
+            let proof = bamboo_storage::v2::HostToolYield::from_verified_host(
                 session,
                 activation_run_id,
-                &delivery.broker_identity,
-                &delivery.parent_mailbox,
-                &delivery.correlation_id,
-                &delivery.message_ids,
+                &call_id,
             )
-            .await
-            .map_err(|error| format!("Host broker receipt prepare failed: {error}"))?;
+            .map_err(|e| e.to_string())?;
+            store
+                .prepare_broker_tool_yield_receipt(
+                    session,
+                    bamboo_storage::v2::BrokerTerminalRoute {
+                        activation_run_id,
+                        broker_identity: &delivery.broker_identity,
+                        parent_mailbox: &delivery.parent_mailbox,
+                        broker_correlation_id: &delivery.correlation_id,
+                        message_ids: &delivery.message_ids,
+                    },
+                    &proof,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+        } else {
+            store
+                .prepare_broker_terminal_receipt(
+                    session,
+                    activation_run_id,
+                    &delivery.broker_identity,
+                    &delivery.parent_mailbox,
+                    &delivery.correlation_id,
+                    &delivery.message_ids,
+                )
+                .await
+                .map_err(|error| format!("Host broker receipt prepare failed: {error}"))?;
+        }
         Ok(true)
     }
 
@@ -2611,6 +2700,34 @@ impl ExternalChildRunner for ActorChildRunner {
         activation_run_id: &str,
         save_succeeded: bool,
     ) -> Result<(), String> {
+        if save_succeeded
+            && session
+                .metadata
+                .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+        {
+            let service = self
+                .ticket_service
+                .lock()
+                .recover_poison()
+                .clone()
+                .ok_or_else(|| {
+                    "Ticket authority unavailable for terminal checkpoint".to_string()
+                })?;
+            let runtime = self
+                .session_inbox_runtime
+                .lock()
+                .recover_poison()
+                .clone()
+                .ok_or_else(|| "Ticket runtime unavailable for terminal checkpoint".to_string())?;
+            crate::ticket_runtime::checkpoint_ticket_result(
+                &service,
+                runtime.storage.as_ref(),
+                session,
+                activation_run_id,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        }
         let key = (
             session.id.clone(),
             session.created_at,
@@ -2695,6 +2812,7 @@ impl ExternalChildRunner for ActorChildRunner {
         let session_inbox_runtime = self.session_inbox_runtime.lock().recover_poison().clone();
         let actor_directory_store = self.actor_directory_store.lock().recover_poison().clone();
         let canonical_subagent_tool = self.canonical_subagent_tool.lock().recover_poison().clone();
+        let ticket_service = self.ticket_service.lock().recover_poison().clone();
         let actor_event_observer = self.actor_event_observer.lock().recover_poison().clone();
         let required_context = bamboo_domain::ChildContextBinding::from_session(session)
             .map_err(|error| AgentError::Budget(error.to_string()))?;
@@ -2710,6 +2828,9 @@ impl ExternalChildRunner for ActorChildRunner {
             .map(|binding| binding.payload.required_assignment.clone())
             .unwrap_or_else(|| extract_assignment(session));
         let mut spec = self.build_live_spec(session, job).await;
+        // Reject before remote routing, Actor claims, provisioning or Ticket
+        // Run admission: resident workers cannot produce local owned stop proof.
+        ensure_ticket_placement_is_enforceable(session, &spec)?;
         let scoped_route = self.scoped_placement_route(&spec)?;
         let strict_remote = scoped_route.as_ref();
         if strict_remote.is_some() && !matches!(spec.executor, ExecutorSpec::BambooRuntime) {
@@ -2863,7 +2984,10 @@ impl ExternalChildRunner for ActorChildRunner {
                 .is_some_and(|ceiling| ceiling.tools == ["Glob"]);
         let local_history_tools = (plain_actor_store.is_none()
             && required_context.is_some()
-            && crate::session_app::child_session::named_profile::has_named_profile(session)
+            && (crate::session_app::child_session::named_profile::has_named_profile(session)
+                || session
+                    .metadata
+                    .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY))
             && matches!(spec.placement, Placement::Local)
             && matches!(spec.executor, ExecutorSpec::BambooRuntime))
         .then(|| spec.capabilities.native_tool_ceiling.as_ref())
@@ -3490,6 +3614,39 @@ impl ExternalChildRunner for ActorChildRunner {
             } else {
                 permission_policy.clone()
             };
+            if session
+                .metadata
+                .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+            {
+                let admission = async {
+                    let service = ticket_service
+                        .as_ref()
+                        .ok_or_else(|| AgentError::LLM("Ticket authority unavailable".into()))?;
+                    let runtime = session_inbox_runtime.as_ref().ok_or_else(|| {
+                        AgentError::LLM("Ticket activation runtime unavailable".into())
+                    })?;
+                    let run_id = bound_activation_run_id
+                        .as_deref()
+                        .ok_or_else(|| AgentError::LLM("Ticket activation owner missing".into()))?;
+                    crate::ticket_runtime::admit_ticket_run(service, runtime, session, run_id)
+                        .await
+                        .map_err(|e| AgentError::LLM(e.to_string()))
+                }
+                .await;
+                if let Err(error) = admission {
+                    if let (Some(runtime), Some(run_id)) = (
+                        session_inbox_runtime.as_ref(),
+                        bound_activation_run_id.as_deref(),
+                    ) {
+                        runtime
+                            .router
+                            .detach_delivery_sink(&job.child_session_id, run_id)
+                            .await;
+                    }
+                    actor.worker.kill().await;
+                    return Err(error);
+                }
+            }
             let mut run_spec = RunSpec {
                 // Cloned (not moved) so a retry can re-dispatch to a fresh worker.
                 assignment: assignment.clone(),
@@ -3687,6 +3844,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 session_inbox_runtime: session_inbox_runtime.as_ref(),
                 actor_directory_store: actor_directory_store.as_deref(),
                 canonical_subagent_tool: canonical_subagent_tool.clone(),
+                ticket_service: ticket_service.clone(),
                 activation_run_id: bound_activation_run_id.as_deref(),
                 execution_epoch,
                 expected_source_actor_id: &actor.mailbox_id,
@@ -3895,7 +4053,44 @@ impl ExternalChildRunner for ActorChildRunner {
         if remote {
             drop(actor);
         } else if required_context.is_some() {
-            actor.worker.kill().await;
+            if session
+                .metadata
+                .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+            {
+                let service = self.ticket_service.lock().recover_poison().clone();
+                let runtime = self.session_inbox_runtime.lock().recover_poison().clone();
+                let owned_run_id = crate::ticket_runtime::read_dispatch(session)
+                    .ok()
+                    .flatten()
+                    .and_then(|dispatch| dispatch.receipt.map(|receipt| receipt.run_id));
+                match actor.worker.kill_confirmed().await {
+                    Ok(proof) => {
+                        if let (Some(service), Some(runtime), Some(run_id)) =
+                            (service, runtime, owned_run_id.as_deref())
+                        {
+                            if let Err(error) = crate::ticket_runtime::checkpoint_owned_ticket_stop(
+                                &service,
+                                &runtime,
+                                session,
+                                run_id,
+                                &proof,
+                                result.is_ok(),
+                            )
+                            .await
+                            {
+                                // The canonical terminal save can retain output
+                                // and retry this stop fact before broker ACK.
+                                tracing::warn!(child_id = %session.id, %error, "Ticket owned-process stop publication retained for reconciliation");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(child_id = %session.id, %error, "Ticket process stop remains unconfirmed; resources retained");
+                    }
+                }
+            } else {
+                actor.worker.kill().await;
+            }
         } else {
             match &result {
                 Ok(_) => self.release_bus_worker(&pool_key, actor).await,
@@ -3926,13 +4121,7 @@ impl ExternalChildRunner for ActorChildRunner {
                                 *session = committed;
                                 for message in messages {
                                     let _ = event_tx
-                                        .send(AgentEvent::MessageAppended {
-                                            session_id: session.id.clone(),
-                                            message_id: message.id,
-                                            role: message.role,
-                                            content: message.content,
-                                            created_at: message.created_at,
-                                        })
+                                        .send(AgentEvent::message_appended(&session.id, &message))
                                         .await;
                                 }
                                 activation.finish(ActorActivationFinish::Succeeded).await
@@ -4609,32 +4798,41 @@ impl PlainActorActivation {
     {
         Box::pin(async move {
             let message = bamboo_agent_core::Message::assistant(text, None);
-            *session = self
-                .store
-                .append_actor_transcript(bamboo_storage::ActorTranscriptAppend {
-                    fence: self.fence.clone(),
-                    expected_created_at: self.created_at,
-                    expected_messages: session.messages.clone(),
-                    expected_provider_transcript: self.provider_transcript.clone(),
-                    messages: vec![message.clone()],
-                    native_groups: Vec::new(),
-                })
-                .await
-                .map_err(|error| {
-                    tracing::warn!(
-                        %error,
-                        "Actor reply checkpoint rejected or unconfirmed; durable history is preserved"
-                    );
-                    AgentError::LLM(format!("actor reply commit failed: {error}"))
-                })?;
+            let request = bamboo_storage::ActorTranscriptAppend {
+                fence: self.fence.clone(),
+                expected_created_at: self.created_at,
+                expected_messages: session.messages.clone(),
+                expected_provider_transcript: self.provider_transcript.clone(),
+                messages: vec![message.clone()],
+                native_groups: Vec::new(),
+            };
+            let mut retries = 0;
+            *session = loop {
+                let result = self.store.append_actor_transcript(request.clone()).await;
+                if matches!(
+                    &result,
+                    Err(bamboo_storage::ActorTranscriptAppendError::PrefixConflict)
+                ) && retries < 3
+                {
+                    // Parent writes may change the ancestor witness before
+                    // publication. Retry this exact reply and Child prefix;
+                    // never reload/adopt a different transcript or replay an
+                    // unconfirmed write. Storage rechecks the same live fence.
+                    tokio::time::sleep(Duration::from_millis(10 << retries)).await;
+                    retries += 1;
+                    continue;
+                }
+                break result;
+            }
+            .map_err(|error| {
+                tracing::warn!(
+                    %error,
+                    "Actor reply checkpoint rejected or unconfirmed; durable history is preserved"
+                );
+                AgentError::LLM(format!("actor reply commit failed: {error}"))
+            })?;
             let _ = event_tx
-                .send(AgentEvent::MessageAppended {
-                    session_id: session.id.clone(),
-                    message_id: message.id,
-                    role: message.role,
-                    content: message.content,
-                    created_at: message.created_at,
-                })
+                .send(AgentEvent::message_appended(&session.id, &message))
                 .await;
             Ok(())
         })
@@ -4948,9 +5146,57 @@ struct LocalToolCollector {
     messages: Option<Vec<bamboo_agent_core::Message>>,
     starts: HashMap<String, (String, serde_json::Value)>,
     outcomes: HashMap<String, (bool, String)>,
+    // Installed only by the Host's exact Task callback receipt. Worker event
+    // JSON and transcript metadata cannot grant this terminal exception.
+    ticket_yield: Option<(String, bamboo_tickets::PendingRequest)>,
 }
 
 impl LocalToolCollector {
+    fn ticket_event(
+        &self,
+        value: &serde_json::Value,
+        committed: &HashMap<String, serde_json::Value>,
+    ) -> Result<bool, AgentError> {
+        if value["type"] == bamboo_subagent::proto::LocalToolMessages::TYPE {
+            return Ok(true);
+        }
+        match serde_json::from_value::<AgentEvent>(value.clone())
+            .map_err(|_| local_tool_history_unsupported())?
+        {
+            AgentEvent::ToolStart { tool_name, .. }
+                if !matches!(tool_name.as_str(), "Task" | "Read" | "Write") =>
+            {
+                Err(local_tool_history_unsupported())
+            }
+            AgentEvent::ToolComplete {
+                tool_call_id,
+                result,
+            } if result.success => {
+                let Some((name, args)) = self.starts.get(&tool_call_id) else {
+                    return Err(local_tool_history_unsupported());
+                };
+                let valid = if name == "Task" {
+                    committed.get(&tool_call_id) == Some(args)
+                } else {
+                    committed.get(&tool_call_id).is_some_and(|proof| {
+                        proof["file_tool"] == *name
+                            && proof["arguments"] == *args
+                            && proof["result"] == result.result
+                    })
+                };
+                if !valid {
+                    return Err(AgentError::LLM(
+                        "LocalPlan success has no exact Host receipt".into(),
+                    ));
+                }
+                Ok(true)
+            }
+            // Only the committed Host projection may publish a plan update.
+            AgentEvent::TaskListUpdated { .. } => Ok(false),
+            _ => Ok(true),
+        }
+    }
+
     fn event(&mut self, value: &serde_json::Value) -> Result<bool, AgentError> {
         use bamboo_subagent::proto::LocalToolMessages;
         if self.messages.is_some() {
@@ -4975,7 +5221,7 @@ impl LocalToolCollector {
                 arguments,
             } => {
                 if !arguments.is_object()
-                    || !matches!(tool_name.as_str(), "Read" | "Glob" | "Write")
+                    || !matches!(tool_name.as_str(), "Read" | "Glob" | "Write" | "Task")
                     || tool_call_id.is_empty()
                     || tool_call_id.len() > 128
                     || self.starts.len() >= LocalToolMessages::MAX_PAIRS
@@ -5019,8 +5265,8 @@ impl LocalToolCollector {
                 ..
             } => {
                 if self.starts.get(&tool_call_id).map(|(name, _)| name) != Some(&tool_name)
-                    || is_mutating != (tool_name == "Write")
-                    || auto_approved != (tool_name != "Write")
+                    || is_mutating != matches!(tool_name.as_str(), "Write" | "Task")
+                    || auto_approved != !matches!(tool_name.as_str(), "Write" | "Task")
                     || !matches!(phase.as_str(), "begin" | "finished" | "error" | "cancelled")
                 {
                     return Err(local_tool_history_unsupported());
@@ -5128,7 +5374,10 @@ impl LocalToolCollector {
                                 || call.tool_type != "function"
                                 || !calls.insert(call.id.clone())
                                 || calls.len() > LocalToolMessages::MAX_MESSAGES
-                                || !matches!(call.function.name.as_str(), "Read" | "Glob" | "Write")
+                                || !matches!(
+                                    call.function.name.as_str(),
+                                    "Read" | "Glob" | "Write" | "Task"
+                                )
                                 || self.starts.get(&call.id).is_some_and(|(name, actual)| {
                                     name != &call.function.name || actual != &arguments
                                 })
@@ -5182,8 +5431,10 @@ impl LocalToolCollector {
                         if object.len() != 5
                             || metadata["elapsed_ms"].as_u64().is_none()
                             || metadata["tool_name"].as_str() != Some(name.as_str())
-                            || metadata["is_mutating"].as_bool() != Some(name == "Write")
-                            || metadata["auto_approved"].as_bool() != Some(name != "Write")
+                            || metadata["is_mutating"].as_bool()
+                                != Some(matches!(name.as_str(), "Write" | "Task"))
+                            || metadata["auto_approved"].as_bool()
+                                != Some(!matches!(name.as_str(), "Write" | "Task"))
                             || metadata["success"].as_bool() != Some(success)
                         {
                             return Err(local_tool_history_unsupported());
@@ -5194,13 +5445,23 @@ impl LocalToolCollector {
             }
         }
         let last = suffix.last().ok_or_else(local_tool_history_unsupported)?;
+        let question_terminal = self.ticket_yield.as_ref().is_some_and(|(id, question)| {
+            last.role == Role::Tool
+                && last.tool_call_id.as_ref() == Some(id)
+                && last.tool_success == Some(true)
+                && self.starts.get(id).is_some_and(|(name, _)| name == "Task")
+                && terminal.is_none_or(str::is_empty)
+                && serde_json::from_str::<serde_json::Value>(&last.content).ok()
+                    == Some(serde_json::json!({"status":"waiting_for_answer", "request":question}))
+        });
+        let report_terminal = last.role == Role::Assistant
+            && last.tool_calls.is_none()
+            && last.phase != Some(bamboo_domain::MessagePhase::Commentary)
+            && terminal == Some(last.content.as_str());
         if !pending.is_empty()
             || used.len() != self.outcomes.len()
             || self.starts.keys().any(|id| !used.contains(id))
-            || last.role != Role::Assistant
-            || last.tool_calls.is_some()
-            || last.phase == Some(bamboo_domain::MessagePhase::Commentary)
-            || terminal != Some(last.content.as_str())
+            || !(report_terminal || question_terminal)
         {
             return Err(local_tool_history_unsupported());
         }
@@ -5984,6 +6245,7 @@ struct ActorDriveContext<'a> {
     session_inbox_runtime: Option<&'a SessionInboxRuntimeBinding>,
     actor_directory_store: Option<&'a bamboo_storage::SessionStoreV2>,
     canonical_subagent_tool: Option<Arc<dyn bamboo_agent_core::tools::Tool>>,
+    ticket_service: Option<Arc<bamboo_tickets::TicketService>>,
     activation_run_id: Option<&'a str>,
     execution_epoch: u64,
     expected_source_actor_id: &'a str,
@@ -7242,6 +7504,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         session_inbox_runtime,
         actor_directory_store,
         canonical_subagent_tool,
+        ticket_service,
         activation_run_id,
         execution_epoch,
         expected_source_actor_id,
@@ -7292,6 +7555,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         HashMap::new();
     let mut owned_tree_requests = 0usize;
     let mut canonical_subagent_requests = 0usize;
+    let mut committed_plan_calls = HashMap::new();
     // Once this Run registers a canonical Child wait, a fast completion may
     // clear it before the Worker sends Terminal. Keep the current Run
     // nonterminal so its already admitted outcome belongs to the successor.
@@ -7513,7 +7777,10 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 if permission_handshake.is_awaiting() && event["type"] != "permission_posture_activated" {
                                     return Err(local_tool_history_unsupported());
                                 }
-                                publish = collector.event(&event)?;
+                                if logical_session.metadata.contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY) {
+                                    publish = collector.ticket_event(&event, &committed_plan_calls)?;
+                                }
+                                publish &= collector.event(&event)?;
                             } else if event["type"] == bamboo_subagent::proto::LocalToolMessages::TYPE {
                                 // Completion DATA is private and grants nothing on an unselected route.
                                 publish = false;
@@ -7595,6 +7862,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             return Err(AgentError::LLM("owned tree request limit exceeded".into()));
                         }
                         let page = if id.len() <= 128
+                            && !logical_session.metadata.contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
                             && cursor.as_ref().is_none_or(|value| !value.is_empty() && value.len() <= 128)
                             && !cancel_token.is_cancelled()
                         {
@@ -7640,11 +7908,77 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             || (args.get("action").and_then(|value| value.as_str()) == Some("create")
                                 && args.get("wait").and_then(|value| value.as_bool()) == Some(true));
                         let checkpoint_payload = args.get(PARENT_QUESTION_CHECKPOINT_ACTION).cloned();
-                        let result = if valid_shape
+                        let ticket_bootstrap_pending = valid_shape
+                            && logical_session.metadata.contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+                            && args == serde_json::json!({(crate::ticket_worker_plan::TICKET_PLAN_ACTION): {"read":true}})
+                            && permission_handshake.is_awaiting()
+                            && !cancel_token.is_cancelled();
+                        let result = if ticket_bootstrap_pending {
+                            // A read control can overtake the queued posture
+                            // event on the separate lanes. Keep the handshake
+                            // fence; the exact bootstrap read may retry briefly.
+                            serde_json::json!({"error":crate::ticket_worker_plan::remote::TICKET_BOOTSTRAP_POSTURE_PENDING})
+                        } else if valid_shape
+                            && (!logical_session.metadata.contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+                                || args.get(crate::ticket_worker_plan::TICKET_PLAN_ACTION).is_some()
+                                || args.get(crate::ticket_worker_plan::files::TICKET_FILE_ACTION).is_some())
                             && !cancel_token.is_cancelled()
                             && !permission_handshake.is_awaiting()
                         {
-                            if let Some(payload) = checkpoint_payload {
+                            if args.get(crate::ticket_worker_plan::TICKET_PLAN_ACTION).is_some() {
+                                match (ticket_service.as_deref(), actor_directory_store,
+                                    session_inbox_runtime, activation_run_id, expected_creation) {
+                                    (Some(service), Some(store), Some(binding), Some(run_id), Some(creation)) => {
+                                        if let Some(caller) = load_active_subagent_caller(
+                                            store, binding, run_id, child_session_id,
+                                            parent_session_id, logical_session, creation, plain_input,
+                                        ).await {
+                                            match crate::ticket_worker_plan::remote::apply_host_plan_request(service, &caller, run_id, &args, &tool_call_id) {
+                                                Ok(projection) => {
+                                                    logical_session.task_list = projection.task_list.clone();
+                                                    logical_session.set_task_list_version_meta(projection.plan_revision.to_string());
+                                                    if let Some(question) = &projection.question {
+                                                        let raw = serde_json::to_string(question).map_err(|_| local_tool_history_unsupported())?;
+                                                        logical_session.metadata.insert(crate::ticket_worker_plan::TICKET_QUESTION_YIELD_KEY.into(), raw);
+                                                        if let Some(collector) = local_history.as_mut() {
+                                                            collector.ticket_yield = Some((tool_call_id.clone(), question.clone()));
+                                                        }
+                                                    }
+                                                    if let Some(task) = args[crate::ticket_worker_plan::TICKET_PLAN_ACTION].get("task") {
+                                                        committed_plan_calls.insert(tool_call_id.clone(), task.clone());
+                                                        if let Some(task_list) = projection.task_list.clone() {
+                                                            let _ = event_tx.send(AgentEvent::TaskListUpdated {
+                                                                task_list,
+                                                                version: Some(projection.plan_revision),
+                                                            }).await;
+                                                        }
+                                                    }
+                                                    serde_json::json!({"result":projection})
+                                                }
+                                                Err(error) => serde_json::json!({"error":error.to_string()}),
+                                            }
+                                        } else { serde_json::json!({"error":"LocalPlan Child Run is no longer current"}) }
+                                    }
+                                    _ => serde_json::json!({"error":"LocalPlan Host authority unavailable"}),
+                                }
+                            } else if args.get(crate::ticket_worker_plan::files::TICKET_FILE_ACTION).is_some() {
+                                match (ticket_service.as_deref(), actor_directory_store, session_inbox_runtime,
+                                    activation_run_id, expected_creation, local_history_tools) {
+                                    (Some(service),Some(store),Some(binding),Some(run_id),Some(creation),Some(ceiling)) => {
+                                        if let Some(caller)=load_active_subagent_caller(store,binding,run_id,child_session_id,parent_session_id,logical_session,creation,plain_input).await {
+                                            match crate::ticket_worker_plan::files::apply_host_file_request(service,&caller,run_id,&args,&tool_call_id,ceiling) {
+                                                Ok(reply)=>{
+                                                    let body=&args[crate::ticket_worker_plan::files::TICKET_FILE_ACTION];
+                                                    committed_plan_calls.insert(tool_call_id.clone(),serde_json::json!({"file_tool":body["tool"],"arguments":body["arguments"],"result":serde_json::to_string(&reply).map_err(|_|local_tool_history_unsupported())?}));
+                                                    serde_json::json!({"result":reply})
+                                                },
+                                                Err(error)=>serde_json::json!({"error":error.to_string()}),
+                                            }
+                                        } else { serde_json::json!({"error":"Ticket file Child Run is no longer current"}) }
+                                    },
+                                    _=>serde_json::json!({"error":"Ticket file Host authority unavailable"}),
+                                }
+                            } else if let Some(payload) = checkpoint_payload {
                                 let parsed = (args.as_object().is_some_and(|object| object.len() == 1))
                                     .then(|| serde_json::from_value::<ParentQuestionCheckpointV1>(payload).ok())
                                     .flatten()
@@ -7708,6 +8042,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             .map_err(|_| AgentError::LLM("canonical SubAgent reply transport closed".into()))?;
                     }
                     Ok(Some(ChildFrame::ApprovalRequest { id, body })) => {
+                        if logical_session.metadata.contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY) {
+                            return Err(AgentError::LLM("Ticket Task-only Worker cannot request unrelated action authority".into()));
+                        }
                         if plain_actor { return Err(plain_actor_unsupported()); }
                         if permission_handshake.is_awaiting() {
                             return Err(AgentError::LLM(
@@ -9407,6 +9744,98 @@ mod tests {
     }
 
     #[test]
+    fn ticket_task_event_requires_exact_host_callback_receipt() {
+        let mut collector = LocalToolCollector::default();
+        let args = serde_json::json!({"tasks":[{"content":"own step","status":"pending"}]});
+        let start = serde_json::to_value(AgentEvent::ToolStart {
+            tool_call_id: "task-call".into(),
+            tool_name: "Task".into(),
+            arguments: args.clone(),
+        })
+        .unwrap();
+        let mut receipts = HashMap::new();
+        assert!(collector.ticket_event(&start, &receipts).unwrap());
+        collector.event(&start).unwrap();
+        let complete = serde_json::to_value(AgentEvent::ToolComplete {
+            tool_call_id: "task-call".into(),
+            result: bamboo_agent_core::tools::ToolResult::text(true, "done"),
+        })
+        .unwrap();
+        assert!(collector.ticket_event(&complete, &receipts).is_err());
+        receipts.insert("other-call".into(), args.clone());
+        assert!(collector.ticket_event(&complete, &receipts).is_err());
+        receipts.insert("task-call".into(), serde_json::json!({"tasks":[]}));
+        assert!(collector.ticket_event(&complete, &receipts).is_err());
+        receipts.insert("task-call".into(), args);
+        assert!(collector.ticket_event(&complete, &receipts).unwrap());
+        let forged_root = serde_json::to_value(AgentEvent::TaskListUpdated {
+            task_list: bamboo_tools::TaskTool::task_list_from_args(
+                &serde_json::json!({"tasks":[{"content":"forged root","status":"completed"}]}),
+                "root",
+            )
+            .unwrap(),
+            version: Some(999),
+        })
+        .unwrap();
+        assert!(!collector.ticket_event(&forged_root, &receipts).unwrap());
+    }
+
+    #[test]
+    fn ticket_question_terminal_requires_exact_host_receipt_and_tool_result() {
+        use bamboo_agent_core::{FunctionCall, Message, ToolCall};
+        let mut host = Session::new("question-child", "model");
+        host.messages.push(Message::user("own assignment"));
+        let question: bamboo_tickets::PendingRequest = serde_json::from_value(serde_json::json!({
+            "id":"own-question", "work_id":"own-work", "assignment_id":"own-assignment",
+            "generation":1, "contract_revision":1, "prompt_revision":1,
+            "kind":{"kind":"question"}, "prompt":"精确问题", "status":"open",
+            "answer":null, "consumed_attempt":null, "worker_packet_hash":"a".repeat(64), "updated_seq":3
+        })).unwrap();
+        let args = serde_json::json!({"tasks":[{"content":"own step","status":"blocked"}], "question":{"prompt":"精确问题"}});
+        for case in ["exact", "no_host_receipt", "forged_request", "fake_report"] {
+            let mut returned =
+                serde_json::json!({"status":"waiting_for_answer", "request":question});
+            if case == "forged_request" {
+                returned["request"]["id"] = serde_json::json!("sibling-question");
+            }
+            let text = returned.to_string();
+            let rows = [
+                Message::assistant(
+                    "",
+                    Some(vec![ToolCall {
+                        id: "own-call".into(),
+                        tool_type: "function".into(),
+                        function: FunctionCall {
+                            name: "Task".into(),
+                            arguments: args.to_string(),
+                        },
+                    }]),
+                ),
+                Message::tool_result_with_status("own-call", &text, true),
+            ];
+            let collector = LocalToolCollector {
+                messages: Some(host.messages.iter().cloned().chain(rows).collect()),
+                starts: HashMap::from([("own-call".into(), ("Task".into(), args.clone()))]),
+                outcomes: HashMap::from([("own-call".into(), (true, text))]),
+                ticket_yield: (case != "no_host_receipt")
+                    .then(|| ("own-call".into(), question.clone())),
+            };
+            let terminal = if case == "fake_report" {
+                Some("fake delivery")
+            } else {
+                Some("")
+            };
+            assert_eq!(
+                collector
+                    .suffix(&host, &["Task".into()], false, terminal)
+                    .is_ok(),
+                case == "exact",
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
     fn local_tool_suffix_preserves_full_current_prefix_and_rejects_authority_or_collisions() {
         let mut host = Session::new("tool-history-prefix", "model");
         host.messages
@@ -9746,11 +10175,18 @@ mod tests {
             "source",
             "birth",
             "qos",
+            "ticket_forged_success",
         ] {
             let mut session = Session::new_child("frame-child", "frame-root", "model", "child");
             session
                 .messages
                 .push(bamboo_agent_core::Message::user("original"));
+            if case == "ticket_forged_success" {
+                session.metadata.insert(
+                    crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
+                    "assignment".into(),
+                );
+            }
             let before = serde_json::to_value(&session).unwrap();
             let creation = bamboo_subagent::proto::ChildCreationIdentity {
                 created_at: session.created_at,
@@ -9800,6 +10236,19 @@ mod tests {
                         .created_at += chrono::Duration::nanoseconds(1)
                 }
                 "qos" => batch.qos = bamboo_subagent::proto::ActorEventQos::Ephemeral,
+                "ticket_forged_success" => {
+                    batch.last_seq = 2;
+                    batch.events = vec![
+                        serde_json::to_value(AgentEvent::ToolStart {
+                            tool_call_id: "forged".into(), tool_name: "Task".into(),
+                            arguments: serde_json::json!({"tasks":[{"content":"own step","status":"pending"}]}),
+                        }).unwrap(),
+                        serde_json::to_value(AgentEvent::ToolComplete {
+                            tool_call_id: "forged".into(),
+                            result: bamboo_agent_core::tools::ToolResult::text(true, "uncommitted"),
+                        }).unwrap(),
+                    ];
+                }
                 _ => {}
             }
             let terminal = ChildFrame::Terminal {
@@ -9829,7 +10278,12 @@ mod tests {
             let (_live, mut live_rx) = mpsc::unbounded_channel();
             let (_delivery, mut delivery_rx) = mpsc::unbounded_channel();
             let cancel = CancellationToken::new();
-            let tools = vec!["Read".into()];
+            let tools = vec![if case == "ticket_forged_success" {
+                "Task"
+            } else {
+                "Read"
+            }
+            .into()];
             let outcome = drive(ActorDriveContext {
                 client: &mut link,
                 parent_session_id: "frame-root",
@@ -9849,6 +10303,7 @@ mod tests {
                 session_inbox_runtime: None,
                 actor_directory_store: None,
                 canonical_subagent_tool: None,
+                ticket_service: None,
                 activation_run_id: Some("current"),
                 execution_epoch: 7,
                 expected_source_actor_id: "selected",
@@ -9867,6 +10322,16 @@ mod tests {
             })
             .await;
             assert!(outcome.is_err(), "{case}: no last-text success fallback");
+            if case == "ticket_forged_success" {
+                assert!(outcome
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no exact Host receipt"));
+                assert!(matches!(
+                    rx.try_recv().unwrap(),
+                    AgentEvent::ToolStart { .. }
+                ));
+            }
             assert_eq!(serde_json::to_value(&session).unwrap(), before, "{case}");
             assert!(link.sent.is_empty());
             assert!(rx.try_recv().is_err(), "DATA must never enter public feed");
@@ -10105,6 +10570,7 @@ mod tests {
                 session_inbox_runtime: Some(&binding),
                 actor_directory_store: None,
                 canonical_subagent_tool: None,
+                ticket_service: None,
                 activation_run_id: Some("current"),
                 execution_epoch: 7,
                 expected_source_actor_id: "selected",
@@ -12890,6 +13356,7 @@ mod tests {
             session_inbox_runtime: None,
             actor_directory_store: None,
             canonical_subagent_tool: None,
+            ticket_service: None,
             activation_run_id: None,
             execution_epoch: 0,
             expected_source_actor_id: session_id,
@@ -13002,6 +13469,7 @@ mod tests {
                 session_inbox_runtime: None,
                 actor_directory_store: None,
                 canonical_subagent_tool: None,
+                ticket_service: None,
                 activation_run_id: None,
                 execution_epoch: 0,
                 expected_source_actor_id: "remote-terminal-proof",
@@ -13111,6 +13579,7 @@ mod tests {
                 session_inbox_runtime: None,
                 actor_directory_store: Some(&store),
                 canonical_subagent_tool: None,
+                ticket_service: None,
                 activation_run_id: Some("cancelled-remote-run"),
                 execution_epoch: 0,
                 expected_source_actor_id: "cancelled-remote-worker",
@@ -14314,6 +14783,7 @@ mod tests {
             session_inbox_runtime: Some(&binding),
             actor_directory_store: None,
             canonical_subagent_tool: None,
+            ticket_service: None,
             activation_run_id: Some(run_id),
             execution_epoch: 0,
             expected_source_actor_id: session_id,
@@ -15335,6 +15805,7 @@ mod tests {
                 session_inbox_runtime: None,
                 actor_directory_store: None,
                 canonical_subagent_tool: None,
+                ticket_service: None,
                 activation_run_id: None,
                 execution_epoch: 0,
                 expected_source_actor_id: "child-reviewer",
@@ -15412,6 +15883,7 @@ mod tests {
                 session_inbox_runtime: None,
                 actor_directory_store: None,
                 canonical_subagent_tool: None,
+                ticket_service: None,
                 activation_run_id: None,
                 execution_epoch: 0,
                 expected_source_actor_id: "child-no-reviewer",
@@ -15487,6 +15959,7 @@ mod tests {
             session_inbox_runtime: None,
             actor_directory_store: None,
             canonical_subagent_tool: None,
+            ticket_service: None,
             activation_run_id: None,
             execution_epoch: 0,
             expected_source_actor_id: "child-x",
@@ -15539,6 +16012,7 @@ mod tests {
             session_inbox_runtime: None,
             actor_directory_store: None,
             canonical_subagent_tool: None,
+            ticket_service: None,
             activation_run_id: None,
             execution_epoch: 0,
             expected_source_actor_id: "child-y",
@@ -16121,6 +16595,88 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("Codex executor"), "{message}");
         assert!(message.contains("command execution"), "{message}");
+    }
+
+    #[test]
+    fn ticket_placement_keeps_local_and_ordinary_remote_execution_available() {
+        let runner = bogus_runner(HashMap::new());
+        let ordinary = session_of_role("worker", "ordinary work");
+        for placement in [
+            Placement::Local,
+            Placement::Remote {
+                endpoint: "wss://fixture.invalid/actor".into(),
+            },
+            Placement::Schedulable {
+                pool: "fixture-pool".into(),
+            },
+        ] {
+            let mut spec = runner.build_spec(&ordinary, &job_for("placement"));
+            spec.placement = placement;
+            ensure_ticket_placement_is_enforceable(&ordinary, &spec).unwrap();
+            for marker in [
+                crate::ticket_runtime::TICKET_DISPATCH_KEY,
+                crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY,
+            ] {
+                let mut ticket = ordinary.clone();
+                ticket.metadata.insert(marker.into(), "fixture".into());
+                assert_eq!(
+                    ensure_ticket_placement_is_enforceable(&ticket, &spec).is_ok(),
+                    matches!(spec.placement, Placement::Local)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ticket_placement_rejected_before_remote_route_claim_or_worker_spawn() {
+        for marker in [
+            crate::ticket_runtime::TICKET_DISPATCH_KEY,
+            crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY,
+        ] {
+            for schedulable in [false, true] {
+                let mut session = session_of_role("worker", "Ticket work");
+                session.metadata.insert(marker.into(), "fixture".into());
+                let before = serde_json::to_value(&session).unwrap();
+                let remote = if schedulable {
+                    HashMap::new()
+                } else {
+                    HashMap::from([(
+                        "worker".into(),
+                        ResolvedRemotePlacement {
+                            endpoint: "wss://fixture.invalid/actor".into(),
+                            ..Default::default()
+                        },
+                    )])
+                };
+                let sched = if schedulable {
+                    HashMap::from([(
+                        "worker".into(),
+                        sched_placement("fixture-pool", "wss://fixture.invalid"),
+                    )])
+                } else {
+                    HashMap::new()
+                };
+                let runner = bogus_sched_runner(remote, sched);
+                let (events, mut observations) = mpsc::channel::<AgentEvent>(4);
+                let error = runner
+                    .execute_external_child(
+                        &mut session,
+                        &job_for("ticket-no-remote"),
+                        events,
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Ticket execution requires local placement"),
+                    "{error}"
+                );
+                assert_eq!(serde_json::to_value(&session).unwrap(), before);
+                assert!(observations.try_recv().is_err());
+            }
+        }
     }
 
     #[test]
