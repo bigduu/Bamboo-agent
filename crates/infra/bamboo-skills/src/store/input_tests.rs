@@ -315,7 +315,7 @@ async fn codex_input_source_mode_refresh_is_one_publication() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn codex_input_ignores_linked_optional_sidecar_files_and_directories() {
+async fn codex_input_linked_sidecars_cannot_publish_instruction_authority() {
     use std::os::unix::fs::symlink;
     let temp = tempfile::tempdir().unwrap();
     let root = skill(&temp.path().join("skills"), "portable", "local", "").await;
@@ -334,10 +334,20 @@ async fn codex_input_ignores_linked_optional_sidecar_files_and_directories() {
         ..Default::default()
     });
     store.initialize().await.unwrap();
-    let (definition, entry) = input(&store, "portable", None).await;
-    assert!(definition.short_description.is_none());
-    assert_eq!(entry.invocation_policy["automatic"], true);
-    assert!(!serde_json::to_string(&definition)
+    // The compatibility reader still ignores external optional metadata. The
+    // source-bound Instruction publication must reject its read/link error.
+    let entry = store
+        .skill_catalog_snapshot()
+        .await
+        .entries
+        .into_iter()
+        .find(|entry| entry.id == "portable")
+        .unwrap();
+    assert_eq!(entry.status, WorkflowStatus::Invalid);
+    assert_eq!(entry.invocation_policy["automatic"], false);
+    assert!(store.get_skill("portable").await.is_err());
+    assert!(!store.source_bindings().await.contains_key("portable"));
+    assert!(!serde_json::to_string(&entry)
         .unwrap()
         .contains("EXTERNAL PRIVATE SUMMARY"));
     fs::remove_file(root.join("agents/openai.yaml"))
@@ -351,7 +361,33 @@ async fn codex_input_ignores_linked_optional_sidecar_files_and_directories() {
     )
     .await
     .is_none());
-    assert_eq!(input(&store, "portable", None).await, (definition, entry));
+    store.reload().await.unwrap();
+    let directory_link = store
+        .skill_catalog_snapshot()
+        .await
+        .entries
+        .into_iter()
+        .find(|entry| entry.id == "portable")
+        .unwrap();
+    assert_eq!(directory_link.status, WorkflowStatus::Invalid);
+    assert!(store.get_skill("portable").await.is_err());
+    assert!(!store.source_bindings().await.contains_key("portable"));
+    assert!(!serde_json::to_string(&directory_link)
+        .unwrap()
+        .contains("EXTERNAL PRIVATE SUMMARY"));
+    fs::remove_file(root.join("agents")).await.unwrap();
+    fs::create_dir(root.join("agents")).await.unwrap();
+    store.reload().await.unwrap();
+    let (lkg, valid) = input(&store, "portable", None).await;
+    assert_eq!(valid.invocation_policy["automatic"], true);
+    symlink(outside.join("openai.yaml"), root.join("agents/openai.yaml")).unwrap();
+    store.reload().await.unwrap();
+    let (retained, invalid) = input(&store, "portable", None).await;
+    assert_eq!(retained, lkg);
+    assert!(retained.short_description.is_none());
+    assert_eq!(invalid.status, WorkflowStatus::Invalid);
+    assert_eq!(invalid.invocation_policy["automatic"], true);
+    assert!(!store.source_bindings().await.contains_key("portable"));
 }
 
 #[tokio::test]

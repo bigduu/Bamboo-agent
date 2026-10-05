@@ -393,7 +393,25 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
     max_skill_file_bytes: usize,
     max_skill_candidates: usize,
 ) -> SkillResult<SkillLoadReport> {
+    load_captured_records(
+        discovery_dirs,
+        max_skill_file_bytes,
+        max_skill_candidates,
+        None,
+    )
+    .await
+    .map(|(report, _)| report)
+}
+
+pub(crate) async fn load_captured_records(
+    discovery_dirs: &[SkillDiscoveryDir],
+    max_skill_file_bytes: usize,
+    max_skill_candidates: usize,
+    pool: Option<std::sync::Arc<crate::progressive::source::SourcePool>>,
+) -> SkillResult<(SkillLoadReport, crate::progressive::source::CapturedSources)> {
+    use crate::progressive::source::CandidateKey;
     let mut report = SkillLoadReport::default();
+    let mut captures = crate::progressive::source::CapturedSources::new();
 
     for discovery in discovery_dirs {
         match fs::try_exists(&discovery.dir).await {
@@ -406,6 +424,9 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
                 continue;
             }
             Err(error) => {
+                if pool.is_some() {
+                    return Err(error.into());
+                }
                 warn!(
                     "Failed to check skill discovery dir {:?}: {}",
                     discovery.dir, error
@@ -454,13 +475,66 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
                 });
                 continue;
             }
-            let metadata_bytes = fs::metadata(&skill_file).await?.len() as usize;
-            if metadata_bytes > max_skill_file_bytes {
-                let skill_root = skill_file
+            // The existing deterministic Workflow adapter is not a progressive
+            // Instruction source. Keep its input path and sidecar tolerance.
+            let workflow_marker = pool.is_some()
+                && fs::try_exists(
+                    skill_file
+                        .parent()
+                        .unwrap_or(&discovery.dir)
+                        .join("workflow.yaml"),
+                )
+                .await
+                .unwrap_or(false);
+            let mut captured = if let Some(pool) = pool.as_ref().filter(|_| !workflow_marker) {
+                let pool = pool.clone();
+                let source_root = discovery.dir.clone();
+                let bundle = skill_file
                     .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_default();
-                report.failed.push(FailedSkillRecord {
+                    .unwrap_or(&discovery.dir)
+                    .strip_prefix(&discovery.dir)
+                    .map_err(|_| SkillError::Storage("Skill outside discovery source".into()))?
+                    .to_path_buf();
+                let source = discovery.source;
+                let mode = discovery.mode.clone();
+                match tokio::task::spawn_blocking(move || {
+                    pool.capture(&source_root, &bundle, source, mode, max_skill_file_bytes)
+                })
+                .await
+                .map_err(|error| SkillError::Storage(error.to_string()))?
+                {
+                    Ok(captured) => Some(captured),
+                    Err(error) => {
+                        tracing::debug!(%error, "Skill source capture rejected");
+                        let skill_root =
+                            skill_file.parent().unwrap_or(&discovery.dir).to_path_buf();
+                        report.failed.push(FailedSkillRecord {
+                            skill_id: skill_root
+                                .file_name()
+                                .and_then(|value| value.to_str())
+                                .map(str::to_string),
+                            skill_root,
+                            skill_file,
+                            source: discovery.source,
+                            mode: discovery.mode.clone(),
+                            error: "SKILL.md: failed to capture coherent source".into(),
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let bytes = if let Some(captured) = &mut captured {
+                std::mem::take(&mut captured.main).into_bytes()
+            } else {
+                let metadata_bytes = fs::metadata(&skill_file).await?.len() as usize;
+                if metadata_bytes > max_skill_file_bytes {
+                    let skill_root = skill_file
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    report.failed.push(FailedSkillRecord {
                     skill_id: skill_root.file_name().and_then(|name| name.to_str()).map(str::to_string),
                     skill_root,
                     skill_file,
@@ -468,19 +542,19 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
                     mode: discovery.mode.clone(),
                     error: format!("SKILL.md exceeds per-file limit ({metadata_bytes} > {max_skill_file_bytes} bytes)"),
                 });
-                continue;
-            }
-            let file = open_skill_file_no_follow(&skill_file).await?;
-            let mut bytes = Vec::with_capacity(metadata_bytes.min(max_skill_file_bytes));
-            file.take(max_skill_file_bytes.saturating_add(1) as u64)
-                .read_to_end(&mut bytes)
-                .await?;
-            if bytes.len() > max_skill_file_bytes {
-                let skill_root = skill_file
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_default();
-                report.failed.push(FailedSkillRecord {
+                    continue;
+                }
+                let file = open_skill_file_no_follow(&skill_file).await?;
+                let mut bytes = Vec::with_capacity(metadata_bytes.min(max_skill_file_bytes));
+                file.take(max_skill_file_bytes.saturating_add(1) as u64)
+                    .read_to_end(&mut bytes)
+                    .await?;
+                if bytes.len() > max_skill_file_bytes {
+                    let skill_root = skill_file
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    report.failed.push(FailedSkillRecord {
                     skill_id: skill_root.file_name().and_then(|name| name.to_str()).map(str::to_string),
                     skill_root,
                     skill_file,
@@ -488,11 +562,23 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
                     mode: discovery.mode.clone(),
                     error: format!("SKILL.md exceeds per-file limit after read ({} > {max_skill_file_bytes} bytes)", bytes.len()),
                 });
-                continue;
-            }
+                    continue;
+                }
+                bytes
+            };
             match String::from_utf8(bytes) {
                 Ok(content) => match parse_markdown_skill(&skill_file, &content) {
                     Ok(skill) => {
+                        if let Some(captured) = captured {
+                            captures.insert(
+                                CandidateKey::new(
+                                    skill_file.clone(),
+                                    discovery.source,
+                                    discovery.mode.clone(),
+                                ),
+                                std::sync::Arc::new(captured),
+                            );
+                        }
                         let skill_root = skill_file
                             .parent()
                             .map(Path::to_path_buf)
@@ -563,7 +649,7 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
         report.loaded.len(),
         report.failed.len()
     );
-    Ok(report)
+    Ok((report, captures))
 }
 
 /// Discover additional skill-discovery dirs contributed by installed
