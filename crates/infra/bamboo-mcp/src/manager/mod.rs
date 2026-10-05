@@ -7,11 +7,10 @@ use tracing::{error, info, warn};
 
 use crate::config::{McpConfig, McpServerConfig, TransportConfig};
 use crate::error::{McpError, Result};
-use crate::protocol::{McpProtocolClient, McpTransport};
+use crate::protocol::McpProtocolClient;
 #[cfg(test)]
 use crate::tool_index::ServerToolCatalog;
 use crate::tool_index::{ToolIndex, MAX_MCP_OWNERSHIP_LEDGER_RELATIONSHIPS};
-use crate::transports::{SseTransport, StdioTransport, StreamableHttpTransport};
 use crate::types::{McpEvent, McpTool, RuntimeInfo, ServerStatus};
 use bamboo_llm::Config;
 
