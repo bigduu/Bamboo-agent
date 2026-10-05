@@ -1245,6 +1245,13 @@ fn same_name_approval_needs_exact_id_and_optional_reply_reference_does_not_autho
 fn question_answers_require_exact_named_human_evidence() {
     for (text, quote, answer, second_question, expected) in [
         (
+            "A使用绿色。",
+            "A使用绿色。",
+            "A使用绿色。",
+            false,
+            ResolutionStatus::NeedsClarification,
+        ),
+        (
             "A 使用绿色",
             "A 使用绿色",
             "绿色",
