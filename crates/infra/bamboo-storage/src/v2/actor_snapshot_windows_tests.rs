@@ -319,7 +319,11 @@ async fn regular_file_symlink_replacement_is_rejected_and_open_handle_retains_or
         .file_type()
         .is_symlink());
     assert!(std::fs::metadata(&outside).unwrap().is_file());
-    assert_eq!(std::fs::read_link(&path).unwrap(), outside);
+    // Windows read_link may omit the verbatim prefix from a canonical target.
+    // Compare canonical targets while still rejecting any fixture escape.
+    let target = std::fs::read_link(&path).unwrap().canonicalize().unwrap();
+    assert!(target.starts_with(&home));
+    assert_eq!(target, outside);
     let mut budget = actor_snapshot_reader::ReadBudget::new(ActorSnapshotLimits::default());
     assert_eq!(
         reader
