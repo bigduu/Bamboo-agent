@@ -441,21 +441,50 @@ mod physical {
 #[cfg(not(unix))]
 mod physical {
     use super::*;
-    pub fn parent(_: &Path, _: &Path) -> Result<((), ())> {
-        Err(Error::AuthorityUnavailable(
+    fn unavailable() -> Error {
+        Error::AuthorityUnavailable(
             "Ticket file tools require the tested Unix directory capability".into(),
-        ))
+        )
+    }
+    pub fn parent(_: &Path, _: &Path) -> Result<((), ())> {
+        Err(unavailable())
     }
     pub(super) fn read(_: &(), _: &()) -> Result<Option<FileContents>> {
-        unreachable!()
+        Err(unavailable())
     }
-    pub fn replace(
-        _: &(),
-        _: &(),
-        _: &[u8],
-        _: Option<&FileContents>,
-        _: Option<&str>,
-    ) -> Result<()> {
-        unreachable!()
+    pub fn create_absent(_: &(), _: &(), _: &[u8]) -> Result<()> {
+        Err(unavailable())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn unsupported_platform_file_operations_fail_closed_without_mutation() {
+            let temp = tempfile::tempdir().unwrap();
+            let existing = temp.path().join("existing");
+            let absent = temp.path().join("absent");
+            std::fs::write(&existing, b"external content").unwrap();
+
+            for path in [&existing, &absent] {
+                assert!(matches!(
+                    parent(temp.path(), path),
+                    Err(Error::AuthorityUnavailable(_))
+                ));
+            }
+            assert!(matches!(
+                read(&(), &()),
+                Err(Error::AuthorityUnavailable(_))
+            ));
+            assert!(matches!(
+                create_absent(&(), &(), b"Worker result"),
+                Err(Error::AuthorityUnavailable(_))
+            ));
+
+            assert_eq!(std::fs::read(existing).unwrap(), b"external content");
+            assert!(!absent.exists());
+            assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        }
     }
 }
