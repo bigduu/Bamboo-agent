@@ -30,6 +30,9 @@ pub struct ProviderRegistry {
     providers: RwLock<HashMap<String, Arc<dyn LLMProvider>>>,
     metadata: RwLock<HashMap<String, ProviderMetadata>>,
     default_provider: RwLock<String>,
+    // None preserves registries managed by embedders rather than Config. A
+    // config-built registry always has a map, including explicit empty lists.
+    runtime_models: RwLock<Option<HashMap<String, Vec<String>>>>,
 }
 
 impl ProviderRegistry {
@@ -64,6 +67,7 @@ impl ProviderRegistry {
             providers: RwLock::new(providers),
             metadata: RwLock::new(metadata),
             default_provider: RwLock::new(default_provider),
+            runtime_models: RwLock::new(None),
         }
     }
 
@@ -76,13 +80,12 @@ impl ProviderRegistry {
     /// Providers that fail to initialize (missing API key, auth failure, etc.)
     /// are skipped with a warning log rather than aborting the entire startup.
     pub async fn from_config(config: &Config, app_data_dir: PathBuf) -> Result<Self, LLMError> {
+        bamboo_config::validate_runtime_model_admission(config).map_err(LLMError::Api)?;
         let (providers, metadata, default_provider) =
             Self::build_registry_state(config, app_data_dir).await?;
-        Ok(Self::new_with_metadata(
-            providers,
-            metadata,
-            default_provider,
-        ))
+        let registry = Self::new_with_metadata(providers, metadata, default_provider);
+        registry.apply_runtime_model_config(config)?;
+        Ok(registry)
     }
 
     /// Rebuild the registry in-place from config so existing holders of the outer
@@ -92,14 +95,7 @@ impl ProviderRegistry {
         config: &Config,
         app_data_dir: PathBuf,
     ) -> Result<(), LLMError> {
-        let (providers, metadata, default_provider) =
-            Self::build_registry_state(config, app_data_dir).await?;
-        // Recover from a poisoned lock rather than panicking the whole process: a
-        // poisoned guard's inner data is still usable, and panicking here would be a
-        // permanent DoS on the critical path for every LLM call.
-        *self.providers.write().recover_poison() = providers;
-        *self.metadata.write().recover_poison() = metadata;
-        *self.default_provider.write().recover_poison() = default_provider;
+        self.replace_with(Self::from_config(config, app_data_dir).await?);
         Ok(())
     }
 
@@ -109,11 +105,116 @@ impl ProviderRegistry {
     /// default provider initialized successfully. Keeping construction separate
     /// from publication means a bad edit cannot tear down the working registry.
     pub fn replace_with(&self, candidate: Self) {
-        *self.providers.write().recover_poison() =
-            candidate.providers.into_inner().recover_poison();
+        // Provider handles and admission belong to one authority generation.
+        // Readers use the same lock order so a model admitted to a new relay
+        // account can never be dispatched through the previous account.
+        {
+            let mut providers = self.providers.write().recover_poison();
+            let mut models = self.runtime_models.write().recover_poison();
+            *providers = candidate.providers.into_inner().recover_poison();
+            *models = candidate.runtime_models.into_inner().recover_poison();
+        }
         *self.metadata.write().recover_poison() = candidate.metadata.into_inner().recover_poison();
         *self.default_provider.write().recover_poison() =
             candidate.default_provider.into_inner().recover_poison();
+    }
+
+    fn apply_runtime_model_config(&self, config: &Config) -> Result<(), LLMError> {
+        let mut models = HashMap::new();
+        for provider in self.provider_names() {
+            models.insert(
+                provider.clone(),
+                bamboo_config::provider_runtime_models(config, &provider).map_err(LLMError::Api)?,
+            );
+        }
+        *self.runtime_models.write().recover_poison() = Some(models);
+        Ok(())
+    }
+
+    /// Explicit admission for hosts that construct providers independently.
+    /// Once installed, entries absent from this map admit no models.
+    pub fn set_runtime_models(&self, models: HashMap<String, Vec<String>>) {
+        let models = models
+            .into_iter()
+            .map(|(provider, ids)| {
+                let ids = ids
+                    .into_iter()
+                    .map(|id| id.trim().to_string())
+                    .filter(|id| !id.is_empty())
+                    .collect::<std::collections::BTreeSet<_>>();
+                (provider, ids.into_iter().collect())
+            })
+            .collect();
+        *self.runtime_models.write().recover_poison() = Some(models);
+    }
+
+    /// Admitted IDs; None is an unmanaged embedded registry, never discovery.
+    pub fn runtime_models_for_provider(&self, provider: &str) -> Option<Vec<String>> {
+        self.runtime_models
+            .read()
+            .recover_poison()
+            .as_ref()
+            .map(|models| models.get(provider).cloned().unwrap_or_default())
+    }
+
+    pub fn validate_model(&self, target: &bamboo_domain::ProviderModelRef) -> Result<(), LLMError> {
+        let models = self.runtime_models.read().recover_poison();
+        Self::validate_model_in_snapshot(models.as_ref(), target)
+    }
+
+    fn validate_model_in_snapshot(
+        models: Option<&HashMap<String, Vec<String>>>,
+        target: &bamboo_domain::ProviderModelRef,
+    ) -> Result<(), LLMError> {
+        if let Some(models) = models {
+            if !models
+                .get(&target.provider)
+                .is_some_and(|models| models.iter().any(|model| model == target.model.trim()))
+            {
+                return Err(LLMError::Api(format!(
+                    "Model '{}' is not admitted to runtime for provider '{}'; add it to runtime_models in provider settings",
+                    target.model, target.provider
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Route a provider and validate its model in one coherent admission
+    /// generation. Do not compose `get` + `validate_model` across reloads.
+    pub fn provider_for_model(
+        &self,
+        target: &bamboo_domain::ProviderModelRef,
+    ) -> Result<Arc<dyn LLMProvider>, LLMError> {
+        let providers = self.providers.read().recover_poison();
+        let models = self.runtime_models.read().recover_poison();
+        let provider = providers.get(&target.provider).cloned().ok_or_else(|| {
+            LLMError::Auth(format!(
+                "Provider '{}' not available. Available: {}",
+                target.provider,
+                providers.keys().cloned().collect::<Vec<_>>().join(", ")
+            ))
+        })?;
+        Self::validate_model_in_snapshot(models.as_ref(), target)?;
+        Ok(provider)
+    }
+
+    /// The catalog must enrich exactly the provider generation that admitted
+    /// these IDs, including during account or model-list reloads.
+    pub fn runtime_provider_snapshot(
+        &self,
+        provider: &str,
+    ) -> (Option<Arc<dyn LLMProvider>>, Vec<String>) {
+        let providers = self.providers.read().recover_poison();
+        let models = self.runtime_models.read().recover_poison();
+        (
+            providers.get(provider).cloned(),
+            models
+                .as_ref()
+                .and_then(|models| models.get(provider))
+                .cloned()
+                .unwrap_or_default(),
+        )
     }
 
     async fn build_registry_state(
@@ -359,7 +460,11 @@ impl ProviderRegistry {
     /// Remove a provider by key at runtime (used by instance CRUD / tests).
     pub fn remove(&self, key: &str) -> Option<Arc<dyn LLMProvider>> {
         self.metadata.write().recover_poison().remove(key);
-        self.providers.write().recover_poison().remove(key)
+        let mut providers = self.providers.write().recover_poison();
+        if let Some(models) = self.runtime_models.write().recover_poison().as_mut() {
+            models.remove(key);
+        }
+        providers.remove(key)
     }
 
     /// Update the default provider key.
@@ -504,6 +609,137 @@ mod tests {
         assert_eq!(registry.default_provider_name(), "old-default");
         registry.set_default("new-default".to_string());
         assert_eq!(registry.default_provider_name(), "new-default");
+    }
+
+    #[tokio::test]
+    async fn concurrent_reload_never_routes_a_model_through_another_accounts_provider() {
+        struct AccountProvider(&'static str);
+        #[async_trait::async_trait]
+        impl LLMProvider for AccountProvider {
+            async fn chat_stream(
+                &self,
+                _messages: &[bamboo_domain::Message],
+                _tools: &[bamboo_domain::ToolSchema],
+                _max_output_tokens: Option<u32>,
+                _model: &str,
+            ) -> crate::provider::Result<crate::provider::LLMStream> {
+                unreachable!("routing test does not execute requests")
+            }
+            async fn list_models(&self) -> crate::provider::Result<Vec<String>> {
+                Ok(vec![self.0.into()])
+            }
+        }
+        let candidate = |model: &'static str| {
+            let registry = ProviderRegistry::new(
+                HashMap::from([(
+                    "relay".into(),
+                    Arc::new(AccountProvider(model)) as Arc<dyn LLMProvider>,
+                )]),
+                "relay".into(),
+            );
+            registry.set_runtime_models(HashMap::from([("relay".into(), vec![model.into()])]));
+            registry
+        };
+        let registry = Arc::new(candidate("account-a-model"));
+        let reloading = registry.clone();
+        let writer = std::thread::spawn(move || {
+            for n in 0..4000 {
+                reloading.replace_with(candidate(if n % 2 == 0 {
+                    "account-a-model"
+                } else {
+                    "account-b-model"
+                }));
+            }
+        });
+        let mut routed = 0;
+        for _ in 0..4000 {
+            for model in ["account-a-model", "account-b-model"] {
+                if let Ok(provider) = registry
+                    .provider_for_model(&bamboo_domain::ProviderModelRef::new("relay", model))
+                {
+                    assert_eq!(provider.list_models().await.unwrap(), [model]);
+                    routed += 1;
+                }
+            }
+        }
+        writer.join().unwrap();
+        assert!(routed > 0);
+    }
+
+    #[tokio::test]
+    async fn config_admission_is_preserved_on_reload_and_failed_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.default_provider_instance = Some("relay".into());
+        config.provider_instances.insert(
+            "relay".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "api_key":"sk-fixture", "model":"chat",
+                "runtime_models":["chat", "custom/id"]
+            }))
+            .unwrap(),
+        );
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&config, temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let router = crate::router::ProviderModelRouter::new(registry.clone());
+        assert!(router
+            .route(&bamboo_domain::ProviderModelRef::new("relay", "custom/id"))
+            .is_ok());
+        assert!(router
+            .route(&bamboo_domain::ProviderModelRef::new(
+                "relay",
+                "upstream-only"
+            ))
+            .is_err());
+        assert_eq!(
+            registry.runtime_models_for_provider("relay").unwrap(),
+            ["chat", "custom/id"]
+        );
+        assert!(registry
+            .validate_model(&bamboo_domain::ProviderModelRef::new("relay", "custom/id"))
+            .is_ok());
+        assert!(registry
+            .validate_model(&bamboo_domain::ProviderModelRef::new(
+                "relay",
+                "upstream-only"
+            ))
+            .is_err());
+        assert!(registry
+            .validate_model(&bamboo_domain::ProviderModelRef::new("other", "custom/id"))
+            .is_err());
+
+        config
+            .provider_instances
+            .get_mut("relay")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["chat"]));
+        registry
+            .reload_from_config(&config, temp.path().to_path_buf())
+            .await
+            .unwrap();
+        assert!(registry
+            .validate_model(&bamboo_domain::ProviderModelRef::new("relay", "custom/id"))
+            .is_err());
+
+        config
+            .provider_instances
+            .get_mut("relay")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(null));
+        assert!(registry
+            .reload_from_config(&config, temp.path().to_path_buf())
+            .await
+            .is_err());
+        assert_eq!(
+            registry.runtime_models_for_provider("relay").unwrap(),
+            ["chat"]
+        );
+        assert!(registry.get("relay").is_some());
     }
 
     #[tokio::test]

@@ -304,7 +304,7 @@ impl Fixture {
         actix_web::rt::spawn(running);
         std::fs::write(data.join("config.json"), serde_json::to_vec(&json!({
             "provider":"openai","features":{"provider_model_ref":true},
-            "providers":{"openai":{"api_key":"fixture","base_url":provider_url,"model":"inbox-root","fast_model":"inbox-auxiliary"}},
+            "providers":{"openai":{"api_key":"fixture","base_url":provider_url,"model":"inbox-root","fast_model":"inbox-auxiliary","runtime_models":["inbox-root","inbox-child","inbox-auxiliary"]}},
             "defaults":{"chat":{"provider":"openai","model":"inbox-root"},"fast":{"provider":"openai","model":"inbox-auxiliary"}},
             "subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1}
         })).unwrap()).unwrap();

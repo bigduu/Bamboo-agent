@@ -1801,6 +1801,15 @@ fn is_legacy_provider_type(value: &str) -> bool {
 }
 
 fn validate_providers(value: &ProvidersSection) -> Result<(), String> {
+    let mut model_config = Config::default();
+    model_config.provider_instances = value.provider_instances.clone();
+    model_config.default_provider_instance = value.default_provider_instance.clone();
+    model_config.defaults = value.defaults.clone();
+    if let Some(provider) = &value.provider {
+        model_config.provider = provider.clone();
+    }
+    *model_config.providers_mut() = value.providers.clone();
+    crate::validate_runtime_model_admission(&model_config)?;
     if value
         .provider
         .as_ref()
@@ -10907,6 +10916,26 @@ mod tests {
         ))
         .unwrap();
         assert!(validate_section_envelope("providers.json", &safe_provider_env, 1).is_ok());
+    }
+
+    #[test]
+    fn provider_validator_rejects_invalid_admission_and_removed_role_references() {
+        for models in [json!(null), json!("all"), json!([42]), json!([""])] {
+            let section: ProvidersSection = serde_json::from_value(json!({
+                "provider_instances":{"relay":{"provider_type":"openai", "runtime_models":models}}
+            }))
+            .unwrap();
+            assert!(validate_providers(&section).is_err());
+        }
+        let mut section: ProvidersSection = serde_json::from_value(json!({
+            "provider_instances":{"relay":{"provider_type":"openai", "runtime_models":["custom/id"]}},
+            "defaults":{"chat":{"provider":"relay","model":"assigned"}}
+        })).unwrap();
+        assert!(validate_providers(&section)
+            .unwrap_err()
+            .contains("role assignment"));
+        section.defaults.as_mut().unwrap().chat.model = "custom/id".into();
+        assert!(validate_providers(&section).is_ok());
     }
 
     #[test]

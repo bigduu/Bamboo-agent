@@ -276,7 +276,8 @@ async fn fixture(case: Case) {
     // No worker_bin/worker_args override: both host and worker are this Cargo
     // fixture's actual compiled artifact, using the production current_exe path.
     let mut config = json!({"provider":"openai",
-        "features":{"provider_model_ref":true},"providers":{"openai":{"api_key":"fixture-key","base_url":provider_url,"model":"root-packet-test"}},
+        "features":{"provider_model_ref":true},"providers":{"openai":{"api_key":"fixture-key","base_url":provider_url,"model":"root-packet-test",
+            "runtime_models":["root-packet-test", "child-packet-test"]}},
         "defaults":{"chat":{"provider":"openai","model":"root-packet-test"}},
         "subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1}});
     if case == Case::UnsupportedStartup {

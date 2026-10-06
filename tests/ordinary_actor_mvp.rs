@@ -312,7 +312,7 @@ async fn actual_four_children_two_rounds_collect_parent_results() {
     let handle = running.handle();
     actix_web::rt::spawn(running);
     std::fs::write(data.join("config.json"), serde_json::to_vec(&json!({"provider":"openai","features":{"provider_model_ref":true},
-        "providers":{"openai":{"api_key":"fixture","base_url":provider_url,"model":"plain-root"}},
+        "providers":{"openai":{"api_key":"fixture","base_url":provider_url,"model":"plain-root","runtime_models":["plain-root","plain-child"]}},
         "defaults":{"chat":{"provider":"openai","model":"plain-root"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":4}})).unwrap()).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
