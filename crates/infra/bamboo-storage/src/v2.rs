@@ -89,6 +89,8 @@ mod actor_snapshot_tests;
 mod actor_snapshot_windows_tests;
 #[cfg(test)]
 mod actor_transcript_tests;
+#[cfg(test)]
+mod child_deletion_tests;
 mod child_project;
 mod compact_main;
 #[cfg(test)]
@@ -528,6 +530,13 @@ impl Drop for SessionLifecycleWriteGuard {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
+}
+
+// Field order releases Task before lifecycle, reversing acquisition order.
+// Started Child removal jobs share these actual guards with their async caller.
+struct SessionDeletionGuards {
+    runtime_task: RuntimeTaskTransactionWriteGuard,
+    _lifecycle: SessionLifecycleWriteGuard,
 }
 
 /// Keeps the just-published copy isolated from cross-process storage writers
@@ -1379,6 +1388,8 @@ pub struct SessionStoreV2 {
     default_write_hook:
         std::sync::Mutex<Option<Arc<default_actor_context_tests::DefaultWriteHook>>>,
     #[cfg(test)]
+    child_delete_hook: std::sync::Mutex<Option<Arc<child_deletion_tests::ChildDeleteHook>>>,
+    #[cfg(test)]
     migration_scan_pause: std::sync::Mutex<Option<startup_sidecar_tests::ScanPause>>,
     #[cfg(test)]
     task_write_hook: std::sync::Mutex<Option<Arc<task_publication_lifetime_tests::TaskWriteHook>>>,
@@ -1700,6 +1711,8 @@ impl SessionStoreV2 {
             child_wait_registration_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             default_write_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            child_delete_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             migration_scan_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -5159,9 +5172,13 @@ impl SessionStoreV2 {
     }
 
     pub async fn cleanup(&self, mode: CleanupMode, keep_pinned: bool) -> io::Result<CleanupResult> {
-        let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
-        let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked(&_runtime_task)
+        let lifecycle = self.lock_session_lifecycle_exclusive().await?;
+        let runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
+        let guards = Arc::new(SessionDeletionGuards {
+            runtime_task,
+            _lifecycle: lifecycle,
+        });
+        self.recover_all_runtime_task_transactions_locked(&guards.runtime_task)
             .await?;
         self.recover_all_session_copy_transactions_locked().await?;
 
@@ -5255,10 +5272,14 @@ impl SessionStoreV2 {
 
         // Apply deletions (roots first; they delete children implicitly).
         for root_id in delete_root_ids.iter() {
-            let _ = self.delete_session_recursive_locked(root_id, true).await?;
+            let _ = self
+                .delete_session_recursive_locked(root_id, true, &guards)
+                .await?;
         }
         for child_id in delete_child_ids.iter() {
-            let _ = self.delete_session_recursive_locked(child_id, true).await?;
+            let _ = self
+                .delete_session_recursive_locked(child_id, true, &guards)
+                .await?;
         }
         let mut deleted_session_ids: Vec<String> = deleted_ids.into_iter().collect();
         deleted_session_ids.sort();
@@ -5340,19 +5361,48 @@ impl SessionStoreV2 {
         session_id: &str,
         force: bool,
     ) -> io::Result<bool> {
-        let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
-        let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked(&_runtime_task)
+        let lifecycle = self.lock_session_lifecycle_exclusive().await?;
+        let runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
+        let guards = Arc::new(SessionDeletionGuards {
+            runtime_task,
+            _lifecycle: lifecycle,
+        });
+        self.recover_all_runtime_task_transactions_locked(&guards.runtime_task)
             .await?;
         self.recover_all_session_copy_transactions_locked().await?;
-        self.delete_session_recursive_locked(session_id, force)
+        self.delete_session_recursive_locked(session_id, force, &guards)
             .await
+    }
+
+    async fn remove_child_directory(
+        &self,
+        directory: &Path,
+        guards: &Arc<SessionDeletionGuards>,
+        tree: &Arc<ActorTreeWriteGuard>,
+    ) -> io::Result<()> {
+        let directory = directory.to_path_buf();
+        let guards = Arc::clone(guards);
+        let tree = Arc::clone(tree);
+        #[cfg(test)]
+        let hook = self.child_delete_hook.lock().unwrap().clone();
+        tokio::task::spawn_blocking(move || {
+            // Tokio filesystem jobs outlive a cancelled waiter or runtime.
+            // Retain the acquired guards until this physical removal ends.
+            let _guards = guards;
+            let _tree = tree;
+            #[cfg(test)]
+            let _finished = hook.as_ref().map(|hook| hook.enter());
+            std::fs::remove_dir_all(directory)
+        })
+        .await
+        .map_err(|_| other_io_error("background task failed"))?
     }
 
     async fn delete_session_recursive_locked(
         &self,
         session_id: &str,
         force: bool,
+        guards: &Arc<SessionDeletionGuards>,
     ) -> io::Result<bool> {
         validate_session_id(session_id)?;
         let entry = self.get_index_entry(session_id).await;
@@ -5425,9 +5475,10 @@ impl SessionStoreV2 {
 
         match entry.kind {
             SessionKind::Child => {
-                let _tree = self
-                    .acquire_actor_tree_write_guard(&entry.root_session_id)
-                    .await?;
+                let tree = Arc::new(
+                    self.acquire_actor_tree_write_guard(&entry.root_session_id)
+                        .await?,
+                );
                 if let Some(root) = self
                     .actor_tree_root_for_child_write(&entry.root_session_id)
                     .await?
@@ -5435,7 +5486,7 @@ impl SessionStoreV2 {
                     self.bump_actor_tree_revision(&root).await?;
                 }
                 let abs_dir = self.abs_path_from_rel(&entry.rel_path);
-                let _ = fs::remove_dir_all(&abs_dir).await;
+                let _ = self.remove_child_directory(&abs_dir, guards, &tree).await;
                 self.update_index(|index| {
                     index.sessions.remove(session_id);
                     Ok(())
@@ -9987,6 +10038,11 @@ mod tests {
         // started now cannot resolve or recreate the target until the deletion
         // and index removal have linearized.
         let lifecycle = storage.lock_session_lifecycle_exclusive().await?;
+        let runtime_task = storage.lock_runtime_task_transaction_exclusive().await?;
+        let guards = Arc::new(SessionDeletionGuards {
+            runtime_task,
+            _lifecycle: lifecycle,
+        });
         let target = session.id.clone();
         let delivery = tokio::spawn(async move {
             inbox
@@ -9998,11 +10054,11 @@ mod tests {
 
         assert!(
             storage
-                .delete_session_recursive_locked(&session.id, true)
+                .delete_session_recursive_locked(&session.id, true, &guards)
                 .await?
         );
         assert!(!session_dir.exists());
-        drop(lifecycle);
+        drop(guards);
 
         let error = tokio::time::timeout(std::time::Duration::from_secs(2), delivery)
             .await
