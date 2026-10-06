@@ -1592,7 +1592,8 @@ async fn skills_read_native_windows_junction_replacement_rejects_foreign_auxilia
         .await
         .unwrap();
     let cursor = first["next_cursor"].as_str().unwrap();
-    let bundle = fixture._directory.path().join("skills/catalog-0");
+    // cmd treats forward slashes in mklink paths as option prefixes.
+    let bundle = fixture._directory.path().join("skills").join("catalog-0");
     let original = bundle.join("references");
     std::fs::rename(&original, bundle.join("old-references")).unwrap();
     let foreign = fixture._directory.path().join("foreign");
