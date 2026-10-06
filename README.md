@@ -188,6 +188,17 @@ independent configured token cap. Names, locators, root aliases and omission
 notices consume that budget; descriptions share remaining space round-robin.
 These exported APIs have no live registry or body-reader integration yet.
 
+Engine's `session_app::skill_input::prepare_skill_input` is a pure, unwired
+ordinary User-content converter. The host must supply current-input restrictions
+and correlated typed selections/snapshots; catalog, configured IDs and client
+fragment text establish no invocation. Explicit bodies use an 8,000 UTF-8-byte
+limit with visible warnings; bounded arguments are rejected rather than cut.
+`session_app::plan_legacy_skill_history` prepares loaded-only ordinary Assistant
+history after the complete original tool batch. It validates typed historical
+data and a unique successful active receipt, retains originals and uses the
+existing 512 KiB bound. Unsupported history stays intact. Neither helper is
+called by chat, runner setup, providers or persistence; live cutover is separate.
+
 ## License
 
 Project-owned code is licensed under the [MIT License](./LICENSE).

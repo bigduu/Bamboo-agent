@@ -18,6 +18,7 @@ use bamboo_skills::runtime_metadata::{
 use super::logging::DebugLogger;
 
 pub(crate) mod compaction;
+pub(crate) mod legacy_skill_history;
 pub(crate) mod prompt_envelope;
 pub(crate) mod prompt_setup;
 pub(crate) mod skill_context;

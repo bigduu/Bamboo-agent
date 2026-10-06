@@ -68,3 +68,14 @@ real provider-envelope accounting. Boundary and behavior fixtures are Bamboo-aut
 the pinned sources contain no dedicated read fixtures to copy.
 Complete Bamboo MIT and Codex Apache-2.0/NOTICE copies remain packaged in both
 bamboo-skills and bamboo-server-tools. Existing provenance and notices above apply.
+
+### Explicit Skill UTF-8 prompt bounds (#1625)
+
+`progressive/render.rs::truncate_skill_utf8_bytes` adapts the pinned Codex
+`codex-rs/ext/skills/src/render.rs::truncate_utf8_to_bytes` and its
+`codex-utils-string` character-boundary operation. The explicit main-prompt
+limit is 8,000 bytes; caller-specific names/paths have separate byte limits.
+The implementation stays in the already Apache-licensed Skills module;
+complete package-local license/notices above remain. Byte-boundary fixtures,
+Engine pure input/history converters and Server transport fixtures are
+Bamboo-authored. No upstream host fragments or lifecycle code enter Engine.
