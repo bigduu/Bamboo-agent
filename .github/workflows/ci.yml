@@ -308,6 +308,9 @@ jobs:
       - name: Verify portable Skill source publication
         run: cargo test --locked -p bamboo-skills progressive::source_tests -- --test-threads=1
 
+      - name: Verify portable selected Skill source
+        run: cargo test --locked -p bamboo-skills progressive::read_tests -- --test-threads=1
+
       - name: Build
         run: cargo build --release --verbose
 

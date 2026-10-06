@@ -195,3 +195,12 @@ Third-party materials retain their own licenses and copyright notices:
 
 - `builtin_skills/skill-creator` retains its [Apache-2.0 license](./builtin_skills/skill-creator/LICENSE.txt).
 - Codex-derived tool-search, Skill-input and catalog/list/render code retain its [Apache-2.0 license and source notices](./THIRD_PARTY_NOTICES.md).
+
+The exported Rust `SkillsListTool::selected_source` helper applies the same mandatory
+current-caller/input, host ceiling, config and source validation as list/render.
+It returns complete raw UTF-8 `SKILL.md` or a published auxiliary file (up to8MiB),
+with byte/entry/inflight limits shared by a manager's stores. Owned data remains
+charged through the last real owner and carries no future execution permission.
+`probe_selected_source` rechecks current authority and raw/physical identity with
+bounded charged scratch. These APIs do not register a `skills_read` Tool or provide
+paging/cache/runtime activation. Existing publication storage has separate bounds.

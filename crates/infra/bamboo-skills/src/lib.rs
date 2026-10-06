@@ -364,6 +364,13 @@ impl SkillManager {
         }
     }
 
+    /// Selected-source ledger is shared by every workspace/mode/project store
+    /// resolved by this manager. Returned bytes retain only their ledger charge.
+    #[cfg(test)]
+    pub(crate) fn selected_budget(&self) -> Arc<progressive::read::SelectedBudget> {
+        self.store.selected_budget()
+    }
+
     /// Resolve the stable Project shared layer plus the current workspace
     /// overlay. Both values must come from trusted server-side session/Project
     /// state, never directly from request arguments.

@@ -6,6 +6,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+pub(crate) mod read;
+pub use read::SelectedSkillSnapshot;
 mod render;
 pub use render::{
     render_skill_catalog, skill_metadata_budget, SkillCatalogRender, SkillCatalogRenderPolicy,
@@ -124,3 +126,6 @@ mod source_tests;
 
 #[cfg(test)]
 mod render_tests;
+
+#[cfg(test)]
+mod read_tests;

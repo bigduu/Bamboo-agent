@@ -22,6 +22,7 @@ impl SkillCatalogCallerResolver for Resolver {
 struct Fixture {
     _directory: tempfile::TempDir,
     config: Arc<RwLock<Config>>,
+    manager: Arc<SkillManager>,
     repo: bamboo_engine::SessionRepository,
     resolver: Arc<Resolver>,
     tool: SkillsListTool,
@@ -99,6 +100,7 @@ impl Fixture {
         Self {
             _directory: directory,
             config,
+            manager,
             repo,
             resolver,
             tool,
@@ -258,15 +260,30 @@ async fn catalog_list_rejects_malformed_arguments_restrictions_and_unavailable_p
     fixture.resolver.0.write().await.as_mut().unwrap().ceiling =
         Some(BTreeSet::from(["../outside".into()]));
     assert!(fixture.page(None, 20).await.is_err());
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-1", "SKILL.md")
+        .await
+        .is_err());
     fixture.resolver.0.write().await.as_mut().unwrap().ceiling = None;
     fixture.resolver.0.write().await.as_mut().unwrap().mode = Some("../invalid-mode".into());
     assert!(fixture.page(None, 20).await.is_err());
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-1", "SKILL.md")
+        .await
+        .is_err());
     fixture.resolver.0.write().await.as_mut().unwrap().mode = None;
     let mut session = fixture.repo.load("catalog-session").await.unwrap();
     session.set_project_id_meta("assigned-but-unavailable");
     session.metadata_version += 1;
     fixture.repo.save(&mut session).await.unwrap();
     assert!(fixture.page(None, 20).await.is_err());
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-1", "SKILL.md")
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -500,4 +517,385 @@ async fn catalog_list_uses_one_session_snapshot_across_workspace_aba() {
     assert_eq!(page["skills"].as_array().unwrap().len(), 1);
     assert_eq!(page["skills"][0]["package"], "catalog-1");
     assert!(!result.result.contains("PRIVATE BODY"));
+}
+
+#[tokio::test]
+async fn selected_source_current_caller_ceiling_and_input_not_old_selection_are_authority() {
+    let fixture = Fixture::new(3).await;
+    let bytes = fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-0", "SKILL.md")
+        .await
+        .unwrap();
+    assert!(bytes.snapshot.contents().contains("PRIVATE BODY catalog-0"));
+    fixture
+        .tool
+        .probe_selected_source(&fixture.ctx, &bytes)
+        .await
+        .unwrap();
+    fixture.resolver.0.write().await.as_mut().unwrap().ceiling = Some(BTreeSet::new());
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-0", "SKILL.md")
+        .await
+        .is_err());
+    assert!(fixture
+        .tool
+        .probe_selected_source(&fixture.ctx, &bytes)
+        .await
+        .is_err());
+    {
+        let mut state = fixture.resolver.0.write().await;
+        let caller = state.as_mut().unwrap();
+        caller.caller_id = "another-host".into();
+        caller.ceiling = Some(BTreeSet::from(["catalog-1".into()]));
+    }
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-0", "SKILL.md")
+        .await
+        .is_err());
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-1", "SKILL.md")
+        .await
+        .is_ok());
+    fixture.resolver.0.write().await.as_mut().unwrap().ceiling = None;
+    let mut session = fixture.repo.load("catalog-session").await.unwrap();
+    let input = Message::user("new input with no mention");
+    fixture.resolver.0.write().await.as_mut().unwrap().input_id = input.id.clone();
+    session.messages.push(input);
+    fixture.repo.save(&mut session).await.unwrap();
+    assert!(
+        fixture
+            .tool
+            .selected_source(&fixture.ctx, "catalog-0", "SKILL.md")
+            .await
+            .is_err(),
+        "stale Input N intent"
+    );
+    fixture
+        .resolver
+        .0
+        .write()
+        .await
+        .as_mut()
+        .unwrap()
+        .invocation = None;
+    assert!(
+        fixture
+            .tool
+            .selected_source(&fixture.ctx, "catalog-0", "SKILL.md")
+            .await
+            .is_err(),
+        "stale Session.selected_skill_ids is not intent"
+    );
+    assert!(fixture
+        .tool
+        .probe_selected_source(&fixture.ctx, &bytes)
+        .await
+        .is_err());
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-1", "SKILL.md")
+        .await
+        .is_ok());
+    *fixture.resolver.0.write().await = None;
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-1", "SKILL.md")
+        .await
+        .is_err());
+    assert!(fixture
+        .tool
+        .probe_selected_source(&fixture.ctx, &bytes)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn selected_source_host_denies_config_ultra_mode_project_and_physical_changes() {
+    let fixture = Fixture::new(2).await;
+    let held = fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-0", "SKILL.md")
+        .await
+        .unwrap();
+    let root = fixture._directory.path().join("skills/catalog-0");
+    std::fs::write(
+        root.join("agents/bamboo.yaml"),
+        "invocation_policy:\n  explicit: false\n  automatic: true\n",
+    )
+    .unwrap();
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-0", "SKILL.md")
+        .await
+        .is_err());
+    assert!(fixture
+        .tool
+        .probe_selected_source(&fixture.ctx, &held)
+        .await
+        .is_err());
+    fixture
+        .resolver
+        .0
+        .write()
+        .await
+        .as_mut()
+        .unwrap()
+        .invocation = None;
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-0", "SKILL.md")
+        .await
+        .is_ok());
+    std::fs::write(
+        root.join("agents/openai.yaml"),
+        "policy:\n  allow_implicit_invocation: false\n",
+    )
+    .unwrap();
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-0", "SKILL.md")
+        .await
+        .is_err());
+    fixture.config.write().await.skills.disabled = vec!["catalog-1".into()];
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-1", "SKILL.md")
+        .await
+        .is_err());
+    fixture.config.write().await.skills.disabled.clear();
+    let permitted = fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-1", "SKILL.md")
+        .await
+        .unwrap();
+    fixture.resolver.0.write().await.as_mut().unwrap().mode = Some("different".into());
+    assert!(fixture
+        .tool
+        .probe_selected_source(&fixture.ctx, &permitted)
+        .await
+        .is_err());
+    fixture.resolver.0.write().await.as_mut().unwrap().mode = Some("../bad".into());
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-1", "SKILL.md")
+        .await
+        .is_err());
+    fixture.resolver.0.write().await.as_mut().unwrap().mode = None;
+    let mut session = fixture.repo.load("catalog-session").await.unwrap();
+    session.root_orchestration_only = true;
+    session.root_tool_authority_revision += 1;
+    fixture.repo.save(&mut session).await.unwrap();
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-1", "SKILL.md")
+        .await
+        .is_err());
+    assert!(fixture
+        .tool
+        .probe_selected_source(&fixture.ctx, &permitted)
+        .await
+        .is_err());
+    session.root_orchestration_only = false;
+    session.set_project_id_meta("unavailable-project");
+    session.metadata_version += 1;
+    fixture.repo.save(&mut session).await.unwrap();
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-1", "SKILL.md")
+        .await
+        .is_err());
+    session.clear_project_id_meta();
+    session.metadata_version += 1;
+    fixture.repo.save(&mut session).await.unwrap();
+    let physical = fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-1", "SKILL.md")
+        .await
+        .unwrap();
+    fixture
+        .tool
+        .probe_selected_source(&fixture.ctx, &physical)
+        .await
+        .unwrap();
+    let main = fixture._directory.path().join("skills/catalog-1/SKILL.md");
+    std::fs::rename(&main, main.with_extension("previous")).unwrap();
+    std::fs::write(&main, physical.snapshot.contents()).unwrap();
+    assert!(fixture
+        .tool
+        .probe_selected_source(&fixture.ctx, &physical)
+        .await
+        .is_err());
+}
+
+struct FinalResolver {
+    caller: SkillCatalogCaller,
+    calls: std::sync::atomic::AtomicUsize,
+    repo: bamboo_engine::SessionRepository,
+    unavailable: bool,
+}
+#[async_trait]
+impl SkillCatalogCallerResolver for FinalResolver {
+    async fn resolve(&self, _: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 2 {
+            if self.unavailable {
+                return Err(ToolError::Execution("caller revoked during read".into()));
+            }
+            let mut session = self.repo.load("catalog-session").await.unwrap();
+            session.root_orchestration_only = true;
+            session.root_tool_authority_revision += 1;
+            self.repo.save(&mut session).await.unwrap();
+        }
+        Ok(self.caller.clone())
+    }
+}
+
+#[tokio::test]
+async fn selected_source_final_async_resolver_cannot_hide_new_ultra_or_error() {
+    for unavailable in [false, true] {
+        let fixture = Fixture::new(1).await;
+        let caller = fixture.resolver.0.read().await.clone().unwrap();
+        let tool = SkillsListTool::new(
+            fixture.manager.clone(),
+            fixture.config.clone(),
+            fixture.repo.clone(),
+            Arc::new(FinalResolver {
+                caller,
+                calls: Default::default(),
+                repo: fixture.repo.clone(),
+                unavailable,
+            }),
+        );
+        assert!(
+            tool.selected_source(&fixture.ctx, "catalog-0", "SKILL.md")
+                .await
+                .is_err(),
+            "late caller/scope revocation {unavailable}"
+        );
+    }
+}
+
+struct FinalConfigResolver {
+    caller: SkillCatalogCaller,
+    calls: std::sync::atomic::AtomicUsize,
+    config: Arc<RwLock<Config>>,
+    held: std::sync::Mutex<Option<tokio::sync::OwnedRwLockWriteGuard<Config>>>,
+    entered: tokio::sync::Notify,
+}
+#[async_trait]
+impl SkillCatalogCallerResolver for FinalConfigResolver {
+    async fn resolve(&self, _: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 2 {
+            let guard = self.config.clone().write_owned().await;
+            *self.held.lock().unwrap() = Some(guard);
+            self.entered.notify_one();
+        }
+        Ok(self.caller.clone())
+    }
+}
+
+#[tokio::test]
+async fn selected_source_and_probe_final_config_wait_cannot_hide_saved_ultra() {
+    let mut grants = Vec::new();
+    for probe in [false, true] {
+        let fixture = Fixture::new(1).await;
+        // Warm the actual store and Session cache, and hold real previously selected bytes.
+        let selected = fixture
+            .tool
+            .selected_source(&fixture.ctx, "catalog-0", "SKILL.md")
+            .await
+            .unwrap();
+        assert!(selected.snapshot.contents().contains("PRIVATE BODY"));
+        let mut session = fixture.repo.load("catalog-session").await.unwrap();
+        let resolver = Arc::new(FinalConfigResolver {
+            caller: fixture.resolver.0.read().await.clone().unwrap(),
+            calls: Default::default(),
+            config: fixture.config.clone(),
+            held: Default::default(),
+            entered: Default::default(),
+        });
+        let tool = SkillsListTool::new(
+            fixture.manager.clone(),
+            fixture.config.clone(),
+            fixture.repo.clone(),
+            resolver.clone(),
+        );
+        let request = async {
+            if probe {
+                tool.probe_selected_source(&fixture.ctx, &selected)
+                    .await
+                    .map(|()| "probe granted".to_string())
+            } else {
+                tool.selected_source(&fixture.ctx, "catalog-0", "SKILL.md")
+                    .await
+                    .map(|value| value.snapshot.contents().to_string())
+            }
+        };
+        tokio::pin!(request);
+        tokio::select! {
+            _ = resolver.entered.notified() => {},
+            result = &mut request => panic!("final config wait not reached: {result:?}"),
+        }
+        assert!(futures::poll!(&mut request).is_pending());
+        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        session.root_orchestration_only = true;
+        session.root_tool_authority_revision += 1;
+        fixture.repo.save(&mut session).await.unwrap();
+        drop(resolver.held.lock().unwrap().take().unwrap());
+        if let Ok(contents) = request.await {
+            grants.push((probe, contents));
+        }
+    }
+    assert!(
+        grants.is_empty(),
+        "final config wait leaked grants: {grants:?}"
+    );
+}
+
+#[tokio::test]
+async fn selected_source_same_session_store_is_not_relooked_up_during_aba() {
+    let mut fixture = Fixture::new(2).await;
+    let workspace_a = fixture._directory.path().join("workspace-a");
+    let workspace_b = fixture._directory.path().join("workspace-b");
+    std::fs::create_dir_all(&workspace_a).unwrap();
+    let foreign = workspace_b.join(".bamboo/skills/catalog-1");
+    std::fs::create_dir_all(&foreign).unwrap();
+    std::fs::write(
+        foreign.join("SKILL.md"),
+        "---\nname: catalog-1\ndescription: foreign\n---\nFOREIGN BODY",
+    )
+    .unwrap();
+    let mut session = fixture.repo.load("catalog-session").await.unwrap();
+    session.set_workspace_path_meta(workspace_a.to_string_lossy());
+    session.metadata_version += 1;
+    fixture.repo.save(&mut session).await.unwrap();
+    let barrier = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+    fixture.tool.store_selection_barrier = Some(barrier.clone());
+    let guard = fixture.config.write().await;
+    let selection = fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-1", "SKILL.md");
+    tokio::pin!(selection);
+    assert!(futures::poll!(&mut selection).is_pending());
+    session.set_workspace_path_meta(workspace_b.to_string_lossy());
+    session.metadata_version += 1;
+    fixture.repo.save(&mut session).await.unwrap();
+    drop(guard);
+    tokio::select! {
+        _ = barrier.0.notified() => {},
+        result = &mut selection => panic!("store barrier not reached: {}", result.is_ok()),
+    }
+    session.set_workspace_path_meta(workspace_a.to_string_lossy());
+    session.metadata_version += 1;
+    fixture.repo.save(&mut session).await.unwrap();
+    barrier.1.notify_one();
+    let result = selection.await.unwrap();
+    assert!(result
+        .snapshot
+        .contents()
+        .contains("PRIVATE BODY catalog-1"));
+    assert!(!result.snapshot.contents().contains("FOREIGN BODY"));
 }
