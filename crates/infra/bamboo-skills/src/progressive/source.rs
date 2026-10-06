@@ -523,6 +523,59 @@ impl PartialEq for SourceBinding {
 impl Eq for SourceBinding {}
 
 impl SourceBinding {
+    /// Tagged physical/raw identity from this existing canonical capture.
+    pub(crate) fn metadata_identity(&self) -> String {
+        fn physical(hash: &mut Sha256, value: PhysicalIdentity) {
+            hash.update(value.0.to_le_bytes());
+            hash.update(value.1.to_le_bytes());
+        }
+        fn file(hash: &mut Sha256, value: &FileSignature) {
+            match value {
+                FileSignature::Error => hash.update([0]),
+                FileSignature::Absent(parent) => {
+                    hash.update([1]);
+                    physical(hash, *parent);
+                }
+                FileSignature::Present(identity, bytes) => {
+                    hash.update([2]);
+                    physical(hash, *identity);
+                    hash.update(bytes);
+                }
+            }
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"bamboo-skill-source-v1");
+        physical(&mut hash, self.signature.source);
+        hash.update(self.signature.anchor.to_le_bytes());
+        physical(&mut hash, self.signature.bundle);
+        file(&mut hash, &self.signature.main);
+        for policy in &self.signature.policies {
+            file(&mut hash, policy);
+        }
+        for value in [
+            self.source.as_os_str().as_encoded_bytes(),
+            self.bundle.as_os_str().as_encoded_bytes(),
+            self.mode.as_deref().unwrap_or_default().as_bytes(),
+            crate::WorkflowSource::from(self.scope).as_str().as_bytes(),
+        ] {
+            hash.update(value.len().to_le_bytes());
+            hash.update(value);
+        }
+        hex::encode(hash.finalize())
+    }
+
+    pub(crate) fn main_locator(&self) -> String {
+        self.source
+            .join(&self.bundle)
+            .join("SKILL.md")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub(crate) fn root_locator(&self) -> String {
+        self.source.to_string_lossy().into_owned()
+    }
+
     pub(crate) fn scope(&self) -> SkillDirectorySource {
         self.scope
     }
