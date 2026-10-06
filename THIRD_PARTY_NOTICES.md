@@ -42,3 +42,14 @@ These portions are copyright 2025 OpenAI and retain the complete package-local
 Bamboo uses source-validated owned metadata, trusted fresh caller/input intent,
 and serialized provider envelopes. Indivisible entries return a budget error.
 The package retains Bamboo's original [MIT text](crates/app/bamboo-server-tools/LICENSE).
+
+
+## OpenAI Codex Skill metadata rendering
+
+`crates/infra/bamboo-skills/src/progressive/render.rs` and `render_tests.rs` adapt
+`codex-rs/ext/skills/src/{render.rs,aliases.rs,render_tests.rs}` at the same pinned
+revision. These portions are copyright 2025 OpenAI and retain the complete
+[Apache license](crates/infra/bamboo-skills/third_party/codex/LICENSE) and
+[upstream notice](crates/infra/bamboo-skills/third_party/codex/NOTICE).
+Bamboo adapts host locators/source ordering and fresh metadata eligibility;
+ordering and unavailable-alias regression fixtures are Bamboo-authored.

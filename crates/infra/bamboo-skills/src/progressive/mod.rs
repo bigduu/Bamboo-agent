@@ -6,6 +6,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+mod render;
+pub use render::{
+    render_skill_catalog, skill_metadata_budget, SkillCatalogRender, SkillCatalogRenderPolicy,
+    SkillMetadataBudget,
+};
 pub(crate) mod source;
 
 /// Owned metadata only; contains no source handles, instruction or policy bytes.
@@ -116,3 +121,6 @@ fn source_rank(source: WorkflowSource) -> u8 {
 mod catalog_tests;
 #[cfg(test)]
 mod source_tests;
+
+#[cfg(test)]
+mod render_tests;

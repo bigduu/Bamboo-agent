@@ -105,6 +105,35 @@ impl Fixture {
             ctx,
         }
     }
+    async fn assert_render_matches_list(&self) {
+        let (_, page) = self.page(None, 20).await.unwrap();
+        let rendered = self.tool.render_catalog(&self.ctx).await.unwrap();
+        let names = page["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rendered.included_count, names.len());
+        assert_eq!(
+            rendered.omitted_count, 0,
+            "budget must fit every eligible entry"
+        );
+        let rendered_names = rendered
+            .text
+            .lines()
+            .filter_map(|line| {
+                // Root-alias table rows are not Skill metadata lines.
+                line.strip_prefix("- ")
+                    .filter(|rest| !rest.starts_with('`'))
+                    .and_then(|rest| rest.split_once(':'))
+                    .map(|(name, _)| name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rendered_names, names);
+        assert!(!rendered.text.contains("PRIVATE BODY"));
+    }
+
     async fn page(
         &self,
         cursor: Option<&str>,
@@ -125,9 +154,11 @@ impl Fixture {
 async fn catalog_list_distinguishes_actual_callers_and_rejects_wide_cursor_replay() {
     let fixture = Fixture::new(3).await;
     let before = fixture.repo.load("catalog-session").await.unwrap();
+    fixture.assert_render_matches_list().await;
     let (_, wide) = fixture.page(None, 1).await.unwrap();
     let cursor = wide["next_cursor"].as_str().unwrap();
     fixture.resolver.0.write().await.as_mut().unwrap().ceiling = Some(BTreeSet::new());
+    fixture.assert_render_matches_list().await;
     assert!(fixture.page(Some(cursor), 1).await.is_err());
     assert!(fixture.page(None, 1).await.unwrap().1["skills"]
         .as_array()
@@ -143,13 +174,16 @@ async fn catalog_list_distinguishes_actual_callers_and_rejects_wide_cursor_repla
         fixture.page(None, 1).await.unwrap().1["skills"][0]["package"],
         "catalog-1"
     );
+    fixture.assert_render_matches_list().await;
     assert!(fixture.page(Some(cursor), 1).await.is_err());
     fixture.resolver.0.write().await.as_mut().unwrap().ceiling = None;
+    fixture.assert_render_matches_list().await;
     assert!(!fixture.page(None, 20).await.unwrap().1["skills"]
         .as_array()
         .unwrap()
         .is_empty());
     *fixture.resolver.0.write().await = None;
+    assert!(fixture.tool.render_catalog(&fixture.ctx).await.is_err());
     assert!(fixture.page(None, 1).await.is_err());
     assert!(fixture.page(Some(cursor), 1).await.is_err());
     let after = fixture.repo.load("catalog-session").await.unwrap();
@@ -171,6 +205,7 @@ async fn catalog_list_fresh_input_config_and_ultra_revoke_metadata() {
     fixture.repo.save(&mut session).await.unwrap();
     // An intent for N cannot be attached to accepted input N+1.
     assert!(fixture.page(None, 20).await.is_err());
+    assert!(fixture.tool.render_catalog(&fixture.ctx).await.is_err());
     fixture
         .resolver
         .0
@@ -179,6 +214,7 @@ async fn catalog_list_fresh_input_config_and_ultra_revoke_metadata() {
         .as_mut()
         .unwrap()
         .invocation = None;
+    fixture.assert_render_matches_list().await;
     let (_, current) = fixture.page(None, 20).await.unwrap();
     assert!(current["skills"]
         .as_array()
@@ -187,6 +223,7 @@ async fn catalog_list_fresh_input_config_and_ultra_revoke_metadata() {
         .all(|entry| entry["package"] != "catalog-0"));
     assert!(fixture.page(Some(cursor), 1).await.is_err());
     fixture.config.write().await.skills.disabled = vec!["catalog-1".into(), "catalog-2".into()];
+    fixture.assert_render_matches_list().await;
     assert!(fixture.page(None, 20).await.unwrap().1["skills"]
         .as_array()
         .unwrap()
@@ -195,6 +232,7 @@ async fn catalog_list_fresh_input_config_and_ultra_revoke_metadata() {
     session.root_orchestration_only = true;
     session.root_tool_authority_revision += 1;
     fixture.repo.save(&mut session).await.unwrap();
+    fixture.assert_render_matches_list().await;
     assert!(fixture.page(None, 20).await.unwrap().1["skills"]
         .as_array()
         .unwrap()
@@ -372,6 +410,7 @@ async fn catalog_list_pages_all_metadata_with_real_provider_cache_envelopes() {
 #[tokio::test]
 async fn catalog_cursor_tracks_current_source_policy_authority() {
     let fixture = Fixture::new(3).await;
+    fixture.assert_render_matches_list().await;
     let (_, page) = fixture.page(None, 1).await.unwrap();
     let cursor = page["next_cursor"].as_str().unwrap();
     let root = fixture._directory.path().join("skills/catalog-0");
@@ -392,6 +431,7 @@ async fn catalog_cursor_tracks_current_source_policy_authority() {
     assert!(fixture.page(Some(cursor), 1).await.is_err());
     let (_, page) = fixture.page(None, 20).await.unwrap();
     assert_eq!(page["skills"].as_array().unwrap().len(), 2);
+    fixture.assert_render_matches_list().await;
 }
 
 #[tokio::test]

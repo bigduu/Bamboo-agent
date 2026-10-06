@@ -6,7 +6,10 @@ use async_trait::async_trait;
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_llm::Config;
 use bamboo_skills::{
-    progressive::{SkillCatalogEligibility, SkillCatalogSnapshot},
+    progressive::{
+        render_skill_catalog, skill_metadata_budget, SkillCatalogEligibility, SkillCatalogRender,
+        SkillCatalogRenderPolicy, SkillCatalogSnapshot,
+    },
     SkillManager,
 };
 use serde::{Deserialize, Serialize};
@@ -64,6 +67,17 @@ impl SkillsListTool {
         self.access = self.access.with_project_store(projects);
         self
     }
+    /// Render eligible metadata using the same fresh caller/input projection as
+    /// skills_list. This does not install a live Tool or read Skill bodies.
+    pub async fn render_catalog(&self, ctx: &ToolCtx) -> Result<SkillCatalogRender, ToolError> {
+        let (caller, snapshot, _) = self.metadata(ctx).await?;
+        Ok(render_skill_catalog(
+            &snapshot.entries,
+            SkillCatalogRenderPolicy::ExtensionCompatible,
+            skill_metadata_budget(caller.context_window, caller.metadata_tokens),
+        ))
+    }
+
     async fn metadata(
         &self,
         ctx: &ToolCtx,

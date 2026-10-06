@@ -182,6 +182,10 @@ selection cannot grant manual invocation. Pages charge ToolResult and provider
 cache envelopes, advance to metadata EOF, or return an explicit budget error.
 The byte ceiling bounds each page-bearing block; unrelated request history is
 outside this per-page budget.
+`SkillsListTool::render_catalog` uses the same fresh metadata projection and the
+pinned Codex allocator: a 2% context budget, an 8,000-character fallback, or an
+independent configured token cap. Names, locators, root aliases and omission
+notices consume that budget; descriptions share remaining space round-robin.
 These exported APIs have no live registry or body-reader integration yet.
 
 ## License
@@ -190,4 +194,4 @@ Project-owned code is licensed under the [MIT License](./LICENSE).
 Third-party materials retain their own licenses and copyright notices:
 
 - `builtin_skills/skill-creator` retains its [Apache-2.0 license](./builtin_skills/skill-creator/LICENSE.txt).
-- Codex-derived tool-search, Skill-input and catalog/list code retain its [Apache-2.0 license and source notices](./THIRD_PARTY_NOTICES.md).
+- Codex-derived tool-search, Skill-input and catalog/list/render code retain its [Apache-2.0 license and source notices](./THIRD_PARTY_NOTICES.md).
