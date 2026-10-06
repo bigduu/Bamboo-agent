@@ -891,6 +891,211 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn title_patch_keeps_initialized_actor_snapshot_coherent() {
+        use bamboo_domain::{ActorDirectoryEntry, ActorDirectoryPort, Session};
+
+        let temp = tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let state = web::Data::new(AppState::new(home.clone()).await.unwrap());
+        let root = Session::new("title-snapshot-root", "model");
+        let child = Session::new_child_of("title-snapshot-child", &root, "model", "Child");
+        state.session_store.save_session(&root).await.unwrap();
+        state.session_store.save_session(&child).await.unwrap();
+        let root_before = state.session_store.ensure_actor(&root.id).await.unwrap();
+        let child_before = state.session_store.ensure_actor(&child.id).await.unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let snapshot_uri = format!("/api/v1/actors/{}/snapshot", root.id);
+        let before = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&snapshot_uri)
+                .peer_addr("127.0.0.1:1234".parse().unwrap())
+                .insert_header((header::HOST, "localhost"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(before.status(), StatusCode::OK);
+
+        let patch = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{}", root.id))
+                .set_json(serde_json::json!({"title": "Renamed actor root"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(patch.status(), StatusCode::OK);
+        let canonical = state
+            .session_store
+            .load_session(&root.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let read_row = |path| async move {
+            serde_json::from_slice::<ActorDirectoryEntry>(&tokio::fs::read(path).await.unwrap())
+                .unwrap()
+        };
+        let root_after =
+            read_row(home.join("sessions/title-snapshot-root/actor-authority.json")).await;
+        let child_after = read_row(home.join(
+            "sessions/title-snapshot-root/children/title-snapshot-child/actor-authority.json",
+        ))
+        .await;
+        eprintln!("title PATCH canonical metadata {} -> {}; Root observation {} -> {}; Child ancestor observation {} -> {}",
+            root.metadata_version, canonical.metadata_version,
+            root_before.actor.observed_metadata_version, root_after.actor.observed_metadata_version,
+            child_before.actor.ancestor_observations[0].metadata_version,
+            child_after.actor.ancestor_observations[0].metadata_version);
+        let after = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&snapshot_uri)
+                .peer_addr("127.0.0.1:1234".parse().unwrap())
+                .insert_header((header::HOST, "localhost"))
+                .to_request(),
+        )
+        .await;
+        let status = after.status();
+        let body: Value = test::read_body_json(after).await;
+        assert_eq!(status, StatusCode::OK, "post-title snapshot: {body}");
+        let root_node = body["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["actor_id"] == root.id)
+            .unwrap();
+        assert_eq!(root_node["title"], "Renamed actor root");
+        assert_eq!(
+            root_after.actor.observed_metadata_version,
+            canonical.metadata_version
+        );
+        assert_eq!(
+            child_after.actor.ancestor_observations[0].metadata_version,
+            canonical.metadata_version
+        );
+    }
+
+    #[actix_web::test]
+    async fn title_manual_noop_rejects_stale_observations_for_direct_service_callers() {
+        use bamboo_domain::{ActorDirectoryPort, Session};
+        use bamboo_engine::session_app::metadata::SessionMetadataService;
+        let temp = tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let state = web::Data::new(AppState::new(home.clone()).await.unwrap());
+        let mut root = Session::new("title-noop-root", "model");
+        root.title = "Original title".into();
+        root.title_generated = true;
+        state.session_store.save_session(&root).await.unwrap();
+        state.session_store.ensure_actor(&root.id).await.unwrap();
+        assert!(
+            SessionMetadataService::set_title(state.get_ref(), &root.id, &root.title, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let path = home.join("sessions/title-noop-root/actor-authority.json");
+        let mut row: Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        row["actor"]["observed_metadata_version"] = 1.into();
+        let bytes = serde_json::to_vec(&row).unwrap();
+        tokio::fs::write(&path, &bytes).await.unwrap();
+        assert!(
+            SessionMetadataService::set_title(state.get_ref(), &root.id, &root.title, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), bytes);
+        assert_eq!(
+            state
+                .session_store
+                .load_session(&root.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .title,
+            root.title
+        );
+    }
+
+    #[actix_web::test]
+    async fn title_manual_save_success_still_requires_current_observations() {
+        use bamboo_domain::{ActorDirectoryPort, Session, Storage};
+        use bamboo_engine::session_app::metadata::SessionMetadataService;
+        use bamboo_storage::{LockedSessionStore, SessionStoreV2};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        // A supported runtime write publishes the same requested title first,
+        // reproducing a load→save collision with canonical title already newer
+        // than its Actor observations. No fake row, new fault hook or repair.
+        struct SameTitleFirst {
+            inner: Arc<SessionStoreV2>,
+            saved: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl Storage for SameTitleFirst {
+            async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+                self.inner.load_session(id).await
+            }
+            async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+                self.inner.save_runtime_state(session).await?;
+                self.inner.save_session(session).await?;
+                self.saved.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+                self.inner.delete_session(id).await
+            }
+            async fn validate_title_observations(&self, session: &Session) -> std::io::Result<()> {
+                self.inner.validate_title_observations(session).await
+            }
+        }
+        let temp = tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let mut state = AppState::new(home).await.unwrap();
+        let mut root = Session::new("title-collision-root", "model");
+        root.title = "Before collision".into();
+        root.title_generated = true;
+        state.session_store.save_session(&root).await.unwrap();
+        state.session_store.ensure_actor(&root.id).await.unwrap();
+        let saved = Arc::new(AtomicBool::new(false));
+        state.persistence = Arc::new(LockedSessionStore::new(Arc::new(SameTitleFirst {
+            inner: state.session_store.clone(),
+            saved: saved.clone(),
+        })));
+        let result =
+            SessionMetadataService::set_title(&state, &root.id, "Concurrent same title", None)
+                .await;
+        assert!(
+            saved.load(Ordering::SeqCst),
+            "must reach a successful full save"
+        );
+        assert!(
+            result.is_err(),
+            "successful save with stale rows must not report title success"
+        );
+        let committed = state
+            .session_store
+            .load_session(&root.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.title, "Concurrent same title");
+        assert!(state
+            .session_store
+            .validate_title_observations(&committed)
+            .await
+            .is_err());
+    }
+
+    #[actix_web::test]
     async fn ordinary_create_and_real_title_patch_cannot_forge_supervisor_identity() {
         let state = new_state().await;
         let app = test::init_service(

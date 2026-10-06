@@ -94,6 +94,423 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn title_save_keeps_initialized_child_ancestor_observation_coherent() {
+    let f = Fixture::new().await;
+    let child = f.child("title-child", &f.root).await;
+    let before = f.store.ensure_actor(&child.id).await.unwrap();
+    f.snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    let mut renamed = f.store.load_session(&f.root.id).await.unwrap().unwrap();
+    renamed.title = "Renamed root".into();
+    renamed.title_generated = true;
+    renamed.title_version += 1;
+    renamed.metadata_version += 1;
+    renamed.updated_at = Utc::now();
+    f.store.save_session(&renamed).await.unwrap();
+    let after: bamboo_domain::ActorDirectoryEntry = serde_json::from_slice(
+        &fs::read(f.directory(&child.id).join("actor-authority.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!f
+        .directory(&f.root.id)
+        .join("actor-authority.json")
+        .exists());
+    assert_eq!(
+        after.actor.observed_metadata_version,
+        child.metadata_version
+    );
+    eprintln!("title save Root uninitialized; canonical Root metadata {} -> {}; Child own metadata {}; Child ancestor observation {} -> {}",
+        f.root.metadata_version, renamed.metadata_version, after.actor.observed_metadata_version,
+        before.actor.ancestor_observations[0].metadata_version,
+        after.actor.ancestor_observations[0].metadata_version);
+    f.snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        after.actor.ancestor_observations[0].metadata_version,
+        renamed.metadata_version
+    );
+}
+
+fn rename_title(mut session: Session) -> Session {
+    session.title = "A new title".into();
+    session.title_generated = true;
+    session.title_version += 1;
+    session.metadata_version += 1;
+    session.updated_at = Utc::now();
+    session
+}
+
+async fn title_row(f: &Fixture, id: &str) -> bamboo_domain::ActorDirectoryEntry {
+    serde_json::from_slice(
+        &fs::read(f.directory(id).join("actor-authority.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn title_observations_preserve_live_fences_and_unaffected_siblings() {
+    let f = Fixture::new().await;
+    let parent = f.child("title-parent", &f.root).await;
+    let leaf = f.child("title-leaf", &parent).await;
+    let sibling = f.child("title-sibling", &f.root).await;
+    f.store.ensure_actor(&f.root.id).await.unwrap();
+    f.store.ensure_actor(&sibling.id).await.unwrap();
+    let parent_activation = f.activate(&parent.id).await;
+    let leaf_activation = f.activate(&leaf.id).await;
+    let ids = [&f.root.id, &parent.id, &leaf.id, &sibling.id];
+    let mut before = Vec::new();
+    for id in ids {
+        before.push(title_row(&f, id).await);
+    }
+    let renamed = rename_title(f.store.load_session(&parent.id).await.unwrap().unwrap());
+    f.store.save_session(&renamed).await.unwrap();
+    for (index, id) in ids.into_iter().enumerate() {
+        let actual = title_row(&f, id).await;
+        let mut expected = before[index].clone();
+        if *id == parent.id {
+            expected.actor.observed_metadata_version = renamed.metadata_version;
+            expected.revision += 1;
+        } else if *id == leaf.id {
+            expected.actor.ancestor_observations[0].metadata_version = renamed.metadata_version;
+            expected.revision += 1;
+        }
+        assert_eq!(
+            actual, expected,
+            "only exact title observations may change for {id}"
+        );
+    }
+    assert_eq!(
+        title_row(&f, &parent.id).await.activation,
+        Some(parent_activation)
+    );
+    assert_eq!(
+        title_row(&f, &leaf.id).await.activation,
+        Some(leaf_activation)
+    );
+    f.snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    let before_noop = durable_tree(&f.home);
+    f.store.validate_title_observations(&renamed).await.unwrap();
+    assert_eq!(durable_tree(&f.home), before_noop);
+}
+
+#[tokio::test]
+async fn title_observations_reject_preexisting_damage_without_publication() {
+    for damage in ["own", "ancestor", "birth", "project", "marker"] {
+        let f = Fixture::new().await;
+        let child = f.child("damaged-title-child", &f.root).await;
+        f.store.ensure_actor(&f.root.id).await.unwrap();
+        f.store.ensure_actor(&child.id).await.unwrap();
+        if damage == "marker" {
+            fs::remove_file(
+                f.directory(&child.id)
+                    .join("actor-authority.initialized.json"),
+            )
+            .await
+            .unwrap();
+        } else {
+            f.edit(&child.id, "actor-authority.json", |v| match damage {
+                "own" => v["actor"]["observed_metadata_version"] = 1.into(),
+                "ancestor" => v["actor"]["ancestor_observations"][0]["metadata_version"] = 1.into(),
+                "birth" => v["actor"]["session_created_at"] = serde_json::json!(Utc::now()),
+                "project" => v["actor"]["project_id"] = "different-project".into(),
+                _ => unreachable!(),
+            })
+            .await;
+        }
+        let current = f.store.load_session(&f.root.id).await.unwrap().unwrap();
+        let before = durable_tree(&f.home);
+        assert!(
+            f.store.validate_title_observations(&current).await.is_err(),
+            "no-op {damage}"
+        );
+        assert!(
+            f.store.save_session(&rename_title(current)).await.is_err(),
+            "rename {damage}"
+        );
+        assert_eq!(durable_tree(&f.home), before, "no mutation on {damage}");
+        assert!(f
+            .snapshot(&f.root.id, ActorSnapshotLimits::default())
+            .await
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn title_observations_keep_counter_gaps_and_project_aba_fail_closed() {
+    for gap in [2, u64::MAX] {
+        let f = Fixture::new().await;
+        f.store.ensure_actor(&f.root.id).await.unwrap();
+        let mut renamed = rename_title(f.root.clone());
+        renamed.metadata_version = gap;
+        let before = durable_tree(&f.home);
+        assert!(f.store.save_session(&renamed).await.is_err());
+        assert_eq!(durable_tree(&f.home), before);
+    }
+    let f = Fixture::new().await;
+    f.activate(&f.root.id).await;
+    // Two unseen metadata revisions may hide Project A→B→A. A title
+    // operation must not bless that already-stale observation as harmless.
+    let mut previous = f.store.load_session(&f.root.id).await.unwrap().unwrap();
+    previous.metadata_version += 2;
+    f.store.save_session(&previous).await.unwrap();
+    let before = durable_tree(&f.home);
+    assert!(f
+        .store
+        .save_session(&rename_title(previous.clone()))
+        .await
+        .is_err());
+    assert!(f
+        .store
+        .validate_title_observations(&previous)
+        .await
+        .is_err());
+    assert_eq!(durable_tree(&f.home), before);
+    assert_eq!(
+        f.store.ensure_actor(&f.root.id).await.unwrap_err(),
+        bamboo_domain::ActorDirectoryError::ProjectTransitionBlocked
+    );
+}
+
+#[tokio::test]
+async fn title_observations_preserve_absence_and_legacy_root_spelling() {
+    let f = Fixture::new().await;
+    f.store.validate_title_observations(&f.root).await.unwrap();
+    let renamed = rename_title(f.root.clone());
+    f.store.save_session(&renamed).await.unwrap();
+    assert!(!f
+        .directory(&f.root.id)
+        .join("actor-authority.json")
+        .exists());
+    assert!(!f
+        .directory(&f.root.id)
+        .join("actor-authority.initialized.json")
+        .exists());
+    for file in ["session.json", RUNTIME_SIDECAR_FILE] {
+        f.edit(&f.root.id, file, |v| v["root_session_id"] = "".into())
+            .await;
+    }
+    f.store.ensure_actor(&f.root.id).await.unwrap();
+    let legacy = f.store.load_session(&f.root.id).await.unwrap().unwrap();
+    assert!(legacy.root_session_id.is_empty());
+    f.store.validate_title_observations(&legacy).await.unwrap();
+    let mut next = rename_title(legacy);
+    next.title = "Legacy renamed".into();
+    f.store.save_session(&next).await.unwrap();
+    f.snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn title_observations_noop_reloads_instead_of_trusting_caller_snapshot() {
+    let f = Fixture::new().await;
+    f.store.ensure_actor(&f.root.id).await.unwrap();
+    let old = f.store.load_session(&f.root.id).await.unwrap().unwrap();
+    let next = rename_title(old.clone());
+    f.store.save_session(&next).await.unwrap();
+    let before = durable_tree(&f.home);
+    assert!(f.store.validate_title_observations(&old).await.is_err());
+    f.store.validate_title_observations(&next).await.unwrap();
+    assert_eq!(durable_tree(&f.home), before);
+}
+
+#[tokio::test]
+async fn title_observations_report_partial_io_and_validate_noop_truthfully() {
+    use super::default_actor_context_tests::DefaultWriteHook;
+    for (file, phase, new_title_visible, consistent) in [
+        (
+            "actor-authority.json",
+            DurableWritePhase::AfterReplace,
+            true,
+            false,
+        ),
+        (
+            RUNTIME_SIDECAR_FILE,
+            DurableWritePhase::BeforeReplace,
+            false,
+            true,
+        ),
+        (
+            "session.json",
+            DurableWritePhase::BeforeReplace,
+            true,
+            false,
+        ),
+        (
+            SEARCH_INDEX_REVISION_FILE,
+            DurableWritePhase::BeforeReplace,
+            true,
+            true,
+        ),
+    ] {
+        let f = Fixture::new().await;
+        let baseline = rename_title(f.root.clone());
+        f.store.save_session(&baseline).await.unwrap();
+        let child = f.child("io-title-child", &baseline).await;
+        f.store.ensure_actor(&f.root.id).await.unwrap();
+        f.store.ensure_actor(&child.id).await.unwrap();
+        let old = f.store.load_session(&f.root.id).await.unwrap().unwrap();
+        let mut next = rename_title(old.clone());
+        next.title = "Next requested title".into();
+        let hook = DefaultWriteHook::install(&f.store, file, phase, true);
+        hook.release();
+        assert!(
+            f.store.save_session(&next).await.is_err(),
+            "{file}: must report write failure"
+        );
+        let current = f.store.load_session(&f.root.id).await.unwrap().unwrap();
+        assert_eq!(current.title == next.title, new_title_visible);
+        let before_validation = durable_tree(&f.home);
+        let validation = f.store.validate_title_observations(&current).await;
+        let snapshot = f.snapshot(&f.root.id, ActorSnapshotLimits::default()).await;
+        assert_eq!(validation.is_ok(), consistent, "no-op after {file}");
+        assert_eq!(snapshot.is_ok(), consistent, "snapshot after {file}");
+        assert_eq!(durable_tree(&f.home), before_validation);
+        if !consistent {
+            // A same-title manual retry checks the validator above. Changing
+            // back to the old title is also a fresh, rejected preflight.
+            let mut retry = rename_title(current);
+            retry.title = old.title.clone();
+            assert!(f.store.save_session(&retry).await.is_err());
+            assert_eq!(durable_tree(&f.home), before_validation);
+        }
+    }
+}
+
+#[tokio::test]
+async fn title_failed_refresh_cannot_hide_later_project_aba_from_live_fences() {
+    use super::default_actor_context_tests::DefaultWriteHook;
+    for initialize_root in [true, false] {
+        let f = Fixture::new().await;
+        let child = f.child("title-aba-child", &f.root).await;
+        let mut fences = Vec::new();
+        if initialize_root {
+            fences.push(f.activate(&f.root.id).await.fence());
+        }
+        fences.push(f.activate(&child.id).await.fence());
+        let next = rename_title(f.store.load_session(&f.root.id).await.unwrap().unwrap());
+        let hook = DefaultWriteHook::install(
+            &f.store,
+            "actor-authority.json",
+            DurableWritePhase::AfterReplace,
+            true,
+        );
+        hook.release();
+        assert!(f.store.save_session(&next).await.is_err());
+        let mut current = f.store.load_session(&f.root.id).await.unwrap().unwrap();
+        for project in [Some("project-b"), None] {
+            match project {
+                Some(project) => current.set_project_id_meta(project),
+                None => current.clear_project_id_meta(),
+            }
+            current.metadata_version += 1;
+            f.store.save_runtime_state(&current).await.unwrap();
+        }
+        let before = durable_tree(&f.home);
+        for fence in fences {
+            assert_eq!(
+                f.store
+                    .validate_fence(&fence, Utc::now())
+                    .await
+                    .unwrap_err(),
+                bamboo_domain::ActorDirectoryError::ProjectTransitionBlocked
+            );
+        }
+        assert!(f.store.validate_title_observations(&current).await.is_err());
+        assert_eq!(durable_tree(&f.home), before);
+    }
+}
+
+#[tokio::test]
+async fn title_commit_rejects_non_title_change_in_loaded_snapshot_window() {
+    let f = Fixture::new().await;
+    let child = f.child("title-concurrent-child", &f.root).await;
+    f.store.ensure_actor(&child.id).await.unwrap();
+    let old = f.store.load_session(&f.root.id).await.unwrap().unwrap();
+    let mut concurrent = old.clone();
+    concurrent.model = "new concurrent model".into();
+    f.store.save_runtime_state(&concurrent).await.unwrap();
+    let before = durable_tree(&f.home);
+    assert!(f.store.save_session(&rename_title(old)).await.is_err());
+    assert_eq!(durable_tree(&f.home), before);
+    assert_eq!(
+        f.store
+            .load_session(&f.root.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .model,
+        concurrent.model
+    );
+    f.snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn title_commit_rejects_equal_nonzero_version_from_another_title_writer() {
+    let f = Fixture::new().await;
+    f.store.ensure_actor(&f.root.id).await.unwrap();
+    let old = f.store.load_session(&f.root.id).await.unwrap().unwrap();
+    let mut committed = rename_title(old.clone());
+    committed.title = "Other title writer".into();
+    f.store.save_session(&committed).await.unwrap();
+    let before = durable_tree(&f.home);
+    assert!(f.store.save_session(&rename_title(old)).await.is_err());
+    assert_eq!(durable_tree(&f.home), before);
+    f.snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn title_commit_checks_newer_runtime_even_when_stale_main_matches() {
+    use super::default_actor_context_tests::DefaultWriteHook;
+    for changed_field in ["title", "pinned"] {
+        let f = Fixture::new().await;
+        let child = f.child("title-split-child", &f.root).await;
+        let first = rename_title(child);
+        f.store.save_session(&first).await.unwrap();
+        f.store.ensure_actor(&first.id).await.unwrap();
+        let mut second = first.clone();
+        second.metadata_version += 1;
+        if changed_field == "title" {
+            second.title = "Newer runtime title".into();
+            second.title_version += 1;
+        } else {
+            second.pinned = true;
+        }
+        let hook = DefaultWriteHook::install(
+            &f.store,
+            "session.json",
+            DurableWritePhase::BeforeReplace,
+            true,
+        );
+        hook.release();
+        assert!(f.store.save_session(&second).await.is_err());
+        let current = f.store.load_session(&first.id).await.unwrap().unwrap();
+        assert_eq!(current.metadata_version, second.metadata_version);
+        let before = durable_tree(&f.home);
+        // This stale caller exactly matches Main, but must not roll newer
+        // runtime back to its old observation and report false success.
+        assert!(
+            f.store.save_session(&first).await.is_err(),
+            "{changed_field}"
+        );
+        assert_eq!(durable_tree(&f.home), before);
+        assert!(f.store.validate_title_observations(&current).await.is_err());
+    }
+}
+
+#[tokio::test]
 async fn complete_134_actor_tree_survives_restart_and_leaves_cold_authority_unknown() {
     let f = Fixture::new().await;
     let parent = f.child("nested-parent", &f.root).await;

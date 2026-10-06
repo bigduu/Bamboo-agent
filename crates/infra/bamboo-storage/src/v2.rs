@@ -101,6 +101,7 @@ mod root_actor_input;
 #[cfg(test)]
 mod root_actor_input_tests;
 mod root_actor_runtime;
+mod title_observations;
 pub use host_registry::FileHostRegistry;
 #[cfg(test)]
 mod default_actor_context_tests;
@@ -6146,6 +6147,16 @@ impl SessionStoreV2 {
         };
         let tree = self.acquire_actor_tree_write_guard(root_id).await?;
         guards.hold_tree(tree);
+        let title_observations = if previous_main.as_ref().is_some_and(|previous| {
+            session.title_version > 0
+                || previous.title != session.title
+                || previous.title_generated != session.title_generated
+                || previous.title_version != session.title_version
+        }) {
+            self.prepare_title_observations(session).await?
+        } else {
+            Vec::new()
+        };
         if previous_projection.as_ref() != Some(&actor_tree_session_projection(session)) {
             let root = if session.kind == SessionKind::Root {
                 Some(session.clone())
@@ -6210,6 +6221,12 @@ impl SessionStoreV2 {
         if supervisor_proof_prepared {
             self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Committed)?;
         }
+        // Observations must never lead canonical metadata: an ahead row
+        // could conceal a later Project A→B→A revision. A failed refresh
+        // remains stale/fail-closed; the manual no-op path validates it too.
+        for (path, bytes) in title_observations {
+            self.write_default_bytes(&path, bytes, guards).await?;
+        }
         let (revision_path, revision) = self
             .publish_default_search_revision(&abs_dir, guards)
             .await?;
@@ -6252,6 +6269,10 @@ impl SessionStoreV2 {
 
 #[async_trait::async_trait]
 impl Storage for SessionStoreV2 {
+    async fn validate_title_observations(&self, expected: &Session) -> io::Result<()> {
+        self.validate_unchanged_title(expected).await
+    }
+
     fn bind_root_actor_inbox(
         &self,
         owner: &bamboo_domain::RootActorRuntimeWrite,

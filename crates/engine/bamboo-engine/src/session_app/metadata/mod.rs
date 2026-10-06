@@ -102,13 +102,25 @@ impl SessionMetadataService {
         let mut session = load_latest(state, session_id).await?;
         ensure_if_match(&session, if_match)?;
         if session.title == trimmed && session.title_generated {
+            state
+                .persistence()
+                .storage()
+                .validate_title_observations(&session)
+                .await
+                .map_err(|e| MetadataError::Storage(format!("validate title: {e}")))?;
             return Ok(None);
         }
 
         session.title = trimmed.to_string();
         session.title_generated = true;
-        session.title_version = session.title_version.saturating_add(1);
-        session.metadata_version = session.metadata_version.saturating_add(1);
+        session.title_version = session
+            .title_version
+            .checked_add(1)
+            .ok_or_else(|| MetadataError::Storage("title version overflow".into()))?;
+        session.metadata_version = session
+            .metadata_version
+            .checked_add(1)
+            .ok_or_else(|| MetadataError::Storage("metadata version overflow".into()))?;
         session.updated_at = Utc::now();
 
         state
@@ -117,6 +129,15 @@ impl SessionMetadataService {
             .save_session(&session)
             .await
             .map_err(|e| MetadataError::Storage(format!("save_session: {e}")))?;
+        // Another physical writer can commit the same title/version between
+        // our load and save. Confirm existing observations even when the full
+        // writer legitimately treated that equal-version save as unchanged.
+        state
+            .persistence()
+            .storage()
+            .validate_title_observations(&session)
+            .await
+            .map_err(|e| MetadataError::Storage(format!("validate title: {e}")))?;
         refresh_in_memory_cache(state, session_id, session.clone()).await;
 
         let event = AgentEvent::SessionTitleUpdated {
