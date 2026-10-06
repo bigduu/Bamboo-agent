@@ -560,7 +560,8 @@ fn trusted_root_aliases_share_handles_without_merging_scope() {
 #[test]
 fn windows_real_opened_handle_identity_admits_and_reuses_regular_sources() {
     let temp = Fixture::new();
-    bundle(temp.path());
+    let root = bundle(temp.path());
+    std::fs::write(root.join("SKILL.md"), MAIN.replace("Body", "OLD SENTINEL")).unwrap();
     let pool = SourcePool::default();
     let first = capture(&pool, temp.path());
     let second = capture(&pool, temp.path());
@@ -570,6 +571,83 @@ fn windows_real_opened_handle_identity_admits_and_reuses_regular_sources() {
         .binding
         .validate(&pool, &first.policies, 4096)
         .unwrap();
+    for name in ["", ".", "..", r"\", r"C:\", r"a\b", "a/.", "a/", "missing"] {
+        assert!(pool
+            .probe_directory_component(temp.path(), Path::new(name))
+            .is_err());
+        assert_eq!(
+            pool.counts(),
+            (1, 0, 1),
+            "failed opens release temporary leases"
+        );
+    }
+
+    let previous = temp.path().parent().unwrap().join("previous-source");
+    std::fs::rename(temp.path(), &previous).unwrap();
+    std::fs::create_dir(temp.path()).unwrap();
+    let replacement = bundle(temp.path());
+    std::fs::write(
+        replacement.join("SKILL.md"),
+        MAIN.replace("Body", "NEW SENTINEL"),
+    )
+    .unwrap();
+    let new = capture(&pool, temp.path());
+    assert!(!first.binding.same_root(&new.binding));
+    assert!(new.main.contains("NEW SENTINEL"));
+    assert!(first
+        .binding
+        .validate(&pool, &first.policies, 4096)
+        .is_err());
+    {
+        let renamed = capture(&pool, &previous);
+        assert!(first.binding.same_root(&renamed.binding));
+        assert!(renamed.main.contains("OLD SENTINEL"));
+        renamed
+            .binding
+            .validate(&pool, &renamed.policies, 4096)
+            .unwrap();
+    }
+    assert_eq!(pool.counts(), (2, 0, 2));
+    drop(first);
+    assert_eq!(
+        pool.counts(),
+        (2, 0, 2),
+        "second old consumer remains charged"
+    );
+    drop(second);
+    pool.prune();
+    assert_eq!(
+        pool.counts(),
+        (1, 0, 1),
+        "last old consumer releases its root"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_real_directory_junction_cannot_supply_instruction_policy() {
+    let temp = Fixture::new();
+    let root = bundle(temp.path());
+    let outside = temp.path().parent().unwrap().join("outside-policy");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(
+        outside.join("bamboo.yaml"),
+        "invocation_policy:\n  explicit: true\n  automatic: true\n",
+    )
+    .unwrap();
+    let status = std::process::Command::new("cmd")
+        .args(["/D", "/C", "mklink", "/J"])
+        .arg(root.join("agents"))
+        .arg(&outside)
+        .status()
+        .unwrap();
+    assert!(status.success(), "real directory junction must be created");
+    let store = store(temp.path());
+    store.reload().await.unwrap();
+    assert_eq!(row(&store).await.status, WorkflowStatus::Invalid);
+    assert!(store.get_skill("source-fixture").await.is_err());
+    assert!(store.source_bindings().await.is_empty());
+    assert!(store.workflow_catalog_snapshot().await.entries.is_empty());
 }
 
 #[tokio::test]

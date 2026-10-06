@@ -1,7 +1,9 @@
 //! Descriptor-bound input capture. These are private publication inputs, not
 //! caller permissions or an alternative Skill parser.
 
-use cap_fs_ext::{DirExt, MetadataExt, OpenOptionsFollowExt};
+#[cfg(not(windows))]
+use cap_fs_ext::DirExt;
+use cap_fs_ext::{MetadataExt, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, Metadata, OpenOptions};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -14,6 +16,47 @@ use crate::store::storage::{LoadedSkillRecord, SkillDirectorySource};
 
 pub(crate) const POLICY_FILES: [&str; 3] =
     ["workflow.yaml", "agents/bamboo.yaml", "agents/openai.yaml"];
+
+#[cfg(not(windows))]
+type SourceDir = Dir;
+
+// Windows cap Dir requires denying deletion for its generic path operations.
+// This private owner supports only single-component, handle-relative reads.
+#[cfg(windows)]
+#[derive(Debug)]
+struct SourceDir(std::fs::File);
+
+#[cfg(windows)]
+impl SourceDir {
+    fn component(path: &Path) -> io::Result<&Path> {
+        let mut components = path.components();
+        match (components.next(), components.next()) {
+            (Some(Component::Normal(name)), None) if path.as_os_str() == name => Ok(path),
+            _ => Err(io::Error::other(
+                "source entry must be one normal component",
+            )),
+        }
+    }
+
+    fn open_with(&self, path: &Path, options: &OpenOptions) -> io::Result<std::fs::File> {
+        let path = Self::component(path)?;
+        let mut options = options.clone();
+        options.follow(cap_std::fs::FollowSymlinks::No);
+        cap_primitives::fs::open(&self.0, path, &options)
+    }
+
+    fn dir_metadata(&self) -> io::Result<Metadata> {
+        Metadata::from_file(&self.0)
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> io::Result<Metadata> {
+        cap_primitives::fs::stat(
+            &self.0,
+            Self::component(path)?,
+            cap_std::fs::FollowSymlinks::No,
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct PhysicalIdentity(u64, u64);
@@ -85,14 +128,14 @@ impl Drop for Lease {
 
 #[derive(Debug)]
 pub(crate) struct SourceRoot {
-    dir: Dir,
+    dir: SourceDir,
     identity: PhysicalIdentity,
     anchor: u64,
     _lease: Lease,
 }
 
 struct TemporaryDir {
-    dir: Dir,
+    dir: SourceDir,
     _lease: Lease,
 }
 
@@ -116,11 +159,34 @@ impl SourcePool {
         })
     }
 
-    fn open_directory(&self, parent: &Dir, name: &Path) -> io::Result<TemporaryDir> {
+    fn open_directory(&self, parent: &SourceDir, name: &Path) -> io::Result<TemporaryDir> {
         // Charge the returned handle and bounded library-open scratch before IO.
         let lease = self.temporary()?;
         let _scratch = self.temporary()?;
+        #[cfg(not(windows))]
         let dir = parent.open_dir_nofollow(name)?;
+        #[cfg(windows)]
+        let dir = {
+            use cap_std::fs::{MetadataExt as _, OpenOptionsExt};
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
+                FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+            let file = parent.open_with(name, &options)?;
+            let metadata = Metadata::from_file(&file)?;
+            if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(io::Error::other(
+                    "source directory is not an ordinary directory",
+                ));
+            }
+            SourceDir(file)
+        };
         Ok(TemporaryDir { dir, _lease: lease })
     }
 
@@ -146,10 +212,10 @@ impl SourcePool {
         let mut opened = {
             let lease = self.temporary()?;
             let _scratch = self.temporary()?;
-            TemporaryDir {
-                dir: Dir::open_ambient_dir(anchor, cap_std::ambient_authority())?,
-                _lease: lease,
-            }
+            let dir = Dir::open_ambient_dir(anchor, cap_std::ambient_authority())?;
+            #[cfg(windows)]
+            let dir = SourceDir(dir.into_std_file());
+            TemporaryDir { dir, _lease: lease }
         };
         for name in names {
             opened = self.open_directory(&opened.dir, Path::new(name))?;
@@ -183,7 +249,7 @@ impl SourcePool {
         Ok(root)
     }
 
-    fn walk(&self, root: &Dir, relative: &Path) -> io::Result<Option<TemporaryDir>> {
+    fn walk(&self, root: &SourceDir, relative: &Path) -> io::Result<Option<TemporaryDir>> {
         let mut opened: Option<TemporaryDir> = None;
         for component in relative.components() {
             let Component::Normal(name) = component else {
@@ -196,7 +262,7 @@ impl SourcePool {
         Ok(opened)
     }
 
-    fn observe(&self, base: &Dir, relative: &Path, limit: usize) -> io::Result<ObservedFile> {
+    fn observe(&self, base: &SourceDir, relative: &Path, limit: usize) -> io::Result<ObservedFile> {
         let mut components = relative.components().peekable();
         let mut opened: Option<TemporaryDir> = None;
         while let Some(component) = components.next() {
@@ -231,7 +297,10 @@ impl SourcePool {
                 }
                 Err(error) => return Err(error),
             };
+            #[cfg(not(windows))]
             let metadata = file.metadata()?;
+            #[cfg(windows)]
+            let metadata = Metadata::from_file(&file)?;
             if !metadata.is_file() || metadata.len() > limit as u64 {
                 return Err(io::Error::other(
                     "source input is not a bounded regular file",
@@ -251,7 +320,7 @@ impl SourcePool {
 
     fn absent(
         &self,
-        parent: &Dir,
+        parent: &SourceDir,
         name: &Path,
         identity: PhysicalIdentity,
     ) -> io::Result<ObservedFile> {
@@ -351,6 +420,13 @@ impl SourcePool {
     pub(crate) fn counts(&self) -> (usize, usize, usize) {
         let state = self.state.lock().unwrap();
         (state.retained, state.temporary, state.roots.len())
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn probe_directory_component(&self, source: &Path, name: &Path) -> io::Result<()> {
+        let root = self.admit(source)?;
+        self.open_directory(&root.dir, name)?;
+        Ok(())
     }
 
     pub(crate) fn prune(&self) {
