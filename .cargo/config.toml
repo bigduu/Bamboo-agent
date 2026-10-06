@@ -2,6 +2,9 @@
 # Release profile is untouched.
 
 [profile.dev]
+# Keep macOS unwind offsets within the compact-unwind range while preserving
+# unwinding and file:line backtraces in development and tests.
+opt-level = 1
 # Line tables keep file:line in backtraces at a fraction of full debuginfo size.
 debug = "line-tables-only"
 
