@@ -3,10 +3,12 @@
 
 use super::*;
 use bamboo_domain::{
-    ActorSnapshotError as Error, ActorSnapshotLimits, ActorSnapshotPort, ActorSnapshotPrincipal,
-    Session, Storage,
+    ActorActivationClaim, ActorDirectoryPort, ActorSnapshotError as Error, ActorSnapshotLimits,
+    ActorSnapshotPort, ActorSnapshotPrincipal, Session, Storage,
 };
 use std::ffi::OsStr;
+use std::io::{Seek, Write};
+use std::os::windows::fs::symlink_file;
 use std::process::Command;
 
 #[tokio::test]
@@ -173,6 +175,273 @@ fn retained_directory_and_file_handles_reject_reparse_replacement() {
         inside.read("evidence", 8, &mut budget).err(),
         Some(Error::BudgetExceeded)
     );
+}
+
+#[tokio::test]
+async fn live_actor_fence_authorizes_self_and_descendants_but_not_siblings_or_foreign_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let store = Arc::new(SessionStoreV2::new(home.clone()).await.unwrap());
+    let root = Session::new("windows-live-root", "PRIVATE-MODEL");
+    let parent = Session::new_child_of("windows-live-parent", &root, "PRIVATE-MODEL", "Parent");
+    let child = Session::new_child_of("windows-live-child", &parent, "PRIVATE-MODEL", "Child");
+    let sibling = Session::new_child_of("windows-live-sibling", &root, "PRIVATE-MODEL", "Sibling");
+    for session in [&root, &parent, &child, &sibling] {
+        store.save_session(session).await.unwrap();
+    }
+    store.flush_search_index().await;
+    let now = Utc::now();
+    let activation = store
+        .claim_activation(&ActorActivationClaim {
+            actor_id: parent.id.clone(),
+            run_id: "PRIVATE-RUN".into(),
+            lease_owner: "PRIVATE-HOST".into(),
+            lease_expires_at: now + chrono::Duration::minutes(5),
+            inbox_generation: 42,
+            placement_ref: None,
+            now,
+        })
+        .await
+        .unwrap();
+    let read = |root: String, subtree: String, fence: bamboo_domain::ActorActivationFence| {
+        let store = store.clone();
+        let home = home.clone();
+        async move {
+            let before = durable_files(&home);
+            let result = store
+                .actor_subtree_snapshot(
+                    ActorSnapshotPrincipal::live_actor(fence),
+                    &root,
+                    &subtree,
+                    ActorSnapshotLimits::default(),
+                )
+                .await;
+            store.flush_search_index().await;
+            assert_eq!(durable_files(&home), before);
+            result
+        }
+    };
+    for (subtree, expected) in [
+        (&parent.id, vec![parent.id.as_str(), child.id.as_str()]),
+        (&child.id, vec![child.id.as_str()]),
+    ] {
+        let snapshot = read(root.id.clone(), subtree.clone(), activation.fence())
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .nodes
+                .iter()
+                .map(|node| node.actor_id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(!serde_json::to_string(&snapshot)
+            .unwrap()
+            .contains("PRIVATE"));
+    }
+    for subtree in [&root.id, &sibling.id] {
+        assert_eq!(
+            read(root.id.clone(), subtree.clone(), activation.fence())
+                .await
+                .unwrap_err(),
+            Error::UnauthorizedScope
+        );
+    }
+    let foreign = Session::new("windows-foreign-root", "PRIVATE-MODEL");
+    store.save_session(&foreign).await.unwrap();
+    store.flush_search_index().await;
+    // Reject foreign-root scope before trying to parse its private, corrupt body.
+    std::fs::write(
+        home.join("sessions/windows-foreign-root/session.json"),
+        b"PRIVATE corrupt body",
+    )
+    .unwrap();
+    assert_eq!(
+        read(foreign.id.clone(), foreign.id.clone(), activation.fence())
+            .await
+            .unwrap_err(),
+        Error::UnauthorizedScope
+    );
+    for component in 0..7 {
+        let mut fence = activation.fence();
+        match component {
+            0 => fence.schema_version += 1,
+            1 => fence.actor_id = sibling.id.clone(),
+            2 => fence.activation_id.push('x'),
+            3 => fence.attempt += 1,
+            4 => fence.run_id.push('x'),
+            5 => fence.lease_owner.push('x'),
+            _ => fence.lease_epoch += 1,
+        }
+        assert_eq!(
+            read(root.id.clone(), parent.id.clone(), fence)
+                .await
+                .unwrap_err(),
+            Error::UnauthorizedScope
+        );
+    }
+    let authority =
+        home.join("sessions/windows-live-root/children/windows-live-parent/actor-authority.json");
+    let mut row: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&authority).unwrap()).unwrap();
+    row["activation"]["lease_expires_at"] =
+        serde_json::json!(Utc::now() - chrono::Duration::seconds(1));
+    std::fs::write(&authority, serde_json::to_vec(&row).unwrap()).unwrap();
+    assert_eq!(
+        read(root.id.clone(), parent.id.clone(), activation.fence())
+            .await
+            .unwrap_err(),
+        Error::UnauthorizedScope
+    );
+}
+
+#[tokio::test]
+async fn regular_file_symlink_replacement_is_rejected_and_open_handle_retains_original() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let store = SessionStoreV2::new(home.clone()).await.unwrap();
+    let root = Session::new("windows-symlink-root", "PRIVATE-MODEL");
+    store.save_session(&root).await.unwrap();
+    let directory = home.join("sessions/windows-symlink-root");
+    let path = directory.join("session.json");
+    let original = std::fs::read(&path).unwrap();
+    let retained = std::fs::File::open(&path).unwrap();
+    let reader = actor_snapshot_reader::Directory::open_absolute(&directory).unwrap();
+    std::fs::rename(&path, directory.join("retained.json")).unwrap();
+    let outside = home.join("owned-outside.json");
+    std::fs::write(&outside, b"PRIVATE foreign replacement").unwrap();
+    // Missing Windows symlink capability is an explicit failure, never a skip.
+    symlink_file(&outside, &path)
+        .expect("native Windows regular-file symlink creation is required");
+    assert!(std::fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(std::fs::metadata(&outside).unwrap().is_file());
+    assert_eq!(std::fs::read_link(&path).unwrap(), outside);
+    let mut budget = actor_snapshot_reader::ReadBudget::new(ActorSnapshotLimits::default());
+    assert_eq!(
+        reader
+            .read("session.json", 512 * 1024, &mut budget)
+            .unwrap_err(),
+        Error::InconsistentAuthority
+    );
+    assert_eq!(
+        actor_snapshot_reader::read_content(retained, original.len(), &mut budget).unwrap(),
+        original
+    );
+    assert_eq!(
+        store
+            .actor_subtree_snapshot(
+                ActorSnapshotPrincipal::host_owner(),
+                &root.id,
+                &root.id,
+                ActorSnapshotLimits::default()
+            )
+            .await
+            .unwrap_err(),
+        Error::InconsistentAuthority
+    );
+    assert_eq!(
+        std::fs::read(&outside).unwrap(),
+        b"PRIVATE foreign replacement"
+    );
+}
+
+#[test]
+fn grow_after_open_is_capped_and_actual_bytes_debit_the_aggregate_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("growing");
+    let earlier = temp.path().join("earlier");
+    std::fs::write(&earlier, b"paid").unwrap();
+    let empty = temp.path().join("empty");
+    std::fs::write(&empty, b"").unwrap();
+    for aggregate_limit in [12, 32] {
+        std::fs::write(&path, b"small").unwrap();
+        let retained = std::fs::File::open(&path).unwrap();
+        let mut observed = retained.try_clone().unwrap();
+        assert_eq!(retained.metadata().unwrap().len(), 5);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[b'x'; 100])
+            .unwrap();
+        let mut budget = actor_snapshot_reader::ReadBudget::new(ActorSnapshotLimits {
+            aggregate_read_bytes: aggregate_limit,
+            ..ActorSnapshotLimits::default()
+        });
+        assert_eq!(
+            actor_snapshot_reader::read_content(
+                std::fs::File::open(&earlier).unwrap(),
+                4,
+                &mut budget
+            )
+            .unwrap(),
+            b"paid"
+        );
+        assert_eq!(
+            actor_snapshot_reader::read_content(retained, 8, &mut budget).unwrap_err(),
+            Error::BudgetExceeded
+        );
+        // A cloned Windows handle shares the original cursor. Exactly max + 1
+        // bytes were consumed, rather than trusting the stale five-byte stat.
+        assert_eq!(observed.stream_position().unwrap(), 9);
+        if aggregate_limit == 12 {
+            assert_eq!(
+                actor_snapshot_reader::read_content(
+                    std::fs::File::open(&empty).unwrap(),
+                    0,
+                    &mut budget
+                )
+                .unwrap_err(),
+                Error::BudgetExceeded
+            );
+        } else {
+            // This exact fill proves that even rejected reads debit all bytes.
+            let remaining = aggregate_limit - (4 + 9);
+            std::fs::write(temp.path().join("tail"), vec![b't'; remaining]).unwrap();
+            assert_eq!(
+                actor_snapshot_reader::read_content(
+                    std::fs::File::open(temp.path().join("tail")).unwrap(),
+                    remaining,
+                    &mut budget
+                )
+                .unwrap()
+                .len(),
+                remaining
+            );
+            assert_eq!(
+                actor_snapshot_reader::read_content(
+                    std::fs::File::open(&earlier).unwrap(),
+                    4,
+                    &mut budget
+                )
+                .unwrap_err(),
+                Error::BudgetExceeded
+            );
+        }
+    }
+}
+
+fn durable_files(home: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(directory: &std::path::Path, files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                files.insert(path.clone(), vec![]);
+                walk(&path, files);
+            } else {
+                assert!(entry.file_type().unwrap().is_file());
+                files.insert(path.clone(), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut files = Default::default();
+    walk(home, &mut files);
+    files
 }
 
 fn junction(link: &std::path::Path, target: &std::path::Path) {
