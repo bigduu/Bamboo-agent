@@ -95,7 +95,6 @@ mod tests {
             actor_id: "child".into(),
             parent_actor_id: Some("root".into()),
             root_actor_id: "root".into(),
-            project_id: Some("private-project".into()),
             activation_id: "safe-activation".into(),
             attempt: 1,
             lease_epoch: 7,
@@ -117,7 +116,7 @@ mod tests {
         let json = serde_json::to_string(&public).unwrap();
         for private in [
             "private-token",
-            "private-project",
+            "project_id",
             "lease_epoch",
             "execution_epoch",
             "source_order",
