@@ -96,6 +96,12 @@ jobs:
       - name: Build locked Rust workspace
         run: cargo build --locked
 
+      - name: Compile locked Rust test targets
+        timeout-minutes: 15
+        run: cargo test --locked --no-run
+        env:
+          RUST_MIN_STACK: "8388608"
+
       - name: Test locked Rust workspace
         timeout-minutes: 30
         run: cargo test --locked
