@@ -42,14 +42,19 @@ pub struct PublicActorEvent {
     pub source_order: ActorEventSourceOrder,
 }
 
+pub(super) fn opaque_event_id(identity: &str) -> String {
+    let digest = Sha256::digest(identity.as_bytes());
+    let mut event_id = String::with_capacity(68);
+    event_id.push_str("ae1-");
+    for byte in digest {
+        write!(&mut event_id, "{byte:02x}").expect("String formatting cannot fail");
+    }
+    event_id
+}
+
 impl From<&ActorEventEnvelope> for PublicActorEvent {
     fn from(envelope: &ActorEventEnvelope) -> Self {
-        let digest = Sha256::digest(envelope.event_id.as_bytes());
-        let mut event_id = String::with_capacity(68);
-        event_id.push_str("ae1-");
-        for byte in digest {
-            write!(&mut event_id, "{byte:02x}").expect("String formatting cannot fail");
-        }
+        let event_id = opaque_event_id(&envelope.event_id);
         let class = match envelope.class {
             ActorEventClass::Lifecycle => PublicActorEventClass::Lifecycle,
             ActorEventClass::Semantic => PublicActorEventClass::Semantic,
