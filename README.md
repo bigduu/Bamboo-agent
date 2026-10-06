@@ -204,3 +204,12 @@ charged through the last real owner and carries no future execution permission.
 `probe_selected_source` rechecks current authority and raw/physical identity with
 bounded charged scratch. These APIs do not register a `skills_read` Tool or provide
 paging/cache/runtime activation. Existing publication storage has separate bounds.
+
+The exported, unregistered `SkillsReadTool` reuses `SkillsListTool`'s mandatory
+trusted caller resolver. Reads use stable packages plus `SKILL.md` or a published
+relative resource. Follow `next_cursor` to complete EOF before applying instructions.
+A finite owned snapshot cache retains shared byte charges through active borrows;
+every continuation validates current caller/input, host policy and source identity.
+UTF-8 pages charge the largest real OpenAI/Anthropic cache envelope (including 1h).
+`render_skill_usage_instructions` exposes complete budgeted guidance only when a
+future runtime deliberately installs the read Tool. Live registration is deferred.

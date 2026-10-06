@@ -53,3 +53,18 @@ revision. These portions are copyright 2025 OpenAI and retain the complete
 [upstream notice](crates/infra/bamboo-skills/third_party/codex/NOTICE).
 Bamboo adapts host locators/source ordering and fresh metadata eligibility;
 ordering and unavailable-alias regression fixtures are Bamboo-authored.
+
+### Selected Skill reading and usage guidance (#1623)
+
+The UTF-8 advancing pagination algorithm and handle bounds in
+`crates/infra/bamboo-skills/src/progressive/read.rs` and
+`crates/app/bamboo-server-tools/src/skill_runtime/catalog.rs` adapt OpenAI Codex
+`codex-rs/ext/skills/src/tools/{read.rs,mod.rs}` at revision
+`7f892275e31002f0422477c6219189284560e689` (Apache-2.0).
+`progressive/render.rs` adapts EOF/reference guidance from `catalog_prompt.rs`.
+The upstream executor cache and content-only cursor authority are not imported.
+Bamboo supplies the finite charged cache, current source/caller validation and
+real provider-envelope accounting. Boundary and behavior fixtures are Bamboo-authored;
+the pinned sources contain no dedicated read fixtures to copy.
+Complete Bamboo MIT and Codex Apache-2.0/NOTICE copies remain packaged in both
+bamboo-skills and bamboo-server-tools. Existing provenance and notices above apply.
