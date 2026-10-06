@@ -11,4 +11,7 @@ debug = "line-tables-only"
 # Third-party dependencies get no debug info at all ("*" excludes workspace
 # members, so bamboo_* crates keep their line tables).
 [profile.dev.package."*"]
+# Preserve the existing dependency optimization; only workspace code needs the
+# unwind-size tuning above, avoiding a cold rebuild of all third-party crates.
+opt-level = 0
 debug = false
