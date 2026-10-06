@@ -116,11 +116,26 @@ fn operation_io_error_response(io_error: std::io::Error) -> HttpResponse {
     use actix_web::http::StatusCode;
 
     match io_error.kind() {
-        std::io::ErrorKind::Unsupported => error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "root_mode_authority_unavailable",
-            "This storage backend does not support recoverable Root mode operations",
-        ),
+        std::io::ErrorKind::Unsupported => {
+            if io_error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+            {
+                tracing::warn!(%io_error, "Root mode protected context mutation rejected");
+                error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "root_mode_context_rejected",
+                    "Root mode protected context mutation was rejected; keep this operation ID and retry recovery",
+                )
+            } else {
+                tracing::warn!(%io_error, "Root mode storage capability unavailable");
+                error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "root_mode_authority_unavailable",
+                    "This storage backend does not support recoverable Root mode operations",
+                )
+            }
+        }
         std::io::ErrorKind::InvalidInput => error(
             StatusCode::BAD_REQUEST,
             "invalid_root_mode_operation",
@@ -575,5 +590,148 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"]["code"], "root_mode_outcome_unconfirmed");
+    }
+
+    #[actix_web::test]
+    async fn unsupported_actor_context_is_distinct_from_missing_backend_capability() {
+        for (cause, expected) in [
+            (
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    bamboo_domain::SessionAuthorityConflict("unfenced protected context".into()),
+                ),
+                "root_mode_context_rejected",
+            ),
+            (
+                std::io::Error::new(std::io::ErrorKind::Unsupported, "backend capability"),
+                "root_mode_authority_unavailable",
+            ),
+        ] {
+            let response = operation_io_error_response(cause);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: Value = serde_json::from_slice(
+                &actix_web::body::to_bytes(response.into_body())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["error"]["code"], expected);
+        }
+    }
+
+    #[actix_web::test]
+    async fn activated_idle_root_mode_http_commits_and_recovers_without_chat() {
+        use bamboo_domain::{
+            ActorActivationClaim, ActorActivationFinish, ActorDirectoryPort, ModelContextState,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(home.path().into()).await.unwrap());
+        let mut root = Session::new("activated-mode-http", "test-model");
+        root.reasoning_effort = Some(bamboo_domain::ReasoningEffort::Max);
+        root.model_context_state = Some(ModelContextState {
+            state_revision: 5,
+            prefix_epoch: 2,
+            cache_scope_sha256: Some("a".repeat(64)),
+            ..Default::default()
+        });
+        root.activate_provider_transcript_route(
+            bamboo_domain::session::provider_transcript::ProviderFamily::OpenAi,
+            bamboo_domain::session::provider_transcript::ProviderProtocol::OpenAiResponsesV1,
+            &"b".repeat(64),
+        )
+        .unwrap();
+        state.storage.save_session(&root).await.unwrap();
+        let now = chrono::Utc::now();
+        let activation = state
+            .session_store
+            .claim_activation(&ActorActivationClaim {
+                actor_id: root.id.clone(),
+                run_id: "fixture-run".into(),
+                lease_owner: "fixture-host".into(),
+                lease_expires_at: now + chrono::Duration::minutes(5),
+                inbox_generation: 0,
+                placement_ref: None,
+                now,
+            })
+            .await
+            .unwrap();
+        state
+            .session_store
+            .start_activation(&activation.fence(), now)
+            .await
+            .unwrap();
+        state
+            .session_store
+            .finish_activation(&activation.fence(), now, ActorActivationFinish::Succeeded)
+            .await
+            .unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let base = format!("/api/v1/sessions/{}", root.id);
+        let operation = format!("{base}/root-mode-operations/0:{}", uuid::Uuid::new_v4());
+        let body = serde_json::json!({"birth_token":root.root_mode_birth_token(), "expected_epoch":0, "thinking_mode":"ultra"});
+        let selected = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&operation)
+                .set_json(&body)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(selected.status(), StatusCode::OK);
+        let selected: Value = test::read_body_json(selected).await;
+        assert_eq!(selected["status"], "committed");
+        assert_eq!(selected["thinking_mode_at_completion"], "ultra");
+        let restarted = web::Data::new(AppState::new(home.path().into()).await.unwrap());
+        let app = test::init_service(
+            App::new()
+                .app_data(restarted.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let recovered: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("{operation}/recover"))
+                .set_json(&body)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(recovered, selected);
+        let standard = format!("{base}/root-mode-operations/1:{}", uuid::Uuid::new_v4());
+        let changed: Value = test::call_and_read_body_json(&app, test::TestRequest::post().uri(&standard)
+            .set_json(serde_json::json!({"birth_token":root.root_mode_birth_token(),"expected_epoch":1,"thinking_mode":"standard"})).to_request()).await;
+        assert_eq!(changed["status"], "committed");
+        assert_eq!(changed["thinking_mode_at_completion"], "standard");
+        let detail: Value =
+            test::call_and_read_body_json(&app, test::TestRequest::get().uri(&base).to_request())
+                .await;
+        assert_eq!(detail["session"]["thinking_mode"], "standard");
+        assert_eq!(detail["session"]["reasoning_effort"], "max");
+        let durable = restarted
+            .storage
+            .load_session(&root.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.root_mode_transition_epoch, 2);
+        assert_eq!(
+            durable.model_context_state.as_ref().unwrap().prefix_epoch,
+            3
+        );
+        assert_eq!(
+            durable.model_context_state.as_ref().unwrap().state_revision,
+            6
+        );
+        assert_eq!(durable.root_mode_operations.len(), 2);
+        assert_eq!(
+            durable.provider_transcript.epoch(),
+            root.provider_transcript.epoch() + 2
+        );
+        assert!(durable.messages.is_empty());
     }
 }
