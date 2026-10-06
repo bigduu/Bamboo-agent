@@ -101,6 +101,7 @@ mod root_actor_input;
 #[cfg(test)]
 mod root_actor_input_tests;
 mod root_actor_runtime;
+mod title_observations;
 pub use host_registry::FileHostRegistry;
 #[cfg(test)]
 mod default_actor_context_tests;
@@ -6076,6 +6077,24 @@ impl SessionStoreV2 {
         guards: &Arc<DefaultWriterGuards>,
         answer_permit: Option<&ParentQuestion>,
     ) -> io::Result<()> {
+        self.save_session_after_lock_with_title_intent(
+            session,
+            total_started,
+            guards,
+            answer_permit,
+            false,
+        )
+        .await
+    }
+
+    async fn save_session_after_lock_with_title_intent(
+        &self,
+        session: &Session,
+        total_started: Instant,
+        guards: &Arc<DefaultWriterGuards>,
+        answer_permit: Option<&ParentQuestion>,
+        manual_title: bool,
+    ) -> io::Result<()> {
         let intended_rel = Self::default_writer_rel_path(session)?;
         self.check_default_or_root_actor_context(
             session,
@@ -6146,6 +6165,11 @@ impl SessionStoreV2 {
         };
         let tree = self.acquire_actor_tree_write_guard(root_id).await?;
         guards.hold_tree(tree);
+        let title_observations = if manual_title {
+            self.prepare_title_observations(session).await?
+        } else {
+            Vec::new()
+        };
         if previous_projection.as_ref() != Some(&actor_tree_session_projection(session)) {
             let root = if session.kind == SessionKind::Root {
                 Some(session.clone())
@@ -6210,6 +6234,12 @@ impl SessionStoreV2 {
         if supervisor_proof_prepared {
             self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Committed)?;
         }
+        // Observations must never lead canonical metadata: an ahead row
+        // could conceal a later Project A→B→A revision. A failed refresh
+        // remains stale/fail-closed; the manual no-op path validates it too.
+        for (path, bytes) in title_observations {
+            self.write_default_bytes(&path, bytes, guards).await?;
+        }
         let (revision_path, revision) = self
             .publish_default_search_revision(&abs_dir, guards)
             .await?;
@@ -6252,6 +6282,22 @@ impl SessionStoreV2 {
 
 #[async_trait::async_trait]
 impl Storage for SessionStoreV2 {
+    async fn save_manual_title(&self, session: &Session) -> io::Result<()> {
+        let total_started = Instant::now();
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_write = self
+            .acquire_session_write_lock(&session.id, SaveKind::Full)
+            .await?;
+        let guards = DefaultWriterGuards::shared(lifecycle, runtime_task, session_write);
+        self.save_session_after_lock_with_title_intent(session, total_started, &guards, None, true)
+            .await
+    }
+
+    async fn validate_title_observations(&self, expected: &Session) -> io::Result<()> {
+        self.validate_unchanged_title(expected).await
+    }
+
     fn bind_root_actor_inbox(
         &self,
         owner: &bamboo_domain::RootActorRuntimeWrite,

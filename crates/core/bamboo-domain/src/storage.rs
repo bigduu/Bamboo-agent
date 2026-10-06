@@ -35,6 +35,25 @@ pub type RootActorRuntimeEventPublisher =
 /// (e.g., JSONL files, databases, cloud storage).
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
+    /// Persist an explicit manual-title mutation. Actor-aware backends must
+    /// compare it with current canonical state under the full writer guards,
+    /// allowing only the title fields and exact version advances. Generic
+    /// Session saves (for example resident frame resets) are a separate lane.
+    /// Backends without Actor observations retain their ordinary save behavior.
+    async fn save_manual_title(&self, session: &Session) -> std::io::Result<()> {
+        self.save_session(session).await
+    }
+
+    /// Validate a manual title before reporting success, including a no-op.
+    /// Backends with Actor metadata observations must reread canonical state
+    /// under their writer guards and reject stale or incomplete observations.
+    /// This must not initialize, refresh or repair any authority. The default
+    /// preserves title behavior for stores without Actor observations.
+    async fn validate_title_observations(&self, expected: &Session) -> std::io::Result<()> {
+        let _ = expected;
+        Ok(())
+    }
+
     /// Bind an Inbox to this exact Root execution before opting into owned
     /// claims. Unsupported/custom queues fail closed, without a legacy claim.
     fn bind_root_actor_inbox(
