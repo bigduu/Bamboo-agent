@@ -41,7 +41,7 @@ impl SourceDir {
     fn open_with(&self, path: &Path, options: &OpenOptions) -> io::Result<std::fs::File> {
         let path = Self::component(path)?;
         let mut options = options.clone();
-        options.follow(cap_std::fs::FollowSymlinks::No);
+        options.follow(cap_primitives::fs::FollowSymlinks::No);
         cap_primitives::fs::open(&self.0, path, &options)
     }
 
@@ -53,7 +53,7 @@ impl SourceDir {
         cap_primitives::fs::stat(
             &self.0,
             Self::component(path)?,
-            cap_std::fs::FollowSymlinks::No,
+            cap_primitives::fs::FollowSymlinks::No,
         )
     }
 }
