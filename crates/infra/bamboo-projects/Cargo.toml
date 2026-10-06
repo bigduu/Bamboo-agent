@@ -5,7 +5,6 @@ edition = "2021"
 rust-version.workspace = true
 description = "Crash-safe Project registry and shared-resource paths for Bamboo"
 license = "MIT"
-license-file = "../../../LICENSE"
 
 [dependencies]
 bamboo-domain = { path = "../../core/bamboo-domain" }

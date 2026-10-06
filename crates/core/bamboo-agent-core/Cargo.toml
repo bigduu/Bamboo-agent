@@ -5,7 +5,6 @@ edition = "2021"
 rust-version.workspace = true
 description = "Core agent abstractions and execution primitives for the Bamboo agent framework"
 license = "MIT"
-license-file = "../../../LICENSE"
 repository = "https://github.com/bigduu/Bamboo-agent"
 keywords = ["ai", "agent", "llm", "automation", "mcp"]
 categories = ["artificial-intelligence", "development-tools", "asynchronous"]
