@@ -167,13 +167,22 @@ Source roots share a bounded handle pool across mode, Project and workspace
 stores. Temporary walks and old publications remain charged while referenced;
 Invalid/LKG entries and failed refreshes cannot grant future progressive API
 access. Public catalog serde, legacy Workflow adapters and deterministic
-orchestration keep their existing interfaces. This source binding adds no
-list/read Tool, caller permission, activation, or runtime registration.
+orchestration keep their existing interfaces. The source binding itself adds no
+caller permission, activation, or runtime registration.
 
 The portable source fixtures run in the existing manual/promotion Build matrix.
 Windows uses cap4.0.3 opened-handle identity with checked by-handle values; a
 candidate requires real Windows/Linux/macOS fixture results before portable
 acceptance. Ordinary eager instruction/resource storage remains until #1563.
+
+`bamboo_skills::progressive` exports a source-validated Instruction catalog. `bamboo_server_tools::SkillsListTool`
+exports a paged metadata Tool requiring a trusted caller/current-input resolver.
+Known host ceilings distinguish `None`, empty and populated sets; stale UI
+selection cannot grant manual invocation. Pages charge ToolResult and provider
+cache envelopes, advance to metadata EOF, or return an explicit budget error.
+The byte ceiling bounds each page-bearing block; unrelated request history is
+outside this per-page budget.
+These exported APIs have no live registry or body-reader integration yet.
 
 ## License
 
@@ -181,4 +190,4 @@ Project-owned code is licensed under the [MIT License](./LICENSE).
 Third-party materials retain their own licenses and copyright notices:
 
 - `builtin_skills/skill-creator` retains its [Apache-2.0 license](./builtin_skills/skill-creator/LICENSE.txt).
-- Codex-derived tool-search and Skill-input code retain its [Apache-2.0 license and source notices](./THIRD_PARTY_NOTICES.md).
+- Codex-derived tool-search, Skill-input and catalog/list code retain its [Apache-2.0 license and source notices](./THIRD_PARTY_NOTICES.md).
