@@ -15,3 +15,8 @@ debug = "line-tables-only"
 # unwind-size tuning above, avoiding a cold rebuild of all third-party crates.
 opt-level = 0
 debug = false
+
+# Keep the full test suite's fast, unoptimized builds. The macOS link guard
+# explicitly selects the development profile to verify its unwind tables.
+[profile.test]
+opt-level = 0
