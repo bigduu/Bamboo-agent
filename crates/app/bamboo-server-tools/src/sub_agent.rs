@@ -1347,6 +1347,10 @@ impl SubAgentTool {
                             .await
                             .map_err(tool_error_from_child_session)?;
                         require_resident_project_identity(parent_project_id.as_ref(), &child)?;
+                        self.sessions
+                            .validate_child_model(&child)
+                            .await
+                            .map_err(tool_error_from_child_session)?;
                         let mut resident_delivery_gate = launch_gate.as_deref();
 
                         // A resident processes tasks serially. If it is still running

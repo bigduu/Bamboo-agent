@@ -4846,6 +4846,8 @@ impl AppState {
             let mut candidate = cfg.clone();
             restore_authoritative_cluster_fabric(self.config_facade.as_ref(), &mut candidate);
             update(&mut candidate)?;
+            bamboo_config::validate_runtime_model_admission(&candidate)
+                .map_err(AppError::BadRequest)?;
             // No caller of this compatibility entrypoint owns cluster CAS.
             restore_authoritative_cluster_fabric(self.config_facade.as_ref(), &mut candidate);
             if self.config_facade.is_none() {
@@ -5014,6 +5016,8 @@ impl AppState {
             let mut candidate = cfg.clone();
             restore_authoritative_cluster_fabric(config_facade.as_ref(), &mut candidate);
             update(&mut candidate)?;
+            bamboo_config::validate_runtime_model_admission(&candidate)
+                .map_err(AppError::BadRequest)?;
             // Provider compatibility updates never own cluster CAS.
             restore_authoritative_cluster_fabric(config_facade.as_ref(), &mut candidate);
             // Provider plaintext may be present until the exact credential

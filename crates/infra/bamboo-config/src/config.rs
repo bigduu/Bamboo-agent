@@ -4799,6 +4799,7 @@ impl Config {
     /// Persist only provider configuration. Provider plaintext keys are first
     /// refreshed into their encrypted at-rest representation.
     pub fn save_providers_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
+        crate::validate_runtime_model_admission(self).map_err(anyhow::Error::msg)?;
         let mut config = self.clone();
         config.clear_legacy_provider_aliases_for_instance_mode();
         config.refresh_provider_api_keys_encrypted()?;
@@ -4812,6 +4813,7 @@ impl Config {
         &self,
         provider_document: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
+        crate::validate_runtime_model_admission(self).map_err(anyhow::Error::msg)?;
         if let Some(status) = self.recovery_status.as_ref().filter(|s| !s.confirmed) {
             anyhow::bail!(
                 "refusing to overwrite config.json: recovery from {:?} is unconfirmed",
@@ -4973,6 +4975,7 @@ impl Config {
     /// an auto-persisted recovery. Call [`Config::confirm_recovery`] (or
     /// [`Config::confirm_recovery_and_save_to_dir`]) first.
     pub fn save_to_dir(&self, data_dir: PathBuf) -> Result<()> {
+        crate::validate_runtime_model_admission(self).map_err(anyhow::Error::msg)?;
         if let Some(status) = self.recovery_status.as_ref().filter(|s| !s.confirmed) {
             anyhow::bail!(
                 "refusing to overwrite config.json: it was recovered from corruption ({:?}) and \

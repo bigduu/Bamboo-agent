@@ -109,6 +109,43 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
 }
 
 impl ChildSessionAdapter {
+    fn validate_configured_child_model(
+        config: &Config,
+        child: &Session,
+    ) -> Result<(), ChildSessionError> {
+        // Standalone embeddings may supply providers directly without a
+        // configuration-managed catalog. Their own routing policy still owns
+        // admission; configured server/worker adapters always check it here.
+        if config.provider_instances.is_empty()
+            && bamboo_config::synthesize_legacy_instances(config).is_empty()
+        {
+            return Ok(());
+        }
+        let provider = match child.model_ref.as_ref() {
+            Some(reference) => {
+                if reference.model.trim() != child.model.trim() {
+                    return Err(ChildSessionError::InvalidArguments(
+                        "child model does not match its provider/model reference".into(),
+                    ));
+                }
+                reference.provider.clone()
+            }
+            None => child
+                .provider_name()
+                .unwrap_or_else(|| config.effective_default_provider().to_string()),
+        };
+        let provider = bamboo_config::configured_provider_routing_key(config, &provider);
+        let model = child.model.trim();
+        let admitted = bamboo_config::provider_runtime_models(config, &provider)
+            .map_err(ChildSessionError::InvalidArguments)?;
+        if model.is_empty() || !admitted.iter().any(|candidate| candidate == model) {
+            return Err(ChildSessionError::InvalidArguments(format!(
+                "Model '{model}' is not admitted to runtime for provider '{provider}'"
+            )));
+        }
+        Ok(())
+    }
+
     fn child_spawn_job(parent: &Session, child: &Session) -> Result<SpawnJob, ChildSessionError> {
         let model = if child.model.trim().is_empty() {
             parent.model.clone()
@@ -245,6 +282,11 @@ impl ChildSessionAdapter {
                 tracing::warn!(child_id = %child.id, parent_id, "pending child launch has invalid parent authority");
                 continue;
             }
+            if let Err(error) = self.validate_child_model(&child).await {
+                tracing::warn!(child_id = %child.id, %error, "pending child model is not admitted");
+                first_error.get_or_insert(error);
+                continue;
+            }
             let already_enqueued = match self.recovered_launches.entry(child.id.clone()) {
                 dashmap::mapref::entry::Entry::Occupied(slot) if *slot.get() == generation => true,
                 dashmap::mapref::entry::Entry::Occupied(mut slot) => {
@@ -301,6 +343,7 @@ impl ChildSessionAdapter {
         &self,
         child: &Session,
     ) -> Result<Session, ChildSessionError> {
+        self.validate_child_model(child).await?;
         self.persistence
             .ensure_child_auto_run_launch_intent(child)
             .await
@@ -767,6 +810,11 @@ impl bamboo_engine::GuardianSpawner for ChildSessionAdapter {
 
 #[async_trait]
 impl ChildSessionPort for ChildSessionAdapter {
+    async fn validate_child_model(&self, child: &Session) -> Result<(), ChildSessionError> {
+        let config = self.config.read().await;
+        Self::validate_configured_child_model(&config, child)
+    }
+
     async fn resolve_named_profile(
         &self,
         parent: &Session,
@@ -1227,6 +1275,7 @@ impl ChildSessionPort for ChildSessionAdapter {
         child_id: &str,
         update: ChildSessionUpdate,
     ) -> Result<(Session, usize), ChildSessionError> {
+        let config = self.config.read().await.clone();
         // A queued worker holds this guard through its eligibility check and
         // runner reservation. Keep it until the latest-session mutation is
         // committed, so update cannot validate an idle snapshot and then race
@@ -1266,6 +1315,7 @@ impl ChildSessionPort for ChildSessionAdapter {
                         ));
                     }
                     messages_removed = apply_child_session_update(latest, update)?;
+                    Self::validate_configured_child_model(&config, latest)?;
                     Ok(())
                 },
                 |saved| {
@@ -1371,6 +1421,7 @@ impl ChildSessionPort for ChildSessionAdapter {
         permission_audit: bamboo_domain::PermissionAuditSeed,
         no_human_approver: bool,
     ) -> Result<(), ChildSessionError> {
+        self.validate_child_model(child).await?;
         let child_id = child.id.clone();
         let workspace_value = workspace.to_string();
         let source_value = workspace_source.as_str().to_string();
@@ -1445,6 +1496,10 @@ impl ChildSessionPort for ChildSessionAdapter {
         bamboo_engine::session_app::child_session::ChildSessionMessageDelivery,
         ChildSessionError,
     > {
+        let child = self
+            .load_child_for_parent(source_session_id, target_session_id)
+            .await?;
+        self.validate_child_model(&child).await?;
         let messenger = self.session_messenger.as_ref().ok_or_else(|| {
             ChildSessionError::Execution(
                 "logical SessionMessenger is not configured for this runtime".to_string(),

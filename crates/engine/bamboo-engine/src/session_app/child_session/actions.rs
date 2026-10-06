@@ -275,7 +275,10 @@ async fn create_child_action_inner(
         child
             .metadata
             .insert("provider_name".to_string(), model_ref.provider);
-    } else if let Some(parent_model_ref) = input.parent_session.model_ref.clone() {
+    } else if let Some(mut parent_model_ref) = input.parent_session.model_ref.clone() {
+        // A legacy bare override inherits provider identity, not the parent's
+        // model ID. Keep the structured ref aligned with the actual spawn model.
+        parent_model_ref.model = child.model.clone();
         child.model_ref = Some(parent_model_ref.clone());
         child.set_provider_name(parent_model_ref.provider);
     } else if let Some(parent_provider) = input.parent_session.provider_name() {
@@ -362,25 +365,6 @@ async fn create_child_action_inner(
             .no_human_approver = true;
     }
 
-    // `validate_child_workspace` already returned the confinement-adjusted,
-    // ownership-checked path. Publish that exact authority without applying a
-    // process-global confinement policy a second time: server embeddings may
-    // use an instance-scoped resolver whose policy differs from the first
-    // AppState registered in this process.
-    let stored_workspace = port.publish_child_workspace(
-        &child.id,
-        std::path::PathBuf::from(final_workspace),
-        input.workspace_source.as_str(),
-    );
-    child.workspace = Some(stored_workspace.to_string_lossy().to_string());
-    child.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(
-        &stored_workspace,
-    ));
-    child.metadata.insert(
-        crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
-        input.workspace_source.as_str().to_string(),
-    );
-
     child
         .metadata
         .insert("spawned_by".to_string(), "SubAgent".to_string());
@@ -429,6 +413,26 @@ async fn create_child_action_inner(
             child.metadata.insert(key, value);
         }
     }
+
+    // Profile selection and runtime metadata now contain the final model
+    // authority. Reject it before publishing workspace or persisting a child.
+    port.validate_child_model(&child).await?;
+
+    // Publish the path that already passed the host's confinement and Project
+    // ownership checks without applying process-global policy a second time.
+    let stored_workspace = port.publish_child_workspace(
+        &child.id,
+        std::path::PathBuf::from(final_workspace),
+        input.workspace_source.as_str(),
+    );
+    child.workspace = Some(stored_workspace.to_string_lossy().to_string());
+    child.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(
+        &stored_workspace,
+    ));
+    child.metadata.insert(
+        crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+        input.workspace_source.as_str().to_string(),
+    );
 
     // Preserve the configured global custom template/fallback, then append the
     // child-only contract idempotently. Deliberately do not inherit the parent
@@ -1046,6 +1050,7 @@ pub async fn run_child_action(
 
     port.validate_child_run_request(parent, &child, reset_to_last_user)
         .await?;
+    port.validate_child_model(&child).await?;
     let mut messages_removed = 0usize;
     if reset_to_last_user.unwrap_or(true) {
         messages_removed = truncate_after_last_user(&mut child)?;
@@ -1117,6 +1122,8 @@ pub async fn send_message_to_child_action_with_gate(
             "message must be non-empty".to_string(),
         ));
     }
+
+    port.validate_child_model(&child).await?;
 
     let mut is_running = port.is_child_running(&child.id).await;
     let should_interrupt = interrupt_running.unwrap_or(false);
