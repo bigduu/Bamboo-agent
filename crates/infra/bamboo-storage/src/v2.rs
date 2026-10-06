@@ -6077,6 +6077,24 @@ impl SessionStoreV2 {
         guards: &Arc<DefaultWriterGuards>,
         answer_permit: Option<&ParentQuestion>,
     ) -> io::Result<()> {
+        self.save_session_after_lock_with_title_intent(
+            session,
+            total_started,
+            guards,
+            answer_permit,
+            false,
+        )
+        .await
+    }
+
+    async fn save_session_after_lock_with_title_intent(
+        &self,
+        session: &Session,
+        total_started: Instant,
+        guards: &Arc<DefaultWriterGuards>,
+        answer_permit: Option<&ParentQuestion>,
+        manual_title: bool,
+    ) -> io::Result<()> {
         let intended_rel = Self::default_writer_rel_path(session)?;
         self.check_default_or_root_actor_context(
             session,
@@ -6147,12 +6165,7 @@ impl SessionStoreV2 {
         };
         let tree = self.acquire_actor_tree_write_guard(root_id).await?;
         guards.hold_tree(tree);
-        let title_observations = if previous_main.as_ref().is_some_and(|previous| {
-            session.title_version > 0
-                || previous.title != session.title
-                || previous.title_generated != session.title_generated
-                || previous.title_version != session.title_version
-        }) {
+        let title_observations = if manual_title {
             self.prepare_title_observations(session).await?
         } else {
             Vec::new()
@@ -6269,6 +6282,18 @@ impl SessionStoreV2 {
 
 #[async_trait::async_trait]
 impl Storage for SessionStoreV2 {
+    async fn save_manual_title(&self, session: &Session) -> io::Result<()> {
+        let total_started = Instant::now();
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_write = self
+            .acquire_session_write_lock(&session.id, SaveKind::Full)
+            .await?;
+        let guards = DefaultWriterGuards::shared(lifecycle, runtime_task, session_write);
+        self.save_session_after_lock_with_title_intent(session, total_started, &guards, None, true)
+            .await
+    }
+
     async fn validate_title_observations(&self, expected: &Session) -> io::Result<()> {
         self.validate_unchanged_title(expected).await
     }

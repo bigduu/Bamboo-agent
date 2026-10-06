@@ -8,7 +8,7 @@ pub mod clone_publication;
 pub mod context;
 pub mod legacy;
 pub mod named_agents;
-pub(crate) mod progressive;
+pub mod progressive;
 pub mod resource_helpers;
 pub mod reuse_draft;
 pub mod runtime_metadata;

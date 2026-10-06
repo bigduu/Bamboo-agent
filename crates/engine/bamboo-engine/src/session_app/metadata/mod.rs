@@ -15,7 +15,8 @@
 //!    setters that would be a no-op).
 //! 5. Mutate the field, bump `title_version` (for title) and always bump
 //!    `metadata_version`, set `updated_at`.
-//! 6. Plain `storage.save_session(&session)` — no merge needed because we
+//! 6. `storage.save_manual_title(&session)` for manual titles; other setters
+//!    use `storage.save_session(&session)` — no merge needed because we
 //!    loaded the latest copy inside the lock and no other writer for this
 //!    session could have interleaved.
 //! 7. Refresh the in-memory cache (`state.sessions`).
@@ -126,12 +127,12 @@ impl SessionMetadataService {
         state
             .persistence()
             .storage()
-            .save_session(&session)
+            .save_manual_title(&session)
             .await
-            .map_err(|e| MetadataError::Storage(format!("save_session: {e}")))?;
-        // Another physical writer can commit the same title/version between
-        // our load and save. Confirm existing observations even when the full
-        // writer legitimately treated that equal-version save as unchanged.
+            .map_err(|e| MetadataError::Storage(format!("save_manual_title: {e}")))?;
+        // Confirm the backend's committed observations before reporting
+        // success, including compatibility backends that delegate this port
+        // to their generic full writer.
         state
             .persistence()
             .storage()

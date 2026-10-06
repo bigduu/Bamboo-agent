@@ -950,6 +950,8 @@ pub struct SkillStore {
     /// Current valid Instruction source bindings, committed with the catalog.
     instruction_sources: RwLock<HashMap<SkillId, SourceBinding>>,
     #[cfg(test)]
+    projection_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
     source_snapshot_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Workflow definitions are published independently from Skills so equal
     /// IDs can coexist without either identity shadowing the other.
@@ -1221,6 +1223,8 @@ impl SkillStore {
             skill_resources: RwLock::new(HashMap::new()),
             skill_catalog: RwLock::new(WorkflowCatalogSnapshot::default()),
             instruction_sources: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            projection_hook: Mutex::new(None),
             #[cfg(test)]
             source_snapshot_hook: Mutex::new(None),
             workflow_definitions: RwLock::new(HashMap::new()),
@@ -1912,6 +1916,69 @@ impl SkillStore {
         (skills, roots, entries, winner_captures)
     }
 
+    /// Fresh, source-bound ordinary Instruction metadata for a trusted host view.
+    /// Validation borrows correlated publication maps; no retained handles or
+    /// resource Arcs escape this read lifetime. Failed refresh never uses LKG.
+    pub async fn progressive_catalog_for_mode(
+        &self,
+        mode: Option<&str>,
+        access: &crate::progressive::SkillCatalogEligibility,
+    ) -> SkillResult<crate::progressive::SkillCatalogSnapshot> {
+        let mode_store = self.skill_store_for_mode(mode).await?;
+        let store = mode_store.as_deref().unwrap_or(self);
+        store.reload().await?;
+        let _publication = store.snapshot_publish_lock.read().await;
+        let catalog = store.skill_catalog.read().await;
+        let definitions = store.skills.read().await;
+        let bindings = store.instruction_sources.read().await;
+        let resources = store.skill_resources.read().await;
+        let mut metadata = Vec::new();
+        for entry in &catalog.entries {
+            if !entry.winner
+                || entry.kind != WorkflowKind::Instruction
+                || entry.status != WorkflowStatus::Valid
+                || entry.legacy
+            {
+                continue;
+            }
+            let (Some(binding), Some(definition), Some(auxiliary)) = (
+                bindings.get(&entry.id),
+                definitions.get(&entry.id),
+                resources.get(&entry.id),
+            ) else {
+                continue;
+            };
+            binding
+                .validate(
+                    &store.retained_budget.sources,
+                    auxiliary,
+                    store.snapshot_limits.max_file_bytes,
+                )
+                .map_err(|error| {
+                    SkillError::Validation(format!("Skill source is unavailable: {error}"))
+                })?;
+            metadata.push(crate::progressive::SkillCatalogMetadata {
+                package: entry.id.clone(),
+                name: entry.name.clone(),
+                description: entry.description.clone(),
+                short_description: definition.short_description.clone(),
+                main_resource: binding.main_locator(),
+                source: entry.source,
+                revision: entry.revision,
+                identity: binding.metadata_identity(),
+                root: binding.root_locator(),
+                explicit: entry.invocation_policy["explicit"].as_bool() == Some(true),
+                automatic: entry.invocation_policy["automatic"].as_bool() == Some(true),
+            });
+        }
+        #[cfg(test)]
+        if let Some(hook) = store.projection_hook.lock().unwrap().take() {
+            hook();
+        }
+        let entries = crate::progressive::eligible_metadata(&metadata, access)?;
+        crate::progressive::SkillCatalogSnapshot::new(store.store_token, catalog.revision, entries)
+    }
+
     /// Return the current immutable metadata-only catalog snapshot.
     pub async fn workflow_catalog_snapshot(&self) -> WorkflowCatalogSnapshot {
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
@@ -1923,6 +1990,11 @@ impl SkillStore {
     pub async fn skill_catalog_snapshot(&self) -> WorkflowCatalogSnapshot {
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
         self.skill_catalog.read().await.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_projection_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.projection_hook.lock().unwrap() = Some(Box::new(hook));
     }
 
     #[cfg(test)]

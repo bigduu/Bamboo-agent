@@ -25,29 +25,7 @@ fn value(session: &Session) -> io::Result<serde_json::Value> {
 }
 
 /// A complete canonical comparison, not a metadata-version permission grant.
-fn title_only(previous: &Session, incoming: &Session) -> io::Result<bool> {
-    if (previous.title_version != 0 || incoming.title_version != 0)
-        && (incoming.title_version < previous.title_version
-            || incoming.metadata_version < previous.metadata_version)
-    {
-        return Err(conflict("authoritative title metadata cannot regress"));
-    }
-    if previous.title == incoming.title
-        && previous.title_generated == incoming.title_generated
-        && previous.title_version == incoming.title_version
-    {
-        return Ok(false);
-    }
-    // Only an authoritative title-version advance enters this repair. Legacy
-    // direct saves keep their old behavior and cannot refresh observations.
-    if previous.title_version == incoming.title_version {
-        if previous.title_version != 0 {
-            return Err(conflict(
-                "changed authoritative title must advance its version",
-            ));
-        }
-        return Ok(false);
-    }
+fn validate_manual_title_change(previous: &Session, incoming: &Session) -> io::Result<()> {
     let mut comparison = incoming.clone();
     comparison.title = previous.title.clone();
     comparison.title_generated = previous.title_generated;
@@ -63,10 +41,10 @@ fn title_only(previous: &Session, incoming: &Session) -> io::Result<bool> {
         || previous.metadata_version.checked_add(1) != Some(incoming.metadata_version)
     {
         return Err(conflict(
-            "title observation update requires exactly one metadata revision",
+            "manual title commit requires exactly one metadata revision",
         ));
     }
-    Ok(true)
+    Ok(())
 }
 
 async fn regular_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
@@ -219,9 +197,10 @@ impl SessionStoreV2 {
         incoming: &Session,
     ) -> io::Result<Vec<(PathBuf, Vec<u8>)>> {
         let previous = self.title_canonical_session(incoming).await?;
-        if !self.ordinary_title_tree(&previous).await? || !title_only(&previous, incoming)? {
+        if !self.ordinary_title_tree(&previous).await? {
             return Ok(Vec::new());
         }
+        validate_manual_title_change(&previous, incoming)?;
         let mut writes = Vec::new();
         // Validate the complete initialized set before serializing any write.
         for (path, mut row) in self

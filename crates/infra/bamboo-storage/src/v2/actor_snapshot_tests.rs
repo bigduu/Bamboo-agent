@@ -107,7 +107,7 @@ async fn title_save_keeps_initialized_child_ancestor_observation_coherent() {
     renamed.title_version += 1;
     renamed.metadata_version += 1;
     renamed.updated_at = Utc::now();
-    f.store.save_session(&renamed).await.unwrap();
+    f.store.save_manual_title(&renamed).await.unwrap();
     let after: bamboo_domain::ActorDirectoryEntry = serde_json::from_slice(
         &fs::read(f.directory(&child.id).join("actor-authority.json"))
             .await
@@ -169,7 +169,7 @@ async fn title_observations_preserve_live_fences_and_unaffected_siblings() {
         before.push(title_row(&f, id).await);
     }
     let renamed = rename_title(f.store.load_session(&parent.id).await.unwrap().unwrap());
-    f.store.save_session(&renamed).await.unwrap();
+    f.store.save_manual_title(&renamed).await.unwrap();
     for (index, id) in ids.into_iter().enumerate() {
         let actual = title_row(&f, id).await;
         let mut expected = before[index].clone();
@@ -232,7 +232,10 @@ async fn title_observations_reject_preexisting_damage_without_publication() {
             "no-op {damage}"
         );
         assert!(
-            f.store.save_session(&rename_title(current)).await.is_err(),
+            f.store
+                .save_manual_title(&rename_title(current))
+                .await
+                .is_err(),
             "rename {damage}"
         );
         assert_eq!(durable_tree(&f.home), before, "no mutation on {damage}");
@@ -251,7 +254,7 @@ async fn title_observations_keep_counter_gaps_and_project_aba_fail_closed() {
         let mut renamed = rename_title(f.root.clone());
         renamed.metadata_version = gap;
         let before = durable_tree(&f.home);
-        assert!(f.store.save_session(&renamed).await.is_err());
+        assert!(f.store.save_manual_title(&renamed).await.is_err());
         assert_eq!(durable_tree(&f.home), before);
     }
     let f = Fixture::new().await;
@@ -264,7 +267,7 @@ async fn title_observations_keep_counter_gaps_and_project_aba_fail_closed() {
     let before = durable_tree(&f.home);
     assert!(f
         .store
-        .save_session(&rename_title(previous.clone()))
+        .save_manual_title(&rename_title(previous.clone()))
         .await
         .is_err());
     assert!(f
@@ -284,7 +287,7 @@ async fn title_observations_preserve_absence_and_legacy_root_spelling() {
     let f = Fixture::new().await;
     f.store.validate_title_observations(&f.root).await.unwrap();
     let renamed = rename_title(f.root.clone());
-    f.store.save_session(&renamed).await.unwrap();
+    f.store.save_manual_title(&renamed).await.unwrap();
     assert!(!f
         .directory(&f.root.id)
         .join("actor-authority.json")
@@ -303,7 +306,7 @@ async fn title_observations_preserve_absence_and_legacy_root_spelling() {
     f.store.validate_title_observations(&legacy).await.unwrap();
     let mut next = rename_title(legacy);
     next.title = "Legacy renamed".into();
-    f.store.save_session(&next).await.unwrap();
+    f.store.save_manual_title(&next).await.unwrap();
     f.snapshot(&f.root.id, ActorSnapshotLimits::default())
         .await
         .unwrap();
@@ -315,7 +318,7 @@ async fn title_observations_noop_reloads_instead_of_trusting_caller_snapshot() {
     f.store.ensure_actor(&f.root.id).await.unwrap();
     let old = f.store.load_session(&f.root.id).await.unwrap().unwrap();
     let next = rename_title(old.clone());
-    f.store.save_session(&next).await.unwrap();
+    f.store.save_manual_title(&next).await.unwrap();
     let before = durable_tree(&f.home);
     assert!(f.store.validate_title_observations(&old).await.is_err());
     f.store.validate_title_observations(&next).await.unwrap();
@@ -353,7 +356,7 @@ async fn title_observations_report_partial_io_and_validate_noop_truthfully() {
     ] {
         let f = Fixture::new().await;
         let baseline = rename_title(f.root.clone());
-        f.store.save_session(&baseline).await.unwrap();
+        f.store.save_manual_title(&baseline).await.unwrap();
         let child = f.child("io-title-child", &baseline).await;
         f.store.ensure_actor(&f.root.id).await.unwrap();
         f.store.ensure_actor(&child.id).await.unwrap();
@@ -363,7 +366,7 @@ async fn title_observations_report_partial_io_and_validate_noop_truthfully() {
         let hook = DefaultWriteHook::install(&f.store, file, phase, true);
         hook.release();
         assert!(
-            f.store.save_session(&next).await.is_err(),
+            f.store.save_manual_title(&next).await.is_err(),
             "{file}: must report write failure"
         );
         let current = f.store.load_session(&f.root.id).await.unwrap().unwrap();
@@ -379,7 +382,7 @@ async fn title_observations_report_partial_io_and_validate_noop_truthfully() {
             // back to the old title is also a fresh, rejected preflight.
             let mut retry = rename_title(current);
             retry.title = old.title.clone();
-            assert!(f.store.save_session(&retry).await.is_err());
+            assert!(f.store.save_manual_title(&retry).await.is_err());
             assert_eq!(durable_tree(&f.home), before_validation);
         }
     }
@@ -404,7 +407,7 @@ async fn title_failed_refresh_cannot_hide_later_project_aba_from_live_fences() {
             true,
         );
         hook.release();
-        assert!(f.store.save_session(&next).await.is_err());
+        assert!(f.store.save_manual_title(&next).await.is_err());
         let mut current = f.store.load_session(&f.root.id).await.unwrap().unwrap();
         for project in [Some("project-b"), None] {
             match project {
@@ -439,7 +442,7 @@ async fn title_commit_rejects_non_title_change_in_loaded_snapshot_window() {
     concurrent.model = "new concurrent model".into();
     f.store.save_runtime_state(&concurrent).await.unwrap();
     let before = durable_tree(&f.home);
-    assert!(f.store.save_session(&rename_title(old)).await.is_err());
+    assert!(f.store.save_manual_title(&rename_title(old)).await.is_err());
     assert_eq!(durable_tree(&f.home), before);
     assert_eq!(
         f.store
@@ -462,9 +465,9 @@ async fn title_commit_rejects_equal_nonzero_version_from_another_title_writer() 
     let old = f.store.load_session(&f.root.id).await.unwrap().unwrap();
     let mut committed = rename_title(old.clone());
     committed.title = "Other title writer".into();
-    f.store.save_session(&committed).await.unwrap();
+    f.store.save_manual_title(&committed).await.unwrap();
     let before = durable_tree(&f.home);
-    assert!(f.store.save_session(&rename_title(old)).await.is_err());
+    assert!(f.store.save_manual_title(&rename_title(old)).await.is_err());
     assert_eq!(durable_tree(&f.home), before);
     f.snapshot(&f.root.id, ActorSnapshotLimits::default())
         .await
@@ -478,7 +481,7 @@ async fn title_commit_checks_newer_runtime_even_when_stale_main_matches() {
         let f = Fixture::new().await;
         let child = f.child("title-split-child", &f.root).await;
         let first = rename_title(child);
-        f.store.save_session(&first).await.unwrap();
+        f.store.save_manual_title(&first).await.unwrap();
         f.store.ensure_actor(&first.id).await.unwrap();
         let mut second = first.clone();
         second.metadata_version += 1;
@@ -495,19 +498,50 @@ async fn title_commit_checks_newer_runtime_even_when_stale_main_matches() {
             true,
         );
         hook.release();
-        assert!(f.store.save_session(&second).await.is_err());
+        let result = if changed_field == "title" {
+            f.store.save_manual_title(&second).await
+        } else {
+            f.store.save_session(&second).await
+        };
+        assert!(result.is_err());
         let current = f.store.load_session(&first.id).await.unwrap().unwrap();
         assert_eq!(current.metadata_version, second.metadata_version);
         let before = durable_tree(&f.home);
         // This stale caller exactly matches Main, but must not roll newer
         // runtime back to its old observation and report false success.
         assert!(
-            f.store.save_session(&first).await.is_err(),
+            f.store.save_manual_title(&first).await.is_err(),
             "{changed_field}"
         );
         assert_eq!(durable_tree(&f.home), before);
         assert!(f.store.validate_title_observations(&current).await.is_err());
     }
+}
+
+#[tokio::test]
+async fn title_manual_intent_does_not_reclassify_generic_full_frame_saves() {
+    let f = Fixture::new().await;
+    let child = f.child("resident-title-frame", &f.root).await;
+    let row = f.store.ensure_actor(&child.id).await.unwrap();
+    let mut frame = rename_title(child);
+    frame.title_generated = false;
+    frame
+        .messages
+        .push(bamboo_domain::Message::user("replacement assignment"));
+    frame
+        .metadata
+        .insert("assignment_prompt".into(), "replacement assignment".into());
+    let before = durable_tree(&f.home);
+    assert!(f.store.save_manual_title(&frame).await.is_err());
+    assert_eq!(durable_tree(&f.home), before);
+    f.store.save_session(&frame).await.unwrap();
+    let current = f.store.load_session(&frame.id).await.unwrap().unwrap();
+    assert_eq!(current.title, frame.title);
+    assert_eq!(
+        current.messages.last().unwrap().content,
+        "replacement assignment"
+    );
+    assert_eq!(title_row(&f, &frame.id).await, row);
 }
 
 #[tokio::test]

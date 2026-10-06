@@ -30,3 +30,15 @@ These portions are copyright 2025 OpenAI and retain the
 Bamboo changes share frontmatter extraction/repair with supported host extras,
 retain safe IDs and body bytes, and intersect host invocation denies. Optional
 OpenAI descriptive errors do not discard a valid implicit invocation deny.
+
+
+## OpenAI Codex Skill metadata list
+
+`crates/app/bamboo-server-tools/src/skill_runtime/catalog.rs` adapts
+`codex-rs/ext/skills/src/tools/list.rs` at the pinned revision above.
+These portions are copyright 2025 OpenAI and retain the complete package-local
+[Apache license](crates/app/bamboo-server-tools/third_party/codex/LICENSE) and
+[upstream notice](crates/app/bamboo-server-tools/third_party/codex/NOTICE).
+Bamboo uses source-validated owned metadata, trusted fresh caller/input intent,
+and serialized provider envelopes. Indivisible entries return a budget error.
+The package retains Bamboo's original [MIT text](crates/app/bamboo-server-tools/LICENSE).
