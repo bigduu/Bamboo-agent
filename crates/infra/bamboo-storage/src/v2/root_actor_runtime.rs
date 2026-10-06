@@ -138,7 +138,12 @@ impl SessionStoreV2 {
         full: bool,
         guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<()> {
-        if let Some(proof) = guards.root_actor.as_ref() {
+        if let Some(proof) = guards.root_mode_context.as_ref() {
+            let incoming = incoming.clone();
+            let proof = proof.clone();
+            Self::default_writer_job(guards, move || proof.validate_candidate(&incoming, full))
+                .await
+        } else if let Some(proof) = guards.root_actor.as_ref() {
             let incoming = incoming.clone();
             let proof = proof.clone();
             let input = guards.input.clone();
