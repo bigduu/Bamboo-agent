@@ -4124,7 +4124,12 @@ impl ExternalChildRunner for ActorChildRunner {
                                         .send(AgentEvent::message_appended(&session.id, &message))
                                         .await;
                                 }
-                                activation.finish(ActorActivationFinish::Succeeded).await
+                                activation
+                                    .finish_with_observer(
+                                        ActorActivationFinish::Succeeded,
+                                        actor_event_observer.as_deref(),
+                                    )
+                                    .await
                             }
                             Err(error) => {
                                 let _ = activation.finish(ActorActivationFinish::Failed).await;
@@ -4135,7 +4140,14 @@ impl ExternalChildRunner for ActorChildRunner {
                         };
                     }
                     match activation.append_reply(session, text, &event_tx).await {
-                        Ok(()) => activation.finish(ActorActivationFinish::Succeeded).await,
+                        Ok(()) => {
+                            activation
+                                .finish_with_observer(
+                                    ActorActivationFinish::Succeeded,
+                                    actor_event_observer.as_deref(),
+                                )
+                                .await
+                        }
                         Err(error) => {
                             // OutcomeUnconfirmed is an error, never ordinary-save fallback.
                             let _ = activation.finish(ActorActivationFinish::Failed).await;
@@ -4241,6 +4253,7 @@ struct PlainActorActivation {
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     initial_input: Option<SessionInboxOwnedClaim>,
     recovering_pre_ack: bool,
+    completion_router: std::sync::Mutex<Option<ActorEventRouter>>,
 }
 type PlainInitialDelivery = (Vec<serde_json::Value>, SessionMessageDelivery);
 #[track_caller]
@@ -4551,6 +4564,7 @@ impl PlainActorActivation {
                 permission_config,
                 initial_input: recovered,
                 recovering_pre_ack: recovery.is_some(),
+                completion_router: std::sync::Mutex::new(None),
             };
             if let Err(error) = activation
                 .store
@@ -5130,11 +5144,37 @@ impl PlainActorActivation {
             })
     }
     async fn finish(&self, outcome: ActorActivationFinish) -> Result<(), AgentError> {
-        self.store
+        self.finish_with_observer(outcome, None).await
+    }
+
+    async fn finish_with_observer(
+        &self,
+        outcome: ActorActivationFinish,
+        observer: Option<&dyn ActorEventObserver>,
+    ) -> Result<(), AgentError> {
+        let committed = self
+            .store
             .finish_activation(&self.fence, chrono::Utc::now(), outcome)
             .await
-            .map(|_| ())
-            .map_err(|error| AgentError::LLM(format!("Actor completion unconfirmed: {error}")))
+            .map_err(|error| AgentError::LLM(format!("Actor completion unconfirmed: {error}")))?;
+        // A validated final Terminal hands off this one router. Failed writes
+        // never publish, and neither a retry nor another finish can reuse it.
+        let router = self.completion_router.lock().recover_poison().take();
+        if let (Some(observer), Some(router)) = (observer, router) {
+            // The Directory may already hold a successor by this point. Never
+            // relabel the old completion, and never turn an already committed
+            // success into an execution failure if best-effort delivery is lost.
+            match self.store.inspect_actor(&self.fence.actor_id).await {
+                Ok(entry) => match router.into_host_completion(&entry, &committed) {
+                    Ok(event) => observer.publish(event),
+                    Err(_) => tracing::debug!(actor_id = %self.fence.actor_id,
+                        "Actor completion notification superseded"),
+                },
+                Err(error) => tracing::warn!(actor_id = %self.fence.actor_id, %error,
+                    "Actor completion committed; notification snapshot unavailable"),
+            }
+        }
+        Ok(())
     }
 }
 fn local_tool_history_unsupported() -> AgentError {
@@ -8466,6 +8506,14 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                         // an error status. Genuine Worker Error/Cancelled frames
                         // are accepted terminals even though drive returns Err.
                         client.accept_durable_terminal(status);
+                        if status == TerminalStatus::Completed {
+                            if let Some(activation) = plain_input {
+                                // Only the final epoch reaches here: continued Runs
+                                // above reset their router and stay in the pump.
+                                *activation.completion_router.lock().recover_poison() =
+                                    canonical_router.take();
+                            }
+                        }
                         return terminal_result;
                     }
                     Ok(None) => {
@@ -9616,6 +9664,244 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn host_completion_notifies_once_only_after_reply_and_finish_commit() {
+        struct CommittedObserver {
+            authority: PathBuf,
+            events: std::sync::Mutex<Vec<PublicActorEvent>>,
+        }
+        impl ActorEventObserver for CommittedObserver {
+            fn publish(&self, event: PublicActorEvent) {
+                // Observe the real durable sidecar synchronously at publication.
+                let entry: bamboo_domain::ActorDirectoryEntry =
+                    serde_json::from_slice(&std::fs::read(&self.authority).unwrap()).unwrap();
+                let committed = entry.activation.unwrap();
+                assert_eq!(
+                    committed.status,
+                    bamboo_domain::ActorActivationStatus::Succeeded
+                );
+                assert_eq!(committed.activation_id, event.activation_id);
+                assert!(committed.finished_at.is_some());
+                self.events.lock().unwrap().push(event);
+            }
+        }
+        struct CompletionLink(VecDeque<ChildFrame>);
+        #[async_trait]
+        impl bamboo_subagent::ChildLink for CompletionLink {
+            async fn send(&mut self, _: ParentFrame) -> bamboo_subagent::TransportResult<()> {
+                Ok(())
+            }
+            async fn next_frame(&mut self) -> bamboo_subagent::TransportResult<Option<ChildFrame>> {
+                Ok(self.0.pop_front())
+            }
+        }
+        for cut in [
+            "success",
+            "no_terminal",
+            "invalid_terminal",
+            "stale",
+            "storage_failure",
+            "append_failure",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(temp.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let root = Session::new("notify-root", "model");
+            store.save_session(&root).await.unwrap();
+            let mut child = Session::new_child_of("notify-child", &root, "model", "assignment");
+            store.save_session(&child).await.unwrap();
+            let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+                store.clone(),
+                bamboo_domain::SessionInboxLimits::default(),
+            ));
+            let binding = actor_binding(
+                store.clone(),
+                inbox,
+                Arc::new(bamboo_storage::LockedSessionStore::new(store.clone())),
+            );
+            let policy = Arc::new(bamboo_tools::permission::PermissionConfig::new());
+            bind_local_control_plane(store.as_ref(), &child.id, policy.as_ref()).await;
+            let activation = PlainActorActivation::start(
+                store.clone(),
+                &child,
+                &binding,
+                Some("notify-run"),
+                Some(policy),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+            let _owner = binding
+                .router
+                .register_run(&child.id, "notify-run")
+                .await
+                .unwrap();
+            let batch = ActorEventBatch {
+                logical_session: Some(LogicalSessionIdentity {
+                    session_id: child.id.clone(),
+                    parent_session_id: child.parent_session_id.clone(),
+                    root_session_id: child.root_session_id.clone(),
+                    creation: None,
+                }),
+                activation_id: Some("notify-run".into()),
+                execution_epoch: 9,
+                source_node_id: None,
+                source_actor_id: Some("notify-worker".into()),
+                first_seq: 1,
+                last_seq: 2,
+                qos: bamboo_subagent::ActorEventQos::Durable,
+                events: vec![
+                    serde_json::to_value(AgentEvent::Token {
+                        content: "PRIVATE_PROVIDER_TOKEN".into(),
+                    })
+                    .unwrap(),
+                    serde_json::to_value(AgentEvent::message_appended(
+                        &child.id,
+                        &bamboo_agent_core::Message::assistant("PRIVATE_WORKER_CACHE", None),
+                    ))
+                    .unwrap(),
+                ],
+            };
+            let mut frames = VecDeque::from([ChildFrame::EventBatch { batch }]);
+            if cut != "no_terminal" {
+                let mut terminal = completed_actor_frame();
+                if cut == "invalid_terminal" {
+                    if let ChildFrame::Terminal { status, .. } = &mut terminal {
+                        *status = TerminalStatus::Suspended;
+                    }
+                }
+                frames.push_back(terminal);
+            }
+            let mut link = CompletionLink(frames);
+            let (tx, mut rx) = mpsc::channel(8);
+            let (_live, mut live_rx) = mpsc::unbounded_channel();
+            let (_delivery, mut delivery_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let outcome = drive(ActorDriveContext {
+                client: &mut link,
+                parent_session_id: "notify-root",
+                child_session_id: "notify-child",
+                child_attempt: 0,
+                approval_registry: None,
+                approval_decider: None,
+                approval_reviewer: None,
+                escalation_bridge: None,
+                event_tx: &tx,
+                cancel_token: &cancel,
+                live_rx: &mut live_rx,
+                delivery_rx: &mut delivery_rx,
+                logical_session: &mut child,
+                expected_permission_posture: None,
+                expected_creation: None,
+                session_inbox_runtime: Some(&binding),
+                actor_directory_store: Some(store.as_ref()),
+                canonical_subagent_tool: None,
+                ticket_service: None,
+                activation_run_id: Some("notify-run"),
+                execution_epoch: 9,
+                expected_source_actor_id: "notify-worker",
+                initial_inflight_claims: VecDeque::new(),
+                plain_actor: true,
+                remote_environment_lease: false,
+                readonly_output: None,
+                local_history_tools: None,
+                local_history_read_only: false,
+                plain_input: Some(&activation),
+                canonical_activation: None,
+                canonical_placement_ref: None,
+                actor_event_observer: None,
+                plain_run: None,
+                first_frame_timeout: Some(Duration::from_secs(1)),
+            })
+            .await;
+            let admitted = !matches!(cut, "no_terminal" | "invalid_terminal");
+            assert_eq!(outcome.is_ok(), admitted, "{cut}: {outcome:?}");
+            assert_eq!(
+                activation.completion_router.lock().unwrap().is_some(),
+                admitted,
+                "{cut}"
+            );
+            while rx.try_recv().is_ok() {}
+            let authority = temp
+                .path()
+                .join(store.resolve_rel_path(&child.id).await.unwrap())
+                .join("actor-authority.json");
+            let observer = CommittedObserver {
+                authority: authority.clone(),
+                events: Default::default(),
+            };
+            if cut == "append_failure" {
+                child.add_message(bamboo_agent_core::Message::user("uncommitted-prefix"));
+                assert!(activation
+                    .append_reply(&mut child, "PRIVATE_REPLY".into(), &tx)
+                    .await
+                    .is_err());
+                activation
+                    .finish(ActorActivationFinish::Failed)
+                    .await
+                    .unwrap();
+                assert!(observer.events.lock().unwrap().is_empty());
+                continue;
+            }
+            activation
+                .append_reply(&mut child, "PRIVATE_REPLY".into(), &tx)
+                .await
+                .unwrap();
+            assert!(
+                rx.try_recv().is_ok(),
+                "legacy content notification retained"
+            );
+            assert!(
+                observer.events.lock().unwrap().is_empty(),
+                "reply alone must not publish"
+            );
+            if cut == "stale" {
+                store
+                    .retire_actor(&child.id, chrono::Utc::now())
+                    .await
+                    .unwrap();
+            } else if cut == "storage_failure" {
+                // Make the canonical write path unreadable, rather than mocking
+                // the store or allowing completion to fall back to ordinary save.
+                std::fs::remove_file(&authority).unwrap();
+                std::fs::create_dir(&authority).unwrap();
+            }
+            let result = activation
+                .finish_with_observer(ActorActivationFinish::Succeeded, Some(&observer))
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                matches!(cut, "success" | "no_terminal" | "invalid_terminal"),
+                "{cut}"
+            );
+            let events = observer.events.lock().unwrap().clone();
+            assert_eq!(events.len(), usize::from(cut == "success"), "{cut}");
+            if let Some(event) = events.first() {
+                assert_eq!(event.actor_id, child.id);
+                assert_eq!(event.root_actor_id, root.id);
+                assert_eq!(event.parent_actor_id, Some(root.id.clone()));
+                assert_eq!(event.source_order.sequence, 3);
+                let json = serde_json::to_string(event).unwrap();
+                assert!(!json.contains("PRIVATE_") && !json.contains("notify-run"));
+                let persisted = store.load_session(&child.id).await.unwrap().unwrap();
+                assert_eq!(persisted.messages.last().unwrap().content, "PRIVATE_REPLY");
+            }
+            assert!(activation
+                .finish_with_observer(ActorActivationFinish::Succeeded, Some(&observer))
+                .await
+                .is_err());
+            assert_eq!(
+                observer.events.lock().unwrap().len(),
+                events.len(),
+                "repeat finish cannot publish"
+            );
+        }
     }
 
     async fn bind_local_control_plane(
