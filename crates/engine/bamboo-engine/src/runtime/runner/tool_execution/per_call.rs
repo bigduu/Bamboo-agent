@@ -90,9 +90,9 @@ pub(super) struct ToolExecutionOnlyContext<'a> {
     pub round: usize,
     pub tools: &'a Arc<dyn ToolExecutor>,
     pub config: &'a AgentLoopConfig,
-    /// Present only on the sequential path when BeforeToolExecution hooks are
-    /// registered. Parallel-safe tools are forced through that path whenever
-    /// such hooks exist, preserving deterministic mutation/control semantics.
+    /// Always present on the sequential path, including when portable hooks
+    /// are enabled after admission. Parallel-safe calls cannot borrow mutable
+    /// session state and fail closed if hooks become active before execution.
     pub hook_session: Option<&'a mut Session>,
     pub hook_runtime_state: Option<&'a mut AgentRuntimeState>,
     /// Per-session execution flags (e.g. bypass permissions), derived from the
@@ -329,14 +329,26 @@ async fn execute_tool_call_only_with_execution_name(
         .hook_runner
         .has_hooks_for(AgentHookPoint::BeforeToolExecution)
     {
-        let session = ctx
-            .hook_session
-            .as_deref_mut()
-            .expect("hooked tool calls must run on the sequential path");
-        let runtime_state = ctx
-            .hook_runtime_state
-            .as_deref_mut()
-            .expect("hooked tool calls must carry runtime state");
+        let (Some(session), Some(runtime_state)) = (
+            ctx.hook_session.as_deref_mut(),
+            ctx.hook_runtime_state.as_deref_mut(),
+        ) else {
+            // A review can enable portable hooks after this parallel batch was
+            // admitted without mutable hook state. Do not panic or bypass the
+            // newly active policy; the next admission can run sequentially.
+            let reason = "Tool hooks became active after parallel admission; retry the tool call"
+                .to_string();
+            let end_event = emitter.error(reason.clone()).clone();
+            let _ = ctx.event_tx.send(end_event.into_agent_event()).await;
+            return Ok(ToolExecutionOutcome {
+                permission_replay_origin: None,
+                result: Err(reason),
+                needs_human: None,
+                portable_tool: None,
+                post_tool_hook_eligible: false,
+                tool_duration: tool_timer.elapsed(),
+            });
+        };
         let payload = HookPayload::ToolExecution {
             tool_name: ctx.tool_call.function.name.clone(),
             tool_call_id: ctx.tool_call.id.clone(),
@@ -1578,6 +1590,97 @@ mod hook_tests {
             .get("runtime.plugin_hook_contexts")
             .unwrap()
             .contains("resolved Read result"));
+    }
+
+    async fn check_live_portable_activation(sequential: bool) {
+        let (temp, config) = portable_alias_policy(r#"printf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Bash blocked"}}'"#, "Bash").await;
+        let registry = temp.path().join("plugins/installed.json");
+        let mut store = bamboo_plugin::InstalledPlugins::load(&registry)
+            .await
+            .unwrap();
+        store.plugins[0].registered.hooks[0].enabled = false;
+        store.save(&registry).await.unwrap();
+        assert!(!config
+            .hook_runner
+            .has_hooks_for(AgentHookPoint::BeforeToolExecution));
+
+        let concrete = Arc::new(ExactOwnerRecordingExecutor::default());
+        let tools: Arc<dyn ToolExecutor> = concrete.clone();
+        let callable =
+            effective_callable_set(&["Bash"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        let mut call = probe_call("Bash");
+        call.function.arguments = serde_json::json!({"command":"printf fixture"}).to_string();
+        let mut session = Session::new("live-hook-review", "model");
+        let flags = ToolExecutionSessionFlags::from_session(&session);
+        let mut runtime = AgentRuntimeState::new(&session.id);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        // Hold ToolStart at a deterministic await after admission, without sleeps.
+        event_tx
+            .send(AgentEvent::Token {
+                content: "barrier".into(),
+            })
+            .await
+            .unwrap();
+        let execution = execute_model_requested_tool_call_only(
+            &callable,
+            ToolExecutionOnlyContext {
+                executing_supervisor: None,
+                tool_call: &call,
+                event_tx: &event_tx,
+                metrics_collector: None,
+                session_id: "live-hook-review",
+                root_session_id: "live-hook-review",
+                root_orchestration_only: false,
+                round_id: "round-1",
+                round: 0,
+                tools: &tools,
+                config: &config,
+                hook_session: sequential.then_some(&mut session),
+                hook_runtime_state: sequential.then_some(&mut runtime),
+                session_flags: flags,
+                available_tool_schemas: &[],
+            },
+        );
+        tokio::pin!(execution);
+        tokio::select! {
+            biased;
+            _ = &mut execution => panic!("ToolStart must be waiting on the barrier"),
+            _ = std::future::ready(()) => {}
+        }
+        store.plugins[0].registered.hooks[0].enabled = true;
+        store.save(&registry).await.unwrap();
+        assert!(config
+            .hook_runner
+            .has_hooks_for(AgentHookPoint::BeforeToolExecution));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            AgentEvent::Token { .. }
+        ));
+        let outcome = loop {
+            tokio::select! {
+                result = &mut execution => break result.unwrap(),
+                event = event_rx.recv() => { assert!(event.is_some()); }
+            }
+        };
+        let expected = if sequential {
+            "Bash blocked"
+        } else {
+            "hooks became active after parallel admission"
+        };
+        assert!(matches!(outcome.result, Err(ref error) if error.contains(expected)));
+        assert!(!outcome.post_tool_hook_eligible);
+        assert!(outcome.portable_tool.is_none());
+        assert!(concrete.exact_dispatches.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn portable_hook_activation_after_parallel_admission_fails_closed() {
+        check_live_portable_activation(false).await;
+    }
+
+    #[tokio::test]
+    async fn portable_hook_activation_during_sequential_tool_start_enforces_policy() {
+        check_live_portable_activation(true).await;
     }
 
     async fn execute_without_hooks(

@@ -73,10 +73,23 @@ pub(crate) async fn run_agent_loop_with_config(
                 }
             });
         let submitted_message = initial_message;
-        let initial_message = config
-            .hook_runner
-            .apply_portable_user_prompt(session, &submitted_message)
-            .await?;
+        let system_resume = config.skip_initial_user_message
+            && session.messages.last().is_some_and(|message| {
+                message.content == submitted_message
+                    && bamboo_domain::session::is_system_resume_message(message)
+            });
+        let initial_message = if system_resume {
+            // Runtime child/guardian/retry notifications are continuations, not
+            // new user submissions. Never carry a stale one-shot receipt into
+            // the next genuine external prompt.
+            session.metadata.remove("runtime.plugin_prompt_prechecked");
+            submitted_message.clone()
+        } else {
+            config
+                .hook_runner
+                .apply_portable_user_prompt(session, &submitted_message)
+                .await?
+        };
         if config.skip_initial_user_message && initial_message != submitted_message {
             if let Some(message) = session.messages.iter_mut().rev().find(|message| {
                 message.role == bamboo_agent_core::Role::User
@@ -452,6 +465,69 @@ mod hook_tests {
                 .any(|message| message.role == Role::System
                     && message.content.contains("portable prompt context")));
         }
+    }
+
+    #[tokio::test]
+    async fn portable_prompt_does_not_reprocess_structured_runtime_resumes() {
+        for metadata in [
+            serde_json::json!({"hidden_from_ui":true,"runtime_kind":"child_completion_resume"}),
+            serde_json::json!({"runtime_kind":"retry_resume"}),
+            serde_json::json!({"hidden_from_ui":true}),
+        ] {
+            let (_temp, mut config) =
+                portable_prompt_config("printf 'prompt blocked' >&2; exit 2").await;
+            config.skip_initial_user_message = true;
+            let runner = config.hook_runner.clone();
+            let mut session = Session::new("portable-internal-resume", "model");
+            let mut message = Message::user("runtime continuation");
+            message.metadata = Some(metadata);
+            session.add_message(message);
+            crate::runtime::hooks::HookRunner::mark_user_prompt_prechecked(
+                &mut session,
+                "later prompt",
+            );
+            let (tx, _rx) = mpsc::channel(32);
+            let error = run_agent_loop_with_config(
+                &mut session,
+                "runtime continuation".into(),
+                tx,
+                Arc::new(PanicProvider),
+                Arc::new(EmptyTools),
+                CancellationToken::new(),
+                config,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("round rejected"), "{error}");
+            assert!(!session
+                .metadata
+                .contains_key("runtime.plugin_prompt_prechecked"));
+            assert!(runner
+                .apply_portable_user_prompt(&mut session, "later prompt")
+                .await
+                .is_err());
+        }
+
+        // The same text, preappended as a genuine user follow-up, still passes
+        // through UserPromptSubmit. Resume alone is not a policy exemption.
+        let (_temp, mut config) =
+            portable_prompt_config("printf 'prompt blocked' >&2; exit 2").await;
+        config.skip_initial_user_message = true;
+        let mut session = Session::new("portable-user-followup", "model");
+        session.add_message(Message::user("runtime continuation"));
+        let (tx, _rx) = mpsc::channel(32);
+        let error = run_agent_loop_with_config(
+            &mut session,
+            "runtime continuation".into(),
+            tx,
+            Arc::new(PanicProvider),
+            Arc::new(EmptyTools),
+            CancellationToken::new(),
+            config,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("prompt blocked"));
     }
 
     #[tokio::test]

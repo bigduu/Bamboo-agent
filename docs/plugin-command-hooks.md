@@ -38,6 +38,11 @@ until the spawn check rejects it. Removal persists disabling before cleanup. A c
 is bounded by its timeout rather than retroactively cancelled. Commands that
 call the same host installation/review API cannot complete that reentrant
 operation while they hold the execution boundary; their timeout releases it.
+The parsed configuration must also match the config bytes verified under that
+lock, so a failed update cannot execute a candidate captured before rollback.
+If hooks become active after parallel tool admission, affected calls fail closed
+and can be retried through hook-aware admission; sequential calls enforce the
+new policy without losing their hook state.
 
 `GET /api/v1/plugins/<id>/hooks` returns a compatibility/review report with the
 current `config`, `digest` and state:
@@ -149,3 +154,6 @@ provider calls, including headless/embedded runs. The server submission seam
 still checks before persisting the user message and records an exact-prompt,
 once-consumed fingerprint to prevent a second execution in the engine. Native
 UserPromptSubmit invocation remains at the existing server seam.
+Preappended, structured runtime-resume messages (such as child-completion or
+retry notifications) do not represent new user submissions and skip this
+fallback. Genuine follow-up user messages still run it.

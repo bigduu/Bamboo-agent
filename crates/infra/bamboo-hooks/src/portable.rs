@@ -445,13 +445,35 @@ async fn run_config(
     original_tool_input: Option<&Value>,
     final_assistant_content: Option<&str>,
 ) -> Result<PortableReport, String> {
+    let path = bundle_path(reviewed.root, reviewed.config).map_err(|e| e.to_string())?;
+    let config_bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
+    run_config_snapshot(
+        event,
+        payload,
+        session,
+        reviewed,
+        remaining,
+        (original_tool_input, final_assistant_content),
+        &config_bytes,
+    )
+    .await
+}
+
+async fn run_config_snapshot(
+    event: PortableEvent,
+    payload: &HookPayload,
+    session: &Session,
+    reviewed: &ReviewedHookConfig<'_>,
+    remaining: &mut usize,
+    inputs: (Option<&Value>, Option<&str>),
+    config_bytes: &[u8],
+) -> Result<PortableReport, String> {
+    let (original_tool_input, final_assistant_content) = inputs;
     let root = reviewed.root;
     let data = &reviewed.data;
     let source = &reviewed.source;
     let reviewed_digest = reviewed.digest;
-    let path = bundle_path(root, reviewed.config).map_err(|e| e.to_string())?;
-    let config = PortableConfig::parse(&tokio::fs::read(path).await.map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    let config = PortableConfig::parse(config_bytes).map_err(|e| e.to_string())?;
     let cwd = session
         .workspace
         .as_deref()
@@ -521,6 +543,18 @@ async fn run_config(
                     .map_err(|e| e.to_string())?;
                     if !current.iter().any(|r| r.digest == reviewed_digest) {
                         return Err("reviewed plugin bytes changed before command execution".into());
+                    }
+                    // The parsed snapshot may have come from a replacement
+                    // bundle while a managed update held this lock. If that
+                    // update rolled back, the old receipt/hash is valid again,
+                    // but commands captured from its candidate are not trusted.
+                    let current_path =
+                        bundle_path(root, reviewed.config).map_err(|e| e.to_string())?;
+                    let current_bytes = tokio::fs::read(current_path)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if current_bytes != config_bytes {
+                        return Err("hook configuration changed before command execution".into());
                     }
                     tokio::fs::create_dir_all(data)
                         .await
@@ -941,6 +975,60 @@ mod tests {
         }
         store.save(&path).await.unwrap();
     }
+    #[tokio::test]
+    async fn rolled_back_update_cannot_execute_a_candidate_config_snapshot() {
+        let (temp, session, payload) =
+            fixture(vec![json!({"type":"command","command":"true","timeout":1})]).await;
+        let root = temp.path();
+        trust(root).await;
+        let store = InstalledPlugins::load(&root.join("installed.json"))
+            .await
+            .unwrap();
+        let installed = &store.plugins[0];
+        let receipt = &installed.registered.hooks[0];
+        let reviewed = ReviewedHookConfig {
+            registry_path: root.join("installed.json"),
+            receipt,
+            root: &installed.plugin_dir,
+            data: root.join(".hook-data/fixture"),
+            config: &receipt.config,
+            source: "fixture@0.1.0:hooks.json:PreToolUse".into(),
+            digest: &receipt.digest,
+        };
+        // The on-disk bundle and receipt have already rolled back. This is the
+        // candidate config an in-flight invocation captured before the lock.
+        let candidate = serde_json::to_vec(&json!({"hooks":{"PreToolUse":[{"hooks":[{
+            "type":"command","command":"touch \"$PLUGIN_DATA/unreviewed\"","timeout":1
+        }]}]}}))
+        .unwrap();
+        let mut remaining = PORTABLE_CONTEXT_BYTES;
+        let report = run_config_snapshot(
+            PortableEvent::PreToolUse,
+            &payload,
+            &session,
+            &reviewed,
+            &mut remaining,
+            (None, None),
+            &candidate,
+        )
+        .await
+        .unwrap();
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("configuration changed")));
+        assert!(!reviewed.data.join("unreviewed").exists());
+        // Restored, reviewed commands remain usable after rejecting the stale snapshot.
+        let report = run(
+            root,
+            AgentHookPoint::BeforeToolExecution,
+            &payload,
+            &session,
+        )
+        .await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
     #[tokio::test]
     async fn install_update_uninstall_and_incomplete_execution_boundaries() {
         let (temp, session, payload) = fixture(vec![
