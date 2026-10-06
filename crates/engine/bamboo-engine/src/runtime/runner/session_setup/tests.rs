@@ -660,6 +660,190 @@ fn activation_reset_preserves_same_explicit_and_clears_superseded_selection() {
 }
 
 #[tokio::test]
+async fn legacy_runner_parity_preserves_typed_resume_context_and_original_checkpoint() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: directory.path().join("skills"),
+        ..Default::default()
+    }));
+    manager.initialize().await.expect("initialize skills");
+    let review = manager
+        .store()
+        .skill_catalog_snapshot()
+        .await
+        .entries
+        .into_iter()
+        .find(|entry| entry.id == "review" && entry.winner)
+        .expect("current review");
+    let selection = bamboo_skills::WorkflowSelection {
+        id: review.id,
+        source: review.source,
+        revision: review.revision,
+        args: serde_json::json!({}),
+    };
+    let persistence = Arc::new(RecordingPersistence::default());
+    let config = crate::runtime::config::AgentLoopConfig {
+        skill_manager: Some(manager),
+        selected_skill_ids: Some(vec!["review".into()]),
+        persistence: Some(persistence.clone()),
+        skip_initial_user_message: true,
+        ..Default::default()
+    };
+    let tools = RecordingToolExecutor {
+        schemas: vec![schema("load_skill")],
+        ..Default::default()
+    };
+    let mut session = Session::new("legacy-runner-parity-resume", "model");
+    session.metadata.insert(
+        bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY.into(),
+        serde_json::to_string(&selection).unwrap(),
+    );
+    session.add_message(Message::user("original user"));
+    let logger = crate::runtime::runner::logging::DebugLogger::new(false);
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+    super::prepare_session_for_loop(
+        &mut session,
+        "Review this change",
+        &config,
+        &tools,
+        None,
+        "legacy-runner-parity-resume",
+        &logger,
+        false,
+        &event_tx,
+    )
+    .await
+    .expect("prepare real typed candidate");
+    record_test_activation_from_pinned_snapshot(&mut session, "review");
+    session.add_message(Message::assistant(
+        "",
+        Some(vec![ToolCall {
+            id: "original-load-call".into(),
+            tool_type: "function".into(),
+            function: bamboo_agent_core::tools::FunctionCall {
+                name: "load_skill".into(),
+                arguments: r#"{"skill_id":"review"}"#.into(),
+            },
+        }]),
+    ));
+    session.add_message(Message::tool_result_with_status(
+        "original-load-call",
+        "loaded",
+        true,
+    ));
+    let messages = serde_json::to_value(&session.messages).unwrap();
+    let raw_durable =
+        session.metadata[bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY].clone();
+    let durable: bamboo_skills::DurableWorkflowActivation =
+        serde_json::from_str(&raw_durable).unwrap();
+    let instructions = &durable.snapshot.skills["review"].definition.prompt;
+    let block = super::prompt_envelope::build_active_workflow_context_block(&session).unwrap();
+    assert_eq!(
+        block.block_type,
+        bamboo_agent_core::ContextBlockType::WorkflowRuntime
+    );
+    assert_eq!(
+        block.title,
+        format!("Active Workflow: review@{}", selection.revision)
+    );
+    assert_eq!(block.content, format!(
+        "workflow_id: review\nsource: Builtin\nrevision: {}\nargs: {{}}\ncontext_fingerprint: test-context-fingerprint\n\n### Instructions\n{}\n\n### Dynamic Context\n[]",
+        selection.revision, instructions));
+    assert_eq!(
+        block.metadata,
+        Some(serde_json::json!({"workflow_id":"review",
+        "source":"builtin", "revision":selection.revision,
+        "context_fingerprint":"test-context-fingerprint"}))
+    );
+    super::prepare_session_for_loop(
+        &mut session,
+        "Review this change",
+        &config,
+        &tools,
+        None,
+        "legacy-runner-parity-resume",
+        &logger,
+        true,
+        &event_tx,
+    )
+    .await
+    .expect("resume same pinned selection");
+    assert_eq!(
+        session.metadata[bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY],
+        raw_durable
+    );
+    assert_eq!(serde_json::to_value(&session.messages).unwrap(), messages);
+    assert_eq!(
+        super::prompt_envelope::build_active_workflow_context_block(&session),
+        Some(block)
+    );
+    assert_eq!(
+        crate::runtime::runner::round_lifecycle::required_tool_for_session(&session),
+        None
+    );
+    assert!(
+        tools.calls.lock().unwrap().is_empty(),
+        "setup cannot issue a model load"
+    );
+    let saved = persistence.sessions.lock().unwrap();
+    assert_eq!(
+        saved.last().unwrap().metadata[bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY],
+        raw_durable
+    );
+}
+
+#[test]
+fn legacy_runner_parity_preserves_raw_terminal_schema_and_degraded_round_contract() {
+    let mut session = Session::new("legacy-runner-parity-degraded", "model");
+    session
+        .metadata
+        .insert("skill_runtime_selection_source".into(), "explicit".into());
+    session.metadata.insert(
+        "skill_runtime_selected_skill_ids".into(),
+        r#"["review"]"#.into(),
+    );
+    let tools = StaticToolExecutor {
+        schemas: vec![
+            schema("load_skill"),
+            schema("functions.load_skill"),
+            schema("Read"),
+        ],
+    };
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    assert_eq!(
+        crate::runtime::runner::round_lifecycle::required_tool_for_session(&session),
+        Some("load_skill")
+    );
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY.into(),
+        r#"{"code":"provider_failed","recoverable":true}"#.into(),
+    );
+    assert_eq!(
+        crate::runtime::runner::round_lifecycle::required_tool_for_session(&session),
+        None
+    );
+    assert!(super::prompt_envelope::build_active_workflow_context_block(&session).is_none());
+    let names = resolve_available_tool_schemas_for_session(&config, &tools, &session)
+        .into_iter()
+        .map(|s| s.function.name)
+        .collect::<Vec<_>>();
+    assert!(!names.iter().any(|name| name == "load_skill"));
+    assert!(
+        names.iter().any(|name| name == "functions.load_skill"),
+        "legacy terminal schema filtering uses the raw name, unlike the first-call gate"
+    );
+    assert!(names.iter().any(|name| name == "Read"));
+    session
+        .metadata
+        .insert("skill_runtime_selection_source".into(), "auto".into());
+    assert!(
+        resolve_available_tool_schemas_for_session(&config, &tools, &session)
+            .iter()
+            .any(|s| s.function.name == "load_skill")
+    );
+}
+
+#[tokio::test]
 async fn pin_failure_clears_stale_runtime_selection_and_revision_metadata() {
     let directory = tempfile::tempdir().expect("tempdir");
     let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {

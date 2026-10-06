@@ -6,25 +6,22 @@ use bamboo_agent_core::AgentEvent;
 use super::super::{clarification, events, task, tool_error_collector};
 use super::{goal, workspace, SuccessPathContext};
 
-const WORKFLOW_TOOL_METADATA_KEYS: &[&str] = &[
-    bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY,
-    bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY,
-    bamboo_skills::WORKFLOW_ACTIVATION_EVENT_METADATA_KEY,
-    bamboo_skills::WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY,
-    bamboo_skills::WORKFLOW_CONTEXT_CACHE_METADATA_KEY,
-    bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY,
-    bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY,
-    bamboo_skills::runtime_metadata::LOADED_SKILL_IDS_METADATA_KEY,
-    bamboo_skills::runtime_metadata::LAST_LOADED_SKILL_ID_METADATA_KEY,
-    bamboo_skills::runtime_metadata::LAST_LOADED_SKILL_SUMMARY_METADATA_KEY,
-];
-
 async fn refresh_workflow_tool_side_effects(ctx: &mut SuccessPathContext<'_>) {
     if !ctx.result.success {
         return;
     }
+    if ctx.tool_call.function.name == "load_skill" {
+        crate::runtime::runner::session_setup::legacy_instruction::refresh_load_side_effects(
+            ctx.session,
+            ctx.config,
+            ctx.session_id,
+            &ctx.tool_call.function.name,
+            ctx.result.success,
+        )
+        .await;
+        return;
+    }
     let keys: &[&str] = match ctx.tool_call.function.name.as_str() {
-        "load_skill" => WORKFLOW_TOOL_METADATA_KEYS,
         "workflow_run" => &[bamboo_skills::WORKFLOW_RUN_IDS_METADATA_KEY],
         _ => return,
     };
