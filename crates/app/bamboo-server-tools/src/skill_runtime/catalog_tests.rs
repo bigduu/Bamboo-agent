@@ -43,6 +43,14 @@ impl Fixture {
                 format!("---\nname: {id}\ndescription: {description}\n---\nPRIVATE BODY {id}"),
             )
             .unwrap();
+            std::fs::create_dir_all(root.join("references")).unwrap();
+            std::fs::write(root.join("references/empty.txt"), "").unwrap();
+            std::fs::write(
+                root.join("references/raw.txt"),
+                "界🦀\r\n\0\"\\aux".repeat(200),
+            )
+            .unwrap();
+            std::fs::write(root.join("references/bad.bin"), [b'a', 0xff]).unwrap();
             if index == 0 {
                 std::fs::create_dir_all(root.join("agents")).unwrap();
                 std::fs::write(
@@ -898,4 +906,721 @@ async fn selected_source_same_session_store_is_not_relooked_up_during_aba() {
         .contents()
         .contains("PRIVATE BODY catalog-1"));
     assert!(!result.snapshot.contents().contains("FOREIGN BODY"));
+}
+
+#[tokio::test]
+async fn skills_read_real_invoke_obeys_escaped_envelope_budget_and_advances() {
+    let fixture = Fixture::new(1).await;
+    let path = fixture._directory.path().join("skills/catalog-0/SKILL.md");
+    let mut raw = std::fs::read_to_string(&path).unwrap();
+    raw.push_str(&"界🦀\r\n\"\\\0".repeat(200));
+    std::fs::write(&path, raw).unwrap();
+    fixture
+        .resolver
+        .0
+        .write()
+        .await
+        .as_mut()
+        .unwrap()
+        .response_bytes = 350;
+    let tool = SkillsReadTool::new(SkillsListTool::new(
+        fixture.manager.clone(),
+        fixture.config.clone(),
+        fixture.repo.clone(),
+        fixture.resolver.clone(),
+    ));
+    let result = tool
+        .invoke(json!({"package":"catalog-0"}), fixture.ctx.clone())
+        .await
+        .unwrap()
+        .into_tool_result();
+    assert!(serde_json::to_vec(&json!({"type":"function_call_output","call_id":fixture.ctx.tool_call_id,"output":result.result})).unwrap().len() <= 350, "read must budget actual nested provider envelopes");
+    let page: Value = serde_json::from_str(&result.result).unwrap();
+    assert!(!page["contents"].as_str().unwrap().is_empty());
+    assert!(
+        page["next_cursor"].as_str().is_some(),
+        "partial read must advance to true EOF"
+    );
+}
+
+fn reader(fixture: &Fixture) -> SkillsReadTool {
+    SkillsReadTool::new(SkillsListTool::new(
+        fixture.manager.clone(),
+        fixture.config.clone(),
+        fixture.repo.clone(),
+        fixture.resolver.clone(),
+    ))
+}
+async fn read_page(
+    tool: &SkillsReadTool,
+    ctx: &ToolCtx,
+    package: &str,
+    resource: &str,
+    cursor: Option<&str>,
+) -> Result<(bamboo_agent_core::tools::ToolResult, Value), ToolError> {
+    let result = tool
+        .invoke(
+            json!({"package":package,"resource":resource,"cursor":cursor}),
+            ctx.clone(),
+        )
+        .await?
+        .into_tool_result();
+    let page = serde_json::from_str(&result.result).unwrap();
+    Ok((result, page))
+}
+fn assert_read_provider_blocks(
+    result: &bamboo_agent_core::tools::ToolResult,
+    ctx: &ToolCtx,
+    budget: usize,
+) {
+    use bamboo_llm::cache::{CacheTtl, PromptCachePlan};
+    use bamboo_llm::providers::{
+        anthropic::build_anthropic_request_with_cache,
+        common::openai_responses::build_responses_body,
+    };
+    assert!(serde_json::to_vec(result).unwrap().len() <= budget);
+    let message = Message::tool_result_with_status(ctx.tool_call_id.as_ref(), &result.result, true);
+    let calls = serde_json::from_value(json!([
+        {"id":ctx.tool_call_id,"type":"function","function":{"name":"skills_read","arguments":"{}"}},
+        {"id":"neighbor","type":"function","function":{"name":"neighbor","arguments":"{}"}}
+    ])).unwrap();
+    let messages = [
+        Message::assistant("", Some(calls)),
+        message.clone(),
+        Message::tool_result("neighbor", "unrelated"),
+    ];
+    let mut largest = serde_json::to_vec(result).unwrap().len();
+    for ttl in [CacheTtl::Default, CacheTtl::Extended] {
+        let plan = PromptCachePlan {
+            breakpoint_message_ids: vec![message.id.clone()],
+            ttl,
+            ..Default::default()
+        };
+        let request = build_anthropic_request_with_cache(
+            &messages,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+        let blocks = request["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "neighbor results merge into the same user message"
+        );
+        let block = &blocks[0];
+        assert_eq!(block["tool_use_id"], ctx.tool_call_id.as_ref());
+        assert_eq!(block["content"], result.result);
+        assert_eq!(block["cache_control"]["ttl"].as_str(), ttl.anthropic_ttl());
+        assert!(blocks[1].get("cache_control").is_none());
+        let cost = serde_json::to_vec(block).unwrap().len();
+        assert!(
+            cost <= budget,
+            "actual block {cost} > budget {budget}; measured={}: {block}",
+            super::catalog::page_size(result, &ctx.tool_call_id).unwrap()
+        );
+        largest = largest.max(cost);
+    }
+    for cached in [false, true] {
+        let plan = PromptCachePlan {
+            breakpoint_message_ids: vec![message.id.clone()],
+            ..Default::default()
+        };
+        let request = build_responses_body(
+            "gpt-6",
+            &messages,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            cached.then_some(&plan),
+        );
+        let block = request["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|block| {
+                block["type"] == "function_call_output"
+                    && block["call_id"] == ctx.tool_call_id.as_ref()
+            })
+            .unwrap();
+        let text = if cached {
+            block["output"][0]["text"].as_str().unwrap()
+        } else {
+            block["output"].as_str().unwrap()
+        };
+        assert_eq!(text, result.result);
+        let cost = serde_json::to_vec(block).unwrap().len();
+        assert!(
+            cost <= budget,
+            "actual block {cost} > budget {budget}; measured={}: {block}",
+            super::catalog::page_size(result, &ctx.tool_call_id).unwrap()
+        );
+        largest = largest.max(cost);
+    }
+    assert_eq!(
+        super::catalog::page_size(result, &ctx.tool_call_id).unwrap(),
+        largest,
+        "counter must equal actual largest public-converter block"
+    );
+}
+
+#[tokio::test]
+async fn skills_read_all_four_real_provider_envelopes_concatenate_raw_files_to_true_eof() {
+    let mut fixture = Fixture::new(1).await;
+    fixture.ctx.tool_call_id = "真实\"call\\id".repeat(8).into();
+    fixture
+        .resolver
+        .0
+        .write()
+        .await
+        .as_mut()
+        .unwrap()
+        .response_bytes = 1500;
+    let tool = reader(&fixture);
+    for resource in ["SKILL.md", "references/raw.txt", "references/empty.txt"] {
+        let expected = std::fs::read_to_string(
+            fixture
+                ._directory
+                .path()
+                .join("skills/catalog-0")
+                .join(resource),
+        )
+        .unwrap();
+        let mut cursor = None::<String>;
+        let mut joined = String::new();
+        let mut pages = 0;
+        loop {
+            let (result, page) = read_page(
+                &tool,
+                &fixture.ctx,
+                "catalog-0",
+                resource,
+                cursor.as_deref(),
+            )
+            .await
+            .unwrap();
+            assert_read_provider_blocks(&result, &fixture.ctx, 1500);
+            assert_eq!(page["package"], "catalog-0");
+            assert_eq!(page["resource"], resource);
+            let contents = page["contents"].as_str().unwrap();
+            joined.push_str(contents);
+            pages += 1;
+            if let Some(next) = page["next_cursor"].as_str() {
+                assert!(!contents.is_empty());
+                assert_ne!(cursor.as_deref(), Some(next));
+                let offset = next.rsplit(':').next().unwrap().parse::<usize>().unwrap();
+                assert_eq!(offset, joined.len());
+                assert!(expected.is_char_boundary(offset) && offset < expected.len());
+                cursor = Some(next.to_owned());
+            } else {
+                assert_eq!(
+                    joined, expected,
+                    "None means real complete EOF including raw CRLF/NUL"
+                );
+                break;
+            }
+            assert!(pages <= expected.len() + 1);
+        }
+        if resource == "references/raw.txt" {
+            assert!(pages > 2);
+        }
+        if expected.is_empty() {
+            assert_eq!(pages, 1);
+        }
+    }
+    assert!(
+        read_page(&tool, &fixture.ctx, "catalog-0", "references/bad.bin", None)
+            .await
+            .is_err(),
+        "whole-file UTF8 validation precedes any first prefix page"
+    );
+}
+
+#[tokio::test]
+async fn skills_read_tiny_indivisible_empty_eof_handles_and_flat_schema() {
+    let fixture = Fixture::new(1).await;
+    let tool = reader(&fixture);
+    assert_eq!(tool.name(), "skills_read");
+    assert_eq!(tool.parameters_schema()["additionalProperties"], false);
+    for args in [
+        json!({}),
+        json!({"package":"catalog-0","scope":"Global"}),
+        json!({"package":""}),
+        json!({"package":"catalog-0\n"}),
+        json!({"package":"a".repeat(2049)}),
+        json!({"package":"catalog-0","resource":""}),
+        json!({"package":"catalog-0","cursor":""}),
+        json!({"package":"catalog-0","resource":"../outside"}),
+        json!({"package":"catalog-0","resource":"/ambient/SKILL.md"}),
+    ] {
+        assert!(tool.invoke(args, fixture.ctx.clone()).await.is_err());
+    }
+    for budget in [0, 1, 150] {
+        fixture
+            .resolver
+            .0
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .response_bytes = budget;
+        for resource in ["SKILL.md", "references/empty.txt"] {
+            assert!(read_page(&tool, &fixture.ctx, "catalog-0", resource, None)
+                .await
+                .is_err());
+        }
+    }
+    fixture
+        .resolver
+        .0
+        .write()
+        .await
+        .as_mut()
+        .unwrap()
+        .response_bytes = 8_000;
+    let (empty, _) = read_page(
+        &tool,
+        &fixture.ctx,
+        "catalog-0",
+        "references/empty.txt",
+        None,
+    )
+    .await
+    .unwrap();
+    let eof_budget = super::catalog::page_size(&empty, &fixture.ctx.tool_call_id).unwrap();
+    fixture
+        .resolver
+        .0
+        .write()
+        .await
+        .as_mut()
+        .unwrap()
+        .response_bytes = eof_budget;
+    assert!(
+        read_page(
+            &tool,
+            &fixture.ctx,
+            "catalog-0",
+            "references/empty.txt",
+            None
+        )
+        .await
+        .is_ok(),
+        "exact empty EOF envelope fits"
+    );
+    assert!(
+        read_page(&tool, &fixture.ctx, "catalog-0", "references/raw.txt", None)
+            .await
+            .is_err(),
+        "an indivisible first UTF8 character plus continuation cannot fit that envelope"
+    );
+    fixture
+        .resolver
+        .0
+        .write()
+        .await
+        .as_mut()
+        .unwrap()
+        .response_bytes = 350;
+    let (_, page) = read_page(&tool, &fixture.ctx, "catalog-0", "references/raw.txt", None)
+        .await
+        .unwrap();
+    let cursor = page["next_cursor"].as_str().unwrap();
+    let prefix = cursor.rsplit_once(':').unwrap().0;
+    for malformed in [
+        "not-a-cursor".into(),
+        format!("{prefix}:99999999"),
+        format!("{prefix}:+1"),
+        format!("{prefix}:2"),
+        format!("{prefix}:0:1"),
+    ] {
+        assert!(read_page(
+            &tool,
+            &fixture.ctx,
+            "catalog-0",
+            "references/raw.txt",
+            Some(&malformed)
+        )
+        .await
+        .is_err());
+    }
+    assert!(
+        read_page(&tool, &fixture.ctx, "catalog-0", "SKILL.md", Some(cursor))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn skills_read_warm_cache_rejects_fresh_actual_caller_input_and_host_denies() {
+    let fixture = Fixture::new(2).await;
+    fixture
+        .resolver
+        .0
+        .write()
+        .await
+        .as_mut()
+        .unwrap()
+        .response_bytes = 350;
+    let tool = reader(&fixture);
+    let configured = fixture.resolver.0.read().await.clone().unwrap();
+    fixture.resolver.0.write().await.as_mut().unwrap().ceiling = None;
+    assert!(
+        read_page(&tool, &fixture.ctx, "catalog-0", "references/raw.txt", None)
+            .await
+            .is_ok(),
+        "None is unrestricted only for a resolved known caller"
+    );
+    *fixture.resolver.0.write().await = Some(configured);
+    let (_, page) = read_page(&tool, &fixture.ctx, "catalog-0", "references/raw.txt", None)
+        .await
+        .unwrap();
+    let cursor = page["next_cursor"].as_str().unwrap();
+    let original = fixture.resolver.0.read().await.clone().unwrap();
+    for ceiling in [
+        Some(BTreeSet::new()),
+        Some(BTreeSet::from(["catalog-1".into()])),
+    ] {
+        fixture.resolver.0.write().await.as_mut().unwrap().ceiling = ceiling;
+        assert!(read_page(
+            &tool,
+            &fixture.ctx,
+            "catalog-0",
+            "references/raw.txt",
+            Some(cursor)
+        )
+        .await
+        .is_err());
+    }
+    *fixture.resolver.0.write().await = None;
+    assert!(read_page(
+        &tool,
+        &fixture.ctx,
+        "catalog-0",
+        "references/raw.txt",
+        Some(cursor)
+    )
+    .await
+    .is_err());
+    *fixture.resolver.0.write().await = Some(original.clone());
+    fixture.resolver.0.write().await.as_mut().unwrap().ceiling = None;
+    assert!(
+        read_page(
+            &tool,
+            &fixture.ctx,
+            "catalog-0",
+            "references/raw.txt",
+            Some(cursor)
+        )
+        .await
+        .is_err(),
+        "even a wider current known ceiling cannot replay another fingerprint"
+    );
+    *fixture.resolver.0.write().await = Some(original.clone());
+    let mut session = fixture.repo.load("catalog-session").await.unwrap();
+    let next = Message::user("Input N+1 with no Skill mention");
+    session.messages.push(next.clone());
+    fixture.repo.save(&mut session).await.unwrap();
+    fixture.resolver.0.write().await.as_mut().unwrap().input_id = next.id.clone();
+    assert!(
+        read_page(
+            &tool,
+            &fixture.ctx,
+            "catalog-0",
+            "references/raw.txt",
+            Some(cursor)
+        )
+        .await
+        .is_err(),
+        "old invocation input is malformed"
+    );
+    fixture
+        .resolver
+        .0
+        .write()
+        .await
+        .as_mut()
+        .unwrap()
+        .invocation = None;
+    assert!(
+        read_page(&tool, &fixture.ctx, "catalog-0", "references/raw.txt", None)
+            .await
+            .is_err(),
+        "stale selected_skill_ids cannot authorize manual-only Skill"
+    );
+    assert!(
+        read_page(&tool, &fixture.ctx, "catalog-1", "SKILL.md", None)
+            .await
+            .is_ok(),
+        "automatic Skill needs no selected pin"
+    );
+    *fixture.resolver.0.write().await = Some(original.clone());
+    fixture
+        .config
+        .write()
+        .await
+        .skills
+        .disabled
+        .push("catalog-0".into());
+    assert!(read_page(
+        &tool,
+        &fixture.ctx,
+        "catalog-0",
+        "references/raw.txt",
+        Some(cursor)
+    )
+    .await
+    .is_err());
+    fixture.config.write().await.skills.disabled.clear();
+    session.root_orchestration_only = true;
+    session.root_tool_authority_revision += 1;
+    fixture.repo.save(&mut session).await.unwrap();
+    assert!(read_page(
+        &tool,
+        &fixture.ctx,
+        "catalog-0",
+        "references/raw.txt",
+        Some(cursor)
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+async fn skills_read_cursor_rejects_current_raw_physical_policy_mode_and_project_changes() {
+    for change in [
+        "raw",
+        "leaf",
+        "bundle",
+        "root",
+        "host-deny",
+        "openai",
+        "malformed",
+        "removed",
+        "mode",
+        "project",
+    ] {
+        let fixture = Fixture::new(1).await;
+        fixture
+            .resolver
+            .0
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .response_bytes = 350;
+        let tool = reader(&fixture);
+        let (_, page) = read_page(&tool, &fixture.ctx, "catalog-0", "references/raw.txt", None)
+            .await
+            .unwrap();
+        let cursor = page["next_cursor"].as_str().unwrap();
+        let root = fixture._directory.path().join("skills");
+        let bundle = root.join("catalog-0");
+        let file = bundle.join("references/raw.txt");
+        match change {
+            "raw" => std::fs::write(&file, "changed raw data").unwrap(),
+            "leaf" => {
+                let bytes = std::fs::read(&file).unwrap();
+                std::fs::rename(&file, file.with_extension("old")).unwrap();
+                std::fs::write(&file, bytes).unwrap();
+            }
+            "bundle" | "root" => {
+                let path = if change == "bundle" { &bundle } else { &root };
+                let renamed = path.with_extension("old");
+                std::fs::rename(path, &renamed).unwrap();
+                std::fs::create_dir_all(path.join(if change == "bundle" {
+                    "references"
+                } else {
+                    "catalog-0/references"
+                }))
+                .unwrap();
+                let target = if change == "bundle" {
+                    path.clone()
+                } else {
+                    path.join("catalog-0")
+                };
+                let original = if change == "bundle" {
+                    renamed.clone()
+                } else {
+                    renamed.join("catalog-0")
+                };
+                std::fs::copy(original.join("SKILL.md"), target.join("SKILL.md")).unwrap();
+                std::fs::copy(
+                    original.join("references/raw.txt"),
+                    target.join("references/raw.txt"),
+                )
+                .unwrap();
+            }
+            "host-deny" => std::fs::write(
+                bundle.join("agents/bamboo.yaml"),
+                "invocation_policy:\n  explicit: false\n  automatic: false\n",
+            )
+            .unwrap(),
+            "openai" => std::fs::write(
+                bundle.join("agents/openai.yaml"),
+                "policy:\n  allow_implicit_invocation: false\n",
+            )
+            .unwrap(),
+            "malformed" => {
+                std::fs::write(bundle.join("agents/bamboo.yaml"), "invocation_policy: [\n").unwrap()
+            }
+            "removed" => std::fs::remove_file(&file).unwrap(),
+            "mode" => {
+                fixture.resolver.0.write().await.as_mut().unwrap().mode = Some("review-mode".into())
+            }
+            "project" => {
+                let mut session = fixture.repo.load("catalog-session").await.unwrap();
+                session.set_project_id_meta("missing-project");
+                session.metadata_version += 1;
+                fixture.repo.save(&mut session).await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            read_page(
+                &tool,
+                &fixture.ctx,
+                "catalog-0",
+                "references/raw.txt",
+                Some(cursor)
+            )
+            .await
+            .is_err(),
+            "old cursor must reject {change}, including byte-identical physical replacement"
+        );
+    }
+}
+
+struct ReadBarrierResolver {
+    caller: SkillCatalogCaller,
+    calls: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[async_trait]
+impl SkillCatalogCallerResolver for ReadBarrierResolver {
+    async fn resolve(&self, _: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 6 {
+            // Cold read uses four resolutions; warm final probe uses the seventh.
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok(self.caller.clone())
+    }
+}
+#[tokio::test]
+async fn skills_read_eviction_during_final_probe_never_revives_the_old_cursor() {
+    let fixture = Fixture::new(1).await;
+    let mut caller = fixture.resolver.0.read().await.clone().unwrap();
+    caller.response_bytes = 350;
+    let resolver = Arc::new(ReadBarrierResolver {
+        caller,
+        calls: Default::default(),
+        entered: Default::default(),
+        release: Default::default(),
+    });
+    let tool = SkillsReadTool::new(SkillsListTool::new(
+        fixture.manager.clone(),
+        fixture.config.clone(),
+        fixture.repo.clone(),
+        resolver.clone(),
+    ));
+    let (_, first) = read_page(&tool, &fixture.ctx, "catalog-0", "references/raw.txt", None)
+        .await
+        .unwrap();
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let pending = read_page(
+        &tool,
+        &fixture.ctx,
+        "catalog-0",
+        "references/raw.txt",
+        Some(cursor),
+    );
+    tokio::pin!(pending);
+    tokio::select! {
+        _ = resolver.entered.notified() => {},
+        result = &mut pending => panic!("final warm probe barrier was not reached: {result:?}"),
+    }
+    assert!(futures::poll!(&mut pending).is_pending());
+    // A real concurrent cold read evicts the entry while the old page/body borrow lives.
+    read_page(&tool, &fixture.ctx, "catalog-0", "SKILL.md", None)
+        .await
+        .unwrap();
+    resolver.release.notify_one();
+    assert!(
+        pending.await.is_err(),
+        "membership validation rejects concurrent eviction"
+    );
+    let (_, replacement) = read_page(&tool, &fixture.ctx, "catalog-0", "references/raw.txt", None)
+        .await
+        .unwrap();
+    assert_ne!(replacement["next_cursor"].as_str(), Some(cursor));
+    assert!(
+        read_page(
+            &tool,
+            &fixture.ctx,
+            "catalog-0",
+            "references/raw.txt",
+            Some(cursor)
+        )
+        .await
+        .is_err(),
+        "identical reread must not resurrect an evicted cursor"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn skills_read_native_windows_junction_replacement_rejects_foreign_auxiliary_data() {
+    let fixture = Fixture::new(1).await;
+    fixture
+        .resolver
+        .0
+        .write()
+        .await
+        .as_mut()
+        .unwrap()
+        .response_bytes = 350;
+    let tool = reader(&fixture);
+    let (_, first) = read_page(&tool, &fixture.ctx, "catalog-0", "references/raw.txt", None)
+        .await
+        .unwrap();
+    let cursor = first["next_cursor"].as_str().unwrap();
+    // cmd treats forward slashes in mklink paths as option prefixes.
+    let bundle = fixture._directory.path().join("skills").join("catalog-0");
+    let original = bundle.join("references");
+    std::fs::rename(&original, bundle.join("old-references")).unwrap();
+    let foreign = fixture._directory.path().join("foreign");
+    std::fs::create_dir(&foreign).unwrap();
+    std::fs::write(foreign.join("raw.txt"), "FOREIGN PRIVATE BODY").unwrap();
+    let output = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&original)
+        .arg(&foreign)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "real junction creation must succeed: {output:?}"
+    );
+    assert!(read_page(
+        &tool,
+        &fixture.ctx,
+        "catalog-0",
+        "references/raw.txt",
+        Some(cursor)
+    )
+    .await
+    .is_err());
+    assert!(
+        read_page(&tool, &fixture.ctx, "catalog-0", "references/raw.txt", None)
+            .await
+            .is_err()
+    );
 }

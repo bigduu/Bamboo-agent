@@ -1,5 +1,5 @@
 // Copyright 2025 OpenAI. Licensed under Apache-2.0.
-// Adapted from Codex ext/skills/src/tools/list.rs, revision
+// Adapted from Codex ext/skills/src/tools/{list.rs,read.rs,mod.rs}, revision
 // 7f892275e31002f0422477c6219189284560e689. See third_party/codex/NOTICE.
 use super::{SkillCatalogCaller, SkillCatalogCallerResolver, SkillToolAccess};
 use async_trait::async_trait;
@@ -7,8 +7,9 @@ use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome,
 use bamboo_llm::Config;
 use bamboo_skills::{
     progressive::{
-        render_skill_catalog, skill_metadata_budget, SkillCatalogEligibility, SkillCatalogRender,
-        SkillCatalogRenderPolicy, SkillCatalogSnapshot,
+        render_skill_catalog, skill_metadata_budget, CachedSkillRead, SelectedSkillReadCache,
+        SkillCatalogEligibility, SkillCatalogRender, SkillCatalogRenderPolicy,
+        SkillCatalogSnapshot,
     },
     SkillManager, SkillStore,
 };
@@ -217,6 +218,17 @@ impl SkillsListTool {
         resource: &str,
     ) -> Result<SelectedSkillSource, ToolError> {
         let prepared = self.metadata(ctx).await?;
+        self.selected_prepared(ctx, &prepared, package, resource)
+            .await
+    }
+
+    async fn selected_prepared(
+        &self,
+        ctx: &ToolCtx,
+        prepared: &SelectedCatalogContext,
+        package: &str,
+        resource: &str,
+    ) -> Result<SelectedSkillSource, ToolError> {
         let snapshot = prepared
             .store
             .selected_source_for_mode(
@@ -228,7 +240,7 @@ impl SkillsListTool {
             )
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))?;
-        self.recheck(ctx, &prepared).await?;
+        self.recheck(ctx, prepared).await?;
         let identity = fingerprint(&(&prepared.identity, &snapshot.identity))?;
         Ok(SelectedSkillSource { snapshot, identity })
     }
@@ -241,6 +253,15 @@ impl SkillsListTool {
         selected: &SelectedSkillSource,
     ) -> Result<(), ToolError> {
         let prepared = self.metadata(ctx).await?;
+        self.probe_prepared(ctx, &prepared, selected).await
+    }
+
+    async fn probe_prepared(
+        &self,
+        ctx: &ToolCtx,
+        prepared: &SelectedCatalogContext,
+        selected: &SelectedSkillSource,
+    ) -> Result<(), ToolError> {
         let identity = prepared
             .store
             .probe_selected_source_for_mode(
@@ -252,7 +273,7 @@ impl SkillsListTool {
             )
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))?;
-        self.recheck(ctx, &prepared).await?;
+        self.recheck(ctx, prepared).await?;
         if fingerprint(&(&prepared.identity, identity))? != selected.identity {
             return Err(ToolError::Execution(
                 "selected Skill caller/source changed".into(),
@@ -376,21 +397,241 @@ fn truncate_description(value: &str) -> String {
     format!("{}...", value.chars().take(1_021).collect::<String>())
 }
 
-// Bound the ToolResult plus actual page-bearing outbound blocks, not an entire
-// request containing unrelated history. Maximum Anthropic cache TTL is charged.
-fn page_size(result: &ToolResult, call_id: &str) -> Result<usize, ToolError> {
-    let openai = json!({"type":"function_call_output","call_id":call_id,"output":result.result});
-    let cached_openai = json!({"type":"function_call_output","call_id":call_id,"output":[{"type":"input_text","text":result.result,"prompt_cache_breakpoint":{"mode":"explicit"}}]});
-    let anthropic = json!({"type":"tool_result","tool_use_id":call_id,"content":result.result,"is_error":false,"cache_control":{"type":"ephemeral","ttl":"1h"}});
+// Count serialized bytes without retaining cloned response/provider strings.
+#[derive(Default)]
+struct WireCount {
+    bytes: usize,
+    escaped: usize,
+}
+impl std::io::Write for WireCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes += bytes.len();
+        self.escaped += bytes
+            .iter()
+            .map(|byte| match byte {
+                b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 8 | 12 => 2,
+                0..=31 => 6,
+                _ => 1,
+            })
+            .sum::<usize>();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn serialized_size(value: &impl Serialize) -> Result<usize, ToolError> {
+    let mut count = WireCount::default();
+    serde_json::to_writer(&mut count, value).map_err(json_error)?;
+    Ok(count.bytes)
+}
+#[derive(Serialize)]
+struct OpenAiOutput<'a, T: Serialize> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    call_id: &'a str,
+    output: T,
+}
+#[derive(Serialize)]
+struct CacheText<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+    prompt_cache_breakpoint: ExplicitCache,
+}
+#[derive(Serialize)]
+struct ExplicitCache {
+    mode: &'static str,
+}
+#[derive(Serialize)]
+struct AnthropicOutput<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    tool_use_id: &'a str,
+    content: &'a str,
+    is_error: bool,
+    cache_control: AnthropicCache,
+}
+#[derive(Serialize)]
+struct AnthropicCache {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    ttl: &'static str,
+}
+// Charge the actual largest page-bearing block, including 1h cache TTL.
+pub(super) fn page_size(result: &ToolResult, call_id: &str) -> Result<usize, ToolError> {
     Ok([
-        serde_json::to_vec(result).map_err(json_error)?.len(),
-        serde_json::to_vec(&openai).map_err(json_error)?.len(),
-        serde_json::to_vec(&cached_openai)
-            .map_err(json_error)?
-            .len(),
-        serde_json::to_vec(&anthropic).map_err(json_error)?.len(),
+        serialized_size(result)?,
+        serialized_size(&OpenAiOutput {
+            kind: "function_call_output",
+            call_id,
+            output: result.result.as_str(),
+        })?,
+        serialized_size(&OpenAiOutput {
+            kind: "function_call_output",
+            call_id,
+            output: [CacheText {
+                kind: "input_text",
+                text: &result.result,
+                prompt_cache_breakpoint: ExplicitCache { mode: "explicit" },
+            }],
+        })?,
+        serialized_size(&AnthropicOutput {
+            kind: "tool_result",
+            tool_use_id: call_id,
+            content: &result.result,
+            is_error: false,
+            cache_control: AnthropicCache {
+                kind: "ephemeral",
+                ttl: "1h",
+            },
+        })?,
     ]
     .into_iter()
     .max()
     .unwrap_or(0))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadArgs {
+    package: String,
+    resource: Option<String>,
+    cursor: Option<String>,
+}
+#[derive(Serialize)]
+struct ReadResponse<'a> {
+    package: &'a str,
+    resource: &'a str,
+    contents: &'a str,
+    next_cursor: Option<String>,
+}
+
+/// Complete-file paging API; deliberately unregistered until runtime migration.
+/// It shares list/render's mandatory fresh host resolver and selected source path.
+pub struct SkillsReadTool {
+    catalog: SkillsListTool,
+    cache: SelectedSkillReadCache,
+}
+impl SkillsReadTool {
+    pub fn new(catalog: SkillsListTool) -> Self {
+        Self {
+            catalog,
+            cache: SelectedSkillReadCache::default(),
+        }
+    }
+    fn validate_handle(value: &str) -> Result<(), ToolError> {
+        if value.is_empty() || value.len() > MAX_HANDLE_BYTES || value.chars().any(char::is_control)
+        {
+            return Err(ToolError::InvalidArguments(
+                "skills_read handle is empty, oversized or contains controls".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn response<'a>(
+        entry: &'a CachedSkillRead,
+        contents: &'a str,
+        offset: Option<usize>,
+    ) -> ReadResponse<'a> {
+        ReadResponse {
+            package: &entry.snapshot.package,
+            resource: &entry.snapshot.resource,
+            contents,
+            next_cursor: offset.map(|offset| entry.cursor(offset)),
+        }
+    }
+}
+#[async_trait]
+impl Tool for SkillsReadTool {
+    fn name(&self) -> &str {
+        "skills_read"
+    }
+    fn description(&self) -> &str {
+        "Read a selected Skill package file; continue next_cursor until complete EOF."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({"type":"object","properties":{"package":{"type":"string","maxLength":MAX_HANDLE_BYTES},"resource":{"type":"string","maxLength":MAX_HANDLE_BYTES},"cursor":{"type":"string","maxLength":MAX_HANDLE_BYTES}},"required":["package"],"additionalProperties":false})
+    }
+    fn classify(&self, _: &Value) -> ToolClass {
+        ToolClass::READONLY_PARALLEL
+    }
+    async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
+        let args: ReadArgs = serde_json::from_value(args)
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        Self::validate_handle(&args.package)?;
+        let resource = args.resource.as_deref().unwrap_or("SKILL.md");
+        Self::validate_handle(resource)?;
+        Self::validate_handle(&ctx.tool_call_id)?;
+        if let Some(cursor) = &args.cursor {
+            Self::validate_handle(cursor)?;
+        }
+        // One context, store and authorizer, resolved before cache access.
+        let prepared = self.catalog.metadata(&ctx).await?;
+        if !prepared
+            .snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.package == args.package)
+        {
+            return Err(ToolError::Execution(
+                "selected Skill is not currently eligible".into(),
+            ));
+        }
+        let (entry, start) = if let Some(cursor) = &args.cursor {
+            let (entry, offset) = self.cache.lookup(cursor).map_err(skill_error)?;
+            if entry.snapshot.package != args.package || entry.snapshot.resource != resource {
+                return Err(ToolError::InvalidArguments(
+                    "skills_read cursor resource changed".into(),
+                ));
+            }
+            (entry, offset)
+        } else {
+            self.cache.clear();
+            let selected = self
+                .catalog
+                .selected_prepared(&ctx, &prepared, &args.package, resource)
+                .await?;
+            (self.cache.admit(selected.snapshot, selected.identity), 0)
+        };
+        let budget = prepared.caller.response_bytes.min(MAX_SKILLS_LIST_BYTES);
+        let overhead = page_size(&ToolResult::text(true, ""), &ctx.tool_call_id)?;
+        let page = entry
+            .snapshot
+            .page_response(
+                start,
+                budget,
+                |contents, offset| {
+                    let mut count = WireCount::default();
+                    serde_json::to_writer(&mut count, &Self::response(&entry, contents, offset))
+                        .map_err(|e| bamboo_skills::SkillError::Validation(e.to_string()))?;
+                    Ok(overhead.saturating_add(count.escaped))
+                },
+                |contents, offset, writer| {
+                    serde_json::to_writer(writer, &Self::response(&entry, contents, offset))
+                        .map_err(|e| bamboo_skills::SkillError::Validation(e.to_string()))
+                },
+            )
+            .map_err(skill_error)?;
+        // Keep the page and selected allocation charged through final fresh checks.
+        let selected = SelectedSkillSource {
+            snapshot: entry.snapshot.clone(),
+            identity: entry.identity.clone(),
+        };
+        self.catalog
+            .probe_prepared(&ctx, &prepared, &selected)
+            .await?;
+        if !self.cache.contains(&entry) {
+            return Err(ToolError::Execution(
+                "skills_read cursor was evicted during read".into(),
+            ));
+        }
+        Ok(ToolOutcome::Completed(ToolResult::text(
+            true,
+            page.into_text(),
+        )))
+    }
+}
+fn skill_error(error: bamboo_skills::SkillError) -> ToolError {
+    ToolError::Execution(error.to_string())
 }
