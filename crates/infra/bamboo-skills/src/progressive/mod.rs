@@ -7,11 +7,11 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 pub(crate) mod read;
-pub use read::SelectedSkillSnapshot;
+pub use read::{CachedSkillRead, SelectedSkillPage, SelectedSkillReadCache, SelectedSkillSnapshot};
 mod render;
 pub use render::{
-    render_skill_catalog, skill_metadata_budget, SkillCatalogRender, SkillCatalogRenderPolicy,
-    SkillMetadataBudget,
+    render_skill_catalog, render_skill_usage_instructions, skill_metadata_budget,
+    SkillCatalogRender, SkillCatalogRenderPolicy, SkillMetadataBudget,
 };
 pub(crate) mod source;
 
