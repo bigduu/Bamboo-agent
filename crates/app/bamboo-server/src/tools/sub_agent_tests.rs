@@ -931,6 +931,10 @@ impl WaitOrderPort {
 
 #[async_trait::async_trait]
 impl ChildSessionPort for WaitOrderPort {
+    async fn validate_child_model(&self, child: &Session) -> Result<(), ChildSessionError> {
+        self.inner.validate_child_model(child).await
+    }
+
     async fn resolve_named_profile(
         &self,
         parent: &Session,
@@ -3423,6 +3427,324 @@ async fn create_uses_async_subagent_model_resolver() {
         child.metadata.get("provider_name").map(String::as_str),
         Some("openai")
     );
+}
+
+async fn configure_test_runtime_models(harness: &TestHarness, models: &[&str]) {
+    let mut config = harness.adapter.config.write().await;
+    config.default_provider_instance = Some("relay".into());
+    config.provider_instances.insert(
+        "relay".into(),
+        serde_json::from_value(json!({
+            "provider_type": "openai",
+            "runtime_models": models
+        }))
+        .unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn runtime_model_admission_rejects_create_before_save_and_allows_custom_ids_offline() {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    configure_test_runtime_models(&harness, &["gpt-5", "private/custom-child"]).await;
+    let before = harness
+        .adapter
+        .session_store
+        .list_index_entries()
+        .await
+        .len();
+    let create = |model: &str| {
+        json!({
+            "action": "create", "title": "Selected model", "responsibility": "Return a result",
+            "prompt": "Use this explicitly selected model", "workspace": harness.workspace_path,
+            "model": model, "auto_run": false
+        })
+    };
+    let error = invoke_completed(
+        &harness.tool,
+        create("relay:upstream-only"),
+        subagent_test_ctx(&harness.parent_session_id, "deny-upstream-model"),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("not admitted"));
+    assert_eq!(
+        harness
+            .adapter
+            .session_store
+            .list_index_entries()
+            .await
+            .len(),
+        before
+    );
+    assert!(harness.agent_runners.read().await.is_empty());
+
+    let result = invoke_completed(
+        &harness.tool,
+        create("relay:private/custom-child"),
+        subagent_test_ctx(&harness.parent_session_id, "admit-private-model"),
+    )
+    .await
+    .unwrap();
+    let result: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    let child = harness
+        .storage
+        .load_session(result["child_session_id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.model, "private/custom-child");
+    assert_eq!(child.model_ref.unwrap().provider, "relay");
+    assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 0);
+
+    configure_test_runtime_models(&harness, &["private/custom-child"]).await;
+    let mut inherited = create("unused");
+    inherited.as_object_mut().unwrap().remove("model");
+    let error = invoke_completed(
+        &harness.tool,
+        inherited,
+        subagent_test_ctx(&harness.parent_session_id, "deny-inherited-model"),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("not admitted"));
+    assert!(error.to_string().contains("gpt-5"));
+    assert_eq!(
+        harness
+            .adapter
+            .session_store
+            .list_index_entries()
+            .await
+            .len(),
+        before + 1
+    );
+}
+
+#[tokio::test]
+async fn runtime_model_admission_rejects_bare_child_override_under_parent_model_ref() {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    configure_test_runtime_models(&harness, &["gpt-5"]).await;
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    parent.model_ref = Some(bamboo_domain::ProviderModelRef::new("relay", "gpt-5"));
+    parent.set_provider_name("relay");
+    harness.storage.save_session(&parent).await.unwrap();
+    let error = child_session::create_child_action(
+        harness.adapter.as_ref(),
+        child_session::CreateChildInput {
+            parent_session: parent,
+            child_id: "unadmitted-bare-child".into(),
+            title: "Denied bare model".into(),
+            responsibility: "Return a result".into(),
+            assignment_prompt: "Return a result".into(),
+            subagent_type: "coder".into(),
+            workspace: harness.workspace_path.to_string_lossy().into_owned(),
+            workspace_source: bamboo_engine::project_context::WorkspaceSource::Explicit,
+            model_override: Some("upstream-only".into()),
+            model_ref_override: None,
+            runtime_metadata: HashMap::new(),
+            read_only: false,
+            auto_run: false,
+            reasoning_effort: None,
+            lifecycle: None,
+            resident_name: None,
+            resident_context: None,
+            disabled_tools: None,
+            context_fork: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("not admitted"));
+    assert!(harness
+        .storage
+        .load_session("unadmitted-bare-child")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn runtime_model_admission_rejects_resolved_defaults_and_named_profile_models() {
+    let resolver: crate::tools::SubagentModelResolver = Arc::new(|_| {
+        Box::pin(async {
+            Some(bamboo_domain::ProviderModelRef::new(
+                "relay",
+                "upstream-only",
+            ))
+        })
+    });
+    let harness = build_test_harness_with_storage(Some(resolver), None, true).await;
+    configure_test_runtime_models(&harness, &["gpt-5"]).await;
+    let agents = harness
+        .adapter
+        .session_store
+        .bamboo_home_dir()
+        .join("agents");
+    tokio::fs::create_dir_all(&agents).await.unwrap();
+    tokio::fs::write(
+        agents.join("reviewer.md"),
+        "---\nschema_version: 1\nname: reviewer\ndescription: Focused review role\nmodel_hint: relay:profile-only\ntools:\n  allow: [Read, Glob]\n---\nReview the assigned work without changing files.\n",
+    )
+    .await
+    .unwrap();
+    let before = harness
+        .adapter
+        .session_store
+        .list_index_entries()
+        .await
+        .len();
+    for (role, rejected_model) in [("coder", "upstream-only"), ("reviewer", "profile-only")] {
+        let error = invoke_completed(
+            &harness.tool,
+            json!({"action": "create", "title": "Role model admission", "responsibility": "Complete this role",
+                "prompt": "Work on the assigned role", "subagent_type": role,
+                "workspace": harness.workspace_path, "auto_run": false}),
+            subagent_test_ctx(&harness.parent_session_id, "deny-role-model"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("not admitted"), "{error}");
+        assert!(error.to_string().contains(rejected_model), "{error}");
+        assert_eq!(
+            harness
+                .adapter
+                .session_store
+                .list_index_entries()
+                .await
+                .len(),
+            before
+        );
+    }
+}
+
+#[tokio::test]
+async fn runtime_model_admission_rejects_update_run_and_send_without_mutation_or_activation() {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    configure_test_runtime_models(&harness, &["gpt-5"]).await;
+    let before_child = serde_json::to_value(
+        harness
+            .storage
+            .load_session(&harness.child_session_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let before_parent = serde_json::to_value(
+        harness
+            .storage
+            .load_session(&harness.parent_session_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let error = invoke_completed(
+        &harness.tool,
+        json!({"action": "update", "child_session_id": harness.child_session_id,
+            "model": "relay:upstream-only", "auto_run": true}),
+        subagent_test_ctx(&harness.parent_session_id, "deny-model-update"),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("not admitted"));
+
+    configure_test_runtime_models(&harness, &[]).await;
+    for args in [
+        json!({"action": "run", "child_session_id": harness.child_session_id}),
+        json!({"action": "send_message", "child_session_id": harness.child_session_id,
+            "message": "A new task", "auto_run": true}),
+    ] {
+        let error = invoke_completed(
+            &harness.tool,
+            args,
+            subagent_test_ctx(&harness.parent_session_id, "deny-revoked-child"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("not admitted"));
+    }
+    assert_eq!(
+        serde_json::to_value(
+            harness
+                .storage
+                .load_session(&harness.child_session_id)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        before_child
+    );
+    assert_eq!(
+        serde_json::to_value(
+            harness
+                .storage
+                .load_session(&harness.parent_session_id)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        before_parent
+    );
+    let backlog = harness
+        .session_inbox
+        .inspect(&harness.child_session_id)
+        .await
+        .unwrap();
+    assert_eq!(backlog.pending, 0);
+    assert_eq!(backlog.claimed, 0);
+    assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 0);
+    assert!(harness.agent_runners.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn runtime_model_admission_rejects_revoked_resident_before_reuse_side_effects() {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let mut child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    child.metadata.insert("lifecycle".into(), "resident".into());
+    child
+        .metadata
+        .insert("resident_name".into(), "stable-worker".into());
+    harness.storage.save_session(&child).await.unwrap();
+    let before = serde_json::to_value(&child).unwrap();
+    configure_test_runtime_models(&harness, &[]).await;
+    for context in ["reset", "accumulate"] {
+        let error = invoke_completed(
+            &harness.tool,
+            json!({"action": "create", "lifecycle": "resident", "name": "stable-worker",
+                "context": context, "title": "New resident task", "responsibility": "New task",
+                "prompt": "Replace the old assignment", "workspace": harness.workspace_path,
+                "auto_run": true}),
+            subagent_test_ctx(&harness.parent_session_id, "deny-resident-reuse"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("not admitted"));
+        assert_eq!(
+            serde_json::to_value(
+                harness
+                    .storage
+                    .load_session(&harness.child_session_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            before
+        );
+    }
+    assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

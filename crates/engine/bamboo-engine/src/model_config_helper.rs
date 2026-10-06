@@ -633,11 +633,6 @@ pub fn resolve_subagent_model(
         resolve_subagent_model_ref(config, provider_name, provider_registry, subagent_type)?;
     let provider = ProviderModelRouter::new(provider_registry.clone())
         .route(&model_ref)
-        .or_else(|_| {
-            provider_registry.get(&model_ref.provider).ok_or_else(|| {
-                LLMError::Auth(format!("Provider '{}' not available", model_ref.provider))
-            })
-        })
         .ok()?;
     Some(ResolvedModel::from_ref(provider, &model_ref))
 }
