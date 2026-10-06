@@ -221,6 +221,22 @@ trusted caller resolver. Reads use stable packages plus `SKILL.md` or a publishe
 relative resource. Follow `next_cursor` to complete EOF before applying instructions.
 A finite owned snapshot cache retains shared byte charges through active borrows;
 every continuation validates current caller/input, host policy and source identity.
-UTF-8 pages charge the largest real OpenAI/Anthropic cache envelope (including 1h).
+UTF-8 pages charge the largest real OpenAI Chat/Responses, Anthropic cache
+(including 1h), Gemini page-bearing block and complete ToolResult envelope.
 `render_skill_usage_instructions` exposes complete budgeted guidance only when a
 future runtime deliberately installs the read Tool. Live registration is deferred.
+
+`skill_response_byte_budget` is an unwired scalar preparation helper. A future
+trusted caller must supply its actual current tool-output token cap alongside the
+existing response byte ceiling. Unknown caps and zero response bytes fail;
+a known zero token cap means no hard token cap while retaining a finite512KiB
+byte ceiling. Positive caps conservatively limit response bytes to that cap.
+The helper grants no Skill access and changes no generic compressor behavior.
+Impossible complete envelopes fail through the existing ToolError path rather
+than emitting partial successful JSON or claiming EOF. Their plain failure text
+has no successful-page token-bound promise. Test-owned Reader overlays exercise
+this composition through the actual Runtime and outbound provider converters;
+they do not install a production Reader or establish configured-provider access.
+The live same-dispatch producer of model-resolved default token caps remains a
+separate requirement: persisted Session omits that resolved budget. Production
+caller resolution and output composition remain disconnected until cutover.

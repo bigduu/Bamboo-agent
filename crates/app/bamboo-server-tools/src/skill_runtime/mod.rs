@@ -16,6 +16,7 @@ use bamboo_domain::ProjectId;
 
 mod catalog;
 mod load_skill;
+mod output_budget;
 mod read_resource;
 
 #[cfg(test)]
@@ -23,6 +24,7 @@ mod tests;
 
 pub use catalog::{SelectedSkillSource, SkillsListTool, SkillsReadTool, MAX_SKILLS_LIST_BYTES};
 pub use load_skill::LoadSkillTool;
+pub use output_budget::skill_response_byte_budget;
 pub use read_resource::ReadSkillResourceTool;
 
 /// Trusted, ephemeral invocation intent tied to one accepted host input.
