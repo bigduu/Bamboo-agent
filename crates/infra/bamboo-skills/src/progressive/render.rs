@@ -7,6 +7,19 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 
+/// Codex's explicit main-prompt limit, measured in UTF-8 bytes, not characters.
+pub const EXPLICIT_SKILL_PROMPT_BYTES: usize = 8_000;
+
+/// Adapted from pinned Codex `truncate_utf8_to_bytes` and its character-boundary
+/// utility. This only truncates the supplied string; it establishes no access.
+pub fn truncate_skill_utf8_bytes(contents: &str, max_bytes: usize) -> (&str, bool) {
+    let mut end = contents.len().min(max_bytes);
+    while !contents.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&contents[..end], end < contents.len())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SkillMetadataBudget {
     Tokens(usize),
