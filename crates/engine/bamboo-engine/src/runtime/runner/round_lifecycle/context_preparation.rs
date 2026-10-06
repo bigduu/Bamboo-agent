@@ -1150,7 +1150,9 @@ async fn maybe_prepare_retrieval_window_context(
     // catalog intentionally excludes `session_history_current`; defer archival
     // until activation completes instead of misclassifying the temporary tool
     // restriction as a missing retrieval capability.
-    if crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(session) {
+    if crate::runtime::runner::session_setup::legacy_instruction::explicit_activation_pending(
+        session,
+    ) {
         tracing::debug!(
             session_id = %session_id,
             "retrieval-window archival deferred until explicit skill activation completes"

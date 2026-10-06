@@ -5,9 +5,9 @@ use bamboo_domain::{
     resolve_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
     ClassifiedToolIdentity, ClassifiedToolSchema, EffectiveCallableSet, SessionKind,
 };
+#[cfg(test)]
 use bamboo_skills::runtime_metadata::{
-    LOADED_SKILL_IDS_METADATA_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
-    SKILL_RUNTIME_SELECTION_SOURCE_KEY,
+    SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY, SKILL_RUNTIME_SELECTION_SOURCE_KEY,
 };
 use bamboo_tools::exposure::{activated_discoverable_tools, expandable_tool_short_description};
 
@@ -179,36 +179,7 @@ fn resolve_catalog_with_activation(
         });
     }
 
-    // Once a single explicitly selected workflow reaches a terminal activation
-    // result, stop advertising load_skill so the model-issued attempt occurs
-    // exactly once. A typed degraded result is terminal too: the main session
-    // continues without workflow instructions instead of retrying forever.
-    // Automatic catalogs keep the tool available until the model chooses a
-    // candidate.
-    let loaded_skill_ids = session
-        .metadata
-        .get(LOADED_SKILL_IDS_METADATA_KEY)
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-        .unwrap_or_default();
-    let selected_skill_ids = session
-        .metadata
-        .get(SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY)
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-        .unwrap_or_default();
-    let explicit_selection = session
-        .metadata
-        .get(SKILL_RUNTIME_SELECTION_SOURCE_KEY)
-        .is_some_and(|source| source == "explicit");
-    let explicit_activation_is_current = explicit_selection
-        && !loaded_skill_ids.is_empty()
-        && loaded_skill_ids == selected_skill_ids;
-    let explicit_activation_degraded = explicit_selection
-        && session
-            .metadata
-            .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY);
-    if explicit_activation_is_current || explicit_activation_degraded {
-        tool_schemas.retain(|schema| schema.function.name != "load_skill");
-    }
+    super::legacy_instruction::retain_terminal_activation_tools(session, &mut tool_schemas);
 
     // Legacy providers keep Deferred schemas visible during migration;
     // activation only controls the depth of the existing tool-guide summaries.

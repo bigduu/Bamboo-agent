@@ -2795,87 +2795,10 @@ async fn handle_tool_calls_path(
 
 // ---- Core pipeline ----
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ExplicitActivationAttempt {
-    call_id: String,
-    skill_id: String,
-}
-
-fn validate_explicit_activation_first_step(
-    session: &Session,
-    tool_calls: &[bamboo_agent_core::tools::ToolCall],
-) -> Result<Option<ExplicitActivationAttempt>, AgentError> {
-    if !crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(session) {
-        return Ok(None);
-    }
-
-    let selected_skill_id = session
-        .metadata
-        .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY)
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-        .and_then(|ids| ids.into_iter().next())
-        .ok_or_else(|| {
-            AgentError::Tool(format!(
-                "[{}] explicit workflow activation is missing its selected skill",
-                session.id
-            ))
-        })?;
-    let valid_call = tool_calls.len() == 1
-        && bamboo_tools::normalize_tool_ref(&tool_calls[0].function.name)
-            .is_some_and(|name| name == "load_skill");
-    if !valid_call {
-        return Err(AgentError::Tool(format!(
-            "[{}] explicit workflow activation was not completed: the first model step must be exactly one load_skill call",
-            session.id
-        )));
-    }
-    let called_skill_id =
-        serde_json::from_str::<serde_json::Value>(&tool_calls[0].function.arguments)
-            .ok()
-            .and_then(|arguments| {
-                arguments
-                    .get("skill_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .map(str::to_string)
-            });
-    if called_skill_id.as_deref() != Some(selected_skill_id.as_str()) {
-        return Err(AgentError::Tool(format!(
-            "[{}] explicit workflow activation must load selected skill '{}'",
-            session.id, selected_skill_id
-        )));
-    }
-
-    Ok(Some(ExplicitActivationAttempt {
-        call_id: tool_calls[0].id.clone(),
-        skill_id: selected_skill_id,
-    }))
-}
-
-fn apply_successful_explicit_activation(
-    session: &mut Session,
-    attempt: &ExplicitActivationAttempt,
-) -> Result<(), AgentError> {
-    let tool_succeeded = session.messages.iter().rev().any(|message| {
-        message.tool_call_id.as_deref() == Some(attempt.call_id.as_str())
-            && message.tool_success == Some(true)
-    });
-    // The #579 success path refreshes the complete workflow activation namespace
-    // from SessionRepository into this runner-owned Session before returning.
-    // Require both the successful tool result and that durable active snapshot;
-    // a provider/degraded/save failure must never unlock the answer round.
-    if !tool_succeeded
-        || crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(
-            session,
-        )
-    {
-        return Err(AgentError::Tool(format!(
-            "[{}] explicit workflow '{}' failed to activate; refusing to continue to a user-facing answer",
-            session.id, attempt.skill_id
-        )));
-    }
-    Ok(())
-}
+use crate::runtime::runner::session_setup::legacy_instruction::{
+    apply_successful_attempt as apply_successful_explicit_activation,
+    validate_first_step as validate_explicit_activation_first_step,
+};
 
 pub(super) async fn run_pipeline(
     session: &mut Session,
@@ -6103,8 +6026,8 @@ mod tests {
         )
         .expect("matching load_skill should pass")
         .expect("pending activation attempt");
-        assert_eq!(attempt.call_id, "load-review");
-        assert_eq!(attempt.skill_id, "review");
+        assert_eq!(attempt.call_id(), "load-review");
+        assert_eq!(attempt.skill_id(), "review");
     }
 
     #[test]
