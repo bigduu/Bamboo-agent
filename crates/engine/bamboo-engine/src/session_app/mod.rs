@@ -14,6 +14,10 @@ pub mod resolution;
 pub mod respond;
 pub mod resume;
 pub mod session_create;
+pub mod skill_input;
+pub use crate::runtime::runner::session_setup::legacy_skill_history::{
+    plan_legacy_skill_history, LegacySkillHistoryPlan,
+};
 pub mod supervisor;
 pub mod system_prompt;
 pub mod truncation;

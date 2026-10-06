@@ -11,7 +11,8 @@ pub use read::{CachedSkillRead, SelectedSkillPage, SelectedSkillReadCache, Selec
 mod render;
 pub use render::{
     render_skill_catalog, render_skill_usage_instructions, skill_metadata_budget,
-    SkillCatalogRender, SkillCatalogRenderPolicy, SkillMetadataBudget,
+    truncate_skill_utf8_bytes, SkillCatalogRender, SkillCatalogRenderPolicy, SkillMetadataBudget,
+    EXPLICIT_SKILL_PROMPT_BYTES,
 };
 pub(crate) mod source;
 
