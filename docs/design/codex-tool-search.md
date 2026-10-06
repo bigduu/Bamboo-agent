@@ -5,6 +5,19 @@ It uses the upstream metadata builder and `bm25` 2.3.2 setup at Codex revision
 `7f892275e31002f0422477c6219189284560e689` with Apache-2.0 attribution in
 `THIRD_PARTY_NOTICES.md`.
 
+The pinned dependency retains `fxhash` 0.2.1, covered by the
+[INFO Unmaintained advisory](https://rustsec.org/advisories/RUSTSEC-2025-0057.html).
+No published bm25 release drops fxhash; its hashes define embedding coordinates.
+[Pinned Codex also records this exception](https://github.com/openai/codex/blob/7f892275e31002f0422477c6219189284560e689/codex-rs/deny.toml#L76).
+Bamboo records the reviewed #1606 decision in both `deny.toml` and
+`.cargo/audit.toml`. It excepts this single ID globally; the stated dependency
+path is review evidence, not a machine-enforced restriction. Recheck each lock
+update, new fxhash path, upstream release/advisory change and before #1537; remove
+both entries when an accepted upstream release drops fxhash. Search and locked
+dependencies stay unchanged. This preserves existing Bamboo tokenization;
+its Unicode segmentation dependency already differs from the pinned Codex lock,
+so this is not a claim of exhaustive Unicode parity.
+
 The current session's host-resolved registry is the authority. Search indexes
 only eligible Deferred tool names, underscore-expanded names, descriptions,
 and recursively nested parameter property names/descriptions (`properties`,
