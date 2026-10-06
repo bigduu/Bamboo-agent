@@ -5,6 +5,7 @@
 
 use crate::counter::TokenCounter;
 use crate::segmenter::{MessageSegment, MessageSegmenter};
+use crate::skill_history::{is_skill_tool_name, SkillNameMatch};
 use crate::types::{
     BudgetError, BudgetStrategy, PreparedContext, TokenBudget, TokenUsageBreakdown,
 };
@@ -858,12 +859,9 @@ fn segment_contains_skill_tool_chain(segment: &MessageSegment) -> bool {
             return false;
         }
         message.tool_calls.as_ref().is_some_and(|calls| {
-            calls.iter().any(|call| {
-                matches!(
-                    call.function.name.as_str(),
-                    "load_skill" | "read_skill_resource"
-                )
-            })
+            calls
+                .iter()
+                .any(|call| is_skill_tool_name(&call.function.name, SkillNameMatch::Exact))
         })
     })
 }
@@ -1560,6 +1558,85 @@ mod tests {
             tool_results_kept < 2,
             "At least one intermediate tool result should be purged"
         );
+    }
+
+    #[test]
+    fn legacy_skill_preparation_requires_assistant_and_exact_names() {
+        for role in [Role::Assistant, Role::User, Role::Tool, Role::System] {
+            for (name, exact) in [
+                ("load_skill", true),
+                ("read_skill_resource", true),
+                ("LOAD_SKILL", false),
+                ("namespace::read_skill_resource", false),
+                ("load_skill_extra", false),
+            ] {
+                let mut message = Message::assistant(
+                    "",
+                    Some(vec![create_named_tool_call("candidate-call", name)]),
+                );
+                message.role = role.clone();
+                let segment = MessageSegment::from_message(message);
+                assert_eq!(
+                    segment_contains_skill_tool_chain(&segment),
+                    role == Role::Assistant && exact,
+                    "{role:?}/{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_skill_phase_one_keeps_complete_mixed_chain_before_generic_chain() {
+        for (name, exact) in [
+            ("load_skill", true),
+            ("read_skill_resource", true),
+            ("namespace::load_skill", false),
+        ] {
+            let mut mixed = MessageSegment::from_message(Message::assistant(
+                "",
+                Some(vec![
+                    create_named_tool_call("skill-call", name),
+                    create_named_tool_call("other-call", "Read"),
+                ]),
+            ));
+            mixed
+                .messages
+                .push(Message::tool_result("skill-call", "skill"));
+            mixed
+                .messages
+                .push(Message::tool_result("other-call", "other"));
+            mixed.token_estimate = 120;
+            let mixed_bytes = serde_json::to_vec(&mixed.messages).unwrap();
+            let mut generic = MessageSegment::from_message(Message::assistant(
+                "",
+                Some(vec![create_named_tool_call("generic-call", "Grep")]),
+            ));
+            generic
+                .messages
+                .push(Message::tool_result("generic-call", "generic"));
+            generic.token_estimate = 120;
+            let generic_bytes = serde_json::to_vec(&generic.messages).unwrap();
+            let selection = select_segments_within_budget(
+                vec![mixed, generic],
+                120,
+                &BudgetStrategy::Window { size: 50 },
+            );
+            assert_eq!(selection.selected.len(), 1);
+            assert_eq!(selection.removed.len(), 1);
+            let (expected_kept, expected_removed) = if exact {
+                (mixed_bytes, generic_bytes)
+            } else {
+                (generic_bytes, mixed_bytes)
+            };
+            assert_eq!(
+                serde_json::to_vec(&selection.selected[0].messages).unwrap(),
+                expected_kept
+            );
+            assert_eq!(
+                serde_json::to_vec(&selection.removed[0].messages).unwrap(),
+                expected_removed
+            );
+        }
     }
 
     #[test]
