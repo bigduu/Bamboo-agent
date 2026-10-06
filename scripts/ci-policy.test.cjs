@@ -73,6 +73,49 @@ test("routine dev pull requests run locked Rust, formatting, and policy checks",
   )
 })
 
+test("locked Rust test compilation has a separate budget before the complete suite", () => {
+  const testJob = job("test")
+  const [settings, ...steps] = testJob.split(/(?=^      - )/mu)
+  assert.doesNotMatch(settings, /^    (?:if|continue-on-error):/mu)
+  assert.match(settings, /^    timeout-minutes: 45$/mu)
+
+  const requiredSteps = [
+    ["Build locked Rust workspace", "cargo build --locked", undefined],
+    ["Compile locked Rust test targets", "cargo test --locked --no-run", "15"],
+    ["Test locked Rust workspace", "cargo test --locked", "30"],
+  ]
+  let previousIndex = -1
+  for (const [name, command, timeout] of requiredSteps) {
+    const matches = steps.filter((step) => step.startsWith(`      - name: ${name}\n`))
+    assert.equal(matches.length, 1, `${name} must appear exactly once`)
+    const [step] = matches
+    const index = steps.indexOf(step)
+    assert.ok(index > previousIndex, `${name} must follow the preceding Rust step`)
+    previousIndex = index
+
+    assert.doesNotMatch(step, /^        (?:if|continue-on-error):/mu)
+    assert.deepEqual(
+      [...step.matchAll(/^        run: (.*)$/gmu)].map((match) => match[1]),
+      [command],
+      `${name} must retain the exact locked command`,
+    )
+    assert.deepEqual(
+      [...step.matchAll(/^        timeout-minutes: (.*)$/gmu)].map((match) => match[1]),
+      timeout === undefined ? [] : [timeout],
+      `${name} must retain its time budget`,
+    )
+    if (timeout !== undefined) {
+      assert.match(step, /^        env:\n          RUST_MIN_STACK: "8388608"$/mu)
+    }
+    assert.equal(
+      steps.filter((candidate) => candidate.split("\n").includes(`        run: ${command}`))
+        .length,
+      1,
+      `${command} must not run again under another step name`,
+    )
+  }
+})
+
 test("promotion retains required checks without repeating platform coverage", () => {
   assert.match(job("promotion-source"), /name: Promotion Source\n/u)
   assert.match(job("lint"), /name: Lint\n/u)
