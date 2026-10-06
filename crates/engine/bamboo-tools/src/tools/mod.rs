@@ -18,6 +18,7 @@ pub mod read;
 pub mod read_tracker;
 pub mod registry;
 pub mod request_permissions;
+mod search_traversal;
 pub mod session_memory;
 pub mod sleep;
 pub mod task;

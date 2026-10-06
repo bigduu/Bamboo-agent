@@ -52,6 +52,7 @@ mod actor_checkpoint_lineage;
 mod actor_checkpoint_lineage_tests;
 mod actor_directory;
 mod actor_input;
+pub(crate) mod child_wait_control_plane;
 // A private observation port, deliberately without an acting caller.
 #[allow(dead_code)]
 mod canonical_birth_census;
@@ -73,7 +74,7 @@ pub use actor_model_context::{
 pub use actor_transcript::{
     ActorTranscriptAppend, ActorTranscriptAppendError, ActorTranscriptGroupAppend,
 };
-pub use broker_receipt::BrokerTerminalReceipt;
+pub use broker_receipt::{BrokerTerminalReceipt, BrokerTerminalRoute, HostToolYield};
 #[cfg(test)]
 mod actor_directory_lifetime_tests;
 mod actor_snapshot;
@@ -88,6 +89,8 @@ mod actor_snapshot_tests;
 mod actor_snapshot_windows_tests;
 #[cfg(test)]
 mod actor_transcript_tests;
+#[cfg(test)]
+mod child_deletion_tests;
 mod child_project;
 mod compact_main;
 #[cfg(test)]
@@ -98,6 +101,7 @@ mod root_actor_input;
 #[cfg(test)]
 mod root_actor_input_tests;
 mod root_actor_runtime;
+mod title_observations;
 pub use host_registry::FileHostRegistry;
 #[cfg(test)]
 mod default_actor_context_tests;
@@ -527,6 +531,13 @@ impl Drop for SessionLifecycleWriteGuard {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
+}
+
+// Field order releases Task before lifecycle, reversing acquisition order.
+// Started Child removal jobs share these actual guards with their async caller.
+struct SessionDeletionGuards {
+    runtime_task: RuntimeTaskTransactionWriteGuard,
+    _lifecycle: SessionLifecycleWriteGuard,
 }
 
 /// Keeps the just-published copy isolated from cross-process storage writers
@@ -1371,9 +1382,14 @@ pub struct SessionStoreV2 {
     #[cfg(test)]
     transcript_write_hook:
         std::sync::Mutex<Option<Arc<actor_transcript_tests::TranscriptWriteHook>>>,
+    #[cfg(any(test, feature = "test-utils"))]
+    child_wait_registration_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
     #[cfg(test)]
     default_write_hook:
         std::sync::Mutex<Option<Arc<default_actor_context_tests::DefaultWriteHook>>>,
+    #[cfg(test)]
+    child_delete_hook: std::sync::Mutex<Option<Arc<child_deletion_tests::ChildDeleteHook>>>,
     #[cfg(test)]
     migration_scan_pause: std::sync::Mutex<Option<startup_sidecar_tests::ScanPause>>,
     #[cfg(test)]
@@ -1692,8 +1708,12 @@ impl SessionStoreV2 {
             actor_write_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             transcript_write_hook: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            child_wait_registration_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             default_write_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            child_delete_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             migration_scan_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1772,7 +1792,11 @@ impl SessionStoreV2 {
     /// and directory-level read errors are logged + tolerated (never
     /// `?`-propagated) so one bad file/dir never re-introduces a boot-fatal
     /// failure or aborts recovery of the rest.
-    async fn rebuild_index_from_disk(&self) -> io::Result<()> {
+    /// Explicit recovery after a verified offline Session tree import. Reuses
+    /// the normal derived-index rebuild and its lifecycle/index publication
+    /// locks; callers must stop the importing Host before copying the tree.
+    /// This does not confer execution, Supervisor, or owned-Inbox authority.
+    pub async fn rebuild_index_from_disk(&self) -> io::Result<()> {
         let mut recovered = 0usize;
 
         let mut root_dirs = match fs::read_dir(&self.sessions_dir).await {
@@ -5149,9 +5173,13 @@ impl SessionStoreV2 {
     }
 
     pub async fn cleanup(&self, mode: CleanupMode, keep_pinned: bool) -> io::Result<CleanupResult> {
-        let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
-        let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked(&_runtime_task)
+        let lifecycle = self.lock_session_lifecycle_exclusive().await?;
+        let runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
+        let guards = Arc::new(SessionDeletionGuards {
+            runtime_task,
+            _lifecycle: lifecycle,
+        });
+        self.recover_all_runtime_task_transactions_locked(&guards.runtime_task)
             .await?;
         self.recover_all_session_copy_transactions_locked().await?;
 
@@ -5245,10 +5273,14 @@ impl SessionStoreV2 {
 
         // Apply deletions (roots first; they delete children implicitly).
         for root_id in delete_root_ids.iter() {
-            let _ = self.delete_session_recursive_locked(root_id, true).await?;
+            let _ = self
+                .delete_session_recursive_locked(root_id, true, &guards)
+                .await?;
         }
         for child_id in delete_child_ids.iter() {
-            let _ = self.delete_session_recursive_locked(child_id, true).await?;
+            let _ = self
+                .delete_session_recursive_locked(child_id, true, &guards)
+                .await?;
         }
         let mut deleted_session_ids: Vec<String> = deleted_ids.into_iter().collect();
         deleted_session_ids.sort();
@@ -5330,19 +5362,48 @@ impl SessionStoreV2 {
         session_id: &str,
         force: bool,
     ) -> io::Result<bool> {
-        let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
-        let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked(&_runtime_task)
+        let lifecycle = self.lock_session_lifecycle_exclusive().await?;
+        let runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
+        let guards = Arc::new(SessionDeletionGuards {
+            runtime_task,
+            _lifecycle: lifecycle,
+        });
+        self.recover_all_runtime_task_transactions_locked(&guards.runtime_task)
             .await?;
         self.recover_all_session_copy_transactions_locked().await?;
-        self.delete_session_recursive_locked(session_id, force)
+        self.delete_session_recursive_locked(session_id, force, &guards)
             .await
+    }
+
+    async fn remove_child_directory(
+        &self,
+        directory: &Path,
+        guards: &Arc<SessionDeletionGuards>,
+        tree: &Arc<ActorTreeWriteGuard>,
+    ) -> io::Result<()> {
+        let directory = directory.to_path_buf();
+        let guards = Arc::clone(guards);
+        let tree = Arc::clone(tree);
+        #[cfg(test)]
+        let hook = self.child_delete_hook.lock().unwrap().clone();
+        tokio::task::spawn_blocking(move || {
+            // Tokio filesystem jobs outlive a cancelled waiter or runtime.
+            // Retain the acquired guards until this physical removal ends.
+            let _guards = guards;
+            let _tree = tree;
+            #[cfg(test)]
+            let _finished = hook.as_ref().map(|hook| hook.enter());
+            std::fs::remove_dir_all(directory)
+        })
+        .await
+        .map_err(|_| other_io_error("background task failed"))?
     }
 
     async fn delete_session_recursive_locked(
         &self,
         session_id: &str,
         force: bool,
+        guards: &Arc<SessionDeletionGuards>,
     ) -> io::Result<bool> {
         validate_session_id(session_id)?;
         let entry = self.get_index_entry(session_id).await;
@@ -5415,9 +5476,10 @@ impl SessionStoreV2 {
 
         match entry.kind {
             SessionKind::Child => {
-                let _tree = self
-                    .acquire_actor_tree_write_guard(&entry.root_session_id)
-                    .await?;
+                let tree = Arc::new(
+                    self.acquire_actor_tree_write_guard(&entry.root_session_id)
+                        .await?,
+                );
                 if let Some(root) = self
                     .actor_tree_root_for_child_write(&entry.root_session_id)
                     .await?
@@ -5425,7 +5487,7 @@ impl SessionStoreV2 {
                     self.bump_actor_tree_revision(&root).await?;
                 }
                 let abs_dir = self.abs_path_from_rel(&entry.rel_path);
-                let _ = fs::remove_dir_all(&abs_dir).await;
+                let _ = self.remove_child_directory(&abs_dir, guards, &tree).await;
                 self.update_index(|index| {
                     index.sessions.remove(session_id);
                     Ok(())
@@ -5736,6 +5798,41 @@ impl SessionStoreV2 {
         owner: Option<&bamboo_domain::storage::RootActorRuntimeWrite>,
         publish: Option<bamboo_domain::storage::RootActorRuntimePublisher>,
     ) -> io::Result<()> {
+        self.save_runtime_state_with_owner_and_inherited(session, owner, publish, None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn reconcile_inherited_runtime_snapshot(
+        &self,
+        session: &Session,
+        inherited: &bamboo_domain::InheritedChildWait,
+        runtime_only: bool,
+    ) -> io::Result<Session> {
+        inherited.validate_session(session)?;
+        let latest = if runtime_only {
+            self.load_runtime_control_plane_unchecked(&session.id)
+                .await?
+        } else {
+            self.load_session_unlocked(&session.id).await?
+        }
+        .ok_or_else(|| {
+            io::Error::other(bamboo_domain::SessionAuthorityConflict(
+                "inherited child wait session disappeared".into(),
+            ))
+        })?;
+        let mut reconciled = session.clone();
+        crate::session_merge::reconcile_inherited_child_wait(&mut reconciled, &latest, inherited)?;
+        Ok(reconciled)
+    }
+
+    async fn save_runtime_state_with_owner_and_inherited(
+        &self,
+        session: &Session,
+        owner: Option<&bamboo_domain::storage::RootActorRuntimeWrite>,
+        publish: Option<bamboo_domain::storage::RootActorRuntimePublisher>,
+        inherited: Option<&bamboo_domain::InheritedChildWait>,
+    ) -> io::Result<Option<Session>> {
         // Fast path: write ONLY the small runtime sidecar (no messages), leaving
         // session.json — which carries the full conversation history — untouched.
         // Legacy sessions retain O(1) I/O in conversation length. Initialized
@@ -5765,12 +5862,12 @@ impl SessionStoreV2 {
             // session.json and the index get created. Deliberately acquire no
             // shared Task guard before this call: `save_session` owns that
             // boundary, avoiding a same-instance shared-lock re-entry.
-            if owner.is_some() {
+            if owner.is_some() || inherited.is_some() {
                 return Err(root_actor_runtime::conflict(
                     "Root runtime source is missing",
                 ));
             }
-            return self.save_session(session).await;
+            return self.save_session(session).await.map(|_| None);
         };
         let total_started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
@@ -5789,16 +5886,46 @@ impl SessionStoreV2 {
                 )
             }),
         );
+        self.save_runtime_state_after_lock(
+            session,
+            &rel,
+            total_started,
+            &guards,
+            publish,
+            inherited,
+        )
+        .await
+    }
+
+    /// Reuse the runtime publication protocol after the caller owns the same
+    /// lifecycle, Task and physical Session guards as the ordinary writer.
+    async fn save_runtime_state_after_lock(
+        &self,
+        session: &Session,
+        rel: &str,
+        total_started: Instant,
+        guards: &Arc<DefaultWriterGuards>,
+        publish: Option<bamboo_domain::RootActorRuntimePublisher>,
+        inherited: Option<&bamboo_domain::InheritedChildWait>,
+    ) -> io::Result<Option<Session>> {
+        let reconciled = match inherited {
+            Some(inherited) => Some(
+                self.reconcile_inherited_runtime_snapshot(session, inherited, true)
+                    .await?,
+            ),
+            None => None,
+        };
+        let session = reconciled.as_ref().unwrap_or(session);
         self.check_default_or_root_actor_context(
             session,
-            &self.abs_path_from_rel(&rel),
+            &self.abs_path_from_rel(rel),
             false,
-            &guards,
+            guards,
         )
         .await?;
         self.validate_authority_for_save(session).await?;
         self.validate_root_context_for_save(session).await?;
-        self.validate_child_project_for_write(session, false, Some(&rel))
+        self.validate_child_project_for_write(session, false, Some(rel))
             .await?;
         self.reject_regressing_runtime_task(session).await?;
         if session.kind == SessionKind::Root && self.get_index_entry(&session.id).await.is_none() {
@@ -5834,7 +5961,7 @@ impl SessionStoreV2 {
                     })?;
             }
         }
-        let abs_dir = self.abs_path_from_rel(&rel);
+        let abs_dir = self.abs_path_from_rel(rel);
         let mut stages = SaveStageDurations::default();
         let serialization_started = Instant::now();
         let runtime_snapshot = runtime_sidecar_snapshot(session);
@@ -5864,7 +5991,7 @@ impl SessionStoreV2 {
             }
         }
         let filesystem_started = Instant::now();
-        self.write_default_bytes(&abs_dir.join(RUNTIME_SIDECAR_FILE), runtime_bytes, &guards)
+        self.write_default_bytes(&abs_dir.join(RUNTIME_SIDECAR_FILE), runtime_bytes, guards)
             .await?;
         stages.filesystem_commit = filesystem_started.elapsed();
 
@@ -5911,7 +6038,7 @@ impl SessionStoreV2 {
                     .ok_or_else(|| {
                         other_io_error("runtime Root disappeared during index repair")
                     })?;
-                self.repair_index_from_authoritative_session(&authoritative, rel.clone())
+                self.repair_index_from_authoritative_session(&authoritative, rel.to_string())
                     .await?;
             }
             stages.index_publication = index_started.elapsed();
@@ -5938,9 +6065,9 @@ impl SessionStoreV2 {
             "session runtime-state commit completed"
         );
         if let Some(publish) = publish {
-            self.publish_root_actor_runtime(&guards, publish).await?;
+            self.publish_root_actor_runtime(guards, publish).await?;
         }
-        Ok(())
+        Ok(reconciled)
     }
 
     async fn save_session_after_lock(
@@ -5949,6 +6076,24 @@ impl SessionStoreV2 {
         total_started: Instant,
         guards: &Arc<DefaultWriterGuards>,
         answer_permit: Option<&ParentQuestion>,
+    ) -> io::Result<()> {
+        self.save_session_after_lock_with_title_intent(
+            session,
+            total_started,
+            guards,
+            answer_permit,
+            false,
+        )
+        .await
+    }
+
+    async fn save_session_after_lock_with_title_intent(
+        &self,
+        session: &Session,
+        total_started: Instant,
+        guards: &Arc<DefaultWriterGuards>,
+        answer_permit: Option<&ParentQuestion>,
+        manual_title: bool,
     ) -> io::Result<()> {
         let intended_rel = Self::default_writer_rel_path(session)?;
         self.check_default_or_root_actor_context(
@@ -6020,6 +6165,11 @@ impl SessionStoreV2 {
         };
         let tree = self.acquire_actor_tree_write_guard(root_id).await?;
         guards.hold_tree(tree);
+        let title_observations = if manual_title {
+            self.prepare_title_observations(session).await?
+        } else {
+            Vec::new()
+        };
         if previous_projection.as_ref() != Some(&actor_tree_session_projection(session)) {
             let root = if session.kind == SessionKind::Root {
                 Some(session.clone())
@@ -6084,6 +6234,12 @@ impl SessionStoreV2 {
         if supervisor_proof_prepared {
             self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Committed)?;
         }
+        // Observations must never lead canonical metadata: an ahead row
+        // could conceal a later Project A→B→A revision. A failed refresh
+        // remains stale/fail-closed; the manual no-op path validates it too.
+        for (path, bytes) in title_observations {
+            self.write_default_bytes(&path, bytes, guards).await?;
+        }
         let (revision_path, revision) = self
             .publish_default_search_revision(&abs_dir, guards)
             .await?;
@@ -6126,6 +6282,22 @@ impl SessionStoreV2 {
 
 #[async_trait::async_trait]
 impl Storage for SessionStoreV2 {
+    async fn save_manual_title(&self, session: &Session) -> io::Result<()> {
+        let total_started = Instant::now();
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_write = self
+            .acquire_session_write_lock(&session.id, SaveKind::Full)
+            .await?;
+        let guards = DefaultWriterGuards::shared(lifecycle, runtime_task, session_write);
+        self.save_session_after_lock_with_title_intent(session, total_started, &guards, None, true)
+            .await
+    }
+
+    async fn validate_title_observations(&self, expected: &Session) -> io::Result<()> {
+        self.validate_unchanged_title(expected).await
+    }
+
     fn bind_root_actor_inbox(
         &self,
         owner: &bamboo_domain::RootActorRuntimeWrite,
@@ -6143,7 +6315,7 @@ impl Storage for SessionStoreV2 {
         claim: &bamboo_domain::SessionInboxOwnedClaim,
         publish: bamboo_domain::RootActorRuntimePublisher,
     ) -> io::Result<()> {
-        self.save_root_actor_input_impl(owner, session, inbox, claim, publish)
+        self.save_root_actor_input_impl(owner, &mut session.clone(), inbox, claim, publish, None)
             .await
     }
 
@@ -6389,6 +6561,81 @@ impl Storage for SessionStoreV2 {
         Ok(())
     }
 
+    async fn save_runtime_with_inherited_child_wait(
+        &self,
+        session: &mut Session,
+        inherited: &bamboo_domain::InheritedChildWait,
+        runtime_only: bool,
+        root_writer: Option<(
+            bamboo_domain::RootActorRuntimeWrite,
+            bamboo_domain::RootActorRuntimePublisher,
+        )>,
+        input: Option<(
+            Arc<dyn bamboo_domain::SessionInboxPort>,
+            bamboo_domain::SessionInboxOwnedClaim,
+        )>,
+    ) -> io::Result<()> {
+        inherited.validate_session(session)?;
+        if let Some((inbox, claim)) = input {
+            if runtime_only {
+                return Err(io::Error::other("Root input requires a full checkpoint"));
+            }
+            let (owner, publish) = root_writer
+                .ok_or_else(|| io::Error::other("Root input checkpoint requires a bound writer"))?;
+            return self
+                .save_root_actor_input_impl(
+                    &owner,
+                    session,
+                    inbox,
+                    &claim,
+                    publish,
+                    Some(inherited),
+                )
+                .await;
+        }
+        if runtime_only {
+            let (owner, publish) = match root_writer.as_ref() {
+                Some((owner, publish)) => (Some(owner), Some(publish.clone())),
+                None => (None, None),
+            };
+            let reconciled = self
+                .save_runtime_state_with_owner_and_inherited(
+                    session,
+                    owner,
+                    publish,
+                    Some(inherited),
+                )
+                .await?;
+            *session = reconciled.expect("inherited runtime writer reconciled its snapshot");
+            return Ok(());
+        }
+        let started = Instant::now();
+        validate_session_id(&session.id)?;
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_write = self
+            .acquire_session_write_lock(&session.id, SaveKind::Full)
+            .await?;
+        let proof = root_writer.as_ref().map(|(owner, _)| {
+            root_actor_runtime::RootActorWriteProof::new(
+                self.sessions_dir.join(&session.id),
+                owner.clone(),
+            )
+        });
+        let guards =
+            DefaultWriterGuards::shared_with_root_actor(lifecycle, task, session_write, proof);
+        let reconciled = self
+            .reconcile_inherited_runtime_snapshot(session, inherited, false)
+            .await?;
+        self.save_session_after_lock(&reconciled, started, &guards, None)
+            .await?;
+        if let Some((_, publish)) = root_writer {
+            self.publish_root_actor_runtime(&guards, publish).await?;
+        }
+        *session = reconciled;
+        Ok(())
+    }
+
     async fn load_session(&self, session_id: &str) -> io::Result<Option<Session>> {
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         self.load_session_unlocked(session_id).await
@@ -6457,6 +6704,43 @@ impl Storage for SessionStoreV2 {
             &_guard,
         )
         .await
+    }
+
+    async fn load_child_wait_session(
+        &self,
+        parent: &Session,
+        child_id: &str,
+        full: bool,
+    ) -> io::Result<Option<Session>> {
+        let _task = self.lock_runtime_task_sidecar_shared().await?;
+        SessionStoreV2::load_child_wait_session(self, parent, child_id, full).await
+    }
+
+    fn supports_atomic_child_wait_control_plane(&self) -> bool {
+        true
+    }
+
+    async fn register_child_wait_control_plane(
+        &self,
+        expected: &Session,
+        batch: &[(String, Option<String>)],
+        policy: bamboo_domain::ChildWaitPolicy,
+        check_terminal: bool,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> io::Result<(Session, usize)> {
+        self.register_child_wait(expected, batch, policy, check_terminal, publish)
+            .await
+    }
+
+    async fn compare_exchange_child_wait_control_plane(
+        &self,
+        expected: &Session,
+        updated: &mut Session,
+        runtime_only: bool,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> io::Result<bool> {
+        self.compare_exchange_child_wait(expected, updated, runtime_only, publish)
+            .await
     }
 
     async fn list_child_run_statuses(
@@ -9800,6 +10084,11 @@ mod tests {
         // started now cannot resolve or recreate the target until the deletion
         // and index removal have linearized.
         let lifecycle = storage.lock_session_lifecycle_exclusive().await?;
+        let runtime_task = storage.lock_runtime_task_transaction_exclusive().await?;
+        let guards = Arc::new(SessionDeletionGuards {
+            runtime_task,
+            _lifecycle: lifecycle,
+        });
         let target = session.id.clone();
         let delivery = tokio::spawn(async move {
             inbox
@@ -9811,11 +10100,11 @@ mod tests {
 
         assert!(
             storage
-                .delete_session_recursive_locked(&session.id, true)
+                .delete_session_recursive_locked(&session.id, true, &guards)
                 .await?
         );
         assert!(!session_dir.exists());
-        drop(lifecycle);
+        drop(guards);
 
         let error = tokio::time::timeout(std::time::Duration::from_secs(2), delivery)
             .await

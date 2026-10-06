@@ -1,3 +1,6 @@
+#[path = "tagged_wait_registration_regression_tests.rs"]
+mod tagged_wait_registration_regression_tests;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

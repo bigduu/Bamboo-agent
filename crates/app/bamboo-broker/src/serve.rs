@@ -1544,7 +1544,8 @@ where
     let parent_actor = msg.from.clone();
     let parent = msg.from.session_id.clone();
     let legacy_event_wire = spec.execution_epoch == 0;
-    let mut event_batcher = ActorEventBatcher::for_run(&spec, None, Some(me.session_id.clone()));
+    let mut event_batcher = ActorEventBatcher::for_run(&spec, None, Some(me.session_id.clone()))
+        .with_durable_events(executor.requires_contiguous_events());
 
     let (sink, mut events, mut controls) = EventSink::channel_with_control();
     // Steer: register this run's steer inbox so out-of-band Steer messages route in.
@@ -1560,7 +1561,7 @@ where
     // Approval: a host bridge on the sink; its requests are pumped to the parent.
     let (host_bridge, mut host_rx) = HostBridge::channel();
     let sink = sink.with_host_bridge(host_bridge);
-    let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+    let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel::<bamboo_subagent::ChildOutcome>();
 
     let me = me.clone();
     let forward_cancel = cancel.clone();
@@ -1701,9 +1702,12 @@ where
             _ = failure_fwd.cancelled() => return false,
             outcome = outcome_rx => outcome,
         };
-        let Ok(outcome) = outcome else {
+        let Ok(mut outcome) = outcome else {
             return critical_failure();
         };
+        // Never trust an executor-supplied watermark. This ordered forwarder
+        // has now received every strict batch receipt, including the final flush.
+        outcome.final_event_watermark = event_batcher.final_watermark();
         let body = serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}));
         if failure_fwd.is_cancelled() || fatal_fwd.is_cancelled() || owner_loss_fwd.is_cancelled() {
             return false;
@@ -2070,6 +2074,9 @@ fn decode_steer_body(
         }
     }
 }
+
+#[cfg(test)]
+mod history_delivery_tests;
 
 #[cfg(test)]
 mod tests {

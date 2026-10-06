@@ -55,12 +55,14 @@ impl Agent {
 
     /// One execution's immutable persistence capability. Shared tool/provider
     /// resources remain on the existing runtime; default callers stay unbound.
-    pub(crate) fn with_execution_persistence(
+    #[doc(hidden)]
+    pub fn with_execution_persistence(
         &self,
         persistence: Arc<dyn RuntimeSessionPersistence>,
     ) -> Self {
         let mut runtime = (*self.runtime).clone();
         runtime.persistence = persistence;
+        runtime.inherited_child_wait_captured = true;
         Self::from_runtime(Arc::new(runtime))
     }
 
@@ -167,6 +169,38 @@ impl Agent {
     /// Execute and finalize a direct run whose ownership was acquired by
     /// [`begin_direct_execution`](Self::begin_direct_execution).
     pub async fn execute_direct_registered(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        lease: DirectExecutionLease,
+    ) -> crate::runtime::runner::Result<()> {
+        let inherited = self.persistence().inherited_child_wait().or_else(|| {
+            (!self.runtime.inherited_child_wait_captured)
+                .then(|| bamboo_domain::InheritedChildWait::capture(session))
+                .flatten()
+        });
+        let agent = if let Some(inherited) = inherited {
+            inherited
+                .validate_session(session)
+                .map_err(|error| bamboo_agent_core::AgentError::LLM(error.to_string()))?;
+            if self.persistence().inherited_child_wait().is_some() {
+                self.clone()
+            } else {
+                self.with_execution_persistence(
+                    self.persistence()
+                        .bind_inherited_child_wait(inherited)
+                        .map_err(|error| bamboo_agent_core::AgentError::LLM(error.to_string()))?,
+                )
+            }
+        } else {
+            self.with_execution_persistence(self.persistence().clone())
+        };
+        agent
+            .execute_direct_registered_bound(session, req, lease)
+            .await
+    }
+
+    async fn execute_direct_registered_bound(
         &self,
         session: &mut Session,
         req: ExecuteRequest,

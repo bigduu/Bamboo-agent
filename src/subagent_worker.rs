@@ -1282,6 +1282,10 @@ impl bamboo_engine::external_agents::ChildApprovalReviewer for ModelApprovalRevi
 
 #[async_trait]
 impl ChildExecutor for BambooRuntimeExecutor {
+    fn requires_contiguous_events(&self) -> bool {
+        self.local_tool_history
+    }
+
     fn supports_environment_lease_v1(&self) -> bool {
         true
     }
@@ -2197,6 +2201,41 @@ impl ChildExecutor for BambooRuntimeExecutor {
             event_tx,
             cancel.clone(),
         );
+        let mut ticket_file_tools = None;
+        match bamboo_engine::ticket_worker_plan::remote::RemoteWorkerPlan::from_run(
+            &run,
+            tree_host.clone(),
+        )
+        .await
+        {
+            Ok(Some(plan)) => {
+                if self.native_tool_ceiling.as_ref().is_none_or(|c| {
+                    !c.tools.iter().any(|t| t == "Task")
+                        || c.tools
+                            .iter()
+                            .any(|t| !matches!(t.as_str(), "Task" | "Read" | "Write"))
+                }) {
+                    return ChildOutcome::error(
+                        "Ticket native route requires bounded Task/Read/Write ceiling",
+                    );
+                }
+                let ceiling = self.native_tool_ceiling.as_ref().expect("verified ceiling");
+                match bamboo_engine::ticket_worker_plan::files::RemoteFileExecutor::new(
+                    self.run_tools
+                        .clone()
+                        .unwrap_or_else(|| self.agent.default_tools().clone()),
+                    tree_host.clone().expect("verified bridge"),
+                    session.id.clone(),
+                    &ceiling.tools,
+                ) {
+                    Ok(tools) => ticket_file_tools = Some(Arc::new(tools)),
+                    Err(error) => return ChildOutcome::error(error.to_string()),
+                }
+                builder = builder.ticket_worker_plan(Arc::new(plan));
+            }
+            Ok(None) => {}
+            Err(error) => return ChildOutcome::error(error.to_string()),
+        }
         if self.native_tool_ceiling.is_some() {
             // The runtime requires a manager; explicit empty selection prevents
             // workspace auto-selection or a retained workflow expanding this Run.
@@ -2237,6 +2276,9 @@ impl ChildExecutor for BambooRuntimeExecutor {
             session
                 .metadata
                 .insert("runtime.canonical_subagent_host".into(), "true".into());
+        }
+        if let Some(tools) = ticket_file_tools {
+            builder = builder.tools(tools);
         }
 
         // Scope the approval proxy to exactly this run (task-local), so gated
@@ -2667,6 +2709,259 @@ mod tests {
     }
 
     struct QuestionTool(HostBridge);
+
+    struct TicketPlanProvider(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl LLMProvider for TicketPlanProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            assert!(
+                messages
+                    .iter()
+                    .all(|m| !m.content.contains("Private Root plan")),
+                "Root plan must never enter the Worker's provider context"
+            );
+            assert_eq!(
+                tools
+                    .iter()
+                    .map(|s| s.function.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["Task"]
+            );
+            let chunks = if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                vec![Ok(LLMChunk::ToolCalls(vec![ToolCall {
+                    id:"ticket-task-call".into(), tool_type:"function".into(),
+                    function:bamboo_domain::FunctionCall { name:"Task".into(), arguments:serde_json::json!({"tasks":[{"id":"owned-step","content":"Own native step","status":"in_progress"}]}).to_string() }
+                }])), Ok(LLMChunk::Done)]
+            } else {
+                assert!(
+                    messages
+                        .iter()
+                        .any(|m| m.tool_call_id.as_deref() == Some("ticket-task-call")
+                            && m.tool_success == Some(true)),
+                    "the next round must observe the Host-committed Task result"
+                );
+                vec![
+                    Ok(LLMChunk::Token("Task saved by Host".into())),
+                    Ok(LLMChunk::Done),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_worker_loop_routes_task_to_host_local_plan_without_root_write() {
+        use bamboo_engine::ticket_worker_plan::{
+            remote::apply_host_plan_request, tickets::*, TICKET_LOCAL_PLAN_KEY,
+            TICKET_PLAN_PACKET_KEY,
+        };
+        use std::collections::BTreeSet;
+        let temp = tempfile::tempdir().unwrap();
+        let service = TicketService::open(
+            temp.path().join("tickets"),
+            ScopeBinding {
+                scope_id: "ticket-fixture".into(),
+                supervisor_session_id: "parent".into(),
+                binding_revision: 1,
+            },
+        )
+        .unwrap();
+        let binding = service.published().unwrap().1.binding;
+        let supervisor = Authority::from_verified_host(
+            binding.clone(),
+            Principal::Supervisor {
+                session_id: "parent".into(),
+            },
+        );
+        let command = service
+            .prepare_command(
+                &supervisor,
+                "create",
+                vec![
+                    Operation::Create {
+                        temp_id: "work".into(),
+                        kind: TicketKind::Work,
+                        parent: None,
+                        contract: Contract {
+                            title: "Native plan".into(),
+                            objective: "Record own steps".into(),
+                            constraints: vec!["No root changes".into()],
+                            acceptance: vec!["Host receipt".into()],
+                            user_acceptance_required: true,
+                            allowed_tools: BTreeSet::from(["Task".into()]),
+                        },
+                        depends_on: BTreeSet::new(),
+                    },
+                    Operation::Ready {
+                        work_id: "work".into(),
+                    },
+                    Operation::Start {
+                        work_id: "work".into(),
+                        temp_id: "assignment".into(),
+                        workspace: None,
+                    },
+                ],
+            )
+            .unwrap();
+        let receipt = service.execute(&supervisor, &command).unwrap();
+        let assignment = receipt.ids["assignment"].clone();
+        let snapshot = service.published().unwrap().1;
+        let a = &snapshot.assignments[&assignment];
+        let runtime = Authority::from_verified_host(binding, Principal::Runtime);
+        // The actual Worker loop runs below. Admission is synthetic in this
+        // adapter test; process-level Runtime dispatch is accepted separately.
+        let command = service
+            .prepare_command(
+                &runtime,
+                "admit",
+                vec![
+                    Operation::Admitted {
+                        assignment_id: assignment.clone(),
+                        receipt: RuntimeReceipt {
+                            dispatch_key: a.dispatch_key.clone(),
+                            spec_hash: snapshot.intents[&a.dispatch_key].spec_hash.clone(),
+                            run_id: "ticket-fixture-run".into(),
+                            session_id: "ticket-fixture-child".into(),
+                        },
+                    },
+                    Operation::Running {
+                        assignment_id: assignment.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+        service.execute(&runtime, &command).unwrap();
+        let packet = service
+            .child_context_packet(&runtime, &assignment, 65536)
+            .unwrap();
+        let mut run = protocol_run("ticket-fixture-child", "ticket-fixture-run", Vec::new());
+        run.messages[0]["metadata"] = serde_json::json!({(TICKET_PLAN_PACKET_KEY):packet});
+        let created_at = run
+            .logical_session
+            .as_ref()
+            .unwrap()
+            .creation
+            .as_ref()
+            .unwrap()
+            .created_at;
+        let store = Arc::new(
+            SessionStoreV2::new(temp.path().join("worker-cache"))
+                .await
+                .unwrap(),
+        );
+        // A real SessionStore requires a canonical Root context. Keep a Root
+        // plan here to prove the Worker updates neither it nor its messages.
+        let mut root = Session::new("parent", "test-model");
+        root.task_list = Some(bamboo_tools::TaskTool::task_list_from_args(
+            &serde_json::json!({"tasks":[{"id":"parent-step","content":"Private Root plan","status":"pending"}]}),
+            "parent",
+        ).unwrap());
+        store.save_session(&root).await.unwrap();
+        let root_plan = serde_json::to_value(&root.task_list).unwrap();
+        let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store.clone(),
+            Default::default(),
+        ));
+        let provider = Arc::new(TicketPlanProvider(std::sync::atomic::AtomicUsize::new(0)));
+        let mut executor = worker_executor_for_store(provider.clone(), store.clone(), inbox).await;
+        executor.run_tools = Some(Arc::new(
+            bamboo_tools::BuiltinToolExecutor::new()
+                .with_native_tool_ceiling(vec!["Task".into()])
+                .unwrap(),
+        ));
+        executor.native_tool_ceiling = Some(bamboo_subagent::proto::NativeToolCeiling {
+            version: 1,
+            child_session_id: "ticket-fixture-child".into(),
+            parent_session_id: "parent".into(),
+            root_session_id: "parent".into(),
+            created_at,
+            spawn_depth: 1,
+            project_id: None,
+            tools: vec!["Task".into()],
+        });
+        let mut caller =
+            Session::new_child("ticket-fixture-child", "parent", "test-model", "Fixture");
+        caller.created_at = created_at;
+        caller
+            .metadata
+            .insert(TICKET_LOCAL_PLAN_KEY.into(), assignment.clone());
+        let (host, mut requests) = HostBridge::channel();
+        let host_service = service.clone();
+        let pump = tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                let projection = apply_host_plan_request(
+                    &host_service,
+                    &caller,
+                    "ticket-fixture-run",
+                    &request.body["args"],
+                    request.body["tool_call_id"].as_str().unwrap(),
+                )
+                .unwrap();
+                let _ = request.reply.send(serde_json::json!({"result":projection}));
+            }
+        });
+        let (events, mut rx) = EventSink::channel();
+        let drain = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let (_tx, steer) = bamboo_subagent::executor::SteerInbox::channel();
+        let outcome = executor
+            .run(
+                run,
+                events.with_host_bridge(host),
+                steer,
+                CancellationToken::new(),
+            )
+            .await;
+        let observed = drain.await.unwrap();
+        assert_eq!(
+            outcome.status,
+            bamboo_subagent::proto::TerminalStatus::Completed,
+            "{:?}",
+            outcome
+        );
+        assert_eq!(
+            provider.0.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "legacy Task evaluator must not run"
+        );
+        let plan = &service.published().unwrap().1.assignments[&assignment].plan;
+        assert_eq!(plan.plan_revision, 1, "Worker events: {observed:?}");
+        assert_eq!(plan.steps[0].id, "owned-step");
+        let root_after = store.load_session("parent").await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(root_after.task_list).unwrap(),
+            root_plan
+        );
+        assert_eq!(
+            serde_json::to_value(root_after.messages).unwrap(),
+            serde_json::to_value(root.messages).unwrap()
+        );
+        assert_eq!(
+            store
+                .load_session("ticket-fixture-child")
+                .await
+                .unwrap()
+                .unwrap()
+                .task_list
+                .as_ref()
+                .unwrap()
+                .items[0]
+                .id,
+            "owned-step"
+        );
+        pump.await.unwrap();
+    }
 
     #[async_trait]
     impl bamboo_agent_core::tools::ToolExecutor for QuestionTool {
@@ -3662,8 +3957,8 @@ mod tests {
         (temp, executor, store, provider, run)
     }
 
-    async fn assert_strict_local_history_read(with_reasoning: bool) {
-        use bamboo_subagent::proto::{ActorEventBatcher, ChildFrame, LocalToolMessages};
+    async fn assert_strict_local_history_read(with_reasoning: bool, over_broker: bool) {
+        use bamboo_subagent::proto::{ChildFrame, LocalToolMessages, ParentFrame};
         let (temp, executor, _store, provider, run) =
             strict_local_history_read_fixture(with_reasoning).await;
         let id = run.logical_session.as_ref().unwrap().session_id.clone();
@@ -3673,26 +3968,99 @@ mod tests {
             .cloned()
             .map(|message| serde_json::from_value(message).unwrap())
             .collect();
-        let (sink, mut receiver) = EventSink::channel();
-        let capture = tokio::spawn(async move {
-            let mut events = Vec::new();
-            while let Some(event) = receiver.recv().await {
-                events.push(event);
-            }
-            events
-        });
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            executor.run(
-                run.clone(),
-                sink,
-                SteerInbox::disconnected(),
-                CancellationToken::new(),
-            ),
-        )
-        .await
-        .expect("strict local Read round trip must finish");
-        let events = capture.await.unwrap();
+        assert!(executor.requires_contiguous_events());
+        let shutdown = CancellationToken::new();
+        let mut broker_task = None;
+        let (mut client, worker): (Box<dyn bamboo_subagent::ChildLink>, _) = if over_broker {
+            let broker = Arc::new(bamboo_broker::BrokerServer::new(
+                Arc::new(bamboo_broker::BrokerCore::new(temp.path().join("broker"))),
+                "history-fixture",
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            broker_task = Some(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                async move {
+                    broker.serve(listener).await.unwrap();
+                },
+            )));
+            let worker_endpoint = endpoint.clone();
+            let stop = shutdown.clone();
+            let worker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                bamboo_broker::serve::serve_executor_with_shutdown(
+                    &worker_endpoint,
+                    bamboo_subagent::AgentRef {
+                        session_id: "history-worker".into(),
+                        role: None,
+                    },
+                    "history-fixture",
+                    Arc::new(executor),
+                    stop,
+                )
+                .await
+                .unwrap();
+            }));
+            let link = bamboo_broker::BrokerChildLink::connect(
+                &endpoint,
+                bamboo_subagent::AgentRef {
+                    session_id: "history-host".into(),
+                    role: None,
+                },
+                "history-fixture",
+                "history-worker",
+            )
+            .await
+            .unwrap();
+            (Box::new(link), worker)
+        } else {
+            let server = bamboo_subagent::transport::WsServer::bind_loopback()
+                .await
+                .unwrap();
+            let endpoint = server.ws_endpoint();
+            let worker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                // The trait-object client is dropped after the validated
+                // terminal, so its socket may close without a WS handshake.
+                let _ = server.serve_one(Arc::new(executor)).await;
+            }));
+            let link = bamboo_subagent::transport::ChildClient::connect(&endpoint)
+                .await
+                .unwrap();
+            (Box::new(link), worker)
+        };
+        client.send(ParentFrame::Run(run.clone())).await.unwrap();
+        let (events, status, error, report) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let mut events = Vec::new();
+                let mut next = 1;
+                loop {
+                    match client.next_frame().await.unwrap().expect("worker terminal") {
+                        ChildFrame::EventBatch { batch } => {
+                            batch.validate().unwrap();
+                            assert_eq!(batch.qos, bamboo_subagent::ActorEventQos::Durable);
+                            assert_eq!(batch.first_seq, next);
+                            next = batch.last_seq + 1;
+                            events.extend(batch.events);
+                        }
+                        ChildFrame::Terminal {
+                            status,
+                            error,
+                            result,
+                            ..
+                        } => {
+                            break (events, status, error, result);
+                        }
+                        other => panic!("unexpected strict history frame: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("strict local Read transport round trip must finish");
+        drop(client);
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .expect("finished history worker drains")
+            .unwrap();
+        drop(broker_task);
         let cold_store = SessionStoreV2::new(temp.path().join("worker"))
             .await
             .unwrap();
@@ -3796,35 +4164,13 @@ mod tests {
         assert_eq!(observed.result, result.content);
         assert!(observed.success);
 
-        let mut batcher = ActorEventBatcher::for_run(&run, None, Some("fixture-worker".into()));
-        let mut batches = Vec::new();
-        for event in &events {
-            batches.extend(batcher.push(event.clone()));
-        }
-        batches.extend(batcher.flush());
-        let mut next = 1;
-        let mut decoded = Vec::new();
-        for batch in batches {
-            batch.validate().unwrap();
-            assert_eq!(batch.first_seq, next);
-            next = batch.last_seq + 1;
-            let wire = ChildFrame::EventBatch { batch }.to_text();
-            let ChildFrame::EventBatch { batch } = ChildFrame::from_text(&wire).unwrap() else {
-                unreachable!()
-            };
-            decoded.extend(batch.events);
-        }
-        assert_eq!(
-            decoded, events,
-            "the real wire encoder must retain every event"
-        );
         let completions: Vec<_> = events
             .iter()
             .filter(|event| event["type"] == LocalToolMessages::TYPE)
             .collect();
-        assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
-        assert!(outcome.error.is_none());
-        assert_eq!(outcome.result.as_deref(), Some(LOCAL_HISTORY_REPORT));
+        assert_eq!(status, bamboo_subagent::TerminalStatus::Completed);
+        assert!(error.is_none());
+        assert_eq!(report.as_deref(), Some(LOCAL_HISTORY_REPORT));
         assert_eq!(completions.len(), 1);
         let completion: LocalToolMessages = serde_json::from_value(completions[0].clone()).unwrap();
         let messages = completion.validate().unwrap();
@@ -3837,12 +4183,16 @@ mod tests {
 
     #[tokio::test]
     async fn strict_local_history_plain_read_preserves_complete_worker_messages_and_events() {
-        assert_strict_local_history_read(false).await;
+        for over_broker in [false, true] {
+            assert_strict_local_history_read(false, over_broker).await;
+        }
     }
 
     #[tokio::test]
     async fn strict_local_history_reasoning_read_preserves_complete_worker_history_on_completion() {
-        assert_strict_local_history_read(true).await;
+        for over_broker in [false, true] {
+            assert_strict_local_history_read(true, over_broker).await;
+        }
     }
 
     #[tokio::test]

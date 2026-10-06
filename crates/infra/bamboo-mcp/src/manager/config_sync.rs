@@ -82,7 +82,7 @@ impl McpServerManager {
                         effective_server_config(&runtime.config) != effective_server_config(desired)
                             || matches!(
                                 runtime.config.transport,
-                                TransportConfig::Sse(_) | TransportConfig::StreamableHttp(_)
+                                TransportConfig::StreamableHttp(_)
                             ) && runtime.proxy_fingerprint != desired_proxy_fingerprint
                     })
                     .unwrap_or(true);

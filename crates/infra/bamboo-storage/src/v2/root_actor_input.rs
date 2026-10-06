@@ -152,10 +152,11 @@ impl SessionStoreV2 {
     pub(super) async fn save_root_actor_input_impl(
         &self,
         owner: &RootActorRuntimeWrite,
-        session: &Session,
+        session: &mut Session,
         inbox: Arc<dyn SessionInboxPort>,
         claim: &SessionInboxOwnedClaim,
         publish: RootActorRuntimePublisher,
+        inherited: Option<&bamboo_domain::InheritedChildWait>,
     ) -> io::Result<()> {
         let total_started = Instant::now();
         let inbox = self.bound_root_inbox(owner, &inbox)?;
@@ -185,9 +186,24 @@ impl SessionStoreV2 {
         let mutable = Arc::get_mut(&mut guards).expect("new Root writer has no borrowers");
         mutable.input = Some(input);
         mutable._input_filesystem = Some(filesystem.clone());
-        self.save_session_after_lock(session, total_started, &guards, None)
-            .await?;
+        let reconciled = match inherited {
+            Some(inherited) => Some(
+                self.reconcile_inherited_runtime_snapshot(session, inherited, false)
+                    .await?,
+            ),
+            None => None,
+        };
+        self.save_session_after_lock(
+            reconciled.as_ref().unwrap_or(session),
+            total_started,
+            &guards,
+            None,
+        )
+        .await?;
         self.publish_root_actor_runtime(&guards, publish).await?;
+        if let Some(reconciled) = reconciled {
+            *session = reconciled;
+        }
         // No provider boundary or new lease driver between Main and ACK.
         inbox
             .ack_owned_with_filesystem(&directory, &session.id, claim, Utc::now(), filesystem)

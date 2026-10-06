@@ -162,3 +162,104 @@ composition:
 
     fs::remove_dir_all(dir).expect("should cleanup temp dir");
 }
+
+#[test]
+fn load_yaml_preserves_explicit_scalar_tags_aliases_and_null_arg_normalization() {
+    let dir = temp_dir();
+    let path = dir.join("typed.yaml");
+    write_workflow(
+        &path,
+        r#"id: typed
+name: !!str 123
+description: Typed YAML inputs
+version: !!str 1.0
+composition:
+  type: sequence
+  steps:
+    - &shared
+      type: call
+      tool: inspect
+      args:
+        literal: !!str yes
+        numeric: 12
+        enabled: true
+    - *shared
+    - type: retry
+      expr:
+        type: call
+        tool: report
+        args: null
+"#,
+    );
+
+    let workflow = WorkflowLoader::with_dir(dir.clone())
+        .load_from_file(&path)
+        .expect("typed mapping and aliases should parse");
+    assert_eq!(workflow.name, "123");
+    assert_eq!(workflow.version, "1.0");
+    let ToolExpr::Sequence { steps, fail_fast } = workflow.composition else {
+        panic!("expected sequence");
+    };
+    assert!(fail_fast);
+    assert_eq!(steps[0], steps[1]);
+    let ToolExpr::Call { args, .. } = &steps[0] else {
+        panic!("expected call");
+    };
+    assert_eq!(
+        args,
+        &serde_json::json!({"literal": "yes", "numeric": 12, "enabled": true})
+    );
+    let ToolExpr::Retry {
+        expr,
+        max_attempts,
+        delay_ms,
+    } = &steps[2]
+    else {
+        panic!("expected retry");
+    };
+    assert_eq!(*max_attempts, 3);
+    assert_eq!(*delay_ms, 1000);
+    assert_eq!(**expr, ToolExpr::call("report", serde_json::json!({})));
+    fs::remove_dir_all(dir).expect("should cleanup temp dir");
+}
+
+#[test]
+fn malformed_yaml_keeps_public_parse_source_path_and_location() {
+    let dir = temp_dir();
+    let path = dir.join("malformed.yaml");
+    write_workflow(&path, "id: broken\ncomposition: [\n");
+    let error = WorkflowLoader::with_dir(dir.clone())
+        .load_from_file(&path)
+        .expect_err("malformed YAML should fail");
+    let display = error.to_string();
+    assert!(display.contains(&path.display().to_string()));
+    assert!(std::error::Error::source(&error).is_some());
+    let WorkflowLoadError::Parse {
+        path: error_path,
+        source,
+    } = error
+    else {
+        panic!("expected public parse error");
+    };
+    assert_eq!(error_path, path);
+    let location = source
+        .location()
+        .expect("syntax errors retain source location");
+    assert!(location.line() >= 2);
+    assert!(location.column() >= 1);
+    fs::remove_dir_all(dir).expect("should cleanup temp dir");
+}
+
+#[test]
+fn scalar_yaml_keeps_public_parse_error() {
+    let dir = temp_dir();
+    let path = dir.join("scalar.yaml");
+    write_workflow(&path, "single scalar\n");
+    let error = WorkflowLoader::with_dir(dir.clone())
+        .load_from_file(&path)
+        .expect_err("workflow must be a mapping");
+    assert!(
+        matches!(error, WorkflowLoadError::Parse { path: error_path, .. } if error_path == path)
+    );
+    fs::remove_dir_all(dir).expect("should cleanup temp dir");
+}

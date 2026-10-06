@@ -153,9 +153,46 @@ async fn ensure_provision_capabilities(
 pub struct SpawnedChild {
     pub record: AgentRecord,
     process: Option<Child>,
+    owned_pid: Option<u32>,
+}
+
+/// A Host-owned process handle was reaped. Never decoded from Worker messages.
+#[derive(Debug)]
+pub struct ConfirmedLocalStop {
+    pid: u32,
+}
+
+impl ConfirmedLocalStop {
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
 }
 
 impl SpawnedChild {
+    /// Confirm termination through the owned OS Child handle. A registry
+    /// record, lease, disconnected stream or remote handle is insufficient.
+    pub async fn kill_confirmed(mut self) -> std::io::Result<ConfirmedLocalStop> {
+        let mut process = self
+            .process
+            .take()
+            .ok_or_else(|| std::io::Error::other("no owned local process to confirm"))?;
+        let pid = process
+            .id()
+            .or(self.owned_pid)
+            .ok_or_else(|| std::io::Error::other("owned process identity unavailable"))?;
+        if process.try_wait()?.is_none() {
+            process.start_kill()?;
+            tokio::time::timeout(Duration::from_secs(5), process.wait())
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "owned process stop not confirmed",
+                    )
+                })??;
+        }
+        Ok(ConfirmedLocalStop { pid })
+    }
     /// Build a record-only handle for a worker this process does not own (a
     /// remote resident worker connected to, not spawned). `kill()`/`pid()` are
     /// inert.
@@ -163,6 +200,7 @@ impl SpawnedChild {
         Self {
             record,
             process: None,
+            owned_pid: None,
         }
     }
 
@@ -234,6 +272,7 @@ pub async fn spawn_worker(
         if let Ok(Some(record)) = fab.resolve(&child_id).await {
             return Ok(SpawnedChild {
                 record,
+                owned_pid: process.id(),
                 process: Some(process),
             });
         }
@@ -303,6 +342,7 @@ pub async fn spawn_worker_on_bus(
     };
     Ok(SpawnedChild {
         record,
+        owned_pid: process.id(),
         process: Some(process),
     })
 }
@@ -311,6 +351,38 @@ pub async fn spawn_worker_on_bus(
 mod tests {
     use super::*;
     use crate::provision::{ChildIdentity, ExecutorSpec};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirmed_stop_uses_owned_handle_even_after_liveness_reaped_it() {
+        let mut process = Command::new("/usr/bin/true").spawn().unwrap();
+        let owned_pid = process.id();
+        process.wait().await.unwrap();
+        assert!(process.id().is_none());
+        let record = AgentRecord {
+            agent_id: "stop-fixture".into(),
+            role: "worker".into(),
+            labels: Vec::new(),
+            endpoint: String::new(),
+            pid: 1,
+            version: String::new(),
+            started_at: chrono::Utc::now(),
+            lease_expires_at: chrono::Utc::now(),
+        };
+        assert!(SpawnedChild::remote(record.clone())
+            .kill_confirmed()
+            .await
+            .is_err());
+        let child = SpawnedChild {
+            record,
+            process: Some(process),
+            owned_pid,
+        };
+        assert_eq!(
+            child.kill_confirmed().await.unwrap().pid(),
+            owned_pid.unwrap()
+        );
+    }
 
     #[test]
     fn typed_read_only_worker_requires_explicit_capability_acknowledgement() {

@@ -22,10 +22,14 @@ pub mod sdk;
 pub mod session_activation;
 pub mod session_app;
 pub mod session_cache;
+pub mod ticket_runtime;
+pub mod ticket_worker_plan;
 pub use session_cache::SessionSnapshot;
 pub mod session_messaging;
 pub mod session_repository;
 pub use session_repository::SessionRepository;
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
 pub mod title_gen;
 pub mod token_usage_log;
 pub mod workflow_run;
@@ -126,3 +130,6 @@ pub mod task_evaluation {
 pub mod agent {
     pub use crate::runtime::agent::*;
 }
+
+#[cfg(test)]
+mod inherited_wait_regression_tests;

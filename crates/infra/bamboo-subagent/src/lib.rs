@@ -38,8 +38,8 @@ pub use mailbox::{
     ReplyBody, ADMITTED_SET_CAPACITY,
 };
 pub use proto::{
-    ActorEventBatch, ActorEventBatcher, ActorEventQos, AgentRecord, ChildFrame,
-    LogicalSessionIdentity, ParentFrame, RunSpec, SessionMessageAdmissionConfirmation,
+    ActorEventBatch, ActorEventBatcher, ActorEventQos, ActorEventWatermark, AgentRecord,
+    ChildFrame, LogicalSessionIdentity, ParentFrame, RunSpec, SessionMessageAdmissionConfirmation,
     SessionMessageDelivery, TerminalStatus, MAX_ACTOR_EVENT_BATCH_EVENTS,
 };
 pub use provision::{

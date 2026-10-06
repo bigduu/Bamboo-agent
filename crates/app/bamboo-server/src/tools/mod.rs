@@ -22,6 +22,8 @@ pub mod browser_eval;
 pub mod child_session_adapter;
 pub mod model_catalog;
 pub mod notify_dispatcher;
+pub mod ticket_dispatch_adapter;
+pub mod ticket_tools;
 
 // Integration tests that wire `SubAgentTool` to a real `ChildSessionAdapter`
 // (the tool itself + its pure unit tests live in `bamboo-server-tools`).

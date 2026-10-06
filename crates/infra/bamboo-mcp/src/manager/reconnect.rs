@@ -171,15 +171,7 @@ impl McpServerManager {
         Option<String>,
         Option<tokio::sync::mpsc::Receiver<JsonRpcNotification>>,
     )> {
-        let transport = self.build_transport(&config.transport).await?;
-        let mut client = McpProtocolClient::new(transport);
-        client.connect().await.map_err(|error| {
-            error!(
-                "Failed to connect MCP server '{}' during {}: {}",
-                server_id, phase, error
-            );
-            error
-        })?;
+        let client = self.build_client(&config.transport).await?;
         let init_result = client
             .initialize(config.request_timeout_ms)
             .await
@@ -199,46 +191,22 @@ impl McpServerManager {
         Ok((client, tools, instructions, notification_rx))
     }
 
-    async fn build_transport(&self, config: &TransportConfig) -> Result<Box<dyn McpTransport>> {
-        match config {
-            TransportConfig::Stdio(stdio_config) => {
-                Ok(Box::new(StdioTransport::new(stdio_config.clone())))
-            }
-            TransportConfig::Sse(sse_config) => {
-                if let Some(config_handle) = self.config.as_ref() {
-                    let config = config_handle.read().await.clone();
-                    let client =
-                        bamboo_llm::http_client::build_http_client(&config).map_err(|error| {
+    async fn build_client(&self, transport: &TransportConfig) -> Result<McpProtocolClient> {
+        let http_client = if matches!(transport, TransportConfig::StreamableHttp(_)) {
+            match self.config.as_ref() {
+                Some(config) => Some(
+                    bamboo_llm::http_client::build_http_client(&config.read().await.clone())
+                        .map_err(|error| {
                             McpError::InvalidConfig(format!(
-                                "Failed to build HTTP client for MCP SSE transport: {error}"
+                                "Failed to build MCP HTTP client: {error}"
                             ))
-                        })?;
-                    Ok(Box::new(SseTransport::new_with_client(
-                        sse_config.clone(),
-                        client,
-                    )))
-                } else {
-                    Ok(Box::new(SseTransport::new(sse_config.clone())))
-                }
+                        })?,
+                ),
+                None => None,
             }
-            TransportConfig::StreamableHttp(http_config) => {
-                if let Some(config_handle) = self.config.as_ref() {
-                    let config = config_handle.read().await.clone();
-                    let client = bamboo_llm::http_client::build_http_client(&config).map_err(
-                        |error| {
-                            McpError::InvalidConfig(format!(
-                                "Failed to build HTTP client for MCP StreamableHTTP transport: {error}"
-                            ))
-                        },
-                    )?;
-                    Ok(Box::new(StreamableHttpTransport::new_with_client(
-                        http_config.clone(),
-                        client,
-                    )))
-                } else {
-                    Ok(Box::new(StreamableHttpTransport::new(http_config.clone())))
-                }
-            }
-        }
+        } else {
+            None
+        };
+        crate::transports::build_client(transport, http_client)
     }
 }

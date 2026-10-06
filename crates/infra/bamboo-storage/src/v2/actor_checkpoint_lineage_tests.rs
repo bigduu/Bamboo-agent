@@ -360,7 +360,25 @@ async fn checkpoint_lineage_real_before_replace_detects_legal_parent_write_and_a
             assert_eq!(files(&f.target()), before);
             assert_eq!(ancestor_files(&f), after_deliberate_parent_change);
             no_temps(&f.target());
-            if matches!(port, Port::InputNew) && change == 0 {
+            if matches!(port, Port::Transcript) && change == 0 {
+                assert_eq!(
+                    rejected.unwrap_err(),
+                    ActorTranscriptAppendError::PrefixConflict.to_string()
+                );
+                let committed = f
+                    .store
+                    .append_actor_transcript(f.transcript())
+                    .await
+                    .unwrap();
+                assert_eq!(committed.messages.len(), f.current.messages.len() + 1);
+                assert_eq!(committed.messages.last().unwrap().content, "new output");
+                assert_eq!(ancestor_files(&f), after_deliberate_parent_change);
+                assert!(f
+                    .target()
+                    .join("inbox/cur")
+                    .join(&f.claim.claim.claim_id)
+                    .exists());
+            } else if matches!(port, Port::InputNew) && change == 0 {
                 assert_eq!(
                     rejected.unwrap_err(),
                     ActorInputCheckpointError::PrefixConflict.to_string()
@@ -393,6 +411,40 @@ async fn checkpoint_lineage_real_before_replace_detects_legal_parent_write_and_a
         }
     }
 }
+#[tokio::test]
+async fn checkpoint_lineage_already_same_request_survives_legal_parent_save_without_ack_or_append()
+{
+    let home = tempfile::tempdir().unwrap();
+    let f = fixture(home.path(), Port::InputAlready).await;
+    let request = f.input(&f.current);
+    let before = files(&f.target());
+    let mut middle = f.other.load_session("middle").await.unwrap().unwrap();
+    middle.title = "settled ordinary parent turn".into();
+    middle.metadata_version += 1;
+    f.other.save_session(&middle).await.unwrap();
+    let committed = f.inbox.checkpoint_actor_input(request).await.unwrap();
+    assert_eq!(
+        committed.status,
+        ActorInputCheckpointStatus::AlreadyCheckpointed
+    );
+    assert_eq!(
+        serde_json::to_value(&committed.session.messages).unwrap(),
+        serde_json::to_value(&f.current.messages).unwrap()
+    );
+    assert_eq!(files(&f.target()), before);
+    assert!(!f
+        .inbox
+        .was_admitted(ID, &f.claim.claim.envelope.id)
+        .await
+        .unwrap());
+    assert!(f
+        .target()
+        .join("inbox/cur")
+        .join(&f.claim.claim.claim_id)
+        .exists());
+    no_temps(&f.target());
+}
+
 #[tokio::test]
 async fn checkpoint_lineage_input_unconfirmed_reload_already_rejects_deleted_parent_without_ack() {
     let home = tempfile::tempdir().unwrap();

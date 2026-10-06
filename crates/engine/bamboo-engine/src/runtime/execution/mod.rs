@@ -28,7 +28,7 @@ pub use agent_spawn::{
     SessionCompletionHook, SessionExecutionArgs, SessionExecutionOutcome,
     SessionExecutionReservation, SessionExecutionReserveOutcome,
 };
-pub use child_completion::{ChildCompletion, ChildCompletionHandler};
+pub use child_completion::{ChildCompletion, ChildCompletionHandler, ChildCompletionSource};
 pub use event_forwarder::{
     create_event_forwarder, create_event_forwarder_with_history_commit_barrier,
     create_event_forwarder_with_root_actor, history_commit_barrier, AccountFeedInbox,

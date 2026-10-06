@@ -68,3 +68,22 @@ path and then stop/reopen its Store for actual SubAgent tool inspection. Only th
 remote model is faked. The host test thread's explicit stack size is fixture-only;
 production native host and worker retain default stack settings. Source fixtures
 and static assertions are not test execution receipts.
+
+## Automatic sealed completion
+
+Ordinary one-shot required-packet children also use the typed contract on parent
+resume when the existing committed terminal seal matches the current Child,
+assignment, parent sources and completion. A strict v1 report separates model
+claims from `host_observation.kind=committed_terminal_source`. Prose, malformed or
+oversized JSON, multipart/nonplain output and no usable current final report
+instead produce the same small unavailable envelope and SubAgent Inspect guidance.
+Raw report/error payloads are not copied into this unavailable delivery.
+
+Callback, terminal-sibling recovery and cold watchdog delivery share this route.
+The complete Inbox envelope, presentation Message and actual provider Message
+must each fit 8192 escaped JSON bytes, including correlation and metadata. A
+wrapper overflow shrinks to unavailable; if its identity still cannot fit,
+admission stops and the wait remains armed. Stale/invalid seals likewise leave
+the wait armed, rather than adopting newer output. Unbound legacy children,
+Guardian verdicts and resident children retain their existing behavior. No
+reported reference is verified and no new result store or authority is added.

@@ -12,7 +12,6 @@ use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use fs2::FileExt;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -229,7 +228,7 @@ impl AtomicFileStore {
                 tracing::warn!("failed to harden a sensitive configuration lock ACL");
             }
         }
-        file.lock_exclusive()?;
+        file.lock()?;
         Ok(FileLock(file))
     }
 
@@ -384,7 +383,7 @@ struct FileLock(File);
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
+        let _ = self.0.unlock();
     }
 }
 
@@ -2134,11 +2133,88 @@ fn sync_parent(parent: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::TryLockError;
     use tempfile::TempDir;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct Example {
         value: String,
+    }
+
+    #[test]
+    fn atomic_store_lock_excludes_independent_handles_until_guard_drop() {
+        let dir = TempDir::new().unwrap();
+        let store = AtomicFileStore::new(dir.path().join("example.json"));
+        let held = store.lock().unwrap();
+        let competitor = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(sibling_suffix(store.path(), "lock"))
+            .unwrap();
+
+        assert!(matches!(
+            competitor.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        drop(held);
+        competitor.try_lock().unwrap();
+        competitor.unlock().unwrap();
+    }
+
+    #[test]
+    fn atomic_store_lock_excludes_other_processes_until_guard_drop() {
+        let dir = TempDir::new().unwrap();
+        let store = AtomicFileStore::new(dir.path().join("example.json"));
+        let held = store.lock().unwrap();
+        let lock_path = sibling_suffix(store.path(), "lock");
+        let probe = |expected| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "config_store::tests::file_lock_process_probe",
+                    "--nocapture",
+                ])
+                .env("BAMBOO_CONFIG_LOCK_TEST_PATH", &lock_path)
+                .env("BAMBOO_CONFIG_LOCK_TEST_EXPECTED", expected)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "lock probe failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("file-lock-probe: {expected}")));
+        };
+
+        probe("blocked");
+        drop(held);
+        probe("released");
+        store.write_bytes_without_backup(b"next writer").unwrap();
+        assert_eq!(std::fs::read(store.path()).unwrap(), b"next writer");
+    }
+
+    #[test]
+    fn file_lock_process_probe() {
+        let Some(path) = std::env::var_os("BAMBOO_CONFIG_LOCK_TEST_PATH") else {
+            return;
+        };
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let expected = std::env::var("BAMBOO_CONFIG_LOCK_TEST_EXPECTED").unwrap();
+        match expected.as_str() {
+            "blocked" => assert!(matches!(file.try_lock(), Err(TryLockError::WouldBlock))),
+            "released" => {
+                file.try_lock().unwrap();
+                file.unlock().unwrap();
+            }
+            other => panic!("unknown lock probe expectation: {other}"),
+        }
+        println!("file-lock-probe: {expected}");
     }
 
     #[test]
@@ -2938,6 +3014,13 @@ mod tests {
                 )
                 .unwrap_err();
             assert!(matches!(error, ConfigStoreError::Io(_)), "{fault:?}");
+            let next_writer = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(sibling_suffix(&path, "lock"))
+                .unwrap();
+            next_writer.try_lock().unwrap();
+            next_writer.unlock().unwrap();
             assert!(!path.exists(), "{fault:?}");
             let after = section.snapshot();
             assert_eq!(after.revision, before.revision, "{fault:?}");

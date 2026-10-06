@@ -152,9 +152,41 @@ cargo clippy
 
 Bare Cargo commands use the manifest's `default-members`; `cargo test` is not every workspace member. The dev-only analytics crate is excluded by default. Inspect [Cargo.toml](./Cargo.toml) before using `--workspace`.
 
-- [Architecture](./docs/design/architecture-overview.md) · [Configuration](./docs/config-reference.md)
+- [Architecture](./docs/design/architecture-overview.md) · [Configuration](./docs/config-reference.md) · [Skill bundle input](./docs/design/codex-skill-input.md)
 - [Plugins](./docs/guides/PLUGINS.md) · [Migration](./docs/guides/MIGRATION_GUIDE.md) · [Documentation index](./docs/README.md)
 - [Contributing](./CONTRIBUTING.md) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md)
+
+Ordinary Instruction publications also retain a private source binding. The
+main file and invocation-policy sidecars are captured through the same bounded
+source capability and parsed once. Raw edits, physical file/root replacement,
+and policy presence changes invalidate the publication even when normalized
+metadata is equal. Captured policy bytes must agree with the auxiliary snapshot;
+read errors and links cannot become an absent policy.
+
+Source roots share a bounded handle pool across mode, Project and workspace
+stores. Temporary walks and old publications remain charged while referenced;
+Invalid/LKG entries and failed refreshes cannot grant future progressive API
+access. Public catalog serde, legacy Workflow adapters and deterministic
+orchestration keep their existing interfaces. The source binding itself adds no
+caller permission, activation, or runtime registration.
+
+The portable source fixtures run in the existing manual/promotion Build matrix.
+Windows uses cap4.0.3 opened-handle identity with checked by-handle values; a
+candidate requires real Windows/Linux/macOS fixture results before portable
+acceptance. Ordinary eager instruction/resource storage remains until #1563.
+
+`bamboo_skills::progressive` exports a source-validated Instruction catalog. `bamboo_server_tools::SkillsListTool`
+exports a paged metadata Tool requiring a trusted caller/current-input resolver.
+Known host ceilings distinguish `None`, empty and populated sets; stale UI
+selection cannot grant manual invocation. Pages charge ToolResult and provider
+cache envelopes, advance to metadata EOF, or return an explicit budget error.
+The byte ceiling bounds each page-bearing block; unrelated request history is
+outside this per-page budget.
+`SkillsListTool::render_catalog` uses the same fresh metadata projection and the
+pinned Codex allocator: a 2% context budget, an 8,000-character fallback, or an
+independent configured token cap. Names, locators, root aliases and omission
+notices consume that budget; descriptions share remaining space round-robin.
+These exported APIs have no live registry or body-reader integration yet.
 
 ## License
 
@@ -162,3 +194,13 @@ Project-owned code is licensed under the [MIT License](./LICENSE).
 Third-party materials retain their own licenses and copyright notices:
 
 - `builtin_skills/skill-creator` retains its [Apache-2.0 license](./builtin_skills/skill-creator/LICENSE.txt).
+- Codex-derived tool-search, Skill-input and catalog/list/render code retain its [Apache-2.0 license and source notices](./THIRD_PARTY_NOTICES.md).
+
+The exported Rust `SkillsListTool::selected_source` helper applies the same mandatory
+current-caller/input, host ceiling, config and source validation as list/render.
+It returns complete raw UTF-8 `SKILL.md` or a published auxiliary file (up to8MiB),
+with byte/entry/inflight limits shared by a manager's stores. Owned data remains
+charged through the last real owner and carries no future execution permission.
+`probe_selected_source` rechecks current authority and raw/physical identity with
+bounded charged scratch. These APIs do not register a `skills_read` Tool or provide
+paging/cache/runtime activation. Existing publication storage has separate bounds.

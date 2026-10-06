@@ -258,6 +258,9 @@ impl EventSink {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChildOutcome {
     pub status: TerminalStatus,
+    /// Set by the transport only after successful event drain and final flush.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_event_watermark: Option<crate::proto::ActorEventWatermark>,
     pub result: Option<String>,
     pub error: Option<String>,
     /// Rolling-wire compatibility field. The current actor host never consumes
@@ -273,6 +276,7 @@ impl ChildOutcome {
     pub fn completed(result: impl Into<String>) -> Self {
         Self {
             status: TerminalStatus::Completed,
+            final_event_watermark: None,
             result: Some(result.into()),
             error: None,
             transcript: Vec::new(),
@@ -281,6 +285,7 @@ impl ChildOutcome {
     pub fn error(msg: impl Into<String>) -> Self {
         Self {
             status: TerminalStatus::Error,
+            final_event_watermark: None,
             result: None,
             error: Some(msg.into()),
             transcript: Vec::new(),
@@ -289,6 +294,7 @@ impl ChildOutcome {
     pub fn cancelled() -> Self {
         Self {
             status: TerminalStatus::Cancelled,
+            final_event_watermark: None,
             result: None,
             error: None,
             transcript: Vec::new(),
@@ -299,6 +305,7 @@ impl ChildOutcome {
     pub fn suspended(transcript: Vec<serde_json::Value>) -> Self {
         Self {
             status: TerminalStatus::Suspended,
+            final_event_watermark: None,
             result: None,
             error: None,
             transcript,
@@ -409,6 +416,13 @@ impl SteerInbox {
 /// What runs inside an actor. Implemented by the worker with the real runtime.
 #[async_trait]
 pub trait ChildExecutor: Send + Sync + 'static {
+    /// The Host validates this executor's complete event trace before admitting
+    /// its history. Transport may coalesce events but must not drop batches.
+    /// Ordinary observation-only executors retain their existing lossy lanes.
+    fn requires_contiguous_events(&self) -> bool {
+        false
+    }
+
     /// Advertise only when `run` validates EnvironmentLease before executing
     /// provider or tools. The broker binds this claim to the authenticated
     /// subscriber connection; an older worker defaults to unsupported.

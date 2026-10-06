@@ -7,6 +7,7 @@ use bamboo_storage::{FileSessionInbox, SessionStoreV2};
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::{
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -20,6 +21,47 @@ const ID: &str = "owned-input-restart-once";
 const INPUT: &str = "OWNED_RESTART_INPUT: return one plain answer without tools";
 const REPLY: &str = "OWNED_RESTART_COMPLETED";
 const WAIT: Duration = Duration::from_secs(45);
+
+fn publish_fixture_ready(ready: &Path, bytes: &[u8], before_write: impl FnOnce()) {
+    // The unique ready name is readable only after its complete JSON is staged.
+    let staging = ready.with_extension("json.pending");
+    let mut file = std::fs::File::create(&staging).unwrap();
+    before_write();
+    file.write_all(bytes).unwrap();
+    drop(file);
+    std::fs::rename(staging, ready).unwrap();
+}
+
+#[test]
+fn fixture_ready_is_not_readable_until_complete_json_is_published() {
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("fixture-ready.json");
+    let bytes = serde_json::to_vec(&json!({"base":"http://127.0.0.1:12345/api/v1"})).unwrap();
+    let (created_tx, created_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let writer_ready = ready.clone();
+    let writer_bytes = bytes.clone();
+    let writer = std::thread::spawn(move || {
+        publish_fixture_ready(&writer_ready, &writer_bytes, || {
+            created_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+    });
+    created_rx.recv().unwrap();
+    // Hold the exact create-before-write window, without scheduling sleeps.
+    let unpublished = std::fs::read(&ready);
+    release_tx.send(()).unwrap();
+    writer.join().unwrap();
+    assert!(
+        matches!(unpublished, Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+        "the final ready path must remain absent while the staging file is empty"
+    );
+    let published = std::fs::read(&ready).unwrap();
+    assert_eq!(published, bytes);
+    let value: Value = serde_json::from_slice(&published).unwrap();
+    assert_eq!(value["base"], "http://127.0.0.1:12345/api/v1");
+    assert!(!ready.with_extension("json.pending").exists());
+}
 
 struct Probe {
     home: PathBuf,
@@ -215,7 +257,11 @@ async fn host_fixture_subprocess_entry() {
     .unwrap();
     let base = format!("http://{}/api/v1", server.addrs()[0]);
     let running = server.run();
-    std::fs::write(ready, serde_json::to_vec(&json!({"base":base})).unwrap()).unwrap();
+    publish_fixture_ready(
+        &ready,
+        &serde_json::to_vec(&json!({"base":base})).unwrap(),
+        || {},
+    );
     running.await.unwrap();
 }
 

@@ -104,6 +104,14 @@ struct FourChildProbe {
     ids: Mutex<Vec<String>>,
     release: tokio::sync::watch::Sender<usize>,
 }
+fn four_child_report(round: usize, slot: usize) -> Value {
+    json!({"version":1,"outcome":"completed","summary":format!("MVP_RESULT_{round}_{slot}"),
+        "reported_evidence":[],"reported_verification":[],"proposals":[],"blockers":[],"open_decisions":[]})
+}
+fn four_child_projection(content: &str) -> Option<Value> {
+    let (_, rest) = content.split_once("Child typed result:\n")?;
+    serde_json::from_str(rest.lines().next()?).ok()
+}
 async fn four_child_provider(
     body: web::Json<Value>,
     probe: web::Data<FourChildProbe>,
@@ -143,14 +151,14 @@ async fn four_child_provider(
         .await
         .expect("four actual Workers are released together");
         (
-            json!({"content":format!("MVP_RESULT_{round}_{slot}")}),
+            json!({"content":four_child_report(round, slot).to_string()}),
             "stop",
         )
     } else if body["model"] == "plain-root" && body["tools"].to_string().contains("SubAgent") {
         if probe.emitted.swap(round, Ordering::SeqCst) != round {
             let ids = probe.ids.lock().unwrap();
             let calls: Vec<_> = (0..4).map(|slot| {
-                let mut args = json!({"message":format!("Return only MVP_RESULT_{round}_{slot} for MVP_ASSIGN_{round}_{slot}; use no tools.")});
+                let mut args = json!({"message":format!("For MVP_ASSIGN_{round}_{slot}, return this exact v1 child report; use no tools: {}", four_child_report(round, slot))});
                 if round == 2 { args["target"] = json!(ids[slot]); }
                 json!({"index":slot,"id":format!("mvp-{round}-{slot}"),"type":"function",
                     "function":{"name":"SubAgent","arguments":args.to_string()}})
@@ -159,9 +167,13 @@ async fn four_child_provider(
         } else {
             let complete = (0..4).all(|slot| {
                 body["messages"].as_array().unwrap().iter().any(|message| {
-                    message["content"].as_str().is_some_and(|content| {
-                        content.contains(&format!("MVP_RESULT_{round}_{slot}"))
-                    })
+                    message["content"]
+                        .as_str()
+                        .and_then(four_child_projection)
+                        .is_some_and(|projection| {
+                            projection["available"] == true
+                                && projection["child_report"] == four_child_report(round, slot)
+                        })
                 })
             });
             (
@@ -239,8 +251,17 @@ fn four_child_outcomes(parent: &bamboo_domain::Session) -> Vec<bamboo_domain::Se
             let envelope: bamboo_domain::SessionMessageEnvelope =
                 serde_json::from_value(message.metadata.as_ref()?.get("session_message")?.clone())
                     .ok()?;
-            match envelope.body {
-                bamboo_domain::SessionMessageBody::ChildOutcome(outcome) => Some(outcome),
+            match &envelope.body {
+                bamboo_domain::SessionMessageBody::ChildOutcome(outcome) => {
+                    assert!(serde_json::to_vec(&envelope).unwrap().len() <= 8192);
+                    assert!(
+                        serde_json::to_vec(&envelope.to_provider_message().unwrap())
+                            .unwrap()
+                            .len()
+                            <= 8192
+                    );
+                    Some(outcome.clone())
+                }
                 _ => None,
             }
         })
@@ -261,7 +282,7 @@ async fn actual_four_children_two_rounds_collect_parent_results() {
         .unwrap();
     let agents = projects.paths().project_home(&project.id).join("agents");
     std::fs::create_dir_all(&agents).unwrap();
-    std::fs::write(agents.join("worker.md"), "---\nschema_version: 1\nname: worker\ndescription: One bounded plain reply\nmodel_hint: openai:plain-child\ntools:\n  deny: [Bash, Read, Glob, Edit, Write]\n---\nReturn the assigned marker exactly; use no tools.\n").unwrap();
+    std::fs::write(agents.join("worker.md"), "---\nschema_version: 1\nname: worker\ndescription: One bounded typed report\nmodel_hint: openai:plain-child\ntools:\n  deny: [Bash, Read, Glob, Edit, Write]\n---\nReturn the assigned v1 child report exactly; use no tools.\n").unwrap();
     let (release, _) = tokio::sync::watch::channel(0);
     let probe = web::Data::new(FourChildProbe {
         round: AtomicUsize::new(1),
@@ -584,12 +605,14 @@ async fn actual_four_children_two_rounds_collect_parent_results() {
             let child = store.load_session(id).await.unwrap().unwrap();
             assert_eq!(child.last_run_status().as_deref(), Some("completed"));
             for prior in 1..=round {
-                let marker = format!("MVP_RESULT_{prior}_{slot}");
+                let report = four_child_report(prior, slot);
                 assert_eq!(
                     child
                         .messages
                         .iter()
-                        .filter(|m| m.role == bamboo_domain::Role::Assistant && m.content == marker)
+                        .filter(|m| m.role == bamboo_domain::Role::Assistant
+                            && serde_json::from_str::<Value>(&m.content)
+                                .is_ok_and(|value| value == report))
                         .count(),
                     1
                 );
@@ -597,11 +620,32 @@ async fn actual_four_children_two_rounds_collect_parent_results() {
                     .into_iter()
                     .filter(|outcome| {
                         outcome.child_session_id == *id
-                            && outcome.result.as_deref() == Some(marker.as_str())
+                            && outcome
+                                .provider_message
+                                .as_ref()
+                                .and_then(|message| four_child_projection(&message.content.text))
+                                .is_some_and(|projection| {
+                                    projection["available"] == true
+                                        && projection["child_report"] == report
+                                })
                     })
                     .collect();
                 assert_eq!(matching.len(), 1);
                 assert_eq!(matching[0].status, "completed");
+                assert!(matching[0].result.is_none());
+                assert!(matching[0].error.is_none());
+                let projection = four_child_projection(
+                    &matching[0].provider_message.as_ref().unwrap().content.text,
+                )
+                .unwrap();
+                assert_eq!(
+                    projection["host_observation"]["kind"],
+                    "committed_terminal_source"
+                );
+                assert_eq!(
+                    projection["host_observation"]["terminal_source"]["child_session_id"],
+                    *id
+                );
             }
         }
         tokio::time::timeout(Duration::from_secs(10), async {

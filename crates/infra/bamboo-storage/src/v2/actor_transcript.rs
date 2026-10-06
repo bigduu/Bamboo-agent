@@ -519,10 +519,13 @@ impl SessionStoreV2 {
         Self::default_writer_job(&guards, move || {
             let initial = (|| -> Result<()> {
                 let initial = Source::read(&directory, &id, kind, &root)?;
-                if !source.unchanged(&initial)
-                    || !ancestors.matches_current(&home, &initial.entry.actor)?
-                {
+                if !source.unchanged(&initial) {
                     return Err(ActorTranscriptAppendError::InvalidSource);
+                }
+                if !ancestors.matches_current(&home, &initial.entry.actor)? {
+                    // No publication occurred. A caller may retry the same
+                    // fenced prefix; every identity/lineage check runs again.
+                    return Err(ActorTranscriptAppendError::PrefixConflict);
                 }
                 actor_directory::current_live(&initial.entry, &request.fence, Utc::now())?;
                 Ok(())
@@ -545,10 +548,11 @@ impl SessionStoreV2 {
                 if phase == DurableWritePhase::BeforeReplace {
                     let check = (|| {
                         let current = Source::read(&directory, &id, kind, &root)?;
-                        if !source.unchanged(&current)
-                            || !ancestors.matches_current(&home, &current.entry.actor)?
-                        {
+                        if !source.unchanged(&current) {
                             return Err(ActorTranscriptAppendError::InvalidSource);
+                        }
+                        if !ancestors.matches_current(&home, &current.entry.actor)? {
+                            return Err(ActorTranscriptAppendError::PrefixConflict);
                         }
                         // This fresh host clock is deliberately AFTER the publication barrier.
                         actor_directory::current_live(&current.entry, &request.fence, Utc::now())?;

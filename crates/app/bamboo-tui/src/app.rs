@@ -10673,6 +10673,10 @@ impl App {
         let reasoning_effort = self.chat.reasoning_effort;
         tokio::spawn(async move {
             let req = ChatRequest {
+                message_id: None,
+                thread_id: None,
+                in_reply_to: None,
+                correlation_id: None,
                 message,
                 session_id: existing_session,
                 project_id,

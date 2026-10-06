@@ -15,9 +15,7 @@ use tokio::time::{sleep, Duration, Instant};
 use crate::app_state::{AgentRunner, AgentStatus};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::{AgentEvent, Session, SessionKind};
-use bamboo_domain::session::runtime_state::{
-    AgentRuntimeState, ChildWaitPolicy, WaitingForChildrenState,
-};
+use bamboo_domain::session::runtime_state::{AgentRuntimeState, ChildWaitPolicy};
 use bamboo_domain::{
     ActorSnapshotLimits, ActorSnapshotPort, ActorSnapshotPrincipal,
     SessionInboxAdministrationPrincipal, SessionInboxLimits, SessionInboxPort,
@@ -218,6 +216,15 @@ impl ChildSessionAdapter {
             let Some(generation) = child.recoverable_child_launch_generation() else {
                 continue;
             };
+            // Ticket recovery must query its immutable key and current writer
+            // permission before enqueueing. The generic legacy boot pass cannot
+            // supply that proof or resurrect an old Assignment.
+            if child
+                .metadata
+                .contains_key(bamboo_engine::ticket_runtime::TICKET_DISPATCH_KEY)
+            {
+                continue;
+            }
             let Some(parent_id) = child.parent_session_id.as_deref() else {
                 continue;
             };
@@ -370,7 +377,7 @@ impl ChildSessionAdapter {
 
         // 4. Persist the whole batch in a single parent write.
         if let Err(error) = self
-            .flush_parent_waits(parent_session_id, &batch, ChildWaitPolicy::All)
+            .flush_parent_waits(parent_session_id, &batch, ChildWaitPolicy::All, false)
             .await
         {
             // Re-queue so nothing is silently lost; a retry or sibling picks it up.
@@ -523,9 +530,8 @@ impl ChildSessionAdapter {
             .iter()
             .map(|id| (id.clone(), tool_call_id.map(str::to_string)))
             .collect();
-        self.flush_parent_waits(parent_session_id, &batch, policy)
-            .await?;
-        Ok(batch.len())
+        self.flush_parent_waits(parent_session_id, &batch, policy, true)
+            .await
     }
 
     /// The parent's currently-active (non-terminal) children, derived from the
@@ -573,71 +579,82 @@ impl ChildSessionAdapter {
         parent_session_id: &str,
         batch: &[(String, Option<String>)],
         policy: ChildWaitPolicy,
-    ) -> Result<(), ChildSessionError> {
-        let Some(mut parent) =
-            self.storage
-                .load_session(parent_session_id)
-                .await
-                .map_err(|error| {
-                    ChildSessionError::Execution(format!(
-                        "failed to load parent session {parent_session_id}: {error}"
-                    ))
-                })?
+        check_terminal: bool,
+    ) -> Result<usize, ChildSessionError> {
+        let Some(parent) = self
+            .storage
+            .load_session(parent_session_id)
+            .await
+            .map_err(|error| {
+                ChildSessionError::Execution(format!(
+                    "failed to load parent session {parent_session_id}: {error}"
+                ))
+            })?
         else {
             return Err(ChildSessionError::NotFound(parent_session_id.to_string()));
         };
 
-        // The active/completed child sets are derived from the session index
-        // (single source of truth), so we no longer maintain a denormalized copy
-        // here. Only the durable wait state below is parent-owned.
-        let mut runtime_state = read_runtime_state(&parent);
+        let cache = self.sessions_cache.clone();
+        let history = parent.clone();
+        let (_, count) = self
+            .persistence
+            .register_child_wait_and_publish(
+                &parent,
+                batch,
+                policy,
+                check_terminal,
+                Arc::new(move |saved| {
+                    if let Some(cached) = cache.get(&saved.id) {
+                        cached.update(|current| {
+                            if current.created_at != saved.created_at {
+                                *current = saved.clone();
+                                current.messages = history.messages.clone();
+                                current.provider_transcript = history.provider_transcript.clone();
+                                current
+                                    .runtime_metadata
+                                    .get_or_insert_with(Default::default)
+                                    .session_inbox_admission =
+                                    history.session_inbox_admission().cloned();
+                                return;
+                            }
 
-        let now = Utc::now();
-        let mut wait = runtime_state
-            .waiting_for_children
-            .take()
-            .unwrap_or_else(|| WaitingForChildrenState::for_children(Vec::new(), policy, now));
-        // An explicit wait re-asserts the policy on any pre-existing wait state.
-        wait.wait_for = policy;
-        for (child_session_id, tool_call_id) in batch {
-            if !wait
-                .child_session_ids
-                .iter()
-                .any(|id| id == child_session_id)
-            {
-                wait.child_session_ids.push(child_session_id.clone());
-            }
-            if wait.registered_by_tool_call_id.is_none() {
-                wait.registered_by_tool_call_id = tool_call_id.clone();
-            }
-        }
-        wait.child_session_ids.sort();
-        wait.child_session_ids.dedup();
-        runtime_state.waiting_for_children = Some(wait);
-
-        write_runtime_state(&mut parent, &runtime_state);
-        parent.metadata.insert(
-            "runtime.suspend_reason".to_string(),
-            "waiting_for_children".to_string(),
-        );
-        parent.updated_at = Utc::now();
-
-        // Runtime-only save: registering a parent's wait mutates the
-        // control-plane (runtime_state + suspend metadata) but NEVER the message
-        // history. Writing just the sidecar keeps spawn O(1) in conversation
-        // length instead of rewriting the parent's full session.json per child.
-        self.persistence
-            .save_runtime_only(&mut parent)
+                            let messages = current.messages.clone();
+                            let transcript = current.provider_transcript.clone();
+                            let admission = current
+                                .runtime_metadata
+                                .as_ref()
+                                .and_then(|metadata| metadata.session_inbox_admission.clone());
+                            *current = saved.clone();
+                            current
+                                .runtime_metadata
+                                .get_or_insert_with(Default::default)
+                                .session_inbox_admission = admission;
+                            current.messages = messages;
+                            current.provider_transcript = transcript;
+                        });
+                    } else {
+                        let mut snapshot = saved.clone();
+                        snapshot.messages = history.messages.clone();
+                        snapshot.provider_transcript = history.provider_transcript.clone();
+                        snapshot
+                            .runtime_metadata
+                            .get_or_insert_with(Default::default)
+                            .session_inbox_admission = history
+                            .runtime_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.session_inbox_admission.clone());
+                        cache.insert(
+                            snapshot.id.clone(),
+                            Arc::new(bamboo_engine::SessionSnapshot::new(snapshot)),
+                        );
+                    }
+                }),
+            )
             .await
             .map_err(|error| {
                 ChildSessionError::Execution(format!("failed to save parent wait state: {error}"))
             })?;
-        self.sessions_cache.insert(
-            parent.id.clone(),
-            Arc::new(bamboo_engine::SessionSnapshot::new(parent)),
-        );
-
-        Ok(())
+        Ok(count)
     }
 }
 

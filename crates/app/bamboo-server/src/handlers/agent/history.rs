@@ -80,6 +80,12 @@ pub struct HistoryQuery {
 
 #[derive(Debug, Serialize)]
 struct ProjectedMessage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    in_reply_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correlation_id: Option<String>,
     id: String,
     role: ProjectedRole,
     content: String,
@@ -109,11 +115,25 @@ fn project_message(message: Message) -> Option<ProjectedMessage> {
     }
 
     Some(ProjectedMessage {
+        thread_id: message_reference(&message, "thread_id"),
+        in_reply_to: message_reference(&message, "in_reply_to"),
+        correlation_id: message_reference(&message, "correlation_id"),
         id: message.id,
         role,
         content: message.content,
         created_at: message.created_at,
     })
+}
+
+fn message_reference(message: &Message, field: &str) -> Option<String> {
+    message
+        .metadata
+        .as_ref()?
+        .get("session_message")?
+        .get(field)?
+        .as_str()
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .map(str::to_owned)
 }
 
 /// Retrieve message history for a chat session.

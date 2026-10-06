@@ -153,6 +153,18 @@ fn resolve_catalog_with_activation(
     tool_schemas.extend(config.additional_tool_schemas.clone());
     tool_schemas.sort_by(|left, right| left.function.name.cmp(&right.function.name));
     tool_schemas.dedup_by(|left, right| left.function.name == right.function.name);
+    if config.ticket_worker_plan.is_some() {
+        // Ticket native execution has a Host file capability rather than the
+        // ambient Builtin Read/Write schema. Keep catalog and executor identical.
+        tool_schemas = tools.list_tools();
+        for schema in tool_schemas
+            .iter_mut()
+            .filter(|s| s.function.name == "Task")
+        {
+            schema.function.description = "Update only this Assignment's private Steps. Include question:{prompt} with tasks to durably ask a User question and end this one-shot run. Answers arrive in a fresh Assignment's versioned context; a question never confers approval.".into();
+            schema.function.parameters["properties"]["question"] = serde_json::json!({"type":"object","additionalProperties":false,"required":["prompt"],"properties":{"prompt":{"type":"string","minLength":1,"maxLength":2048}}});
+        }
+    }
     // Resolve the disabled set LIVE each round (#136): when a resolver is wired
     // (server path) a tool disabled/re-enabled mid-run takes effect on the next
     // round, because this list is rebuilt unfiltered every round; with no resolver

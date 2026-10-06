@@ -4,8 +4,7 @@ version.workspace = true
 edition = "2021"
 rust-version.workspace = true
 description = "Agent skill management (definitions, store, selection, access control) for the Bamboo agent framework"
-license = "MIT"
-license-file = "../../../LICENSE"
+license = "MIT AND Apache-2.0"
 
 [dependencies]
 bamboo-domain = { path = "../../core/bamboo-domain" }
@@ -24,8 +23,11 @@ async-trait = "0.1"
 walkdir = "2"
 notify = "8"
 libc = "0.2"
+cap-std = "=4.0.3"
+cap-fs-ext = "=4.0.3"
 
 [target.'cfg(windows)'.dependencies]
+cap-primitives = "=4.0.3"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]

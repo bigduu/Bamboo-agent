@@ -289,6 +289,67 @@ fn task_list_value(session: &Session) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn ticket_task_projection_never_patches_root_or_session_authority() {
+    let mut fixture = crate::ticket_worker_plan::tests::Fixture::new();
+    let plan = Arc::new(fixture.plan());
+    plan.bind_session(&mut fixture.session).unwrap();
+    let (tool_call, result) = task_call_and_result();
+    let persistence = Arc::new(RecordingPersistence::default());
+    let mut config = AgentLoopConfig::default();
+    config.persistence = Some(persistence.clone());
+    config.bind_ticket_worker_plan(plan);
+    let result = super::maybe_apply_ticket_task(&tool_call, &result, &mut fixture.session, &config)
+        .await
+        .unwrap();
+    assert!(result.success, "{}", result.result);
+    let (tx, mut rx) = mpsc::channel(4);
+    let mut context = None;
+    maybe_handle_taskwrite(
+        &tool_call,
+        &result,
+        &mut fixture.session,
+        "fixture-child",
+        &tx,
+        &config,
+        &mut context,
+    )
+    .await;
+    assert_eq!(persistence.task_patches.load(Ordering::SeqCst), 0);
+    assert_eq!(persistence.control_plane_saves.load(Ordering::SeqCst), 0);
+    assert_eq!(persistence.full_saves.load(Ordering::SeqCst), 0);
+    assert!(context.as_ref().unwrap().task_list_dirty);
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AgentEvent::TaskListUpdated {
+            version: Some(1),
+            ..
+        })
+    ));
+    assert_eq!(
+        fixture.service.published().unwrap().1.assignments[&fixture.assignment]
+            .plan
+            .plan_revision,
+        1
+    );
+}
+
+#[tokio::test]
+async fn forged_ticket_marker_fails_closed_without_runtime_capability() {
+    let (call, result) = task_call_and_result();
+    let mut child = Session::new_child("forged", "root", "model", "forged");
+    child.metadata.insert(
+        crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
+        "guessed-assignment".into(),
+    );
+    let rejected =
+        super::maybe_apply_ticket_task(&call, &result, &mut child, &AgentLoopConfig::default())
+            .await
+            .unwrap();
+    assert!(!rejected.success);
+    assert!(child.task_list.is_none());
+}
+
+#[tokio::test]
 async fn root_taskwrite_uses_control_plane_save_and_preserves_event_and_context_behavior() {
     let (tool_call, result) = task_call_and_result();
 

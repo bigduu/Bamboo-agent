@@ -45,6 +45,9 @@ pub use plan::PlanTool;
 pub use project_tools::{ProjectTool, ProjectWorkspaceTool};
 pub use session_control::SessionControlTool;
 pub use session_inspector::SessionInspectorTool;
-pub use skill_runtime::{LoadSkillTool, ReadSkillResourceTool};
+pub use skill_runtime::{
+    LoadSkillTool, ReadSkillResourceTool, SelectedSkillSource, SkillCatalogCaller,
+    SkillCatalogCallerResolver, SkillCatalogInvocation, SkillsListTool,
+};
 pub use sub_agent::{SubAgentTool, DEFAULT_MAX_SPAWN_DEPTH};
 pub use surface::{ToolSurface, ToolSurfaceFactory};

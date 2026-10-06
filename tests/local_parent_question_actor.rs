@@ -3,7 +3,7 @@
 
 use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;
-use bamboo_domain::{ParentQuestion, Role, SessionMessageEnvelope};
+use bamboo_domain::{ActorDirectoryPort, ParentQuestion, Role, SessionMessageEnvelope};
 use bamboo_storage::SessionStoreV2;
 use serde_json::{json, Value};
 use std::{
@@ -62,8 +62,14 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             0 => {
                 probe.first_child_ready.store(true, Ordering::SeqCst);
                 tokio::time::timeout(Duration::from_secs(60), async {
-                    while !probe.release_first_child.load(Ordering::SeqCst) {
-                        probe.wake.notified().await;
+                    loop {
+                        // notify_waiters retains notifications only for futures
+                        // created before the release flag can change.
+                        let notified = probe.wake.notified();
+                        if probe.release_first_child.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        notified.await;
                     }
                 })
                 .await
@@ -87,8 +93,14 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 assert_eq!(answers.len(), 1, "Child sees one canonical answer");
                 probe.second_child_ready.store(true, Ordering::SeqCst);
                 tokio::time::timeout(Duration::from_secs(60), async {
-                    while !probe.release_second_child.load(Ordering::SeqCst) {
-                        probe.wake.notified().await;
+                    loop {
+                        // notify_waiters retains notifications only for futures
+                        // created before the release flag can change.
+                        let notified = probe.wake.notified();
+                        if probe.release_second_child.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        notified.await;
                     }
                 })
                 .await
@@ -124,6 +136,11 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             }
             3 => {
                 assert!(body.to_string().contains("root-answer-child"));
+                eprintln!(
+                    "ParentQuestion reply provider entered: early={} data={}",
+                    probe.complete_child_before_parent_reply,
+                    probe.data.display()
+                );
                 if probe.complete_child_before_parent_reply {
                     // Force the legal completion/final-save ordering which used
                     // to resurrect the Root's inherited, untagged child wait.
@@ -453,9 +470,16 @@ async fn parent_question_round_trip(complete_child_before_parent_reply: bool) {
             log.lines().rev().take(30).collect::<Vec<_>>(),
         );
     }
+    eprintln!(
+        "ParentQuestion Child release: early={} root_calls={} child_calls={} data={}",
+        complete_child_before_parent_reply,
+        probe.root_calls.load(Ordering::SeqCst),
+        probe.child_calls.load(Ordering::SeqCst),
+        data.display()
+    );
     probe.release_second_child.store(true, Ordering::SeqCst);
     probe.wake.notify_waiters();
-    tokio::time::timeout(Duration::from_secs(60), async {
+    let terminal = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let child = store.load_session(&child_id).await.unwrap().unwrap();
             let parent = store.load_session(ROOT_ID).await.unwrap().unwrap();
@@ -508,8 +532,42 @@ async fn parent_question_round_trip(complete_child_before_parent_reply: bool) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .expect("same Child must complete and wake the original Parent wait once");
+    .await;
+    if terminal.is_err() {
+        let diagnostic = tokio::time::timeout(Duration::from_secs(3), async {
+            let child = store.load_session(&child_id).await.unwrap().unwrap();
+            let parent = store.load_session(ROOT_ID).await.unwrap().unwrap();
+            let parent_actor = store.inspect_actor(ROOT_ID).await;
+            let child_actor = store.inspect_actor(&child_id).await;
+            json!({"early":complete_child_before_parent_reply,
+                "early_observed":probe.early_completion_observed.load(Ordering::SeqCst),
+                "root_calls":probe.root_calls.load(Ordering::SeqCst),"child_calls":probe.child_calls.load(Ordering::SeqCst),
+                "parent_status":parent.last_run_status(),"parent_error":parent.last_run_error(),"parent_runtime":parent.agent_runtime_state,
+                "parent_messages":parent.messages.iter().filter(|m|m.role!=Role::System).map(|m|json!({"role":m.role,"content":m.content})).collect::<Vec<_>>(),
+                "child_status":child.last_run_status(),"child_error":child.last_run_error(),"child_runtime":child.agent_runtime_state,
+                "parent_actor":parent_actor.ok().map(|v|json!({"actor":v.actor,"activation":v.activation})),
+                "child_actor":child_actor.ok().map(|v|json!({"actor":v.actor,"activation":v.activation}))})
+        }).await;
+        eprintln!("ParentQuestion terminal diagnostic: {diagnostic:?}");
+        use std::io::{Read, Seek, SeekFrom};
+        if let Ok(mut file) = std::fs::File::open(data.join("host.log")) {
+            if let Ok(length) = file.metadata().map(|m| m.len()) {
+                if file
+                    .seek(SeekFrom::Start(length.saturating_sub(16384)))
+                    .is_ok()
+                {
+                    let mut bytes = Vec::new();
+                    if file.take(16384).read_to_end(&mut bytes).is_ok() {
+                        eprintln!(
+                            "ParentQuestion Host tail: {}",
+                            String::from_utf8_lossy(&bytes)
+                        );
+                    }
+                }
+            }
+        }
+        panic!("same Child must complete and wake the original Parent wait once");
+    }
     drop(host);
     let cold = SessionStoreV2::new(data).await.unwrap();
     let child = cold.load_session(&child_id).await.unwrap().unwrap();

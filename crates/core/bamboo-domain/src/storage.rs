@@ -35,6 +35,25 @@ pub type RootActorRuntimeEventPublisher =
 /// (e.g., JSONL files, databases, cloud storage).
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
+    /// Persist an explicit manual-title mutation. Actor-aware backends must
+    /// compare it with current canonical state under the full writer guards,
+    /// allowing only the title fields and exact version advances. Generic
+    /// Session saves (for example resident frame resets) are a separate lane.
+    /// Backends without Actor observations retain their ordinary save behavior.
+    async fn save_manual_title(&self, session: &Session) -> std::io::Result<()> {
+        self.save_session(session).await
+    }
+
+    /// Validate a manual title before reporting success, including a no-op.
+    /// Backends with Actor metadata observations must reread canonical state
+    /// under their writer guards and reject stale or incomplete observations.
+    /// This must not initialize, refresh or repair any authority. The default
+    /// preserves title behavior for stores without Actor observations.
+    async fn validate_title_observations(&self, expected: &Session) -> std::io::Result<()> {
+        let _ = expected;
+        Ok(())
+    }
+
     /// Bind an Inbox to this exact Root execution before opting into owned
     /// claims. Unsupported/custom queues fail closed, without a legacy claim.
     fn bind_root_actor_inbox(
@@ -119,6 +138,93 @@ pub trait Storage: Send + Sync {
             crate::SessionAuthorityConflict(
                 "atomic inherited child wait finalization is unsupported".into(),
             ),
+        ))
+    }
+
+    /// Reconcile only the execution's exact inherited wait at the final
+    /// physical writer lock, preserving live run status and unrelated fields.
+    /// Root input saves retain the same owner, transcript and ACK protocol.
+    async fn save_runtime_with_inherited_child_wait(
+        &self,
+        session: &mut Session,
+        inherited: &crate::InheritedChildWait,
+        runtime_only: bool,
+        root_writer: Option<(RootActorRuntimeWrite, RootActorRuntimePublisher)>,
+        input: Option<(
+            std::sync::Arc<dyn crate::SessionInboxPort>,
+            crate::SessionInboxOwnedClaim,
+        )>,
+    ) -> std::io::Result<()> {
+        let _ = (session, inherited, runtime_only, root_writer, input);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            crate::SessionAuthorityConflict(
+                "atomic inherited child wait runtime persistence is unsupported".into(),
+            ),
+        ))
+    }
+
+    /// Whether this backend owns atomic child-wait mutations. Legacy backends
+    /// retain LockedSessionStore's process-local serialized compatibility path.
+    fn supports_atomic_child_wait_control_plane(&self) -> bool {
+        false
+    }
+
+    /// Read one waited-for Child through its parent's canonical tree. Durable
+    /// linkage must be checked before loading transcript content.
+    async fn load_child_wait_session(
+        &self,
+        parent: &Session,
+        child_id: &str,
+        full: bool,
+    ) -> std::io::Result<Option<Session>> {
+        let control = self.load_runtime_control_plane(child_id).await?;
+        let owned = control.filter(|child| {
+            child.kind == crate::SessionKind::Child
+                && child.parent_session_id.as_deref() == Some(&parent.id)
+        });
+        if !full || owned.is_none() {
+            return Ok(owned);
+        }
+        Ok(self.load_session(child_id).await?.filter(|child| {
+            child.kind == crate::SessionKind::Child
+                && child.parent_session_id.as_deref() == Some(&parent.id)
+        }))
+    }
+
+    /// Merge a child wait into the latest control plane under the physical
+    /// session writer lock. Terminal filtering uses fresh durable child state,
+    /// not a per-instance index. Explicit waits check terminality; pre-launch
+    /// arms retain prior terminal generations until the new launch is queued.
+    /// Zero means the requested explicit policy is satisfied.
+    async fn register_child_wait_control_plane(
+        &self,
+        expected: &Session,
+        batch: &[(String, Option<String>)],
+        policy: crate::ChildWaitPolicy,
+        check_terminal: bool,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<(Session, usize)> {
+        let _ = (expected, batch, policy, check_terminal, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic child wait registration is unsupported",
+        ))
+    }
+
+    /// Commit a child completion only if the full observed wait and Session
+    /// incarnation still match. A conflict performs no write or publication.
+    async fn compare_exchange_child_wait_control_plane(
+        &self,
+        expected: &Session,
+        updated: &mut Session,
+        runtime_only: bool,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<bool> {
+        let _ = (expected, updated, runtime_only, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic child wait completion is unsupported",
         ))
     }
 

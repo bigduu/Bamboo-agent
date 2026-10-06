@@ -73,6 +73,49 @@ test("routine dev pull requests run locked Rust, formatting, and policy checks",
   )
 })
 
+test("locked Rust test compilation has a separate budget before the complete suite", () => {
+  const testJob = job("test")
+  const [settings, ...steps] = testJob.split(/(?=^      - )/mu)
+  assert.doesNotMatch(settings, /^    (?:if|continue-on-error):/mu)
+  assert.match(settings, /^    timeout-minutes: 45$/mu)
+
+  const requiredSteps = [
+    ["Build locked Rust workspace", "cargo build --locked", undefined],
+    ["Compile locked Rust test targets", "cargo test --locked --no-run", "15"],
+    ["Test locked Rust workspace", "cargo test --locked", "30"],
+  ]
+  let previousIndex = -1
+  for (const [name, command, timeout] of requiredSteps) {
+    const matches = steps.filter((step) => step.startsWith(`      - name: ${name}\n`))
+    assert.equal(matches.length, 1, `${name} must appear exactly once`)
+    const [step] = matches
+    const index = steps.indexOf(step)
+    assert.ok(index > previousIndex, `${name} must follow the preceding Rust step`)
+    previousIndex = index
+
+    assert.doesNotMatch(step, /^        (?:if|continue-on-error):/mu)
+    assert.deepEqual(
+      [...step.matchAll(/^        run: (.*)$/gmu)].map((match) => match[1]),
+      [command],
+      `${name} must retain the exact locked command`,
+    )
+    assert.deepEqual(
+      [...step.matchAll(/^        timeout-minutes: (.*)$/gmu)].map((match) => match[1]),
+      timeout === undefined ? [] : [timeout],
+      `${name} must retain its time budget`,
+    )
+    if (timeout !== undefined) {
+      assert.match(step, /^        env:\n          RUST_MIN_STACK: "8388608"$/mu)
+    }
+    assert.equal(
+      steps.filter((candidate) => candidate.split("\n").includes(`        run: ${command}`))
+        .length,
+      1,
+      `${command} must not run again under another step name`,
+    )
+  }
+})
+
 test("promotion retains required checks without repeating platform coverage", () => {
   assert.match(job("promotion-source"), /name: Promotion Source\n/u)
   assert.match(job("lint"), /name: Lint\n/u)
@@ -96,6 +139,13 @@ test("promotion retains required checks without repeating platform coverage", ()
   assert.match(build, /name: Build \(\$\{\{ matrix\.os \}\}\)\n/u)
   assert.match(build, /os: \[ubuntu-latest, macos-latest, windows-latest\]/u)
   assert.match(build, /run: cargo build --release --verbose\n/u)
+  const sourceStep = build.indexOf("- name: Verify portable Skill source publication")
+  const selectedStep = build.indexOf("- name: Verify portable selected Skill source")
+  const releaseStep = build.indexOf("- name: Build\n")
+  assert.ok(sourceStep >= 0 && selectedStep > sourceStep && releaseStep > selectedStep)
+  assert.match(build, /run: cargo test --locked -p bamboo-skills progressive::read_tests -- --test-threads=1\n/u)
+  assert.equal((workflow.match(/progressive::read_tests/gu) || []).length, 1)
+
   assert.match(
     build,
     /- name: Test frontend artifact and release policies\n        if: runner\.os != 'Linux'\n/u,
