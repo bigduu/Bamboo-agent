@@ -156,6 +156,25 @@ Bare Cargo commands use the manifest's `default-members`; `cargo test` is not ev
 - [Plugins](./docs/guides/PLUGINS.md) · [Migration](./docs/guides/MIGRATION_GUIDE.md) · [Documentation index](./docs/README.md)
 - [Contributing](./CONTRIBUTING.md) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md)
 
+Ordinary Instruction publications also retain a private source binding. The
+main file and invocation-policy sidecars are captured through the same bounded
+source capability and parsed once. Raw edits, physical file/root replacement,
+and policy presence changes invalidate the publication even when normalized
+metadata is equal. Captured policy bytes must agree with the auxiliary snapshot;
+read errors and links cannot become an absent policy.
+
+Source roots share a bounded handle pool across mode, Project and workspace
+stores. Temporary walks and old publications remain charged while referenced;
+Invalid/LKG entries and failed refreshes cannot grant future progressive API
+access. Public catalog serde, legacy Workflow adapters and deterministic
+orchestration keep their existing interfaces. This source binding adds no
+list/read Tool, caller permission, activation, or runtime registration.
+
+The portable source fixtures run in the existing manual/promotion Build matrix.
+Windows uses cap4.0.3 opened-handle identity with checked by-handle values; a
+candidate requires real Windows/Linux/macOS fixture results before portable
+acceptance. Ordinary eager instruction/resource storage remains until #1563.
+
 ## License
 
 Project-owned code is licensed under the [MIT License](./LICENSE).

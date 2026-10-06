@@ -305,6 +305,9 @@ jobs:
           # a live promotion PR and permit manual runs on main to seed its base.
           save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
 
+      - name: Verify portable Skill source publication
+        run: cargo test --locked -p bamboo-skills progressive::source_tests -- --test-threads=1
+
       - name: Build
         run: cargo build --release --verbose
 
