@@ -591,7 +591,7 @@ async fn replacement_fixture(delayed_release: bool) {
     let running = server.run();
     let provider_handle = running.handle();
     actix_web::rt::spawn(running);
-    std::fs::write(data.join("config.json"),serde_json::to_vec(&json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":"fixture","base_url":url,"model":"replacement-root","fast_model":"replacement-auxiliary"}},"defaults":{"chat":{"provider":"openai","model":"replacement-root"},"fast":{"provider":"openai","model":"replacement-auxiliary"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1,"fabric_dir":data.join("subagents")},"stream_timeout":{"transport_idle_timeout_secs":120,"first_semantic_timeout_secs":120,"semantic_idle_timeout_secs":120}})).unwrap()).unwrap();
+    std::fs::write(data.join("config.json"),serde_json::to_vec(&json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":"fixture","base_url":url,"model":"replacement-root","fast_model":"replacement-auxiliary","runtime_models":["replacement-root","replacement-child","replacement-auxiliary"]}},"defaults":{"chat":{"provider":"openai","model":"replacement-root"},"fast":{"provider":"openai","model":"replacement-auxiliary"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1,"fabric_dir":data.join("subagents")},"stream_timeout":{"transport_idle_timeout_secs":120,"first_semantic_timeout_secs":120,"semantic_idle_timeout_secs":120}})).unwrap()).unwrap();
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(150))
