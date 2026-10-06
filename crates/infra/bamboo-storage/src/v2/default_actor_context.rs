@@ -6,6 +6,7 @@ use bamboo_domain::{ActorDirectoryEntry, ActorLogicalState, SessionAuthorityConf
 
 // Field order releases Session, Task, lifecycle, reversing acquisition order.
 pub(super) struct DefaultWriterGuards {
+    pub(super) root_mode_context: Option<super::root_context::RootModeContextWrite>,
     pub(super) root_actor: Option<super::root_actor_runtime::RootActorWriteProof>,
     pub(super) root_origin: Option<super::root_actor_runtime::RootActorWriteProof>,
     pub(super) input: Option<super::root_actor_input::RootActorInputProof>,
@@ -53,6 +54,7 @@ impl DefaultWriterGuards {
         root_actor: Option<super::root_actor_runtime::RootActorWriteProof>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            root_mode_context: None,
             root_actor,
             root_origin: None,
             input: None,
@@ -73,6 +75,7 @@ impl DefaultWriterGuards {
         session: SessionWriteGuard,
     ) -> Arc<Self> {
         Arc::new(Self {
+            root_mode_context: None,
             root_actor: None,
             root_origin: None,
             input: None,
@@ -364,6 +367,7 @@ impl SessionStoreV2 {
         guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<()> {
         let path = path.to_path_buf();
+        let root_mode_context = guards.root_mode_context.clone();
         let root_actor = guards.root_actor.clone();
         let root_origin = guards.root_origin.clone();
         let input = guards.input.clone();
@@ -376,6 +380,9 @@ impl SessionStoreV2 {
                     hook.visit(&path, phase)?;
                 }
                 if matches!(phase, DurableWritePhase::BeforeReplace) {
+                    if let Some(proof) = &root_mode_context {
+                        proof.validate_actor_witnesses()?;
+                    }
                     if let Some(proof) = &root_actor {
                         proof.validate()?;
                     }

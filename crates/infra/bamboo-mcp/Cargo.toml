@@ -5,7 +5,6 @@ edition = "2021"
 rust-version.workspace = true
 description = "Model Context Protocol (MCP) client — protocol, transports, executor, manager — for the Bamboo agent framework"
 license = "MIT"
-license-file = "../../../LICENSE"
 
 [dependencies]
 bamboo-agent-core = { path = "../../core/bamboo-agent-core" }

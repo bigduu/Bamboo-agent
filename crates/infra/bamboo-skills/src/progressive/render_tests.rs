@@ -5,6 +5,43 @@
 use super::*;
 use std::num::NonZeroUsize;
 
+// Bamboo-authored byte-boundary fixtures for the pinned narrow UTF-8 helper.
+#[test]
+fn explicit_skill_utf8_limits_are_bytes_and_preserve_complete_characters() {
+    for (input, limit, expected, cut) in [
+        ("", 0, "", false),
+        ("abc", 0, "", true),
+        ("abc", 3, "abc", false),
+        ("é中🙂z", 1, "", true),
+        ("é中🙂z", 2, "é", true),
+        ("é中🙂z", 4, "é", true),
+        ("é中🙂z", 5, "é中", true),
+        ("é中🙂z", 8, "é中", true),
+        ("é中🙂z", 9, "é中🙂", true),
+        ("é中🙂z", 10, "é中🙂z", false),
+        ("é中🙂z", usize::MAX, "é中🙂z", false),
+    ] {
+        assert_eq!(truncate_skill_utf8_bytes(input, limit), (expected, cut));
+    }
+    let exact = "🙂".repeat(2_000);
+    assert_eq!(
+        truncate_skill_utf8_bytes(&exact, EXPLICIT_SKILL_PROMPT_BYTES),
+        (exact.as_str(), false)
+    );
+    let longer = format!("{exact}é");
+    assert_eq!(
+        truncate_skill_utf8_bytes(&longer, EXPLICIT_SKILL_PROMPT_BYTES),
+        (exact.as_str(), true)
+    );
+    let crossing = format!("{}中", "a".repeat(7_999));
+    assert_eq!(
+        truncate_skill_utf8_bytes(&crossing, EXPLICIT_SKILL_PROMPT_BYTES)
+            .0
+            .len(),
+        7_999
+    );
+}
+
 fn entry(id: &str, description: &str, short: Option<&str>) -> SkillCatalogMetadata {
     SkillCatalogMetadata {
         package: id.into(),

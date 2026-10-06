@@ -120,6 +120,8 @@ mod root_context_tests;
 mod root_lifetime;
 #[cfg(test)]
 mod root_lifetime_tests;
+#[cfg(test)]
+mod root_mode_actor_context_tests;
 mod supervisor;
 mod supervisor_management;
 pub(crate) use supervisor_management::SupervisorFollowupGuard;
@@ -6366,7 +6368,7 @@ impl Storage for SessionStoreV2 {
         let session_write = self
             .acquire_session_write_lock(&request.session_id, SaveKind::Full)
             .await?;
-        let guards = DefaultWriterGuards::shared(lifecycle, runtime_task, session_write);
+        let mut guards = DefaultWriterGuards::shared(lifecycle, runtime_task, session_write);
         let Some(mut session) = self.load_session_unlocked(&request.session_id).await? else {
             return Ok(RootModeOperationDecision::NotFound);
         };
@@ -6397,6 +6399,7 @@ impl Storage for SessionStoreV2 {
             });
         }
 
+        let original = session.clone();
         let outcome = match request.action {
             RootModeOperationAction::Recover => RootModeOperationOutcome::Fenced,
             RootModeOperationAction::Select => {
@@ -6444,6 +6447,22 @@ impl Storage for SessionStoreV2 {
         session
             .record_root_mode_operation(receipt)
             .map_err(|error| other_io_error(error.to_string()))?;
+        // A pending ledger reset may coalesce across a quick mode round trip,
+        // while the native transcript still invalidates on each selection.
+        if session.authority_identity.is_ordinary()
+            && (session.model_context_state != original.model_context_state
+                || session.provider_transcript != original.provider_transcript)
+        {
+            let directory = self.sessions_dir.join(&session.id);
+            let candidate = session.clone();
+            let proof = Self::default_writer_job(&guards, move || {
+                root_context::RootModeContextWrite::capture(directory, &original, &candidate)
+            })
+            .await?;
+            Arc::get_mut(&mut guards)
+                .expect("Root mode writer owns its acquired guards")
+                .root_mode_context = Some(proof);
+        }
         self.save_session_after_lock(&session, total_started, &guards, None)
             .await?;
         Ok(RootModeOperationDecision::Terminal(

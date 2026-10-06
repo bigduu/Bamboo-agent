@@ -5,7 +5,6 @@ edition = "2021"
 rust-version.workspace = true
 description = "Domain models and shared types for the Bamboo agent framework"
 license = "MIT"
-license-file = "../../../LICENSE"
 
 [dependencies]
 serde = { workspace = true }
