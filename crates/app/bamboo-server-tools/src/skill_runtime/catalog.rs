@@ -10,7 +10,7 @@ use bamboo_skills::{
         render_skill_catalog, skill_metadata_budget, SkillCatalogEligibility, SkillCatalogRender,
         SkillCatalogRenderPolicy, SkillCatalogSnapshot,
     },
-    SkillManager,
+    SkillManager, SkillStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -39,6 +39,22 @@ struct ListResponse {
     skills: Vec<ListedSkill>,
     warnings: Vec<String>,
     next_cursor: Option<String>,
+}
+
+/// Historical owned bytes with current-call identity; never a bearer grant.
+#[derive(Clone)]
+pub struct SelectedSkillSource {
+    pub snapshot: Arc<bamboo_skills::progressive::SelectedSkillSnapshot>,
+    pub identity: String,
+}
+
+struct SelectedCatalogContext {
+    caller: SkillCatalogCaller,
+    snapshot: SkillCatalogSnapshot,
+    identity: String,
+    store: Arc<SkillStore>,
+    access: SkillCatalogEligibility,
+    scope: (Option<String>, Option<String>, bool, u64),
 }
 
 /// Exported metadata Tool; a trusted resolver is mandatory at construction.
@@ -70,18 +86,18 @@ impl SkillsListTool {
     /// Render eligible metadata using the same fresh caller/input projection as
     /// skills_list. This does not install a live Tool or read Skill bodies.
     pub async fn render_catalog(&self, ctx: &ToolCtx) -> Result<SkillCatalogRender, ToolError> {
-        let (caller, snapshot, _) = self.metadata(ctx).await?;
+        let prepared = self.metadata(ctx).await?;
         Ok(render_skill_catalog(
-            &snapshot.entries,
+            &prepared.snapshot.entries,
             SkillCatalogRenderPolicy::ExtensionCompatible,
-            skill_metadata_budget(caller.context_window, caller.metadata_tokens),
+            skill_metadata_budget(
+                prepared.caller.context_window,
+                prepared.caller.metadata_tokens,
+            ),
         ))
     }
 
-    async fn metadata(
-        &self,
-        ctx: &ToolCtx,
-    ) -> Result<(SkillCatalogCaller, SkillCatalogSnapshot, String), ToolError> {
+    async fn metadata(&self, ctx: &ToolCtx) -> Result<SelectedCatalogContext, ToolError> {
         // Await the trusted adapter before any Source publication guard is held.
         let caller = self.resolver.resolve(ctx).await?;
         if ctx.session_id() != Some(caller.session_id.as_str())
@@ -143,27 +159,7 @@ impl SkillsListTool {
             .progressive_catalog_for_mode(caller.mode.as_deref(), &access)
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))?;
-        let current = self
-            .access
-            .session_for_context(ctx.session_id())
-            .await
-            .ok_or_else(|| ToolError::Execution("Skill caller session is unavailable".into()))?;
-        if scope_identity(&session) != scope_identity(&current)
-            || access.disabled
-                != self
-                    .access
-                    .config
-                    .read()
-                    .await
-                    .disabled_skill_ids()
-                    .into_iter()
-                    .collect()
-        {
-            return Err(ToolError::Execution(
-                "Skill host scope changed during metadata projection".into(),
-            ));
-        }
-        let fingerprint = fingerprint(&(
+        let identity = fingerprint(&(
             &snapshot.identity,
             &caller,
             &access,
@@ -171,7 +167,98 @@ impl SkillsListTool {
             session.project_id_meta(),
             session.root_tool_authority_revision,
         ))?;
-        Ok((caller, snapshot, fingerprint))
+        let prepared = SelectedCatalogContext {
+            caller,
+            snapshot,
+            identity,
+            store,
+            access,
+            scope: scope_identity(&session),
+        };
+        self.recheck(ctx, &prepared).await?;
+        Ok(prepared)
+    }
+
+    async fn recheck(
+        &self,
+        ctx: &ToolCtx,
+        prepared: &SelectedCatalogContext,
+    ) -> Result<(), ToolError> {
+        // Resolve first: the adapter may await while official Session/config setters run.
+        let caller = self.resolver.resolve(ctx).await?;
+        // Hold configuration stable before the last Session await. Everything after
+        // that read compares the current caller/scope/input/config synchronously.
+        let config = self.access.config.read().await;
+        let current = self
+            .access
+            .session_for_context(ctx.session_id())
+            .await
+            .ok_or_else(|| ToolError::Execution("Skill caller session is unavailable".into()))?;
+        if prepared.scope != scope_identity(&current)
+            || !current.messages.iter().any(|message| {
+                message.id == caller.input_id && message.role == bamboo_agent_core::Role::User
+            })
+            || fingerprint(&caller)? != fingerprint(&prepared.caller)?
+            || prepared.access.disabled != config.disabled_skill_ids().into_iter().collect()
+        {
+            return Err(ToolError::Execution(
+                "Skill host scope/caller changed during projection".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Unregistered Rust helper: materialize one complete current chosen file.
+    /// Mandatory trusted resolution and the same list/render authorizer apply.
+    pub async fn selected_source(
+        &self,
+        ctx: &ToolCtx,
+        package: &str,
+        resource: &str,
+    ) -> Result<SelectedSkillSource, ToolError> {
+        let prepared = self.metadata(ctx).await?;
+        let snapshot = prepared
+            .store
+            .selected_source_for_mode(
+                prepared.caller.mode.as_deref(),
+                &prepared.access,
+                &prepared.snapshot,
+                package,
+                resource,
+            )
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        self.recheck(ctx, &prepared).await?;
+        let identity = fingerprint(&(&prepared.identity, &snapshot.identity))?;
+        Ok(SelectedSkillSource { snapshot, identity })
+    }
+
+    /// Revalidate historical owned data without materializing another whole file.
+    /// R2 may reuse this probe; no cache/cursor/Tool is installed by this API.
+    pub async fn probe_selected_source(
+        &self,
+        ctx: &ToolCtx,
+        selected: &SelectedSkillSource,
+    ) -> Result<(), ToolError> {
+        let prepared = self.metadata(ctx).await?;
+        let identity = prepared
+            .store
+            .probe_selected_source_for_mode(
+                prepared.caller.mode.as_deref(),
+                &prepared.access,
+                &prepared.snapshot,
+                &selected.snapshot.package,
+                &selected.snapshot.resource,
+            )
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        self.recheck(ctx, &prepared).await?;
+        if fingerprint(&(&prepared.identity, identity))? != selected.identity {
+            return Err(ToolError::Execution(
+                "selected Skill caller/source changed".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -198,9 +285,10 @@ impl Tool for SkillsListTool {
                 "skills_list limit must be 1..20".into(),
             ));
         }
-        let (caller, snapshot, identity) = self.metadata(&ctx).await?;
-        let identity = fingerprint(&(identity, limit))?;
-        let budget = caller.response_bytes.min(MAX_SKILLS_LIST_BYTES);
+        let prepared = self.metadata(&ctx).await?;
+        let snapshot = prepared.snapshot;
+        let identity = fingerprint(&(prepared.identity, limit))?;
+        let budget = prepared.caller.response_bytes.min(MAX_SKILLS_LIST_BYTES);
         let start = parse_cursor(args.cursor.as_deref(), &identity, snapshot.entries.len())?;
         let mut end = snapshot.entries.len().min(start.saturating_add(limit));
         loop {

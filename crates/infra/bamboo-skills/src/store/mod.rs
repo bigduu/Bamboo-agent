@@ -133,6 +133,7 @@ struct RetainedResourceBudgetState {
 struct RetainedResourceBudget {
     state: Mutex<RetainedResourceBudgetState>,
     sources: Arc<SourcePool>,
+    selected: Arc<crate::progressive::read::SelectedBudget>,
 }
 
 impl RetainedResourceBudget {
@@ -1924,6 +1925,21 @@ impl SkillStore {
         mode: Option<&str>,
         access: &crate::progressive::SkillCatalogEligibility,
     ) -> SkillResult<crate::progressive::SkillCatalogSnapshot> {
+        self.progressive_projection(mode, access, |_, snapshot, _, _| Ok(snapshot.clone()))
+            .await
+    }
+
+    async fn progressive_projection<T>(
+        &self,
+        mode: Option<&str>,
+        access: &crate::progressive::SkillCatalogEligibility,
+        project: impl FnOnce(
+            &Self,
+            &crate::progressive::SkillCatalogSnapshot,
+            &HashMap<SkillId, SourceBinding>,
+            &HashMap<SkillId, SkillResourceSnapshot>,
+        ) -> SkillResult<T>,
+    ) -> SkillResult<T> {
         let mode_store = self.skill_store_for_mode(mode).await?;
         let store = mode_store.as_deref().unwrap_or(self);
         store.reload().await?;
@@ -1949,10 +1965,11 @@ impl SkillStore {
                 continue;
             };
             binding
-                .validate(
+                .validate_charged(
                     &store.retained_budget.sources,
                     auxiliary,
                     store.snapshot_limits.max_file_bytes,
+                    &store.retained_budget.selected,
                 )
                 .map_err(|error| {
                     SkillError::Validation(format!("Skill source is unavailable: {error}"))
@@ -1976,7 +1993,184 @@ impl SkillStore {
             hook();
         }
         let entries = crate::progressive::eligible_metadata(&metadata, access)?;
-        crate::progressive::SkillCatalogSnapshot::new(store.store_token, catalog.revision, entries)
+        let snapshot = crate::progressive::SkillCatalogSnapshot::new(
+            store.store_token,
+            catalog.revision,
+            entries,
+        )?;
+        project(store, &snapshot, &bindings, &resources)
+    }
+
+    /// Trusted-host foundation: current eligibility/publication must agree with
+    /// the supplied catalog. Returned owned bytes are not a future permission.
+    pub async fn selected_source_for_mode(
+        &self,
+        mode: Option<&str>,
+        access: &crate::progressive::SkillCatalogEligibility,
+        catalog: &crate::progressive::SkillCatalogSnapshot,
+        package: &str,
+        resource: &str,
+    ) -> SkillResult<Arc<crate::progressive::SelectedSkillSnapshot>> {
+        self.selected_projection(mode, access, catalog, package, resource, true)
+            .await
+            .map(|(_, snapshot)| snapshot.expect("materialized selected source"))
+    }
+
+    /// Current raw/physical probe without another full chosen buffer. It shares
+    /// the same finite ledger and publication/source validation as materialization.
+    pub async fn probe_selected_source_for_mode(
+        &self,
+        mode: Option<&str>,
+        access: &crate::progressive::SkillCatalogEligibility,
+        catalog: &crate::progressive::SkillCatalogSnapshot,
+        package: &str,
+        resource: &str,
+    ) -> SkillResult<String> {
+        self.selected_projection(mode, access, catalog, package, resource, false)
+            .await
+            .map(|(identity, _)| identity)
+    }
+
+    async fn selected_projection(
+        &self,
+        mode: Option<&str>,
+        access: &crate::progressive::SkillCatalogEligibility,
+        expected: &crate::progressive::SkillCatalogSnapshot,
+        package: &str,
+        resource: &str,
+        materialize: bool,
+    ) -> SkillResult<(
+        String,
+        Option<Arc<crate::progressive::SelectedSkillSnapshot>>,
+    )> {
+        let relative = Path::new(resource);
+        if resource.is_empty()
+            || resource.len() > 2048
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(SkillError::Validation(
+                "selected resource must be a normal relative path".into(),
+            ));
+        }
+        let _operation = self.retained_budget.selected.operation()?;
+        self.progressive_projection(mode, access, |store, catalog, bindings, resources| {
+            if expected.identity != catalog.identity {
+                return Err(SkillError::Validation(
+                    "selected catalog generation changed".into(),
+                ));
+            }
+            let metadata = catalog
+                .entries
+                .iter()
+                .find(|entry| entry.package == package)
+                .ok_or_else(|| {
+                    SkillError::Validation("selected Skill is not currently eligible".into())
+                })?;
+            let binding = bindings.get(package).expect("projected source binding");
+            let auxiliary = resources
+                .get(package)
+                .expect("projected auxiliary snapshot");
+            let published = if resource == "SKILL.md" {
+                None
+            } else {
+                Some(
+                    auxiliary
+                        .get(resource)
+                        .ok_or_else(|| {
+                            SkillError::Validation("selected resource is not published".into())
+                        })?
+                        .as_slice(),
+                )
+            };
+            let read = || {
+                binding
+                    .selected(
+                        &store.retained_budget.sources,
+                        relative,
+                        published,
+                        store.snapshot_limits.max_file_bytes,
+                        &store.retained_budget.selected,
+                        materialize,
+                    )
+                    .map_err(|error| SkillError::Validation(error.to_string()))
+            };
+            let (identity, buffer) = read()?;
+            binding
+                .validate_charged(
+                    &store.retained_budget.sources,
+                    auxiliary,
+                    store.snapshot_limits.max_file_bytes,
+                    &store.retained_budget.selected,
+                )
+                .map_err(|error| SkillError::Validation(error.to_string()))?;
+            let (current, _) = binding
+                .selected(
+                    &store.retained_budget.sources,
+                    relative,
+                    published,
+                    store.snapshot_limits.max_file_bytes,
+                    &store.retained_budget.selected,
+                    false,
+                )
+                .map_err(|error| SkillError::Validation(error.to_string()))?;
+            if current != identity {
+                return Err(SkillError::Validation(
+                    "selected resource changed during read".into(),
+                ));
+            }
+            let snapshot = buffer
+                .map(|buffer| {
+                    buffer
+                        .snapshot(
+                            metadata.package.clone(),
+                            resource.to_string(),
+                            identity.clone(),
+                        )
+                        .map(Arc::new)
+                })
+                .transpose()?;
+            Ok((identity, snapshot))
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_reload_for_selected_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.reload_lock.lock().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_budget(&self) -> Arc<crate::progressive::read::SelectedBudget> {
+        self.retained_budget.selected.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn selected_mode_budget(
+        &self,
+        mode: &str,
+    ) -> Arc<crate::progressive::read::SelectedBudget> {
+        self.skill_store_for_mode(Some(mode))
+            .await
+            .unwrap()
+            .unwrap()
+            .selected_budget()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_selected_limits(
+        config: SkillStoreConfig,
+        limits: crate::progressive::read::SelectedLimits,
+    ) -> Self {
+        Self::new_with_shared_snapshot_state(
+            config,
+            Arc::new(RetainedResourceBudget {
+                selected: Arc::new(crate::progressive::read::SelectedBudget::new(limits)),
+                ..Default::default()
+            }),
+            SkillSnapshotLimits::default(),
+        )
     }
 
     /// Return the current immutable metadata-only catalog snapshot.

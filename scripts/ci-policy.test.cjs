@@ -139,6 +139,13 @@ test("promotion retains required checks without repeating platform coverage", ()
   assert.match(build, /name: Build \(\$\{\{ matrix\.os \}\}\)\n/u)
   assert.match(build, /os: \[ubuntu-latest, macos-latest, windows-latest\]/u)
   assert.match(build, /run: cargo build --release --verbose\n/u)
+  const sourceStep = build.indexOf("- name: Verify portable Skill source publication")
+  const selectedStep = build.indexOf("- name: Verify portable selected Skill source")
+  const releaseStep = build.indexOf("- name: Build\n")
+  assert.ok(sourceStep >= 0 && selectedStep > sourceStep && releaseStep > selectedStep)
+  assert.match(build, /run: cargo test --locked -p bamboo-skills progressive::read_tests -- --test-threads=1\n/u)
+  assert.equal((workflow.match(/progressive::read_tests/gu) || []).length, 1)
+
   assert.match(
     build,
     /- name: Test frontend artifact and release policies\n        if: runner\.os != 'Linux'\n/u,

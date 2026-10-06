@@ -11,6 +11,13 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
+use super::read::{SelectedBudget, SelectedBuffer};
+
+#[cfg(not(windows))]
+type SourceFile = cap_std::fs::File;
+#[cfg(windows)]
+type SourceFile = std::fs::File;
+
 use crate::catalog::{bundle_metadata_from_bytes, BundleMetadata, WorkflowKind};
 use crate::store::storage::{LoadedSkillRecord, SkillDirectorySource};
 
@@ -262,7 +269,13 @@ impl SourcePool {
         Ok(opened)
     }
 
-    fn observe(&self, base: &SourceDir, relative: &Path, limit: usize) -> io::Result<ObservedFile> {
+    fn visit<T>(
+        &self,
+        base: &SourceDir,
+        relative: &Path,
+        limit: usize,
+        read: impl FnOnce(&mut SourceFile, PhysicalIdentity, usize) -> io::Result<T>,
+    ) -> io::Result<(PhysicalIdentity, Option<T>)> {
         let mut components = relative.components().peekable();
         let mut opened: Option<TemporaryDir> = None;
         while let Some(component) = components.next() {
@@ -275,7 +288,12 @@ impl SourcePool {
                 match self.open_directory(parent, Path::new(name)) {
                     Ok(next) => opened = Some(next),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        return self.absent(parent, Path::new(name), parent_identity);
+                        let ObservedFile::Absent(identity) =
+                            self.absent(parent, Path::new(name), parent_identity)?
+                        else {
+                            unreachable!()
+                        };
+                        return Ok((identity, None));
                     }
                     Err(error) => return Err(error),
                 }
@@ -290,10 +308,15 @@ impl SourcePool {
                 use cap_std::fs::OpenOptionsExt;
                 options.custom_flags(libc::O_NONBLOCK);
             }
-            let file = match parent.open_with(Path::new(name), &options) {
+            let mut file = match parent.open_with(Path::new(name), &options) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return self.absent(parent, Path::new(name), parent_identity);
+                    let ObservedFile::Absent(identity) =
+                        self.absent(parent, Path::new(name), parent_identity)?
+                    else {
+                        unreachable!()
+                    };
+                    return Ok((identity, None));
                 }
                 Err(error) => return Err(error),
             };
@@ -301,21 +324,72 @@ impl SourcePool {
             let metadata = file.metadata()?;
             #[cfg(windows)]
             let metadata = Metadata::from_file(&file)?;
+            #[cfg(windows)]
+            {
+                use cap_std::fs::MetadataExt as _;
+                if metadata.file_attributes()
+                    & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                    != 0
+                {
+                    return Err(io::Error::other("source leaf is a reparse point"));
+                }
+            }
             if !metadata.is_file() || metadata.len() > limit as u64 {
                 return Err(io::Error::other(
                     "source input is not a bounded regular file",
                 ));
             }
             let identity = physical(&metadata)?;
+            let value = read(&mut file, identity, metadata.len() as usize)?;
+            return Ok((identity, Some(value)));
+        }
+        Err(io::Error::other("empty resource path"))
+    }
+
+    fn observe(&self, base: &SourceDir, relative: &Path, limit: usize) -> io::Result<ObservedFile> {
+        let (identity, bytes) = self.visit(base, relative, limit, |file, _, _| {
             let mut bytes = Vec::new();
             file.take(limit.saturating_add(1) as u64)
                 .read_to_end(&mut bytes)?;
             if bytes.len() > limit {
                 return Err(io::Error::other("source input exceeds byte limit"));
             }
-            return Ok(ObservedFile::Present(identity, Arc::new(bytes)));
-        }
-        Err(io::Error::other("empty resource path"))
+            Ok(Arc::new(bytes))
+        })?;
+        Ok(match bytes {
+            Some(bytes) => ObservedFile::Present(identity, bytes),
+            None => ObservedFile::Absent(identity),
+        })
+    }
+
+    fn probe(
+        &self,
+        base: &SourceDir,
+        relative: &Path,
+        limit: usize,
+        budget: &SelectedBudget,
+    ) -> io::Result<FileSignature> {
+        let (identity, hash) = self.visit(base, relative, limit, |file, _, _| {
+            let mut scratch = budget.buffer(4096, false).map_err(io::Error::other)?;
+            let mut hash = Sha256::new();
+            let mut size = 0;
+            loop {
+                let count = file.read(&mut scratch.contents)?;
+                if count == 0 {
+                    break;
+                }
+                size += count;
+                if size > limit {
+                    return Err(io::Error::other("source input exceeds byte limit"));
+                }
+                hash.update(&scratch.contents[..count]);
+            }
+            Ok(hash.finalize().into())
+        })?;
+        Ok(match hash {
+            Some(hash) => FileSignature::Present(identity, hash),
+            None => FileSignature::Absent(identity),
+        })
     }
 
     fn absent(
@@ -608,6 +682,106 @@ impl SourceBinding {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn validate_charged(
+        &self,
+        pool: &SourcePool,
+        auxiliary: &HashMap<String, Arc<Vec<u8>>>,
+        limit: usize,
+        budget: &SelectedBudget,
+    ) -> io::Result<()> {
+        let root = pool.admit(&self.source)?;
+        let opened = pool.walk(&root.dir, &self.bundle)?;
+        let dir = opened.as_ref().map(|value| &value.dir).unwrap_or(&root.dir);
+        let signature = InputSignature {
+            source: root.identity,
+            anchor: root.anchor,
+            bundle: physical(&dir.dir_metadata()?)?,
+            main: pool.probe(dir, Path::new("SKILL.md"), limit, budget)?,
+            policies: POLICY_FILES
+                .iter()
+                .map(|path| pool.probe(dir, Path::new(path), limit, budget))
+                .collect::<io::Result<_>>()?,
+        };
+        if signature != self.signature {
+            return Err(io::Error::other("Skill source changed during probe"));
+        }
+        for (path, observed) in POLICY_FILES.into_iter().zip(&self.signature.policies) {
+            if !match (observed, auxiliary.get(path)) {
+                (FileSignature::Absent(_), None) => true,
+                (FileSignature::Present(_, hash), Some(bytes)) => *hash == digest(bytes),
+                _ => false,
+            } {
+                return Err(io::Error::other(
+                    "Skill policy and auxiliary snapshot disagree",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn selected(
+        &self,
+        pool: &SourcePool,
+        resource: &Path,
+        expected: Option<&[u8]>,
+        limit: usize,
+        budget: &SelectedBudget,
+        materialize: bool,
+    ) -> io::Result<(String, Option<SelectedBuffer>)> {
+        let root = pool.admit(&self.source)?;
+        let opened = pool.walk(&root.dir, &self.bundle)?;
+        let dir = opened.as_ref().map(|value| &value.dir).unwrap_or(&root.dir);
+        if root.identity != self.root.identity
+            || physical(&dir.dir_metadata()?)? != self.signature.bundle
+        {
+            return Err(io::Error::other("selected Skill root/bundle changed"));
+        }
+        let mut contents = None;
+        let signature = if materialize {
+            let (identity, bytes) = pool.visit(dir, resource, limit, |file, _, size| {
+                let mut buffer = budget
+                    .buffer(size.saturating_add(1), true)
+                    .map_err(io::Error::other)?;
+                let mut length = 0;
+                while length < buffer.contents.len() {
+                    let count = file.read(&mut buffer.contents[length..])?;
+                    if count == 0 {
+                        break;
+                    }
+                    length += count;
+                }
+                if length > size {
+                    return Err(io::Error::other("selected Skill grew during read"));
+                }
+                buffer.contents.truncate(length);
+                Ok(buffer)
+            })?;
+            let bytes = bytes.ok_or_else(|| io::Error::other("selected Skill file absent"))?;
+            let signature = FileSignature::Present(identity, digest(&bytes.contents));
+            contents = Some(bytes);
+            signature
+        } else {
+            pool.probe(dir, resource, limit, budget)?
+        };
+        let agrees = if let Some(expected) = expected {
+            matches!(&signature, FileSignature::Present(_, hash) if *hash == digest(expected))
+        } else {
+            signature == self.signature.main
+        };
+        if !agrees || !matches!(signature, FileSignature::Present(_, _)) {
+            return Err(io::Error::other("selected Skill differs from publication"));
+        }
+        let mut hash = Sha256::new();
+        hash.update(self.metadata_identity());
+        hash.update(resource.as_os_str().as_encoded_bytes());
+        if let FileSignature::Present(identity, digest) = signature {
+            hash.update(identity.0.to_le_bytes());
+            hash.update(identity.1.to_le_bytes());
+            hash.update(digest);
+        }
+        Ok((hex::encode(hash.finalize()), contents))
     }
 
     #[cfg(test)]
