@@ -123,7 +123,7 @@ jobs:
           shared-key: bamboo-actor-snapshot-windows-2025-msvc-1.99
           save-if: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' }}
 
-      - name: Compile and verify all 23 selected native tests
+      - name: Compile and verify all 27 selected native tests
         timeout-minutes: 20
         run: |
           $evidence = Join-Path $env:RUNNER_TEMP 'actor-snapshot-evidence'
@@ -149,12 +149,16 @@ jobs:
           # Listing compiles the exact package/feature selection used below.
           # A combined -p storage -p server build would unify storage/test-utils.
           Assert-TestList 'bamboo-storage' 'v2::actor_snapshot_windows_tests::' @(
+            'grow_after_open_is_capped_and_actual_bytes_debit_the_aggregate_budget'
+            'live_actor_fence_authorizes_self_and_descendants_but_not_siblings_or_foreign_roots'
+            'regular_file_symlink_replacement_is_rejected_and_open_handle_retains_original'
             'nested_snapshot_is_private_read_only_and_stable_after_restart'
             'retained_directory_and_file_handles_reject_reparse_replacement'
             'stale_identity_and_tight_budgets_fail_without_partial_tree'
           ) 'snapshot-list.log'
           Assert-TestList 'bamboo-server' 'handlers::agent::actor_snapshot::tests::' @(
             'canonical_gateway_requires_trusted_host_owner_and_keeps_codex_response_scope'
+            'corrupt_and_unsupported_authority_return_private_typed_errors_without_writes'
           ) 'gateway-list.log'
           Assert-TestList 'bamboo-storage' 'v2::actor_directory::tests::' @(
             'active_child_cannot_rebind_its_own_project'
@@ -178,7 +182,7 @@ jobs:
             'store_opened_before_creation_discovers_root_and_child_from_durable_files'
           ) 'directory-list.log'
 
-      - name: Execute 3 snapshot, 1 gateway and 19 directory tests
+      - name: Execute 6 snapshot, 2 gateway and 19 directory tests
         timeout-minutes: 5
         run: |
           $evidence = Join-Path $env:RUNNER_TEMP 'actor-snapshot-evidence'
@@ -198,8 +202,8 @@ jobs:
             "$filter : $expectedCount passed; zero failed/ignored" |
               Tee-Object -FilePath "$evidence/verified-counts.txt" -Append
           }
-          Assert-TestRun 'bamboo-storage' 'v2::actor_snapshot_windows_tests::' 3 'snapshot-run.log'
-          Assert-TestRun 'bamboo-server' 'handlers::agent::actor_snapshot::tests::' 1 'gateway-run.log'
+          Assert-TestRun 'bamboo-storage' 'v2::actor_snapshot_windows_tests::' 6 'snapshot-run.log'
+          Assert-TestRun 'bamboo-server' 'handlers::agent::actor_snapshot::tests::' 2 'gateway-run.log'
           Assert-TestRun 'bamboo-storage' 'v2::actor_directory::tests::' 19 'directory-run.log'
           # This receipts the existing reader tests, not all of #1338 or #791.
           Get-Content "$evidence/verified-counts.txt" | Add-Content $env:GITHUB_STEP_SUMMARY
