@@ -13,7 +13,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 set +e
-cargo test --locked -p bamboo-server --all-features --lib server::tls::tests -- --nocapture \
+# Exercise the same optimized profile as the normal development binary.
+cargo test --locked --profile dev -p bamboo-server --all-features --lib server::tls::tests -- --nocapture \
   2>&1 | tee "$log_file"
 pipeline_status=("${PIPESTATUS[@]}")
 cargo_status=${pipeline_status[0]}
