@@ -510,3 +510,283 @@ async fn actual_windows_junction_is_created_and_rejected_without_reading_target(
     assert_eq!(fixture.store.selected_budget().usage(), (0, 0, 0));
     assert_eq!(fixture.store.source_pool().counts().1, 0);
 }
+
+// Bamboo-authored cache and upstream UTF-8 algorithm boundary goldens.
+fn owned_snapshot(ledger: &SelectedBudget, contents: &str) -> Arc<super::SelectedSkillSnapshot> {
+    let mut buffer = ledger.buffer(contents.len(), true).unwrap();
+    buffer.contents.copy_from_slice(contents.as_bytes());
+    Arc::new(
+        buffer
+            .snapshot("chosen".into(), "SKILL.md".into(), "raw-physical".into())
+            .unwrap(),
+    )
+}
+fn test_page(
+    snapshot: &super::SelectedSkillSnapshot,
+    start: usize,
+    budget: usize,
+) -> crate::SkillResult<super::SelectedSkillPage> {
+    snapshot.page_response(
+        start,
+        budget,
+        |text, offset| Ok(serde_json::to_vec(&(text, offset)).unwrap().len()),
+        |text, offset, writer| {
+            serde_json::to_writer(writer, &(text, offset))
+                .map_err(|e| crate::SkillError::Validation(e.to_string()))
+        },
+    )
+}
+
+#[test]
+fn chosen_cache_active_borrow_eviction_last_drop_and_teardown_are_charged() {
+    let ledger = SelectedBudget::new(SelectedLimits {
+        bytes: 2048,
+        owners: 2,
+        inflight: 1,
+    });
+    let weak = ledger.weak_state();
+    let cache = super::SelectedSkillReadCache::default();
+    let first = cache.admit(owned_snapshot(&ledger, "first 界"), "caller-A".into());
+    let cursor = first.cursor(0);
+    let active = cache.lookup(&cursor).unwrap().0;
+    let second = cache.admit(owned_snapshot(&ledger, "second 🦀"), "caller-B".into());
+    assert!(!cache.contains(&first));
+    assert!(cache.lookup(&cursor).is_err());
+    assert_eq!(
+        ledger.usage().1,
+        2,
+        "eviction does not release an active owner"
+    );
+    assert!(ledger.buffer(0, true).is_err());
+    drop(first);
+    assert_eq!(
+        ledger.usage().1,
+        2,
+        "the real last borrower still holds the charge"
+    );
+    drop(active);
+    assert_eq!(ledger.usage().1, 1);
+    cache.clear();
+    assert_eq!(
+        ledger.usage().1,
+        1,
+        "returned second admission is still a real owner"
+    );
+    drop(second);
+    assert_eq!(ledger.usage(), (0, 0, 0));
+    let entry = cache.admit(owned_snapshot(&ledger, "teardown"), "caller".into());
+    drop(entry);
+    drop(ledger);
+    assert!(
+        weak.upgrade().is_some(),
+        "cache retains only data and its ledger charge"
+    );
+    drop(cache);
+    assert!(
+        weak.upgrade().is_none(),
+        "no cache-to-charge-to-cache ownership cycle"
+    );
+}
+
+#[test]
+fn chosen_cursors_never_revive_on_identical_data_or_another_cache() {
+    let ledger = SelectedBudget::default();
+    let snapshot = owned_snapshot(&ledger, "a界🦀b");
+    let cache = super::SelectedSkillReadCache::default();
+    let old = cache.admit(snapshot.clone(), "same-current-source".into());
+    let old_cursor = old.cursor(1);
+    assert_eq!(cache.lookup(&old_cursor).unwrap().1, 1);
+    for offset in [2, 3, 5, 6, 7, 100] {
+        assert!(
+            cache.lookup(&old.cursor(offset)).is_err(),
+            "reject nonboundary/out-of-range {offset}"
+        );
+    }
+    for malformed in [
+        "",
+        "1",
+        "1:2",
+        "1:2:3:4",
+        "-1:2:3",
+        "1:overflow:0",
+        "1:2:+0",
+    ] {
+        assert!(cache.lookup(malformed).is_err(), "reject {malformed:?}");
+    }
+    cache.clear();
+    let new = cache.admit(snapshot.clone(), "same-current-source".into());
+    assert!(cache.lookup(&old_cursor).is_err());
+    assert_ne!(old.cursor(1), new.cursor(1));
+    let other = super::SelectedSkillReadCache::default();
+    let elsewhere = other.admit(snapshot, "same-current-source".into());
+    assert!(other.lookup(&new.cursor(1)).is_err());
+    assert!(cache.lookup(&elsewhere.cursor(1)).is_err());
+    // Empty resident state has no stale weak keys to accumulate.
+    for _ in 0..100 {
+        cache.clear();
+        assert!(cache.lookup(&new.cursor(1)).is_err());
+    }
+}
+
+#[test]
+fn charged_pages_roll_back_all_failed_operations_and_keep_active_page_bytes() {
+    let ledger = SelectedBudget::new(SelectedLimits {
+        bytes: 400,
+        owners: 1,
+        inflight: 1,
+    });
+    let snapshot = owned_snapshot(&ledger, "body 界");
+    let base = ledger.usage();
+    assert!(
+        test_page(&snapshot, 0, 300).is_err(),
+        "scratch plus page must be precharged"
+    );
+    assert_eq!(ledger.usage(), base);
+    for budget in [0, 1, 2, 3] {
+        assert!(test_page(&snapshot, 0, budget).is_err());
+        assert_eq!(ledger.usage(), base);
+    }
+    let pending = ledger.operation().unwrap();
+    assert!(
+        test_page(&snapshot, 0, 30).is_err(),
+        "inflight is shared with materialization/probe"
+    );
+    drop(pending);
+    assert_eq!(ledger.usage(), base);
+    let failed = snapshot.page_response(
+        0,
+        30,
+        |_, _| Ok(20),
+        |_, _, _| Err(crate::SkillError::Validation("encoder failure".into())),
+    );
+    assert!(failed.is_err());
+    assert_eq!(ledger.usage(), base);
+    let oversized = snapshot.page_response(
+        0,
+        30,
+        |_, _| Ok(20),
+        |_, _, writer| {
+            std::io::Write::write_all(writer, &[b'x'; 40])
+                .map_err(|e| crate::SkillError::Validation(e.to_string()))
+        },
+    );
+    assert!(
+        oversized.is_err(),
+        "fixed output buffer cannot grow behind the ledger"
+    );
+    assert_eq!(ledger.usage(), base);
+    let page = test_page(&snapshot, 0, 30).unwrap();
+    assert_eq!(
+        ledger.usage().0,
+        base.0 + 30,
+        "page bytes remain charged during final async host checks"
+    );
+    assert_eq!(
+        ledger.usage().2,
+        0,
+        "probe can acquire the same inflight lease"
+    );
+    drop(snapshot);
+    assert_eq!(ledger.usage(), (30, 0, 0));
+    drop(page);
+    assert_eq!(ledger.usage(), (0, 0, 0));
+}
+
+#[test]
+fn advancing_utf8_search_matches_bruteforce_and_preserves_complete_eof() {
+    let ledger = SelectedBudget::default();
+    for contents in ["", "a", "界", "🦀", "a界🦀\r\n\0\"\\tail"] {
+        let snapshot = owned_snapshot(&ledger, contents);
+        for start in (0..=contents.len()).filter(|offset| contents.is_char_boundary(*offset)) {
+            for budget in 0..45 {
+                let mut expected = None;
+                for end in
+                    (start..=contents.len()).filter(|offset| contents.is_char_boundary(*offset))
+                {
+                    if end == start && end < contents.len() {
+                        continue;
+                    }
+                    let offset = (end < contents.len()).then_some(end);
+                    if serde_json::to_vec(&(&contents[start..end], offset))
+                        .unwrap()
+                        .len()
+                        <= budget
+                    {
+                        expected = Some(end);
+                    }
+                }
+                match (test_page(&snapshot, start, budget), expected) {
+                    (Ok(page), Some(end)) => {
+                        let (text, next): (String, Option<usize>) = serde_json::from_str(page.as_str()).unwrap();
+                        assert_eq!(text, contents[start..end]);
+                        assert_eq!(next, (end < contents.len()).then_some(end));
+                        assert!(page.as_str().len() <= budget);
+                        assert!(next.is_none() || !text.is_empty());
+                    },
+                    (Err(_), None) => {},
+                    (result, expected) => panic!("start={start} budget={budget} contents={contents:?} actual={result:?} expected={expected:?}"),
+                }
+                assert_eq!(ledger.usage().2, 0);
+            }
+        }
+    }
+    assert_eq!(ledger.usage(), (0, 0, 0));
+}
+
+#[test]
+fn warm_probe_page_candidates_never_copy_the_whole_large_buffer() {
+    let ledger = SelectedBudget::default();
+    let raw = "界🦀\"\\\r\n".repeat(100_000);
+    let snapshot = owned_snapshot(&ledger, &raw);
+    let baseline = ledger.usage();
+    let observed = std::cell::Cell::new(0usize);
+    let page = snapshot
+        .page_response(
+            0,
+            512 * 1024,
+            |contents, next| {
+                observed.set(observed.get().max(contents.len()));
+                assert_eq!(
+                    ledger.usage().0,
+                    baseline.0 + 256,
+                    "only bounded scratch exists during borrowed probes"
+                );
+                Ok(serde_json::to_vec(&(contents, next)).unwrap().len())
+            },
+            |contents, next, writer| {
+                serde_json::to_writer(writer, &(contents, next))
+                    .map_err(|e| crate::SkillError::Validation(e.to_string()))
+            },
+        )
+        .unwrap();
+    assert!(observed.get() <= 512 * 1024 && observed.get() < raw.len());
+    assert_eq!(ledger.usage().0, baseline.0 + 512 * 1024);
+    let (contents, next): (String, Option<usize>) = serde_json::from_str(page.as_str()).unwrap();
+    assert_eq!(contents, raw[..next.unwrap()]);
+    drop(page);
+    assert_eq!(ledger.usage(), baseline);
+}
+
+#[test]
+fn usage_guidance_is_atomic_budgeted_and_requires_complete_current_turn_reads() {
+    use super::{render_skill_usage_instructions, SkillMetadataBudget};
+    let guidance =
+        render_skill_usage_instructions(SkillMetadataBudget::Characters(10_000)).unwrap();
+    for required in [
+        "stable package",
+        "next_cursor",
+        "EOF",
+        "main agent",
+        "Multiple mentions",
+        "later turns",
+        "references/guide.md",
+    ] {
+        assert!(guidance.contains(required));
+    }
+    let chars = guidance.chars().count();
+    assert!(render_skill_usage_instructions(SkillMetadataBudget::Characters(chars)).is_some());
+    assert!(render_skill_usage_instructions(SkillMetadataBudget::Characters(chars - 1)).is_none());
+    let tokens = SkillMetadataBudget::Tokens(usize::MAX).cost(guidance);
+    assert!(render_skill_usage_instructions(SkillMetadataBudget::Tokens(tokens)).is_some());
+    assert!(render_skill_usage_instructions(SkillMetadataBudget::Tokens(tokens - 1)).is_none());
+}

@@ -779,13 +779,23 @@ impl ProviderTranscriptState {
     }
 
     pub fn invalidate(&mut self, reason: ProviderTranscriptResetReason) {
-        if self.is_empty() {
+        self.invalidate_repeated(reason, 1);
+    }
+
+    /// Coalesce missed host selections without replaying an unbounded loop.
+    /// This is exactly repeated invalidation of the existing native epoch.
+    pub(super) fn invalidate_repeated(
+        &mut self,
+        reason: ProviderTranscriptResetReason,
+        count: u64,
+    ) {
+        if count == 0 || self.is_empty() {
             return;
         }
-        self.epoch = self.epoch.saturating_add(1);
+        self.epoch = self.epoch.saturating_add(count);
         self.next_sequence = 0;
         self.last_reset_reason = Some(reason);
-        self.state_revision = self.state_revision.saturating_add(1);
+        self.state_revision = self.state_revision.saturating_add(count);
     }
 
     pub fn append_group(

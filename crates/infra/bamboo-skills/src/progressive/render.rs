@@ -1,11 +1,24 @@
 // Copyright 2025 OpenAI. Licensed under Apache-2.0.
-// Adapted from Codex ext/skills/src/{render.rs,aliases.rs} at
+// Adapted from Codex ext/skills/src/{render.rs,aliases.rs,catalog_prompt.rs} at
 // 7f892275e31002f0422477c6219189284560e689; see third_party/codex notices.
 use super::{source_rank, SkillCatalogMetadata};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
+
+/// Codex's explicit main-prompt limit, measured in UTF-8 bytes, not characters.
+pub const EXPLICIT_SKILL_PROMPT_BYTES: usize = 8_000;
+
+/// Adapted from pinned Codex `truncate_utf8_to_bytes` and its character-boundary
+/// utility. This only truncates the supplied string; it establishes no access.
+pub fn truncate_skill_utf8_bytes(contents: &str, max_bytes: usize) -> (&str, bool) {
+    let mut end = contents.len().min(max_bytes);
+    while !contents.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&contents[..end], end < contents.len())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SkillMetadataBudget {
@@ -374,4 +387,22 @@ pub fn render_skill_catalog(
     } else {
         plain
     }
+}
+
+// Stable packages and source membership replace Codex executor/cloud aliases.
+const SKILL_USAGE: &str = r#"### Using Skills
+- Discovery: use `skills_list` to find each Skill's stable package and main resource. Display root aliases alone do not authorize file access.
+- Trigger rules: if the user names a Skill or the task clearly matches its description, use it for the current turn. Multiple mentions mean use them all; do not automatically carry Skills into later turns.
+- Announce the selected Skills and their order in one short sentence.
+- Open the selected package with `skills_read` (omitting resource selects `SKILL.md`). Follow every `next_cursor` until EOF before any task action.
+- When instructions name relative files such as `references/guide.md`, use that resource with the same selected package. Read every required reference completely to EOF before applying it.
+- The main agent must read the instructions itself. Subagents may perform task work when the selected Skill allows it; delegated summaries do not replace reading.
+- Read the files required for the task and preserve the Skill's own routing. Reuse supported scripts/assets/templates where appropriate.
+- If a required Skill or resource is unavailable, state the limitation and use the best available fallback. Never treat a partial page as complete instructions.
+"#;
+
+/// Complete guidance or None when indivisible guidance does not fit.
+/// The runtime must deliberately install the read Tool before exposing this.
+pub fn render_skill_usage_instructions(budget: SkillMetadataBudget) -> Option<&'static str> {
+    (budget.cost(SKILL_USAGE) <= budget.limit()).then_some(SKILL_USAGE)
 }

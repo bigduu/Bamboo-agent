@@ -529,7 +529,7 @@ fn measure_request_usage(
 pub(in crate::runtime::runner) fn required_tool_for_session(
     session: &Session,
 ) -> Option<&'static str> {
-    crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(session)
+    crate::runtime::runner::session_setup::legacy_instruction::explicit_activation_pending(session)
         .then_some("load_skill")
 }
 
@@ -1543,7 +1543,7 @@ pub(super) async fn execute_llm_stream(
     // model-issued call, then later rounds stream normally once activation is
     // mirrored into the runner-owned Session.
     let stream_output_result =
-        if crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(
+        if crate::runtime::runner::session_setup::legacy_instruction::explicit_activation_pending(
             session,
         ) {
             crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(

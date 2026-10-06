@@ -188,6 +188,29 @@ independent configured token cap. Names, locators, root aliases and omission
 notices consume that budget; descriptions share remaining space round-robin.
 These exported APIs have no live registry or body-reader integration yet.
 
+Engine's `session_app::skill_input::prepare_skill_input` is a pure, unwired
+ordinary User-content converter. The host must supply current-input restrictions
+and correlated typed selections/snapshots; catalog, configured IDs and client
+fragment text establish no invocation. Explicit bodies use an 8,000 UTF-8-byte
+limit with visible warnings; bounded arguments are rejected rather than cut.
+`session_app::plan_legacy_skill_history` prepares loaded-only ordinary Assistant
+history after the complete original tool batch. It validates typed historical
+data and a unique successful active receipt, retains originals and uses the
+existing 512 KiB bound. Unsupported history stays intact. Neither helper is
+called by chat, runner setup, providers or persistence; live cutover is separate.
+
+The runner's existing Instruction activation path is factored into a private,
+stateless `legacy_instruction` adapter. It still publishes the selected pin,
+requires one model-issued `load_skill` call, suppresses first-round answer text,
+and refreshes the existing repository activation metadata before continuation.
+Durable workflow context, resume behavior, terminal degraded results and
+WorkflowRun ordering retain their existing contracts. The adapter adds no
+caller grant, Session field, source reader or lifecycle writer.
+
+This extraction does not wire the pure input/history helpers or register the
+progressive catalog/read Tools. The legacy Instruction path remains the only
+live protocol; an atomic live cutover is a separate migration step.
+
 ## License
 
 Project-owned code is licensed under the [MIT License](./LICENSE).
@@ -204,3 +227,12 @@ charged through the last real owner and carries no future execution permission.
 `probe_selected_source` rechecks current authority and raw/physical identity with
 bounded charged scratch. These APIs do not register a `skills_read` Tool or provide
 paging/cache/runtime activation. Existing publication storage has separate bounds.
+
+The exported, unregistered `SkillsReadTool` reuses `SkillsListTool`'s mandatory
+trusted caller resolver. Reads use stable packages plus `SKILL.md` or a published
+relative resource. Follow `next_cursor` to complete EOF before applying instructions.
+A finite owned snapshot cache retains shared byte charges through active borrows;
+every continuation validates current caller/input, host policy and source identity.
+UTF-8 pages charge the largest real OpenAI/Anthropic cache envelope (including 1h).
+`render_skill_usage_instructions` exposes complete budgeted guidance only when a
+future runtime deliberately installs the read Tool. Live registration is deferred.

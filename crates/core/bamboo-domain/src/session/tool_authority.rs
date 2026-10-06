@@ -183,13 +183,20 @@ impl Session {
         {
             return Err(RootToolAuthorityError::StaleSnapshot);
         }
-        let changed = self.root_orchestration_only != latest.root_orchestration_only;
+        let selections = latest.root_tool_authority_revision - self.root_tool_authority_revision;
         self.root_orchestration_only = latest.root_orchestration_only;
         self.root_tool_authority_revision = latest.root_tool_authority_revision;
         self.root_mode_transition_epoch = latest.root_mode_transition_epoch;
         self.root_mode_operations = latest.root_mode_operations.clone();
-        if changed && self.model_context_state.is_some() {
-            self.reset_model_context_epoch(ModelContextResetReason::CacheScopeChanged);
+        if selections > 0 {
+            // A running snapshot may miss several selections, including a
+            // round trip to the same mode. Adopt the durable invalidation;
+            // resetting the local ledger once could retain an older epoch.
+            self.model_context_state = latest.model_context_state.clone();
+            self.provider_transcript.invalidate_repeated(
+                super::provider_transcript::ProviderTranscriptResetReason::CacheScopeChanged,
+                selections,
+            );
         }
         Ok(())
     }
@@ -430,5 +437,50 @@ mod tests {
                 Some(ModelContextResetReason::CacheScopeChanged)
             );
         }
+    }
+
+    #[test]
+    fn live_authority_adoption_preserves_all_missed_mode_resets() {
+        let mut running = Session::new("root", "model");
+        running.model_context_state = Some(ModelContextState {
+            prefix_epoch: 4,
+            cache_scope_sha256: Some("old scope".into()),
+            ..Default::default()
+        });
+        running
+            .activate_provider_transcript_route(
+                super::super::provider_transcript::ProviderFamily::OpenAi,
+                super::super::provider_transcript::ProviderProtocol::OpenAiResponsesV1,
+                &"a".repeat(64),
+            )
+            .unwrap();
+        let mut durable = running.clone();
+        durable.set_root_orchestration_only(true).unwrap();
+        // A prepared round between selections makes the second reset a new
+        // ledger boundary rather than the existing pending-reset coalescing.
+        durable
+            .model_context_state
+            .as_mut()
+            .unwrap()
+            .cache_scope_sha256 = Some("new scope".into());
+        durable.set_root_orchestration_only(false).unwrap();
+        assert_eq!(running.root_thinking_mode(), durable.root_thinking_mode());
+        running.adopt_root_tool_authority_from(&durable).unwrap();
+        assert_eq!(running.model_context_state, durable.model_context_state);
+        assert_eq!(
+            running.model_context_state.as_ref().unwrap().prefix_epoch,
+            6
+        );
+        assert_eq!(running.provider_transcript, durable.provider_transcript);
+        // A recovery-only epoch advance must preserve current owner work.
+        running
+            .model_context_state
+            .as_mut()
+            .unwrap()
+            .cache_scope_sha256 = Some("owner scope".into());
+        let owner_context = running.model_context_state.clone();
+        durable.root_mode_transition_epoch += 1;
+        running.adopt_root_tool_authority_from(&durable).unwrap();
+        assert_eq!(running.model_context_state, owner_context);
     }
 }

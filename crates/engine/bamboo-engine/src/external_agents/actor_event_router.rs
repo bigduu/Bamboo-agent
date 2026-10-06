@@ -33,7 +33,6 @@ pub(super) struct ActorEventEnvelope {
     pub actor_id: ActorId,
     pub parent_actor_id: Option<ActorId>,
     pub root_actor_id: ActorId,
-    pub project_id: Option<String>,
     pub activation_id: String,
     pub attempt: u64,
     pub lease_epoch: u64,
@@ -204,7 +203,6 @@ impl ActorEventRouter {
             actor_id: self.identity.actor_id.clone(),
             parent_actor_id: self.identity.parent_actor_id.clone(),
             root_actor_id: self.identity.root_actor_id.clone(),
-            project_id: self.identity.project_id.clone(),
             activation_id: self.identity.activation_id.clone(),
             attempt: self.identity.attempt,
             lease_epoch: self.identity.lease_epoch,
@@ -531,7 +529,6 @@ mod tests {
         assert_eq!(first.actor_id, "event-root");
         assert_eq!(first.root_actor_id, "event-root");
         assert_eq!(first.parent_actor_id, None);
-        assert_eq!(first.project_id, None);
         assert_eq!(first.activation_id, "activation-one");
         assert_eq!(first.attempt, 1);
         assert_eq!(first.lease_epoch, 1);

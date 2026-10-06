@@ -19,6 +19,7 @@ pub mod limits;
 pub mod preparation;
 pub mod retrieval_window;
 pub mod segmenter;
+mod skill_history;
 pub mod summarizer;
 pub mod types;
 

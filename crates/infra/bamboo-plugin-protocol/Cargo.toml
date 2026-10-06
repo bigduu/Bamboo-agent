@@ -5,7 +5,6 @@ edition = "2021"
 rust-version.workspace = true
 description = "Dependency-light public wire protocols shared by Bamboo and plugin services"
 license = "MIT"
-license-file = "../../../LICENSE"
 
 [dependencies]
 serde = { workspace = true }
