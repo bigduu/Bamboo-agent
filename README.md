@@ -199,6 +199,18 @@ data and a unique successful active receipt, retains originals and uses the
 existing 512 KiB bound. Unsupported history stays intact. Neither helper is
 called by chat, runner setup, providers or persistence; live cutover is separate.
 
+The runner's existing Instruction activation path is factored into a private,
+stateless `legacy_instruction` adapter. It still publishes the selected pin,
+requires one model-issued `load_skill` call, suppresses first-round answer text,
+and refreshes the existing repository activation metadata before continuation.
+Durable workflow context, resume behavior, terminal degraded results and
+WorkflowRun ordering retain their existing contracts. The adapter adds no
+caller grant, Session field, source reader or lifecycle writer.
+
+This extraction does not wire the pure input/history helpers or register the
+progressive catalog/read Tools. The legacy Instruction path remains the only
+live protocol; an atomic live cutover is a separate migration step.
+
 ## License
 
 Project-owned code is licensed under the [MIT License](./LICENSE).
