@@ -860,11 +860,71 @@ async fn await_host_pre_ack_cut(
     }
     cut.unwrap()
 }
-struct Host(Child);
+struct HostCleanupReceipt {
+    phase: &'static str,
+    path: Option<PathBuf>,
+    confirmed: bool,
+}
+struct Host(Child, Option<HostCleanupReceipt>);
+impl Host {
+    fn record_cleanup(&mut self, phase: &'static str, path: Option<PathBuf>) {
+        self.1 = Some(HostCleanupReceipt {
+            phase,
+            path,
+            confirmed: false,
+        });
+    }
+
+    fn kill_and_wait(
+        &mut self,
+        reason: &'static str,
+    ) -> (
+        std::io::Result<()>,
+        std::io::Result<std::process::ExitStatus>,
+    ) {
+        use std::io::Write;
+        use std::os::unix::process::ExitStatusExt;
+        let pid = self.0.id();
+        let killed = self.0.kill();
+        // Always attempt wait, including when kill fails. A failed cleanup is
+        // evidence, never a reason to panic again while the test unwinds.
+        let waited = self.0.wait();
+        if let Some(receipt) = &mut self.1 {
+            receipt.confirmed = killed.is_ok() && waited.is_ok();
+            let value = json!({
+                "schema_version":1, "owner":"native_actor_fixture", "phase":receipt.phase,
+                "reason":reason, "pid":pid, "unwinding":std::thread::panicking(),
+                "kill_success":killed.is_ok(), "kill_error":killed.as_ref().err().map(ToString::to_string),
+                "wait_success":waited.is_ok(), "wait_error":waited.as_ref().err().map(ToString::to_string),
+                "exit_code":waited.as_ref().ok().and_then(|status| status.code()),
+                "exit_signal":waited.as_ref().ok().and_then(|status| status.signal()),
+                "host_killed_and_waited":receipt.confirmed
+            });
+            // Stderr and the opt-in JSONL receipt retain the actual PID and
+            // syscall outcomes on success and on ordinary assertion unwinding.
+            let _ = writeln!(std::io::stderr(), "native Actor Host cleanup: {value}");
+            if let Some(path) = &receipt.path {
+                let written = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .and_then(|mut file| writeln!(file, "{value}"));
+                if let Err(error) = written {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "native Actor cleanup receipt write failed: {error}"
+                    );
+                }
+            }
+        }
+        (killed, waited)
+    }
+}
 impl Drop for Host {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        if !self.1.as_ref().is_some_and(|receipt| receipt.confirmed) {
+            let _ = self.kill_and_wait("drop");
+        }
     }
 }
 fn fixture_http_client() -> reqwest::Client {
@@ -955,6 +1015,10 @@ async fn fixture_sessions_poll_survives_idle_peer_close() {
 }
 
 fn start(data: &Path, port: u16) -> Host {
+    start_with_static_dir(data, port, None)
+}
+
+fn start_with_static_dir(data: &Path, port: u16, static_dir: Option<&Path>) -> Host {
     let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -967,10 +1031,15 @@ fn start(data: &Path, port: u16) -> Host {
         chrono::Utc::now()
     )
     .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bamboo"));
+    if let Some(static_dir) = static_dir {
+        command.arg("serve").arg("--static-dir").arg(static_dir);
+    } else {
+        command.arg("serve");
+    }
     Host(
-        Command::new(env!("CARGO_BIN_EXE_bamboo"))
+        command
             .args([
-                "serve",
                 "--bind",
                 "127.0.0.1",
                 "--port",
@@ -986,6 +1055,7 @@ fn start(data: &Path, port: u16) -> Host {
             .stderr(Stdio::from(log))
             .spawn()
             .unwrap(),
+        None,
     )
 }
 async fn fixture(
@@ -2648,7 +2718,95 @@ async fn actual_root_catalog_uses_single_subagent_facade_and_preserves_ultra_con
 const MESSAGE_ONLY_TASK: &str = "Report one bounded plain answer for the F2 assignment. Return F2_CHILD_COMPLETED and stop. Do not use tools or create another agent.";
 const MESSAGE_ONLY_CALL: &str = "f2-message-only";
 
+// Opt-in only: the ordinary native test never waits for a browser. All signals
+// are local files, while the browser observes only actual Host HTTP/WS traffic.
+struct ActorBrowserFixture {
+    info: PathBuf,
+    static_dir: PathBuf,
+    host_log: Option<PathBuf>,
+}
+impl ActorBrowserFixture {
+    fn from_env() -> Self {
+        let info = PathBuf::from(
+            std::env::var_os("BAMBOO_ACTOR_BROWSER_INFO")
+                .expect("set BAMBOO_ACTOR_BROWSER_INFO to a fresh absolute JSON path"),
+        );
+        let static_dir = PathBuf::from(
+            std::env::var_os("BAMBOO_ACTOR_BROWSER_STATIC_DIR")
+                .expect("set BAMBOO_ACTOR_BROWSER_STATIC_DIR to the built Lotus dist"),
+        );
+        assert!(info.is_absolute() && static_dir.is_absolute());
+        assert!(
+            static_dir.join("index.html").is_file(),
+            "built Lotus index.html"
+        );
+        for phase in [
+            "release",
+            "completed",
+            "restart",
+            "restarted",
+            "done",
+            "native",
+            "cleanup.jsonl",
+        ] {
+            assert!(
+                !info.with_extension(phase).exists(),
+                "fresh rendezvous {phase}"
+            );
+        }
+        assert!(!info.exists(), "fresh rendezvous info");
+        Self {
+            info,
+            static_dir,
+            host_log: None,
+        }
+    }
+    fn write(&self, path: &Path, value: Value) {
+        let pending = path.with_extension("pending");
+        std::fs::write(&pending, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        std::fs::rename(pending, path).unwrap();
+    }
+    fn phase(&self, phase: &str, value: Value) {
+        self.write(&self.info.with_extension(phase), value);
+    }
+    async fn wait(&self, phase: &str, host: &mut Host) -> Value {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                assert!(
+                    host.0.try_wait().unwrap().is_none(),
+                    "actual Host exited at {phase}"
+                );
+                if let Ok(bytes) = std::fs::read(self.info.with_extension("done")) {
+                    let done: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(done["pass"], true, "browser failed: {done}");
+                }
+                if let Ok(bytes) = std::fs::read(self.info.with_extension(phase)) {
+                    return serde_json::from_slice(&bytes).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("bounded browser rendezvous timed out: {phase}"))
+    }
+}
+impl Drop for ActorBrowserFixture {
+    fn drop(&mut self) {
+        // Preserve only bounded diagnostics. Config/provider requests and the
+        // generated fake credential are deliberately not exported.
+        if let Some(path) = &self.host_log {
+            if let Ok(bytes) = std::fs::read(path) {
+                let _ = std::fs::write(
+                    self.info.with_extension("host.log"),
+                    &bytes[bytes.len().saturating_sub(64 * 1024)..],
+                );
+            }
+        }
+    }
+}
+
 struct MessageOnlyProbe {
+    browser: bool,
     root_calls: AtomicUsize,
     child_calls: AtomicUsize,
     child_ready: AtomicBool,
@@ -2667,15 +2825,18 @@ async fn message_only_provider(
         assert_eq!(probe.child_calls.fetch_add(1, Ordering::SeqCst), 0);
         assert!(body["tools"].is_null() || body["tools"].as_array().is_some_and(Vec::is_empty));
         probe.child_ready.store(true, Ordering::SeqCst);
-        tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
-                let wake = probe.wake.notified();
-                if probe.release_child.load(Ordering::SeqCst) {
-                    break;
+        tokio::time::timeout(
+            Duration::from_secs(if probe.browser { 150 } else { 60 }),
+            async {
+                loop {
+                    let wake = probe.wake.notified();
+                    if probe.release_child.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    wake.await;
                 }
-                wake.await;
-            }
-        })
+            },
+        )
         .await
         .expect("bounded actual Child provider response gate");
         (json!({"content":"F2_CHILD_COMPLETED"}), "stop")
@@ -2768,8 +2929,10 @@ fn message_only_root_result(root: &bamboo_domain::Session, completed: bool) -> V
     result
 }
 
-async fn message_only_fixture() {
+async fn message_only_fixture(browser: Option<ActorBrowserFixture>) {
     let temp = tempfile::tempdir().unwrap();
+    // Drop the log receipt guard before the temporary fixture data disappears.
+    let mut browser = browser;
     let root = temp.path().canonicalize().unwrap();
     let data = root.join("host");
     let workspace = root.join("workspace");
@@ -2783,6 +2946,7 @@ async fn message_only_fixture() {
     std::fs::create_dir_all(&agents).unwrap();
     std::fs::write(agents.join("worker.md"), "---\nschema_version: 1\nname: worker\ndescription: One bounded plain reply\nmodel_hint: openai:plain-child\ntools:\n  deny: [Bash, Read, Glob, Edit, Write]\n---\nDo not use tools; return one plain answer and stop.\n").unwrap();
     let probe = web::Data::new(MessageOnlyProbe {
+        browser: browser.is_some(),
         root_calls: AtomicUsize::new(0),
         child_calls: AtomicUsize::new(0),
         child_ready: AtomicBool::new(false),
@@ -2813,19 +2977,37 @@ async fn message_only_fixture() {
     let running = server.run();
     let handle = running.handle();
     actix_web::rt::spawn(running);
-    std::fs::write(data.join("config.json"), serde_json::to_vec(&json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":"fixture","base_url":provider_url,"model":"plain-root"}},"defaults":{"chat":{"provider":"openai","model":"plain-root"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1}})).unwrap()).unwrap();
+    std::fs::write(data.join("config.json"), serde_json::to_vec(&json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":format!("fixture-{}", uuid::Uuid::new_v4()),"base_url":provider_url,"model":"plain-root"}},"defaults":{"chat":{"provider":"openai","model":"plain-root"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1}})).unwrap()).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port();
-    let mut host = start(&data, port);
+    if let Some(browser) = &mut browser {
+        browser.host_log = Some(data.join("host.log"));
+    }
+    let mut host = start_with_static_dir(
+        &data,
+        port,
+        browser.as_ref().map(|b| b.static_dir.as_path()),
+    );
+    host.record_cleanup(
+        "initial_host",
+        browser
+            .as_ref()
+            .map(|b| b.info.with_extension("cleanup.jsonl")),
+    );
+    let initial_host_pid = host.0.id();
     let base = format!("http://127.0.0.1:{port}/api/v1");
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .unwrap();
+    let client = if browser.is_some() {
+        fixture_http_client()
+    } else {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap()
+    };
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             assert!(host.0.try_wait().unwrap().is_none(), "actual Host exited");
@@ -3013,6 +3195,18 @@ async fn message_only_fixture() {
         logical.creation.as_ref().unwrap().created_at,
         before.created_at
     );
+    if let Some(browser) = &browser {
+        browser.write(&browser.info, json!({
+            "schema_version":1, "origin":format!("http://127.0.0.1:{port}"), "api":base,
+            "root_id":"plain-root", "child_id":id, "activation_id":activation.activation_id,
+            "attempt":1, "release":browser.info.with_extension("release"),
+            "completed":browser.info.with_extension("completed"), "restart":browser.info.with_extension("restart"),
+            "restarted":browser.info.with_extension("restarted"), "done":browser.info.with_extension("done"),
+            "native":browser.info.with_extension("native"), "cleanup":browser.info.with_extension("cleanup.jsonl"),
+            "host_pid":initial_host_pid
+        }));
+        assert_eq!(browser.wait("release", &mut host).await["release"], true);
+    }
     probe.release_child.store(true, Ordering::SeqCst);
     probe.wake.notify_waiters();
     let (completed, parent_completed) = tokio::time::timeout(Duration::from_secs(60), async {
@@ -3087,12 +3281,26 @@ async fn message_only_fixture() {
         serde_json::to_value(&completed.messages[..before.messages.len()]).unwrap(),
         serde_json::to_value(&before.messages).unwrap()
     );
-    host.0.kill().unwrap();
-    host.0.wait().unwrap();
+    if let Some(browser) = &browser {
+        // `runs` was captured while the provider was held. Claimed Maildir
+        // entries may be ACKed after completion, so this is not a lifetime total.
+        browser.phase(
+            "completed",
+            json!({"completed":true, "held_cut_runs":runs.len(),
+            "root_provider_calls":probe.root_calls.load(Ordering::SeqCst),
+            "child_provider_calls":probe.child_calls.load(Ordering::SeqCst),
+            "host_pid":initial_host_pid, "actor_id":id,
+            "activation_id":activation.activation_id, "attempt":1}),
+        );
+        assert_eq!(browser.wait("restart", &mut host).await["restart"], true);
+    }
+    let (killed, waited) = host.kill_and_wait("completed_before_cold_reopen");
+    killed.unwrap();
+    waited.unwrap();
     drop(host); // Confirmed kill/wait precedes the cold Store reopen.
     drop(index_store);
     drop(store);
-    let cold_store = SessionStoreV2::new(data).await.unwrap();
+    let cold_store = SessionStoreV2::new(data.clone()).await.unwrap();
     let cold = cold_store.load_session(&id).await.unwrap().unwrap();
     let cold_root = cold_store
         .load_session("plain-root")
@@ -3128,6 +3336,70 @@ async fn message_only_fixture() {
         ActorActivationStatus::Succeeded
     );
     assert_eq!(cold_actor.activation.unwrap().run_id, activation.run_id);
+    if let Some(browser) = &browser {
+        let mut restarted = start_with_static_dir(&data, port, Some(&browser.static_dir));
+        restarted.record_cleanup(
+            "restarted_host",
+            Some(browser.info.with_extension("cleanup.jsonl")),
+        );
+        let restarted_host_pid = restarted.0.id();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                assert!(
+                    restarted.0.try_wait().unwrap().is_none(),
+                    "restarted Host exited"
+                );
+                if client
+                    .get(format!("{base}/health"))
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        browser.phase(
+            "restarted",
+            json!({"restarted":true,"host_pid":restarted_host_pid,
+            "previous_host_pid":initial_host_pid,"previous_host_killed_and_waited":true}),
+        );
+        assert_eq!(browser.wait("done", &mut restarted).await["pass"], true);
+        let (killed, waited) = restarted.kill_and_wait("completed_transport_cleanup");
+        killed.unwrap();
+        waited.unwrap();
+        drop(restarted);
+        assert_eq!(
+            probe.child_calls.load(Ordering::SeqCst),
+            1,
+            "restart did not admit another Worker"
+        );
+        let after = SessionStoreV2::new(data.clone()).await.unwrap();
+        let child = after.load_session(&id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&child.messages).unwrap(),
+            serde_json::to_value(&completed.messages).unwrap()
+        );
+        let actor = after.inspect_actor(&id).await.unwrap();
+        assert_eq!(actor.actor.current_attempt, 1);
+        assert_eq!(actor.activation.as_ref().unwrap().run_id, activation.run_id);
+        assert_eq!(
+            actor.activation.unwrap().status,
+            ActorActivationStatus::Succeeded
+        );
+        browser.phase(
+            "native",
+            json!({"pass":true,"held_cut_runs":runs.len(),
+            "root_provider_calls":probe.root_calls.load(Ordering::SeqCst),
+            "child_provider_calls":probe.child_calls.load(Ordering::SeqCst),
+            "actor_id":id,"activation_id":activation.activation_id,"attempt":1,
+            "initial_host_pid":initial_host_pid,"restarted_host_pid":restarted_host_pid,
+            "host_killed_and_waited":true}),
+        );
+    }
     eprintln!(
         "message-only native evidence: {}",
         json!({"call_id":MESSAGE_ONLY_CALL,"caller_keys":["message"],"actor_id":id,"root_provider_calls":probe.root_calls.load(Ordering::SeqCst),"child_provider_calls":probe.child_calls.load(Ordering::SeqCst),"actual_runs":runs.len(),"default_role":"worker","cold_answer":cold.messages.last().unwrap().content,"host_killed_and_waited":true})
@@ -3137,5 +3409,13 @@ async fn message_only_fixture() {
 
 #[actix_web::test]
 async fn actual_message_only_subagent_creates_and_completes_one_local_child() {
-    Box::pin(message_only_fixture()).await;
+    Box::pin(message_only_fixture(None)).await;
+}
+
+/// Build separately with --no-run, then start this exact ignored fixture while
+/// Lotus runs playwright.actor-runtime.config.ts. No real provider is contacted.
+#[actix_web::test]
+#[ignore = "requires built Lotus and its focused real Actor browser test"]
+async fn actual_message_only_native_actor_browser_fixture() {
+    Box::pin(message_only_fixture(Some(ActorBrowserFixture::from_env()))).await;
 }
