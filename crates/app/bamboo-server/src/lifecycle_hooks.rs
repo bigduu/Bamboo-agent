@@ -31,6 +31,7 @@ pub(crate) async fn apply_user_prompt_submit_hooks(
     runtime_state.stop_hook_forced_continuations = 0;
     if !runner.has_hooks_for(AgentHookPoint::BeforeSessionSetup) {
         session.agent_runtime_state = Some(runtime_state);
+        HookRunner::mark_user_prompt_prechecked(session, raw_prompt);
         return Ok(raw_prompt.to_string());
     }
     let outcome = runner
@@ -63,19 +64,28 @@ pub(crate) async fn apply_user_prompt_submit_hooks(
         return Err(reason);
     }
 
-    let contexts = outcome
+    let mut contexts = outcome
         .injected_contexts
         .into_iter()
         .map(|context| context.trim().to_string())
         .filter(|context| !context.is_empty())
         .collect::<Vec<_>>();
+    contexts.extend(
+        outcome
+            .plugin_contexts
+            .into_iter()
+            .map(|context| context.rendered_text()),
+    );
     if contexts.is_empty() {
+        HookRunner::mark_user_prompt_prechecked(session, raw_prompt);
         return Ok(raw_prompt.to_string());
     }
-    Ok(format!(
+    let effective_prompt = format!(
         "{raw_prompt}\n\n{USER_PROMPT_CONTEXT_START}\n{}\n{USER_PROMPT_CONTEXT_END}",
         contexts.join("\n\n---\n\n")
-    ))
+    );
+    HookRunner::mark_user_prompt_prechecked(session, &effective_prompt);
+    Ok(effective_prompt)
 }
 
 #[cfg(test)]
@@ -98,6 +108,68 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn portable_prompt_context_reaches_user_prompt_without_system_injection() {
+        use bamboo_plugin::{
+            InstalledPlugin, InstalledPlugins, PluginInstallStatus, PluginManifest, PluginSource,
+            RegisteredCapabilities,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins");
+        let bundle = root.join("fixture");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id":"fixture", "name":"Fixture", "version":"0.1.0",
+            "provides":{"hooks":[{"config":"hooks.json","scripts":["script.sh"]}]}
+        }))
+        .unwrap();
+        std::fs::write(
+            bundle.join("plugin.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(bundle.join("script.sh"), "# reviewed fixture").unwrap();
+        std::fs::write(bundle.join("hooks.json"), serde_json::to_vec(&serde_json::json!({"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"printf 'portable context'","timeout":1}]}]}})).unwrap()).unwrap();
+        let mut hooks = bamboo_plugin::hooks::registrations(&manifest, &bundle).unwrap();
+        let digest = hooks[0].digest.clone();
+        hooks[0].confirm_review(&digest).unwrap();
+        InstalledPlugins {
+            plugins: vec![InstalledPlugin {
+                id: manifest.id,
+                version: manifest.version,
+                source: PluginSource::LocalDir {
+                    path: bundle.clone(),
+                },
+                plugin_dir: bundle,
+                installed_at: chrono::Utc::now(),
+                status: PluginInstallStatus::Installed,
+                registered: RegisteredCapabilities {
+                    hooks,
+                    ..Default::default()
+                },
+            }],
+        }
+        .save(&root.join("installed.json"))
+        .await
+        .unwrap();
+        let mut session = Session::new("portable-prompt", "model");
+        let prompt = apply_user_prompt_submit_hooks(
+            &LifecycleHooksConfig::default(),
+            Some(temp.path().to_owned()),
+            &mut session,
+            "raw prompt",
+        )
+        .await
+        .unwrap();
+        assert!(prompt.starts_with("raw prompt\n\n<user_prompt_submit_context>"));
+        assert!(prompt.contains("untrusted; source fixture@0.1.0:hooks.json:UserPromptSubmit"));
+        assert!(prompt.contains("portable context"));
+        assert!(session.messages.is_empty());
+        assert!(!session
+            .metadata
+            .contains_key("runtime.plugin_hook_contexts"));
     }
 
     #[tokio::test]

@@ -51,7 +51,7 @@ mod supported {
             }
         }
 
-        pub(crate) fn candidates(
+        pub(in crate::named_agents) fn candidates(
             &self,
             limits: NamedAgentLimits,
             budget: &mut ScanBudget,
@@ -181,7 +181,7 @@ mod supported {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(super) use supported::AgentDirectory;
+pub(crate) use supported::AgentDirectory;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) struct AgentDirectory;

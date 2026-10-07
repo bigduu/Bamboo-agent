@@ -310,6 +310,8 @@ async fn fixture(case: Case) {
     let handle = running.handle();
     actix_web::rt::spawn(running);
     let mut config = json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":"fixture-key","base_url":url,"model":"native-root"}},"defaults":{"chat":{"provider":"openai","model":"native-root"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1}});
+    config["providers"]["openai"]["runtime_models"] =
+        json!(["native-root", "native-child", "explicit-child"]);
     if case == Case::Narrow {
         config["tools"] = json!({"disabled":["Bash","Edit","Write"]});
     }
@@ -1100,7 +1102,8 @@ async fn actual_implementer_reviewer_bounded_handoff_and_correction() {
     let handle = running.handle();
     actix_web::rt::spawn(running);
     let config = json!({"provider":"openai","features":{"provider_model_ref":true},
-        "providers":{"openai":{"api_key":"fixture-key","base_url":url,"model":"handoff-root"}},
+        "providers":{"openai":{"api_key":"fixture-key","base_url":url,"model":"handoff-root",
+            "runtime_models":["handoff-root", "handoff-implementer", "handoff-reviewer"]}},
         "defaults":{"chat":{"provider":"openai","model":"handoff-root"}},
         "subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1}});
     std::fs::write(

@@ -4,7 +4,14 @@
 use std::collections::VecDeque;
 
 use bamboo_agent_core::AgentEvent;
-use bamboo_domain::{ActorActivationFence, ActorActivationStatus, ActorDirectoryEntry, ActorId};
+use bamboo_domain::{
+    ActorActivation, ActorActivationFence, ActorActivationStatus, ActorDirectoryEntry, ActorId,
+    ActorPlacementRef,
+};
+
+use super::actor_event_stream::{
+    opaque_event_id, ActorEventSourceOrder, PublicActorEvent, PublicActorEventClass,
+};
 
 const MAX_REPLAY_EVENTS: usize = 64;
 const MAX_REPLAY_BYTES: usize = 64 * 1024;
@@ -26,7 +33,6 @@ pub(super) struct ActorEventEnvelope {
     pub actor_id: ActorId,
     pub parent_actor_id: Option<ActorId>,
     pub root_actor_id: ActorId,
-    pub project_id: Option<String>,
     pub activation_id: String,
     pub attempt: u64,
     pub lease_epoch: u64,
@@ -68,6 +74,8 @@ pub(super) struct ActorEventRouter {
 }
 
 struct ActorEventEnvelopeIdentity {
+    fence: ActorActivationFence,
+    placement_ref: Option<ActorPlacementRef>,
     actor_id: ActorId,
     parent_actor_id: Option<ActorId>,
     root_actor_id: ActorId,
@@ -96,6 +104,8 @@ impl ActorEventRouter {
             .ok_or(ActorEventRouteError::StaleAuthority)?;
         Ok(Self {
             identity: ActorEventEnvelopeIdentity {
+                fence: fence.clone(),
+                placement_ref: activation.placement_ref.clone(),
                 actor_id: entry.actor.actor_id.clone(),
                 parent_actor_id: entry.actor.parent_actor_id.clone(),
                 root_actor_id: entry.actor.root_actor_id.clone(),
@@ -193,7 +203,6 @@ impl ActorEventRouter {
             actor_id: self.identity.actor_id.clone(),
             parent_actor_id: self.identity.parent_actor_id.clone(),
             root_actor_id: self.identity.root_actor_id.clone(),
-            project_id: self.identity.project_id.clone(),
             activation_id: self.identity.activation_id.clone(),
             attempt: self.identity.attempt,
             lease_epoch: self.identity.lease_epoch,
@@ -209,6 +218,54 @@ impl ActorEventRouter {
         self.next_sequence = next_sequence;
         self.remember(&envelope);
         Ok(ActorEventRoute::Publish(envelope))
+    }
+
+    /// Consume the final, admitted pump after its validated Terminal. This is a
+    /// Host snapshot invalidation, not a Worker frame or replayable AgentEvent.
+    /// Its source position is the next unused position of that same pump; no
+    /// earlier epoch, reset counter, or untrusted terminal watermark is used.
+    pub(super) fn into_host_completion(
+        self,
+        entry: &ActorDirectoryEntry,
+        committed: &ActorActivation,
+    ) -> Result<PublicActorEvent, ActorEventRouteError> {
+        let identity = self.identity;
+        if !committed.matches_fence(&identity.fence)
+            || committed.status != ActorActivationStatus::Succeeded
+            || committed.finished_at.is_none()
+            || committed.placement_ref != identity.placement_ref
+            || committed.project_id != identity.project_id
+            || entry.activation.as_ref() != Some(committed)
+            || entry.actor.state != bamboo_domain::ActorLogicalState::Cold
+            || entry.actor.current_attempt != committed.attempt
+            || entry.actor.actor_id != identity.actor_id
+            || entry.actor.parent_actor_id != identity.parent_actor_id
+            || entry.actor.root_actor_id != identity.root_actor_id
+            || entry.actor.project_id != identity.project_id
+            || (self.require_lifecycle && !self.lifecycle_seen)
+        {
+            return Err(ActorEventRouteError::StaleAuthority);
+        }
+        Ok(PublicActorEvent {
+            actor_id: identity.actor_id,
+            root_actor_id: identity.root_actor_id,
+            parent_actor_id: identity.parent_actor_id,
+            event_id: opaque_event_id(&format!(
+                "host-completion:{}:{}:{}:{}",
+                identity.activation_id,
+                identity.lease_epoch,
+                identity.execution_epoch,
+                self.next_sequence,
+            )),
+            activation_id: identity.activation_id,
+            attempt: identity.attempt,
+            class: PublicActorEventClass::Snapshot,
+            source_order: ActorEventSourceOrder {
+                lease_epoch: identity.lease_epoch,
+                execution_epoch: identity.execution_epoch,
+                sequence: self.next_sequence,
+            },
+        })
     }
 
     pub(super) fn replay_after(
@@ -300,6 +357,154 @@ mod tests {
     }
 
     #[test]
+    fn host_completion_uses_final_admitted_order_and_redacted_identity() {
+        let (entry, fence) = running();
+        let mut router = ActorEventRouter::new(&entry, &fence, 7, true).unwrap();
+        router
+            .route(&entry, &fence, 7, 1, Some(lifecycle()))
+            .unwrap();
+        router
+            .route(
+                &entry,
+                &fence,
+                7,
+                2,
+                Some(AgentEvent::Token {
+                    content: "PRIVATE_TOKEN".into(),
+                }),
+            )
+            .unwrap();
+        // Worker cache/history suppression still consumes its source position.
+        assert!(matches!(
+            router.route(&entry, &fence, 7, 3, None).unwrap(),
+            ActorEventRoute::Suppressed
+        ));
+        let mut completed = entry.clone();
+        completed.actor.state = ActorLogicalState::Cold;
+        let activation = completed.activation.as_mut().unwrap();
+        activation.status = ActorActivationStatus::Succeeded;
+        activation.finished_at = Some(Utc::now());
+        let public = router
+            .into_host_completion(&completed, completed.activation.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(public.actor_id, entry.actor.actor_id);
+        assert_eq!(public.root_actor_id, entry.actor.root_actor_id);
+        assert_eq!(public.parent_actor_id, entry.actor.parent_actor_id);
+        assert_eq!(public.activation_id, fence.activation_id);
+        assert_eq!(public.attempt, fence.attempt);
+        assert_eq!(
+            public.source_order,
+            ActorEventSourceOrder {
+                lease_epoch: 1,
+                execution_epoch: 7,
+                sequence: 4
+            }
+        );
+        assert_eq!(public.class, PublicActorEventClass::Snapshot);
+        assert_eq!(
+            public.event_id,
+            opaque_event_id("host-completion:activation-one:1:7:4")
+        );
+        assert_ne!(public.event_id, opaque_event_id("activation-one:1:7:4"));
+        let json = serde_json::to_value(&public).unwrap();
+        let mut fields: Vec<_> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "activation_id",
+                "actor_id",
+                "attempt",
+                "class",
+                "event_id",
+                "parent_actor_id",
+                "root_actor_id"
+            ]
+        );
+    }
+
+    #[test]
+    fn host_completion_rejects_changed_authority_or_unadmitted_lifecycle() {
+        for changed in [
+            "actor",
+            "root",
+            "parent",
+            "project",
+            "activation_project",
+            "actor_attempt",
+            "retired",
+            "activation",
+            "attempt",
+            "lease",
+            "run",
+            "owner",
+            "schema",
+            "placement",
+            "running",
+            "failed",
+            "no_finish",
+            "reread",
+            "lifecycle",
+        ] {
+            let (entry, fence) = running();
+            let mut router = ActorEventRouter::new(&entry, &fence, 7, true).unwrap();
+            if changed != "lifecycle" {
+                router
+                    .route(&entry, &fence, 7, 1, Some(lifecycle()))
+                    .unwrap();
+            }
+            let mut completed = entry.clone();
+            completed.actor.state = ActorLogicalState::Cold;
+            let committed = completed.activation.as_mut().unwrap();
+            committed.status = ActorActivationStatus::Succeeded;
+            committed.finished_at = Some(Utc::now());
+            match changed {
+                "actor" => completed.actor.actor_id = "other".into(),
+                "root" => completed.actor.root_actor_id = "other".into(),
+                "parent" => completed.actor.parent_actor_id = Some("other".into()),
+                "project" => completed.actor.project_id = Some("other".into()),
+                "activation_project" => committed.project_id = Some("other".into()),
+                "actor_attempt" => completed.actor.current_attempt += 1,
+                "retired" => completed.actor.state = ActorLogicalState::Retired,
+                "activation" => committed.activation_id = "other".into(),
+                "attempt" => committed.attempt += 1,
+                "lease" => committed.lease_epoch += 1,
+                "run" => committed.run_id = "other".into(),
+                "owner" => committed.lease_owner = "other".into(),
+                "schema" => committed.schema_version += 1,
+                "placement" => {
+                    committed.placement_ref = Some(ActorPlacementRef {
+                        class: bamboo_domain::ActorPlacementClass::Local,
+                        lease_id: "other".into(),
+                        slot_epoch: None,
+                    })
+                }
+                "running" => committed.status = ActorActivationStatus::Running,
+                "failed" => committed.status = ActorActivationStatus::Failed,
+                "no_finish" => committed.finished_at = None,
+                "reread" | "lifecycle" => {}
+                _ => unreachable!(),
+            }
+            let committed = completed.activation.clone().unwrap();
+            if changed == "reread" {
+                completed.activation.as_mut().unwrap().checkpoint_revision += 1;
+            }
+            assert!(
+                matches!(
+                    router.into_host_completion(&completed, &committed),
+                    Err(ActorEventRouteError::StaleAuthority)
+                ),
+                "{changed}"
+            );
+        }
+    }
+
+    #[test]
     fn publishes_directory_identity_before_content_and_replays_bounded_window() {
         let (entry, fence) = running();
         let mut router = ActorEventRouter::new(&entry, &fence, 7, true).unwrap();
@@ -324,7 +529,6 @@ mod tests {
         assert_eq!(first.actor_id, "event-root");
         assert_eq!(first.root_actor_id, "event-root");
         assert_eq!(first.parent_actor_id, None);
-        assert_eq!(first.project_id, None);
         assert_eq!(first.activation_id, "activation-one");
         assert_eq!(first.attempt, 1);
         assert_eq!(first.lease_epoch, 1);

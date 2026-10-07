@@ -24,4 +24,15 @@ ignore = [
     # migrates PEM parsing to rustls-pki-types >=1.9 (the upstream-suggested
     # replacement) or another maintained fork.
     "RUSTSEC-2025-0134",
+
+    # RUSTSEC-2025-0057 — INFO Unmaintained fxhash 0.2.1, only via exact-pinned
+    # bm25 2.3.2 for Codex-derived tool search. No published bm25 release drops it;
+    # hashes define embedding coordinates, so replacement needs parity review.
+    # Reviewed 2026-10-06 (#1606); pinned Codex 7f892275 makes the same exception.
+    # https://rustsec.org/advisories/RUSTSEC-2025-0057.html
+    # https://github.com/Michael-JB/bm25/issues/25
+    # This exception covers the ID globally, not a machine-enforced bm25 path.
+    # Recheck every lock update/new fxhash path, upstream release/advisory change,
+    # and before #1537; remove both ignores when an accepted release drops fxhash.
+    "RUSTSEC-2025-0057",
 ]

@@ -214,6 +214,13 @@ pub struct QueuedInjectedMessage {
 
 #[async_trait]
 pub trait ChildSessionPort: Send + Sync {
+    /// Check the child's final provider/model before persistence or activation.
+    /// Hosts without configuration-managed model admission retain their own
+    /// routing policy; server adapters enforce the configured runtime list.
+    async fn validate_child_model(&self, _child: &Session) -> Result<(), ChildSessionError> {
+        Ok(())
+    }
+
     /// Host-private catalog selection. Embeddings without a catalog keep the
     /// legacy path; server implementations reject unavailable authority.
     async fn resolve_named_profile(

@@ -152,9 +152,64 @@ cargo clippy
 
 Bare Cargo commands use the manifest's `default-members`; `cargo test` is not every workspace member. The dev-only analytics crate is excluded by default. Inspect [Cargo.toml](./Cargo.toml) before using `--workspace`.
 
-- [Architecture](./docs/design/architecture-overview.md) · [Configuration](./docs/config-reference.md)
+- [Architecture](./docs/design/architecture-overview.md) · [Configuration](./docs/config-reference.md) · [Skill bundle input](./docs/design/codex-skill-input.md)
 - [Plugins](./docs/guides/PLUGINS.md) · [Migration](./docs/guides/MIGRATION_GUIDE.md) · [Documentation index](./docs/README.md)
 - [Contributing](./CONTRIBUTING.md) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md)
+
+Ordinary Instruction publications also retain a private source binding. The
+main file and invocation-policy sidecars are captured through the same bounded
+source capability and parsed once. Raw edits, physical file/root replacement,
+and policy presence changes invalidate the publication even when normalized
+metadata is equal. Captured policy bytes must agree with the auxiliary snapshot;
+read errors and links cannot become an absent policy.
+
+Source roots share a bounded handle pool across mode, Project and workspace
+stores. Temporary walks and old publications remain charged while referenced;
+Invalid/LKG entries and failed refreshes cannot grant future progressive API
+access. Public catalog serde, legacy Workflow adapters and deterministic
+orchestration keep their existing interfaces. The source binding itself adds no
+caller permission, activation, or runtime registration.
+
+The portable source fixtures run in the existing manual/promotion Build matrix.
+Windows uses cap4.0.3 opened-handle identity with checked by-handle values; a
+candidate requires real Windows/Linux/macOS fixture results before portable
+acceptance. Ordinary eager instruction/resource storage remains until #1563.
+
+`bamboo_skills::progressive` exports a source-validated Instruction catalog. `bamboo_server_tools::SkillsListTool`
+exports a paged metadata Tool requiring a trusted caller/current-input resolver.
+Known host ceilings distinguish `None`, empty and populated sets; stale UI
+selection cannot grant manual invocation. Pages charge ToolResult and provider
+cache envelopes, advance to metadata EOF, or return an explicit budget error.
+The byte ceiling bounds each page-bearing block; unrelated request history is
+outside this per-page budget.
+`SkillsListTool::render_catalog` uses the same fresh metadata projection and the
+pinned Codex allocator: a 2% context budget, an 8,000-character fallback, or an
+independent configured token cap. Names, locators, root aliases and omission
+notices consume that budget; descriptions share remaining space round-robin.
+These exported APIs have no live registry or body-reader integration yet.
+
+Engine's `session_app::skill_input::prepare_skill_input` is a pure, unwired
+ordinary User-content converter. The host must supply current-input restrictions
+and correlated typed selections/snapshots; catalog, configured IDs and client
+fragment text establish no invocation. Explicit bodies use an 8,000 UTF-8-byte
+limit with visible warnings; bounded arguments are rejected rather than cut.
+`session_app::plan_legacy_skill_history` prepares loaded-only ordinary Assistant
+history after the complete original tool batch. It validates typed historical
+data and a unique successful active receipt, retains originals and uses the
+existing 512 KiB bound. Unsupported history stays intact. Neither helper is
+called by chat, runner setup, providers or persistence; live cutover is separate.
+
+The runner's existing Instruction activation path is factored into a private,
+stateless `legacy_instruction` adapter. It still publishes the selected pin,
+requires one model-issued `load_skill` call, suppresses first-round answer text,
+and refreshes the existing repository activation metadata before continuation.
+Durable workflow context, resume behavior, terminal degraded results and
+WorkflowRun ordering retain their existing contracts. The adapter adds no
+caller grant, Session field, source reader or lifecycle writer.
+
+This extraction does not wire the pure input/history helpers or register the
+progressive catalog/read Tools. The legacy Instruction path remains the only
+live protocol; an atomic live cutover is a separate migration step.
 
 ## License
 
@@ -162,4 +217,38 @@ Project-owned code is licensed under the [MIT License](./LICENSE).
 Third-party materials retain their own licenses and copyright notices:
 
 - `builtin_skills/skill-creator` retains its [Apache-2.0 license](./builtin_skills/skill-creator/LICENSE.txt).
-- Codex-derived tool-search code retains its [Apache-2.0 license and source notices](./THIRD_PARTY_NOTICES.md).
+- Codex-derived tool-search, Skill-input and catalog/list/render code retain its [Apache-2.0 license and source notices](./THIRD_PARTY_NOTICES.md).
+
+The exported Rust `SkillsListTool::selected_source` helper applies the same mandatory
+current-caller/input, host ceiling, config and source validation as list/render.
+It returns complete raw UTF-8 `SKILL.md` or a published auxiliary file (up to8MiB),
+with byte/entry/inflight limits shared by a manager's stores. Owned data remains
+charged through the last real owner and carries no future execution permission.
+`probe_selected_source` rechecks current authority and raw/physical identity with
+bounded charged scratch. These APIs do not register a `skills_read` Tool or provide
+paging/cache/runtime activation. Existing publication storage has separate bounds.
+
+The exported, unregistered `SkillsReadTool` reuses `SkillsListTool`'s mandatory
+trusted caller resolver. Reads use stable packages plus `SKILL.md` or a published
+relative resource. Follow `next_cursor` to complete EOF before applying instructions.
+A finite owned snapshot cache retains shared byte charges through active borrows;
+every continuation validates current caller/input, host policy and source identity.
+UTF-8 pages charge the largest real OpenAI Chat/Responses, Anthropic cache
+(including 1h), Gemini page-bearing block and complete ToolResult envelope.
+`render_skill_usage_instructions` exposes complete budgeted guidance only when a
+future runtime deliberately installs the read Tool. Live registration is deferred.
+
+`skill_response_byte_budget` is an unwired scalar preparation helper. A future
+trusted caller must supply its actual current tool-output token cap alongside the
+existing response byte ceiling. Unknown caps and zero response bytes fail;
+a known zero token cap means no hard token cap while retaining a finite512KiB
+byte ceiling. Positive caps conservatively limit response bytes to that cap.
+The helper grants no Skill access and changes no generic compressor behavior.
+Impossible complete envelopes fail through the existing ToolError path rather
+than emitting partial successful JSON or claiming EOF. Their plain failure text
+has no successful-page token-bound promise. Test-owned Reader overlays exercise
+this composition through the actual Runtime and outbound provider converters;
+they do not install a production Reader or establish configured-provider access.
+The live same-dispatch producer of model-resolved default token caps remains a
+separate requirement: persisted Session omits that resolved budget. Production
+caller resolution and output composition remain disconnected until cutover.

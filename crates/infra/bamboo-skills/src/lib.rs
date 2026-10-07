@@ -8,6 +8,7 @@ pub mod clone_publication;
 pub mod context;
 pub mod legacy;
 pub mod named_agents;
+pub mod progressive;
 pub mod resource_helpers;
 pub mod reuse_draft;
 pub mod runtime_metadata;
@@ -361,6 +362,13 @@ impl SkillManager {
             Some(workspace) => self.store.skill_store_for_workspace(workspace).await,
             None => Ok(self.store.clone()),
         }
+    }
+
+    /// Selected-source ledger is shared by every workspace/mode/project store
+    /// resolved by this manager. Returned bytes retain only their ledger charge.
+    #[cfg(test)]
+    pub(crate) fn selected_budget(&self) -> Arc<progressive::read::SelectedBudget> {
+        self.store.selected_budget()
     }
 
     /// Resolve the stable Project shared layer plus the current workspace

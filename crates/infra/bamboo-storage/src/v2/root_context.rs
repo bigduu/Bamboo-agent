@@ -133,6 +133,125 @@ fn conflict(message: impl Into<String>) -> io::Error {
     )
 }
 
+/// A private control-plane capability for the exact domain-derived mode reset.
+/// It is minted only by root_mode_operation while holding the same lifecycle,
+/// Task and Session locks as Actor claim/checkpoint writers. It grants neither
+/// an execution owner nor general permission to replace activated context.
+#[derive(Clone)]
+pub(super) struct RootModeContextWrite {
+    directory: PathBuf,
+    actor_record: Option<Vec<u8>>,
+    actor_marker: Option<Vec<u8>>,
+    candidate: serde_json::Value,
+}
+
+impl RootModeContextWrite {
+    fn actor_file(directory: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {
+        let path = directory.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => std::fs::read(path)
+                .map(Some)
+                .map_err(|error| conflict(format!("Root mode Actor witness: {error}"))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            _ => Err(conflict(
+                "Root mode Actor witness is unavailable or invalid",
+            )),
+        }
+    }
+
+    pub(super) fn capture(
+        directory: PathBuf,
+        original: &Session,
+        candidate: &Session,
+    ) -> io::Result<Self> {
+        if original.kind != SessionKind::Root
+            || original.parent_session_id.is_some()
+            || !original.authority_identity.is_ordinary()
+        {
+            return Err(conflict("mode context reset requires an ordinary Root"));
+        }
+        let receipt = candidate
+            .root_mode_operations
+            .last()
+            .filter(|receipt| {
+                receipt.expected_epoch == original.root_mode_transition_epoch
+                    && original
+                        .root_mode_operation(&receipt.operation_id)
+                        .is_none()
+                    && receipt.outcome == RootModeOperationOutcome::Committed
+            })
+            .ok_or_else(|| conflict("mode context reset has no fresh committed operation"))?;
+        let mut expected = original.clone();
+        expected
+            .set_root_orchestration_only(receipt.requested_enabled)
+            .map_err(|error| conflict(error.to_string()))?;
+        expected
+            .record_root_mode_operation(receipt.clone())
+            .map_err(|error| conflict(error.to_string()))?;
+        // The operation assigns its timestamp once. It is not Actor context.
+        expected.updated_at = candidate.updated_at;
+        let expected =
+            serde_json::to_value(expected).map_err(|error| conflict(error.to_string()))?;
+        let candidate =
+            serde_json::to_value(candidate).map_err(|error| conflict(error.to_string()))?;
+        if expected != candidate {
+            return Err(conflict(
+                "mode operation changed fields outside its authorized reset",
+            ));
+        }
+        let actor_record = Self::actor_file(&directory, "actor-authority.json")?;
+        let actor_marker = Self::actor_file(&directory, "actor-authority.initialized.json")?;
+        match (&actor_record, &actor_marker) {
+            (None, None) => {} // Preserve the existing legacy Root boundary.
+            (Some(record), Some(marker)) => {
+                let project = original
+                    .project_id_meta()
+                    .map(bamboo_domain::ProjectId::parse)
+                    .transpose()
+                    .map_err(|error| conflict(error.to_string()))?;
+                actor_directory::validate_census_witnesses(
+                    record,
+                    marker,
+                    original,
+                    project.as_ref(),
+                )
+                .map_err(|error| conflict(format!("Root mode Actor witness: {error}")))?;
+            }
+            _ => return Err(conflict("Root mode Actor authority is incomplete")),
+        }
+        Ok(Self {
+            directory,
+            actor_record,
+            actor_marker,
+            candidate,
+        })
+    }
+
+    pub(super) fn validate_actor_witnesses(&self) -> io::Result<()> {
+        if Self::actor_file(&self.directory, "actor-authority.json")? != self.actor_record
+            || Self::actor_file(&self.directory, "actor-authority.initialized.json")?
+                != self.actor_marker
+        {
+            return Err(conflict(
+                "Root mode Actor authority changed before publication",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_candidate(&self, incoming: &Session, full: bool) -> io::Result<()> {
+        if !full
+            || serde_json::to_value(incoming).map_err(|error| conflict(error.to_string()))?
+                != self.candidate
+        {
+            return Err(conflict(
+                "mode context capability does not authorize this save",
+            ));
+        }
+        self.validate_actor_witnesses()
+    }
+}
+
 async fn regular_file_exists(path: &Path) -> io::Result<bool> {
     let metadata = match fs::symlink_metadata(path).await {
         Ok(metadata) => metadata,

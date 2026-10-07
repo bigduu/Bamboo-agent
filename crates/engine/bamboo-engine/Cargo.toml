@@ -5,7 +5,6 @@ edition = "2021"
 rust-version.workspace = true
 description = "Execution engine and orchestration for the Bamboo agent framework"
 license = "MIT"
-license-file = "../../../LICENSE"
 
 [dependencies]
 bamboo-domain = { path = "../../core/bamboo-domain" }
@@ -66,6 +65,7 @@ bytes = "1"
 rust_ocr = "0.1.5"
 
 [dev-dependencies]
+bamboo-plugin = { path = "../../infra/bamboo-plugin" }
 tempfile = "3"
 mockall = "0.15"
 wiremock = "0.6"

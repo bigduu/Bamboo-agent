@@ -27,6 +27,7 @@ pub mod patch;
 pub mod paths;
 pub mod provider_configs;
 pub mod provider_instance;
+pub mod runtime_models;
 pub mod section_facade;
 pub mod settings;
 pub mod settings_loader;
@@ -49,6 +50,7 @@ pub use provider_instance::{
     provider_instance_api_key_from_env, provider_instance_environment_override_active,
     synthesize_legacy_instances, PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY,
 };
+pub use runtime_models::*;
 pub use section_facade::*;
 pub use settings::PermissionMode;
 pub use subagents_config::SubagentsConfigModule;

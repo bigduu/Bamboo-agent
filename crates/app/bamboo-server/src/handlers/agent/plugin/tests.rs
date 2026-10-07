@@ -1272,3 +1272,228 @@ async fn install_and_list_surface_service_status() {
         serde_json::json!("svc")
     );
 }
+
+#[actix_web::test]
+async fn portable_hook_review_requires_exact_explicit_consent_and_update_resets_it() {
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(data.path()).await;
+    let native_hooks = tokio::fs::read(data.path().join("hooks.json")).await.ok();
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../infra/bamboo-plugin/examples/portable-hooks");
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/plugins/install")
+            .set_json(local_dir_source(&source))
+            .to_request(),
+    )
+    .await;
+    assert!(response.status().is_success(), "{:?}", response.status());
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/plugins/portable-hook-example/hooks")
+            .to_request(),
+    )
+    .await;
+    let report: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(report["hooks"][0]["state"], "needs-review");
+    let digest = report["hooks"][0]["digest"].as_str().unwrap();
+    for (digest, confirm) in [("stale", true), (digest, false)] {
+        let response=test::call_service(&app,test::TestRequest::post().uri("/api/v1/plugins/portable-hook-example/hooks/review").set_json(serde_json::json!({"config":"hooks/hooks.json","digest":digest,"enabled":true,"confirm_execution":confirm})).to_request()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let response=test::call_service(&app,test::TestRequest::post().uri("/api/v1/plugins/portable-hook-example/hooks/review").set_json(serde_json::json!({"config":"hooks/hooks.json","digest":digest,"enabled":true,"confirm_execution":true})).to_request()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/plugins/portable-hook-example/hooks")
+            .to_request(),
+    )
+    .await;
+    let report: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(report["hooks"][0]["state"], "active");
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/plugins/portable-hook-example/update")
+            .set_json(local_dir_source(&source))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/plugins/portable-hook-example/hooks")
+            .to_request(),
+    )
+    .await;
+    let report: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(report["hooks"][0]["state"], "needs-review");
+    assert_eq!(
+        tokio::fs::read(data.path().join("hooks.json")).await.ok(),
+        native_hooks
+    );
+}
+
+#[actix_web::test]
+async fn portable_hook_review_rejects_invalid_manifest_and_platform_without_changing_trust() {
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(data.path()).await;
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../infra/bamboo-plugin/examples/portable-hooks");
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/plugins/install")
+            .set_json(local_dir_source(&source))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let registry = data.path().join("plugins/installed.json");
+    let store = InstalledPlugins::load(&registry).await.unwrap();
+    let entry = store.get_unique("portable-hook-example").unwrap().unwrap();
+    let original: bamboo_plugin::PluginManifest =
+        serde_json::from_slice(&std::fs::read(entry.plugin_dir.join("plugin.json")).unwrap())
+            .unwrap();
+    let receipt = entry.registered.hooks[0].clone();
+    let response = test::call_service(&app, test::TestRequest::post().uri("/api/v1/plugins/portable-hook-example/hooks/review").set_json(serde_json::json!({"config":receipt.config,"digest":receipt.digest,"enabled":true,"confirm_execution":true})).to_request()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let trusted = InstalledPlugins::load(&registry)
+        .await
+        .unwrap()
+        .get_unique(&entry.id)
+        .unwrap()
+        .unwrap()
+        .registered
+        .hooks
+        .clone();
+    for platform_case in [true, false] {
+        let mut changed = original.clone();
+        if platform_case {
+            changed.platforms = Some(vec![if Platform::current() == Some(Platform::Windows) {
+                Platform::Linux
+            } else {
+                Platform::Windows
+            }]);
+        } else {
+            changed.name.clear();
+        }
+        std::fs::write(
+            entry.plugin_dir.join("plugin.json"),
+            serde_json::to_vec(&changed).unwrap(),
+        )
+        .unwrap();
+        let digest = bamboo_plugin::hooks::registrations(&changed, &entry.plugin_dir).unwrap()[0]
+            .digest
+            .clone();
+        let response = test::call_service(&app, test::TestRequest::post().uri("/api/v1/plugins/portable-hook-example/hooks/review").set_json(serde_json::json!({"config":receipt.config,"digest":digest,"enabled":true,"confirm_execution":true})).to_request()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/plugins/portable-hook-example/hooks")
+                .to_request(),
+        )
+        .await;
+        let report: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(report["state"], "unsupported");
+        assert_eq!(
+            InstalledPlugins::load(&registry)
+                .await
+                .unwrap()
+                .get_unique(&entry.id)
+                .unwrap()
+                .unwrap()
+                .registered
+                .hooks,
+            trusted
+        );
+    }
+}
+
+#[actix_web::test]
+async fn portable_hook_data_survives_install_and_uninstall_of_plugin_named_data() {
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(data.path()).await;
+    let app = test::init_service(plugin_test_app!(state)).await;
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../infra/bamboo-plugin/examples/portable-hooks");
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/plugins/install")
+            .set_json(local_dir_source(&source))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let persistent = data.path().join("plugins/.hook-data/portable-hook-example");
+    std::fs::create_dir_all(&persistent).unwrap();
+    std::fs::write(persistent.join("state"), "other plugin state").unwrap();
+    let source_copy = tempfile::tempdir().unwrap();
+    std::fs::create_dir(source_copy.path().join("hooks")).unwrap();
+    for file in ["plugin.json", "hooks/hooks.json", "hooks/policy.py"] {
+        std::fs::copy(source.join(file), source_copy.path().join(file)).unwrap();
+    }
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(source_copy.path().join("plugin.json")).unwrap())
+            .unwrap();
+    manifest["id"] = serde_json::json!("data");
+    std::fs::write(
+        source_copy.path().join("plugin.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/plugins/install")
+            .set_json(local_dir_source(source_copy.path()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = test::call_service(
+        &app,
+        test::TestRequest::delete()
+            .uri("/api/v1/plugins/data")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        std::fs::read_to_string(persistent.join("state")).unwrap(),
+        "other plugin state"
+    );
+    assert!(data
+        .path()
+        .join("plugins/portable-hook-example/plugin.json")
+        .exists());
+    assert!(!data.path().join("plugins/data").exists());
+}
+
+#[actix_web::test]
+async fn portable_hook_endpoints_report_absent_plugins_as_not_found() {
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(data.path()).await;
+    let app = test::init_service(plugin_test_app!(state)).await;
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/plugins/missing/hooks")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = test::call_service(&app, test::TestRequest::post()
+        .uri("/api/v1/plugins/missing/hooks/review")
+        .set_json(serde_json::json!({"config":"hooks.json","digest":"missing","enabled":true,"confirm_execution":true}))
+        .to_request()).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}

@@ -269,4 +269,112 @@ mod tests {
             })
         );
     }
+
+    #[actix_web::test]
+    async fn corrupt_and_unsupported_authority_return_private_typed_errors_without_writes() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x37; 32]);
+        let bootstrap = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let mut state = AppState::new(bootstrap.path().canonicalize().unwrap())
+            .await
+            .unwrap();
+        // Startup FTS maintenance retains its original empty store. Give the
+        // real gateway a separate real store so it cannot race this witness.
+        let store = std::sync::Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.clone())
+                .await
+                .unwrap(),
+        );
+        state.storage = store.clone();
+        state.session_store = store;
+        let state = web::Data::new(state);
+        let root = Session::new("private-error-root", "PRIVATE-MODEL");
+        state.session_store.save_session(&root).await.unwrap();
+        state.session_store.flush_search_index().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::agent_routes),
+        )
+        .await;
+        let request = || {
+            test::TestRequest::get()
+                .uri("/api/v1/actors/private-error-root/snapshot")
+                .peer_addr("127.0.0.1:1234".parse().unwrap())
+                .insert_header((header::HOST, "localhost"))
+                .to_request()
+        };
+        let healthy = test::call_service(&app, request()).await;
+        assert_eq!(healthy.status(), StatusCode::OK);
+        let source = home.join("sessions/private-error-root/session.json");
+        let runtime = home.join("sessions/private-error-root/runtime.json");
+        let main_before = std::fs::read(&source).unwrap();
+        let runtime_before = std::fs::read(&runtime).unwrap();
+        for (path, replacement, expected_status, expected_code) in [
+            (
+                &runtime,
+                b"{\"lease_owner\":\"PRIVATE-HOST\",\"endpoint\":\"PRIVATE-ENDPOINT\",".to_vec(),
+                StatusCode::CONFLICT,
+                "inconsistent_authority",
+            ),
+            (
+                &source,
+                serde_json::to_vec(&root).unwrap(), // Unsupported unframed legacy Main.
+                StatusCode::NOT_IMPLEMENTED,
+                "unsupported_authority",
+            ),
+        ] {
+            std::fs::write(&source, &main_before).unwrap();
+            std::fs::write(&runtime, &runtime_before).unwrap();
+            std::fs::write(path, replacement).unwrap();
+            let before = snapshot_durable_files(&home);
+            let response = test::call_service(&app, request()).await;
+            assert_eq!(response.status(), expected_status);
+            assert!(response.headers().get(header::ETAG).is_none());
+            let bytes = test::read_body(response).await;
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "schema_version": ACTOR_SNAPSHOT_SCHEMA_VERSION,
+                    "error": crate::error::error_value(expected_code)
+                })
+            );
+            let text = std::str::from_utf8(&bytes).unwrap();
+            for private in ["PRIVATE", root.id.as_str(), home.to_str().unwrap()] {
+                assert!(!text.contains(private));
+            }
+            state.session_store.flush_search_index().await;
+            assert_eq!(snapshot_durable_files(&home), before);
+        }
+        std::fs::write(&source, main_before).unwrap();
+        std::fs::write(&runtime, runtime_before).unwrap();
+        let restored = test::call_service(&app, request()).await;
+        assert_eq!(restored.status(), StatusCode::OK);
+    }
+
+    fn snapshot_durable_files(
+        home: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        fn walk(
+            directory: &std::path::Path,
+            files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    files.insert(path.clone(), vec![]);
+                    walk(&path, files);
+                } else {
+                    assert!(entry.file_type().unwrap().is_file());
+                    files.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut files = Default::default();
+        walk(home, &mut files);
+        files
+    }
 }

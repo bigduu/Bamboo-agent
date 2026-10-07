@@ -1111,6 +1111,7 @@ dependencies = [
  "bamboo-mcp",
  "bamboo-memory",
  "bamboo-metrics",
+ "bamboo-plugin",
  "bamboo-skills",
  "bamboo-storage",
  "bamboo-subagent",
@@ -1165,6 +1166,7 @@ dependencies = [
  "bamboo-domain",
  "bamboo-infrastructure",
  "bamboo-llm",
+ "bamboo-plugin",
  "chrono",
  "libc",
  "regex",
@@ -1355,8 +1357,10 @@ dependencies = [
  "bamboo-domain",
  "bamboo-plugin-protocol",
  "chrono",
+ "regex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1553,6 +1557,9 @@ dependencies = [
  "bamboo-config",
  "bamboo-domain",
  "bamboo-infrastructure",
+ "cap-fs-ext",
+ "cap-primitives",
+ "cap-std",
  "chrono",
  "hex",
  "libc",
@@ -1671,6 +1678,7 @@ dependencies = [
  "dirs",
  "futures",
  "globset",
+ "ignore",
  "regex",
  "reqwest",
  "serde",
@@ -2366,6 +2374,16 @@ version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
 dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-deque"
+version = "0.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "622f3fc73690be383c7214310406f28a90e6edeadc3cea882f9d71e495b9711a"
+dependencies = [
+ "crossbeam-epoch",
  "crossbeam-utils",
 ]
 
@@ -3970,6 +3988,22 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "ignore"
+version = "0.4.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00b69833ed729dc5aa7d19541d96d6cf8e9137194207a04916d658e43168402f"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
 ]
 
 [[package]]

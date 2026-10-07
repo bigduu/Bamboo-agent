@@ -5,9 +5,9 @@ edition = "2021"
 rust-version.workspace = true
 description = "Lifecycle hook dispatch and external script orchestration for Bamboo"
 license = "MIT"
-license-file = "../../../LICENSE"
 
 [dependencies]
+bamboo-plugin = { path = "../bamboo-plugin" }
 bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
 bamboo-config = { path = "../bamboo-config" }
 bamboo-domain = { path = "../../core/bamboo-domain" }
@@ -32,4 +32,5 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+bamboo-infrastructure = { path = "../bamboo-infrastructure", features = ["test-utils"] }
 tempfile = "3"

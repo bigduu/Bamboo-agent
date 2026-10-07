@@ -5,7 +5,6 @@ edition = "2021"
 rust-version.workspace = true
 description = "Agent-to-Agent (A2A) protocol client for the Bamboo agent framework"
 license = "MIT"
-license-file = "../../../LICENSE"
 
 [dependencies]
 serde = { workspace = true }

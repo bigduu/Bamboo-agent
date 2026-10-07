@@ -5,7 +5,6 @@ edition = "2021"
 rust-version.workspace = true
 description = "Standalone network message broker for sub-agent ask/reply: durable Mailbox queues fronted by a WebSocket bus"
 license = "MIT"
-license-file = "../../../LICENSE"
 
 [dependencies]
 bamboo-subagent = { path = "../../infra/bamboo-subagent" }
