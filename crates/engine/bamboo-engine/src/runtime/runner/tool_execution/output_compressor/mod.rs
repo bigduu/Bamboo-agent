@@ -677,6 +677,7 @@ mod tests {
             permission_replay_origin: None,
             result: Ok(ToolResult::text(true, raw.clone())),
             needs_human: None,
+            portable_tool: None,
             post_tool_hook_eligible: true,
             tool_duration: std::time::Duration::ZERO,
         };
@@ -752,6 +753,7 @@ mod tests {
                 permission_replay_origin: None,
                 result: Ok(ToolResult::text(true, raw)),
                 needs_human: None,
+                portable_tool: None,
                 post_tool_hook_eligible: true,
                 tool_duration: std::time::Duration::ZERO,
             };
