@@ -286,6 +286,7 @@ async fn required_packet_optional_fit_and_final_safe_cap_guard() {
             reasoning_effort: None,
             max_context_tokens: prepared.budget.max_context_tokens,
             max_output_tokens: prepared.budget.max_output_tokens,
+            observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
     )

@@ -873,16 +873,6 @@ pub(crate) async fn execute_round_tool_calls(
         }
     }
 
-    // Place guidance after the complete paired tool-result batch so it cannot
-    // split an assistant tool-call message from its remaining tool responses.
-    if let Some(hint) = policy_guard.observation_progress_hint() {
-        let mut message = bamboo_agent_core::Message::user(hint);
-        message.metadata = Some(serde_json::json!({
-            "hidden_from_ui": true,
-            "runtime_kind": "observation_progress_hint",
-        }));
-        session.add_message(message);
-    }
     Ok(state.into_result())
 }
 

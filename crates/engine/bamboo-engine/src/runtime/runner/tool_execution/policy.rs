@@ -257,7 +257,7 @@ impl ToolPolicyGuard {
         self.observation_progress.begin_round(round);
     }
 
-    pub(super) fn observation_progress_hint(&mut self) -> Option<&'static str> {
+    pub(crate) fn observation_progress_hint(&mut self) -> Option<&'static str> {
         self.observation_progress.finish_round()
     }
 
