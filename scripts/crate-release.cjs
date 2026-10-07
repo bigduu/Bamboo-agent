@@ -177,19 +177,19 @@ async function publish(context, release, receipt) {
   }
 }
 
-async function completedAutomaticReceipts(context, currentRelease, receipt, { stableOnly = false } = {}) {
+async function automaticReceipts(context, currentRelease, receipt, { stableOnly = false } = {}) {
   const receipts = []
   for (const release of await context.releases()) {
     if (release.id === currentRelease.id || (stableOnly && (release.draft || release.prerelease))) continue
     const previous = await context.readReceipt(release)
-    if (!previous?.automatic || !previous.completed) continue
+    if (!previous?.automatic || (stableOnly && !previous.completed)) continue
     validateReceipt(previous, previous.identity, previous.crates)
     assert.equal(previous.identity.repository, receipt.identity.repository)
     assert.match(previous.identity.sourceRevision, SHA)
     assert.equal(release.target_commitish, previous.identity.sourceRevision)
     assert.equal(release.tag_name, `v${previous.version}`)
     assert.equal(await context.tagSource(previous.version), previous.identity.sourceRevision,
-      'Completed automatic release tag points to different source')
+      'Automatic release tag points to different source')
     receipts.push(previous)
   }
   return receipts
@@ -208,11 +208,11 @@ function compareAutomaticVersions(left, right) {
 
 async function assertAutomaticVersionOrder(context, release, receipt) {
   if (!receipt.automatic) return
-  for (const previous of await completedAutomaticReceipts(context, release, receipt)) {
+  for (const previous of await automaticReceipts(context, release, receipt)) {
     if (previous.identity.sourceRevision !== receipt.identity.sourceRevision &&
         compareAutomaticVersions(receipt.version, previous.version) >= 0) {
       assert.ok(await context.isAncestor(previous.identity.sourceRevision, receipt.identity.sourceRevision),
-        'Older or unproven main source cannot publish at or above a completed newer source version')
+        'Older or unproven main source cannot publish at or above a reserved newer source version')
     }
   }
 }
@@ -221,7 +221,7 @@ async function shouldMakeLatest(context, currentRelease, receipt) {
   if (!receipt.automatic) return false
   // A retry may finish after a newer main source. Release numbers describe
   // allocation time, so a late first attempt for old CI can have a larger one.
-  for (const previous of await completedAutomaticReceipts(context, currentRelease, receipt, { stableOnly: true })) {
+  for (const previous of await automaticReceipts(context, currentRelease, receipt, { stableOnly: true })) {
     if (previous.identity.sourceRevision === receipt.identity.sourceRevision) {
       if (compareAutomaticVersions(previous.version, receipt.version) > 0) return false
     } else if (!await context.isAncestor(previous.identity.sourceRevision, receipt.identity.sourceRevision)) {
@@ -402,7 +402,7 @@ function makeContext(env = process.env) {
     isAncestor: async (ancestor, descendant) => gitIsAncestor(ancestor, descendant),
     tagSource: async (version) => {
       const tag = github(repository, `git/ref/tags/v${assertVersion(version)}`)
-      assert.equal(tag.object.type, 'commit', 'Completed automatic release tag must be a direct commit ref')
+      assert.equal(tag.object.type, 'commit', 'Automatic release tag must be a direct commit ref')
       return tag.object.sha
     },
     reserve: async (receipt) => github(repository, 'releases', {

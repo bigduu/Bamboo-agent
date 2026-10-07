@@ -218,8 +218,9 @@ publishing again or changing the latest release.
 An older main CI recovery remains public without replacing a completed newer
 main source as GitHub's latest; source ancestry takes precedence over the date
 sequence allocated when each run first starts.
-Before any crate upload, an older or unproven main source at or above an already
-completed newer source version is rejected, preserving crates.io version order.
+Before any crate upload, an older or unproven main source at or above a newer
+source's reserved version is rejected, including partial publications. This
+preserves crates.io version order while the newer source is still recovering.
 
 The existing manual workflow inputs remain available, including `dev` dispatches
 from Zenith and the explicit fixed legacy frontend rollback. Pass an unused real

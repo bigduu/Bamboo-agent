@@ -297,6 +297,19 @@ test('completed crate versions remain ordered even when the final GitHub publica
   assert.deepEqual(calls, ['reserve', 'tag', 'frontend'])
 })
 
+test('a newer main partial publication keeps its reserved version ahead of a late older main attempt', async () => {
+  const newerSource = 'b'.repeat(40)
+  const newer = makeReceipt({ version: '2026.10.10',
+    identity: { ...clone(identity), sourceRevision: newerSource },
+    packageChecksums: { 'bamboo-domain': checksum } })
+  const { context, calls } = fixture({ releases: async () => [release(newer, { id: 43 })],
+    tagSource: async () => newerSource, isAncestor: async () => false })
+  const result = await plan(context)
+  assert.equal(result.receipt.version, '2026.10.11')
+  await assert.rejects(() => publish(context, result.release, result.receipt), /cannot publish at or above/)
+  assert.deepEqual(calls, ['reserve', 'tag', 'frontend'])
+})
+
 test('Git source ordering handles descendants published after checkout and rejects divergent history', (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-release-ancestry-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
