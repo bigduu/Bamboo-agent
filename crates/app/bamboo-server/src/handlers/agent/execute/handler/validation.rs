@@ -1,10 +1,8 @@
 #[cfg(test)]
-use actix_web::HttpResponse;
+use crate::error::ResponseResult;
 
 #[cfg(test)]
-pub(super) fn validate_and_normalize_model(
-    model: Option<&str>,
-) -> Result<Option<String>, HttpResponse> {
+pub(super) fn validate_and_normalize_model(model: Option<&str>) -> ResponseResult<Option<String>> {
     let Some(model) = model else {
         return Ok(None);
     };

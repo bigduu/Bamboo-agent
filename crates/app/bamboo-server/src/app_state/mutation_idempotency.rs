@@ -7,6 +7,8 @@
 //! are replayed for a bounded window. Only digests are retained; raw keys and
 //! request payloads never enter the cache or logs.
 
+use crate::error::ResponseResult;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -49,7 +51,7 @@ pub(crate) fn prepare<T: Serialize + ?Sized>(
     scope: &str,
     target: &str,
     payload: &T,
-) -> Result<Option<PreparedMutationIdempotency>, HttpResponse> {
+) -> ResponseResult<Option<PreparedMutationIdempotency>> {
     let Some(value) = request.headers().get(IDEMPOTENCY_KEY_HEADER) else {
         return Ok(None);
     };

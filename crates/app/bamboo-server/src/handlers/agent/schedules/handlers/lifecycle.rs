@@ -17,15 +17,15 @@ pub async fn create_schedule(
 ) -> Result<HttpResponse> {
     let name = match validate_schedule_name(&req.name) {
         Ok(name) => name,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let resolved = match resolve_create_schedule_definition(&req) {
         Ok(value) => value,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let run_config = match validate_auto_execute_run_config(&state, &req.run_config).await {
         Ok(run_config) => run_config,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
 
     let created = state
@@ -61,7 +61,7 @@ pub async fn patch_schedule(
             }
             match validate_auto_execute_run_config(&state, &run_config).await {
                 Ok(run_config) => Some(run_config),
-                Err(response) => return Ok(response),
+                Err(response) => return Ok(*response),
             }
         }
         None => None,
@@ -69,7 +69,7 @@ pub async fn patch_schedule(
 
     let resolved = match resolve_patch_schedule_definition(&req) {
         Ok(value) => value,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
 
     let updated = state
@@ -110,7 +110,7 @@ pub async fn run_now(state: web::Data<AppState>, path: web::Path<String>) -> Res
         return Ok(schedule_not_found(&id));
     };
     if let Err(response) = validate_auto_execute_run_config(&state, &schedule.run_config).await {
-        return Ok(response);
+        return Ok(*response);
     }
     let Some(claimed) = state
         .schedule_store
