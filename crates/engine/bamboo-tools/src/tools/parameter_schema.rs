@@ -9,13 +9,50 @@ pub(super) fn for_arguments<T: schemars::JsonSchema>() -> serde_json::Value {
     schema.to_value()
 }
 
+// Read/Glob historically advertise a plain number while serde parses usize.
+// Keep that provider contract without integer bounds or a float format.
+pub(super) fn number(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type": "number"})
+}
+
 #[cfg(test)]
 mod tests {
-    use bamboo_agent_core::Tool;
+    use bamboo_agent_core::{Message, Tool};
+    use bamboo_llm::providers::anthropic::build_anthropic_request_with_cache_blocks;
     use bamboo_llm::providers::common::tool_schema::sanitize_openai_function_parameters_schema;
     use serde_json::json;
 
-    use crate::tools::{ViewImageTool, WriteTool};
+    use crate::tools::{GlobTool, ReadTool, ViewImageTool, WriteTool};
+
+    fn anthropic_input_schema(
+        tool: &dyn Tool,
+        parameters: &serde_json::Value,
+    ) -> serde_json::Value {
+        let mut schema = tool.to_schema();
+        schema.function.parameters = parameters.clone();
+        let request = build_anthropic_request_with_cache_blocks(
+            &[Message::user("Inspect the workspace")],
+            &[],
+            &[schema],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            None,
+            false,
+        );
+        let tools = request["tools"].as_array().expect("wire tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], tool.name());
+        assert_eq!(tools[0]["description"], tool.description());
+        serde_json::Value::Object(
+            tools[0]["input_schema"]
+                .as_object()
+                .expect("wire input_schema")
+                .clone(),
+        )
+    }
 
     fn assert_unchanged(tool: &dyn Tool, previous: serde_json::Value) {
         let generated = tool.parameters_schema();
@@ -23,6 +60,10 @@ mod tests {
         assert_eq!(
             sanitize_openai_function_parameters_schema(&generated).to_string(),
             sanitize_openai_function_parameters_schema(&previous).to_string()
+        );
+        assert_eq!(
+            anthropic_input_schema(tool, &generated).to_string(),
+            anthropic_input_schema(tool, &previous).to_string()
         );
     }
 
@@ -61,6 +102,63 @@ mod tests {
                     }
                 },
                 "required": ["path"],
+                "additionalProperties": false
+            }),
+        );
+    }
+
+    #[test]
+    fn read_schema_preserves_existing_parameter_contract() {
+        assert_unchanged(
+            &ReadTool::new(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "The absolute path to the file or directory to read"
+                    },
+                    "offset": {
+                        "type": "number",
+                        "description": "The line offset to start reading from. Omit when you want the full file or directory listing."
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "The maximum number of lines or directory entries to read. Omit for the full result when safe."
+                    }
+                },
+                "required": ["file_path"],
+                "additionalProperties": false
+            }),
+        );
+    }
+
+    #[test]
+    fn glob_schema_preserves_existing_parameter_contract() {
+        assert_unchanged(
+            &GlobTool::new(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "The glob pattern to match files against (for example **/*.rs or src/**/*.ts)"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "The directory to search in. Omit to use the current workspace root."
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of returned matches (default 100, hard cap 200). Use a smaller limit for broad searches."
+                    },
+                    "include_ignored": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Include gitignored files. Requires an explicit path; scan/result limits and fixed directory exclusions still apply."
+                    }
+                },
+                "required": ["pattern"],
                 "additionalProperties": false
             }),
         );
