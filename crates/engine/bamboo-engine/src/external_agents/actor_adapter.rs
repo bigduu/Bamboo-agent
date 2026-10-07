@@ -12462,8 +12462,20 @@ mod tests {
                 store.clone(),
                 bamboo_domain::SessionInboxLimits::default(),
             );
+            // Complete unfenced persistence before starting the setup lease window.
+            let envelope =
+                bamboo_domain::SessionMessageEnvelope::user_input(&child.id, "RECOVER_SAME_INPUT");
+            let receipt = inbox.deliver(&envelope).await.unwrap();
+            inbox
+                .mark_activation_eligible(
+                    &child.id,
+                    receipt.generation,
+                    bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                )
+                .await
+                .unwrap();
             let now = chrono::Utc::now();
-            let cutoff = now + chrono::Duration::seconds(1);
+            let cutoff = now + chrono::Duration::seconds(10);
             let consumer = SessionInboxConsumerId::new();
             let old = store
                 .claim_activation(&ActorActivationClaim {
@@ -12471,7 +12483,7 @@ mod tests {
                     run_id: "old-run".into(),
                     lease_owner: consumer.as_str().into(),
                     lease_expires_at: if case == "actor-live" {
-                        now + chrono::Duration::minutes(1)
+                        now + chrono::Duration::minutes(5)
                     } else {
                         cutoff
                     },
@@ -12489,18 +12501,11 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            store.start_activation(&old.fence(), now).await.unwrap();
-            let envelope =
-                bamboo_domain::SessionMessageEnvelope::user_input(&child.id, "RECOVER_SAME_INPUT");
-            let receipt = inbox.deliver(&envelope).await.unwrap();
-            inbox
-                .mark_activation_eligible(
-                    &child.id,
-                    receipt.generation,
-                    bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
-                )
+            store
+                .start_activation(&old.fence(), chrono::Utc::now())
                 .await
                 .unwrap();
+            let claim_now = chrono::Utc::now();
             let claim = inbox
                 .claim_owned(
                     &child.id,
@@ -12508,11 +12513,11 @@ mod tests {
                     Some("old-run"),
                     &SessionInboxLeaseRequest {
                         consumer,
-                        now,
+                        now: claim_now,
                         duration: if case == "claim-live" {
-                            chrono::Duration::minutes(1)
+                            chrono::Duration::minutes(5)
                         } else {
-                            cutoff - now
+                            cutoff - claim_now
                         },
                     },
                 )
@@ -12532,6 +12537,29 @@ mod tests {
                 .await
                 .unwrap()
                 .session;
+            // The real checkpoint must succeed under the original live authority.
+            store
+                .validate_fence(&old.fence(), chrono::Utc::now())
+                .await
+                .unwrap_or_else(|error| panic!("{case}: setup fence: {error:?}"));
+            let setup_leases = inbox
+                .inspect_owned_leases(&child.id, 2, chrono::Utc::now())
+                .await
+                .unwrap();
+            assert_eq!(setup_leases.len(), 1, "{case}: original setup claim");
+            assert_eq!(setup_leases[0].epoch, claim.lease.epoch, "{case}");
+            assert_eq!(setup_leases[0].expires_at, claim.lease.expires_at, "{case}");
+            assert!(!setup_leases[0].expired, "{case}: setup claim must be live");
+            let setup_at = chrono::Utc::now();
+            assert!(
+                setup_at < old.lease_expires_at,
+                "{case}: setup Actor expired"
+            );
+            assert!(
+                setup_at < claim.lease.expires_at,
+                "{case}: setup claim expired"
+            );
+            eprintln!("pre-ACK {case}: setup live at {setup_at}, cutoff {cutoff}");
             if case == "ack" {
                 inbox
                     .ack_owned(&child.id, &claim, chrono::Utc::now())
@@ -12571,8 +12599,40 @@ mod tests {
                 "birth" => child.created_at += chrono::Duration::nanoseconds(1),
                 _ => {}
             }
+            // One shared short deadline per case; never wait for the live controls.
+            // No reclaim, renewal or authority-file edit occurs between these stages.
             let delay = (cutoff - chrono::Utc::now()).to_std().unwrap_or_default();
             tokio::time::sleep(delay + Duration::from_millis(10)).await;
+            let recovery_at = chrono::Utc::now();
+            assert!(recovery_at >= cutoff, "{case}: real expiry is required");
+            let before_recovery = store.inspect_actor(&child.id).await.unwrap();
+            let original = before_recovery.activation.unwrap();
+            assert_eq!(original.fence(), old.fence(), "{case}: same authority");
+            assert_eq!(original.lease_expires_at, old.lease_expires_at, "{case}");
+            assert_eq!(
+                store
+                    .validate_fence(&old.fence(), recovery_at)
+                    .await
+                    .is_ok(),
+                case == "actor-live",
+                "{case}: Actor expiry control"
+            );
+            let recovery_leases = inbox
+                .inspect_owned_leases(&child.id, 2, recovery_at)
+                .await
+                .unwrap();
+            if case == "ack" {
+                assert!(recovery_leases.is_empty(), "{case}: terminal ACK");
+            } else {
+                assert_eq!(recovery_leases.len(), 1, "{case}: original recovery claim");
+                assert_eq!(recovery_leases[0].epoch, claim.lease.epoch, "{case}");
+                assert_eq!(
+                    recovery_leases[0].expires_at, claim.lease.expires_at,
+                    "{case}"
+                );
+                assert_eq!(recovery_leases[0].expired, case != "claim-live", "{case}");
+            }
+            eprintln!("pre-ACK {case}: recovery expiry control at {recovery_at}");
             let second = Arc::new(
                 bamboo_storage::SessionStoreV2::new(temp.path().into())
                     .await
