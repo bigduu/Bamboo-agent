@@ -142,15 +142,28 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
         ))
     }
 
+    async fn commit_durable_child_delivery(
+        &self,
+        session: &bamboo_agent_core::Session,
+        activation_run_id: &str,
+    ) -> Result<(), String> {
+        for runner in &self.runners {
+            runner
+                .commit_durable_child_delivery(session, activation_run_id)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn confirm_durable_child_delivery(
         &self,
         session: &bamboo_agent_core::Session,
         activation_run_id: &str,
-        save_succeeded: bool,
+        history_committed: bool,
     ) -> Result<(), String> {
         for runner in &self.runners {
             runner
-                .confirm_durable_child_delivery(session, activation_run_id, save_succeeded)
+                .confirm_durable_child_delivery(session, activation_run_id, history_committed)
                 .await?;
         }
         Ok(())

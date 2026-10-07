@@ -1205,6 +1205,9 @@ impl BrokerTerminalReceiptReconciler {
             .map(String::as_str)
             .unwrap_or("worker");
         for receipt in receipts {
+            publish_recovered_completion_source(&self.store, &receipt)
+                .await
+                .map_err(|_| "committed Child completion source remains pending")?;
             if current
                 .metadata
                 .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
@@ -1282,6 +1285,61 @@ impl BrokerTerminalReceiptReconciler {
         }
         Ok(())
     }
+}
+
+/// Finish only the interrupted publication of an already committed Host
+/// receipt. The pending source stays in the existing protected source record;
+/// no provider, event admission or transcript reconstruction is involved.
+async fn publish_recovered_completion_source(
+    store: &Arc<bamboo_storage::SessionStoreV2>,
+    receipt: &bamboo_storage::v2::BrokerTerminalReceipt,
+) -> Result<(), String> {
+    let expected = store
+        .load_session(&receipt.session_id)
+        .await
+        .map_err(|error| format!("Child completion recovery reload failed: {error}"))?
+        .ok_or("Child completion recovery snapshot missing")?;
+    if expected.id != receipt.session_id
+        || expected.created_at != receipt.created_at
+        || expected.parent_session_id.as_deref() != Some(receipt.parent_session_id.as_str())
+        || expected.root_session_id != receipt.root_session_id
+        || expected.project_id_meta() != receipt.project_id
+    {
+        return Err("Child completion recovery identity changed".into());
+    }
+    let mut candidate = expected.clone();
+    if candidate.last_run_status().as_deref() == Some("running") {
+        candidate.set_last_run_status(receipt.terminal_status.clone());
+        if let Some(error) = &receipt.terminal_error {
+            candidate.set_last_run_error(error.clone());
+        } else {
+            candidate.clear_last_run_error();
+        }
+    }
+    if crate::execution::ChildCompletionSource::publish_after_durable_delivery(
+        &mut candidate,
+        &receipt.activation_run_id,
+    )? {
+        let source = crate::execution::ChildCompletionSource::from_committed_session(&candidate)
+            .ok_or("Child completion recovery source invalid")?;
+        let published = candidate
+            .metadata
+            .get("runtime.child_completion_source_v1")
+            .ok_or("Child completion recovery source missing")?;
+        // CAS reloads under the physical Session lock and mutates only the
+        // source/status fields. Another reconciler or successor cannot be
+        // overwritten by this earlier snapshot.
+        let saved = store
+            .publish_broker_terminal_source(receipt, &expected, published)
+            .await
+            .map_err(|error| format!("Child completion recovery publication failed: {error}"))?;
+        if crate::execution::ChildCompletionSource::from_committed_session(&saved).as_ref()
+            != Some(&source)
+        {
+            return Err("Child completion recovery source changed".into());
+        }
+    }
+    Ok(())
 }
 
 fn receipt_remote_route(
@@ -1481,6 +1539,16 @@ struct PendingDurableChildLink {
     /// Captured from this Host frame pump after canonical nested-wait checks.
     /// The map key binds it to the exact Child birth and activation Run.
     host_nested_wait_handoff: bool,
+    // Never reconstructed from Worker JSON or ordinary Session metadata.
+    strict_history: Option<StrictTerminalHistory>,
+    strict_history_required: bool,
+    strict_history_committed: bool,
+}
+
+#[derive(Clone)]
+struct StrictTerminalHistory {
+    proof: bamboo_storage::v2::HostTerminalCompleteness,
+    watermark: bamboo_subagent::ActorEventWatermark,
 }
 
 fn effective_broker_terminal_status(
@@ -2599,17 +2667,21 @@ impl ExternalChildRunner for ActorChildRunner {
             session.created_at,
             activation_run_id.to_owned(),
         );
-        let (delivery, host_nested_wait_handoff) = {
+        let (delivery, host_nested_wait_handoff, strict_history) = {
             let pending = self.pending_durable_links.lock().await;
             let Some(pending) = pending.get(&key) else {
                 return Ok(false);
             };
+            if pending.strict_history_required && pending.strict_history.is_none() {
+                return Err("Host strict terminal completeness proof missing".into());
+            }
             (
                 pending
                     .link
                     .durable_delivery_receipt()
                     .ok_or_else(|| "broker terminal has no exact durable receipt".to_string())?,
                 pending.host_nested_wait_handoff,
+                pending.strict_history.clone(),
             )
         };
         let expected_status =
@@ -2657,41 +2729,146 @@ impl ExternalChildRunner for ActorChildRunner {
         } else {
             None
         };
+        let route = bamboo_storage::v2::BrokerTerminalRoute {
+            activation_run_id,
+            broker_identity: &delivery.broker_identity,
+            parent_mailbox: &delivery.parent_mailbox,
+            broker_correlation_id: &delivery.correlation_id,
+            message_ids: &delivery.message_ids,
+        };
         if let Some(call_id) = yielded_call {
             let proof = bamboo_storage::v2::HostToolYield::from_verified_host(
                 session,
                 activation_run_id,
                 &call_id,
             )
-            .map_err(|e| e.to_string())?;
-            store
-                .prepare_broker_tool_yield_receipt(
-                    session,
-                    bamboo_storage::v2::BrokerTerminalRoute {
-                        activation_run_id,
-                        broker_identity: &delivery.broker_identity,
-                        parent_mailbox: &delivery.parent_mailbox,
-                        broker_correlation_id: &delivery.correlation_id,
-                        message_ids: &delivery.message_ids,
-                    },
-                    &proof,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
+            if let Some(history) = strict_history.as_ref() {
+                store
+                    .prepare_broker_tool_yield_receipt_with_completeness(
+                        session,
+                        route,
+                        &proof,
+                        &history.proof,
+                    )
+                    .await
+            } else {
+                store
+                    .prepare_broker_tool_yield_receipt(session, route, &proof)
+                    .await
+            }
+            .map_err(|error| format!("Host broker receipt prepare failed: {error}"))?;
         } else {
-            store
-                .prepare_broker_terminal_receipt(
-                    session,
-                    activation_run_id,
-                    &delivery.broker_identity,
-                    &delivery.parent_mailbox,
-                    &delivery.correlation_id,
-                    &delivery.message_ids,
-                )
-                .await
-                .map_err(|error| format!("Host broker receipt prepare failed: {error}"))?;
+            if let Some(history) = strict_history.as_ref() {
+                store
+                    .prepare_broker_terminal_receipt_with_completeness(
+                        session,
+                        route,
+                        &history.proof,
+                    )
+                    .await
+            } else {
+                store
+                    .prepare_broker_terminal_receipt(
+                        session,
+                        activation_run_id,
+                        &delivery.broker_identity,
+                        &delivery.parent_mailbox,
+                        &delivery.correlation_id,
+                        &delivery.message_ids,
+                    )
+                    .await
+            }
+            .map_err(|error| format!("Host broker receipt prepare failed: {error}"))?;
         }
         Ok(true)
+    }
+
+    async fn commit_durable_child_delivery(
+        &self,
+        session: &Session,
+        activation_run_id: &str,
+    ) -> Result<(), String> {
+        let key = (
+            session.id.clone(),
+            session.created_at,
+            activation_run_id.to_owned(),
+        );
+        let mut pending_links = self.pending_durable_links.lock().await;
+        let Some(pending) = pending_links.get_mut(&key) else {
+            return Ok(());
+        };
+        let delivery = pending
+            .link
+            .durable_delivery_receipt()
+            .ok_or_else(|| "broker terminal lost its exact durable receipt".to_string())?;
+        let expected_status = effective_broker_terminal_status(
+            delivery.terminal_status,
+            pending.host_nested_wait_handoff,
+        )?;
+        if session.last_run_status().as_deref() != Some(expected_status) {
+            return Err("Host final status differs from accepted broker terminal".into());
+        }
+        if pending.strict_history_required && pending.strict_history.is_none() {
+            return Err("Host strict terminal completeness proof missing".into());
+        }
+        let store = self
+            .actor_directory_store
+            .lock()
+            .recover_poison()
+            .clone()
+            .ok_or_else(|| "Host broker receipt store unavailable".to_string())?;
+        let committed = if let Some(history) = pending.strict_history.as_ref() {
+            store
+                .commit_broker_terminal_receipt_with_completeness(
+                    session,
+                    activation_run_id,
+                    &history.proof,
+                )
+                .await
+        } else {
+            store
+                .commit_broker_terminal_receipt(session, activation_run_id)
+                .await
+        }
+        .map_err(|error| format!("Host broker receipt checkpoint unconfirmed: {error}"))?;
+        if committed.broker_identity != delivery.broker_identity
+            || committed.parent_mailbox != delivery.parent_mailbox
+            || committed.broker_correlation_id != delivery.correlation_id
+            || committed.message_ids != delivery.message_ids
+            || committed.terminal_status != expected_status
+        {
+            return Err("Host broker receipt changed before completion".into());
+        }
+        if let Some(history) = pending.strict_history.as_ref() {
+            let proof = committed
+                .terminal_completeness
+                .as_ref()
+                .ok_or_else(|| "Host strict terminal completeness readback missing".to_string())?;
+            let creation = bamboo_subagent::proto::ChildCreationIdentity {
+                created_at: session.created_at,
+                spawn_depth: session.spawn_depth,
+            };
+            validate_strict_history_terminal(
+                Some(&history.watermark),
+                session,
+                session
+                    .parent_session_id
+                    .as_deref()
+                    .ok_or("Child parent missing")?,
+                Some(activation_run_id),
+                proof.execution_epoch,
+                Some(&creation),
+                proof.contiguous_applied_seq,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        // The same exact-snapshot CAS serves live and cold publication. An
+        // append-safe generic save could expose Completed after merging new
+        // input that invalidates the source; CAS rejects before that write.
+        publish_recovered_completion_source(&store, &committed).await?;
+        pending.strict_history_committed = true;
+        Ok(())
     }
 
     async fn confirm_durable_child_delivery(
@@ -2755,10 +2932,27 @@ impl ExternalChildRunner for ActorChildRunner {
             .recover_poison()
             .clone()
             .ok_or_else(|| "Host broker receipt store unavailable".to_string())?;
-        let committed = store
-            .commit_broker_terminal_receipt(session, activation_run_id)
-            .await
-            .map_err(|error| format!("Host broker receipt checkpoint unconfirmed: {error}"))?;
+        let committed = if pending.strict_history_required {
+            if !pending.strict_history_committed {
+                return Err("Host strict completeness was not committed before ACK".into());
+            }
+            let history = pending
+                .strict_history
+                .as_ref()
+                .ok_or_else(|| "Host strict terminal completeness proof missing".to_string())?;
+            store
+                .commit_broker_terminal_receipt_with_completeness(
+                    session,
+                    activation_run_id,
+                    &history.proof,
+                )
+                .await
+        } else {
+            store
+                .commit_broker_terminal_receipt(session, activation_run_id)
+                .await
+        }
+        .map_err(|error| format!("Host broker receipt checkpoint unconfirmed: {error}"))?;
         if committed.broker_identity != delivery.broker_identity
             || committed.parent_mailbox != delivery.parent_mailbox
             || committed.broker_correlation_id != delivery.correlation_id
@@ -3342,6 +3536,9 @@ impl ExternalChildRunner for ActorChildRunner {
                             format!("Host broker receipt recovery blocked: {error}")
                         })?;
                     for receipt in receipts {
+                        // This path already owns a successor Run and its public
+                        // running marker. Old committed receipts authorize ACK
+                        // only; never publish the predecessor over that owner.
                         if client.broker_parent_mailbox() != Some(receipt.parent_mailbox.as_str()) {
                             return Err(
                                 "old Child broker parent mailbox changed before ACK".to_string()
@@ -3823,6 +4020,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 self.approval_registry.clone(),
             );
 
+            let mut strict_history = None;
             let result = drive(ActorDriveContext {
                 client: &mut *client,
                 parent_session_id: &job.parent_session_id,
@@ -3864,6 +4062,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 },
                 local_history_tools: local_history_tools.as_deref(),
                 local_history_read_only: spec.capabilities.read_only_enforced(),
+                strict_history_output: Some(&mut strict_history),
                 plain_input: plain_activation.as_ref(),
                 canonical_activation: active_lease.as_ref().map(|lease| &lease.fence),
                 canonical_placement_ref: active_lease.as_ref().map(|lease| &lease.placement_ref),
@@ -4006,6 +4205,9 @@ impl ExternalChildRunner for ActorChildRunner {
                         PendingDurableChildLink {
                             link: client,
                             host_nested_wait_handoff,
+                            strict_history,
+                            strict_history_required: local_history_tools.is_some(),
+                            strict_history_committed: false,
                         },
                     );
                 } else {
@@ -6295,6 +6497,7 @@ struct ActorDriveContext<'a> {
     readonly_output: Option<&'a mut Vec<bamboo_agent_core::Message>>,
     local_history_tools: Option<&'a [String]>,
     local_history_read_only: bool,
+    strict_history_output: Option<&'a mut Option<StrictTerminalHistory>>,
     plain_input: Option<&'a PlainActorActivation>,
     canonical_activation: Option<&'a ActorActivationFence>,
     canonical_placement_ref: Option<&'a bamboo_domain::ActorPlacementRef>,
@@ -7555,6 +7758,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         mut readonly_output,
         local_history_tools,
         local_history_read_only,
+        mut strict_history_output,
         plain_input,
         canonical_activation,
         canonical_placement_ref,
@@ -8499,6 +8703,27 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 Ok(None)
                             }
                         };
+                        if local_history_tools.is_some() {
+                            // Failed strict Runs discard their collected suffix. A
+                            // consumed watermark cannot certify those unapplied
+                            // effects; retain every broker frame for recovery.
+                            if status != TerminalStatus::Completed {
+                                return terminal_result;
+                            }
+                            let proof = bamboo_storage::v2::HostTerminalCompleteness::from_verified_host(
+                                logical_session,
+                                activation_run_id.ok_or_else(local_tool_history_unsupported)?,
+                                current_epoch,
+                                next_actor_event_seq - 1,
+                            ).map_err(|_| local_tool_history_unsupported())?;
+                            let history = StrictTerminalHistory {
+                                proof,
+                                watermark: final_event_watermark.ok_or_else(local_tool_history_unsupported)?,
+                            };
+                            if let Some(output) = strict_history_output.as_deref_mut() {
+                                *output = Some(history);
+                            }
+                        }
                         // This marker is set only after every Host terminal
                         // validation above succeeded. A surfaced broker Outcome
                         // that failed permission, Inbox, or question checks must
@@ -9186,6 +9411,7 @@ mod tests {
 
     struct DurableAckProbe {
         calls: Arc<AtomicUsize>,
+        fail: bool,
         terminal_status: TerminalStatus,
         parent_mailbox: String,
     }
@@ -9216,7 +9442,13 @@ mod tests {
 
         async fn acknowledge_durable_frames(&mut self) -> bamboo_subagent::TransportResult<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            if self.fail {
+                Err(bamboo_subagent::TransportError::Protocol(
+                    "injected ACK delivery failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -9241,10 +9473,14 @@ mod tests {
             PendingDurableChildLink {
                 link: Box::new(DurableAckProbe {
                     calls: calls.clone(),
+                    fail: false,
                     terminal_status,
                     parent_mailbox: format!("p-{}", session.id),
                 }),
                 host_nested_wait_handoff,
+                strict_history: None,
+                strict_history_required: false,
+                strict_history_committed: false,
             },
         );
     }
@@ -9346,18 +9582,58 @@ mod tests {
             assert_eq!(mailbox.drain().await.unwrap().len(), 1);
             child.add_message(bamboo_agent_core::Message::assistant("done", None));
             child.set_last_run_status("completed");
-            store
-                .prepare_broker_terminal_receipt(
-                    &child,
-                    "run-1",
-                    receipt_broker,
-                    receipt_mailbox,
-                    "correlation-1",
-                    &[message_id.as_str().to_owned()],
+            if id == "receipt-good" {
+                let prior_ids = child.messages[..child.messages.len() - 1]
+                    .iter()
+                    .map(|message| message.id.clone())
+                    .collect();
+                crate::execution::ChildCompletionSource::prepare(&mut child, "run-1", &prior_ids);
+                assert!(
+                    crate::execution::ChildCompletionSource::defer_for_durable_delivery(
+                        &mut child, "run-1"
+                    )
+                    .unwrap()
+                );
+                let proof = bamboo_storage::v2::HostTerminalCompleteness::from_verified_host(
+                    &child, "run-1", 7, 1,
                 )
-                .await
                 .unwrap();
-            store.save_session(&child).await.unwrap();
+                store
+                    .prepare_broker_terminal_receipt_with_completeness(
+                        &child,
+                        bamboo_storage::v2::BrokerTerminalRoute {
+                            activation_run_id: "run-1",
+                            broker_identity: receipt_broker,
+                            parent_mailbox: receipt_mailbox,
+                            broker_correlation_id: "correlation-1",
+                            message_ids: &[message_id.as_str().to_owned()],
+                        },
+                        &proof,
+                    )
+                    .await
+                    .unwrap();
+                let mut staged = child.clone();
+                staged.set_last_run_status("running");
+                staged.clear_last_run_error();
+                store.save_session(&staged).await.unwrap();
+                store
+                    .commit_broker_terminal_receipt_with_completeness(&child, "run-1", &proof)
+                    .await
+                    .unwrap();
+            } else {
+                store
+                    .prepare_broker_terminal_receipt(
+                        &child,
+                        "run-1",
+                        receipt_broker,
+                        receipt_mailbox,
+                        "correlation-1",
+                        &[message_id.as_str().to_owned()],
+                    )
+                    .await
+                    .unwrap();
+                store.save_session(&child).await.unwrap();
+            }
         }
 
         let mut config = bamboo_config::Config::default();
@@ -9377,11 +9653,40 @@ mod tests {
                 broker_peer: None,
                 placement_requirements: None,
             });
-        let repair = BrokerTerminalReceiptReconciler::new(store.clone(), &config);
+        // Recover on an independently reopened Store, with no Actor executor or
+        // provider available. Only the committed Host proof can authorize ACK.
+        let cold_store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let before = cold_store
+            .load_session("receipt-good")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(crate::execution::ChildCompletionSource::has_source_record(
+            &before
+        ));
+        assert_eq!(before.last_run_status().as_deref(), Some("running"));
+        assert!(crate::execution::ChildCompletionSource::from_committed_session(&before).is_none());
+        let repair = BrokerTerminalReceiptReconciler::new(cold_store.clone(), &config);
         let report = repair.reconcile_once().await;
         assert_eq!(report.candidates, 5);
         assert_eq!(report.repaired, 2);
         assert_eq!(report.blocked, 3);
+        let after = cold_store
+            .load_session("receipt-good")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(crate::execution::ChildCompletionSource::from_committed_session(&after).is_some());
+        assert_eq!(
+            serde_json::to_value(before.messages).unwrap(),
+            serde_json::to_value(after.messages).unwrap()
+        );
+        let retry = repair.reconcile_once().await;
+        assert_eq!(retry.repaired, 0, "committed strict recovery is idempotent");
 
         let good = bamboo_subagent::Mailbox::at(broker_dir.path().join("mailboxes/p-receipt-good"));
         let wrong = bamboo_subagent::Mailbox::at(
@@ -9535,6 +9840,143 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn strict_completeness_gate_precedes_ack_and_ack_failure_preserves_cold_proof() {
+        for commit in [false, true] {
+            let runner = ActorChildRunner::new(
+                "test".into(),
+                PathBuf::new(),
+                vec![],
+                PathBuf::new(),
+                ExecutorSpec::BambooRuntime,
+                vec![],
+                "test".into(),
+                1,
+            );
+            let home = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(home.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let root = Session::new("strict-ack-parent", "model");
+            store.save_session(&root).await.unwrap();
+            let mut child = Session::new_child_of("strict-ack-child", &root, "model", "work");
+            child.add_message(bamboo_agent_core::Message::user("work"));
+            store.save_session(&child).await.unwrap();
+            child.add_message(bamboo_agent_core::Message::assistant("finished", None));
+            child.set_last_run_status("completed");
+            let proof = bamboo_storage::v2::HostTerminalCompleteness::from_verified_host(
+                &child, "run-1", 7, 2,
+            )
+            .unwrap();
+            let creation = bamboo_subagent::proto::ChildCreationIdentity {
+                created_at: child.created_at,
+                spawn_depth: child.spawn_depth,
+            };
+            let history = StrictTerminalHistory {
+                proof: proof.clone(),
+                watermark: bamboo_subagent::ActorEventWatermark {
+                    version: 1,
+                    logical_session: Some(actor_event_logical_identity(
+                        &child,
+                        &root.id,
+                        Some(&creation),
+                    )),
+                    activation_id: Some("run-1".into()),
+                    execution_epoch: 7,
+                    final_seq: 2,
+                },
+            };
+            let parent_mailbox = "p-strict-ack-child";
+            store
+                .prepare_broker_terminal_receipt_with_completeness(
+                    &child,
+                    bamboo_storage::v2::BrokerTerminalRoute {
+                        activation_run_id: "run-1",
+                        broker_identity: "00000000-0000-4000-8000-000000000001",
+                        parent_mailbox,
+                        broker_correlation_id: "broker-run-1",
+                        message_ids: &["broker-outcome-1".into()],
+                    },
+                    &proof,
+                )
+                .await
+                .unwrap();
+            store.save_session(&child).await.unwrap();
+            runner.set_actor_directory_store(Some(store.clone()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            runner.pending_durable_links.lock().await.insert(
+                (child.id.clone(), child.created_at, "run-1".into()),
+                PendingDurableChildLink {
+                    link: Box::new(DurableAckProbe {
+                        calls: calls.clone(),
+                        fail: true,
+                        terminal_status: TerminalStatus::Completed,
+                        parent_mailbox: parent_mailbox.into(),
+                    }),
+                    host_nested_wait_handoff: false,
+                    strict_history: Some(history),
+                    strict_history_required: true,
+                    strict_history_committed: false,
+                },
+            );
+            if commit {
+                runner
+                    .commit_durable_child_delivery(&child, "run-1")
+                    .await
+                    .unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 0, "proof commit cannot ACK");
+            }
+            assert!(runner
+                .confirm_durable_child_delivery(&child, "run-1", true)
+                .await
+                .is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(commit));
+            let cold = bamboo_storage::SessionStoreV2::new(home.path().into())
+                .await
+                .unwrap();
+            let recovered = cold.recover_broker_terminal_receipts(&child).await;
+            if commit {
+                let receipts = recovered.unwrap();
+                assert_eq!(receipts.len(), 1);
+                assert_eq!(
+                    receipts[0]
+                        .terminal_completeness
+                        .as_ref()
+                        .unwrap()
+                        .contiguous_applied_seq,
+                    2
+                );
+                assert_eq!(
+                    cold.load_session(&child.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .last_run_status()
+                        .as_deref(),
+                    Some("completed")
+                );
+            } else {
+                assert!(
+                    recovered.is_err(),
+                    "matching canonical history is not proof commitment"
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(
+                    cold.load_session(&child.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .messages
+                )
+                .unwrap(),
+                serde_json::to_value(&child.messages).unwrap(),
+            );
+        }
     }
 
     #[tokio::test]
@@ -9812,6 +10254,7 @@ mod tests {
                 readonly_output: None,
                 local_history_tools: None,
                 local_history_read_only: false,
+                strict_history_output: None,
                 plain_input: Some(&activation),
                 canonical_activation: None,
                 canonical_placement_ref: None,
@@ -10599,6 +11042,7 @@ mod tests {
                 readonly_output: None,
                 local_history_tools: Some(&tools),
                 local_history_read_only: true,
+                strict_history_output: None,
                 plain_input: None,
                 canonical_activation: None,
                 canonical_placement_ref: None,
@@ -10837,6 +11281,7 @@ mod tests {
             let (_delivery, mut delivery_rx) = mpsc::unbounded_channel();
             let cancel = CancellationToken::new();
             let tools = vec!["Read".into()];
+            let mut strict_history = None;
             let outcome = drive(ActorDriveContext {
                 client: &mut link,
                 parent_session_id: &root.id,
@@ -10866,6 +11311,7 @@ mod tests {
                 readonly_output: None,
                 local_history_tools: (case != "ordinary_lossy").then_some(&tools),
                 local_history_read_only: true,
+                strict_history_output: Some(&mut strict_history),
                 plain_input: None,
                 canonical_activation: None,
                 canonical_placement_ref: None,
@@ -10874,6 +11320,12 @@ mod tests {
                 first_frame_timeout: Some(Duration::from_secs(1)),
             })
             .await;
+            assert_eq!(strict_history.is_some(), case == "success", "{case}");
+            if let Some(history) = strict_history {
+                assert_eq!(history.proof.execution_epoch(), 7);
+                assert_eq!(history.proof.contiguous_applied_seq(), 1);
+                assert_eq!(history.watermark.final_seq, 1);
+            }
             let cold = store.load_session(&child.id).await.unwrap().unwrap();
             if matches!(case, "success" | "ordinary_lossy") {
                 assert_eq!(outcome.unwrap().as_deref(), Some("complete"), "{case}");
@@ -10913,10 +11365,7 @@ mod tests {
                     "{case}: no mutable history commit"
                 );
             }
-            let accepted = matches!(
-                case,
-                "success" | "ordinary_lossy" | "error_valid" | "error_zero_valid"
-            );
+            let accepted = matches!(case, "success" | "ordinary_lossy");
             assert_eq!(link.accepted.is_some(), accepted, "{case}");
             assert_eq!(
                 link.durable_delivery_receipt().is_some(),
@@ -13652,6 +14101,7 @@ mod tests {
             readonly_output: None,
             local_history_tools: None,
             local_history_read_only: false,
+            strict_history_output: None,
             plain_input: None,
             canonical_activation: None,
             canonical_placement_ref: None,
@@ -13765,6 +14215,7 @@ mod tests {
                 readonly_output: None,
                 local_history_tools: None,
                 local_history_read_only: false,
+                strict_history_output: None,
                 plain_input: None,
                 canonical_activation: None,
                 canonical_placement_ref: None,
@@ -13875,6 +14326,7 @@ mod tests {
                 readonly_output: None,
                 local_history_tools: None,
                 local_history_read_only: false,
+                strict_history_output: None,
                 plain_input: None,
                 canonical_activation: Some(&fence),
                 canonical_placement_ref: None,
@@ -15079,6 +15531,7 @@ mod tests {
             readonly_output: None,
             local_history_tools: None,
             local_history_read_only: false,
+            strict_history_output: None,
             plain_input: None,
             canonical_activation: None,
             canonical_placement_ref: None,
@@ -16101,6 +16554,7 @@ mod tests {
                 readonly_output: None,
                 local_history_tools: None,
                 local_history_read_only: false,
+                strict_history_output: None,
                 plain_input: None,
                 canonical_activation: None,
                 canonical_placement_ref: None,
@@ -16179,6 +16633,7 @@ mod tests {
                 readonly_output: None,
                 local_history_tools: None,
                 local_history_read_only: false,
+                strict_history_output: None,
                 plain_input: None,
                 canonical_activation: None,
                 canonical_placement_ref: None,
@@ -16255,6 +16710,7 @@ mod tests {
             readonly_output: None,
             local_history_tools: None,
             local_history_read_only: false,
+            strict_history_output: None,
             plain_input: None,
             canonical_activation: None,
             canonical_placement_ref: None,
@@ -16308,6 +16764,7 @@ mod tests {
             readonly_output: None,
             local_history_tools: None,
             local_history_read_only: false,
+            strict_history_output: None,
             plain_input: None,
             canonical_activation: None,
             canonical_placement_ref: None,
