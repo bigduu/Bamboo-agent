@@ -233,8 +233,9 @@ over the complete canonical receipt. Only authenticated, source-bound receipts
 and crates.io versions advance the automatic allocator. Unsigned release/tag
 names only occupy individual candidates; 100 consecutive collisions stop the
 run before any publication. Explicit manual reservations and authenticated
-receipts for the current source fail on invalid recovery evidence without
-being re-signed. A public target SHA alone does not establish receipt authority.
+receipts for the current source at their signed version's canonical tag fail on
+invalid recovery evidence without being re-signed. A public target SHA alone
+does not establish receipt authority.
 Unauthenticated names remain occupancy only. Unrelated shape or placement
 failures have no allocation or source-order authority; transport failures still
 stop the run.

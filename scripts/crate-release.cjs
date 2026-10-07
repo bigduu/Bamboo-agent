@@ -263,7 +263,8 @@ async function readReleaseReceipt(context, release, identity, version) {
     return null
   }
   if (!receipt) return null
-  required ||= receipt.identity?.sourceRevision === identity.sourceRevision
+  required ||= receipt.identity?.sourceRevision === identity.sourceRevision &&
+    release.tag_name === `v${receipt.version}`
   try {
     assert.ok(receipt.identity && Array.isArray(receipt.crates), 'Invalid release receipt shape')
     validateReceipt(receipt, receipt.identity, receipt.crates)

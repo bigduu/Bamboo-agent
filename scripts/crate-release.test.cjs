@@ -399,10 +399,36 @@ test('unrelated unsigned releases and huge bare tags are bounded occupancy witho
   assert.deepEqual(blocked.calls, [])
 })
 
-test('authenticated history still rejects tag, target, repository and duplicate version replay', async () => {
+test('a valid current receipt copied to a different tag cannot block or authorize automatic recovery', async () => {
   const receipt = makeReceipt()
-  for (const changed of [release(receipt, { tag_name: 'v2026.10.99' }),
-    release(receipt, { target_commitish: 'b'.repeat(40) }),
+  const canonical = release(receipt)
+  const copied = { ...canonical, id: 43, tag_name: 'v2026.10.9999' }
+  const originalCopy = clone(copied)
+  for (const hasCanonical of [true, false]) {
+    let tagReads = 0
+    const { context, calls, completions } = fixture({
+      releases: async () => hasCanonical ? [copied, canonical] : [copied],
+      versions: async () => ['2026.10.7'],
+      tagSource: async () => { tagReads++; return sourceRevision },
+    })
+    const result = await plan(context)
+    assert.equal(result.receipt.version, receipt.version)
+    assert.equal(result.release.tag_name, canonical.tag_name)
+    assert.notEqual(result.release.id, copied.id)
+    assert.equal(calls.includes('reserve'), !hasCanonical, 'Only canonical placement may authorize resume')
+    await publish(context, result.release, result.receipt)
+    assert.deepEqual(completions, [{ version: receipt.version, makeLatest: true }])
+    assert.equal(tagReads, hasCanonical ? 1 : 0, 'The invalid copy must not reach tag transport at any boundary')
+    assert.deepEqual(copied, originalCopy, 'The copied receipt must never be changed or re-signed')
+  }
+  const manual = fixture({ automatic: false, requestedVersion: '2026.10.9999', releases: async () => [copied] })
+  await assert.rejects(() => plan(manual.context), assert.AssertionError)
+  assert.deepEqual(manual.calls, [])
+})
+
+test('canonical authenticated history still rejects target, shape, repository and duplicate version replay', async () => {
+  const receipt = makeReceipt()
+  for (const changed of [release(receipt, { target_commitish: 'b'.repeat(40) }),
     release(signReceipt({ ...clone(receipt), crates: null }, signingKey)),
     release(makeReceipt({ identity: { ...clone(identity), repository: 'foreign/repo' } }))]) {
     const { context, calls } = fixture({ releases: async () => [changed] })
