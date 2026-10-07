@@ -1329,6 +1329,7 @@ mod tests {
         for cap in [raw.len() as u32, 0] {
             let outcome = ToolExecutionOutcome {
                 permission_replay_origin: None,
+                portable_tool: None,
                 result: Ok(ToolResult::text(true, raw.clone())),
                 needs_human: None,
                 post_tool_hook_eligible: true,
@@ -1359,6 +1360,7 @@ mod tests {
             for success in [true, false] {
                 let outcome = ToolExecutionOutcome {
                     permission_replay_origin: None,
+                    portable_tool: None,
                     result: Ok(ToolResult::text(success, raw.clone())),
                     needs_human: None,
                     post_tool_hook_eligible: true,
@@ -1376,6 +1378,7 @@ mod tests {
         let error = "genuine execution error ".repeat(200);
         let outcome = ToolExecutionOutcome {
             permission_replay_origin: None,
+            portable_tool: None,
             result: Err(error.clone()),
             needs_human: None,
             post_tool_hook_eligible: true,
