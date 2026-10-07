@@ -178,6 +178,7 @@ async fn execute_and_apply_single_tool_call(
             let outcome = per_call::ToolExecutionOutcome {
                 permission_replay_origin: None,
                 needs_human: None,
+                portable_tool: None,
                 post_tool_hook_eligible: false,
                 result: Err(format!("Plan mode: {} operation blocked", tool_name)),
                 tool_duration: std::time::Duration::ZERO,
@@ -226,9 +227,6 @@ async fn execute_and_apply_single_tool_call(
     let mut stop_round = false;
     let outcome = match policy_guard.check_before_execution(tool_call, reserved_calls) {
         Ok(()) => {
-            let before_tool_hooks = config
-                .hook_runner
-                .has_hooks_for(AgentHookPoint::BeforeToolExecution);
             per_call::execute_model_requested_tool_call_only(
                 effective_callable_set,
                 per_call::ToolExecutionOnlyContext {
@@ -243,8 +241,11 @@ async fn execute_and_apply_single_tool_call(
                     round,
                     tools,
                     config,
-                    hook_session: before_tool_hooks.then_some(&mut *session),
-                    hook_runtime_state: before_tool_hooks.then_some(&mut *runtime_state),
+                    // Portable hooks can be enabled while ToolStart is awaiting
+                    // delivery. Sequential calls always carry the state needed
+                    // by the execution-time hook check.
+                    hook_session: Some(&mut *session),
+                    hook_runtime_state: Some(&mut *runtime_state),
                     session_flags,
                     available_tool_schemas,
                 },
@@ -265,6 +266,7 @@ async fn execute_and_apply_single_tool_call(
             per_call::ToolExecutionOutcome {
                 permission_replay_origin: None,
                 needs_human: None,
+                portable_tool: None,
                 post_tool_hook_eligible: false,
                 result: Err(message),
                 tool_duration: std::time::Duration::ZERO,
@@ -677,6 +679,10 @@ pub(crate) async fn execute_round_tool_calls(
                             Ok(per_call::ToolExecutionOutcome {
                                 permission_replay_origin: None,
                                 needs_human: None,
+                                portable_tool: per_call::portable_tool_for_admitted_call(
+                                    effective_callable_set,
+                                    tool_call,
+                                ),
                                 post_tool_hook_eligible: true,
                                 result: Err(format!(
                                     "Tool '{}' timed out after {:?}",
@@ -698,10 +704,14 @@ pub(crate) async fn execute_round_tool_calls(
                 );
                 batch
                     .iter()
-                    .map(|_batch_call| {
+                    .map(|batch_call| {
                         Ok(per_call::ToolExecutionOutcome {
                             permission_replay_origin: None,
                             needs_human: None,
+                            portable_tool: per_call::portable_tool_for_admitted_call(
+                                effective_callable_set,
+                                batch_call,
+                            ),
                             post_tool_hook_eligible: true,
                             result: Err(format!(
                                 "Parallel batch timed out after {:?}",

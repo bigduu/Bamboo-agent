@@ -760,6 +760,8 @@ pub struct PluginArtifact {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginProvides {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<crate::hooks::HookDeclaration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerManifestEntry>,
     /// Directory names under `<plugin_dir>/skills/`. Each must contain a
     /// `SKILL.md`. These are discovered *in place* (no copy, no symlink) once
@@ -786,7 +788,8 @@ pub struct PluginProvides {
 
 impl PluginProvides {
     pub fn is_empty(&self) -> bool {
-        self.mcp_servers.is_empty()
+        self.hooks.is_empty()
+            && self.mcp_servers.is_empty()
             && self.skills.is_empty()
             && self.prompts.is_empty()
             && self.workflows.is_empty()
