@@ -65,6 +65,7 @@ bytes = "1"
 rust_ocr = "0.1.5"
 
 [dev-dependencies]
+bamboo-plugin = { path = "../../infra/bamboo-plugin" }
 tempfile = "3"
 mockall = "0.15"
 wiremock = "0.6"
