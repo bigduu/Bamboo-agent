@@ -2,10 +2,9 @@ use async_trait::async_trait;
 use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use globset::{GlobBuilder, GlobSetBuilder};
 use serde::Deserialize;
-use serde_json::json;
 use std::path::{Path, PathBuf};
 
-use super::{search_traversal, workspace_state};
+use super::{parameter_schema, search_traversal, workspace_state};
 
 const DEFAULT_GLOB_MATCHES: usize = 100;
 const MAX_GLOB_MATCHES: usize = 200;
@@ -13,13 +12,23 @@ const MAX_GLOB_SCANNED_FILES: usize = 50_000;
 const SEARCH_SCOPE_TOO_BROAD_ERROR: &str =
     "Search scope too broad. Add path/glob/type or reduce pattern.";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 struct GlobArgs {
+    /// The glob pattern to match files against (for example **/*.rs or src/**/*.ts)
     pattern: String,
+    /// The directory to search in. Omit to use the current workspace root.
     #[serde(default)]
+    #[schemars(with = "String", skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    /// Maximum number of returned matches (default 100, hard cap 200). Use a smaller limit for broad searches.
     #[serde(default)]
+    #[schemars(
+        schema_with = "parameter_schema::number",
+        skip_serializing_if = "Option::is_none"
+    )]
     limit: Option<usize>,
+    /// Include gitignored files. Requires an explicit path; scan/result limits and fixed directory exclusions still apply.
     #[serde(default)]
     include_ignored: bool,
 }
@@ -61,30 +70,7 @@ impl Tool for GlobTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "The glob pattern to match files against (for example **/*.rs or src/**/*.ts)"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "The directory to search in. Omit to use the current workspace root."
-                },
-                "limit": {
-                    "type": "number",
-                    "description": "Maximum number of returned matches (default 100, hard cap 200). Use a smaller limit for broad searches."
-                },
-                "include_ignored": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Include gitignored files. Requires an explicit path; scan/result limits and fixed directory exclusions still apply."
-                }
-            },
-            "required": ["pattern"],
-            "additionalProperties": false
-        })
+        parameter_schema::for_arguments::<GlobArgs>()
     }
 
     async fn invoke(
@@ -213,9 +199,53 @@ impl Tool for GlobTool {
 
 #[cfg(test)]
 mod tests {
-    use super::GlobTool;
+    use super::{GlobArgs, GlobTool};
     use bamboo_agent_core::{Tool, ToolCtx, ToolOutcome};
     use serde_json::json;
+
+    #[test]
+    fn glob_args_preserve_optional_defaults_and_unknown_fields() {
+        for args in [
+            json!({"pattern": "**/*.rs"}),
+            json!({
+                "pattern": "**/*.rs",
+                "path": null,
+                "limit": null,
+                "unknown": true
+            }),
+        ] {
+            let parsed: GlobArgs = serde_json::from_value(args).unwrap();
+            assert_eq!(parsed.pattern, "**/*.rs");
+            assert_eq!(parsed.path, None);
+            assert_eq!(parsed.limit, None);
+            assert!(!parsed.include_ignored);
+        }
+    }
+
+    #[test]
+    fn glob_args_preserve_invalid_argument_rejection() {
+        for invalid in [json!(-1), json!(1.5), json!("1"), json!(true)] {
+            assert!(serde_json::from_value::<GlobArgs>(json!({
+                "pattern": "**/*.rs",
+                "limit": invalid
+            }))
+            .is_err());
+        }
+        for invalid in [json!(null), json!(0), json!("false")] {
+            assert!(serde_json::from_value::<GlobArgs>(json!({
+                "pattern": "**/*.rs",
+                "include_ignored": invalid
+            }))
+            .is_err());
+        }
+        for args in [
+            json!({}),
+            json!({"pattern": null}),
+            json!({"pattern": "**/*.rs", "path": 1}),
+        ] {
+            assert!(serde_json::from_value::<GlobArgs>(args).is_err());
+        }
+    }
 
     fn result_lines(result: &bamboo_agent_core::ToolResult) -> Vec<&str> {
         result
