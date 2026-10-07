@@ -503,7 +503,10 @@ fn unsupported_namespaces_selectors_and_object_kinds_fail_without_writes() {
     );
     assert_eq!(durable_files(&home), before);
     assert_eq!(
-        directory.read("sentinel", 64, &mut budget).unwrap().unwrap(),
+        directory
+            .read("sentinel", 64, &mut budget)
+            .unwrap()
+            .unwrap(),
         b"PRIVATE sentinel bytes"
     );
     assert_eq!(
@@ -584,10 +587,9 @@ async fn changed_birth_stale_actor_and_root_authority_fail_without_repair() {
         "nul\0name",
         oversized.as_str(),
     ] {
-        for (requested_root, subtree) in [
-            (selector, root.id.as_str()),
-            (root.id.as_str(), selector),
-        ] {
+        for (requested_root, subtree) in
+            [(selector, root.id.as_str()), (root.id.as_str(), selector)]
+        {
             assert_eq!(
                 readonly_snapshot(&store, &home, requested_root, subtree)
                     .await
@@ -644,8 +646,7 @@ async fn changed_birth_stale_actor_and_root_authority_fail_without_repair() {
                 Error::InconsistentAuthority
             }
             4 => {
-                let mut proof: serde_json::Value =
-                    serde_json::from_slice(&original_proof).unwrap();
+                let mut proof: serde_json::Value = serde_json::from_slice(&original_proof).unwrap();
                 assert_eq!(proof["state"], "committed");
                 proof["created_at"] =
                     serde_json::json!(root.created_at + chrono::Duration::seconds(1));
@@ -715,7 +716,10 @@ async fn pending_task_and_copy_journals_leave_owned_home_unchanged() {
                 .unwrap_err(),
             Error::PendingTransaction
         );
-        assert_eq!(std::fs::read(&journal).unwrap(), b"PRIVATE journal incomplete");
+        assert_eq!(
+            std::fs::read(&journal).unwrap(),
+            b"PRIVATE journal incomplete"
+        );
         // Remove only this fixture journal. Keep both directories and the same
         // open store; no recovery or reopen runs while the journal is present.
         std::fs::remove_file(&journal).unwrap();
