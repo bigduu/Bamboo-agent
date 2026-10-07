@@ -451,6 +451,7 @@ pub enum PermissionType {
     HttpRequest,
     DeleteOperation,
     TerminalSession,
+    BrowserInteraction,
 }
 
 impl PermissionType {
@@ -462,6 +463,7 @@ impl PermissionType {
             Self::HttpRequest => "http_request",
             Self::DeleteOperation => "delete_operation",
             Self::TerminalSession => "terminal_session",
+            Self::BrowserInteraction => "browser_interaction",
         }
     }
 }
@@ -1663,7 +1665,7 @@ mod tests {
 
     #[test]
     fn every_reasoning_effort_uses_the_canonical_wire_value() {
-        let values = ["low", "medium", "high", "xhigh", "max"];
+        let values = ["none", "low", "medium", "high", "xhigh", "max"];
         for (effort, expected) in ReasoningEffort::ALL.into_iter().zip(values) {
             assert_eq!(
                 serde_json::to_string(&effort).unwrap(),

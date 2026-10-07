@@ -16,6 +16,7 @@ pub mod ledger;
 pub mod memory;
 pub mod notify;
 pub mod overlay_executor;
+pub mod parent_request_reply;
 pub mod plan;
 pub mod project_tools;
 pub mod registry_keys;
@@ -23,6 +24,7 @@ pub mod session_control;
 pub mod session_inspector;
 pub mod skill_runtime;
 pub mod sub_agent;
+mod sub_agent_facade;
 pub mod surface;
 
 pub use archive::ArchiveContextTool;
@@ -35,10 +37,18 @@ pub use ledger::{LedgerScheduleBridge, LedgerTool};
 pub use memory::MemoryTool;
 pub use notify::{NotificationDispatcher, NotifyTool};
 pub use overlay_executor::OverlayToolExecutor;
+pub use parent_request_reply::{
+    validate_parent_answer_input, ParentQuestionReplyReceipt, ParentRequestMessageReceipt,
+    ParentRequestReplyPort, ParentRequestReplyReceipt, ParentRequestReplyState,
+};
 pub use plan::PlanTool;
 pub use project_tools::{ProjectTool, ProjectWorkspaceTool};
 pub use session_control::SessionControlTool;
 pub use session_inspector::SessionInspectorTool;
-pub use skill_runtime::{LoadSkillTool, ReadSkillResourceTool};
+pub use skill_runtime::{
+    skill_response_byte_budget, LoadSkillTool, ReadSkillResourceTool, SelectedSkillSource,
+    SkillCatalogCaller, SkillCatalogCallerResolver, SkillCatalogInvocation, SkillsListTool,
+    SkillsReadTool,
+};
 pub use sub_agent::{SubAgentTool, DEFAULT_MAX_SPAWN_DEPTH};
 pub use surface::{ToolSurface, ToolSurfaceFactory};

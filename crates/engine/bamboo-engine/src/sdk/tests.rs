@@ -89,6 +89,46 @@ struct SuccessorRecordingProvider {
     successor_match_count: Arc<AtomicUsize>,
 }
 
+/// Observes the real parent execution launched after a completed child clears
+/// a durable synchronous wait. The provider must see the hidden child result.
+struct ChildOutcomeRecordingProvider {
+    calls: Arc<AtomicUsize>,
+    outcome_seen: Arc<Notify>,
+    saw_final_response: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl LLMProvider for ChildOutcomeRecordingProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.saw_final_response.store(
+            messages.iter().any(|message| {
+                message
+                    .content
+                    .contains("Child final response:\nfast child reply")
+                    && message
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("runtime_kind"))
+                        .and_then(|kind| kind.as_str())
+                        == Some("child_completion_resume")
+            }),
+            Ordering::SeqCst,
+        );
+        self.outcome_seen.notify_one();
+        Ok(Box::pin(stream::iter(vec![
+            Ok(LLMChunk::Token("parent resumed".to_string())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
 #[async_trait]
 impl LLMProvider for SuccessorRecordingProvider {
     async fn chat_stream(
@@ -230,6 +270,7 @@ impl ExternalChildRunner for InProcessTestRunner {
 struct TerminalBarrierRunner {
     inner: InProcessTestRunner,
     completed_runs: AtomicUsize,
+    durable_confirmations: Arc<AtomicUsize>,
     first_execute_returned: Arc<Notify>,
     release_first_terminal: Arc<Notify>,
 }
@@ -259,6 +300,34 @@ impl ExternalChildRunner for TerminalBarrierRunner {
             self.release_first_terminal.notified().await;
         }
         result
+    }
+
+    async fn confirm_durable_child_delivery(
+        &self,
+        session: &Session,
+        _activation_run_id: &str,
+        save_succeeded: bool,
+    ) -> Result<(), String> {
+        if !save_succeeded {
+            return Ok(());
+        }
+        let saved = self
+            .inner
+            .agent
+            .storage()
+            .load_session(&session.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "terminal Child snapshot missing before ACK callback".to_string())?;
+        if saved.created_at != session.created_at
+            || saved.last_run_status() != session.last_run_status()
+            || saved.messages.last().map(|message| &message.content)
+                != session.messages.last().map(|message| &message.content)
+        {
+            return Err("terminal Child snapshot was not durable before ACK callback".into());
+        }
+        self.durable_confirmations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -383,6 +452,7 @@ struct DeliveryHarness {
     reservation_entered: Arc<Notify>,
     allow_reservation: Arc<Notify>,
     reservations: Arc<AtomicUsize>,
+    durable_confirmations: Arc<AtomicUsize>,
     _spawn_scheduler: Arc<crate::runtime::execution::spawn::SpawnScheduler>,
 }
 
@@ -595,12 +665,14 @@ async fn build_terminal_delivery_harness(
 
     let first_execute_returned = Arc::new(Notify::new());
     let release_first_terminal = Arc::new(Notify::new());
+    let durable_confirmations = Arc::new(AtomicUsize::new(0));
     let external_child_runner: Arc<dyn ExternalChildRunner> = Arc::new(TerminalBarrierRunner {
         inner: InProcessTestRunner {
             agent: agent.clone(),
             tools: tools.clone(),
         },
         completed_runs: AtomicUsize::new(0),
+        durable_confirmations: durable_confirmations.clone(),
         first_execute_returned: first_execute_returned.clone(),
         release_first_terminal: release_first_terminal.clone(),
     });
@@ -663,6 +735,7 @@ async fn build_terminal_delivery_harness(
         reservation_entered,
         allow_reservation,
         reservations,
+        durable_confirmations,
         _spawn_scheduler: spawn_scheduler,
     }
 }
@@ -701,6 +774,64 @@ async fn collect_until_completed_with_budget(
             Err(_) => panic!("timed out waiting for SubAgentCompleted; saw: {events:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn queue_commit_then_producer_abort_publishes_start_once_before_completion() {
+    let mut harness = build_harness(Arc::new(CompletedProvider), vec![], &[]).await;
+    let scheduler = crate::runtime::execution::spawn::SpawnScheduler::new(harness.ctx.clone());
+    // `prepare_child_launch` needs this map. Holding it parks the producer
+    // after queue admission but before Start publication.
+    let held_senders = harness.ctx.session_event_senders.write().await;
+    let gate = Arc::new(bamboo_domain::AdmissionGate::default());
+    let job = SpawnJob {
+        parent_session_id: harness.parent_session_id.clone(),
+        child_session_id: harness.child_session_id.clone(),
+        model: "gpt-5".to_string(),
+        disabled_tools: None,
+    };
+    let producer = {
+        let gate = gate.clone();
+        tokio::spawn(async move {
+            scheduler
+                .enqueue_announced_with_gate(job, Some("Child session".into()), Some(&gate))
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !gate.is_committed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queue entry must commit before aborting producer");
+    producer.abort();
+    assert!(producer.await.unwrap_err().is_cancelled());
+    drop(held_senders);
+
+    let events = collect_until_completed(&mut harness.parent_rx).await;
+    let starts = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::SubAgentStarted { child_session_id, .. }
+                    if child_session_id == &harness.child_session_id
+            )
+        })
+        .count();
+    let completed = events.iter().position(|event| {
+        matches!(
+            event,
+            AgentEvent::SubAgentCompleted { child_session_id, .. }
+                if child_session_id == &harness.child_session_id
+        )
+    });
+    assert_eq!(
+        starts, 1,
+        "the worker must publish one fallback Start: {events:?}"
+    );
+    assert!(completed.is_some_and(|index| index > 0), "{events:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,6 +1178,141 @@ async fn activation_watermark_wait_gap_defers_then_reserves_same_generation_once
     })
     .await
     .expect("dropping an unpublished activation must roll back its reservation");
+}
+
+#[tokio::test]
+async fn fast_child_completion_automatically_starts_parent_successor() {
+    use crate::execution::{ChildCompletion, ChildCompletionHandler};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let outcome_seen = Arc::new(Notify::new());
+    let saw_final_response = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider: Arc<dyn LLMProvider> = Arc::new(ChildOutcomeRecordingProvider {
+        calls: calls.clone(),
+        outcome_seen: outcome_seen.clone(),
+        saw_final_response: saw_final_response.clone(),
+    });
+    let harness = build_terminal_delivery_harness(provider, None, None).await;
+    let now = chrono::Utc::now();
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut runtime = AgentRuntimeState::new("parent-wait-fast-child");
+    runtime.status = AgentStatusState::Suspended;
+    runtime.suspension = Some(SuspensionState {
+        reason: "waiting_for_children".to_string(),
+        suspended_at: now,
+        resumable: true,
+        hook_point: None,
+    });
+    let mut wait = WaitingForChildrenState::for_children(
+        vec![harness.child_session_id.clone()],
+        ChildWaitPolicy::All,
+        now,
+    );
+    wait.registered_by_tool_call_id = Some("fast-child-launch".to_string());
+    runtime.waiting_for_children = Some(wait);
+    parent.agent_runtime_state = Some(runtime);
+    parent.metadata.insert(
+        "runtime.suspend_reason".to_string(),
+        "waiting_for_children".to_string(),
+    );
+    parent.set_last_run_status("suspended");
+    harness.storage.save_session(&parent).await.unwrap();
+
+    let mut child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    child.add_message(Message::assistant("fast child reply", None));
+    child.set_last_run_status("completed");
+    crate::execution::ChildCompletionSource::prepare(
+        &mut child,
+        "fast-child-run",
+        &Default::default(),
+    );
+    harness.storage.save_session(&child).await.unwrap();
+
+    let completion = ChildCompletion {
+        parent_session_id: harness.parent_session_id.clone(),
+        child_session_id: harness.child_session_id.clone(),
+        status: "completed".to_string(),
+        error: None,
+        completed_at: now,
+        source: crate::execution::ChildCompletionSource::from_committed_session(&child),
+    };
+    let coordinator = harness.coordinator.clone();
+    let completion_task = tokio::spawn(async move {
+        coordinator.on_child_completed(completion).await;
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        harness.reservation_entered.notified(),
+    )
+    .await
+    .expect("child completion must request a real parent successor");
+    let cleared = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(cleared
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.waiting_for_children.as_ref())
+        .is_none());
+    assert!(!cleared.metadata.contains_key("runtime.suspend_reason"));
+    assert_eq!(harness.reservations.load(Ordering::SeqCst), 1);
+
+    harness.allow_reservation.notify_one();
+    completion_task.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), outcome_seen.notified())
+        .await
+        .expect("the parent successor must reach its provider without a watchdog");
+    assert!(saw_final_response.load(Ordering::SeqCst));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let settled = harness
+                .agent_runners
+                .read()
+                .await
+                .get(&harness.parent_session_id)
+                .is_some_and(|runner| {
+                    !matches!(runner.status, crate::execution::AgentStatus::Running)
+                });
+            if settled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("parent successor must finish through the real runner lifecycle");
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parent.last_run_status().as_deref(), Some("completed"));
+    assert!(parent
+        .messages
+        .iter()
+        .any(|message| message.content == "parent resumed"));
+    let backlog = harness
+        .inbox
+        .inspect(&harness.parent_session_id)
+        .await
+        .unwrap();
+    assert_eq!(backlog.pending + backlog.claimed, 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -2070,6 +2336,14 @@ async fn terminal_delivery_runs_only_in_one_real_successor_execution() {
     .await
     .expect("first production run must reach terminal barrier");
 
+    let activation_a = harness
+        .agent_runners
+        .read()
+        .await
+        .get(&harness.child_session_id)
+        .unwrap()
+        .run_id
+        .clone();
     let mut envelope =
         SessionMessageEnvelope::user_input(&harness.child_session_id, "after final provider round");
     envelope.id = SessionMessageId::parse(message_id.clone()).unwrap();
@@ -2089,6 +2363,11 @@ async fn terminal_delivery_runs_only_in_one_real_successor_execution() {
     )
     .await
     .expect("terminal finalization must request a successor");
+    assert_eq!(
+        harness.durable_confirmations.load(Ordering::SeqCst),
+        1,
+        "the external ACK callback must follow the first durable terminal save"
+    );
     let backlog = harness
         .inbox
         .inspect(&harness.child_session_id)
@@ -2107,6 +2386,24 @@ async fn terminal_delivery_runs_only_in_one_real_successor_execution() {
         .await
         .unwrap()
         .unwrap();
+    let source_a =
+        crate::execution::ChildCompletionSource::from_committed_session(&first_terminal_snapshot)
+            .expect(
+            "actual SDK finalizer must seal the canonical terminal source before successor release",
+        );
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source_a.activation_run_id, activation_a);
+    assert_eq!(
+        source_a
+            .result(&first_terminal_snapshot, &parent)
+            .as_deref(),
+        Some("done")
+    );
     assert!(!first_terminal_snapshot
         .messages
         .iter()
@@ -2157,6 +2454,22 @@ async fn terminal_delivery_runs_only_in_one_real_successor_execution() {
             .count(),
         1
     );
+    let source_b = crate::execution::ChildCompletionSource::from_committed_session(&settled)
+        .expect("actual resumed-child finalizer must seal its own terminal source");
+    assert_eq!(
+        source_b.activation_run_id,
+        harness
+            .agent_runners
+            .read()
+            .await
+            .get(&harness.child_session_id)
+            .unwrap()
+            .run_id
+    );
+    assert_ne!(source_a.activation_run_id, source_b.activation_run_id);
+    assert_ne!(source_a.result_message_id, source_b.result_message_id);
+    assert!(source_a.result(&settled, &parent).is_none());
+    assert!(source_b.result(&settled, &parent).is_some());
     let backlog = harness
         .inbox
         .inspect(&harness.child_session_id)
@@ -2441,5 +2754,343 @@ async fn s_t2_5_watchdog_timeout_completes_with_timeout_status() {
             assert_eq!(status, "timeout", "watchdog must yield timeout status");
         }
         other => panic!("expected SubAgentCompleted, got {other:?}"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalDeliveryFailure {
+    UnreceiptedExecutionError,
+    Prepare,
+    Checkpoint,
+    Proof,
+    Ack,
+}
+
+struct TerminalDeliveryPersistence {
+    inner: Arc<dyn bamboo_domain::RuntimeSessionPersistence>,
+    failure: TerminalDeliveryFailure,
+}
+
+#[async_trait]
+impl bamboo_domain::RuntimeSessionPersistence for TerminalDeliveryPersistence {
+    async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        if self.failure == TerminalDeliveryFailure::UnreceiptedExecutionError
+            && crate::execution::ChildCompletionSource::has_source_record(session)
+        {
+            return Err(std::io::Error::other(
+                "injected unfenced final-save rejection",
+            ));
+        }
+        self.inner.save_runtime_session(session).await
+    }
+
+    async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        if self.failure == TerminalDeliveryFailure::Checkpoint
+            && session.last_run_status().as_deref() == Some("running")
+            && crate::execution::ChildCompletionSource::has_source_record(session)
+        {
+            return Err(std::io::Error::other(
+                "injected terminal checkpoint failure",
+            ));
+        }
+        self.inner.checkpoint_runtime_session(session).await
+    }
+
+    async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+        self.inner.load_runtime_session(session_id).await
+    }
+
+    async fn clear_legacy_pending_messages(
+        &self,
+        session_id: &str,
+        expected: &[serde_json::Value],
+    ) -> std::io::Result<bool> {
+        self.inner
+            .clear_legacy_pending_messages(session_id, expected)
+            .await
+    }
+
+    async fn append_token_usage_record(
+        &self,
+        session_id: &str,
+        json_line: &str,
+    ) -> std::io::Result<()> {
+        self.inner
+            .append_token_usage_record(session_id, json_line)
+            .await
+    }
+}
+
+struct TerminalDeliveryRunner {
+    storage: Arc<dyn Storage>,
+    failure: TerminalDeliveryFailure,
+    calls: Arc<tokio::sync::Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait]
+impl ExternalChildRunner for TerminalDeliveryRunner {
+    async fn should_handle(&self, _session: &Session) -> bool {
+        true
+    }
+
+    async fn execute_external_child(
+        &self,
+        session: &mut Session,
+        _job: &SpawnJob,
+        _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        _cancel_token: tokio_util::sync::CancellationToken,
+    ) -> crate::runtime::runner::Result<()> {
+        self.calls.lock().await.push("execute");
+        session.add_message(Message::assistant("durable terminal answer", None));
+        if self.failure == TerminalDeliveryFailure::UnreceiptedExecutionError {
+            return Err(bamboo_agent_core::AgentError::LLM(
+                "actor activation fence is stale or expired".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn prepare_durable_child_delivery(
+        &self,
+        _session: &Session,
+        _activation_run_id: &str,
+    ) -> Result<bool, String> {
+        self.calls.lock().await.push("prepare");
+        if self.failure == TerminalDeliveryFailure::Prepare {
+            return Err("injected receipt preparation failure".into());
+        }
+        if self.failure == TerminalDeliveryFailure::UnreceiptedExecutionError {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    async fn commit_durable_child_delivery(
+        &self,
+        session: &Session,
+        activation_run_id: &str,
+    ) -> Result<(), String> {
+        self.calls.lock().await.push("proof");
+        let durable = self
+            .storage
+            .load_session(&session.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("terminal checkpoint missing")?;
+        if durable.last_run_status().as_deref() != Some("running")
+            || !crate::execution::ChildCompletionSource::has_source_record(&durable)
+            || crate::execution::ChildCompletionSource::from_committed_session(&durable).is_some()
+            || durable.messages.last().map(|message| &message.content)
+                != session.messages.last().map(|message| &message.content)
+        {
+            return Err("proof callback did not follow the deferred transcript checkpoint".into());
+        }
+        if self.failure == TerminalDeliveryFailure::Proof {
+            return Err("injected Host proof commitment failure".into());
+        }
+        // The isolated fake emulates the real actor's proof-owned canonical
+        // publication. The SDK must read this back, never publish it itself.
+        let mut published = session.clone();
+        if !crate::execution::ChildCompletionSource::publish_after_durable_delivery(
+            &mut published,
+            activation_run_id,
+        )? {
+            return Err("pending completion source missing".into());
+        }
+        self.storage
+            .save_session(&published)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.calls.lock().await.push("published");
+        Ok(())
+    }
+
+    async fn confirm_durable_child_delivery(
+        &self,
+        session: &Session,
+        _activation_run_id: &str,
+        history_committed: bool,
+    ) -> Result<(), String> {
+        self.calls.lock().await.push(if history_committed {
+            "ack"
+        } else {
+            "unconfirmed"
+        });
+        if history_committed {
+            if crate::execution::ChildCompletionSource::from_committed_session(session).is_none() {
+                return Err("ACK preceded proven source publication".into());
+            }
+            return Err("injected transport ACK failure".into());
+        }
+        Ok(())
+    }
+}
+
+struct TerminalDeliveryCompletion(
+    tokio::sync::mpsc::UnboundedSender<crate::execution::ChildCompletion>,
+);
+
+#[async_trait]
+impl crate::execution::ChildCompletionHandler for TerminalDeliveryCompletion {
+    async fn on_child_completed(&self, completion: crate::execution::ChildCompletion) {
+        let _ = self.0.send(completion);
+    }
+}
+
+#[tokio::test]
+async fn terminal_delivery_failure_matrix_gates_success_before_transport_ack() {
+    for failure in [
+        TerminalDeliveryFailure::UnreceiptedExecutionError,
+        TerminalDeliveryFailure::Prepare,
+        TerminalDeliveryFailure::Checkpoint,
+        TerminalDeliveryFailure::Proof,
+        TerminalDeliveryFailure::Ack,
+    ] {
+        let mut harness = build_harness(Arc::new(CompletedProvider), Vec::new(), &[]).await;
+        let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let persistence = Arc::new(TerminalDeliveryPersistence {
+            inner: harness.ctx.agent.persistence().clone(),
+            failure,
+        });
+        harness.ctx.agent = Arc::new(harness.ctx.agent.with_execution_persistence(persistence));
+        harness.ctx.external_child_runner = Arc::new(TerminalDeliveryRunner {
+            storage: harness.storage.clone(),
+            failure,
+            calls: calls.clone(),
+        });
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::unbounded_channel();
+        harness.ctx.completion_handler = Some(Arc::new(TerminalDeliveryCompletion(completion_tx)));
+        let child_tx = crate::runtime::execution::session_events::get_or_create_event_sender(
+            &harness.ctx.session_event_senders,
+            &harness.child_session_id,
+        )
+        .await;
+        let mut child_rx = child_tx.subscribe();
+        run_child_spawn(
+            harness.ctx.clone(),
+            SpawnJob {
+                parent_session_id: harness.parent_session_id.clone(),
+                child_session_id: harness.child_session_id.clone(),
+                model: "gpt-5".into(),
+                disabled_tools: None,
+            },
+        )
+        .await
+        .unwrap();
+        let completion = tokio::time::timeout(Duration::from_secs(10), completion_rx.recv())
+            .await
+            .expect("terminal callback must settle")
+            .unwrap();
+        if failure == TerminalDeliveryFailure::UnreceiptedExecutionError {
+            // The old owned-Actor rejection is the execution outcome. An
+            // unrelated generic save failure must not replace that diagnostic
+            // or claim durable history/ACK for the unfenced snapshot.
+            assert_eq!(completion.status, "error");
+            assert!(completion
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("actor activation fence is stale or expired")));
+            assert!(completion.source.is_none());
+            assert_eq!(
+                *calls.lock().await,
+                vec!["execute", "prepare", "unconfirmed"]
+            );
+            let durable = harness
+                .storage
+                .load_session(&harness.child_session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!durable
+                .messages
+                .iter()
+                .any(|message| message.content == "durable terminal answer"));
+            assert!(!crate::execution::ChildCompletionSource::has_source_record(
+                &durable
+            ));
+            while let Ok(event) = child_rx.try_recv() {
+                assert!(!matches!(event, AgentEvent::SessionHistoryCommitted { .. }));
+            }
+            let runners = harness.ctx.agent_runners.read().await;
+            assert!(
+                matches!(&runners.get(&harness.child_session_id).unwrap().status,
+                crate::execution::AgentStatus::Error(error) if error.contains("actor activation fence is stale or expired"))
+            );
+            continue;
+        }
+        let success = failure == TerminalDeliveryFailure::Ack;
+        assert_eq!(
+            completion.status,
+            if success { "completed" } else { "error" },
+            "{failure:?}"
+        );
+        assert_eq!(completion.source.is_some(), success, "{failure:?}");
+        assert_eq!(completion.error.is_none(), success, "{failure:?}");
+        let events = collect_until_completed(&mut harness.parent_rx).await;
+        assert!(
+            events.iter().any(|event| matches!(event,
+                AgentEvent::SubAgentCompleted { status, .. } if status == &completion.status
+            )),
+            "{failure:?}"
+        );
+        let runners = harness.ctx.agent_runners.read().await;
+        let runner = runners.get(&harness.child_session_id).unwrap();
+        assert_eq!(
+            matches!(runner.status, crate::execution::AgentStatus::Completed),
+            success,
+            "{failure:?}"
+        );
+        if !success {
+            assert!(
+                matches!(runner.status, crate::execution::AgentStatus::Error(_)),
+                "{failure:?}"
+            );
+        }
+        drop(runners);
+        let durable = harness
+            .storage
+            .load_session(&harness.child_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable.last_run_status().as_deref(),
+            Some(completion.status.as_str()),
+            "{failure:?}"
+        );
+        assert_eq!(
+            crate::execution::ChildCompletionSource::from_committed_session(&durable).is_some(),
+            success,
+            "{failure:?}"
+        );
+        assert!(
+            crate::execution::ChildCompletionSource::has_source_record(&durable),
+            "{failure:?}"
+        );
+        assert_eq!(
+            durable
+                .messages
+                .iter()
+                .filter(|message| message.content == "durable terminal answer")
+                .count(),
+            1,
+            "{failure:?}"
+        );
+        let mut history_barriers = 0;
+        while let Ok(event) = child_rx.try_recv() {
+            if matches!(event, AgentEvent::SessionHistoryCommitted { .. }) {
+                history_barriers += 1;
+            }
+        }
+        assert_eq!(history_barriers, usize::from(success), "{failure:?}");
+        let expected = match failure {
+            TerminalDeliveryFailure::UnreceiptedExecutionError => unreachable!(),
+            TerminalDeliveryFailure::Prepare | TerminalDeliveryFailure::Checkpoint => {
+                vec!["execute", "prepare", "unconfirmed"]
+            }
+            TerminalDeliveryFailure::Proof => vec!["execute", "prepare", "proof", "unconfirmed"],
+            TerminalDeliveryFailure::Ack => vec!["execute", "prepare", "proof", "published", "ack"],
+        };
+        assert_eq!(*calls.lock().await, expected, "{failure:?}");
     }
 }

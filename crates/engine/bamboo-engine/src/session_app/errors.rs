@@ -27,6 +27,8 @@ pub enum ChatError {
     InvalidModel(String),
     #[error("invalid workflow selection: {0}")]
     InvalidWorkflowSelection(String),
+    #[error("invalid Root orchestration tool selection: {0}")]
+    RootToolAuthority(#[from] bamboo_domain::RootToolAuthorityError),
     #[error("session carries an invalid Project identity '{raw}': {message}")]
     InvalidProjectIdentity { raw: String, message: String },
     #[error(

@@ -4,9 +4,19 @@ use tracing::Instrument;
 
 use crate::app_state::AppState;
 use bamboo_agent_core::AgentEvent;
+use bamboo_agent_core::NativeToolEventDisplay;
 use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::{history_commit_barrier, HistoryCommitBarrier};
 use bamboo_engine::gold_auto_answer::{maybe_auto_answer_pending_question, GoldAutoAnswerOutcome};
+
+fn visible_terminal_reason(event: &AgentEvent) -> Option<&'static str> {
+    match event {
+        AgentEvent::Complete { .. } => Some("complete"),
+        AgentEvent::Cancelled { .. } => Some("cancelled"),
+        AgentEvent::Error { .. } => Some("error"),
+        _ => None,
+    }
+}
 
 /// Returns true for events that carry critical state a late subscriber must see.
 ///
@@ -16,13 +26,61 @@ fn is_critical_event(event: &AgentEvent) -> bool {
     event.is_replayable_session_state()
 }
 
+async fn publish_root_event(
+    state: &AppState,
+    owner: Option<&bamboo_domain::RootActorRuntimeWrite>,
+    session_id: &str,
+    event: &AgentEvent,
+    publish: Box<dyn FnOnce() -> bool + Send>,
+) -> std::io::Result<()> {
+    if let Some(owner) = owner {
+        bamboo_engine::events::RootActorEventPublication::new(
+            state.storage.clone(),
+            state.account_sink.clone(),
+            owner.clone(),
+        )
+        .publish(session_id, event, publish)
+        .await
+    } else {
+        state.account_sink.record(Some(session_id), event);
+        if publish() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "per-session event publication was retired",
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn spawn_event_forwarder(
+    state: actix_web::web::Data<AppState>,
+    session_id: String,
+    run_id: String,
+    mpsc_rx: mpsc::Receiver<AgentEvent>,
+    session_tx: tokio::sync::broadcast::Sender<AgentEvent>,
+    gold_config: Option<GoldConfig>,
+) -> HistoryCommitBarrier {
+    spawn_event_forwarder_with_root_actor(
+        state,
+        session_id,
+        run_id,
+        mpsc_rx,
+        session_tx,
+        gold_config,
+        None,
+    )
+}
+
+pub(crate) fn spawn_event_forwarder_with_root_actor(
     state: actix_web::web::Data<AppState>,
     session_id: String,
     run_id: String,
     mut mpsc_rx: mpsc::Receiver<AgentEvent>,
     session_tx: tokio::sync::broadcast::Sender<AgentEvent>,
     gold_config: Option<GoldConfig>,
+    root_actor: Option<bamboo_domain::RootActorRuntimeWrite>,
 ) -> HistoryCommitBarrier {
     let (history_commit_acknowledger, history_commit_barrier) = history_commit_barrier();
     // Always-on relay: previously the notification relay only started when an
@@ -43,6 +101,21 @@ pub(crate) fn spawn_event_forwarder(
 
     tokio::spawn(
         async move {
+            if root_actor.is_none() {
+                match state.storage.load_session(&session_id).await {
+                    Ok(Some(session)) if state.agent.persistence().root_actor_execution_required(&session) => {
+                        tracing::warn!(%session_id, %run_id,
+                            "Root event route requires an explicit Actor handoff before publication");
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%session_id, %run_id, %error,
+                            "event route could not prove its Session identity");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             // Capture the reservation generation at the call site. This task
             // may start only after a clarification answer has replaced the
             // shared runner entry; reading that mutable registry here would
@@ -52,20 +125,51 @@ pub(crate) fn spawn_event_forwarder(
                 session_id: session_id.clone(),
                 started_at: chrono::Utc::now().to_rfc3339(),
             };
-            let publication = {
-                let runners = state.agent_runners.read().await;
+            let (publication, visible_messages) = {
+                let runners = state.agent_runners.clone().read_owned().await;
                 let Some(runner) = runners
                     .get(&session_id)
                     .filter(|runner| runner.run_id == run_id)
                 else {
                     return;
                 };
-                state.account_sink.record(Some(&session_id), &started_event);
-                let _ = session_tx.send(started_event);
-                runner.event_publication.clone()
+                let publication = runner.event_publication.clone();
+                let visible_messages = runner.visible_messages.clone();
+                let publish_tx = session_tx.clone();
+                let account_event = started_event.clone();
+                let result = publish_root_event(state.get_ref(), root_actor.as_ref(), &session_id, &account_event, Box::new(move || {
+                    let _runners = runners;
+                    let _ = publish_tx.send(started_event);
+                    true
+                })).await;
+                if result.is_err() { return; }
+                (publication, visible_messages)
             };
             let mut forwarded_lifecycle_ids = HashSet::new();
+            let mut tool_event_display = NativeToolEventDisplay::default();
             while let Some(event) = mpsc_rx.recv().await {
+                match &event {
+                    AgentEvent::VisibleMessageStart {
+                        message_id,
+                        created_at,
+                    } => {
+                        if !publication.publish(|| {
+                            visible_messages.start(message_id.clone(), created_at.to_owned())
+                        }) {
+                            return;
+                        }
+                        continue;
+                    }
+                    AgentEvent::VisibleMessageDiscard { message_id } => {
+                        if !publication.publish(|| visible_messages.discard(message_id)) {
+                            return;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                let event = tool_event_display.project(event);
+                let event = bamboo_engine::external_agents::live::approval_event_for_display(event);
                 let lifecycle_id = match &event {
                     AgentEvent::WorkflowActivated { event_id, .. }
                     | AgentEvent::WorkflowDeactivated { event_id, .. } => Some(event_id),
@@ -85,50 +189,84 @@ pub(crate) fn spawn_event_forwarder(
                 if needs_runner_update {
                     let is_history_commit =
                         matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
-                    let mut runners = state.agent_runners.write().await;
-                    let Some(runner) = runners
-                        .get_mut(&session_id)
-                        .filter(|runner| runner.run_id == run_id)
-                    else {
+                    let mut runners = state.agent_runners.clone().write_owned().await;
+                    if !runners.get(&session_id).is_some_and(|runner| runner.run_id == run_id) { return; }
+                    let publish_session = session_id.clone();
+                    let publish_tx = session_tx.clone();
+                    let account_event = event.clone();
+                    let route = event.session_id().unwrap_or(&session_id).to_owned();
+                    let result = publish_root_event(state.get_ref(), root_actor.as_ref(), &route, &account_event, Box::new(move || {
+                        let runner = runners.get_mut(&publish_session).expect("retained exact runner guard");
+                        if is_critical_event(&event) { runner.push_critical_event(event.clone()); }
+                        if matches!(&event, AgentEvent::TokenBudgetUpdated { .. }) { runner.last_budget_event = Some(event.clone()); }
+                        let _ = publish_tx.send(event);
+                        true
+                    })).await;
+                    if let Err(error) = result {
+                        tracing::warn!(%session_id, %run_id, %error, "obsolete Root runtime event rejected before publication");
                         return;
-                    };
-                    if is_critical_event(&event) {
-                        runner.push_critical_event(event.clone());
-                        tracing::trace!(
-                            "[{}] Cached critical event for late subscribers",
-                            session_id
-                        );
                     }
-                    if matches!(&event, AgentEvent::TokenBudgetUpdated { .. }) {
-                        runner.last_budget_event = Some(event.clone());
-                        // Fires once per agent round — far too hot for debug.
-                        tracing::trace!(
-                            "[{}] Stored budget event for late subscribers",
-                            session_id
-                        );
-                    }
-                    // Hold exact generation ownership through the synchronous
-                    // account/broadcast publication. A successor reservation
-                    // needs this write lock and therefore cannot interleave a
-                    // new Started before this old frame.
-                    let route_session_id = event.session_id().unwrap_or(&session_id);
-                    state.account_sink.record(Some(route_session_id), &event);
-                    let _ = session_tx.send(event);
-                    if is_history_commit {
-                        history_commit_acknowledger.acknowledge();
-                    }
+                    if is_history_commit { history_commit_acknowledger.acknowledge(); }
                 } else {
                     let is_history_commit =
                         matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
+                    let visible_token = match &event {
+                        AgentEvent::Token { content } => Some(content.clone()),
+                        _ => None,
+                    };
+                    let round_count = match &event {
+                        AgentEvent::RunnerProgress { round_count, .. } => Some(*round_count),
+                        _ => None,
+                    };
+                    let terminal_reason = visible_terminal_reason(&event);
+                    if (terminal_reason.is_some() || is_history_commit || event.is_durable_change()) && root_actor.is_some() {
+                        let publish_tx = session_tx.clone();
+                        let account_event = event.clone();
+                        let route = event.session_id().unwrap_or(&session_id).to_owned();
+                        let publication = publication.clone();
+                        let visible = visible_messages.clone();
+                        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let publication_accepted = accepted.clone();
+                        let result = publish_root_event(state.get_ref(), root_actor.as_ref(), &route, &account_event, Box::new(move || {
+                            let published = publication.publish(|| {
+                                if let Some(round_count) = round_count { visible.begin_round(round_count); }
+                                if let Some(content) = visible_token { visible.append(content); }
+                                let _ = publish_tx.send(event);
+                                if let Some(reason) = terminal_reason { visible.mark_terminal(reason); }
+                                if is_history_commit { visible.history_committed(); }
+                            });
+                            publication_accepted.store(published, std::sync::atomic::Ordering::Release);
+                            published
+                        })).await;
+                        if let Err(error) = result {
+                            tracing::warn!(%session_id, %run_id, %error, "obsolete Root terminal event rejected before publication");
+                            return;
+                        }
+                        if !accepted.load(std::sync::atomic::Ordering::Acquire) { return; }
+                        if is_history_commit { history_commit_acknowledger.acknowledge(); }
+                    } else {
                     if !publication.publish(|| {
+                        if let Some(round_count) = round_count {
+                            visible_messages.begin_round(round_count);
+                        }
+                        if let Some(content) = visible_token {
+                            visible_messages.append(content);
+                        }
                         let route_session_id = event.session_id().unwrap_or(&session_id);
                         state.account_sink.record(Some(route_session_id), &event);
                         let _ = session_tx.send(event);
+                        if let Some(reason) = terminal_reason {
+                            visible_messages.mark_terminal(reason);
+                        }
+                        if is_history_commit {
+                            visible_messages.history_committed();
+                        }
                     }) {
                         return;
                     }
                     if is_history_commit {
                         history_commit_acknowledger.acknowledge();
+                    }
                     }
                 }
             }
@@ -286,6 +424,114 @@ mod tests {
         assert!(registry[id].last_activity_at().is_some());
         drop(registry);
         drop(input);
+    }
+
+    #[tokio::test]
+    async fn server_forwarder_keeps_internal_message_markers_off_the_session_stream() {
+        let directory = tempfile::tempdir().unwrap();
+        let state =
+            actix_web::web::Data::new(AppState::new(directory.path().to_path_buf()).await.unwrap());
+        let id = "server-visible-message";
+        let sender = state.get_session_event_sender(id).await;
+        let mut receiver = sender.subscribe();
+        bamboo_engine::execution::reserve_runner_core(
+            &state.agent_runners,
+            &state.session_event_senders,
+            id,
+            &sender,
+        )
+        .await;
+        let run_id = current_run_id(&state, id).await;
+        let (input, events) = mpsc::channel(8);
+        let mut barrier =
+            spawn_event_forwarder(state.clone(), id.into(), run_id, events, sender, None);
+        let visible = state.agent_runners.read().await[id]
+            .visible_messages
+            .clone();
+        let (mut visible_receiver, _) = visible.subscribe_with_snapshot();
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { .. }
+        ));
+
+        input
+            .send(AgentEvent::VisibleMessageStart {
+                message_id: "visible-1".into(),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::Token {
+                content: "public text".into(),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::Complete {
+                usage: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            AgentEvent::Token { .. }
+        ));
+        assert!(matches!(
+            timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            AgentEvent::Complete { .. }
+        ));
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    visible_receiver.recv().await.unwrap().kind,
+                    bamboo_engine::execution::VisibleMessageEventKind::Terminal { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("terminal replay event");
+        let (_, before_commit) = visible.subscribe_with_snapshot();
+        assert_eq!(before_commit.messages.len(), 1);
+        assert_eq!(before_commit.messages[0].id, "visible-1");
+        assert_eq!(before_commit.messages[0].content, "public text");
+        assert_eq!(before_commit.terminal.as_deref(), Some("complete"));
+
+        assert!(timeout(
+            Duration::from_secs(5),
+            barrier.send_and_wait(&input, id.into())
+        )
+        .await
+        .expect("history commit barrier"));
+        let (_, after_commit) = visible.subscribe_with_snapshot();
+        assert!(after_commit.messages.is_empty());
+        assert!(after_commit.history_committed);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let event = receiver.recv().await.unwrap();
+                assert!(
+                    !matches!(
+                        event,
+                        AgentEvent::VisibleMessageStart { .. }
+                            | AgentEvent::VisibleMessageDiscard { .. }
+                    ),
+                    "internal markers must not be broadcast"
+                );
+                if matches!(event, AgentEvent::SessionHistoryCommitted { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("history commit on the session stream");
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -528,6 +774,148 @@ mod tests {
         .expect("provider purpose should appear");
     }
 
+    async fn close_bound_gold_forwarder(
+        state: &actix_web::web::Data<AppState>,
+        session: &bamboo_agent_core::Session,
+        gold_config: GoldConfig,
+    ) {
+        use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
+
+        let session_id = session.id.as_str();
+        let session_tx = state.get_session_event_sender(session_id).await;
+        let mut session_rx = session_tx.subscribe();
+        let mut account_rx = state.account_sink.subscribe();
+        let mut reservation = match reserve_session_execution(
+            &state.agent,
+            &state.agent_runners,
+            &state.session_event_senders,
+            session_id,
+            &session_tx,
+        )
+        .await
+        {
+            SessionExecutionReserveOutcome::Reserved(reservation) => reservation,
+            SessionExecutionReserveOutcome::AlreadyRunning { run_id } => {
+                panic!("the initial gold fixture run must reserve ownership: {run_id}")
+            }
+        };
+        reservation
+            .bind_root_actor(&state.agent, session)
+            .await
+            .expect("the initial Root must bind through its real execution reservation");
+        let run_id = reservation.run_id().to_string();
+        let root_actor = reservation
+            .root_actor_writer()
+            .expect("the ordinary Root forwarder requires its actual Actor owner");
+        state
+            .agent_runners
+            .write()
+            .await
+            .get_mut(session_id)
+            .unwrap()
+            .status = AgentStatus::Running;
+
+        let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
+        let mut history = spawn_event_forwarder_with_root_actor(
+            state.clone(),
+            session_id.to_string(),
+            run_id.clone(),
+            mpsc_rx,
+            session_tx,
+            Some(gold_config),
+            Some(root_actor),
+        );
+        mpsc_tx
+            .send(AgentEvent::Token {
+                content: "before-close".into(),
+            })
+            .await
+            .expect("the bound old run must send its token before closing");
+        assert!(timeout(
+            Duration::from_secs(30),
+            history.send_and_wait(&mpsc_tx, session_id.into()),
+        )
+        .await
+        .expect("the bound old run must reach its physical history publication"));
+
+        timeout(Duration::from_secs(30), async {
+            let mut started = false;
+            let mut token = false;
+            let mut committed = false;
+            while !(started && token && committed) {
+                match session_rx.recv().await.expect("old Root session broadcast") {
+                    AgentEvent::ExecutionStarted {
+                        run_id: started_id, ..
+                    } => {
+                        assert_eq!(started_id, run_id);
+                        started = true;
+                    }
+                    AgentEvent::Token { content } if content == "before-close" => token = true,
+                    AgentEvent::SessionHistoryCommitted {
+                        session_id: committed_id,
+                        ..
+                    } => {
+                        assert_eq!(committed_id, session_id);
+                        committed = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("old Root started/token/history must publish before its owner finishes");
+        timeout(Duration::from_secs(30), async {
+            let mut started = false;
+            let mut committed = false;
+            while !(started && committed) {
+                let change = account_rx.recv().await.expect("old Root account broadcast");
+                if change.session_id.as_deref() != Some(session_id) {
+                    continue;
+                }
+                match &change.event {
+                    AgentEvent::ExecutionStarted {
+                        run_id: started_id, ..
+                    } => {
+                        assert_eq!(started_id, &run_id);
+                        started = true;
+                    }
+                    AgentEvent::SessionHistoryCommitted { .. } => committed = true,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("old Root account/history must publish before its owner finishes");
+        let journaled =
+            bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+        assert!(journaled.iter().any(|change| {
+            change.session_id.as_deref() == Some(session_id)
+                && matches!(
+                    &change.event,
+                    AgentEvent::ExecutionStarted { run_id: started_id, .. }
+                        if started_id == &run_id
+                )
+        }));
+        assert!(journaled.iter().any(|change| {
+            change.session_id.as_deref() == Some(session_id)
+                && matches!(&change.event, AgentEvent::SessionHistoryCommitted { .. })
+        }));
+
+        reservation
+            .finish_root_actor(bamboo_domain::ActorActivationFinish::Succeeded)
+            .await;
+        // This port fixture has no spawned old runner to finish its router
+        // registration. Release that exact reservation before Gold reserves
+        // the successor; the Root Actor has already finished successfully.
+        reservation.abandon().await;
+        let mut runners = state.agent_runners.write().await;
+        let runner = runners.get_mut(session_id).unwrap();
+        assert_eq!(runner.run_id, run_id);
+        runner.status = AgentStatus::Completed;
+        drop(runners);
+        drop(mpsc_tx);
+    }
+
     // ── is_critical_event ──────────────────────────────────────────────
 
     #[test]
@@ -693,6 +1081,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_download_events_are_private_before_session_broadcast() {
+        use bamboo_agent_core::ToolResult;
+        use bamboo_domain::tool_types::ToolResultImage;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = actix_web::web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let session_id = "native-download-display";
+        let sender = state.get_session_event_sender(session_id).await;
+        let mut receiver = sender.subscribe();
+        bamboo_engine::execution::reserve_runner_core(
+            &state.agent_runners,
+            &state.session_event_senders,
+            session_id,
+            &sender,
+        )
+        .await;
+        let (input, events) = mpsc::channel(8);
+        spawn_event_forwarder(
+            state.clone(),
+            session_id.into(),
+            current_run_id(&state, session_id).await,
+            events,
+            sender,
+            None,
+        );
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { .. }
+        ));
+
+        let private = "private-selector-url-filename-and-bytes";
+        input.send(AgentEvent::ToolStart {
+            tool_call_id: "download-1".into(),
+            tool_name: "default::browser".into(),
+            arguments: json!({"action":"download","selector":private,"expected_epoch":12,"url":private}),
+        }).await.unwrap();
+        input
+            .send(AgentEvent::ToolToken {
+                tool_call_id: "download-1".into(),
+                content: private.into(),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::ToolLifecycle {
+                tool_call_id: "download-1".into(),
+                tool_name: "browser".into(),
+                phase: "error".into(),
+                elapsed_ms: Some(2),
+                is_mutating: false,
+                auto_approved: false,
+                summary: Some(private.into()),
+                error: Some(private.into()),
+            })
+            .await
+            .unwrap();
+        let authoritative = ToolResult {
+            success: false,
+            result: private.into(),
+            display_preference: Some(private.into()),
+            images: vec![ToolResultImage {
+                mime_type: "image/png".into(),
+                data: private.into(),
+            }],
+        };
+        input
+            .send(AgentEvent::ToolComplete {
+                tool_call_id: "download-1".into(),
+                result: authoritative.clone(),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::ToolStart {
+                tool_call_id: "read-1".into(),
+                tool_name: "Read".into(),
+                arguments: json!({"path":"readme.md"}),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::ToolComplete {
+                tool_call_id: "read-1".into(),
+                result: ToolResult::text(true, "ordinary Read result"),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::HookLifecycle {
+                hook_name: private.into(),
+                point: bamboo_domain::AgentHookPoint::BeforeToolExecution,
+                phase: private.into(),
+                duration_ms: 7,
+                decision: bamboo_domain::HookResult::Deny {
+                    reason: private.into(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let mut visible = Vec::new();
+        for _ in 0..7 {
+            visible.push(
+                timeout(Duration::from_secs(5), receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        for event in &visible[..4] {
+            assert!(!serde_json::to_string(event).unwrap().contains(private));
+        }
+        assert!(
+            matches!(&visible[3], AgentEvent::ToolComplete { result, .. }
+            if !result.success && result.images.is_empty() && result.display_preference.is_none()
+                && result.result == "Browser download result hidden")
+        );
+        assert!(
+            matches!(&visible[5], AgentEvent::ToolComplete { result, .. }
+            if result.result == "ordinary Read result")
+        );
+        assert!(!serde_json::to_string(&visible[6])
+            .unwrap()
+            .contains(private));
+        assert!(matches!(
+            &visible[6],
+            AgentEvent::HookLifecycle {
+                point: bamboo_domain::AgentHookPoint::BeforeToolExecution,
+                duration_ms: 7,
+                decision: bamboo_domain::HookResult::Deny { .. },
+                ..
+            }
+        ));
+        assert!(!visible[6].is_durable_change());
+        assert!(!visible[6].is_replayable_session_state());
+        assert_eq!(
+            authoritative.result, private,
+            "model-facing result remains unchanged"
+        );
+        assert_eq!(authoritative.images[0].data, private);
+    }
+
+    #[tokio::test]
     async fn delayed_server_forwarder_cannot_publish_after_successor_reservation() {
         let temp_dir = tempfile::tempdir().unwrap();
         let state = actix_web::web::Data::new(
@@ -764,7 +1299,7 @@ mod tests {
         }
 
         let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
-        let (session_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
+        let (session_tx, mut session_rx) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
         let mut history_commit_barrier = spawn_event_forwarder(
             state.clone(),
             session_id.to_string(),
@@ -797,6 +1332,7 @@ mod tests {
                 .await,
             "history barrier must be durably published before the producer continues"
         );
+        let private = "private-download-selector";
         mpsc_tx
             .send(AgentEvent::ChildApprovalChanged {
                 parent_session_id: "parent-session".into(),
@@ -805,10 +1341,10 @@ mod tests {
                 request_id: "req-1".into(),
                 version: 2,
                 status: "approved".into(),
-                reason: None,
-                tool_name: "Bash".into(),
-                permission: "execute".into(),
-                resource: "/tmp/x".into(),
+                reason: Some(private.into()),
+                tool_name: "default::browser".into(),
+                permission: private.into(),
+                resource: format!("browser:17:download:css:{private}"),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 resolved_at: Some("2026-01-01T00:00:01Z".into()),
             })
@@ -842,6 +1378,16 @@ mod tests {
             journaled[4].event,
             AgentEvent::ChildApprovalChanged { .. }
         ));
+        assert!(!serde_json::to_string(&journaled[4].event)
+            .unwrap()
+            .contains(private));
+        let broadcast = std::iter::from_fn(|| session_rx.try_recv().ok())
+            .find(|event| matches!(event, AgentEvent::ChildApprovalChanged { .. }))
+            .expect("child approval reached the live session stream");
+        assert!(!serde_json::to_string(&broadcast).unwrap().contains(private));
+        let runners = state.agent_runners.read().await;
+        let replay = &runners[session_id].last_critical_events;
+        assert!(!serde_json::to_string(replay).unwrap().contains(private));
         // Sequence numbers are monotonic and 1-based.
         assert_eq!(journaled[0].seq, 1);
         assert_eq!(journaled[1].seq, 2);
@@ -1108,42 +1654,7 @@ mod tests {
             }),
         );
         state.save_and_cache_session(&mut session).await;
-
-        let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
-        let (session_tx, _session_rx) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
-        let mut runner = bamboo_engine::runtime::execution::runner_state::AgentRunner::new();
-        runner.run_id = "gold-run".to_string();
-        runner.status = AgentStatus::Running;
-        runner.event_sender = session_tx.clone();
-        state
-            .agent_runners
-            .write()
-            .await
-            .insert(session_id.to_string(), runner);
-
-        spawn_event_forwarder(
-            state.clone(),
-            session_id.to_string(),
-            "gold-run".to_string(),
-            mpsc_rx,
-            session_tx,
-            Some(test_gold_config()),
-        );
-
-        mpsc_tx
-            .send(AgentEvent::Token {
-                content: "before-close".into(),
-            })
-            .await
-            .expect("should send token before close");
-        state
-            .agent_runners
-            .write()
-            .await
-            .get_mut(session_id)
-            .unwrap()
-            .status = AgentStatus::Completed;
-        drop(mpsc_tx);
+        close_bound_gold_forwarder(&state, &session, test_gold_config()).await;
 
         let resumed_status = wait_for_resume_activity(state.as_ref(), session_id).await;
         wait_for_provider_purpose(provider.as_ref(), "agent_loop").await;
@@ -1152,13 +1663,8 @@ mod tests {
             AgentStatus::Running | AgentStatus::Completed
         ));
 
-        // The gold answer (pending_question cleared + auto-answer message)
-        // lands in the memory cache first; `load_session_merged` can still
-        // surface the stale storage copy until persistence catches up, because
-        // its prefer-storage heuristic favours a storage session that still
-        // carries the pending question (`memory.pending=None && storage.pending=Some`).
-        // Poll until the merged view has settled so the assertions are
-        // deterministic rather than racing the memory↔storage convergence.
+        // The detached successor owns the accepted answer. Observe its shared
+        // cache after the actual bound checkpoint and resume-marker consume.
         let after = timeout(Duration::from_secs(30), async {
             loop {
                 if let Some(session) =
@@ -1245,46 +1751,11 @@ mod tests {
         );
         state.save_and_cache_session(&mut session).await;
 
-        let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
-        let (session_tx, _session_rx) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
-        let mut runner = bamboo_engine::runtime::execution::runner_state::AgentRunner::new();
-        runner.run_id = "gold-run".to_string();
-        runner.status = AgentStatus::Running;
-        runner.event_sender = session_tx.clone();
-        state
-            .agent_runners
-            .write()
-            .await
-            .insert(session_id.to_string(), runner);
-
         let mut gold_config = test_gold_config();
         gold_config.auto_answer_enabled = true;
         gold_config.auto_continue_enabled = true;
         gold_config.max_auto_continuations = 3;
-
-        spawn_event_forwarder(
-            state.clone(),
-            session_id.to_string(),
-            "gold-run".to_string(),
-            mpsc_rx,
-            session_tx,
-            Some(gold_config),
-        );
-
-        mpsc_tx
-            .send(AgentEvent::Token {
-                content: "before-close".into(),
-            })
-            .await
-            .expect("should send token before close");
-        state
-            .agent_runners
-            .write()
-            .await
-            .get_mut(session_id)
-            .unwrap()
-            .status = AgentStatus::Completed;
-        drop(mpsc_tx);
+        close_bound_gold_forwarder(&state, &session, gold_config).await;
 
         let resumed_status = wait_for_resume_activity(state.as_ref(), session_id).await;
         wait_for_provider_purpose(provider.as_ref(), "agent_loop").await;
@@ -1293,9 +1764,8 @@ mod tests {
             AgentStatus::Running | AgentStatus::Completed
         ));
 
-        // See the sibling test: poll until the merged view has settled (the
-        // gold answer is visible) so the assertions don't race the
-        // memory↔storage convergence in `load_session_merged`.
+        // Observe the detached successor's accepted answer, as in the sibling
+        // test, before checking that no separate Gold continuation was added.
         let after = timeout(Duration::from_secs(30), async {
             loop {
                 if let Some(session) =

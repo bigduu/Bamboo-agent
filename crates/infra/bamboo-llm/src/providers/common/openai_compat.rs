@@ -563,6 +563,21 @@ mod tests {
     }
 
     #[test]
+    fn build_openai_compat_body_sends_explicit_none_reasoning_effort() {
+        let body = super::build_openai_compat_body(
+            "gpt-5.6-sol",
+            &[],
+            &[],
+            None,
+            Some(32_000),
+            Some(bamboo_domain::ReasoningEffort::Disabled),
+            None,
+        );
+
+        assert_eq!(body["reasoning_effort"], "none");
+    }
+
+    #[test]
     fn build_openai_compat_body_keeps_legacy_models_on_xhigh() {
         let body = super::build_openai_compat_body(
             "gpt-4o",

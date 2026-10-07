@@ -1,4 +1,302 @@
 use std::collections::BTreeMap;
+
+fn required_packet_session() -> Session {
+    let mut parent = Session::new("packet-parent", "test-model");
+    let background = Message::assistant("optional background words ".repeat(60), None);
+    let packet = bamboo_domain::ChildContextPacket {
+        version: 1,
+        objective: "required exact objective 🪷".into(),
+        constraints: vec!["preserve the user constraint".into()],
+        acceptance: vec!["return evidence".into()],
+        non_goals: vec![],
+        necessary_user_instructions: vec![],
+        recorded_decisions: vec![],
+        source_user_message_ids: vec![],
+        background_message_ids: vec![background.id.clone()],
+    };
+    parent.add_message(background);
+    let resolved = packet.resolve(&parent, "bounded task").unwrap();
+    let mut binding = bamboo_domain::ChildContextBinding::new(
+        &parent,
+        "packet-child",
+        resolved.required_brief.clone(),
+        resolved,
+    )
+    .unwrap();
+    let mut child = Session::new_child_of("packet-child", &parent, "test-model", "packet");
+    child.token_budget = Some(TokenBudget::with_safety_margin(
+        32_000,
+        64,
+        Default::default(),
+        0,
+    ));
+    binding.bind_host_budget(&child).unwrap();
+    binding.install(&mut child).unwrap();
+    child.add_message(Message::system("system"));
+    child.add_message(binding.assignment_message());
+    child.messages.extend(binding.background_messages());
+    child
+}
+
+#[tokio::test]
+async fn required_packet_midturn_manual_archive_and_overflow_do_not_call_lossy_provider() {
+    let (llm, model_calls) = recording_llm();
+    for strategy in [
+        ContextManagementStrategy::Summary,
+        ContextManagementStrategy::RetrievalWindow,
+    ] {
+        let mut config = AgentLoopConfig::default();
+        config.context_management.strategy = strategy;
+        let mut session = required_packet_session();
+        let required = bamboo_domain::ChildContextBinding::from_session(&session)
+            .unwrap()
+            .unwrap()
+            .assignment_message();
+        assert!(!maybe_apply_host_context_compression(
+            &mut session,
+            &config,
+            "test-model",
+            "packet-child",
+            &[],
+            &llm,
+            None,
+            "mid-turn"
+        )
+        .await
+        .unwrap());
+        session.force_manual_compression = Some("compact".into());
+        assert!(maybe_apply_host_context_compression(
+            &mut session,
+            &config,
+            "test-model",
+            "packet-child",
+            &[],
+            &llm,
+            None,
+            "mid-turn"
+        )
+        .await
+        .is_err());
+        session.force_manual_compression = None;
+        append_archive_context_request(&mut session, "packet-archive");
+        assert!(maybe_apply_host_context_compression(
+            &mut session,
+            &config,
+            "test-model",
+            "packet-child",
+            &[],
+            &llm,
+            None,
+            "mid-turn"
+        )
+        .await
+        .is_err());
+        assert!(super::force_overflow_context_recovery(
+            &mut session,
+            &config,
+            "test-model",
+            "packet-child",
+            &[],
+            &llm,
+            None
+        )
+        .await
+        .is_err());
+        assert!(session
+            .messages
+            .iter()
+            .any(|message| message.id == required.id
+                && message.content == required.content
+                && !message.compressed));
+        assert!(model_calls.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn required_packet_later_round_overflow_fails_before_any_provider_or_compression() {
+    let (llm, model_calls) = recording_llm();
+    let mut session = required_packet_session();
+    session.add_message(Message::assistant(
+        "later round tool evidence ".repeat(30_000),
+        None,
+    ));
+    let error = prepare_round_context(
+        &mut session,
+        &AgentLoopConfig::default(),
+        "test-model",
+        "packet-child",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("context_budget_exceeded"));
+    assert!(bamboo_domain::ChildContextBinding::from_session(&session)
+        .unwrap()
+        .is_some());
+    assert!(model_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn required_packet_optional_fit_and_final_safe_cap_guard() {
+    let (llm, model_calls) = recording_llm();
+    let config = AgentLoopConfig::default();
+    let mut session = required_packet_session();
+    let mut binding = bamboo_domain::ChildContextBinding::from_session(&session)
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.payload.background.len(), 1);
+    let mut minimal = session.clone();
+    minimal
+        .messages
+        .retain(|message| !binding.is_background(message));
+    let prepared = prepare_round_context(
+        &mut minimal,
+        &config,
+        "test-model",
+        "packet-child",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .unwrap();
+    let usage = super::super::stream_execution::project_request_usage(
+        &minimal,
+        &prepared.prepared_context,
+        &config,
+        &[],
+        "test-model",
+        &llm,
+    )
+    .await
+    .unwrap();
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        usage.input_tokens + 65,
+        64,
+        Default::default(),
+        0,
+    ));
+    binding.bind_host_budget(&session).unwrap();
+    binding.install(&mut session).unwrap();
+    session.messages = vec![Message::system("system"), binding.assignment_message()];
+    session.messages.extend(binding.background_messages());
+    let fitted = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "packet-child",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .unwrap();
+    binding
+        .validate_messages(&session.id, &fitted.prepared_context.messages)
+        .unwrap();
+    let model_budget = super::super::token_budget::resolve_token_budget(
+        &mut Session::new("model-budget-proof", "test-model"),
+        &config,
+        "test-model",
+        llm.as_ref(),
+    )
+    .await;
+    assert!(fitted.budget.max_request_input_tokens() <= model_budget.max_request_input_tokens());
+    assert!(
+        fitted.budget.max_request_input_tokens()
+            <= session
+                .token_budget
+                .as_ref()
+                .unwrap()
+                .max_request_input_tokens()
+    );
+    assert!(!fitted
+        .prepared_context
+        .messages
+        .iter()
+        .any(|message| binding.is_background(message)));
+    assert_eq!(
+        session.metadata["child.context_packet.provider_background_omitted.v1"],
+        "1"
+    );
+    assert!(model_calls.lock().unwrap().is_empty());
+    // A final known tool footprint added after fitting must also respect the
+    // safe input cap, even when it still fits the old context-minus-output cap.
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        usage.input_tokens + 1 + 64 + 1_000,
+        64,
+        Default::default(),
+        1_000,
+    ));
+    binding.bind_host_budget(&session).unwrap();
+    binding.install(&mut session).unwrap();
+    session.messages = vec![Message::system("system"), binding.assignment_message()];
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "packet-child",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .unwrap();
+    let tools = vec![ToolSchema {
+        schema_type: "function".into(),
+        function: FunctionSchema {
+            name: "bounded_lookup".into(),
+            description: "Known provider tool".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"query":{"type":"string"}}}),
+        },
+    }];
+    let final_usage = super::super::stream_execution::project_request_usage(
+        &session,
+        &prepared.prepared_context,
+        &config,
+        &tools,
+        "test-model",
+        &llm,
+    )
+    .await
+    .unwrap();
+    assert!(final_usage.tool_schema_input_tokens > 0);
+    assert!(final_usage.input_tokens > prepared.budget.max_request_input_tokens());
+    assert!(
+        final_usage.input_tokens
+            <= prepared.budget.max_context_tokens - prepared.budget.max_output_tokens
+    );
+    let (event_tx, _event_rx) = mpsc::channel(16);
+    let error = super::super::stream_execution::execute_llm_stream(
+        &mut session,
+        &config,
+        &llm,
+        &prepared.prepared_context,
+        &tools,
+        &super::super::stream_execution::LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &tokio_util::sync::CancellationToken::new(),
+            session_id: "packet-child",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: prepared.budget.max_context_tokens,
+            max_output_tokens: prepared.budget.max_output_tokens,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(error
+        .to_string()
+        .contains("final known provider-visible request exceeds"));
+    assert!(model_calls.lock().unwrap().is_empty());
+}
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -3457,16 +3755,18 @@ async fn retrieval_window_post_archive_projection_failure_discards_staged_state(
     .await
     .expect_err("expanded retained request must fail before checkpoint");
 
-    assert!(error.to_string().contains("exact retained request exceeds"));
+    assert!(error
+        .to_string()
+        .contains("estimated retained request exceeds"));
     assert_eq!(serde_json::to_vec(&session).unwrap(), before);
     assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
     assert!(event_rx.try_recv().is_err());
 }
 
 #[tokio::test]
-async fn retrieval_window_native_image_without_complete_cost_fails_before_mutation() {
+async fn retrieval_window_archives_older_turns_with_native_image_estimate() {
     let mut session = retrieval_window_session("retrieval-image-cost");
-    session.messages.push(Message::user_with_parts(
+    let image = Message::user_with_parts(
         "latest image evidence",
         vec![ContentPart::ImageUrl {
             image_url: ImageUrl {
@@ -3477,14 +3777,19 @@ async fn retrieval_window_native_image_without_complete_cost_fails_before_mutati
         .into_iter()
         .map(Into::into)
         .collect(),
-    ));
-    let before = serde_json::to_vec(&session).unwrap();
+    );
+    let image_id = image.id.clone();
+    session.messages.push(image);
     let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
-    let config = retrieval_window_config(persistence);
+    let mut config = retrieval_window_config(persistence);
+    config
+        .context_management
+        .retrieval_window
+        .min_recent_user_turns = 1;
     let tool_schemas = vec![retrieval_history_tool_schema()];
     let llm = noop_llm();
 
-    let error = prepare_round_context(
+    let prepared = prepare_round_context(
         &mut session,
         &config,
         "test-model",
@@ -3494,11 +3799,150 @@ async fn retrieval_window_native_image_without_complete_cost_fails_before_mutati
         None,
     )
     .await
-    .expect_err("provider-native image cost must fail closed");
+    .expect("native images should be estimated for retrieval planning");
 
-    assert!(error.to_string().contains("active image message"));
+    assert!(session.messages.iter().any(|message| {
+        message.id == image_id && !message.compressed && message.content_parts.is_some()
+    }));
+    assert!(prepared
+        .prepared_context
+        .messages
+        .iter()
+        .any(|message| { message.id == image_id && message.content_parts.is_some() }));
+    assert!(session.messages.iter().any(|message| message.compressed));
+    assert!(session.conversation_summary.is_none());
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+}
+
+#[tokio::test]
+async fn retrieval_window_native_image_below_trigger_does_not_archive() {
+    let mut session = Session::new("retrieval-image-below-trigger", "test-model");
+    session.messages.push(Message::system("retrieval system"));
+    let image = Message::user_with_parts(
+        "inspect the image",
+        vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,AA==".to_string(),
+                detail: Some("high".to_string()),
+            },
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect(),
+    );
+    let image_id = image.id.clone();
+    session.messages.push(image);
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        32_000,
+        512,
+        BudgetStrategy::default(),
+        0,
+    ));
+    let before = serde_json::to_vec(&session).unwrap();
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let llm = noop_llm();
+
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-image-below-trigger",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .expect("a low-usage image request should not require archival capability");
+
     assert_eq!(serde_json::to_vec(&session).unwrap(), before);
     assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
+    assert!(prepared
+        .prepared_context
+        .messages
+        .iter()
+        .any(|message| { message.id == image_id && message.content_parts.is_some() }));
+}
+
+#[test]
+fn retrieval_window_image_estimate_ignores_base64_length() {
+    let counter = TiktokenTokenCounter::default();
+    let image_message = |encoded: &str, detail: &str| {
+        Message::user_with_parts(
+            "inspect the image",
+            vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: format!("data:image/png;base64,{encoded}"),
+                    detail: Some(detail.to_string()),
+                },
+            }]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        )
+    };
+    let short = image_message("AA==", "high");
+    let long = image_message(&"A".repeat(40_000), "high");
+    let original_with_dimensions = image_message(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/C1cAAAAASUVORK5CYII=",
+        "original",
+    );
+    let original_without_dimensions = image_message("AA==", "original");
+    let image_tokens = |message: &Message| {
+        super::provider_prepared_message_tokens(message, &counter)
+            .saturating_sub(counter.count_message(message))
+    };
+
+    assert_eq!(image_tokens(&short), 1_844);
+    assert_eq!(image_tokens(&long), image_tokens(&short));
+    assert_eq!(image_tokens(&original_with_dimensions), 1);
+    assert_eq!(image_tokens(&original_without_dimensions), 10_000);
+}
+
+#[tokio::test]
+async fn retrieval_window_overflow_recovery_archives_with_native_image() {
+    let mut session = retrieval_window_session("retrieval-image-overflow");
+    let image = Message::user_with_parts(
+        "latest image evidence",
+        vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,AA==".to_string(),
+                detail: Some("high".to_string()),
+            },
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect(),
+    );
+    let image_id = image.id.clone();
+    session.messages.push(image);
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let mut config = retrieval_window_config(persistence);
+    config
+        .context_management
+        .retrieval_window
+        .min_recent_user_turns = 1;
+    let llm = noop_llm();
+
+    let recovered = super::force_overflow_context_recovery(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-image-overflow",
+        &[retrieval_history_tool_schema()],
+        &llm,
+        None,
+    )
+    .await
+    .expect("provider overflow should archive older turns around the active image");
+
+    assert!(recovered);
+    assert!(session.messages.iter().any(|message| {
+        message.id == image_id && !message.compressed && message.content_parts.is_some()
+    }));
+    assert!(session.messages.iter().any(|message| message.compressed));
+    assert!(session.conversation_summary.is_none());
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
 }
 
 #[tokio::test]

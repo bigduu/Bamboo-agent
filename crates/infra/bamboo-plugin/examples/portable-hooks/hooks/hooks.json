@@ -1,0 +1,13 @@
+{
+  "description": "Example portable synchronous policy command",
+  "hooks": {
+    "PreToolUse": [{
+      "matcher": ".*",
+      "hooks": [{
+        "type": "command",
+        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/policy.py\"",
+        "timeout": 5
+      }]
+    }]
+  }
+}

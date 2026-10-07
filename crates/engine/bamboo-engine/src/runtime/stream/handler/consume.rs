@@ -37,7 +37,13 @@ fn timeout_error(
     )
 }
 
-fn preview_for_log(value: &str, max_chars: usize) -> String {
+fn preview_for_log(tool_name: &str, value: &str, max_chars: usize) -> String {
+    let canonical = bamboo_domain::canonical_tool_name(tool_name);
+    if canonical.eq_ignore_ascii_case("browser") || canonical.eq_ignore_ascii_case("browser_eval") {
+        // This stream finalizer runs before executor-level argument repair.
+        // Malformed browser calls can contain private input or page source.
+        return "[redacted]".to_string();
+    }
     let mut iter = value.chars();
     let mut preview = String::new();
     for _ in 0..max_chars {
@@ -196,7 +202,7 @@ pub(super) async fn consume_llm_stream_internal_with_partial(
                 tool_call.id,
                 tool_call.function.name,
                 args.len(),
-                preview_for_log(args, 180),
+                preview_for_log(&tool_call.function.name, args, 180),
                 error
             );
         } else {
@@ -211,4 +217,27 @@ pub(super) async fn consume_llm_stream_internal_with_partial(
     }
 
     Ok(output)
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::preview_for_log;
+
+    #[test]
+    fn malformed_browser_arguments_never_log_prompt_or_keyboard_text() {
+        for args in [
+            r#"{"action":"dialog_respond","text":"private prompt""#,
+            r#"{"action":"type","text":"private typing""#,
+            r#"{"action":"key","key":"private key""#,
+        ] {
+            assert!(serde_json::from_str::<serde_json::Value>(args).is_err());
+            assert_eq!(preview_for_log("browser", args, 180), "[redacted]");
+            assert_eq!(preview_for_log("BROWSER", args, 180), "[redacted]");
+            assert_eq!(preview_for_log("default::browser", args, 180), "[redacted]");
+        }
+        assert_eq!(
+            preview_for_log("Bash", "echo ordinary", 180),
+            "echo ordinary"
+        );
+    }
 }

@@ -21,6 +21,64 @@ use super::approval_registry::{
     SharedApprovalRegistry,
 };
 
+const BROWSER_APPROVAL_PERMISSION: &str = "Browser interaction approval";
+const PRIVATE_APPROVAL_FIELD: &str = "[redacted]";
+
+fn is_browser_approval(tool_name: &str, resource: &str) -> bool {
+    tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case("browser"))
+        || resource
+            .trim_start()
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("browser:"))
+}
+
+/// Return only a presentation copy. The durable record and its CAS identity
+/// remain untouched so an approval can still be delivered after reconnect.
+pub fn approval_record_for_display(mut record: DurableApproval) -> DurableApproval {
+    if is_browser_approval(&record.tool_name, &record.resource) {
+        record.tool_name = "browser".into();
+        record.permission = BROWSER_APPROVAL_PERMISSION.into();
+        record.resource = PRIVATE_APPROVAL_FIELD.into();
+        record.reason = record.reason.map(|_| PRIVATE_APPROVAL_FIELD.into());
+    }
+    record
+}
+
+/// Project the actor or host approval event before it reaches a user-visible
+/// event stream. Request and version fields are left intact for reconciliation.
+pub fn approval_event_for_display(mut event: AgentEvent) -> AgentEvent {
+    match &mut event {
+        AgentEvent::ChildApprovalRequested {
+            tool_name,
+            permission,
+            resource,
+            ..
+        } if is_browser_approval(tool_name, resource) => {
+            *tool_name = "browser".into();
+            *permission = BROWSER_APPROVAL_PERMISSION.into();
+            *resource = PRIVATE_APPROVAL_FIELD.into();
+        }
+        AgentEvent::ChildApprovalChanged {
+            tool_name,
+            permission,
+            resource,
+            reason,
+            ..
+        } if is_browser_approval(tool_name, resource) => {
+            *tool_name = "browser".into();
+            *permission = BROWSER_APPROVAL_PERMISSION.into();
+            *resource = PRIVATE_APPROVAL_FIELD.into();
+            *reason = reason.take().map(|_| PRIVATE_APPROVAL_FIELD.into());
+        }
+        _ => {}
+    }
+    event
+}
+
 type ScopeId = usize;
 type LiveKey = (ScopeId, String, u32);
 type PendingKey = (ScopeId, String, String, u32, String);
@@ -280,7 +338,7 @@ fn emit_resolution(
     durable: Option<&DurableApproval>,
 ) {
     let now = chrono::Utc::now();
-    let event = AgentEvent::ChildApprovalChanged {
+    let event = approval_event_for_display(AgentEvent::ChildApprovalChanged {
         parent_session_id: record.parent_session_id,
         child_session_id: child_id.to_string(),
         child_attempt: record.child_attempt,
@@ -300,7 +358,7 @@ fn emit_resolution(
                 .map(|record| record.updated_at.clone())
                 .unwrap_or_else(|| now.to_rfc3339()),
         ),
-    };
+    });
     match record.event_tx.try_send(event) {
         Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
         Err(mpsc::error::TrySendError::Full(event)) => {
@@ -477,7 +535,7 @@ fn finish_durable(
 }
 
 fn record_event(record: DurableApproval) -> AgentEvent {
-    AgentEvent::ChildApprovalChanged {
+    approval_event_for_display(AgentEvent::ChildApprovalChanged {
         parent_session_id: record.parent_session_id,
         child_session_id: record.child_session_id,
         child_attempt: record.child_attempt,
@@ -498,7 +556,7 @@ fn record_event(record: DurableApproval) -> AgentEvent {
         resource: record.resource,
         created_at: record.created_at,
         resolved_at: Some(record.updated_at),
-    }
+    })
 }
 
 /// Unregisters the child on drop, so a panicking/returning runner can't leak
@@ -684,6 +742,192 @@ pub fn is_live(child_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PRIVATE_MARKER: &str = "private-download-selector-and-url";
+
+    fn browser_approval(state: ApprovalState) -> DurableApproval {
+        DurableApproval {
+            parent_session_id: "parent-private".into(),
+            child_session_id: "child-private".into(),
+            child_attempt: 3,
+            request_id: "request-private".into(),
+            tool_name: "default::browser".into(),
+            permission: PRIVATE_MARKER.into(),
+            resource: format!("browser:17:download:css:{PRIVATE_MARKER}"),
+            created_at: "2026-09-24T00:00:00Z".into(),
+            updated_at: "2026-09-24T00:00:01Z".into(),
+            version: 9,
+            state,
+            approved: None,
+            reason: Some(PRIVATE_MARKER.into()),
+        }
+    }
+
+    #[test]
+    fn browser_approval_display_copy_preserves_identity_but_hides_private_fields() {
+        let original = browser_approval(ApprovalState::Pending);
+        let displayed = approval_record_for_display(original.clone());
+        let wire = serde_json::to_string(&displayed).unwrap();
+        assert!(!wire.contains(PRIVATE_MARKER));
+        assert_eq!(displayed.parent_session_id, original.parent_session_id);
+        assert_eq!(displayed.child_session_id, original.child_session_id);
+        assert_eq!(displayed.child_attempt, original.child_attempt);
+        assert_eq!(displayed.request_id, original.request_id);
+        assert_eq!(displayed.version, original.version);
+        assert_eq!(displayed.state, original.state);
+        assert_eq!(displayed.created_at, original.created_at);
+        assert_eq!(displayed.updated_at, original.updated_at);
+        assert!(original.resource.contains(PRIVATE_MARKER));
+
+        let requested = approval_event_for_display(AgentEvent::ChildApprovalRequested {
+            child_session_id: original.child_session_id.clone(),
+            request_id: original.request_id.clone(),
+            tool_name: original.tool_name.clone(),
+            permission: original.permission.clone(),
+            resource: original.resource.clone(),
+        });
+        assert!(!serde_json::to_string(&requested)
+            .unwrap()
+            .contains(PRIVATE_MARKER));
+        assert!(
+            matches!(requested, AgentEvent::ChildApprovalRequested { request_id, .. }
+            if request_id == original.request_id)
+        );
+
+        let changed = record_event(original.clone());
+        let changed_wire = serde_json::to_string(&changed).unwrap();
+        assert!(!changed_wire.contains(PRIVATE_MARKER));
+        assert!(matches!(changed, AgentEvent::ChildApprovalChanged {
+            request_id, child_attempt: 3, version: 9, status, ..
+        } if request_id == original.request_id && status == "pending"));
+
+        let ordinary = DurableApproval {
+            tool_name: "Read".into(),
+            resource: PRIVATE_MARKER.into(),
+            ..original
+        };
+        assert_eq!(
+            approval_record_for_display(ordinary.clone()).resource,
+            ordinary.resource
+        );
+        let malformed = DurableApproval {
+            tool_name: "Read".into(),
+            resource: format!(" BROWSER:17:download:css:{PRIVATE_MARKER}"),
+            ..ordinary
+        };
+        assert!(
+            !serde_json::to_string(&approval_record_for_display(malformed))
+                .unwrap()
+                .contains(PRIVATE_MARKER)
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_approval_resolution_and_restart_events_hide_private_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("approvals.json");
+        let registry =
+            std::sync::Arc::new(Mutex::new(ApprovalRegistry::open(path.clone()).unwrap()));
+        let (wire_tx, mut wire_rx) = mpsc::unbounded_channel();
+        let _guard = register("child-private", wire_tx, 3, Some(registry.clone()));
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let (version, _) = observe_pending_approval(PendingApprovalObservation {
+            registry: Some(&registry),
+            parent_session_id: "parent-private",
+            child_id: "child-private",
+            child_attempt: 3,
+            request_id: "request-private",
+            tool_name: "default::browser",
+            permission: PRIVATE_MARKER,
+            resource: &format!("browser:17:download:css:{PRIVATE_MARKER}"),
+            event_tx,
+        });
+        let authority = registry.lock().unwrap().unresolved_snapshot();
+        assert!(authority.approvals[0].resource.contains(PRIVATE_MARKER));
+        assert_eq!(
+            deliver_approval_checked_cas(
+                Some(&registry),
+                "parent-private",
+                "child-private",
+                3,
+                "request-private",
+                version,
+                true,
+            ),
+            ApprovalDeliveryResult::Delivered
+        );
+        assert!(matches!(wire_rx.try_recv(), Ok(ParentFrame::ApprovalReply {
+            id, approved: true
+        }) if id == "request-private"));
+        let changed = event_rx.recv().await.unwrap();
+        assert!(!serde_json::to_string(&changed)
+            .unwrap()
+            .contains(PRIVATE_MARKER));
+        assert!(matches!(changed, AgentEvent::ChildApprovalChanged {
+            request_id, version: changed_version, status, ..
+        } if request_id == "request-private" && changed_version > version && status == "approved"));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(PRIVATE_MARKER));
+
+        // A different unresolved request is reconciled from the authoritative
+        // registry after restart, then published only as a display copy.
+        let mut restart = browser_approval(ApprovalState::Pending);
+        restart.request_id = "restart-private".into();
+        registry.lock().unwrap().register(restart).unwrap();
+        drop(_guard);
+        drop(registry);
+        let (_, restarted_events) = initialize_durable_approvals(path.clone()).unwrap();
+        assert_eq!(restarted_events.len(), 1);
+        let restart_wire = serde_json::to_string(&restarted_events).unwrap();
+        assert!(!restart_wire.contains(PRIVATE_MARKER));
+        assert!(restart_wire.contains("restart-private"));
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains(PRIVATE_MARKER));
+    }
+
+    #[tokio::test]
+    async fn browser_denied_and_expired_events_hide_private_fields() {
+        let (wire_tx, _wire_rx) = mpsc::unbounded_channel();
+        let _guard = register("child-denied-private", wire_tx, 0, None);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        for (child_id, request_id) in [
+            ("child-denied-private", "request-denied-private"),
+            ("child-expired-private", "request-expired-private"),
+        ] {
+            observe_pending_approval(PendingApprovalObservation {
+                registry: None,
+                parent_session_id: "parent-private",
+                child_id,
+                child_attempt: 0,
+                request_id,
+                tool_name: "browser",
+                permission: PRIVATE_MARKER,
+                resource: PRIVATE_MARKER,
+                event_tx: event_tx.clone(),
+            });
+        }
+        assert!(deliver_approval_checked(
+            None,
+            "child-denied-private",
+            "request-denied-private",
+            false,
+        ));
+        assert!(expire_pending_approval(
+            None,
+            "child-expired-private",
+            "request-expired-private",
+        ));
+        let denied = event_rx.recv().await.unwrap();
+        let expired = event_rx.recv().await.unwrap();
+        for event in [denied, expired] {
+            assert!(!serde_json::to_string(&event)
+                .unwrap()
+                .contains(PRIVATE_MARKER));
+            assert!(matches!(event, AgentEvent::ChildApprovalChanged { .. }));
+        }
+    }
 
     fn registry() -> SharedApprovalRegistry {
         std::sync::Arc::new(Mutex::new(

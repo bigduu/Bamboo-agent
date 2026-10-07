@@ -47,6 +47,8 @@ use crate::session_messaging::SessionMessenger;
 pub struct AgentRuntime {
     pub storage: Arc<dyn Storage>,
     pub persistence: Arc<dyn RuntimeSessionPersistence>,
+    /// Capturing no inherited wait is also immutable for this execution.
+    pub(crate) inherited_child_wait_captured: bool,
     pub session_inbox: Option<Arc<dyn SessionInboxPort>>,
     pub activation_router: Option<Arc<SessionActivationRouter>>,
     pub session_messenger: Option<Arc<SessionMessenger>>,
@@ -220,6 +222,7 @@ impl AgentRuntimeBuilder {
             router.set_inbox(inbox.clone());
         }
         Ok(AgentRuntime {
+            inherited_child_wait_captured: false,
             storage: self.storage.ok_or_else(|| format_missing("storage"))?,
             persistence: self
                 .persistence
@@ -282,6 +285,8 @@ impl Default for AgentRuntimeBuilder {
 /// be provided.  The provider is taken from [`AgentRuntime::provider`]; tools
 /// default to [`AgentRuntime::default_tools`] when `None`.
 pub struct ExecuteRequest {
+    /// Host-installed, per-run private plan capability. Never decoded from HTTP.
+    pub ticket_worker_plan: Option<Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>>,
     // -- Required ----------------------------------------------------------
     pub initial_message: String,
     pub event_tx: mpsc::Sender<AgentEvent>,
@@ -356,6 +361,7 @@ pub struct ExecuteRequest {
 /// schedule manager) and the root `bamboo_agent` SDK facade (which re-exports
 /// it) construct requests through one shared builder — no forked assembly.
 pub struct ExecuteRequestBuilder {
+    ticket_worker_plan: Option<Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>>,
     initial_message: String,
     event_tx: mpsc::Sender<AgentEvent>,
     cancel_token: CancellationToken,
@@ -401,6 +407,7 @@ impl ExecuteRequestBuilder {
     ) -> Self {
         Self {
             initial_message: initial_message.into(),
+            ticket_worker_plan: None,
             event_tx,
             cancel_token,
             tools: None,
@@ -430,6 +437,15 @@ impl ExecuteRequestBuilder {
             app_data_dir: None,
             run_budget: None,
         }
+    }
+
+    /// Install a trusted, per-run private LocalPlan port.
+    pub fn ticket_worker_plan(
+        mut self,
+        plan: Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>,
+    ) -> Self {
+        self.ticket_worker_plan = Some(plan);
+        self
     }
 
     /// Override the tool executor for this execution.
@@ -641,6 +657,7 @@ impl ExecuteRequestBuilder {
             ),
         };
         ExecuteRequest {
+            ticket_worker_plan: self.ticket_worker_plan,
             initial_message: self.initial_message,
             event_tx: self.event_tx,
             cancel_token: self.cancel_token,
@@ -708,6 +725,35 @@ impl AgentRuntime {
         session: &mut Session,
         req: ExecuteRequest,
     ) -> crate::runtime::runner::Result<()> {
+        let existing = self.persistence.inherited_child_wait();
+        if let Some(inherited) = existing.as_ref() {
+            inherited
+                .validate_session(session)
+                .map_err(|error| bamboo_agent_core::AgentError::LLM(error.to_string()))?;
+        } else if !self.inherited_child_wait_captured {
+            let mut runtime = self.clone();
+            if let Some(inherited) = bamboo_domain::InheritedChildWait::capture(session) {
+                runtime.persistence = self
+                    .persistence
+                    .bind_inherited_child_wait(inherited)
+                    .map_err(|error| bamboo_agent_core::AgentError::LLM(error.to_string()))?;
+            }
+            runtime.inherited_child_wait_captured = true;
+            return runtime.execute_bound(session, req).await;
+        }
+        self.execute_bound(session, req).await
+    }
+
+    async fn execute_bound(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+    ) -> crate::runtime::runner::Result<()> {
+        if self.persistence.root_actor_execution_required(session) {
+            return Err(bamboo_agent_core::AgentError::Tool(
+                "Root execution route requires a bound Actor writer and event handoff".into(),
+            ));
+        }
         let session_activation_notifications = match self.activation_router.as_ref() {
             Some(router) => Some(Arc::new(parking_lot::Mutex::new(
                 router.subscribe(&session.id).await,
@@ -721,6 +767,7 @@ impl AgentRuntime {
         let system_prompt = extract_system_prompt(session);
         let config = self.config.read().await;
         let ExecuteRequest {
+            ticket_worker_plan,
             initial_message,
             event_tx,
             cancel_token,
@@ -777,6 +824,7 @@ impl AgentRuntime {
         );
 
         let loop_config = AgentLoopConfig {
+            ticket_worker_plan: ticket_worker_plan.clone(),
             guidance_active_run_id,
             system_prompt,
             // Snapshot the legacy model_limits from the live in-memory config so
@@ -882,10 +930,19 @@ impl AgentRuntime {
 
         drop(config);
 
+        if let Some(plan) = &ticket_worker_plan {
+            session
+                .agent_runtime_state
+                .get_or_insert_with(Default::default)
+                .run_id = plan.run_id().to_owned();
+            plan.bind_session(session)
+                .map_err(|e| bamboo_agent_core::AgentError::LLM(e.to_string()))?;
+        }
+
         let trace_message_start = session.messages.len();
         let session_end_runner = loop_config.hook_runner.clone();
         let session_end_event_tx = event_tx.clone();
-        let result = run_agent_loop_with_config(
+        let result = Box::pin(run_agent_loop_with_config(
             session,
             initial_message,
             event_tx,
@@ -893,7 +950,7 @@ impl AgentRuntime {
             tools,
             cancel_token,
             loop_config,
-        )
+        ))
         .await;
 
         crate::runtime::hooks::run_session_end_hooks(

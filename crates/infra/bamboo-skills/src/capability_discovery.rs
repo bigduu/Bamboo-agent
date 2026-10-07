@@ -1857,6 +1857,7 @@ mod tests {
             schema("Bash", "canonical builtin", json!({})),
             schema("bash", "custom lowercase", json!({})),
             schema("Project", "canonical server", json!({})),
+            schema("browser", "server browser", json!({})),
             schema("project", "custom lowercase", json!({})),
             schema("Edit", "canonical edit", json!({})),
             schema("edit", "custom lowercase", json!({})),
@@ -1873,6 +1874,7 @@ mod tests {
         assert_eq!(entry("Bash").source, CapabilitySource::Builtin);
         assert_eq!(entry("bash").source, CapabilitySource::Custom);
         assert_eq!(entry("Project").source, CapabilitySource::Server);
+        assert_eq!(entry("browser").source, CapabilitySource::Server);
         assert_eq!(entry("project").source, CapabilitySource::Custom);
         assert_eq!(entry("Edit").aliases, vec!["apply_patch"]);
         assert!(entry("edit").aliases.is_empty());

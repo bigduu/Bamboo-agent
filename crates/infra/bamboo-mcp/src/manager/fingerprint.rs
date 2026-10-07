@@ -19,11 +19,6 @@ pub(super) enum EffectiveTransportConfig {
         env: BTreeMap<String, String>,
         startup_timeout_ms: u64,
     },
-    Sse {
-        url: String,
-        headers: Vec<EffectiveHeaderConfig>,
-        connect_timeout_ms: u64,
-    },
     StreamableHttp {
         url: String,
         headers: Vec<EffectiveHeaderConfig>,
@@ -53,18 +48,6 @@ pub(super) fn effective_server_config(config: &McpServerConfig) -> EffectiveServ
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             startup_timeout_ms: stdio.startup_timeout_ms,
-        },
-        TransportConfig::Sse(sse) => EffectiveTransportConfig::Sse {
-            url: sse.url.clone(),
-            headers: sse
-                .headers
-                .iter()
-                .map(|h| EffectiveHeaderConfig {
-                    name: h.name.clone(),
-                    value: h.value.clone(),
-                })
-                .collect(),
-            connect_timeout_ms: sse.connect_timeout_ms,
         },
         TransportConfig::StreamableHttp(sh) => EffectiveTransportConfig::StreamableHttp {
             url: sh.url.clone(),

@@ -71,6 +71,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamMap;
 
+use bamboo_domain::{ActorSnapshotLimits, ActorSnapshotPort, ActorSnapshotPrincipal};
 use serde::Deserialize;
 
 use self::envelope::{
@@ -78,7 +79,8 @@ use self::envelope::{
     Encoding, OutFrame,
 };
 use self::forwarders::{
-    spawn_agent_forwarder, spawn_agent_terminal_forwarder, spawn_feed_forwarder, OutboundTx,
+    spawn_actor_forwarder, spawn_actor_tree_forwarder, spawn_agent_forwarder,
+    spawn_agent_terminal_forwarder, spawn_feed_forwarder, spawn_message_forwarder, OutboundTx,
 };
 use crate::app_state::AppState;
 use crate::handlers::agent::events::MAX_BATCH_MS;
@@ -340,6 +342,8 @@ pub async fn handler(
         let config = state.config.read().await.clone();
         crate::handlers::settings::request_is_authorized(&req, &config)
     };
+    let actor_host_owner =
+        crate::handlers::agent::actor_snapshot::host_owner_authorized(&state, &req).await;
 
     let (mut response, session, msg_stream) = actix_ws::handle(&req, body)?;
 
@@ -359,6 +363,7 @@ pub async fn handler(
         msg_stream,
         batch_ms,
         pre_authorized,
+        actor_host_owner,
         encoding,
     ));
 
@@ -374,6 +379,7 @@ async fn drive(
     mut msg_stream: actix_ws::MessageStream,
     batch_ms: u64,
     pre_authorized: bool,
+    initial_actor_host_owner: bool,
     encoding: Encoding,
 ) {
     // Per-channel outbound (RFC §10-Q3): every subscribed channel owns its OWN
@@ -393,6 +399,7 @@ async fn drive(
     // / cookie / header clients are authorized immediately; everything else must
     // present a valid `hello` before any channel is served.
     let mut authorized = pre_authorized;
+    let mut actor_host_owner = initial_actor_host_owner;
     // The protocol acknowledges only the first successfully authorized `hello`
     // on a socket. Later token-less/valid hellos remain harmless and a later
     // credentialed hello is still re-verified, but none duplicates `welcome`.
@@ -480,6 +487,7 @@ async fn drive(
                             batch_ms,
                             encoding,
                             authorized: &mut authorized,
+                            actor_host_owner: &mut actor_host_owner,
                             welcome_sent,
                         }, text.as_bytes())
                         .await;
@@ -507,6 +515,7 @@ async fn drive(
                             batch_ms,
                             encoding,
                             authorized: &mut authorized,
+                            actor_host_owner: &mut actor_host_owner,
                             welcome_sent,
                         }, &bytes)
                         .await;
@@ -568,6 +577,7 @@ struct ClientDispatchContext<'a> {
     batch_ms: u64,
     encoding: Encoding,
     authorized: &'a mut bool,
+    actor_host_owner: &'a mut bool,
     /// Whether this socket has already completed its one successful welcome
     /// write. Passed by value so only the sole socket writer marks it after the
     /// direct write succeeds.
@@ -651,6 +661,7 @@ async fn handle_client_frame(
         batch_ms,
         encoding,
         authorized,
+        actor_host_owner,
         welcome_sent,
     } = context;
 
@@ -661,6 +672,7 @@ async fn handle_client_frame(
         GateOutcome::Handled => return ClientFrameOutcome::Continue,
         GateOutcome::Close => return ClientFrameOutcome::Close,
         GateOutcome::AcknowledgeHello => {
+            *actor_host_owner = true;
             return acknowledge_hello(encoding, welcome_sent);
         }
         GateOutcome::Dispatch => {}
@@ -686,6 +698,7 @@ async fn handle_client_frame(
                 (Some(device_id), Some(token)) => {
                     let config = state.config.read().await.clone();
                     if crate::handlers::settings::verify_device_token(&config, &device_id, &token) {
+                        *actor_host_owner = true;
                         // Neither the credential nor its device identity belongs in logs.
                         tracing::debug!("ws_v2: hello credential verified");
                     } else {
@@ -702,7 +715,29 @@ async fn handle_client_frame(
             return acknowledge_hello(encoding, welcome_sent);
         }
         ClientFrame::Subscribe { ch, since } => {
-            subscribe(state, forwarders, queues, batch_ms, encoding, &ch, since).await;
+            subscribe(
+                state,
+                forwarders,
+                queues,
+                batch_ms,
+                encoding,
+                &ch,
+                since,
+                *actor_host_owner,
+            )
+            .await;
+        }
+        ClientFrame::SubscribeTree { ch, cursor } => {
+            subscribe_tree(
+                state,
+                forwarders,
+                queues,
+                encoding,
+                &ch,
+                cursor,
+                *actor_host_owner,
+            )
+            .await;
         }
         ClientFrame::Unsubscribe { ch } => {
             if let Some(handle) = forwarders.remove(&ch) {
@@ -737,6 +772,7 @@ async fn subscribe(
     encoding: Encoding,
     ch: &str,
     since: Option<u64>,
+    actor_host_owner: bool,
 ) {
     let Some(channel) = Channel::parse(ch) else {
         tracing::debug!("ws_v2: ignoring subscribe to unknown channel {ch}");
@@ -855,8 +891,111 @@ async fn subscribe(
                 batch_ms,
             )
         }
+        Channel::Actor(actor_id) => {
+            if !actor_host_owner {
+                return;
+            }
+            // Index metadata only selects a root. The bounded snapshot reader
+            // proves the full root/child lineage before this channel is opened.
+            let Some(index) = state.session_store.get_index_entry(&actor_id).await else {
+                return;
+            };
+            let root_id = if index.root_session_id.is_empty() {
+                actor_id.as_str()
+            } else {
+                index.root_session_id.as_str()
+            };
+            if state
+                .session_store
+                .actor_subtree_snapshot(
+                    ActorSnapshotPrincipal::host_owner(),
+                    root_id,
+                    &actor_id,
+                    ActorSnapshotLimits::default(),
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let Some(subscription) = state.actor_event_hub.subscribe(&actor_id, since) else {
+                return;
+            };
+            spawn_actor_forwarder(out_tx, encoding, ch.to_string(), subscription, since)
+        }
+        Channel::Tree(_) => return, // opaque cursors use subscribe_tree
+        Channel::Message(sid) => {
+            if state.session_store.get_index_entry(&sid).await.is_none() {
+                tracing::debug!("ws_v2: ignoring message subscribe to unknown session {sid}");
+                return;
+            }
+            // Subscribe to generation signals before the safe replay snapshot is
+            // read. Events produced during setup remain buffered, while the
+            // message forwarder serializes only the independent safe stream.
+            let (sender, generation_receiver, _runner_snapshot) =
+                crate::handlers::agent::events::subscribe_with_runner_snapshot(
+                    state.get_ref(),
+                    &sid,
+                )
+                .await;
+            state.ensure_notification_relay(&sid, sender);
+            spawn_message_forwarder(
+                state.clone(),
+                sid,
+                out_tx,
+                encoding,
+                ch.to_string(),
+                generation_receiver,
+            )
+        }
     };
     finish_subscribe(forwarders, queues, ch, out_rx, handle, since);
+}
+
+async fn subscribe_tree(
+    state: &web::Data<AppState>,
+    forwarders: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    queues: &mut StreamMap<String, ReceiverStream<OutFrame>>,
+    encoding: Encoding,
+    ch: &str,
+    cursor: Option<String>,
+    actor_host_owner: bool,
+) {
+    let Some(Channel::Tree(root_id)) = Channel::parse(ch) else {
+        return;
+    };
+    if !actor_host_owner || cursor.as_ref().is_some_and(|cursor| cursor.len() > 128) {
+        return;
+    }
+    if let Some(old) = forwarders.remove(ch) {
+        old.abort();
+    }
+    queues.remove(ch);
+    // Full bounded Root proof is the authorization gate. The forwarder then
+    // polls only this Root's fd-bound durable cursor, including across hosts.
+    if state
+        .session_store
+        .actor_subtree_snapshot(
+            ActorSnapshotPrincipal::host_owner(),
+            &root_id,
+            &root_id,
+            ActorSnapshotLimits::default(),
+        )
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let (out_tx, out_rx) = mpsc::channel::<OutFrame>(OUTBOUND_BUFFER);
+    let handle = spawn_actor_tree_forwarder(
+        out_tx,
+        encoding,
+        ch.to_string(),
+        state.clone(),
+        root_id,
+        cursor,
+    );
+    finish_subscribe(forwarders, queues, ch, out_rx, handle, None);
 }
 
 fn can_attempt_terminal_replay(
@@ -1123,6 +1262,7 @@ mod tests {
         let (sys_tx, mut sys_rx) = mpsc::channel(SYS_OUTBOUND_BUFFER);
 
         let mut authorized = false;
+        let mut actor_host_owner = false;
         assert_eq!(
             handle_client_frame(
                 ClientDispatchContext {
@@ -1133,6 +1273,7 @@ mod tests {
                     batch_ms: 0,
                     encoding: Encoding::Json,
                     authorized: &mut authorized,
+                    actor_host_owner: &mut actor_host_owner,
                     welcome_sent: false,
                 },
                 ClientFrame::Ping,
@@ -1156,6 +1297,7 @@ mod tests {
                     batch_ms: 0,
                     encoding: Encoding::Json,
                     authorized: &mut authorized,
+                    actor_host_owner: &mut actor_host_owner,
                     welcome_sent: false,
                 },
                 ClientFrame::Ping,
@@ -1176,6 +1318,7 @@ mod tests {
         let mut queues = StreamMap::new();
         let (sys_tx, mut sys_rx) = mpsc::channel(SYS_OUTBOUND_BUFFER);
         let mut authorized = true;
+        let mut actor_host_owner = false;
 
         let first = handle_client_frame(
             ClientDispatchContext {
@@ -1186,6 +1329,7 @@ mod tests {
                 batch_ms: 0,
                 encoding: Encoding::Json,
                 authorized: &mut authorized,
+                actor_host_owner: &mut actor_host_owner,
                 welcome_sent: false,
             },
             hello(None, None),
@@ -1210,6 +1354,7 @@ mod tests {
                 batch_ms: 0,
                 encoding: Encoding::Json,
                 authorized: &mut authorized,
+                actor_host_owner: &mut actor_host_owner,
                 welcome_sent: true,
             },
             hello(None, None),
@@ -1230,6 +1375,7 @@ mod tests {
                 batch_ms: 0,
                 encoding: Encoding::Json,
                 authorized: &mut authorized,
+                actor_host_owner: &mut actor_host_owner,
                 welcome_sent: true,
             },
             hello(Some(&cred.device_id), Some(&token)),
@@ -1250,6 +1396,7 @@ mod tests {
                 batch_ms: 0,
                 encoding: Encoding::Json,
                 authorized: &mut authorized,
+                actor_host_owner: &mut actor_host_owner,
                 welcome_sent: true,
             },
             hello(Some(&cred.device_id), Some("bd1_wrongwrongwrong")),
@@ -1270,6 +1417,7 @@ mod tests {
         let (sys_tx, sys_rx) = mpsc::channel(SYS_OUTBOUND_BUFFER);
         queues.insert(SYS_CHANNEL.to_string(), ReceiverStream::new(sys_rx));
         let mut authorized = true;
+        let mut actor_host_owner = false;
 
         for frame in [
             ClientFrame::Subscribe {
@@ -1290,6 +1438,7 @@ mod tests {
                         batch_ms: 0,
                         encoding: Encoding::Json,
                         authorized: &mut authorized,
+                        actor_host_owner: &mut actor_host_owner,
                         welcome_sent: false,
                     },
                     frame,
@@ -1361,6 +1510,96 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn tree_channel_uses_durable_root_cursor_and_host_authority() {
+        use bamboo_agent_core::Storage;
+
+        let dir = tempdir().expect("temporary app data");
+        let home = dir.path().canonicalize().unwrap();
+        let state = web::Data::new(AppState::new(home).await.unwrap());
+        let root = bamboo_agent_core::Session::new("ws-tree-root", "test-model");
+        state.session_store.save_session(&root).await.unwrap();
+        let initial = state
+            .session_store
+            .actor_subtree_snapshot(
+                ActorSnapshotPrincipal::host_owner(),
+                &root.id,
+                &root.id,
+                ActorSnapshotLimits::default(),
+            )
+            .await
+            .unwrap();
+        let cursor = initial.stream_cursor.clone().expect("durable cursor");
+        let ch = format!("tree.{}", root.id);
+        let mut forwarders = HashMap::new();
+        let mut queues = StreamMap::new();
+        subscribe_tree(
+            &state,
+            &mut forwarders,
+            &mut queues,
+            Encoding::Json,
+            &ch,
+            Some(cursor.clone()),
+            false,
+        )
+        .await;
+        assert!(!queues.contains_key(&ch));
+        subscribe_tree(
+            &state,
+            &mut forwarders,
+            &mut queues,
+            Encoding::Json,
+            &ch,
+            Some(cursor),
+            true,
+        )
+        .await;
+        assert!(queues.contains_key(&ch));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), queues.next())
+                .await
+                .is_err()
+        );
+
+        // A second Store stands in for a different process sharing the same
+        // durable Bamboo home. The WS process has no local Hub notification.
+        let other = bamboo_storage::SessionStoreV2::new(
+            state.session_store.bamboo_home_dir().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let mut changed = root.clone();
+        changed.title = "remote writer".into();
+        changed.metadata_version += 1;
+        other.save_session(&changed).await.unwrap();
+        let (received_ch, frame) = tokio::time::timeout(Duration::from_secs(5), queues.next())
+            .await
+            .expect("cross-process poll")
+            .expect("tree channel");
+        assert_eq!(received_ch, ch);
+        let OutFrame::Text(raw) = frame else {
+            panic!("expected JSON frame");
+        };
+        let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(body["control"]["type"], "actor_snapshot_required");
+        assert_eq!(body["control"]["reason"], "changed");
+        let latest = state
+            .session_store
+            .actor_subtree_snapshot(
+                ActorSnapshotPrincipal::host_owner(),
+                &root.id,
+                &root.id,
+                ActorSnapshotLimits::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body["control"]["cursor"], latest.stream_cursor.unwrap());
+        assert_eq!(body["seq"], 2);
+        for (_, handle) in forwarders {
+            handle.abort();
+        }
+    }
+
+    #[actix_web::test]
     async fn expired_startup_subscribe_waits_for_locked_live_reconcile() {
         let dir = tempdir().expect("temporary app data");
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
@@ -1390,6 +1629,7 @@ mod tests {
             Encoding::Json,
             &channel,
             None,
+            false,
         )
         .await;
 

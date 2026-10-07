@@ -219,6 +219,12 @@ pub trait ToolExecutor: Send + Sync {
             .any(|schema| schema.function.name == tool_name)
     }
 
+    /// Read-only observation of the concrete exact owner in a known routing
+    /// chain. Unknown wrappers return None; existence/name is not provenance.
+    fn exact_tool_owner(&self, _name: &str) -> Option<&dyn ToolExecutor> {
+        None
+    }
+
     /// Server-level usage guidance to surface in the system prompt for whatever
     /// this executor currently exposes — e.g. the `instructions` an MCP server
     /// returns from `initialize`. Because it is derived from the live executor,

@@ -12,6 +12,7 @@ bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
 bamboo-llm = { path = "../../infra/bamboo-llm" }
 bamboo-config = { path = "../../infra/bamboo-config" }
 bamboo-storage = { path = "../../infra/bamboo-storage" }
+bamboo-tickets = { path = "../../infra/bamboo-tickets" }
 bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
 bamboo-a2a = { path = "../../infra/bamboo-a2a" }
 bamboo-memory = { path = "../../infra/bamboo-memory" }
@@ -45,6 +46,7 @@ crossbeam-skiplist = "0.1.3"
 parking_lot = "0.12"
 fs2 = "0.4"
 base64 = "0.23"
+imagesize = { version = "0.15", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 sha2 = "0.11"
 hex = "0.4"
 colored = "2"
@@ -63,6 +65,7 @@ bytes = "1"
 rust_ocr = "0.1.5"
 
 [dev-dependencies]
+bamboo-plugin = { path = "../../infra/bamboo-plugin" }
 tempfile = "3"
 mockall = "0.15"
 wiremock = "0.6"

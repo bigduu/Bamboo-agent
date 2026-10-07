@@ -484,6 +484,16 @@ impl ToolExecutor for CompositeToolExecutor {
             .await
     }
 
+    fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+        if self.builtin.owns_exact_tool(name) {
+            self.builtin.exact_tool_owner(name)
+        } else if self.mcp.owns_exact_tool(name) {
+            self.mcp.exact_tool_owner(name)
+        } else {
+            None
+        }
+    }
+
     fn list_tools(&self) -> Vec<ToolSchema> {
         let mut tools = self.builtin.list_tools();
         let mut names: HashSet<String> = tools

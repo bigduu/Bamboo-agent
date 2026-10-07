@@ -287,15 +287,11 @@ async fn wait_for_pressure_output(path: &Path) {
 }
 
 fn mutation_root() -> tempfile::TempDir {
-    let target = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("example package must live under the workspace examples directory")
-        .join("target");
-    std::fs::create_dir_all(&target).unwrap();
+    // The checkout itself can live under `.codex`, whose paths are deliberately
+    // redacted even when the recorder has the paths observation permission.
     tempfile::Builder::new()
         .prefix("tool-event-recorder-e2e-")
-        .tempdir_in(target)
+        .tempdir()
         .unwrap()
 }
 

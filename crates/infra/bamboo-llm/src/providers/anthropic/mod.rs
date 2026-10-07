@@ -49,6 +49,19 @@ static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
 
 const ANTHROPIC_TOOL_SEARCH_TYPE: &str = "tool_search_tool_regex_20251119";
 const ANTHROPIC_TOOL_SEARCH_NAME: &str = "tool_search_tool_regex";
+/// Per-response resource ceilings for the optional provider-native transcript
+/// lane. The normalized token/tool stream is intentionally independent of
+/// these budgets and continues when native capture is discarded.
+///
+/// Byte ceilings count retained UTF-8 bytes: a block's initial JSON plus later
+/// string fragments. They are deliberately larger than an ordinary Anthropic
+/// response while still placing a fixed upper bound on provider-controlled
+/// capture state.
+const ANTHROPIC_NATIVE_CAPTURE_MAX_BLOCKS: usize = 128;
+const ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK: usize = 1024 * 1024;
+const ANTHROPIC_NATIVE_CAPTURE_MAX_THINKING_BYTES_PER_BLOCK: usize = 1024 * 1024;
+const ANTHROPIC_NATIVE_CAPTURE_MAX_INPUT_JSON_BYTES_PER_BLOCK: usize = 1024 * 1024;
+const ANTHROPIC_NATIVE_CAPTURE_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const ANTHROPIC_TOOL_SEARCH_MODEL_PREFIXES: [&str; 10] = [
     "claude-fable-5",
     "claude-mythos-5",
@@ -1998,9 +2011,13 @@ pub struct AnthropicStreamState {
     request_thinking_budget_tokens: Option<u64>,
     native_blocks_by_index: HashMap<usize, Value>,
     native_input_json_by_index: HashMap<usize, String>,
-    native_thinking_signature_indices: HashSet<usize>,
+    /// Thinking blocks that have received a signature delta. This ordering
+    /// guard intentionally outlives native transcript invalidation so the
+    /// normalized reasoning lane still rejects deltas after a signature.
+    thinking_signature_indices: HashSet<usize>,
     invalid_thinking_signature_indices: HashSet<usize>,
     native_open_indices: HashSet<usize>,
+    native_capture_bytes: usize,
     native_capture_invalid: bool,
 }
 
@@ -2013,6 +2030,91 @@ impl AnthropicStreamState {
     fn thinking_signature_replayable(&self) -> bool {
         self.thinking_blocks_started == 1 && self.redacted_thinking_blocks_started == 0
     }
+}
+
+#[derive(Clone, Copy)]
+enum AnthropicNativeCaptureLimit {
+    BlockCount,
+    TextBytes,
+    ThinkingBytes,
+    InputJsonBytes,
+    TotalBytes,
+}
+
+impl AnthropicNativeCaptureLimit {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::BlockCount => "block_count",
+            Self::TextBytes => "text_bytes",
+            Self::ThinkingBytes => "thinking_bytes",
+            Self::InputJsonBytes => "input_json_bytes",
+            Self::TotalBytes => "total_bytes",
+        }
+    }
+}
+
+fn invalidate_anthropic_native_capture_for_limit(
+    state: &mut AnthropicStreamState,
+    limit: AnthropicNativeCaptureLimit,
+    observed_count: usize,
+    observed_bytes: usize,
+) {
+    // This structured event doubles as the operational metric source. Keep it
+    // strictly cardinality-safe and payload-free: no fragments, paths, tool
+    // arguments, schemas, thinking, or provider output belong here.
+    tracing::warn!(
+        metric = "anthropic_native_capture_limit_exceeded",
+        limit_kind = limit.as_str(),
+        observed_count,
+        observed_bytes,
+        "Anthropic native transcript capture exceeded its resource budget"
+    );
+    state.native_capture_invalid = true;
+    state.native_blocks_by_index.clear();
+    state.native_input_json_by_index.clear();
+    state.native_open_indices.clear();
+    state.native_capture_bytes = 0;
+}
+
+fn reserve_anthropic_native_capture_bytes(
+    state: &mut AnthropicStreamState,
+    additional_bytes: usize,
+    observed_count: usize,
+) -> bool {
+    let Some(observed_bytes) = state.native_capture_bytes.checked_add(additional_bytes) else {
+        invalidate_anthropic_native_capture_for_limit(
+            state,
+            AnthropicNativeCaptureLimit::TotalBytes,
+            observed_count,
+            usize::MAX,
+        );
+        return false;
+    };
+    if observed_bytes > ANTHROPIC_NATIVE_CAPTURE_MAX_TOTAL_BYTES {
+        invalidate_anthropic_native_capture_for_limit(
+            state,
+            AnthropicNativeCaptureLimit::TotalBytes,
+            observed_count,
+            observed_bytes,
+        );
+        return false;
+    }
+    state.native_capture_bytes = observed_bytes;
+    true
+}
+
+fn append_anthropic_native_string_field(block: &mut Value, field: &str, fragment: &str) -> bool {
+    let Some(object) = block.as_object_mut() else {
+        return false;
+    };
+    let value = object
+        .entry(field.to_string())
+        .or_insert_with(|| Value::String(String::new()));
+    let Value::String(current) = value else {
+        return false;
+    };
+    current.push_str(fragment);
+    true
 }
 
 fn capture_anthropic_native_event(state: &mut AnthropicStreamState, event_type: &str, data: &str) {
@@ -2029,6 +2131,37 @@ fn capture_anthropic_native_event(state: &mut AnthropicStreamState, event_type: 
         .get("index")
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok());
+
+    // Signature ordering protects normalized reasoning replay as well as the
+    // optional native transcript. Keep tracking this small control-plane state
+    // even after the native lane has exceeded a resource limit.
+    if event_type == "content_block_delta" {
+        if let Some(index) = index {
+            if state.thinking_signature_indices.contains(&index) {
+                state.native_capture_invalid = true;
+                state.invalid_thinking_signature_indices.insert(index);
+                state.thinking_signature.clear();
+                return;
+            }
+            if value
+                .get("delta")
+                .and_then(|delta| delta.get("type"))
+                .and_then(Value::as_str)
+                == Some("signature_delta")
+                && state.thinking_blocks_by_index.contains(&index)
+            {
+                state.thinking_signature_indices.insert(index);
+            }
+        }
+    } else if event_type == "content_block_stop" {
+        if let Some(index) = index {
+            state.thinking_signature_indices.remove(&index);
+        }
+    }
+
+    if state.native_capture_invalid {
+        return;
+    }
     match event_type {
         "content_block_start" => {
             let Some((index, block)) = index.zip(value.get("content_block")) else {
@@ -2051,6 +2184,55 @@ fn capture_anthropic_native_event(state: &mut AnthropicStreamState, event_type: 
             );
             if !supported {
                 state.native_capture_invalid = true;
+                return;
+            }
+            let observed_count = state.native_blocks_by_index.len().saturating_add(1);
+            if observed_count > ANTHROPIC_NATIVE_CAPTURE_MAX_BLOCKS {
+                invalidate_anthropic_native_capture_for_limit(
+                    state,
+                    AnthropicNativeCaptureLimit::BlockCount,
+                    observed_count,
+                    state.native_capture_bytes,
+                );
+                return;
+            }
+            let block_type = block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let initial_field_bytes = match block_type {
+                "text" => block.get("text").and_then(Value::as_str).map(str::len),
+                "thinking" => block.get("thinking").and_then(Value::as_str).map(str::len),
+                _ => None,
+            };
+            let field_limit = match block_type {
+                "text" => Some((
+                    AnthropicNativeCaptureLimit::TextBytes,
+                    ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK,
+                )),
+                "thinking" => Some((
+                    AnthropicNativeCaptureLimit::ThinkingBytes,
+                    ANTHROPIC_NATIVE_CAPTURE_MAX_THINKING_BYTES_PER_BLOCK,
+                )),
+                _ => None,
+            };
+            if let (Some(observed_bytes), Some((limit, max_bytes))) =
+                (initial_field_bytes, field_limit)
+            {
+                if observed_bytes > max_bytes {
+                    invalidate_anthropic_native_capture_for_limit(
+                        state,
+                        limit,
+                        observed_count,
+                        observed_bytes,
+                    );
+                    return;
+                }
+            }
+            let block_bytes = serde_json::to_vec(block)
+                .map(|encoded| encoded.len())
+                .unwrap_or(usize::MAX);
+            if !reserve_anthropic_native_capture_bytes(state, block_bytes, observed_count) {
                 return;
             }
             if state
@@ -2080,29 +2262,40 @@ fn capture_anthropic_native_event(state: &mut AnthropicStreamState, event_type: 
                 state.native_capture_invalid = true;
                 return;
             };
-            if block_type == "thinking" && state.native_thinking_signature_indices.contains(&index)
-            {
-                // Anthropic emits exactly one signature delta immediately
-                // before closing the thinking block. Any later delta makes the
-                // signature inconsistent with the normalized reasoning too, so
-                // invalidate both replay lanes before the legacy parser sees it.
-                state.native_capture_invalid = true;
-                state.invalid_thinking_signature_indices.insert(index);
-                state.thinking_signature.clear();
-                return;
-            }
-            let append = |block: &mut Value, field: &str, fragment: &str| {
-                let current = block.get(field).and_then(Value::as_str).unwrap_or("");
-                block[field] = json!(format!("{current}{fragment}"));
-            };
             match delta.get("type").and_then(Value::as_str) {
                 Some("text_delta") if block_type == "text" => {
                     let Some(fragment) = delta.get("text").and_then(Value::as_str) else {
                         state.native_capture_invalid = true;
                         return;
                     };
+                    let current_bytes = state
+                        .native_blocks_by_index
+                        .get(&index)
+                        .and_then(|block| block.get("text"))
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or(0);
+                    let observed_bytes = current_bytes.saturating_add(fragment.len());
+                    if observed_bytes > ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK {
+                        invalidate_anthropic_native_capture_for_limit(
+                            state,
+                            AnthropicNativeCaptureLimit::TextBytes,
+                            state.native_blocks_by_index.len(),
+                            observed_bytes,
+                        );
+                        return;
+                    }
+                    if !reserve_anthropic_native_capture_bytes(
+                        state,
+                        fragment.len(),
+                        state.native_blocks_by_index.len(),
+                    ) {
+                        return;
+                    }
                     if let Some(block) = state.native_blocks_by_index.get_mut(&index) {
-                        append(block, "text", fragment);
+                        if !append_anthropic_native_string_field(block, "text", fragment) {
+                            state.native_capture_invalid = true;
+                        }
                     }
                 }
                 Some("thinking_delta") if block_type == "thinking" => {
@@ -2114,8 +2307,34 @@ fn capture_anthropic_native_event(state: &mut AnthropicStreamState, event_type: 
                         state.native_capture_invalid = true;
                         return;
                     };
+                    let current_bytes = state
+                        .native_blocks_by_index
+                        .get(&index)
+                        .and_then(|block| block.get("thinking"))
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or(0);
+                    let observed_bytes = current_bytes.saturating_add(fragment.len());
+                    if observed_bytes > ANTHROPIC_NATIVE_CAPTURE_MAX_THINKING_BYTES_PER_BLOCK {
+                        invalidate_anthropic_native_capture_for_limit(
+                            state,
+                            AnthropicNativeCaptureLimit::ThinkingBytes,
+                            state.native_blocks_by_index.len(),
+                            observed_bytes,
+                        );
+                        return;
+                    }
+                    if !reserve_anthropic_native_capture_bytes(
+                        state,
+                        fragment.len(),
+                        state.native_blocks_by_index.len(),
+                    ) {
+                        return;
+                    }
                     if let Some(block) = state.native_blocks_by_index.get_mut(&index) {
-                        append(block, "thinking", fragment);
+                        if !append_anthropic_native_string_field(block, "thinking", fragment) {
+                            state.native_capture_invalid = true;
+                        }
                     }
                 }
                 Some("signature_delta") if block_type == "thinking" => {
@@ -2123,9 +2342,17 @@ fn capture_anthropic_native_event(state: &mut AnthropicStreamState, event_type: 
                         state.native_capture_invalid = true;
                         return;
                     };
-                    state.native_thinking_signature_indices.insert(index);
+                    if !reserve_anthropic_native_capture_bytes(
+                        state,
+                        fragment.len(),
+                        state.native_blocks_by_index.len(),
+                    ) {
+                        return;
+                    }
                     if let Some(block) = state.native_blocks_by_index.get_mut(&index) {
-                        append(block, "signature", fragment);
+                        if !append_anthropic_native_string_field(block, "signature", fragment) {
+                            state.native_capture_invalid = true;
+                        }
                     }
                 }
                 Some("input_json_delta")
@@ -2135,6 +2362,28 @@ fn capture_anthropic_native_event(state: &mut AnthropicStreamState, event_type: 
                         state.native_capture_invalid = true;
                         return;
                     };
+                    let current_bytes = state
+                        .native_input_json_by_index
+                        .get(&index)
+                        .map(String::len)
+                        .unwrap_or(0);
+                    let observed_bytes = current_bytes.saturating_add(fragment.len());
+                    if observed_bytes > ANTHROPIC_NATIVE_CAPTURE_MAX_INPUT_JSON_BYTES_PER_BLOCK {
+                        invalidate_anthropic_native_capture_for_limit(
+                            state,
+                            AnthropicNativeCaptureLimit::InputJsonBytes,
+                            state.native_blocks_by_index.len(),
+                            observed_bytes,
+                        );
+                        return;
+                    }
+                    if !reserve_anthropic_native_capture_bytes(
+                        state,
+                        fragment.len(),
+                        state.native_blocks_by_index.len(),
+                    ) {
+                        return;
+                    }
                     state
                         .native_input_json_by_index
                         .entry(index)
@@ -2179,8 +2428,9 @@ fn take_anthropic_provider_transcript_items(state: &mut AnthropicStreamState) ->
         || !state.native_input_json_by_index.is_empty();
     state.native_open_indices.clear();
     state.native_input_json_by_index.clear();
-    state.native_thinking_signature_indices.clear();
+    state.thinking_signature_indices.clear();
     state.invalid_thinking_signature_indices.clear();
+    state.native_capture_bytes = 0;
     if invalid
         || !blocks.iter().any(|(_, block)| {
             matches!(
@@ -2989,35 +3239,65 @@ mod anthropic_request_building {
             .collect()
     }
 
-    fn valid_discovery_events() -> Vec<(&'static str, Value)> {
+    fn valid_discovery_events_from(first_index: usize) -> Vec<(&'static str, Value)> {
         vec![
             (
                 "content_block_start",
-                json!({"index":0,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{}}}),
+                json!({"index":first_index,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{}}}),
             ),
             (
                 "content_block_delta",
-                json!({"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"weather\"}"}}),
+                json!({"index":first_index,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"weather\"}"}}),
             ),
-            ("content_block_stop", json!({"index":0})),
+            ("content_block_stop", json!({"index":first_index})),
             (
                 "content_block_start",
-                json!({"index":1,"content_block":{"type":"tool_search_tool_result","tool_use_id":"srv_1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}}}),
+                json!({"index":first_index + 1,"content_block":{"type":"tool_search_tool_result","tool_use_id":"srv_1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}}}),
             ),
-            ("content_block_stop", json!({"index":1})),
+            ("content_block_stop", json!({"index":first_index + 1})),
             (
                 "content_block_start",
-                json!({"index":2,"content_block":{"type":"tool_use","id":"tool_1","name":"get_weather","input":{}}}),
+                json!({"index":first_index + 2,"content_block":{"type":"tool_use","id":"tool_1","name":"get_weather","input":{}}}),
             ),
-            ("content_block_stop", json!({"index":2})),
+            ("content_block_stop", json!({"index":first_index + 2})),
             ("message_stop", json!({"type":"message_stop"})),
         ]
+    }
+
+    fn valid_discovery_events() -> Vec<(&'static str, Value)> {
+        valid_discovery_events_from(0)
+    }
+
+    fn json_object_with_exact_bytes(target_bytes: usize) -> String {
+        const PREFIX: &str = "{\"value\":\"";
+        const SUFFIX: &str = "\"}";
+        assert!(target_bytes >= PREFIX.len() + SUFFIX.len());
+        let value = format!(
+            "{PREFIX}{}{SUFFIX}",
+            "x".repeat(target_bytes - PREFIX.len() - SUFFIX.len())
+        );
+        assert_eq!(value.len(), target_bytes);
+        value
+    }
+
+    fn redacted_thinking_block_with_exact_bytes(target_bytes: usize) -> Value {
+        let empty = json!({"type":"redacted_thinking","data":""});
+        let overhead = serde_json::to_vec(&empty).unwrap().len();
+        assert!(target_bytes >= overhead);
+        let block = json!({
+            "type":"redacted_thinking",
+            "data":"x".repeat(target_bytes - overhead),
+        });
+        assert_eq!(serde_json::to_vec(&block).unwrap().len(), target_bytes);
+        block
     }
 
     #[derive(Clone, Default)]
     struct EventCapture {
         events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
+
+    static EVENT_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     impl tracing::Subscriber for EventCapture {
         fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
@@ -3490,6 +3770,382 @@ mod anthropic_request_building {
             super::CapabilityLoadingMode::Progressive,
         );
         assert_eq!(body["messages"][1]["content"], json!(expected));
+    }
+
+    #[test]
+    fn native_capture_bounds_text_bytes_without_changing_normalized_chunks() {
+        let _limit_log_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let run = |text: String| {
+            let mut events = vec![
+                (
+                    "content_block_start",
+                    json!({"index":0,"content_block":{"type":"text","text":""}}),
+                ),
+                (
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"text_delta","text":text}}),
+                ),
+                ("content_block_stop", json!({"index":0})),
+            ];
+            events.extend(valid_discovery_events_from(1));
+            parse_native_events(&events)
+        };
+
+        let exact = run("x".repeat(super::ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK));
+        assert_eq!(
+            exact
+                .iter()
+                .filter(|chunk| matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_)))
+                .count(),
+            4
+        );
+
+        let over = run("x".repeat(super::ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK + 1));
+        assert!(over
+            .iter()
+            .all(|chunk| !matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_))));
+        assert_eq!(
+            over.iter()
+                .filter_map(|chunk| match chunk {
+                    super::LLMChunk::Token(fragment) => Some(fragment.len()),
+                    _ => None,
+                })
+                .sum::<usize>(),
+            super::ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK + 1
+        );
+        assert!(over
+            .iter()
+            .any(|chunk| matches!(chunk, super::LLMChunk::ToolCalls(_))));
+        assert!(over
+            .iter()
+            .any(|chunk| matches!(chunk, super::LLMChunk::Done)));
+    }
+
+    #[test]
+    fn native_capture_bounds_thinking_bytes_without_breaking_signature_fallback() {
+        let _limit_log_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let run = |thinking: String| {
+            let mut events = vec![
+                (
+                    "content_block_start",
+                    json!({"index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+                ),
+                (
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"thinking_delta","thinking":thinking}}),
+                ),
+                (
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"signature_delta","signature":"signed"}}),
+                ),
+                ("content_block_stop", json!({"index":0})),
+            ];
+            events.extend(valid_discovery_events_from(1));
+            parse_native_events(&events)
+        };
+
+        let exact = run("x".repeat(super::ANTHROPIC_NATIVE_CAPTURE_MAX_THINKING_BYTES_PER_BLOCK));
+        assert_eq!(
+            exact
+                .iter()
+                .filter(|chunk| matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_)))
+                .count(),
+            4
+        );
+        assert!(exact.iter().any(|chunk| matches!(
+            chunk,
+            super::LLMChunk::ReasoningSignature(signature) if signature == "signed"
+        )));
+
+        let over =
+            run("x".repeat(super::ANTHROPIC_NATIVE_CAPTURE_MAX_THINKING_BYTES_PER_BLOCK + 1));
+        assert!(over
+            .iter()
+            .all(|chunk| !matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_))));
+        assert_eq!(
+            over.iter()
+                .filter_map(|chunk| match chunk {
+                    super::LLMChunk::ReasoningToken(fragment) => Some(fragment.len()),
+                    _ => None,
+                })
+                .sum::<usize>(),
+            super::ANTHROPIC_NATIVE_CAPTURE_MAX_THINKING_BYTES_PER_BLOCK + 1
+        );
+        assert!(over.iter().any(|chunk| matches!(
+            chunk,
+            super::LLMChunk::ReasoningSignature(signature) if signature == "signed"
+        )));
+        assert!(over
+            .iter()
+            .any(|chunk| matches!(chunk, super::LLMChunk::Done)));
+    }
+
+    #[test]
+    fn native_capture_limit_keeps_normalized_signature_ordering_safe() {
+        let _limit_log_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let oversized = "x".repeat(super::ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK + 1);
+        let events = vec![
+            (
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"text","text":""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"text_delta","text":oversized}}),
+            ),
+            ("content_block_stop", json!({"index":0})),
+            (
+                "content_block_start",
+                json!({"index":1,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":1,"delta":{"type":"thinking_delta","thinking":"reason"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":1,"delta":{"type":"signature_delta","signature":"signed"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":1,"delta":{"type":"thinking_delta","thinking":"tampered"}}),
+            ),
+            ("content_block_stop", json!({"index":1})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ];
+
+        let chunks = parse_native_events(&events);
+        assert!(chunks
+            .iter()
+            .all(|chunk| !matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_))));
+        assert!(chunks.iter().all(|chunk| !matches!(
+            chunk,
+            super::LLMChunk::ReasoningSignature(signature) if !signature.is_empty()
+        )));
+        assert_eq!(
+            chunks
+                .iter()
+                .filter_map(|chunk| match chunk {
+                    super::LLMChunk::ReasoningToken(fragment) => Some(fragment.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "reasontampered"
+        );
+        assert!(chunks
+            .iter()
+            .any(|chunk| matches!(chunk, super::LLMChunk::Done)));
+    }
+
+    #[test]
+    fn native_capture_bounds_fragmented_partial_input_json() {
+        let _limit_log_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let run = |input: String| {
+            let split = input.len() / 2;
+            let (first, second) = input.split_at(split);
+            let mut events = vec![
+                (
+                    "content_block_start",
+                    json!({"index":0,"content_block":{"type":"tool_use","id":"tool_large","name":"unrelated_tool","input":{}}}),
+                ),
+                (
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"input_json_delta","partial_json":first}}),
+                ),
+                (
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"input_json_delta","partial_json":second}}),
+                ),
+                ("content_block_stop", json!({"index":0})),
+            ];
+            events.extend(valid_discovery_events_from(1));
+            parse_native_events(&events)
+        };
+
+        let exact = run(json_object_with_exact_bytes(
+            super::ANTHROPIC_NATIVE_CAPTURE_MAX_INPUT_JSON_BYTES_PER_BLOCK,
+        ));
+        assert_eq!(
+            exact
+                .iter()
+                .filter(|chunk| matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_)))
+                .count(),
+            4
+        );
+
+        let over = run(json_object_with_exact_bytes(
+            super::ANTHROPIC_NATIVE_CAPTURE_MAX_INPUT_JSON_BYTES_PER_BLOCK + 1,
+        ));
+        assert!(over
+            .iter()
+            .all(|chunk| !matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_))));
+        assert!(over
+            .iter()
+            .any(|chunk| matches!(chunk, super::LLMChunk::ToolCalls(_))));
+        assert!(over
+            .iter()
+            .any(|chunk| matches!(chunk, super::LLMChunk::Done)));
+    }
+
+    #[test]
+    fn native_capture_enforces_exact_block_and_total_byte_boundaries() {
+        let _limit_log_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut block_state = super::AnthropicStreamState::default();
+        for index in 0..super::ANTHROPIC_NATIVE_CAPTURE_MAX_BLOCKS {
+            super::capture_anthropic_native_event(
+                &mut block_state,
+                "content_block_start",
+                &json!({"index":index,"content_block":{"type":"text","text":""}}).to_string(),
+            );
+            super::capture_anthropic_native_event(
+                &mut block_state,
+                "content_block_stop",
+                &json!({"index":index}).to_string(),
+            );
+        }
+        assert!(!block_state.native_capture_invalid);
+        assert_eq!(
+            block_state.native_blocks_by_index.len(),
+            super::ANTHROPIC_NATIVE_CAPTURE_MAX_BLOCKS
+        );
+        super::capture_anthropic_native_event(
+            &mut block_state,
+            "content_block_start",
+            &json!({
+                "index":super::ANTHROPIC_NATIVE_CAPTURE_MAX_BLOCKS,
+                "content_block":{"type":"text","text":""}
+            })
+            .to_string(),
+        );
+        assert!(block_state.native_capture_invalid);
+        assert!(block_state.native_blocks_by_index.is_empty());
+
+        let mut exact_total_state = super::AnthropicStreamState::default();
+        super::capture_anthropic_native_event(
+            &mut exact_total_state,
+            "content_block_start",
+            &json!({
+                "index":0,
+                "content_block":redacted_thinking_block_with_exact_bytes(
+                    super::ANTHROPIC_NATIVE_CAPTURE_MAX_TOTAL_BYTES
+                )
+            })
+            .to_string(),
+        );
+        assert!(!exact_total_state.native_capture_invalid);
+        assert_eq!(
+            exact_total_state.native_capture_bytes,
+            super::ANTHROPIC_NATIVE_CAPTURE_MAX_TOTAL_BYTES
+        );
+
+        let mut over_total_state = super::AnthropicStreamState::default();
+        super::capture_anthropic_native_event(
+            &mut over_total_state,
+            "content_block_start",
+            &json!({
+                "index":0,
+                "content_block":redacted_thinking_block_with_exact_bytes(
+                    super::ANTHROPIC_NATIVE_CAPTURE_MAX_TOTAL_BYTES + 1
+                )
+            })
+            .to_string(),
+        );
+        assert!(over_total_state.native_capture_invalid);
+        assert_eq!(over_total_state.native_capture_bytes, 0);
+        assert!(over_total_state.native_blocks_by_index.is_empty());
+    }
+
+    #[test]
+    fn native_capture_limit_state_resets_after_message_stop() {
+        let _limit_log_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = super::AnthropicStreamState::default();
+        let oversized = "x".repeat(super::ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK + 1);
+        for (event, payload) in [
+            (
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"text","text":""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"text_delta","text":oversized}}),
+            ),
+            ("content_block_stop", json!({"index":0})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ] {
+            super::parse_anthropic_sse_event_multi(&mut state, event, &payload.to_string())
+                .unwrap();
+        }
+        assert!(!state.native_capture_invalid);
+        assert_eq!(state.native_capture_bytes, 0);
+
+        let recovered = valid_discovery_events()
+            .into_iter()
+            .flat_map(|(event, payload)| {
+                super::parse_anthropic_sse_event_multi(&mut state, event, &payload.to_string())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recovered
+                .iter()
+                .filter(|chunk| matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_)))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn native_capture_limit_diagnostic_is_payload_free() {
+        const SENTINEL: &str = "LIMIT_SENTINEL_/private/tool-argument.json";
+        let _capture_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let capture = EventCapture::default();
+        let events = capture.events.clone();
+        let _guard = tracing::subscriber::set_default(capture);
+        tracing::callsite::rebuild_interest_cache();
+        let mut state = super::AnthropicStreamState::default();
+        let mut oversized = SENTINEL.to_string();
+        oversized
+            .push_str(&"x".repeat(super::ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK + 1));
+
+        super::parse_anthropic_sse_event_multi(
+            &mut state,
+            "content_block_start",
+            &json!({"index":0,"content_block":{"type":"text","text":""}}).to_string(),
+        )
+        .unwrap();
+        super::parse_anthropic_sse_event_multi(
+            &mut state,
+            "content_block_delta",
+            &json!({"index":0,"delta":{"type":"text_delta","text":oversized}}).to_string(),
+        )
+        .unwrap();
+
+        let logs = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .join("\n");
+        assert!(!logs.contains(SENTINEL));
+        assert!(
+            logs.contains("anthropic_native_capture_limit_exceeded"),
+            "captured diagnostic: {logs}"
+        );
+        assert!(logs.contains("limit_kind"));
+        assert!(logs.contains("observed_count"));
+        assert!(logs.contains("observed_bytes"));
     }
 
     #[test]
@@ -4143,9 +4799,13 @@ mod anthropic_request_building {
     #[test]
     fn malformed_stream_warnings_never_include_raw_provider_payloads() {
         const SENTINEL: &str = "LOG_SENTINEL_/private/credential.json";
+        let _capture_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let capture = EventCapture::default();
         let events = capture.events.clone();
         let _guard = tracing::subscriber::set_default(capture);
+        tracing::callsite::rebuild_interest_cache();
         let mut state = super::AnthropicStreamState::default();
 
         for (event, payload) in [

@@ -17,9 +17,13 @@ pub use bamboo_server_tools::{
     ToolSurfaceFactory,
 };
 
+pub mod browser;
+pub mod browser_eval;
 pub mod child_session_adapter;
 pub mod model_catalog;
 pub mod notify_dispatcher;
+pub mod ticket_dispatch_adapter;
+pub mod ticket_tools;
 
 // Integration tests that wire `SubAgentTool` to a real `ChildSessionAdapter`
 // (the tool itself + its pure unit tests live in `bamboo-server-tools`).
@@ -34,6 +38,8 @@ pub type SubagentModelResolver = std::sync::Arc<
 pub type OptionalSubagentModelResolver = Option<SubagentModelResolver>;
 
 // Re-export server-specific tool types for convenience
+pub use browser::BrowserTool;
+pub use browser_eval::BrowserEvalTool;
 pub use child_session_adapter::ChildSessionAdapter;
 pub use model_catalog::RegistryModelCatalog;
 pub use notify_dispatcher::ServerNotificationDispatcher;

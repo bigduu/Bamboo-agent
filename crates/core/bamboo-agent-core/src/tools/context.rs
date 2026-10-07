@@ -19,6 +19,25 @@ use bamboo_domain::{
 };
 use uuid::Uuid;
 
+tokio::task_local! {
+    static ROOT_ACTOR_TOOL_WRITER: Option<bamboo_domain::RootActorRuntimeWrite>;
+}
+
+/// Scope the actual execution's capability across asynchronous tool dispatch.
+/// It is never deserialized or inherited by a spawned Host reconciliation job.
+pub async fn with_root_actor_tool_writer<F: std::future::Future>(
+    owner: Option<bamboo_domain::RootActorRuntimeWrite>,
+    dispatch: F,
+) -> F::Output {
+    ROOT_ACTOR_TOOL_WRITER.scope(owner, dispatch).await
+}
+
+/// None is a Host job; Some(None) is a tool on an unbound execution. The latter
+/// must not mint a Root control execution to replace its missing runtime grant.
+pub fn root_actor_tool_writer() -> Option<Option<bamboo_domain::RootActorRuntimeWrite>> {
+    ROOT_ACTOR_TOOL_WRITER.try_with(Clone::clone).ok()
+}
+
 /// The lifetime observed when a real Supervisor Session admits a tool call.
 ///
 /// This is not a grant: consumers must still check the reference against the

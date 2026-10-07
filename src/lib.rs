@@ -90,6 +90,8 @@ pub mod setup_cli;
 /// The `bamboo skills list` / `mcp list` read CLI: inspect the configured skill
 /// and MCP surfaces offline (straight from `<data_dir>`), no running server.
 pub mod read_cli;
+/// Explicit preview/legacy import/verified offline Ticket authority migration.
+pub mod ticket_cli;
 
 /// The `bamboo plugin install|list|remove|update` CLI: a thin HTTP client over
 /// a running `bamboo serve` instance's `/api/v1/plugins` routes.

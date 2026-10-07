@@ -16,9 +16,9 @@ use bamboo_domain::{
 };
 
 use crate::execution::{
-    create_event_forwarder_with_history_commit_barrier, finalize_runner, reserve_runner_core,
-    reserve_session_execution, spawn_session_execution, AgentRunner, AgentStatus, ChildCompletion,
-    ChildCompletionHandler, ReserveOutcome, SessionExecutionArgs, SessionExecutionReservation,
+    finalize_runner, reserve_runner_core, reserve_session_execution, spawn_session_execution,
+    AgentRunner, AgentStatus, ChildCompletion, ChildCompletionHandler, ChildCompletionSource,
+    ReserveOutcome, SessionExecutionArgs, SessionExecutionReservation,
     SessionExecutionReserveOutcome, SpawnJob, SpawnScheduler,
 };
 use crate::runtime::config::{BashResumeHook, GuardianSpawner, BASH_COMPLETION_RESUME_KIND};
@@ -48,6 +48,10 @@ use crate::model_config_helper::{
 };
 use crate::session_activation::{
     SessionActivationLaunch, SessionActivationReserveOutcome, SessionActivationSpawner,
+};
+use crate::session_app::child_session::result_projection::{
+    child_result_identity, decode_report, fits_child_result_budget, plain_child_report_message,
+    project_child_report, unavailable_child_result,
 };
 use crate::session_app::execute::consume_pending_clarification_resume;
 use crate::session_app::provider_model::{persist_model_ref, session_effective_model_ref};
@@ -144,58 +148,121 @@ fn child_completion_envelope(
     result: Option<String>,
     provider_message: &Message,
 ) -> SessionMessageEnvelope {
+    let envelope = build_child_completion_envelope(
+        completion,
+        wait_registered_at,
+        result.as_deref(),
+        provider_message,
+        false,
+    );
+    if serde_json::to_vec(&envelope).map_or(true, |bytes| {
+        bytes.len() > bamboo_domain::SessionInboxLimits::default().max_payload_bytes
+    }) {
+        // UTF-8 byte caps do not bound JSON escaping or duplicate fields in
+        // ChildOutcome/provider metadata. Fall back to digest-only summaries
+        // before admission so an escaped or mixed result/error cannot strand
+        // the parent wait at the SessionInbox payload limit.
+        return build_child_completion_envelope(
+            completion,
+            wait_registered_at,
+            result.as_deref(),
+            provider_message,
+            true,
+        );
+    }
+    envelope
+}
+
+fn build_child_completion_envelope(
+    completion: &ChildCompletion,
+    wait_registered_at: chrono::DateTime<Utc>,
+    result: Option<&str>,
+    provider_message: &Message,
+    compact: bool,
+) -> SessionMessageEnvelope {
     fn bounded_terminal_field(
         label: &str,
         child_session_id: &str,
-        value: Option<String>,
-    ) -> (Option<String>, serde_json::Value, bool) {
+        value: Option<&str>,
+        compact: bool,
+    ) -> (Option<String>, serde_json::Value) {
         let Some(value) = value else {
-            return (None, serde_json::Value::Null, false);
+            return (None, serde_json::Value::Null);
         };
-        if value.len() <= CHILD_COMPLETION_INLINE_FIELD_BYTES {
-            return (Some(value.clone()), serde_json::Value::String(value), false);
-        }
-        let digest = hex::encode(Sha256::digest(value.as_bytes()));
-        let mut tail_start = value
-            .len()
-            .saturating_sub(CHILD_COMPLETION_OVERSIZE_TAIL_BYTES);
-        while tail_start < value.len() && !value.is_char_boundary(tail_start) {
-            tail_start += 1;
-        }
-        let tail = &value[tail_start..];
-        let summary = format!(
-            "Child {label} exceeded the durable inline limit ({} UTF-8 bytes, sha256={digest}). \
-             Retrieve the full child transcript with SubAgent.get(child_session_id=\"{child_session_id}\").\
-             \n\nBounded tail:\n{tail}",
-            value.len()
-        );
-        (
-            Some(summary),
+        let oversized = value.len() > CHILD_COMPLETION_INLINE_FIELD_BYTES;
+        let identity = if oversized {
             serde_json::json!({
                 "oversized": true,
                 "utf8_bytes": value.len(),
-                "sha256": digest,
-            }),
-            true,
-        )
+                "sha256": hex::encode(Sha256::digest(value.as_bytes())),
+            })
+        } else {
+            serde_json::Value::String(value.to_string())
+        };
+        if !oversized && !compact {
+            return (Some(value.to_string()), identity);
+        }
+        let digest = hex::encode(Sha256::digest(value.as_bytes()));
+        let retrieval_view = if label == "error" {
+            "diagnostics"
+        } else {
+            "result"
+        };
+        let inspection = serde_json::json!({
+            "intent": "inspect", "target": child_session_id, "message": retrieval_view,
+        });
+        let recovery = if label == "error" {
+            format!(
+                "Check observed status and recovery diagnostics by calling SubAgent with {inspection}. \
+                 Detailed execution errors remain available to the authenticated inspector."
+            )
+        } else {
+            format!(
+                "Read it in bounded slices by calling SubAgent with {inspection}; use message=\"messages\" for transcript previews. \
+                 Follow returned cursors with a JSON-encoded view/cursor query in message, omitting unused query fields."
+            )
+        };
+        let mut summary = format!(
+            "Child {label} could not fit in the durable inline envelope ({} UTF-8 bytes, sha256={digest}). {recovery}",
+            value.len()
+        );
+        if !compact {
+            let mut tail_start = value
+                .len()
+                .saturating_sub(CHILD_COMPLETION_OVERSIZE_TAIL_BYTES);
+            while tail_start < value.len() && !value.is_char_boundary(tail_start) {
+                tail_start += 1;
+            }
+            summary.push_str("\n\nBounded tail:\n");
+            summary.push_str(&value[tail_start..]);
+        }
+        (Some(summary), identity)
     }
 
-    let (stored_result, result_identity, _result_oversized) =
-        bounded_terminal_field("result", &completion.child_session_id, result);
-    let (stored_error, error_identity, _error_oversized) = bounded_terminal_field(
+    let (stored_result, result_identity) =
+        bounded_terminal_field("result", &completion.child_session_id, result, compact);
+    let (stored_error, error_identity) = bounded_terminal_field(
         "error",
         &completion.child_session_id,
-        completion.error.clone(),
+        completion.error.as_deref(),
+        compact,
     );
     let mut bounded_provider_message = provider_message.clone();
     let provider_oversized = serde_json::to_vec(provider_message)
         .map(|bytes| bytes.len() > CHILD_COMPLETION_INLINE_FIELD_BYTES)
         .unwrap_or(true);
-    if provider_oversized {
-        let mut content = format!(
-            "Runtime notification: child session `{}` finished with status `{}`.",
-            completion.child_session_id, completion.status
-        );
+    if provider_oversized || compact {
+        // A short provider presentation can carry an important instruction or
+        // guardian verdict. Keep it when only the typed fields' JSON escaping
+        // forced a compact envelope.
+        let mut content = if provider_oversized {
+            format!(
+                "Runtime notification: child session `{}` finished with status `{}`.",
+                completion.child_session_id, completion.status
+            )
+        } else {
+            bounded_provider_message.content.clone()
+        };
         if let Some(result) = stored_result.as_deref() {
             content.push_str("\n\n");
             content.push_str(result);
@@ -205,7 +272,54 @@ fn child_completion_envelope(
             content.push_str(error);
         }
         bounded_provider_message.content = content;
-        bounded_provider_message.content_parts = None;
+        if provider_oversized {
+            bounded_provider_message.content_parts = None;
+        }
+        // The runtime resume also carries the raw error in metadata. Bounding
+        // only its visible content leaves the durable inbox envelope oversized
+        // and strands the parent's wait when admission rejects it.
+        if compact {
+            let original = bounded_provider_message
+                .metadata
+                .as_ref()
+                .and_then(serde_json::Value::as_object);
+            let mut metadata = serde_json::Map::new();
+            for key in [
+                RUNTIME_RESUME_MESSAGE_HIDDEN_KEY,
+                RUNTIME_RESUME_MESSAGE_KIND_KEY,
+                "child_session_id",
+                "child_status",
+                "child_final_response_included",
+                "child_completion_source",
+                "guardian_approved",
+            ] {
+                if let Some(value) = original.and_then(|metadata| metadata.get(key)) {
+                    metadata.insert(key.to_string(), value.clone());
+                }
+            }
+            if original.is_some_and(|metadata| metadata.contains_key("child_error")) {
+                metadata.insert(
+                    "child_error".to_string(),
+                    stored_error
+                        .as_ref()
+                        .map_or(serde_json::Value::Null, |error| {
+                            serde_json::Value::String(error.clone())
+                        }),
+                );
+            }
+            bounded_provider_message.metadata = Some(serde_json::Value::Object(metadata));
+        } else if let Some(child_error) = bounded_provider_message
+            .metadata
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|metadata| metadata.get_mut("child_error"))
+        {
+            *child_error = stored_error
+                .as_ref()
+                .map_or(serde_json::Value::Null, |error| {
+                    serde_json::Value::String(error.clone())
+                });
+        }
     }
     let body = SessionMessageBody::ChildOutcome(SessionChildOutcome {
         child_session_id: completion.child_session_id.clone(),
@@ -221,6 +335,7 @@ fn child_completion_envelope(
         "error": error_identity,
         "result": result_identity,
         "wait_registered_at": wait_registered_at,
+        "terminal_source": completion.source,
     });
     SessionMessageEnvelope {
         id: SessionMessageId::stable("session_child_completion", &semantic),
@@ -323,7 +438,7 @@ fn parent_locks() -> &'static std::sync::Mutex<HashMap<String, Arc<tokio::sync::
 /// ([`BashCompletionSink::on_bash_completed`]), and the bash **backstop** poll
 /// ([`ChildCompletionCoordinator::bash_self_resume`]) — can never double-resume.
 /// The inner sync `Mutex` guards only the brief map lookup (no await inside).
-fn session_resume_lock(session_id: &str) -> SessionResumeLock {
+pub(crate) fn session_resume_lock(session_id: &str) -> SessionResumeLock {
     let mut map = parent_locks().lock().recover_poison();
     let lock = map
         .entry(session_id.to_string())
@@ -338,7 +453,7 @@ fn session_resume_lock(session_id: &str) -> SessionResumeLock {
 /// The lease is constructed before awaiting the mutex, so cancelled waiters
 /// also reclaim their registration. Lookup and last-owner removal use the same
 /// brief registry lock; two live mutexes can never exist for the same ID.
-struct SessionResumeLock {
+pub(crate) struct SessionResumeLock {
     session_id: String,
     lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
@@ -398,6 +513,7 @@ fn wait_policy_satisfied(
 /// Extract the child session's last assistant content, if any. Returns `None`
 /// when the child produced no assistant message (e.g. errored before the first
 /// model response, or only emitted tool messages).
+#[cfg(test)]
 fn child_final_assistant_text(child: &Session) -> Option<String> {
     child
         .messages
@@ -420,7 +536,7 @@ fn runtime_resume_message(
 
     // Fold the child's full final response back into the parent — no
     // truncation. Sub-agents are first-class agents whose complete conclusion
-    // should be available to the parent without an extra `SubAgent.get` round
+    // should be available to the parent without an extra SubAgent inspection round
     // trip. The message is left compressible (see `never_compress` below) so a
     // long transcript can still be reclaimed under parent compaction.
     let final_response = child_final_response.map(str::to_string);
@@ -434,10 +550,14 @@ fn runtime_resume_message(
         }
     }
 
-    body.push_str(
+    let inspection = serde_json::json!({
+        "intent": "inspect", "target": completion.child_session_id, "message": "messages",
+    });
+    body.push_str(&format!(
         "\n\nResume the parent task using this child result and continue from the previous plan. \
-         If you need the full child transcript, call SubAgent.get(child_session_id).",
-    );
+         If you need transcript evidence, call SubAgent with {inspection}. \
+         Follow returned cursors with a JSON-encoded view/cursor query in message; use view=\"message\" and message_id inside that query for a selected full message. Omit unused query fields.",
+    ));
 
     let mut message = Message::user(body);
     message.metadata = Some(serde_json::json!({
@@ -447,17 +567,140 @@ fn runtime_resume_message(
         "child_status": completion.status,
         "child_error": completion.error,
         "child_final_response_included": final_response.is_some(),
+        "child_completion_source": completion.source,
     }));
     // Allow parent-side compaction to reclaim this (now untruncated) message if
     // the parent context grows — important once children nest and fold full
-    // results upward. The `SubAgent.get` hint preserves recoverability.
+    // results upward. The compact inspection hint preserves recoverability.
     message.never_compress = false;
     message
 }
 
+/// A current sealed required-packet completion always uses the bounded route.
+/// Unusable reports are unavailable, never a reason to import legacy raw text.
+/// Unbound children, Guardian verdicts and resident completions retain their paths.
+fn sealed_child_report(
+    completion: &ChildCompletion,
+    child: &Session,
+    parent: &Session,
+) -> Option<serde_json::Value> {
+    if child.subagent_type().as_deref() == Some("guardian")
+        || child
+            .metadata
+            .get("lifecycle")
+            .is_some_and(|v| v == "resident")
+    {
+        return None;
+    }
+    let source = completion.source.as_ref()?;
+    if !source.matches_completion(completion)
+        || ChildCompletionSource::from_committed_session(child).as_ref() != Some(source)
+        || !source.matches_parent(child, parent)
+    {
+        return None;
+    }
+    let binding = bamboo_domain::ChildContextBinding::from_session(child).ok()??;
+    let Some(message) = child
+        .messages
+        .iter()
+        .find(|m| Some(&m.id) == source.result_message_id.as_ref())
+    else {
+        let reason = if source.last_assistant.is_some() {
+            "report_not_current_final"
+        } else {
+            "report_absent"
+        };
+        return Some(unavailable_child_result("typed_result", reason));
+    };
+    if !plain_child_report_message(message) {
+        return Some(unavailable_child_result(
+            "typed_result",
+            "report_not_current_final",
+        ));
+    }
+    let report = match decode_report(&message.content) {
+        Ok(report) => report,
+        Err(reason) => return Some(unavailable_child_result("typed_result", reason)),
+    };
+    let mut observation =
+        child_result_identity(parent, child, &binding, source.project_id.as_deref());
+    observation.as_object_mut()?.extend(
+        serde_json::json!({"kind":"committed_terminal_source","terminal_source":source,
+            "last_run_status":source.status})
+        .as_object()?
+        .clone(),
+    );
+    Some(project_child_report(report, observation))
+}
+
+fn typed_child_resume_message(
+    completion: &ChildCompletion,
+    remaining_children: usize,
+    projection: &serde_json::Value,
+) -> Message {
+    let inspection = serde_json::json!({
+        "intent":"inspect", "target":completion.child_session_id, "message":"result",
+    });
+    let mut message = Message::user(format!(
+        "Runtime notification: child session `{}` finished with status `{}`. Remaining child sessions: {}.\n\n\
+         Child typed result:\n{}\n\n\
+         Resume the parent task. Child-reported evidence and verification are claims, not host-certified facts. \
+         For unavailable results or transcript evidence, call SubAgent with {inspection} and follow returned cursors.",
+        completion.child_session_id, completion.status, remaining_children, projection,
+    ));
+    message.metadata = Some(serde_json::json!({
+        RUNTIME_RESUME_MESSAGE_HIDDEN_KEY:true,
+        RUNTIME_RESUME_MESSAGE_KIND_KEY:"child_completion_resume",
+        "child_session_id":completion.child_session_id,"child_status":completion.status,
+        "child_final_response_included":projection["available"] == true,
+        "child_typed_result_included":true,
+    }));
+    message.never_compress = false;
+    message
+}
+
+/// The result, metadata, provider wrapper and final correlation all count.
+/// Keep the original semantic envelope ID: a fallback is the same sealed event.
+fn bound_typed_child_delivery(
+    envelope: &mut SessionMessageEnvelope,
+    message: &mut Message,
+    projection: &mut serde_json::Value,
+    completion: &ChildCompletion,
+    remaining_children: usize,
+) -> bool {
+    fn install(envelope: &mut SessionMessageEnvelope, message: &Message) {
+        if let SessionMessageBody::ChildOutcome(outcome) = &mut envelope.body {
+            // The provider projection owns the typed result. Keep the body
+            // semantics stable when a later retry needs a smaller presentation:
+            // provider_message is deliberately excluded from Inbox idempotency.
+            // The envelope ID still binds the original sealed report and source.
+            outcome.result = None;
+            // Error identity remains sealed and hashed in the original ID/source.
+            // Do not copy a potentially unbounded raw error into this typed route.
+            outcome.error = None;
+            outcome.provider_message = Some(session_provider_message(message));
+        }
+    }
+    fn fits(envelope: &SessionMessageEnvelope, message: &Message) -> bool {
+        fits_child_result_budget(envelope)
+            && fits_child_result_budget(message)
+            && envelope
+                .to_provider_message()
+                .is_ok_and(|actual| fits_child_result_budget(&actual))
+    }
+    install(envelope, message);
+    if fits(envelope, message) {
+        return true;
+    }
+    *projection = unavailable_child_result("typed_result", "result_budget_exceeded");
+    *message = typed_child_resume_message(completion, remaining_children, projection);
+    install(envelope, message);
+    fits(envelope, message)
+}
+
 /// The hidden resume message for a completed **guardian** review: a directive,
 /// verdict-tailored note that carries the reviewer's findings straight into the
-/// parent (so it can act without a `SubAgent.get`), mirroring
+/// parent (so it can act without a SubAgent inspection), mirroring
 /// [`runtime_resume_message`]'s hidden/compressible shape.
 fn guardian_resume_message(completion: &ChildCompletion, verdict: &GuardianVerdict) -> Message {
     let mut body = if verdict.approve {
@@ -479,9 +722,13 @@ fn guardian_resume_message(completion: &ChildCompletion, verdict: &GuardianVerdi
             body.push_str(&format!("\n{}. {}", idx + 1, finding));
         }
     }
-    body.push_str(
-        "\n\nIf you need the full guardian transcript, call SubAgent.get(child_session_id).",
-    );
+    let inspection = serde_json::json!({
+        "intent": "inspect", "target": completion.child_session_id, "message": "messages",
+    });
+    body.push_str(&format!(
+        "\n\nIf you need guardian transcript evidence, call SubAgent with {inspection}. \
+         Follow returned cursors with a JSON-encoded view/cursor query in message, omitting unused query fields.",
+    ));
 
     let mut message = Message::user(body);
     message.metadata = Some(serde_json::json!({
@@ -490,6 +737,7 @@ fn guardian_resume_message(completion: &ChildCompletion, verdict: &GuardianVerdi
         "child_session_id": completion.child_session_id,
         "child_status": completion.status,
         "guardian_approved": verdict.approve,
+        "child_completion_source": completion.source,
     }));
     message.never_compress = false;
     message
@@ -508,6 +756,7 @@ pub struct ChildCompletionCoordinator {
     provider_router: Arc<ProviderModelRouter>,
     app_data_dir: std::path::PathBuf,
     account_feed_inbox: Option<crate::execution::AccountFeedInbox>,
+    root_account_sink: Option<Arc<crate::events::AccountEventSink>>,
     root_tools: Arc<RwLock<Option<Arc<dyn ToolExecutor>>>>,
     /// Late-bound guardian reviewer spawner, set post-construction by the server
     /// (mirrors `root_tools`). Re-injected into resumed runs so a guardian's
@@ -520,6 +769,11 @@ pub struct ChildCompletionCoordinator {
 }
 
 impl ChildCompletionCoordinator {
+    pub fn with_root_account_sink(mut self, sink: Arc<crate::events::AccountEventSink>) -> Self {
+        self.root_account_sink = Some(sink);
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage: Arc<dyn Storage>,
@@ -546,6 +800,7 @@ impl ChildCompletionCoordinator {
             provider_router,
             app_data_dir,
             account_feed_inbox,
+            root_account_sink: None,
             root_tools: Arc::new(RwLock::new(None)),
             guardian_spawner: Arc::new(RwLock::new(None)),
             spawn_scheduler: Arc::new(RwLock::new(Weak::new())),
@@ -669,110 +924,186 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
         let per_parent = session_resume_lock(&completion.parent_session_id);
         let _per_parent_guard = per_parent.lock().await;
 
-        let Some(mut parent) = self.load_session(&completion.parent_session_id).await else {
-            tracing::warn!(
-                parent_session_id = %completion.parent_session_id,
-                child_session_id = %completion.child_session_id,
-                "child completion received for missing parent"
-            );
-            return;
-        };
+        let (parent, should_resume, messenger, child_admission) = loop {
+            let Some(mut parent) = self.load_session(&completion.parent_session_id).await else {
+                tracing::warn!(
+                    parent_session_id = %completion.parent_session_id,
+                    child_session_id = %completion.child_session_id,
+                    "child completion received for missing parent"
+                );
+                return;
+            };
 
-        // A parent may itself be a child (nested sub-agents): the rest of this
-        // handler is kind-agnostic — it operates on `completion.parent_session_id`,
-        // inspects that session's own `waiting_for_children` runtime state, and
-        // resumes it. (Previously this bailed unless the parent was Root, which
-        // silently dropped grandchild completions.)
-        let mut runtime_state = read_runtime_state(&parent);
+            let expected_parent = parent.clone();
 
-        // Single source of truth: reconstruct the completed-child set from the
-        // session index rather than from a denormalized copy on the parent file.
-        let completed_child_ids = derive_completed_child_ids(
-            &self.storage,
-            &completion.parent_session_id,
-            &completion.child_session_id,
-        )
-        .await;
+            // A parent may itself be a child (nested sub-agents): the rest of this
+            // handler is kind-agnostic — it operates on `completion.parent_session_id`,
+            // inspects that session's own `waiting_for_children` runtime state, and
+            // resumes it. (Previously this bailed unless the parent was Root, which
+            // silently dropped grandchild completions.)
+            let mut runtime_state = read_runtime_state(&parent);
 
-        let mut should_resume = false;
-        let mut remaining_children = 0usize;
-        let active_wait = runtime_state.waiting_for_children.clone();
-        if let Some(wait) = active_wait.as_ref() {
-            remaining_children = wait
-                .child_session_ids
-                .iter()
-                .filter(|id| !completed_child_ids.iter().any(|completed| completed == *id))
-                .count();
-            should_resume = wait_policy_satisfied(
-                wait.wait_for,
-                &wait.child_session_ids,
-                &completed_child_ids,
-                &completion.child_session_id,
-                &completion.status,
-            );
-        }
-
-        // READ-SIDE OWNERSHIP GUARD (issue #546): `SubAgent.wait` ids are
-        // model-provided and unvalidated, and the watchdog unstrands a wait
-        // over a FOREIGN/unknown id by publishing a synthetic completion
-        // here. We must resume the parent (so it is not stranded) but MUST
-        // NOT fold that foreign session's transcript into the parent — that
-        // would be a cross-session disclosure primitive. Decide ownership
-        // from the child's OWN parent linkage (control-plane only, no
-        // messages loaded), and only load its full content when it is truly
-        // this parent's child. An unowned id resumes with the neutral/error
-        // message (`runtime_resume_message` falls back to `completion.error`
-        // when no child content is supplied).
-        let reported_child_owned = match self
-            .storage
-            .load_runtime_control_plane(&completion.child_session_id)
-            .await
-        {
-            Ok(Some(control_plane)) => completion_child_is_owned(
+            // Single source of truth: reconstruct the completed-child set from the
+            // session index rather than from a denormalized copy on the parent file.
+            let mut completed_child_ids = derive_completed_child_ids(
+                &self.storage,
                 &completion.parent_session_id,
-                control_plane.parent_session_id.as_deref(),
-            ),
-            _ => false,
-        };
+                &completion.child_session_id,
+            )
+            .await;
 
-        // Load the completed child once, ONLY when owned. The guardian
-        // branch inspects its subagent_type + final verdict; the generic
-        // path folds its final assistant content into the hidden resume
-        // message (avoiding an extra `SubAgent.get` round trip after resume).
-        let loaded_child = if reported_child_owned {
-            match self
-                .storage
-                .load_session(&completion.child_session_id)
-                .await
-            {
-                Ok(child) => child,
-                Err(error) => {
-                    tracing::warn!(
-                        child_session_id = %completion.child_session_id,
-                        %error,
-                        "failed to load child session for runtime resume message"
-                    );
-                    None
+            let mut should_resume = false;
+            let mut remaining_children = 0usize;
+            let active_wait = runtime_state.waiting_for_children.clone();
+            if active_wait.as_ref().is_none_or(|wait| {
+                !wait
+                    .child_session_ids
+                    .contains(&completion.child_session_id)
+            }) {
+                // Registration owns the physical writer while it fresh-checks
+                // Child terminality. Our no-wait decision must use that same
+                // boundary, so a callback cannot disappear before its arm lands.
+                let mut unchanged = parent.clone();
+                match self
+                    .persistence
+                    .compare_exchange_child_wait_and_publish(
+                        &parent,
+                        &mut unchanged,
+                        true,
+                        Arc::new(|_| {}),
+                    )
+                    .await
+                {
+                    Ok(false) => continue,
+                    Ok(true) => return,
+                    Err(error) => {
+                        tracing::warn!(parent_session_id = %parent.id, %error,
+                            "child completion could not settle no-wait observation");
+                        return;
+                    }
                 }
             }
-        } else {
-            tracing::warn!(
-                parent_session_id = %completion.parent_session_id,
-                child_session_id = %completion.child_session_id,
-                "completion child is not a child of this parent; resuming with a neutral \
-                 message and NOT folding its content"
-            );
-            None
-        };
+            // Independent Stores can have stale child-status indexes. Refresh
+            // this arm's known children from their durable control planes.
+            if let Some(wait) = active_wait.as_ref() {
+                for id in &wait.child_session_ids {
+                    if id == &completion.child_session_id {
+                        continue;
+                    }
+                    if let Ok(Some(child)) = self
+                        .storage
+                        .load_child_wait_session(&parent, id, false)
+                        .await
+                    {
+                        completed_child_ids.retain(|completed| completed != id);
+                        if completion_child_is_owned(&parent.id, child.parent_session_id.as_deref())
+                            && child
+                                .last_run_status()
+                                .as_deref()
+                                .is_some_and(is_terminal_child_status)
+                        {
+                            completed_child_ids.push(id.clone());
+                        }
+                    }
+                }
+            }
+            if let Some(wait) = active_wait.as_ref() {
+                remaining_children = wait
+                    .child_session_ids
+                    .iter()
+                    .filter(|id| !completed_child_ids.iter().any(|completed| completed == *id))
+                    .count();
+                should_resume = wait_policy_satisfied(
+                    wait.wait_for,
+                    &wait.child_session_ids,
+                    &completed_child_ids,
+                    &completion.child_session_id,
+                    &completion.status,
+                );
+            }
 
-        let child_final_response = loaded_child.as_ref().and_then(child_final_assistant_text);
-        // Select the exact provider-facing resume message before durable
-        // admission. The typed body carries its content/parts and safe runtime
-        // metadata, so the canonical path is semantically identical to the
-        // rolling-upgrade transcript fallback.
-        let guardian_resume = if should_resume {
-            let reviewed_round = runtime_state.round.current_round;
-            loaded_child.as_ref().and_then(|child| {
+            // READ-SIDE OWNERSHIP GUARD (issue #546): `SubAgent.wait` ids are
+            // model-provided and unvalidated, and the watchdog unstrands a wait
+            // over a FOREIGN/unknown id by publishing a synthetic completion
+            // here. We must resume the parent (so it is not stranded) but MUST
+            // NOT fold that foreign session's transcript into the parent — that
+            // would be a cross-session disclosure primitive. Decide ownership
+            // from the child's OWN parent linkage (control-plane only, no
+            // messages loaded), and only load its full content when it is truly
+            // this parent's child. An unowned id resumes with the neutral/error
+            // message (`runtime_resume_message` falls back to `completion.error`
+            // when no child content is supplied).
+            let reported_child_owned = match self
+                .storage
+                .load_child_wait_session(&parent, &completion.child_session_id, false)
+                .await
+            {
+                Ok(Some(control_plane)) => completion_child_is_owned(
+                    &completion.parent_session_id,
+                    control_plane.parent_session_id.as_deref(),
+                ),
+                _ => false,
+            };
+
+            // Load the completed child once, ONLY when owned. The guardian
+            // branch inspects its subagent_type + final verdict; the generic
+            // path folds its final assistant content into the hidden resume
+            // message (avoiding an extra `SubAgent.get` round trip after resume).
+            let loaded_child = if reported_child_owned {
+                match self
+                    .storage
+                    .load_child_wait_session(&parent, &completion.child_session_id, true)
+                    .await
+                {
+                    Ok(child) => child,
+                    Err(error) => {
+                        tracing::warn!(
+                            child_session_id = %completion.child_session_id,
+                            %error,
+                            "failed to load child session for runtime resume message"
+                        );
+                        None
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    parent_session_id = %completion.parent_session_id,
+                    child_session_id = %completion.child_session_id,
+                    "completion child is not a child of this parent; resuming with a neutral \
+                     message and NOT folding its content"
+                );
+                None
+            };
+
+            // An old committed callback cannot count a successor, stage another
+            // outcome, or clear a newer wait. Source-less synthetic completions may
+            // unblock recovery, but never borrow the latest transcript answer.
+            if let Some(source) = completion.source.as_ref() {
+                if loaded_child
+                    .as_ref()
+                    .and_then(ChildCompletionSource::from_committed_session)
+                    .as_ref()
+                    != Some(source)
+                    || !source.matches_completion(&completion)
+                    || loaded_child
+                        .as_ref()
+                        .is_none_or(|child| !source.matches_parent(child, &parent))
+                {
+                    tracing::warn!(child_session_id = %completion.child_session_id,
+                    "stale/unavailable committed child completion source; leaving wait armed");
+                    return;
+                }
+            }
+            let child_final_response = loaded_child
+                .as_ref()
+                .and_then(|child| completion.source.as_ref()?.result(child, &parent));
+            // Select the exact provider-facing resume message before durable
+            // admission. The typed body carries its content/parts and safe runtime
+            // metadata, so the canonical path is semantically identical to the
+            // rolling-upgrade transcript fallback.
+            let guardian_resume = if should_resume {
+                let reviewed_round = runtime_state.round.current_round;
+                loaded_child.as_ref().and_then(|child| {
                 if child.subagent_type().as_deref() != Some("guardian") {
                     return None;
                 }
@@ -797,7 +1128,7 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                 // treated as a SYNTHETIC REJECT (never a silent pass), so the
                 // budgeted re-review loop governs the outcome: fail-closed, but
                 // still bounded by `max_reviews`.
-                let verdict = child_final_assistant_text(child)
+                let verdict = child_final_response.clone()
                     .and_then(|text| match parse_guardian_verdict(&text) {
                         Ok(verdict) => Some(verdict),
                         Err(error) => {
@@ -829,30 +1160,74 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                 );
                 Some(message)
             })
-        } else {
-            None
-        };
-        let resume_message = guardian_resume.unwrap_or_else(|| {
-            runtime_resume_message(
-                &completion,
-                remaining_children,
-                child_final_response.as_deref(),
-            )
-        });
+            } else {
+                None
+            };
+            let mut typed_result = loaded_child
+                .as_ref()
+                .and_then(|child| sealed_child_report(&completion, child, &parent));
+            let mut resume_message = if let Some(projection) = typed_result.as_mut() {
+                let message =
+                    typed_child_resume_message(&completion, remaining_children, projection);
+                if fits_child_result_budget(&message) {
+                    message
+                } else {
+                    *projection =
+                        unavailable_child_result("typed_result", "result_budget_exceeded");
+                    typed_child_resume_message(&completion, remaining_children, projection)
+                }
+            } else {
+                guardian_resume.unwrap_or_else(|| {
+                    runtime_resume_message(
+                        &completion,
+                        remaining_children,
+                        child_final_response.as_deref(),
+                    )
+                })
+            };
+            if typed_result.is_some() && !fits_child_result_budget(&resume_message) {
+                tracing::warn!(child_session_id = %completion.child_session_id,
+                "typed child resume identity exceeds budget; leaving wait armed");
+                return;
+            }
 
-        // Stage the typed child outcome before clearing any durable wait. A
-        // crash after this admission leaves the parent suspended with an
-        // inspectable envelope; only a durably committed policy transition
-        // below is allowed to activate it.
-        let messenger = self.agent.session_messenger().cloned();
-        let child_admission =
-            if let (Some(wait), Some(messenger)) = (active_wait.as_ref(), messenger.as_ref()) {
-                let envelope = child_completion_envelope(
+            // Stage the typed child outcome before clearing any durable wait. A
+            // crash after this admission leaves the parent suspended with an
+            // inspectable envelope; only a durably committed policy transition
+            // below is allowed to activate it.
+            let messenger = self.agent.session_messenger().cloned();
+            let mut child_admission = if let (Some(wait), Some(messenger)) =
+                (active_wait.as_ref(), messenger.as_ref())
+            {
+                let mut envelope = child_completion_envelope(
                     &completion,
                     wait.registered_at,
                     child_final_response,
                     &resume_message,
                 );
+                if let Some(run_id) = self
+                    .agent
+                    .activation_router()
+                    .map(|router| router.current_run_id(&completion.parent_session_id))
+                {
+                    if let Some(run_id) = run_id.await {
+                        envelope.correlation_id =
+                            Some(format!("child_completion_after_run:{run_id}"));
+                    }
+                }
+                if let Some(projection) = typed_result.as_mut() {
+                    if !bound_typed_child_delivery(
+                        &mut envelope,
+                        &mut resume_message,
+                        projection,
+                        &completion,
+                        remaining_children,
+                    ) {
+                        tracing::warn!(child_session_id = %completion.child_session_id,
+                        "typed child outcome wrapper exceeds budget; leaving wait armed");
+                        return;
+                    }
+                }
                 match messenger.admit(envelope).await {
                     Ok(admission) => Some(admission),
                     Err(error) => {
@@ -869,63 +1244,273 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                 None
             };
 
-        if should_resume {
-            if let (Some(messenger), Some(admission)) =
-                (messenger.as_ref(), child_admission.as_ref())
-            {
-                if let Err(error) = messenger.prepare_activation(admission).await {
-                    tracing::warn!(
-                        parent_session_id = %completion.parent_session_id,
-                        child_session_id = %completion.child_session_id,
-                        %error,
-                        "child outcome activation watermark failed; leaving parent wait armed"
-                    );
+            // The durable Child index can reach terminal state before its
+            // completion callback acquires this parent lock. Clearing an already
+            // satisfied wait after staging only the current callback would drop
+            // every later callback at the no-wait guard above. Stage those exact
+            // waited-for terminal siblings first, using the same wait identity and
+            // Inbox protocol. Any/FirstError still do not wait for running siblings.
+            if should_resume {
+                if let (Some(wait), Some(messenger)) = (active_wait.as_ref(), messenger.as_ref()) {
+                    let parent_run_id = if let Some(router) = self.agent.activation_router() {
+                        router.current_run_id(&completion.parent_session_id).await
+                    } else {
+                        None
+                    };
+                    for child_id in &wait.child_session_ids {
+                        if child_id == &completion.child_session_id
+                            || !completed_child_ids.contains(child_id)
+                        {
+                            continue;
+                        }
+                        // Check lineage before reading transcript content. The
+                        // index is parent-scoped, but ownership must still come
+                        // from this child's own durable control plane.
+                        let owned = match self
+                            .storage
+                            .load_child_wait_session(&parent, child_id, false)
+                            .await
+                        {
+                            Ok(Some(child)) => completion_child_is_owned(
+                                &completion.parent_session_id,
+                                child.parent_session_id.as_deref(),
+                            ),
+                            _ => false,
+                        };
+                        let sibling = if owned {
+                            self.storage
+                                .load_child_wait_session(&parent, child_id, true)
+                                .await
+                        } else {
+                            tracing::warn!(%child_id, "terminal sibling ownership unavailable; leaving parent wait armed");
+                            return;
+                        };
+                        let sibling = match sibling {
+                            Ok(Some(child))
+                                if completion_child_is_owned(
+                                    &completion.parent_session_id,
+                                    child.parent_session_id.as_deref(),
+                                ) && child
+                                    .last_run_status()
+                                    .as_deref()
+                                    .is_some_and(is_terminal_child_status) =>
+                            {
+                                child
+                            }
+                            _ => {
+                                tracing::warn!(%child_id, "terminal sibling snapshot unavailable; leaving parent wait armed");
+                                return;
+                            }
+                        };
+                        if ChildCompletionSource::has_source_record(&sibling)
+                            && ChildCompletionSource::from_committed_session(&sibling).is_none()
+                        {
+                            tracing::warn!(%child_id, "terminal sibling source is invalid; leaving wait armed");
+                            return;
+                        }
+                        let sibling_completion = ChildCompletion {
+                            parent_session_id: completion.parent_session_id.clone(),
+                            child_session_id: child_id.clone(),
+                            status: sibling.last_run_status().expect("terminal status checked"),
+                            error: sibling.last_run_error(),
+                            completed_at: sibling.updated_at,
+                            source: ChildCompletionSource::from_committed_session(&sibling),
+                        };
+                        if sibling_completion
+                            .source
+                            .as_ref()
+                            .is_some_and(|source| !source.matches_parent(&sibling, &parent))
+                        {
+                            tracing::warn!(%child_id, "terminal sibling parent context is stale; leaving wait armed");
+                            return;
+                        }
+                        let result = sibling_completion
+                            .source
+                            .as_ref()
+                            .and_then(|source| source.result(&sibling, &parent));
+                        let mut typed_result =
+                            sealed_child_report(&sibling_completion, &sibling, &parent);
+                        let mut presentation = if let Some(projection) = typed_result.as_ref() {
+                            typed_child_resume_message(
+                                &sibling_completion,
+                                remaining_children,
+                                projection,
+                            )
+                        } else {
+                            runtime_resume_message(
+                                &sibling_completion,
+                                remaining_children,
+                                result.as_deref(),
+                            )
+                        };
+                        let mut envelope = child_completion_envelope(
+                            &sibling_completion,
+                            wait.registered_at,
+                            result,
+                            &presentation,
+                        );
+                        if let Some(run_id) = parent_run_id.as_ref() {
+                            envelope.correlation_id =
+                                Some(format!("child_completion_after_run:{run_id}"));
+                        }
+                        if let Some(projection) = typed_result.as_mut() {
+                            if !bound_typed_child_delivery(
+                                &mut envelope,
+                                &mut presentation,
+                                projection,
+                                &sibling_completion,
+                                remaining_children,
+                            ) {
+                                tracing::warn!(%child_id, "typed terminal sibling wrapper exceeds budget; leaving wait armed");
+                                return;
+                            }
+                        }
+                        match messenger.admit(envelope).await {
+                            Ok(admission) => {
+                                // Preparing the highest generation authorizes the
+                                // whole staged prefix while RespectSpecificWait
+                                // keeps it inert until the wait save succeeds.
+                                if child_admission.as_ref().is_none_or(|current| {
+                                    admission.delivery.generation > current.delivery.generation
+                                }) {
+                                    child_admission = Some(admission);
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%child_id, %error, "terminal sibling admission failed; leaving parent wait armed");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if should_resume {
+                if let (Some(messenger), Some(admission)) =
+                    (messenger.as_ref(), child_admission.as_ref())
+                {
+                    if let Err(error) = messenger.prepare_activation(admission).await {
+                        tracing::warn!(
+                            parent_session_id = %completion.parent_session_id,
+                            child_session_id = %completion.child_session_id,
+                            %error,
+                            "child outcome activation watermark failed; leaving parent wait armed"
+                        );
+                        return;
+                    }
+                }
+            }
+
+            if should_resume {
+                runtime_state.waiting_for_children = None;
+                runtime_state.status = AgentStatusState::Idle;
+                runtime_state.suspension = None;
+                parent.metadata.remove("runtime.suspend_reason");
+
+                if child_admission.is_none() {
+                    // Rolling-upgrade fallback only. The canonical path keeps the
+                    // child outcome solely in SessionInbox until the next safe
+                    // reasoning boundary.
+                    parent.add_message(resume_message);
+                }
+            } else if runtime_state.waiting_for_children.is_some() {
+                runtime_state.status = AgentStatusState::Suspended;
+                runtime_state.suspension = Some(SuspensionState {
+                    reason: "waiting_for_children".to_string(),
+                    suspended_at: Utc::now(),
+                    resumable: true,
+                    hook_point: Some("ChildCompletion".to_string()),
+                });
+            }
+
+            parent.updated_at = Utc::now();
+            write_runtime_state(&mut parent, &runtime_state);
+            // Canonical ChildOutcome admission owns the provider-visible message;
+            // this transaction only changes the parent's wait/control state. A
+            // concurrent Root turn may already have advanced its model-context
+            // ledger, so use the control-plane writer, which adopts that durable
+            // ledger under the session lock. The rolling-upgrade fallback above
+            // appends a message and still requires an append-safe checkpoint.
+            let runtime_only = child_admission.is_some();
+            let sessions = self.sessions.clone();
+            let history = expected_parent.clone();
+            let save = self
+                .persistence
+                .compare_exchange_child_wait_and_publish(
+                    &expected_parent,
+                    &mut parent,
+                    runtime_only,
+                    Arc::new(move |saved| {
+                        if runtime_only {
+                            if let Some(cached) = sessions.get(&saved.id) {
+                                cached.update(|current| {
+                                    if current.created_at != saved.created_at {
+                                        *current = saved.clone();
+                                        current.messages = history.messages.clone();
+                                        current.provider_transcript =
+                                            history.provider_transcript.clone();
+                                        current
+                                            .runtime_metadata
+                                            .get_or_insert_with(Default::default)
+                                            .session_inbox_admission =
+                                            history.session_inbox_admission().cloned();
+                                        return;
+                                    }
+
+                                    let messages = current.messages.clone();
+                                    let provider_transcript = current.provider_transcript.clone();
+                                    let admission =
+                                        current.runtime_metadata.as_ref().and_then(|metadata| {
+                                            metadata.session_inbox_admission.clone()
+                                        });
+                                    *current = saved.clone();
+                                    current.messages = messages;
+                                    current.provider_transcript = provider_transcript;
+                                    current
+                                        .runtime_metadata
+                                        .get_or_insert_with(Default::default)
+                                        .session_inbox_admission = admission;
+                                });
+                            } else {
+                                let mut snapshot = saved.clone();
+                                snapshot.messages = history.messages.clone();
+                                snapshot.provider_transcript = history.provider_transcript.clone();
+                                snapshot
+                                    .runtime_metadata
+                                    .get_or_insert_with(Default::default)
+                                    .session_inbox_admission = history
+                                    .runtime_metadata
+                                    .as_ref()
+                                    .and_then(|metadata| metadata.session_inbox_admission.clone());
+                                sessions.insert(
+                                    snapshot.id.clone(),
+                                    Arc::new(crate::SessionSnapshot::new(snapshot)),
+                                );
+                            }
+                        } else {
+                            sessions.insert(
+                                saved.id.clone(),
+                                Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                            );
+                        }
+                    }),
+                )
+                .await;
+            match save {
+                Ok(false) => {
+                    // Membership or policy changed, even if first-arm tag/time
+                    // stayed the same. Reload and recompute; never replay a clear.
+                    continue;
+                }
+                Ok(true) => break (parent, should_resume, messenger, child_admission),
+                Err(error) => {
+                    tracing::warn!(parent_session_id = %completion.parent_session_id,
+                    child_session_id = %completion.child_session_id, %error,
+                    "child outcome is durable but parent wait transition failed; leaving activation deferred");
                     return;
                 }
             }
-        }
-
-        if should_resume {
-            runtime_state.waiting_for_children = None;
-            runtime_state.status = AgentStatusState::Idle;
-            runtime_state.suspension = None;
-            parent.metadata.remove("runtime.suspend_reason");
-
-            if child_admission.is_none() {
-                // Rolling-upgrade fallback only. The canonical path keeps the
-                // child outcome solely in SessionInbox until the next safe
-                // reasoning boundary.
-                parent.add_message(resume_message);
-            }
-        } else if runtime_state.waiting_for_children.is_some() {
-            runtime_state.status = AgentStatusState::Suspended;
-            runtime_state.suspension = Some(SuspensionState {
-                reason: "waiting_for_children".to_string(),
-                suspended_at: Utc::now(),
-                resumable: true,
-                hook_point: Some("ChildCompletion".to_string()),
-            });
-        }
-
-        parent.updated_at = Utc::now();
-        write_runtime_state(&mut parent, &runtime_state);
-        if let Err(error) = self
-            .persistence
-            .checkpoint_runtime_session(&mut parent)
-            .await
-        {
-            tracing::warn!(
-                parent_session_id = %completion.parent_session_id,
-                child_session_id = %completion.child_session_id,
-                %error,
-                "child outcome is durable but parent wait transition failed; leaving activation deferred"
-            );
-            return;
-        }
-        self.sessions.insert(
-            parent.id.clone(),
-            Arc::new(crate::SessionSnapshot::new(parent.clone())),
-        );
+        };
 
         // Capture before releasing the per-parent lock so the borrow checker
         // is satisfied; `resume_parent` has its own retry loop and should not
@@ -1026,6 +1611,34 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             return;
         }
 
+        if self
+            .agent
+            .persistence()
+            .root_actor_execution_required(&session)
+            && self.root_account_sink.is_none()
+        {
+            tracing::warn!(%session_id, "Root resume has no actual account sink; rejecting before Actor claim");
+            execution_reservation.abandon().await;
+            return;
+        }
+        if let Err(error) = execution_reservation
+            .bind_root_actor(&self.agent, &session)
+            .await
+        {
+            tracing::warn!(%session_id, %error, "Root coordinator resume Actor binding rejected");
+            execution_reservation.abandon().await;
+            return;
+        }
+        let root_publication = execution_reservation.root_actor_writer().map(|owner| {
+            crate::events::RootActorEventPublication::new(
+                self.storage.clone(),
+                self.root_account_sink
+                    .clone()
+                    .expect("required Root actual account sink checked before claim"),
+                owner,
+            )
+        });
+
         let Some(root_tools) = self.root_tools.read().await.clone() else {
             tracing::error!(%session_id, "cannot resume parent after child completion: root tool surface is not initialized");
             return;
@@ -1108,12 +1721,13 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         .or(config.gold_config.clone());
 
         let (mpsc_tx, _forwarder, history_commit_barrier) =
-            create_event_forwarder_with_history_commit_barrier(
+            crate::execution::create_event_forwarder_with_root_actor(
                 session_id.clone(),
                 execution_reservation.run_id().to_string(),
                 event_sender,
                 self.agent_runners.clone(),
                 self.account_feed_inbox.clone(),
+                root_publication,
             );
 
         let config_handle = self.config.clone();
@@ -1380,7 +1994,7 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
         let run_id = reservation.run_id.clone();
         let launch = match launch_plan {
             LaunchPlan::Root(config) => {
-                let execution_reservation =
+                let mut execution_reservation =
                     SessionExecutionReservation::from_activation_placeholder(
                         target_session_id,
                         reservation,
@@ -1390,6 +2004,33 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
                             .clone(),
                         self.agent_runners.clone(),
                     );
+                // Busy must reach the router before it commits a launched
+                // generation. Its existing recovery backoff can then retry the
+                // durable input when the old Host's actual lease expires.
+                if self
+                    .agent
+                    .persistence()
+                    .root_actor_execution_required(&session)
+                    && self.root_account_sink.is_none()
+                {
+                    execution_reservation
+                        .rollback_unpublished_activation()
+                        .await;
+                    return Err(bamboo_domain::SessionActivationError::Internal(
+                        "Root activation has no actual account sink".into(),
+                    ));
+                }
+                if let Err(error) = execution_reservation
+                    .bind_root_actor(&self.agent, &session)
+                    .await
+                {
+                    execution_reservation
+                        .rollback_unpublished_activation()
+                        .await;
+                    return Err(bamboo_domain::SessionActivationError::Internal(format!(
+                        "Root Actor reservation rejected: {error}"
+                    )));
+                }
                 // Launch and rollback share one exact RAII reservation. Dropping
                 // an unlaunched SessionActivationLaunch cannot race a raw slot
                 // removal against the reservation's router-placeholder cleanup.
@@ -1413,10 +2054,12 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
                         // The router publishes the exact owner before invoking
                         // this closure, so only now may the prepared snapshot
                         // replace the shared cache entry.
-                        launch_sessions.insert(
-                            launch_session_id,
-                            Arc::new(crate::SessionSnapshot::new(launch_session)),
-                        );
+                        if execution_reservation.root_actor_writer().is_none() {
+                            launch_sessions.insert(
+                                launch_session_id,
+                                Arc::new(crate::SessionSnapshot::new(launch_session)),
+                            );
+                        }
                         let request = ResumeSpawnRequest {
                             session_id: request_session_id,
                             session,
@@ -2220,19 +2863,20 @@ fn child_wait_watchdog_resume_message(body: String) -> Message {
 }
 
 fn empty_child_wait_message() -> Message {
-    child_wait_watchdog_resume_message(
+    let inspection = serde_json::json!({"intent": "inspect", "message": "tree"});
+    child_wait_watchdog_resume_message(format!(
         "Runtime notification: this session was suspended waiting for child sessions, but the \
          wait tracked no children (internal inconsistency). The session has been resumed; use \
-         SubAgent.list to inspect child state and continue the task."
-            .to_string(),
-    )
+         SubAgent with {inspection} to inspect child state and continue the task.",
+    ))
 }
 
 fn child_wait_lease_expired_message(child_ids: &[String]) -> Message {
+    let inspection = serde_json::json!({"intent": "inspect", "message": "tree"});
     child_wait_watchdog_resume_message(format!(
         "Runtime notification: the wait lease for child session(s) [{}] expired before they all \
          reported completion. They were NOT cancelled and may still be running or already \
-         finished — verify their actual status with SubAgent.list / SubAgent.get before assuming \
+         finished — verify their actual status by calling SubAgent with {inspection} before assuming \
          anything, then continue the task.",
         child_ids.join(", ")
     ))
@@ -2651,12 +3295,35 @@ impl ChildCompletionCoordinator {
                     "child-wait watchdog: wait already satisfied but parent still suspended \
                      (lost wake); replaying the completion"
                 );
-                let error = self
-                    .load_control_plane(child_id)
-                    .await
-                    .and_then(|child| child.last_run_error());
-                self.publish_synthetic_completion(parent_session_id, child_id, status, error)
-                    .await;
+                let control_plane = self.load_control_plane(child_id).await;
+                let mut completion = ChildCompletion {
+                    parent_session_id: parent_session_id.into(),
+                    child_session_id: child_id.clone(),
+                    status: status.clone(),
+                    error: control_plane.as_ref().and_then(Session::last_run_error),
+                    completed_at: Utc::now(),
+                    source: None,
+                };
+                // Lost callbacks replay the committed source, not a synthetic
+                // latest answer. Check ownership before loading any transcript.
+                if control_plane.as_ref().is_some_and(|child| {
+                    child.parent_session_id.as_deref() == Some(parent_session_id)
+                }) {
+                    let Ok(Some(child)) = self.storage.load_session(child_id).await else {
+                        return;
+                    };
+                    completion.source = ChildCompletionSource::from_committed_session(&child)
+                        .filter(|source| source.matches_completion(&completion));
+                    if ChildCompletionSource::has_source_record(&child)
+                        && completion.source.is_none()
+                    {
+                        tracing::warn!(%child_id,
+                            "unavailable committed replay source; leaving wait armed");
+                        return;
+                    }
+                    completion.completed_at = child.updated_at;
+                }
+                self.publish_completion(completion).await;
             }
         }
     }
@@ -2743,6 +3410,18 @@ impl ChildCompletionCoordinator {
         status: &str,
         error: Option<String>,
     ) {
+        self.publish_completion(ChildCompletion {
+            parent_session_id: parent_session_id.into(),
+            child_session_id: child_session_id.into(),
+            status: status.into(),
+            error,
+            completed_at: Utc::now(),
+            source: None,
+        })
+        .await;
+    }
+
+    async fn publish_completion(&self, completion: ChildCompletion) {
         let publisher =
             crate::runtime::execution::session_events::ReplayableSessionEventPublisher::new(
                 self.agent_runners.clone(),
@@ -2750,13 +3429,10 @@ impl ChildCompletionCoordinator {
                 self.account_feed_inbox.clone(),
             );
         let handler: Arc<dyn ChildCompletionHandler> = Arc::new(self.clone());
-        crate::runtime::execution::spawn::publish_child_completion_parts(
+        crate::runtime::execution::spawn::publish_child_completion(
             &publisher,
             Some(handler),
-            parent_session_id.to_string(),
-            child_session_id.to_string(),
-            status.to_string(),
-            error,
+            completion,
         )
         .await;
     }
@@ -2895,6 +3571,33 @@ mod tests {
     use futures::stream;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    struct FailingRuntimeSaveStorage {
+        inner: Arc<bamboo_storage::SessionStoreV2>,
+    }
+
+    #[async_trait]
+    impl Storage for FailingRuntimeSaveStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.inner.save_session(session).await
+        }
+
+        async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_session(id).await
+        }
+
+        async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(id).await
+        }
+
+        async fn load_runtime_control_plane(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_runtime_control_plane(id).await
+        }
+
+        async fn save_runtime_state(&self, _session: &Session) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected sidecar save failure"))
+        }
+    }
+
     struct EmptyTools;
 
     #[async_trait]
@@ -2959,7 +3662,595 @@ mod tests {
         }
     }
 
+    async fn save_sourced_test_child(store: &bamboo_storage::SessionStoreV2, child: &Session) {
+        let mut saved = child.clone();
+        ChildCompletionSource::prepare(
+            &mut saved,
+            &format!("test-run-{}", child.id),
+            &Default::default(),
+        );
+        store.save_session(&saved).await.unwrap();
+    }
+
+    async fn test_child_source(
+        store: &bamboo_storage::SessionStoreV2,
+        id: &str,
+    ) -> Option<ChildCompletionSource> {
+        ChildCompletionSource::from_committed_session(
+            &store.load_session(id).await.unwrap().unwrap(),
+        )
+    }
+
+    fn typed_test_report() -> serde_json::Value {
+        serde_json::json!({"version":1,"outcome":"blocked","summary":"Quoted \"claim\" \\ 用户🪷\n",
+            "reported_evidence":[{"description":"reported only","reference":"/never/read/reported-ref","sha256":null}],
+            "reported_verification":[{"check":"fixture","reported_status":"passed","details":"a model claim"}],
+            "proposals":["Try the next step"],"blockers":["Need approval"],"open_decisions":["Which route?"]})
+    }
+
+    fn typed_test_child(parent: &Session, id: &str, report: &str) -> Session {
+        let mut child = Session::new_child(id, &parent.id, "model", "Child");
+        let packet = bamboo_domain::ChildContextPacket {
+            version: 1,
+            objective: "bounded task".into(),
+            constraints: vec![],
+            acceptance: vec!["report only".into()],
+            non_goals: vec![],
+            necessary_user_instructions: vec![],
+            recorded_decisions: vec![],
+            source_user_message_ids: vec![parent.messages[0].id.clone()],
+            background_message_ids: vec![],
+        };
+        let resolved = packet.resolve(parent, "bounded task").unwrap();
+        let binding = bamboo_domain::ChildContextBinding::new(
+            parent,
+            id,
+            resolved.required_brief.clone(),
+            resolved,
+        )
+        .unwrap();
+        binding.install(&mut child).unwrap();
+        child.add_message(binding.assignment_message());
+        child.add_message(Message::assistant(report, None));
+        child.set_last_run_status("completed");
+        ChildCompletionSource::prepare(&mut child, "sealed-report-run", &Default::default());
+        child
+    }
+
+    fn typed_test_completion(child: &Session) -> ChildCompletion {
+        ChildCompletion {
+            parent_session_id: child.parent_session_id.clone().unwrap(),
+            child_session_id: child.id.clone(),
+            status: child.last_run_status().unwrap(),
+            error: child.last_run_error(),
+            completed_at: child.updated_at,
+            source: ChildCompletionSource::from_committed_session(child),
+        }
+    }
+
+    fn unusable_typed_test_child(
+        parent: &Session,
+        id: &str,
+        case: &str,
+    ) -> (Session, &'static str) {
+        let mut child = typed_test_child(parent, id, &typed_test_report().to_string());
+        let mut prior = Default::default();
+        let reason = match case {
+            "prose" => {
+                child.messages.last_mut().unwrap().content = "UNUSABLE_RAW_PROSE".repeat(64);
+                "report_malformed"
+            }
+            "malformed" => {
+                child.messages.last_mut().unwrap().content =
+                    "{\"version\":1,UNUSABLE_RAW_JSON".into();
+                "report_malformed"
+            }
+            "oversized" => {
+                child
+                    .messages
+                    .last_mut()
+                    .unwrap()
+                    .content
+                    .push_str(&" ".repeat(8193));
+                "result_budget_exceeded"
+            }
+            "multipart" => {
+                child.messages.last_mut().unwrap().content_parts = Some(
+                    serde_json::from_value(
+                        serde_json::json!([{"type":"text","text":"UNUSABLE_RAW_PART"}]),
+                    )
+                    .unwrap(),
+                );
+                "report_not_current_final"
+            }
+            "commentary" => {
+                child.messages.last_mut().unwrap().phase =
+                    Some(bamboo_domain::MessagePhase::Commentary);
+                "report_not_current_final"
+            }
+            "blank" => {
+                child.messages.last_mut().unwrap().content = "  ".into();
+                "report_not_current_final"
+            }
+            "old_final" => {
+                prior = child.messages.iter().map(|m| m.id.clone()).collect();
+                "report_not_current_final"
+            }
+            "error" => {
+                prior = child.messages.iter().map(|m| m.id.clone()).collect();
+                child.set_last_run_status("error");
+                child.set_last_run_error("UNUSABLE_RAW_ERROR\"\\\n".repeat(4096));
+                "report_not_current_final"
+            }
+            "absent" => {
+                child.messages.pop();
+                "report_absent"
+            }
+            _ => panic!("unknown unusable report case"),
+        };
+        ChildCompletionSource::prepare(&mut child, "unusable-report-run", &prior);
+        (child, reason)
+    }
+
+    #[test]
+    fn sealed_unusable_reports_keep_current_source_boundary_and_escape_budget() {
+        let mut parent = Session::new("unavailable-parent", "model");
+        parent.add_message(Message::user("required source"));
+        for case in [
+            "prose",
+            "malformed",
+            "oversized",
+            "multipart",
+            "commentary",
+            "blank",
+            "old_final",
+            "error",
+            "absent",
+        ] {
+            let (child, reason) = unusable_typed_test_child(&parent, "unavailable-child", case);
+            let completion = typed_test_completion(&child);
+            assert!(completion.source.is_some(), "valid seal: {case}");
+            let mut projection = sealed_child_report(&completion, &child, &parent).unwrap();
+            assert_eq!(
+                projection,
+                unavailable_child_result("typed_result", reason),
+                "{case}"
+            );
+            let mut message = typed_child_resume_message(&completion, 0, &projection);
+            let raw = completion.source.as_ref().unwrap().result(&child, &parent);
+            let mut envelope =
+                child_completion_envelope(&completion, Utc::now(), raw.clone(), &message);
+            assert!(bound_typed_child_delivery(
+                &mut envelope,
+                &mut message,
+                &mut projection,
+                &completion,
+                0
+            ));
+            assert!(fits_child_result_budget(&envelope));
+            assert!(fits_child_result_budget(&message));
+            assert!(fits_child_result_budget(
+                &envelope.to_provider_message().unwrap()
+            ));
+            assert!(message.content.contains("SubAgent"));
+            assert_eq!(
+                message.metadata.as_ref().unwrap()["child_final_response_included"],
+                false
+            );
+            assert!(projection.get("child_report").is_none());
+            assert!(projection.get("host_observation").is_none());
+            let SessionMessageBody::ChildOutcome(outcome) = envelope.body else {
+                panic!("child outcome")
+            };
+            assert!(outcome.result.is_none());
+            assert!(outcome.error.is_none());
+            if let Some(raw) = raw {
+                assert!(!message.content.contains(&raw), "no raw report: {case}");
+            }
+            // A replaced or invalid source never turns into an unavailable
+            // completion that could clear a newer wait.
+            let mut stale = child.clone();
+            stale
+                .messages
+                .last_mut()
+                .unwrap()
+                .content
+                .push_str("changed");
+            assert!(sealed_child_report(&completion, &stale, &parent).is_none());
+        }
+    }
+
+    #[test]
+    fn unavailable_delivery_counts_escaped_wrappers_at_exact_limit() {
+        let mut parent = Session::new("unavailable-parent", "model");
+        parent.add_message(Message::user("required source"));
+        let (child, _) = unusable_typed_test_child(&parent, "unavailable-child", "oversized");
+        let completion = typed_test_completion(&child);
+        let mut projection = sealed_child_report(&completion, &child, &parent).unwrap();
+        let mut message = typed_child_resume_message(&completion, 0, &projection);
+        let mut base = child_completion_envelope(&completion, Utc::now(), None, &message);
+        assert!(bound_typed_child_delivery(
+            &mut base,
+            &mut message,
+            &mut projection,
+            &completion,
+            0
+        ));
+        let bytes = serde_json::to_vec(&base).unwrap().len().max(
+            serde_json::to_vec(&base.to_provider_message().unwrap())
+                .unwrap()
+                .len(),
+        );
+        for extra in [8192 - bytes, 8193 - bytes] {
+            let mut envelope = base.clone();
+            // Quotes count twice in the actual escaped wrappers.
+            let padding = format!("{}{}", "\"".repeat(extra / 2), "x".repeat(extra % 2));
+            envelope.correlation_id.as_mut().unwrap().push_str(&padding);
+            let mut projection = projection.clone();
+            let mut message = message.clone();
+            assert_eq!(
+                bound_typed_child_delivery(
+                    &mut envelope,
+                    &mut message,
+                    &mut projection,
+                    &completion,
+                    0
+                ),
+                bytes + extra == 8192
+            );
+            assert_eq!(
+                serde_json::to_vec(&envelope).unwrap().len().max(
+                    serde_json::to_vec(&envelope.to_provider_message().unwrap())
+                        .unwrap()
+                        .len()
+                ),
+                bytes + extra
+            );
+            assert!(fits_child_result_budget(&message));
+        }
+    }
+
+    #[test]
+    fn sealed_typed_projection_keeps_host_source_distinct_from_all_reported_claims() {
+        let mut parent = Session::new("typed-parent", "model");
+        parent.add_message(Message::user("required user constraint"));
+        let report = typed_test_report();
+        let child = typed_test_child(&parent, "typed-child", &report.to_string());
+        let completion = typed_test_completion(&child);
+        let projection = sealed_child_report(&completion, &child, &parent).unwrap();
+        assert_eq!(projection["child_report"], report);
+        assert_eq!(
+            projection["host_observation"]["terminal_source"],
+            serde_json::to_value(&completion.source).unwrap()
+        );
+        assert_eq!(
+            projection["host_observation"]["kind"],
+            "committed_terminal_source"
+        );
+        assert_eq!(
+            projection["host_observation"]["last_run_status"],
+            "completed"
+        );
+        assert_eq!(projection["child_report"]["outcome"], "blocked");
+        assert_eq!(
+            projection["child_report"]["reported_verification"][0]["reported_status"],
+            "passed"
+        );
+        assert!(projection["host_observation"].get("verified").is_none());
+        for excluded in ["guardian", "resident", "legacy", "missing_source"] {
+            let mut excluded_child = child.clone();
+            match excluded {
+                "guardian" => {
+                    excluded_child
+                        .metadata
+                        .insert("subagent_type".into(), "guardian".into());
+                }
+                "resident" => {
+                    excluded_child
+                        .metadata
+                        .insert("lifecycle".into(), "resident".into());
+                }
+                "legacy" => {
+                    excluded_child =
+                        Session::new_child("typed-child", &parent.id, "model", "Child");
+                    excluded_child.add_message(Message::assistant(report.to_string(), None));
+                    excluded_child.set_last_run_status("completed");
+                }
+                _ => {}
+            }
+            ChildCompletionSource::prepare(
+                &mut excluded_child,
+                "excluded-run",
+                &Default::default(),
+            );
+            let mut excluded_completion = typed_test_completion(&excluded_child);
+            if excluded == "missing_source" {
+                excluded_completion.source = None;
+            }
+            assert!(
+                sealed_child_report(&excluded_completion, &excluded_child, &parent).is_none(),
+                "{excluded}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_delivery_counts_complete_escaped_envelope_and_final_correlation() {
+        let mut parent = Session::new("typed-parent", "model");
+        parent.add_message(Message::user("required source"));
+        let child = typed_test_child(&parent, "typed-child", &typed_test_report().to_string());
+        let completion = typed_test_completion(&child);
+        let original = sealed_child_report(&completion, &child, &parent).unwrap();
+        let presentation = typed_child_resume_message(&completion, 0, &original);
+        let mut base = child_completion_envelope(
+            &completion,
+            Utc::now(),
+            completion.source.as_ref().unwrap().result(&child, &parent),
+            &presentation,
+        );
+        let mut projection = original.clone();
+        let mut message = presentation.clone();
+        assert!(bound_typed_child_delivery(
+            &mut base,
+            &mut message,
+            &mut projection,
+            &completion,
+            0
+        ));
+        assert_eq!(projection, original);
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        store.save_session(&parent).await.unwrap();
+        let inbox = bamboo_storage::FileSessionInbox::new(store, Default::default());
+        let first = inbox.deliver(&base).await.unwrap();
+        let stable_id = base.id.clone();
+        let base_bytes = serde_json::to_vec(&base.to_provider_message().unwrap())
+            .unwrap()
+            .len();
+        assert!(base_bytes < 8192);
+        let correlation = base.correlation_id.as_ref().unwrap().clone();
+        for (extra, available) in [(8192 - base_bytes, true), (8193 - base_bytes, false)] {
+            let mut envelope = base.clone();
+            envelope.correlation_id = Some(format!("{correlation}{}", "x".repeat(extra)));
+            assert_eq!(
+                serde_json::to_vec(&envelope.to_provider_message().unwrap())
+                    .unwrap()
+                    .len(),
+                base_bytes + extra
+            );
+            let mut message = presentation.clone();
+            let mut projection = original.clone();
+            assert!(bound_typed_child_delivery(
+                &mut envelope,
+                &mut message,
+                &mut projection,
+                &completion,
+                0
+            ));
+            assert_eq!(projection["available"], available);
+            assert!(fits_child_result_budget(&envelope));
+            assert!(fits_child_result_budget(&message));
+            assert!(fits_child_result_budget(
+                &envelope.to_provider_message().unwrap()
+            ));
+            assert_eq!(
+                envelope.idempotency_semantics(),
+                base.idempotency_semantics()
+            );
+            assert_eq!(envelope.id, stable_id);
+            assert_eq!(
+                inbox.deliver(&envelope).await.unwrap(),
+                first,
+                "presentation overflow cannot change delivery semantics"
+            );
+            if !available {
+                assert_eq!(projection["reason"], "result_budget_exceeded");
+                assert!(projection.get("child_report").is_none());
+                assert!(message.content.contains("SubAgent"));
+                assert!(!message.content.contains("Bounded tail"));
+            }
+        }
+        let mut large = typed_test_report();
+        large["summary"] = serde_json::json!("\"\\\n".repeat(500));
+        large["proposals"] = serde_json::json!(["\"\\\n".repeat(250)]);
+        let child = typed_test_child(&parent, "escaped-child", &large.to_string());
+        assert!(decode_report(&large.to_string()).is_ok());
+        let completion = typed_test_completion(&child);
+        let mut projection = sealed_child_report(&completion, &child, &parent).unwrap();
+        let mut message = typed_child_resume_message(&completion, 0, &projection);
+        let mut envelope =
+            child_completion_envelope(&completion, Utc::now(), Some(large.to_string()), &message);
+        assert!(serde_json::to_vec(&envelope).unwrap().len() > 8192);
+        assert!(bound_typed_child_delivery(
+            &mut envelope,
+            &mut message,
+            &mut projection,
+            &completion,
+            0
+        ));
+        assert_eq!(projection["available"], false);
+        assert!(fits_child_result_budget(&envelope));
+        assert!(fits_child_result_budget(&message));
+        assert!(fits_child_result_budget(
+            &envelope.to_provider_message().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn typed_source_mutations_reject_before_admission_and_wait_clear() {
+        for mutation in ["birth", "assignment", "input", "result", "parent_source"] {
+            let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+            save_waiting_test_parent(
+                &store,
+                "typed-parent",
+                vec!["typed-child".into()],
+                ChildWaitPolicy::All,
+            )
+            .await;
+            let mut parent = store.load_session("typed-parent").await.unwrap().unwrap();
+            parent.add_message(Message::user("required source"));
+            store.save_session(&parent).await.unwrap();
+            let mut child =
+                typed_test_child(&parent, "typed-child", &typed_test_report().to_string());
+            store.save_session(&child).await.unwrap();
+            let mut completion = typed_test_completion(&child);
+            match mutation {
+                "birth" => {
+                    completion.source.as_mut().unwrap().child_created_at +=
+                        chrono::Duration::seconds(1)
+                }
+                "assignment" => {
+                    child.messages[0].content.push_str("changed assignment");
+                }
+                "input" => child.add_message(Message::user("new user input")),
+                "result" => child
+                    .messages
+                    .last_mut()
+                    .unwrap()
+                    .content
+                    .push_str("changed"),
+                _ => {
+                    parent.messages[0].content.push_str("changed");
+                    store.save_session(&parent).await.unwrap();
+                }
+            }
+            store.save_session(&child).await.unwrap();
+            coordinator.on_child_completed(completion).await;
+            assert_eq!(
+                inbox.inspect(&parent.id).await.unwrap().pending,
+                0,
+                "{mutation}"
+            );
+            assert_eq!(launches.load(Ordering::SeqCst), 0, "{mutation}");
+            assert!(
+                read_runtime_state(&store.load_session(&parent.id).await.unwrap().unwrap())
+                    .waiting_for_children
+                    .is_some(),
+                "{mutation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_cold_watchdog_and_terminal_siblings_admit_each_source_once() {
+        for case in [
+            "valid",
+            "prose",
+            "malformed",
+            "oversized",
+            "multipart",
+            "commentary",
+            "blank",
+            "old_final",
+            "error",
+            "absent",
+        ] {
+            for cold_watchdog in [false, true] {
+                let (_temp, store, inbox, coordinator, reservations, launches) =
+                    completion_inbox_fixture().await;
+                let ids = vec!["typed-a".into(), "typed-b".into()];
+                save_waiting_test_parent(&store, "typed-parent", ids.clone(), ChildWaitPolicy::All)
+                    .await;
+                let mut parent = store.load_session("typed-parent").await.unwrap().unwrap();
+                parent.add_message(Message::user("required source"));
+                store.save_session(&parent).await.unwrap();
+                let mut completions = Vec::new();
+                for id in &ids {
+                    let child = if case == "valid" {
+                        typed_test_child(&parent, id, &typed_test_report().to_string())
+                    } else {
+                        unusable_typed_test_child(&parent, id, case).0
+                    };
+                    store.save_session(&child).await.unwrap();
+                    completions.push(typed_test_completion(&child));
+                }
+                if cold_watchdog {
+                    // No callbacks or cached Session snapshots precede this disk-only sweep.
+                    let mut wait = read_runtime_state(&parent).waiting_for_children.unwrap();
+                    wait.registered_at = Utc::now() - chrono::Duration::seconds(61);
+                    coordinator.sweep_child_wait(&parent.id, wait.clone()).await;
+                    coordinator.sweep_child_wait(&parent.id, wait).await;
+                } else {
+                    // The terminal index is ahead of the second sibling's callback.
+                    coordinator.on_child_completed(completions[0].clone()).await;
+                }
+                for completion in completions {
+                    coordinator.on_child_completed(completion).await;
+                }
+                let claims = inbox.claim(&parent.id, 8).await.unwrap();
+                assert_eq!(claims.len(), 2);
+                assert_eq!(reservations.load(Ordering::SeqCst), 1);
+                assert_eq!(launches.load(Ordering::SeqCst), 1);
+                for claim in claims {
+                    assert!(fits_child_result_budget(&claim.envelope));
+                    assert!(fits_child_result_budget(
+                        &claim.envelope.to_provider_message().unwrap()
+                    ));
+                    let actual = claim.envelope.to_provider_message().unwrap();
+                    assert!(!actual.content.contains("UNUSABLE_RAW"));
+                    let SessionMessageBody::ChildOutcome(outcome) = claim.envelope.body else {
+                        panic!("child outcome");
+                    };
+                    let projection: serde_json::Value = serde_json::from_str(
+                        outcome
+                            .provider_message
+                            .as_ref()
+                            .unwrap()
+                            .content
+                            .text
+                            .split_once("Child typed result:\n")
+                            .unwrap()
+                            .1
+                            .lines()
+                            .next()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    if case != "valid" {
+                        let expected =
+                            unusable_typed_test_child(&parent, &outcome.child_session_id, case).1;
+                        assert_eq!(
+                            projection,
+                            unavailable_child_result("typed_result", expected)
+                        );
+                        assert!(outcome.result.is_none());
+                        assert!(outcome.error.is_none());
+                        assert!(fits_child_result_budget(&outcome.provider_message));
+                        continue;
+                    }
+                    assert_eq!(projection["child_report"], typed_test_report());
+                    assert_eq!(
+                        projection["host_observation"]["terminal_source"]["child_session_id"],
+                        outcome.child_session_id
+                    );
+                    assert_eq!(
+                        projection["host_observation"]["last_run_status"],
+                        "completed"
+                    );
+                    assert!(fits_child_result_budget(&outcome.provider_message));
+                }
+            }
+        }
+    }
+
     async fn completion_inbox_fixture() -> (
+        tempfile::TempDir,
+        Arc<bamboo_storage::SessionStoreV2>,
+        Arc<dyn SessionInboxPort>,
+        Arc<ChildCompletionCoordinator>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        completion_inbox_fixture_with_limits(bamboo_domain::SessionInboxLimits::default()).await
+    }
+
+    async fn completion_inbox_fixture_with_limits(
+        limits: bamboo_domain::SessionInboxLimits,
+    ) -> (
         tempfile::TempDir,
         Arc<bamboo_storage::SessionStoreV2>,
         Arc<dyn SessionInboxPort>,
@@ -2975,10 +4266,8 @@ mod tests {
         );
         let storage: Arc<dyn Storage> = store.clone();
         let locked = Arc::new(LockedSessionStore::new(storage.clone()));
-        let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
-            store.clone(),
-            bamboo_domain::SessionInboxLimits::default(),
-        ));
+        let inbox: Arc<dyn SessionInboxPort> =
+            Arc::new(bamboo_storage::FileSessionInbox::new(store.clone(), limits));
         let router = crate::SessionActivationRouter::new();
         let messenger = Arc::new(crate::SessionMessenger::new(
             storage.clone(),
@@ -3036,6 +4325,551 @@ mod tests {
             None,
         ));
         (temp, store, inbox, coordinator, reservations, launches)
+    }
+
+    async fn save_waiting_test_parent(
+        store: &bamboo_storage::SessionStoreV2,
+        parent_id: &str,
+        ids: Vec<String>,
+        policy: ChildWaitPolicy,
+    ) {
+        let mut parent = Session::new(parent_id, "model");
+        let mut runtime = AgentRuntimeState::new("waiting-run");
+        runtime.status = AgentStatusState::Suspended;
+        runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
+            ids,
+            policy,
+            Utc::now(),
+        ));
+        runtime.suspension = Some(SuspensionState {
+            reason: "waiting_for_children".into(),
+            suspended_at: Utc::now(),
+            resumable: true,
+            hook_point: Some("ChildCompletion".into()),
+        });
+        write_runtime_state(&mut parent, &runtime);
+        parent.metadata.insert(
+            "runtime.suspend_reason".into(),
+            "waiting_for_children".into(),
+        );
+        store.save_session(&parent).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_index_ahead_of_callbacks_preserves_every_waited_child_outcome() {
+        for partial_first in [false, true] {
+            let (_temp, store, inbox, coordinator, reservations, launches) =
+                completion_inbox_fixture().await;
+            let parent_id = "parallel-parent";
+            let ids: Vec<_> = (0..4)
+                .map(|slot| format!("parallel-child-{slot}"))
+                .collect();
+            save_waiting_test_parent(&store, parent_id, ids.clone(), ChildWaitPolicy::All).await;
+            for (slot, id) in ids.iter().enumerate() {
+                let mut child = Session::new_child(id, parent_id, "model", "Child");
+                child.add_message(Message::assistant(format!("result-{id}"), None));
+                child.set_last_run_status(if partial_first && slot > 0 {
+                    "running"
+                } else {
+                    "completed"
+                });
+                save_sourced_test_child(&store, &child).await;
+            }
+            let mut sources = HashMap::new();
+            for id in &ids {
+                sources.insert(id.clone(), test_child_source(&store, id).await);
+            }
+            let completion = |id: &str| ChildCompletion {
+                parent_session_id: parent_id.into(),
+                child_session_id: id.into(),
+                status: "completed".into(),
+                error: None,
+                completed_at: Utc::now(),
+                source: sources.get(id).cloned().flatten(),
+            };
+            if partial_first {
+                ChildCompletionHandler::on_child_completed(
+                    coordinator.as_ref(),
+                    completion(&ids[0]),
+                )
+                .await;
+                assert!(
+                    read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
+                        .waiting_for_children
+                        .is_some()
+                );
+                assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 1);
+                assert_eq!(launches.load(Ordering::SeqCst), 0);
+                for id in &ids[1..] {
+                    let mut child = store.load_session(id).await.unwrap().unwrap();
+                    child.set_last_run_status("completed");
+                    save_sourced_test_child(&store, &child).await;
+                }
+            }
+            // The index knows all four outcomes, but only one completion
+            // callback has reached the coordinator at this wake boundary.
+            for id in &ids {
+                sources.insert(id.clone(), test_child_source(&store, id).await);
+            }
+            let completion = |id: &str| ChildCompletion {
+                parent_session_id: parent_id.into(),
+                child_session_id: id.into(),
+                status: "completed".into(),
+                error: None,
+                completed_at: Utc::now(),
+                source: sources.get(id).cloned().flatten(),
+            };
+            ChildCompletionHandler::on_child_completed(coordinator.as_ref(), completion(&ids[1]))
+                .await;
+            assert!(
+                read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
+                    .waiting_for_children
+                    .is_none()
+            );
+            assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 4);
+            assert_eq!(reservations.load(Ordering::SeqCst), 1);
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+            for id in &ids {
+                ChildCompletionHandler::on_child_completed(coordinator.as_ref(), completion(id))
+                    .await;
+            }
+            let claims = inbox.claim(parent_id, 8).await.unwrap();
+            assert_eq!(claims.len(), 4, "late callbacks cannot duplicate outcomes");
+            assert_eq!(reservations.load(Ordering::SeqCst), 1);
+            for id in &ids {
+                let matching: Vec<_> = claims
+                    .iter()
+                    .filter_map(|claim| match &claim.envelope.body {
+                        SessionMessageBody::ChildOutcome(outcome)
+                            if &outcome.child_session_id == id =>
+                        {
+                            Some(outcome)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(matching.len(), 1);
+                assert_eq!(
+                    matching[0].result.as_deref(),
+                    Some(format!("result-{id}").as_str())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_a_callback_barrier_never_attributes_completed_b_to_a() {
+        for guardian in [false, true] {
+            let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+            let parent_id = "source-barrier-parent";
+            let child_id = "source-barrier-child";
+            save_waiting_test_parent(
+                &store,
+                parent_id,
+                vec![child_id.into()],
+                ChildWaitPolicy::All,
+            )
+            .await;
+            if guardian {
+                let mut parent = store.load_session(parent_id).await.unwrap().unwrap();
+                let mut state = crate::runtime::guardian_state::ensure_guardian_state(&parent);
+                state.record_spawn(child_id);
+                write_guardian_state(&mut parent, state);
+                store.save_session(&parent).await.unwrap();
+            }
+            let mut child = Session::new_child(child_id, parent_id, "model", "Child");
+            if guardian {
+                child
+                    .metadata
+                    .insert("subagent_type".into(), "guardian".into());
+            }
+            child.add_message(Message::user("assignment A"));
+            store.save_session(&child).await.unwrap();
+            let prior = child.messages.iter().map(|m| m.id.clone()).collect();
+            child.add_message(Message::assistant("answer A", None));
+            child.set_last_run_status("completed");
+            ChildCompletionSource::prepare(&mut child, "actual-run-A", &prior);
+            coordinator
+                .agent
+                .persistence()
+                .save_runtime_session(&mut child)
+                .await
+                .unwrap();
+            let completion_a = ChildCompletion {
+                parent_session_id: parent_id.into(),
+                child_session_id: child_id.into(),
+                status: "completed".into(),
+                error: None,
+                completed_at: Utc::now(),
+                source: ChildCompletionSource::after_final_save(&child, true),
+            };
+            assert_eq!(
+                completion_a.source.as_ref().unwrap().activation_run_id,
+                "actual-run-A"
+            );
+            // Pause the real callback boundary after A's canonical save. B can
+            // now finish on the same Child before A enters the coordinator.
+            let (release, barrier) = tokio::sync::oneshot::channel();
+            let target = coordinator.clone();
+            let callback = tokio::spawn(async move {
+                barrier.await.unwrap();
+                target.on_child_completed(completion_a).await;
+            });
+            let prior = child.messages.iter().map(|m| m.id.clone()).collect();
+            child.add_message(Message::user("assignment B"));
+            let answer_b = if guardian {
+                r#"{"approve":true,"summary":"B approved","findings":[]}"#
+            } else {
+                "answer B"
+            };
+            child.add_message(Message::assistant(answer_b, None));
+            child.set_last_run_status("completed");
+            ChildCompletionSource::prepare(&mut child, "actual-run-B", &prior);
+            coordinator
+                .agent
+                .persistence()
+                .save_runtime_session(&mut child)
+                .await
+                .unwrap();
+            release.send(()).unwrap();
+            callback.await.unwrap();
+            assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 0);
+            let parent = store.load_session(parent_id).await.unwrap().unwrap();
+            assert!(read_runtime_state(&parent).waiting_for_children.is_some());
+            assert_eq!(launches.load(Ordering::SeqCst), 0);
+            if guardian {
+                assert!(read_guardian_state(&parent).unwrap().phase.is_pending());
+            }
+
+            let completion_b = ChildCompletion {
+                parent_session_id: parent_id.into(),
+                child_session_id: child_id.into(),
+                status: "completed".into(),
+                error: None,
+                completed_at: Utc::now(),
+                source: ChildCompletionSource::after_final_save(&child, true),
+            };
+            coordinator.on_child_completed(completion_b.clone()).await;
+            coordinator.on_child_completed(completion_b).await;
+            let claims = inbox.claim(parent_id, 8).await.unwrap();
+            assert_eq!(
+                claims.len(),
+                1,
+                "B is admitted once with B's own provenance"
+            );
+            let SessionMessageBody::ChildOutcome(outcome) = &claims[0].envelope.body else {
+                panic!("expected ChildOutcome");
+            };
+            assert_eq!(outcome.result.as_deref(), Some(answer_b));
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_source_cannot_import_latest_guardian_approval() {
+        let (_temp, store, inbox, coordinator, _, _) = completion_inbox_fixture().await;
+        let parent_id = "unavailable-guardian-parent";
+        let child_id = "unavailable-guardian-child";
+        save_waiting_test_parent(
+            &store,
+            parent_id,
+            vec![child_id.into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let mut parent = store.load_session(parent_id).await.unwrap().unwrap();
+        let mut state = crate::runtime::guardian_state::ensure_guardian_state(&parent);
+        state.record_spawn(child_id);
+        write_guardian_state(&mut parent, state);
+        store.save_session(&parent).await.unwrap();
+        let mut child = Session::new_child(child_id, parent_id, "model", "Child");
+        child
+            .metadata
+            .insert("subagent_type".into(), "guardian".into());
+        child.add_message(Message::assistant(
+            r#"{"approve":true,"summary":"unbound latest","findings":[]}"#,
+            None,
+        ));
+        child.set_last_run_status("completed");
+        store.save_session(&child).await.unwrap();
+        coordinator
+            .on_child_completed(ChildCompletion {
+                parent_session_id: parent_id.into(),
+                child_session_id: child_id.into(),
+                status: "completed".into(),
+                error: None,
+                completed_at: Utc::now(),
+                source: None,
+            })
+            .await;
+        let parent = store.load_session(parent_id).await.unwrap().unwrap();
+        let state = read_guardian_state(&parent).unwrap();
+        assert!(state.phase.is_reviewed());
+        assert!(
+            !state.last_approved(),
+            "source-less latest approval is never authoritative"
+        );
+        let claims = inbox.claim(parent_id, 8).await.unwrap();
+        let SessionMessageBody::ChildOutcome(outcome) = &claims[0].envelope.body else {
+            panic!("expected ChildOutcome");
+        };
+        assert!(outcome.result.is_none());
+    }
+
+    #[tokio::test]
+    async fn lost_callback_replay_uses_the_committed_seal() {
+        for valid in [true, false] {
+            let (_temp, store, inbox, coordinator, _, _) = completion_inbox_fixture().await;
+            save_waiting_test_parent(
+                &store,
+                "replay-parent",
+                vec!["replay-child".into()],
+                ChildWaitPolicy::All,
+            )
+            .await;
+            let mut child = Session::new_child("replay-child", "replay-parent", "model", "Child");
+            child.add_message(Message::assistant("sealed replay result", None));
+            child.set_last_run_status("completed");
+            save_sourced_test_child(&store, &child).await;
+            if !valid {
+                let mut child = store.load_session("replay-child").await.unwrap().unwrap();
+                child.messages[0].content = "unsealed successor result".into();
+                store.save_session(&child).await.unwrap();
+            }
+            let parent = store.load_session("replay-parent").await.unwrap().unwrap();
+            let mut wait = read_runtime_state(&parent).waiting_for_children.unwrap();
+            wait.registered_at = Utc::now() - chrono::Duration::seconds(61);
+            coordinator.sweep_child_wait("replay-parent", wait).await;
+            let claims = inbox.claim("replay-parent", 1).await.unwrap();
+            if !valid {
+                assert!(claims.is_empty());
+                let parent = store.load_session("replay-parent").await.unwrap().unwrap();
+                assert!(read_runtime_state(&parent).waiting_for_children.is_some());
+                continue;
+            }
+            let SessionMessageBody::ChildOutcome(outcome) = &claims[0].envelope.body else {
+                panic!("expected ChildOutcome");
+            };
+            assert_eq!(outcome.result.as_deref(), Some("sealed replay result"));
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_admission_then_source_mutation_ignores_stale_retry() {
+        for parent_changed in [false, true] {
+            let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+            let parent_id = "partial-source-parent";
+            let child_id = "partial-source-child";
+            save_waiting_test_parent(
+                &store,
+                parent_id,
+                vec![child_id.into(), "still-running-child".into()],
+                ChildWaitPolicy::All,
+            )
+            .await;
+            let mut child = Session::new_child(child_id, parent_id, "model", "Child");
+            if parent_changed {
+                let mut parent = store.load_session(parent_id).await.unwrap().unwrap();
+                let mut source = Message::user("required parent constraint");
+                source.id = "parent-source".into();
+                parent.add_message(source);
+                store.save_session(&parent).await.unwrap();
+                let packet = bamboo_domain::ChildContextPacket {
+                    version: 1,
+                    objective: "task".into(),
+                    constraints: vec![],
+                    acceptance: vec!["source remains attributable".into()],
+                    non_goals: vec![],
+                    necessary_user_instructions: vec![],
+                    recorded_decisions: vec![],
+                    source_user_message_ids: vec!["parent-source".into()],
+                    background_message_ids: vec![],
+                };
+                let resolved = packet.resolve(&parent, "task").unwrap();
+                let binding = bamboo_domain::ChildContextBinding::new(
+                    &parent,
+                    child_id,
+                    resolved.required_brief.clone(),
+                    resolved,
+                )
+                .unwrap();
+                binding.install(&mut child).unwrap();
+                child.add_message(binding.assignment_message());
+            }
+            child.add_message(Message::assistant("original source", None));
+            child.set_last_run_status("completed");
+            save_sourced_test_child(&store, &child).await;
+            let completion = ChildCompletion {
+                parent_session_id: parent_id.into(),
+                child_session_id: child_id.into(),
+                status: "completed".into(),
+                error: None,
+                completed_at: Utc::now(),
+                source: test_child_source(&store, child_id).await,
+            };
+            coordinator.on_child_completed(completion.clone()).await;
+            assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 1);
+            if parent_changed {
+                let mut parent = store.load_session(parent_id).await.unwrap().unwrap();
+                parent.messages[0].content = "modified parent source".into();
+                store.save_session(&parent).await.unwrap();
+            } else {
+                child = store.load_session(child_id).await.unwrap().unwrap();
+                child.messages[0].content = "modified after admission".into();
+                store.save_session(&child).await.unwrap();
+            }
+            coordinator.on_child_completed(completion).await;
+            assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 1);
+            assert_eq!(launches.load(Ordering::SeqCst), 0);
+            assert!(
+                read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
+                    .waiting_for_children
+                    .is_some()
+            );
+            let mut sibling =
+                Session::new_child("still-running-child", parent_id, "model", "Child");
+            sibling.add_message(Message::assistant("sibling result", None));
+            sibling.set_last_run_status("completed");
+            save_sourced_test_child(&store, &sibling).await;
+            coordinator
+                .on_child_completed(ChildCompletion {
+                    parent_session_id: parent_id.into(),
+                    child_session_id: sibling.id.clone(),
+                    status: "completed".into(),
+                    error: None,
+                    completed_at: Utc::now(),
+                    source: test_child_source(&store, &sibling.id).await,
+                })
+                .await;
+            assert_eq!(
+                inbox.inspect(parent_id).await.unwrap().pending,
+                2,
+                "sibling completion cannot restage mutated A as a neutral outcome"
+            );
+            assert_eq!(launches.load(Ordering::SeqCst), 0);
+            assert!(
+                read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
+                    .waiting_for_children
+                    .is_some()
+            );
+            assert_eq!(
+                inbox.inspect(parent_id).await.unwrap().claimed,
+                0,
+                "partial outcomes remain inert until the wait is durably released"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn short_circuit_wait_stages_terminal_siblings_without_waiting_or_foreign_content() {
+        for policy in [ChildWaitPolicy::Any, ChildWaitPolicy::FirstError] {
+            let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+            let parent_id = "short-circuit-parent";
+            let ids = vec![
+                "failed-child".into(),
+                "done-child".into(),
+                "running-child".into(),
+                "foreign-child".into(),
+            ];
+            save_waiting_test_parent(&store, parent_id, ids, policy).await;
+            for (id, owner, status, result) in [
+                ("failed-child", parent_id, "error", "failed-owned-result"),
+                ("done-child", parent_id, "completed", "done-owned-result"),
+                ("running-child", parent_id, "running", "not-terminal"),
+                (
+                    "foreign-child",
+                    "another-parent",
+                    "completed",
+                    "foreign-secret",
+                ),
+            ] {
+                let mut child = Session::new_child(id, owner, "model", "Child");
+                child.add_message(Message::assistant(result, None));
+                child.set_last_run_status(status);
+                save_sourced_test_child(&store, &child).await;
+            }
+            ChildCompletionHandler::on_child_completed(
+                coordinator.as_ref(),
+                ChildCompletion {
+                    parent_session_id: parent_id.into(),
+                    child_session_id: "failed-child".into(),
+                    status: "error".into(),
+                    error: None,
+                    completed_at: Utc::now(),
+                    source: test_child_source(&store, "failed-child").await,
+                },
+            )
+            .await;
+            assert!(
+                read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
+                    .waiting_for_children
+                    .is_none()
+            );
+            let claims = inbox.claim(parent_id, 8).await.unwrap();
+            assert_eq!(claims.len(), 2);
+            let content = serde_json::to_string(
+                &claims
+                    .iter()
+                    .map(|claim| &claim.envelope)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            assert!(content.contains("done-owned-result"));
+            assert!(!content.contains("foreign-secret"));
+            assert!(!content.contains("not-terminal"));
+            assert_eq!(
+                store
+                    .load_session("running-child")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .last_run_status()
+                    .as_deref(),
+                Some("running")
+            );
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn sibling_admission_failure_keeps_wait_armed_without_activation() {
+        let limits = bamboo_domain::SessionInboxLimits {
+            max_backlog: 1,
+            ..Default::default()
+        };
+        let (_temp, store, inbox, coordinator, reservations, launches) =
+            completion_inbox_fixture_with_limits(limits).await;
+        let parent_id = "partial-stage-parent";
+        let ids = vec!["first-child".into(), "second-child".into()];
+        save_waiting_test_parent(&store, parent_id, ids, ChildWaitPolicy::All).await;
+        for id in ["first-child", "second-child"] {
+            let mut child = Session::new_child(id, parent_id, "model", "Child");
+            child.add_message(Message::assistant(format!("result-{id}"), None));
+            child.set_last_run_status("completed");
+            save_sourced_test_child(&store, &child).await;
+        }
+        ChildCompletionHandler::on_child_completed(
+            coordinator.as_ref(),
+            ChildCompletion {
+                parent_session_id: parent_id.into(),
+                child_session_id: "first-child".into(),
+                status: "completed".into(),
+                error: None,
+                completed_at: Utc::now(),
+                source: test_child_source(&store, "first-child").await,
+            },
+        )
+        .await;
+        let durable = store.load_session(parent_id).await.unwrap().unwrap();
+        assert!(read_runtime_state(&durable).waiting_for_children.is_some());
+        assert_eq!(
+            read_runtime_state(&durable).status,
+            AgentStatusState::Suspended
+        );
+        assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 1);
+        assert!(!inbox.inspect(parent_id).await.unwrap().activation_pending());
+        assert_eq!(reservations.load(Ordering::SeqCst), 0);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -3155,6 +4989,42 @@ mod tests {
         assert!(lease.content.contains("c-1"));
     }
 
+    #[test]
+    fn runtime_child_guidance_uses_compact_inspection_calls() {
+        let completion = make_completion("completed");
+        let child_inspection = serde_json::json!({
+            "intent": "inspect", "target": "child-1", "message": "messages",
+        })
+        .to_string();
+        let tree_inspection =
+            serde_json::json!({"intent": "inspect", "message": "tree"}).to_string();
+        for (message, expected_call) in [
+            (
+                runtime_resume_message(&completion, 0, Some("evidence")),
+                &child_inspection,
+            ),
+            (
+                guardian_resume_message(&completion, &GuardianVerdict::approved()),
+                &child_inspection,
+            ),
+            (empty_child_wait_message(), &tree_inspection),
+            (
+                child_wait_lease_expired_message(&["child-1".to_string()]),
+                &tree_inspection,
+            ),
+        ] {
+            assert!(message.content.contains(expected_call));
+            for legacy in [
+                "SubAgent.get",
+                "SubAgent.list",
+                "SubAgent.wait",
+                "child_session_id=",
+            ] {
+                assert!(!message.content.contains(legacy), "stale hint: {legacy}");
+            }
+        }
+    }
+
     // ── on_child_completed terminality guard (issue #546) ────────────────
 
     #[test]
@@ -3173,6 +5043,7 @@ mod tests {
             status: status.to_string(),
             error: None,
             completed_at: Utc::now(),
+            source: None,
         }
     }
 
@@ -3197,7 +5068,10 @@ mod tests {
         };
         let stored = outcome.result.as_deref().unwrap();
         assert!(stored.contains("sha256="));
-        assert!(stored.contains("SubAgent.get"));
+        assert!(stored.contains("\"intent\":\"inspect\""));
+        assert!(stored.contains("\"target\":\"child-1\""));
+        assert!(stored.contains("\"message\":\"result\""));
+        assert!(!stored.contains("SubAgent.get"));
         assert!(stored.len() < CHILD_COMPLETION_INLINE_FIELD_BYTES);
 
         // Retry-only completion timestamps and provider presentation do not
@@ -3218,6 +5092,262 @@ mod tests {
             &runtime_resume_message(&completion, 0, Some(&changed)),
         );
         assert_ne!(corrected.id, first.id);
+    }
+
+    #[test]
+    fn oversized_child_error_points_to_bounded_error_view() {
+        let mut completion = make_completion("error");
+        completion.error = Some("失败🙂".repeat(30_000));
+        let presentation = runtime_resume_message(&completion, 0, None);
+        let envelope = child_completion_envelope(&completion, Utc::now(), None, &presentation);
+        assert!(
+            serde_json::to_vec(&envelope).unwrap().len()
+                < bamboo_domain::SessionInboxLimits::default().max_payload_bytes
+        );
+        let SessionMessageBody::ChildOutcome(outcome) = &envelope.body else {
+            panic!("typed child outcome");
+        };
+        let stored = outcome.error.as_deref().expect("bounded error");
+        assert!(stored.contains(r#""message":"diagnostics""#));
+        assert!(stored.contains("authenticated inspector"));
+        assert!(!stored.contains("bounded slices"));
+        assert!(!stored.contains("cursors"));
+        assert!(stored.len() < CHILD_COMPLETION_INLINE_FIELD_BYTES);
+        let metadata_error = outcome
+            .provider_message
+            .as_ref()
+            .and_then(|provider| provider.metadata.get("child_error"))
+            .and_then(serde_json::Value::as_str)
+            .expect("bounded metadata error");
+        assert_eq!(metadata_error, stored);
+        assert!(!metadata_error.contains(&"失败🙂".repeat(30_000)));
+    }
+
+    #[test]
+    fn escaped_and_mixed_child_fields_fit_the_serialized_inbox_budget() {
+        let mut completion = make_completion("error");
+        completion.error = Some("\u{0001}".repeat(CHILD_COMPLETION_INLINE_FIELD_BYTES));
+        let result = "\n".repeat(CHILD_COMPLETION_INLINE_FIELD_BYTES);
+        let wait_registered_at = Utc::now();
+        let presentation = runtime_resume_message(&completion, 0, Some(&result));
+        let envelope = child_completion_envelope(
+            &completion,
+            wait_registered_at,
+            Some(result.clone()),
+            &presentation,
+        );
+        assert!(
+            serde_json::to_vec(&envelope).unwrap().len()
+                < bamboo_domain::SessionInboxLimits::default().max_payload_bytes
+        );
+        let SessionMessageBody::ChildOutcome(outcome) = &envelope.body else {
+            panic!("typed child outcome");
+        };
+        let error = outcome.error.as_deref().unwrap();
+        let stored_result = outcome.result.as_deref().unwrap();
+        assert!(error.contains(r#""message":"diagnostics""#));
+        assert!(stored_result.contains(r#""message":"result""#));
+        assert!(!error.contains("Bounded tail"));
+        assert!(!stored_result.contains("Bounded tail"));
+        assert_eq!(
+            outcome
+                .provider_message
+                .as_ref()
+                .and_then(|provider| provider.metadata.get("child_error"))
+                .and_then(serde_json::Value::as_str),
+            Some(error)
+        );
+        let retry = child_completion_envelope(
+            &completion,
+            wait_registered_at,
+            Some(result),
+            &runtime_resume_message(&completion, 8, None),
+        );
+        assert_eq!(envelope.id, retry.id);
+    }
+
+    #[test]
+    fn compact_guardian_outcome_keeps_rejected_verdict_and_result_retrieval() {
+        let completion = make_completion("completed");
+        let result = format!(
+            "{}{{\"approve\":false,\"findings\":[\"needs fix\"]}}",
+            "\u{0001}".repeat(CHILD_COMPLETION_INLINE_FIELD_BYTES - 80)
+        );
+        assert!(result.len() <= CHILD_COMPLETION_INLINE_FIELD_BYTES);
+        let verdict = parse_guardian_verdict(&result).expect("trailing guardian verdict");
+        let presentation = guardian_resume_message(&completion, &verdict);
+        assert!(
+            serde_json::to_vec(&presentation).unwrap().len() <= CHILD_COMPLETION_INLINE_FIELD_BYTES,
+            "the original guardian presentation must fit the inline cap"
+        );
+        let wait_registered_at = Utc::now();
+        let expanded = build_child_completion_envelope(
+            &completion,
+            wait_registered_at,
+            Some(&result),
+            &presentation,
+            false,
+        );
+        assert!(
+            serde_json::to_vec(&expanded).unwrap().len()
+                > bamboo_domain::SessionInboxLimits::default().max_payload_bytes,
+            "JSON escaping must trigger the compact fallback"
+        );
+
+        let envelope =
+            child_completion_envelope(&completion, wait_registered_at, Some(result), &presentation);
+        assert!(
+            serde_json::to_vec(&envelope).unwrap().len()
+                <= bamboo_domain::SessionInboxLimits::default().max_payload_bytes
+        );
+        let SessionMessageBody::ChildOutcome(outcome) = &envelope.body else {
+            panic!("typed child outcome");
+        };
+        let provider = outcome.provider_message.as_ref().unwrap();
+        assert!(provider.content.text.contains("Guardian review REJECTED"));
+        assert!(provider.content.text.contains(r#""message":"result""#));
+        assert_eq!(
+            provider.metadata.get("guardian_approved"),
+            Some(&serde_json::json!(false))
+        );
+        assert!(envelope
+            .to_provider_message()
+            .unwrap()
+            .content
+            .contains("Guardian review REJECTED"));
+    }
+
+    #[tokio::test]
+    async fn oversized_multibyte_child_error_is_durable_and_replayable() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let parent_id = "large-error-parent";
+        store
+            .save_session(&Session::new(parent_id, "model"))
+            .await
+            .unwrap();
+        let inbox = bamboo_storage::FileSessionInbox::new(
+            store.clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        );
+        let mut completion = make_completion("error");
+        completion.parent_session_id = parent_id.to_string();
+        completion.error = Some("失败🙂".repeat(30_000));
+        let presentation = runtime_resume_message(&completion, 0, None);
+        let envelope = child_completion_envelope(&completion, Utc::now(), None, &presentation);
+        inbox.deliver(&envelope).await.unwrap();
+        completion.child_session_id = "escaped-error-child".to_string();
+        completion.error = Some("\u{0001}".repeat(CHILD_COMPLETION_INLINE_FIELD_BYTES));
+        let result = "\n".repeat(CHILD_COMPLETION_INLINE_FIELD_BYTES);
+        let mixed = child_completion_envelope(
+            &completion,
+            Utc::now(),
+            Some(result.clone()),
+            &runtime_resume_message(&completion, 0, Some(&result)),
+        );
+        let receipt = inbox.deliver(&mixed).await.unwrap();
+        inbox
+            .mark_activation_eligible(
+                parent_id,
+                receipt.generation,
+                bamboo_domain::SessionActivationPolicy::RespectSpecificWait,
+            )
+            .await
+            .unwrap();
+        drop(inbox);
+        drop(store);
+
+        let reopened_store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let reopened = bamboo_storage::FileSessionInbox::new(
+            reopened_store,
+            bamboo_domain::SessionInboxLimits::default(),
+        );
+        let claims = reopened.claim(parent_id, 2).await.unwrap();
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0].envelope.id, envelope.id);
+        assert_eq!(claims[1].envelope.id, mixed.id);
+        for claim in claims {
+            assert!(
+                serde_json::to_vec(&claim.envelope).unwrap().len()
+                    < bamboo_domain::SessionInboxLimits::default().max_payload_bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_child_wait_sidecar_save_keeps_cache_wait_and_transcript() {
+        let (_temp, store, inbox, mut coordinator, reservations, launches) =
+            completion_inbox_fixture().await;
+        let parent_id = "failed-sidecar-parent";
+        let child_id = "failed-sidecar-child";
+        let now = Utc::now();
+        let mut parent = Session::new(parent_id, "model");
+        parent.add_message(Message::user("durable root turn"));
+        let mut runtime = AgentRuntimeState::new("waiting-run");
+        runtime.status = AgentStatusState::Suspended;
+        runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
+            vec![child_id.to_string()],
+            ChildWaitPolicy::All,
+            now,
+        ));
+        write_runtime_state(&mut parent, &runtime);
+        parent.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+        store.save_session(&parent).await.unwrap();
+        let mut cached = parent.clone();
+        cached.add_message(Message::assistant("newer cached root turn", None));
+        coordinator.sessions.insert(
+            parent_id.to_string(),
+            Arc::new(crate::SessionSnapshot::new(cached)),
+        );
+
+        let mut child = Session::new_child(child_id, parent_id, "model", "Child");
+        child.set_last_run_status("completed");
+        save_sourced_test_child(&store, &child).await;
+        Arc::get_mut(&mut coordinator).unwrap().persistence = Arc::new(LockedSessionStore::new(
+            Arc::new(FailingRuntimeSaveStorage {
+                inner: store.clone(),
+            }),
+        ));
+
+        ChildCompletionHandler::on_child_completed(
+            coordinator.as_ref(),
+            ChildCompletion {
+                parent_session_id: parent_id.to_string(),
+                child_session_id: child_id.to_string(),
+                status: "completed".to_string(),
+                error: None,
+                completed_at: Utc::now(),
+                source: None,
+            },
+        )
+        .await;
+
+        let durable = store.load_session(parent_id).await.unwrap().unwrap();
+        assert!(read_runtime_state(&durable).waiting_for_children.is_some());
+        assert_eq!(durable.messages.len(), 1);
+        assert_eq!(durable.messages[0].content, "durable root turn");
+        let cached = coordinator.sessions.get(parent_id).unwrap();
+        let cached = cached.value().read();
+        assert!(read_runtime_state(&cached).waiting_for_children.is_some());
+        assert!(cached
+            .messages
+            .iter()
+            .any(|message| message.content == "newer cached root turn"));
+        let backlog = inbox.inspect(parent_id).await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 1);
+        assert_eq!(reservations.load(Ordering::SeqCst), 0);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -3247,17 +5377,27 @@ mod tests {
             "waiting_for_children".to_string(),
         );
         store.save_session(&parent).await.unwrap();
+        // The running Root can have a newer in-memory transcript while this
+        // coordinator reads the durable wait. Publishing the control-plane
+        // transition must not replace that transcript with the stale load.
+        let mut cached_parent = parent.clone();
+        cached_parent.add_message(Message::assistant("concurrent root turn", None));
+        coordinator.sessions.insert(
+            parent_id.to_string(),
+            Arc::new(crate::SessionSnapshot::new(cached_parent)),
+        );
 
         let mut child = Session::new_child(child_id, parent_id, "model", "Child");
         child.add_message(Message::assistant("z".repeat(300 * 1024), None));
         child.set_last_run_status("completed");
-        store.save_session(&child).await.unwrap();
+        save_sourced_test_child(&store, &child).await;
         let completion = ChildCompletion {
             parent_session_id: parent_id.to_string(),
             child_session_id: child_id.to_string(),
             status: "completed".to_string(),
             error: None,
             completed_at: Utc::now(),
+            source: test_child_source(&store, child_id).await,
         };
 
         ChildCompletionHandler::on_child_completed(coordinator.as_ref(), completion.clone()).await;
@@ -3268,6 +5408,15 @@ mod tests {
         assert!(!durable_parent
             .metadata
             .contains_key("runtime.suspend_reason"));
+        let cached_parent = coordinator.sessions.get(parent_id).unwrap();
+        let cached_parent = cached_parent.value().read();
+        assert!(cached_parent
+            .messages
+            .iter()
+            .any(|message| message.content == "concurrent root turn"));
+        assert!(read_runtime_state(&cached_parent)
+            .waiting_for_children
+            .is_none());
         let backlog = inbox.inspect(parent_id).await.unwrap();
         assert_eq!(backlog.pending + backlog.claimed, 1);
         assert!(backlog.activation_pending());
@@ -3285,6 +5434,45 @@ mod tests {
         assert_eq!(reservations.load(Ordering::SeqCst), 1);
         assert_eq!(launches.load(Ordering::SeqCst), 1);
         assert_eq!(inbox.inspect(parent_id).await.unwrap().claimed, 1);
+    }
+
+    #[tokio::test]
+    async fn completion_before_parent_wait_does_not_checkpoint_stale_root() {
+        let (_temp, store, inbox, coordinator, reservations, launches) =
+            completion_inbox_fixture().await;
+        let parent_id = "parent-without-wait";
+        let child_id = "already-finished-child";
+        let mut parent = Session::new(parent_id, "model");
+        parent.add_message(Message::assistant("root is still reasoning", None));
+        store.save_session(&parent).await.unwrap();
+        let before = store.load_session(parent_id).await.unwrap().unwrap();
+
+        let mut child = Session::new_child(child_id, parent_id, "model", "Child");
+        child.set_last_run_status("completed");
+        save_sourced_test_child(&store, &child).await;
+        ChildCompletionHandler::on_child_completed(
+            coordinator.as_ref(),
+            ChildCompletion {
+                parent_session_id: parent_id.to_string(),
+                child_session_id: child_id.to_string(),
+                status: "completed".to_string(),
+                error: None,
+                completed_at: Utc::now(),
+                source: None,
+            },
+        )
+        .await;
+
+        let after = store.load_session(parent_id).await.unwrap().unwrap();
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(
+            serde_json::to_value(&after.messages).unwrap(),
+            serde_json::to_value(&before.messages).unwrap()
+        );
+        assert!(read_runtime_state(&after).waiting_for_children.is_none());
+        assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 0);
+        assert_eq!(reservations.load(Ordering::SeqCst), 0);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -3373,6 +5561,7 @@ mod tests {
             status: "completed".to_string(),
             error: None,
             completed_at: Utc::now(),
+            source: None,
         };
         let child_resume = runtime_resume_message(&completion, 1, Some("first child"));
         inbox

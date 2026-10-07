@@ -41,6 +41,85 @@ fn timeout_context(
     .allow_turn_retry_before_semantic_output()
 }
 
+#[derive(Clone, Default)]
+struct FinalizerWarnings {
+    events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[derive(Default)]
+struct WarningFields(String);
+
+impl tracing::field::Visit for WarningFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!("{}={value:?} ", field.name()));
+    }
+}
+
+impl tracing::Subscriber for FinalizerWarnings {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut fields = WarningFields::default();
+            event.record(&mut fields);
+            self.events.lock().unwrap().push(fields.0);
+        }
+    }
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn finalized_browser_arguments_hide_private_invalid_json_in_logs() {
+    let private_args = r#"{"code":"private-page-source","expected_url":"https://example.test/?token=private-query""#;
+    for name in [
+        "browser_eval",
+        "default::browser_eval",
+        "browser",
+        "default::browser",
+    ] {
+        let stream = build_stream(vec![
+            Ok(LLMChunk::ToolCalls(vec![ToolCall {
+                id: "call_private".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: private_args.to_string(),
+                },
+            }])),
+            Ok(LLMChunk::Done),
+        ]);
+        let (event_tx, _) = mpsc::channel::<AgentEvent>(8);
+        let warnings = FinalizerWarnings::default();
+        let recorded = warnings.events.clone();
+        let output = {
+            let _guard = tracing::subscriber::set_default(warnings);
+            consume_llm_stream(
+                stream,
+                &event_tx,
+                &CancellationToken::new(),
+                "private-finalizer-test",
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(output.tool_calls[0].function.arguments, private_args);
+        let text = recorded.lock().unwrap().join("\n");
+        assert!(
+            text.contains("args_preview=") && text.contains("[redacted]"),
+            "{name}: {text}"
+        );
+        assert!(!text.contains("private-page-source"), "{name}: {text}");
+        assert!(!text.contains("private-query"), "{name}: {text}");
+    }
+}
+
 #[tokio::test]
 async fn consume_llm_stream_accumulates_tokens_and_tool_calls() {
     let stream = build_stream(vec![
@@ -82,8 +161,85 @@ async fn consume_llm_stream_accumulates_tokens_and_tool_calls() {
     let reasoning_event = event_rx.recv().await.expect("missing reasoning event");
     assert!(matches!(reasoning_event, AgentEvent::ReasoningToken { .. }));
 
+    let start_event = event_rx
+        .recv()
+        .await
+        .expect("missing visible-message start");
+    let identity = output
+        .visible_message
+        .as_ref()
+        .expect("visible token must create a stable identity");
+    assert!(matches!(
+        start_event,
+        AgentEvent::VisibleMessageStart {
+            message_id,
+            created_at,
+        } if message_id == identity.message_id && created_at == identity.created_at
+    ));
+
     let token_event = event_rx.recv().await.expect("missing token event");
-    assert!(matches!(token_event, AgentEvent::Token { .. }));
+    assert!(matches!(token_event, AgentEvent::Token { content } if content == "hi"));
+    assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[tokio::test]
+async fn visible_message_start_is_emitted_once_before_multiple_tokens() {
+    let stream = build_stream(vec![
+        Ok(LLMChunk::Token("hello".to_string())),
+        Ok(LLMChunk::Token(" world".to_string())),
+        Ok(LLMChunk::Done),
+    ]);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
+
+    let output = consume_llm_stream(
+        stream,
+        &event_tx,
+        &CancellationToken::new(),
+        "session-visible-identity",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.content, "hello world");
+    assert!(output.visible_message.is_some());
+    assert!(matches!(
+        event_rx.recv().await,
+        Some(AgentEvent::VisibleMessageStart { .. })
+    ));
+    assert!(matches!(
+        event_rx.recv().await,
+        Some(AgentEvent::Token { content }) if content == "hello"
+    ));
+    assert!(matches!(
+        event_rx.recv().await,
+        Some(AgentEvent::Token { content }) if content == " world"
+    ));
+    assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[tokio::test]
+async fn reasoning_only_stream_has_no_visible_message_identity() {
+    let stream = build_stream(vec![
+        Ok(LLMChunk::ReasoningToken("private".to_string())),
+        Ok(LLMChunk::Done),
+    ]);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
+
+    let output = consume_llm_stream(
+        stream,
+        &event_tx,
+        &CancellationToken::new(),
+        "session-reasoning-only",
+    )
+    .await
+    .unwrap();
+
+    assert!(output.visible_message.is_none());
+    assert!(matches!(
+        event_rx.recv().await,
+        Some(AgentEvent::ReasoningToken { content }) if content == "private"
+    ));
+    assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
 }
 
 #[tokio::test]
@@ -117,6 +273,12 @@ async fn provider_native_sideband_is_accumulated_without_emitting_ui_events() {
 
     assert_eq!(output.provider_transcript_items, vec![item]);
     assert_eq!(output.content, "visible");
+    let identity = output.visible_message.expect("visible identity");
+    assert!(matches!(
+        event_rx.recv().await,
+        Some(AgentEvent::VisibleMessageStart { message_id, created_at })
+            if message_id == identity.message_id && created_at == identity.created_at
+    ));
     assert!(matches!(
         event_rx.recv().await,
         Some(AgentEvent::Token { content }) if content == "visible"
@@ -711,6 +873,54 @@ async fn stalled_stream_bootstrap_times_out_before_response_headers() {
     assert!(message.contains("last_transport_ms_ago=2000"));
     assert!(message.contains("last_semantic_ms_ago=never"));
     assert!(message.contains("retry_safe=true"));
+    assert!(timeout.last_http_retry().is_none());
+}
+
+#[tokio::test]
+async fn rate_limited_bootstrap_timeout_keeps_the_observed_http_status() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "2")
+                .set_body_string("private provider response body"),
+        )
+        .mount(&server)
+        .await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/responses", server.uri());
+    let retry_config = bamboo_llm::retry::RetryConfig {
+        max_attempts: 2,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+    };
+    let context = timeout_context(1, 20, 20).begin_request();
+
+    let result = await_stream_bootstrap(
+        bamboo_llm::retry::send_with_retry(&retry_config, "test", || client.post(&url)),
+        &CancellationToken::new(),
+        "session-rate-limited-bootstrap",
+        &context,
+    )
+    .await;
+
+    let timeout = match result {
+        Err(AgentError::StreamTimeout(timeout)) => timeout,
+        Err(other) => panic!("expected bootstrap StreamTimeout, got {other:?}"),
+        Ok(_) => panic!("expected bootstrap StreamTimeout, got success"),
+    };
+    assert_eq!(timeout.phase(), StreamTimeoutPhase::Bootstrap);
+    assert!(timeout.retry_safe());
+    assert_eq!(
+        timeout.last_http_retry(),
+        Some((429, Duration::from_secs(2)))
+    );
+    let message = timeout.to_string();
+    assert!(message.contains("last_http_status=429, retry_delay_ms=2000"));
+    assert!(!message.contains("private provider response body"));
 }
 
 #[tokio::test(start_paused = true)]

@@ -116,7 +116,7 @@ async fn workflow_catalog_unifies_metadata_without_exposing_bodies_or_paths() {
     tokio::fs::write(
         skill.join("SKILL.md"),
         format!(
-            "---\nname: review\ndescription: changed too early\n{PRIVATE_INVALID_FIELD}: secret\n---\n{PRIVATE_INVALID_BODY}\n"
+            "---\nname: review\ndescription: changed too early\n{PRIVATE_INVALID_FIELD}: secret\nallowed-tools: [\n---\n{PRIVATE_INVALID_BODY}\n"
         ),
     )
     .await

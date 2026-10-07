@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bamboo_agent_core::tools::{Tool, ToolExecutionContext};
+use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext};
 use bamboo_broker::{ask_agent, BrokerCore, BrokerServer};
 use bamboo_server_tools::DeployAgentTool;
 use bamboo_subagent::{AgentRef, AskMode};
@@ -112,4 +112,69 @@ async fn agent_deploys_a_worker_then_asks_lists_and_stops_it() {
         .expect("stop succeeds");
     let v: serde_json::Value = serde_json::from_str(&r.result).unwrap();
     assert_eq!(v["status"], "stopped");
+}
+
+/// A host-bound deploy without a canonical Child port must not publish a
+/// broker-private worker or leave a Child after the rejected launch.
+#[tokio::test]
+async fn host_bound_deploy_fails_before_publishing_actor_or_worker() {
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_domain::Session;
+    use bamboo_server_tools::AskAgentTool;
+    use bamboo_storage::SessionStoreV2;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("host");
+    let store = Arc::new(SessionStoreV2::new(home.clone()).await.unwrap());
+    store
+        .save_session(&Session::new("root", "echo-model"))
+        .await
+        .unwrap();
+    let registry = Arc::new(Mutex::new(HashMap::new()));
+    let tool = DeployAgentTool::new(
+        "ws://127.0.0.1:1",
+        TOKEN,
+        dir.path().join("no-worker-binary"),
+        registry.clone(),
+        Arc::new(tokio::sync::RwLock::new(bamboo_config::Config::default())),
+    )
+    .with_actor_store(store.clone());
+    let error = tool
+        .invoke(
+            serde_json::json!({"action":"deploy", "id":"resident-alias", "echo":true}),
+            ctx().to_tool_ctx(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            ToolError::Execution(message) if message == "canonical Child creation is unavailable"
+        ),
+        "unexpected deploy error: {error}"
+    );
+    assert!(registry.lock().await.is_empty());
+    let children = store.sessions_root_dir().join("root").join("children");
+    assert!(!children.exists() || std::fs::read_dir(children).unwrap().next().is_none());
+    let listed = tool
+        .invoke(serde_json::json!({"action":"list"}), ctx().to_tool_ctx())
+        .await
+        .unwrap()
+        .into_tool_result();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&listed.result).unwrap()["agents"],
+        serde_json::json!([])
+    );
+
+    let ask = AskAgentTool::new("ws://127.0.0.1:1", TOKEN).with_deployments(registry, store);
+    let error = ask
+        .invoke(
+            serde_json::json!({"target":"resident-alias", "question":"status"}),
+            ctx().to_tool_ctx(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not a live deployment"));
+    let reopened = SessionStoreV2::new(home).await.unwrap();
+    assert_eq!(reopened.list_index_entries().await.len(), 1);
 }

@@ -10,9 +10,9 @@ use bamboo_agent_core::{AgentEvent, Message, Role};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::{
-    create_event_forwarder_with_history_commit_barrier, get_or_create_event_sender,
-    reserve_session_execution, spawn_session_execution, AgentRunner, SessionCompletionHook,
-    SessionExecutionArgs, SessionExecutionReserveOutcome,
+    create_event_forwarder_with_root_actor, get_or_create_event_sender, reserve_session_execution,
+    spawn_session_execution, AgentRunner, SessionCompletionHook, SessionExecutionArgs,
+    SessionExecutionReserveOutcome,
 };
 use bamboo_engine::{AuxiliaryModelConfig, ModelRoster};
 use bamboo_storage::LockedSessionStore;
@@ -64,6 +64,7 @@ pub struct ScheduleContext {
     pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     /// Optional inbox to the account-wide change feed (durable multi-client sync).
     pub account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
+    pub root_account_sink: Option<Arc<bamboo_engine::events::AccountEventSink>>,
     pub app_data_dir: Option<std::path::PathBuf>,
     pub trigger_engine: DynTriggerEngine,
     /// Authoritative Project registry, rechecked when each persisted job fires.
@@ -502,7 +503,7 @@ async fn run_schedule_job(
 
     // Reserve the shared runner and router before publishing any relay or
     // execution-specific state.
-    let execution_reservation = match reserve_session_execution(
+    let mut execution_reservation = match reserve_session_execution(
         &ctx.agent,
         &ctx.agent_runners,
         &ctx.session_event_senders,
@@ -518,6 +519,31 @@ async fn run_schedule_job(
             ));
         }
     };
+    if ctx
+        .agent
+        .persistence()
+        .root_actor_execution_required(&session)
+        && ctx.root_account_sink.is_none()
+    {
+        execution_reservation.abandon().await;
+        return Err("Root schedule execution requires its Host account sink".into());
+    }
+    if let Err(error) = execution_reservation
+        .bind_root_actor(&ctx.agent, &session)
+        .await
+    {
+        execution_reservation.abandon().await;
+        return Err(format!("Root schedule execution binding failed: {error}"));
+    }
+    let root_publication = execution_reservation.root_actor_writer().map(|owner| {
+        bamboo_engine::events::RootActorEventPublication::new(
+            ctx.persistence.storage().clone(),
+            ctx.root_account_sink
+                .clone()
+                .expect("required Root sink checked before binding"),
+            owner,
+        )
+    });
 
     // Always-on relay (the critical gap this closes): a scheduled/headless
     // run has no SSE/WS client subscribed at start — often ever — so nothing
@@ -532,12 +558,13 @@ async fn run_schedule_job(
     );
 
     let (mpsc_tx, _forwarder_handle, history_commit_barrier) =
-        create_event_forwarder_with_history_commit_barrier(
+        create_event_forwarder_with_root_actor(
             session_id.clone(),
             execution_reservation.run_id().to_string(),
             session_tx.clone(),
             ctx.agent_runners.clone(),
             ctx.account_feed_inbox.clone(),
+            root_publication,
         );
 
     // Run the agent loop in the background via the single canonical execution
@@ -755,6 +782,7 @@ pub fn build_schedule_context(
         agent_runners: base.agent_runners,
         session_event_senders: base.session_event_senders,
         account_feed_inbox: base.account_feed_inbox,
+        root_account_sink: base.root_account_sink,
         app_data_dir: base.app_data_dir,
         trigger_engine: base.trigger_engine,
         project_store: base.project_store,

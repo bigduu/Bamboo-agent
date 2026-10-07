@@ -681,4 +681,113 @@ mod tests {
         assert!(!retry.changed);
         assert_eq!(session.model_context_state.as_ref(), Some(&before));
     }
+
+    #[tokio::test]
+    async fn actor_existing_ledger_accepts_actual_reconcile_and_cold_reopen_without_context_grant()
+    {
+        use bamboo_agent_core::Storage;
+        use bamboo_domain::{ActorActivationClaim, ActorDirectoryPort};
+        use bamboo_storage::{
+            ActorModelContextCheckpoint, ActorModelContextOutcome, SessionStoreV2,
+        };
+        use chrono::{Duration, Utc};
+        for child in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let first = SessionStoreV2::new(home.path().into()).await.unwrap();
+            let root = Session::new(if child { "parent" } else { "ledger-actor" }, "model");
+            if child {
+                first.save_session(&root).await.unwrap();
+            }
+            let mut seed = if child {
+                Session::new_child_of("ledger-actor", &root, "model", "child")
+            } else {
+                root
+            };
+            seed.messages = vec![Message::user("stable prepared user 🪷")];
+            seed.activate_provider_transcript_route(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                &"a".repeat(64),
+            )
+            .unwrap();
+            let transcript = seed.messages.clone();
+            let scope = "c".repeat(64); // Test-only established scope, not provider configuration proof.
+            let mut workspace = block("workspace");
+            workspace.block_type = ContextBlockType::Workspace;
+            let initial = reconcile_model_context(
+                &mut seed,
+                vec![workspace.clone(), block("v1")],
+                &transcript,
+                scope.clone(),
+                false,
+            );
+            assert!(initial.changed);
+            first.save_session(&seed).await.unwrap(); // Cold initialization precedes activation.
+            let fence = first
+                .claim_activation(&ActorActivationClaim {
+                    actor_id: seed.id.clone(),
+                    run_id: "run".into(),
+                    lease_owner: "host".into(),
+                    lease_expires_at: Utc::now() + Duration::minutes(5),
+                    inbox_generation: 1,
+                    placement_ref: None,
+                    now: Utc::now(),
+                })
+                .await
+                .unwrap()
+                .fence();
+            first.start_activation(&fence, Utc::now()).await.unwrap();
+            let second = SessionStoreV2::new(home.path().into()).await.unwrap();
+            for (blocks, witnesses) in [
+                (vec![workspace.clone(), block("v2")], vec![block("v2")]),
+                (vec![workspace.clone()], vec![]),
+                (vec![block("v3")], vec![block("v3")]), // Removal + resurrection in existing Ord.
+                (vec![block("v3")], vec![]), // No semantic change -> Already, no witnesses.
+            ] {
+                let expected = second.load_session(&seed.id).await.unwrap().unwrap();
+                let mut generated = expected.clone();
+                let outcome = reconcile_model_context(
+                    &mut generated,
+                    blocks,
+                    &transcript,
+                    scope.clone(),
+                    false,
+                );
+                assert_eq!(outcome.prefix_epoch, 0);
+                assert!(outcome.reset_reason.is_none());
+                let candidate = generated.model_context_state.clone().unwrap();
+                let result = first
+                    .checkpoint_actor_model_context(ActorModelContextCheckpoint {
+                        fence: fence.clone(),
+                        expected: expected.clone(),
+                        candidate: candidate.clone(),
+                        snapshot_blocks: witnesses,
+                    })
+                    .await
+                    .unwrap();
+                let actual = match result {
+                    ActorModelContextOutcome::Committed(s) => {
+                        assert!(outcome.changed);
+                        s
+                    }
+                    ActorModelContextOutcome::Already(s) => {
+                        assert!(!outcome.changed);
+                        s
+                    }
+                };
+                assert_eq!(actual.model_context_state, Some(candidate));
+                assert_eq!(
+                    serde_json::to_value(&actual.messages).unwrap(),
+                    serde_json::to_value(&expected.messages).unwrap()
+                );
+                assert_eq!(actual.provider_transcript, expected.provider_transcript);
+                let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+                assert_eq!(
+                    serde_json::to_value(actual).unwrap(),
+                    serde_json::to_value(reopened.load_session(&seed.id).await.unwrap().unwrap())
+                        .unwrap()
+                );
+            }
+        }
+    }
 }

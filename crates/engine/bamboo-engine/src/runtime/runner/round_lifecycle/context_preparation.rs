@@ -32,6 +32,7 @@ use bamboo_domain::{
     MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::LLMProvider;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -52,6 +53,14 @@ const FORCE_CONTEXT_COMPRESSION_PERCENT: f64 = 98.0;
 const MODEL_CONTEXT_RETENTION_PERCENT: u32 = 25;
 const MAX_PROJECTED_REQUEST_REFIT_PASSES: usize = 3;
 const MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES: usize = 2;
+// Match Codex's coarse image estimate: 7,373 model-visible bytes at four
+// bytes/token. Original-detail inline images use 32px patches; references
+// without known dimensions use its maximum patch estimate. These are budgeting
+// estimates, not billing data.
+const RESIZED_IMAGE_TOKEN_ESTIMATE: u32 = 1_844;
+const ORIGINAL_IMAGE_MAX_PATCHES: u32 = 10_000;
+const ORIGINAL_IMAGE_PATCH_SIZE: usize = 32;
+const MAX_INLINE_IMAGE_HEADER_BASE64_BYTES: usize = 256 * 1024;
 const LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY: &str =
     "context_management.last_manual_archive_occurrence.v1";
 const MANUAL_ARCHIVE_REJECTIONS_KEY: &str = "context_management.manual_archive_rejections.v1";
@@ -774,10 +783,7 @@ fn all_active_prepared_context(
     }
 }
 
-fn provider_prepared_message_tokens(
-    message: &Message,
-    counter: &dyn TokenCounter,
-) -> Result<u32, AgentError> {
+fn provider_prepared_message_tokens(message: &Message, counter: &dyn TokenCounter) -> u32 {
     let mut tokens = counter.count_message(message);
     if let Some(reasoning) = message.reasoning.as_deref() {
         tokens = tokens.saturating_add(counter.count_text(reasoning));
@@ -794,16 +800,52 @@ fn provider_prepared_message_tokens(
                     // conservative when a caller populated both views.
                     tokens = tokens.saturating_add(counter.count_text(text));
                 }
-                MessagePart::ImageUrl { .. } => {
-                    return Err(AgentError::Budget(format!(
-                        "retrieval-window cannot determine the complete provider token cost for active image message {}",
-                        message.id
-                    )));
+                MessagePart::ImageUrl { image_url } => {
+                    tokens = tokens.saturating_add(estimate_image_tokens(image_url));
                 }
             }
         }
     }
-    Ok(tokens)
+    tokens
+}
+
+fn estimate_image_tokens(image_url: &bamboo_domain::ImageUrlRef) -> u32 {
+    if image_url.detail.as_deref() == Some("original") {
+        estimate_inline_original_image_patches(&image_url.url).unwrap_or(ORIGINAL_IMAGE_MAX_PATCHES)
+    } else {
+        RESIZED_IMAGE_TOKEN_ESTIMATE
+    }
+}
+
+fn estimate_inline_original_image_patches(url: &str) -> Option<u32> {
+    let (header, encoded) = url.trim().split_once(',')?;
+    let mime = header.strip_prefix("data:")?.split(';').next()?;
+    if !mime.starts_with("image/")
+        || !header
+            .split(';')
+            .skip(1)
+            .any(|part| part.eq_ignore_ascii_case("base64"))
+    {
+        return None;
+    }
+    // Image dimensions live in the header for supported formats. Decode only a
+    // bounded, four-character-aligned prefix; unusual oversized metadata falls
+    // back to the conservative original-image estimate.
+    let encoded = encoded.trim();
+    let prefix_len = encoded.len().min(MAX_INLINE_IMAGE_HEADER_BASE64_BYTES) / 4 * 4;
+    let encoded_prefix = encoded.get(..prefix_len)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded_prefix)
+        .ok()?;
+    let size = imagesize::blob_size(&bytes).ok()?;
+    if size.width == 0 || size.height == 0 {
+        return None;
+    }
+    let patches = size
+        .width
+        .div_ceil(ORIGINAL_IMAGE_PATCH_SIZE)
+        .saturating_mul(size.height.div_ceil(ORIGINAL_IMAGE_PATCH_SIZE));
+    Some(patches.min(ORIGINAL_IMAGE_MAX_PATCHES as usize) as u32)
 }
 
 fn late_bound_tool_schema_reserve(
@@ -839,7 +881,6 @@ struct RetrievalWindowAccountingFrame {
 
 struct RetrievalWindowPreflight {
     active_tokens: u32,
-    has_provider_native_image: bool,
 }
 
 enum RetrievalWindowPreparationOutcome {
@@ -866,11 +907,9 @@ async fn retrieval_window_preflight(
     budget: &TokenBudget,
     counter: &dyn TokenCounter,
 ) -> Result<RetrievalWindowPreflight, AgentError> {
-    // This projection deliberately performs no image fallback: it is the
-    // mutation-free/no-model-call gate used before capability validation. For
-    // text-only messages the extra fields below make it conservative; native
-    // images remain explicitly unknown and therefore cannot prove that usage is
-    // below the trigger.
+    // This mutation-free, no-model-call gate runs before capability validation.
+    // Native images use the same coarse estimate as candidate accounting so
+    // their presence alone does not force an archive below the trigger.
     let prepared = all_active_prepared_context(session, budget, counter);
     let projected = super::stream_execution::project_request_usage(
         session,
@@ -881,26 +920,10 @@ async fn retrieval_window_preflight(
         llm,
     )
     .await?;
-    let mut extra_tokens = 0u32;
-    let mut has_provider_native_image = false;
-    for message in &prepared.messages {
-        if let Some(reasoning) = message.reasoning.as_deref() {
-            extra_tokens = extra_tokens.saturating_add(counter.count_text(reasoning));
-        }
-        if let Some(signature) = message.reasoning_signature.as_deref() {
-            extra_tokens = extra_tokens.saturating_add(counter.count_text(signature));
-        }
-        if let Some(parts) = message.content_parts.as_deref() {
-            for part in parts {
-                match part {
-                    MessagePart::Text { text } => {
-                        extra_tokens = extra_tokens.saturating_add(counter.count_text(text));
-                    }
-                    MessagePart::ImageUrl { .. } => has_provider_native_image = true,
-                }
-            }
-        }
-    }
+    let extra_tokens = prepared.messages.iter().fold(0u32, |total, message| {
+        let estimated = provider_prepared_message_tokens(message, counter);
+        total.saturating_add(estimated.saturating_sub(counter.count_message(message)))
+    });
     let late_bound_tool_tokens =
         late_bound_tool_schema_reserve(session, tool_schemas, &projected, counter)?;
     Ok(RetrievalWindowPreflight {
@@ -908,7 +931,6 @@ async fn retrieval_window_preflight(
             .input_tokens
             .saturating_add(extra_tokens)
             .saturating_add(late_bound_tool_tokens),
-        has_provider_native_image,
     })
 }
 
@@ -957,7 +979,7 @@ async fn build_retrieval_window_accounting_frame(
     let mut provider_message_token_total = 0u32;
     for message in &active_messages {
         let tokens = match transformed_by_id.get(&message.id) {
-            Some(prepared_message) => provider_prepared_message_tokens(prepared_message, counter)?,
+            Some(prepared_message) => provider_prepared_message_tokens(prepared_message, counter),
             // Tool-chain normalization may remove an orphan result. It is not
             // provider-visible in this accounting frame, so its complete
             // provider cost is exactly zero.
@@ -1128,7 +1150,9 @@ async fn maybe_prepare_retrieval_window_context(
     // catalog intentionally excludes `session_history_current`; defer archival
     // until activation completes instead of misclassifying the temporary tool
     // restriction as a missing retrieval capability.
-    if crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(session) {
+    if crate::runtime::runner::session_setup::legacy_instruction::explicit_activation_pending(
+        session,
+    ) {
         tracing::debug!(
             session_id = %session_id,
             "retrieval-window archival deferred until explicit skill activation completes"
@@ -1161,7 +1185,7 @@ async fn maybe_prepare_retrieval_window_context(
     } else {
         preflight.active_tokens < trigger_tokens
     };
-    if !preflight.has_provider_native_image && below_boundary {
+    if below_boundary {
         return Ok(RetrievalWindowPreparationOutcome::NotNeeded);
     }
     let policy = RetrievalWindowPolicy {
@@ -1333,13 +1357,10 @@ async fn maybe_prepare_retrieval_window_context(
         .await?;
         let late_bound_tool_tokens =
             late_bound_tool_schema_reserve(&staged, tool_schemas, &projected, &counter)?;
-        let retained_supplemental_tokens = retained.messages.iter().try_fold(
-            0u32,
-            |total, message| -> Result<u32, AgentError> {
-                let complete = provider_prepared_message_tokens(message, &counter)?;
-                Ok(total.saturating_add(complete.saturating_sub(counter.count_message(message))))
-            },
-        )?;
+        let retained_supplemental_tokens = retained.messages.iter().fold(0u32, |total, message| {
+            let estimated = provider_prepared_message_tokens(message, &counter);
+            total.saturating_add(estimated.saturating_sub(counter.count_message(message)))
+        });
         let projected_input_tokens = projected
             .input_tokens
             .saturating_add(late_bound_tool_tokens)
@@ -1349,7 +1370,7 @@ async fn maybe_prepare_retrieval_window_context(
             || projected.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
         {
             return Err(AgentError::Budget(format!(
-                "retrieval-window exact retained request exceeds its committed limits: input_tokens={projected_input_tokens}, target_tokens={}, input_limit={}, late_bound_tool_tokens={late_bound_tool_tokens}, supplemental_message_tokens={retained_supplemental_tokens}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
+                "retrieval-window estimated retained request exceeds its committed limits: input_tokens={projected_input_tokens}, target_tokens={}, input_limit={}, late_bound_tool_tokens={late_bound_tool_tokens}, supplemental_message_tokens={retained_supplemental_tokens}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
                 plan.target_tokens,
                 budget.max_request_input_tokens(),
                 projected.ledger_rendered_bytes,
@@ -1920,6 +1941,17 @@ pub(super) async fn maybe_apply_host_context_compression(
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     phase_label: &str,
 ) -> Result<bool, AgentError> {
+    if bamboo_domain::ChildContextBinding::from_session(session)
+        .map_err(|error| AgentError::Budget(error.to_string()))?
+        .is_some()
+    {
+        if session.force_manual_compression.is_some()
+            || pending_manual_archive_request(session).is_some()
+        {
+            return Err(AgentError::Budget("required_child_context_unsupported: lossy compaction is unavailable for required one-shot context".into()));
+        }
+        return Ok(false);
+    }
     let manual_archive_request = pending_manual_archive_request(session);
     if config.context_management.strategy != ContextManagementStrategy::RetrievalWindow {
         if let Some(request) = manual_archive_request.as_ref() {
@@ -2054,6 +2086,14 @@ pub(crate) async fn force_overflow_context_recovery(
     llm: &Arc<dyn LLMProvider>,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<bool, AgentError> {
+    if bamboo_domain::ChildContextBinding::from_session(session)
+        .map_err(|error| AgentError::Budget(error.to_string()))?
+        .is_some()
+    {
+        return Err(AgentError::Budget(
+            bamboo_domain::ChildContextPacketError::Budget.to_string(),
+        ));
+    }
     let degraded_sections =
         if config.context_management.strategy == ContextManagementStrategy::RetrievalWindow {
             checkpoint_retrieval_overflow_prompt_degradation(session, config).await?
@@ -2179,6 +2219,77 @@ pub(super) async fn prepare_round_context(
     llm: &Arc<dyn LLMProvider>,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<PreparedRoundContext, AgentError> {
+    if let Some(binding) = bamboo_domain::ChildContextBinding::from_session(session)
+        .map_err(|error| AgentError::Budget(error.to_string()))?
+    {
+        // Required one-shot context has no lossy compression path. Project the
+        // complete final IR, then omit optional background only as whole units.
+        // Later rounds also fail closed when complete history no longer fits.
+        let mut model_session = session.clone();
+        model_session.token_budget = None;
+        let mut budget = super::token_budget::resolve_token_budget(
+            &mut model_session,
+            config,
+            model_name,
+            llm.as_ref(),
+        )
+        .await;
+        if let Some(host) = binding.payload.token_budget.as_ref() {
+            let input_limit = host
+                .max_request_input_tokens()
+                .min(budget.max_request_input_tokens());
+            budget.max_output_tokens = budget.max_output_tokens.min(host.max_output_tokens);
+            budget.safety_margin = budget.safety_margin.min(host.safety_margin);
+            budget.max_context_tokens = budget.max_context_tokens.min(host.max_context_tokens).min(
+                input_limit
+                    .saturating_add(budget.max_output_tokens)
+                    .saturating_add(budget.safety_margin),
+            );
+        }
+        let counter = TiktokenTokenCounter::default();
+        let mut shadow = session.clone();
+        let mut omitted = 0usize;
+        loop {
+            let mut prepared_context = all_active_prepared_context(&shadow, &budget, &counter);
+            prepared_context.truncation_occurred = omitted > 0;
+            prepared_context.segments_removed = omitted;
+            binding
+                .validate_messages(&session.id, &prepared_context.messages)
+                .map_err(|error| AgentError::Budget(error.to_string()))?;
+            let projected = super::stream_execution::project_request_usage(
+                session,
+                &prepared_context,
+                config,
+                tool_schemas,
+                model_name,
+                llm,
+            )
+            .await?;
+            if projected.input_tokens <= budget.max_request_input_tokens()
+                && projected.ledger_rendered_bytes <= MAX_MODEL_CONTEXT_RENDERED_BYTES
+            {
+                session.metadata.insert(
+                    "child.context_packet.provider_background_omitted.v1".into(),
+                    omitted.to_string(),
+                );
+                return Ok(PreparedRoundContext {
+                    prepared_context,
+                    budget,
+                });
+            }
+            let Some(index) = shadow
+                .messages
+                .iter()
+                .rposition(|message| binding.is_background(message))
+            else {
+                return Err(AgentError::Budget(
+                    bamboo_domain::ChildContextPacketError::Budget.to_string(),
+                ));
+            };
+            shadow.messages.remove(index);
+            omitted += 1;
+        }
+    }
     let retrieval_window_enabled =
         config.context_management.strategy == ContextManagementStrategy::RetrievalWindow;
     let manual_archive_request = pending_manual_archive_request(session);
@@ -2415,7 +2526,7 @@ pub(super) async fn prepare_round_context(
         }
 
         let deficit_tokens = projected.input_tokens.saturating_sub(request_input_limit);
-        let prepared_message_tokens = counter.count_messages(&prepared_context.messages);
+        let prepared_message_tokens = projected.prepared_message_input_tokens;
         // The projection is the transformed messages plus provider-visible
         // material outside that vector. Subtract the messages directly to get
         // the exact fixed reservation. Deriving it via unused input-window space

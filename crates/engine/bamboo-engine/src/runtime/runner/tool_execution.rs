@@ -18,6 +18,8 @@ use bamboo_domain::{
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 
+pub(crate) use policy::ToolPolicyGuard;
+
 fn build_context_pressure(session: &Session) -> Option<output_compressor::ContextPressure> {
     let usage = session.token_usage.as_ref()?;
     let budget = session.effective_token_budget()?;
@@ -145,9 +147,9 @@ async fn execute_and_apply_single_tool_call(
     reserved_calls: usize,
 ) -> Result<SingleToolExecutionControl, AgentError> {
     // Every sequential/single dispatch is its own externally visible safe
-    // boundary. Re-read only the authoritative permission control-plane before
-    // deriving flags; storage failures abort before ToolStart or executor entry.
-    super::state_bridge::refresh_tool_boundary_permission_posture(
+    // boundary. Re-read the authoritative permission and Root tool control
+    // planes before dispatch; storage failures abort before ToolStart.
+    super::state_bridge::refresh_tool_boundary_authorities(
         session,
         runtime_state,
         config.storage.as_ref(),
@@ -161,6 +163,7 @@ async fn execute_and_apply_single_tool_call(
     let root_session_id = session.root_session_id.clone();
     let executing_supervisor =
         ExecutingSupervisorObservation::capture_from_executing_session(session);
+    let root_orchestration_only = session.root_orchestration_only_enabled();
     // Plan mode gate: block mutating tools (except pause/clarification tools)
     if session_flags.plan_read_only {
         let tool_name = tool_call.function.name.trim();
@@ -175,6 +178,7 @@ async fn execute_and_apply_single_tool_call(
             let outcome = per_call::ToolExecutionOutcome {
                 permission_replay_origin: None,
                 needs_human: None,
+                portable_tool: None,
                 post_tool_hook_eligible: false,
                 result: Err(format!("Plan mode: {} operation blocked", tool_name)),
                 tool_duration: std::time::Duration::ZERO,
@@ -223,9 +227,6 @@ async fn execute_and_apply_single_tool_call(
     let mut stop_round = false;
     let outcome = match policy_guard.check_before_execution(tool_call, reserved_calls) {
         Ok(()) => {
-            let before_tool_hooks = config
-                .hook_runner
-                .has_hooks_for(AgentHookPoint::BeforeToolExecution);
             per_call::execute_model_requested_tool_call_only(
                 effective_callable_set,
                 per_call::ToolExecutionOnlyContext {
@@ -233,14 +234,18 @@ async fn execute_and_apply_single_tool_call(
                     event_tx,
                     metrics_collector,
                     session_id,
+                    root_orchestration_only,
                     root_session_id: &root_session_id,
                     executing_supervisor,
                     round_id,
                     round,
                     tools,
                     config,
-                    hook_session: before_tool_hooks.then_some(&mut *session),
-                    hook_runtime_state: before_tool_hooks.then_some(&mut *runtime_state),
+                    // Portable hooks can be enabled while ToolStart is awaiting
+                    // delivery. Sequential calls always carry the state needed
+                    // by the execution-time hook check.
+                    hook_session: Some(&mut *session),
+                    hook_runtime_state: Some(&mut *runtime_state),
                     session_flags,
                     available_tool_schemas,
                 },
@@ -261,14 +266,13 @@ async fn execute_and_apply_single_tool_call(
             per_call::ToolExecutionOutcome {
                 permission_replay_origin: None,
                 needs_human: None,
+                portable_tool: None,
                 post_tool_hook_eligible: false,
                 result: Err(message),
                 tool_duration: std::time::Duration::ZERO,
             }
         }
     };
-
-    policy_guard.observe_outcome(tool_call, &outcome.result);
 
     // Compress tool output before applying
     let task_hint = build_task_compression_hint(task_context);
@@ -285,6 +289,9 @@ async fn execute_and_apply_single_tool_call(
         task_hint.as_ref(),
     )
     .await;
+    // The output budget may turn an otherwise successful browser download
+    // into a bounded failure. Count the result the model actually receives.
+    policy_guard.observe_outcome(tool_call, &outcome.result);
 
     let should_break = per_call::apply_tool_execution_outcome(
         per_call::ToolExecutionApplyContext {
@@ -435,6 +442,7 @@ pub(crate) struct RoundToolExecution<'a, 'frame> {
     pub(crate) frame: &'a crate::runtime::runner::round_frame::RoundFrame<'frame>,
     pub(crate) session: &'a mut Session,
     pub(crate) runtime_state: &'a mut AgentRuntimeState,
+    pub(crate) policy_guard: &'a mut ToolPolicyGuard,
     pub(crate) task_context: &'a mut Option<TaskLoopContext>,
     pub(crate) compression_model_name: Option<&'a str>,
     pub(crate) compression_model_provider: Option<&'a Arc<dyn LLMProvider>>,
@@ -451,6 +459,7 @@ pub(crate) async fn execute_round_tool_calls(
         frame,
         session,
         runtime_state,
+        policy_guard,
         task_context,
         compression_model_name,
         compression_model_provider,
@@ -483,7 +492,7 @@ pub(crate) async fn execute_round_tool_calls(
     let available_tool_schemas = available_tool_schemas.as_slice();
 
     let mut state = RoundExecutionState::default();
-    let mut policy_guard = policy::ToolPolicyGuard::new(
+    policy_guard.begin_round(
         config.max_tool_calls_per_round,
         config.max_consecutive_failures_per_tool,
     );
@@ -537,7 +546,7 @@ pub(crate) async fn execute_round_tool_calls(
                         runtime_state,
                         task_context,
                         &mut state,
-                        &mut policy_guard,
+                        policy_guard,
                         0,
                     )
                     .await?;
@@ -578,7 +587,7 @@ pub(crate) async fn execute_round_tool_calls(
                     runtime_state,
                     task_context,
                     &mut state,
-                    &mut policy_guard,
+                    policy_guard,
                     0,
                 )
                 .await?;
@@ -606,7 +615,7 @@ pub(crate) async fn execute_round_tool_calls(
             // every already-started call. A transition during the batch applies
             // at the next sequential call or batch, never nondeterministically
             // to only part of this batch.
-            super::state_bridge::refresh_tool_boundary_permission_posture(
+            super::state_bridge::refresh_tool_boundary_authorities(
                 session,
                 runtime_state,
                 config.storage.as_ref(),
@@ -636,6 +645,7 @@ pub(crate) async fn execute_round_tool_calls(
             let root_session_id = root_session_id.as_str();
             let executing_supervisor =
                 ExecutingSupervisorObservation::capture_from_executing_session(session);
+            let root_orchestration_only = session.root_orchestration_only_enabled();
             let outcomes = tokio::time::timeout(
                 batch_timeout,
                 join_all(batch.iter().map(|tool_call| {
@@ -650,6 +660,7 @@ pub(crate) async fn execute_round_tool_calls(
                                     event_tx,
                                     metrics_collector,
                                     session_id,
+                                    root_orchestration_only,
                                     root_session_id,
                                     executing_supervisor,
                                     round_id,
@@ -668,6 +679,10 @@ pub(crate) async fn execute_round_tool_calls(
                             Ok(per_call::ToolExecutionOutcome {
                                 permission_replay_origin: None,
                                 needs_human: None,
+                                portable_tool: per_call::portable_tool_for_admitted_call(
+                                    effective_callable_set,
+                                    tool_call,
+                                ),
                                 post_tool_hook_eligible: true,
                                 result: Err(format!(
                                     "Tool '{}' timed out after {:?}",
@@ -689,10 +704,14 @@ pub(crate) async fn execute_round_tool_calls(
                 );
                 batch
                     .iter()
-                    .map(|_batch_call| {
+                    .map(|batch_call| {
                         Ok(per_call::ToolExecutionOutcome {
                             permission_replay_origin: None,
                             needs_human: None,
+                            portable_tool: per_call::portable_tool_for_admitted_call(
+                                effective_callable_set,
+                                batch_call,
+                            ),
                             post_tool_hook_eligible: true,
                             result: Err(format!(
                                 "Parallel batch timed out after {:?}",
@@ -822,7 +841,7 @@ pub(crate) async fn execute_round_tool_calls(
             runtime_state,
             task_context,
             &mut state,
-            &mut policy_guard,
+            policy_guard,
             0,
         )
         .await?;
@@ -896,6 +915,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum BoundaryTransition {
         Mode(SessionPermissionMode, u64),
+        RootOrchestrationOnly,
         FailNextLoad,
         RemoveSession,
     }
@@ -925,6 +945,12 @@ mod tests {
                         .get_or_insert_with(AgentRuntimeState::default)
                         .set_permission_mode(mode);
                     permission_audit(mode, audit_revision).write_to(&mut session.metadata);
+                    *guard = Some(session);
+                }
+                BoundaryTransition::RootOrchestrationOnly => {
+                    let mut guard = self.session.lock().expect("boundary storage lock");
+                    let mut session = guard.clone().expect("transition requires session");
+                    session.set_root_orchestration_only(true).unwrap();
                     *guard = Some(session);
                 }
                 BoundaryTransition::FailNextLoad => {
@@ -1073,6 +1099,8 @@ mod tests {
 
         fn list_tools(&self) -> Vec<ToolSchema> {
             [
+                "Read",
+                "Bash",
                 "prepare",
                 "mutation",
                 "parallel_a",
@@ -1217,6 +1245,7 @@ mod tests {
             frame: &frame,
             session: &mut session,
             runtime_state: &mut runtime_state,
+            policy_guard: &mut super::ToolPolicyGuard::default(),
             task_context: &mut task_context,
             compression_model_name: None,
             compression_model_provider: None,
@@ -1350,6 +1379,130 @@ mod tests {
             }));
             assert_eq!(storage.load_count(), 2);
         }
+    }
+
+    #[tokio::test]
+    async fn same_round_root_tightening_blocks_stale_sequential_call_before_tool_start() {
+        let session =
+            permission_session("root-sequential-tightening", SessionPermissionMode::Auto, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "Read",
+            BoundaryTransition::RootOrchestrationOnly,
+        ));
+        let calls = [
+            named_call("read-first", "Read"),
+            named_call("bash-stale", "Bash"),
+        ];
+
+        let (result, running, _, events) =
+            run_permission_boundary_calls(storage.clone(), executor.clone(), session, &calls).await;
+
+        assert!(!result.unwrap().awaiting_clarification);
+        assert!(running.root_orchestration_only_enabled());
+        assert_eq!(running.root_tool_authority_revision, 1);
+        assert!(executor.entered("Read"));
+        assert!(!executor.entered("Bash"));
+        assert!(events.iter().all(|event| {
+            !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "bash-stale")
+        }));
+        assert!(running.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("bash-stale")
+                && message
+                    .content
+                    .contains("outside orchestration-only Root authority")
+        }));
+        assert_eq!(storage.load_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn same_round_root_tightening_refreshes_at_parallel_batch_boundaries() {
+        let session =
+            permission_session("root-parallel-tightening", SessionPermissionMode::Auto, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "Read",
+            BoundaryTransition::RootOrchestrationOnly,
+        ));
+        let calls = [
+            named_call("read-first", "Read"),
+            named_call("parallel-a-stale", "parallel_a"),
+            named_call("parallel-b-stale", "parallel_b"),
+        ];
+
+        let (result, running, _, events) =
+            run_permission_boundary_calls(storage.clone(), executor.clone(), session, &calls).await;
+
+        assert!(!result.unwrap().awaiting_clarification);
+        assert!(running.root_orchestration_only_enabled());
+        assert!(executor.entered("Read"));
+        assert!(!executor.entered("parallel_a"));
+        assert!(!executor.entered("parallel_b"));
+        for denied in ["parallel-a-stale", "parallel-b-stale"] {
+            assert!(events.iter().all(|event| {
+                !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == denied)
+            }));
+        }
+        assert_eq!(
+            storage.load_count(),
+            2,
+            "one refresh before the parallel batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_call_root_tightening_removes_revoked_schema_next_round() {
+        let session = permission_session("root-next-round", SessionPermissionMode::Auto, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "Read",
+            BoundaryTransition::RootOrchestrationOnly,
+        ));
+        let calls = [named_call("final-read", "Read")];
+        let (result, mut running, mut runtime_state, _) =
+            run_permission_boundary_calls(storage.clone(), executor.clone(), session, &calls).await;
+        assert!(!result.unwrap().awaiting_clarification);
+        assert!(!running.root_orchestration_only_enabled());
+
+        let storage_port: Arc<dyn Storage> = storage.clone();
+        let config = crate::runtime::config::AgentLoopConfig {
+            storage: Some(storage_port),
+            ..Default::default()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        crate::runtime::runner::round_prelude::refresh_round_boundary_and_prompt_context(
+            &mut running,
+            &mut runtime_state,
+            &config,
+            None,
+            &cancel,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(running.root_orchestration_only_enabled());
+        let tools: Arc<dyn ToolExecutor> = executor;
+        let names = crate::runtime::runner::session_setup::tool_schemas::resolve_available_tool_schemas_for_session(
+            &config,
+            tools.as_ref(),
+            &running,
+        )
+        .into_iter()
+        .map(|schema| schema.function.name)
+        .collect::<std::collections::BTreeSet<_>>();
+        assert!(names.contains("Read"));
+        assert!(!names.contains("Bash"));
+        assert!(!names.contains("parallel_a"));
+        assert_eq!(
+            storage.load_count(),
+            2,
+            "tool plus bounded next-round proof read"
+        );
     }
 
     #[tokio::test]

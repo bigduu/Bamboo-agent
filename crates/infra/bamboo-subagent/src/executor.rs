@@ -5,7 +5,11 @@
 //! [`EchoExecutor`] is a dependency-free stand-in used by the demo worker and tests.
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::proto::{
@@ -16,6 +20,7 @@ use crate::proto::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutorControl {
     SessionMessageAdmitted(SessionMessageAdmissionConfirmation),
+    InitialInputReleaseRequest(crate::proto::InitialInputReleaseRequest),
 }
 
 /// Which kind of host callback a [`HostRequest`] is — selects the wire frame.
@@ -23,6 +28,10 @@ pub enum ExecutorControl {
 pub enum HostRequestKind {
     /// Proxy a gated-tool approval to the host (→ `ChildFrame::ApprovalRequest`).
     Approval,
+    /// Read the active logical Child's owned tree from its canonical Host.
+    OwnedTree,
+    /// Invoke the canonical Host's logical SubAgent tool for this active Run.
+    SubAgent,
 }
 
 /// A single host-callback request: an executor proxies a gated-tool approval
@@ -39,13 +48,26 @@ pub struct HostRequest {
 #[derive(Clone)]
 pub struct HostBridge {
     req_tx: mpsc::UnboundedSender<HostRequest>,
+    tree_permits: Arc<Semaphore>,
+    tree_calls: Arc<AtomicUsize>,
+    subagent_permits: Arc<Semaphore>,
+    subagent_calls: Arc<AtomicUsize>,
 }
 
 impl HostBridge {
     /// Create a bridge + the receiver the transport pumps to the wire.
     pub fn channel() -> (Self, mpsc::UnboundedReceiver<HostRequest>) {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
-        (HostBridge { req_tx }, req_rx)
+        (
+            HostBridge {
+                req_tx,
+                tree_permits: Arc::new(Semaphore::new(1)),
+                tree_calls: Arc::new(AtomicUsize::new(0)),
+                subagent_permits: Arc::new(Semaphore::new(1)),
+                subagent_calls: Arc::new(AtomicUsize::new(0)),
+            },
+            req_rx,
+        )
     }
 
     /// Proxy one gated-tool approval to the host and await the decision JSON
@@ -56,6 +78,87 @@ impl HostBridge {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         self.call(HostRequestKind::Approval, body).await
+    }
+
+    /// Request one bounded read from the canonical Host for the active logical
+    /// Child. Caller identity is never accepted from the Worker payload.
+    pub async fn owned_tree_call(&self, cursor: Option<&str>) -> Result<serde_json::Value, String> {
+        const MAX_CURSOR_BYTES: usize = 128;
+        const MAX_RESULT_BYTES: usize = 8192;
+        const MAX_CALLS_PER_RUN: usize = 16;
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        if cursor.is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_CURSOR_BYTES) {
+            return Err("invalid owned tree cursor".into());
+        }
+        let _permit = tokio::time::timeout(TIMEOUT, self.tree_permits.acquire())
+            .await
+            .map_err(|_| "owned tree request timed out")?
+            .map_err(|_| "owned tree inspection unavailable")?;
+        if self.tree_calls.fetch_add(1, Ordering::AcqRel) >= MAX_CALLS_PER_RUN {
+            return Err("owned tree request limit reached".into());
+        }
+        let reply = tokio::time::timeout(
+            TIMEOUT,
+            self.call(
+                HostRequestKind::OwnedTree,
+                serde_json::json!({"cursor":cursor}),
+            ),
+        )
+        .await
+        .map_err(|_| "owned tree request timed out")??;
+        let page = reply
+            .get("page")
+            .filter(|page| !page.is_null())
+            .ok_or_else(|| "owned tree inspection rejected".to_string())?;
+        if serde_json::to_vec(page).map_or(true, |bytes| bytes.len() > MAX_RESULT_BYTES) {
+            return Err("owned tree observation exceeds its limit".into());
+        }
+        Ok(page.clone())
+    }
+
+    /// Route a nested Child's logical operation to its canonical Host. The
+    /// Worker sends arguments and a transcript call id, never caller authority.
+    pub async fn subagent_call(
+        &self,
+        args: serde_json::Value,
+        tool_call_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        const MAX_ARGS_BYTES: usize = 64 * 1024;
+        const MAX_REPLY_BYTES: usize = 16 * 1024;
+        const MAX_CALLS_PER_RUN: usize = 64;
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        if tool_call_id.is_empty()
+            || tool_call_id.len() > 128
+            || serde_json::to_vec(&args).map_or(true, |bytes| bytes.len() > MAX_ARGS_BYTES)
+        {
+            return Err("invalid canonical SubAgent request".into());
+        }
+        let _permit = tokio::time::timeout(TIMEOUT, self.subagent_permits.acquire())
+            .await
+            .map_err(|_| "canonical SubAgent request timed out")?
+            .map_err(|_| "canonical SubAgent unavailable")?;
+        if self.subagent_calls.fetch_add(1, Ordering::AcqRel) >= MAX_CALLS_PER_RUN {
+            return Err("canonical SubAgent request limit reached".into());
+        }
+        let reply = tokio::time::timeout(
+            TIMEOUT,
+            self.call(
+                HostRequestKind::SubAgent,
+                serde_json::json!({"args":args,"tool_call_id":tool_call_id}),
+            ),
+        )
+        .await
+        .map_err(|_| "canonical SubAgent request timed out")??;
+        if serde_json::to_vec(&reply).map_or(true, |bytes| bytes.len() > MAX_REPLY_BYTES) {
+            return Err("canonical SubAgent result exceeds its limit".into());
+        }
+        if let Some(error) = reply.get("error").and_then(serde_json::Value::as_str) {
+            return Err(error.to_owned());
+        }
+        reply
+            .get("result")
+            .cloned()
+            .ok_or_else(|| "canonical SubAgent operation rejected".into())
     }
 
     async fn call(
@@ -129,6 +232,17 @@ impl EventSink {
     pub async fn emit(&self, event: serde_json::Value) {
         let _ = self.tx.send(event).await;
     }
+    pub async fn request_initial_release(
+        &self,
+        request: crate::proto::InitialInputReleaseRequest,
+    ) -> Result<(), String> {
+        self.control_tx
+            .as_ref()
+            .ok_or("initial release channel missing")?
+            .send(ExecutorControl::InitialInputReleaseRequest(request))
+            .await
+            .map_err(|_| "initial release channel closed".into())
+    }
     /// Confirm a forwarded SessionInbox message only after the executor has
     /// observed its durable local admitted receipt.
     pub async fn confirm_session_message(&self, confirmation: SessionMessageAdmissionConfirmation) {
@@ -144,6 +258,9 @@ impl EventSink {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChildOutcome {
     pub status: TerminalStatus,
+    /// Set by the transport only after successful event drain and final flush.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_event_watermark: Option<crate::proto::ActorEventWatermark>,
     pub result: Option<String>,
     pub error: Option<String>,
     /// Rolling-wire compatibility field. The current actor host never consumes
@@ -159,6 +276,7 @@ impl ChildOutcome {
     pub fn completed(result: impl Into<String>) -> Self {
         Self {
             status: TerminalStatus::Completed,
+            final_event_watermark: None,
             result: Some(result.into()),
             error: None,
             transcript: Vec::new(),
@@ -167,6 +285,7 @@ impl ChildOutcome {
     pub fn error(msg: impl Into<String>) -> Self {
         Self {
             status: TerminalStatus::Error,
+            final_event_watermark: None,
             result: None,
             error: Some(msg.into()),
             transcript: Vec::new(),
@@ -175,6 +294,7 @@ impl ChildOutcome {
     pub fn cancelled() -> Self {
         Self {
             status: TerminalStatus::Cancelled,
+            final_event_watermark: None,
             result: None,
             error: None,
             transcript: Vec::new(),
@@ -185,6 +305,7 @@ impl ChildOutcome {
     pub fn suspended(transcript: Vec<serde_json::Value>) -> Self {
         Self {
             status: TerminalStatus::Suspended,
+            final_event_watermark: None,
             result: None,
             error: None,
             transcript,
@@ -211,6 +332,7 @@ pub enum SteerMessage {
         text: String,
     },
     SessionMessage(Box<SessionMessageDelivery>),
+    InitialInputRelease(crate::proto::InitialInputRelease),
 }
 
 impl From<String> for SteerMessage {
@@ -242,6 +364,46 @@ impl SteerInbox {
             SteerMessage::Text(text) => Some(text),
             SteerMessage::DurableText { text, .. } => Some(text),
             SteerMessage::SessionMessage(delivery) => serde_json::to_string(&delivery).ok(),
+            SteerMessage::InitialInputRelease(_) => None, // Never flatten authority into text.
+        }
+    }
+    /// Wait before SDK admission. Any unrelated/late control is a failed barrier.
+    pub async fn wait_initial_release(
+        &mut self,
+        request: &crate::proto::InitialInputReleaseRequest,
+        cancel: &CancellationToken,
+        events: &EventSink,
+    ) -> Result<chrono::DateTime<chrono::Utc>, String> {
+        self.wait_initial_release_bounded(
+            request,
+            cancel,
+            events,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+    }
+    async fn wait_initial_release_bounded(
+        &mut self,
+        request: &crate::proto::InitialInputReleaseRequest,
+        cancel: &CancellationToken,
+        events: &EventSink,
+        wait: std::time::Duration,
+    ) -> Result<chrono::DateTime<chrono::Utc>, String> {
+        let timeout = tokio::time::sleep(wait);
+        tokio::pin!(timeout);
+        let mut retry = tokio::time::interval(std::time::Duration::from_secs(5));
+        retry.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err("initial release cancelled".into()),
+                _ = &mut timeout => return Err("initial release timed out".into()),
+                message = self.recv_message() => return match message {
+                    Some(SteerMessage::InitialInputRelease(release)) if release.permits(request, chrono::Utc::now()) => Ok(release.expires_at),
+                    _ => Err("initial release missing, expired or mismatched".into()),
+                },
+                _ = retry.tick() => events.request_initial_release(request.clone()).await?,
+            }
         }
     }
     /// Receive the typed steering value. Runtime-backed workers use this path
@@ -254,6 +416,19 @@ impl SteerInbox {
 /// What runs inside an actor. Implemented by the worker with the real runtime.
 #[async_trait]
 pub trait ChildExecutor: Send + Sync + 'static {
+    /// The Host validates this executor's complete event trace before admitting
+    /// its history. Transport may coalesce events but must not drop batches.
+    /// Ordinary observation-only executors retain their existing lossy lanes.
+    fn requires_contiguous_events(&self) -> bool {
+        false
+    }
+
+    /// Advertise only when `run` validates EnvironmentLease before executing
+    /// provider or tools. The broker binds this claim to the authenticated
+    /// subscriber connection; an older worker defaults to unsupported.
+    fn supports_environment_lease_v1(&self) -> bool {
+        false
+    }
     /// Maximum number of independent Run/Ask/Task executions this instance may
     /// execute at once. The safe default is one: production executors often
     /// own mutable permission/provider/child-runner state that must not cross
@@ -337,6 +512,48 @@ impl ChildExecutor for EchoExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn initial_release_wait_observes_timeout_disconnect_and_cancel() {
+        let request = crate::proto::InitialInputReleaseRequest {
+            version: 1,
+            nonce: uuid::Uuid::new_v4().to_string(),
+            child_id: "wait-child".into(),
+            parent_id: "parent".into(),
+            root_id: "parent".into(),
+            created_at: chrono::Utc::now(),
+            spawn_depth: 1,
+            project_id: None,
+            envelope_id: "input".into(),
+            generation: 1,
+            activation_run_id: "run".into(),
+            execution_epoch: 1,
+        };
+        let (events, _rx, _controls) = EventSink::channel_with_control();
+        for case in ["timeout", "disconnect", "cancel"] {
+            let (sender, mut inbox) = SteerInbox::channel();
+            let cancel = CancellationToken::new();
+            if case == "disconnect" {
+                drop(sender);
+            } else if case == "cancel" {
+                cancel.cancel();
+            }
+            let error = inbox
+                .wait_initial_release_bounded(
+                    &request,
+                    &cancel,
+                    &events,
+                    std::time::Duration::from_millis(2),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.contains(match case {
+                "timeout" => "timed out",
+                "cancel" => "cancelled",
+                _ => "missing",
+            }));
+        }
+    }
 
     #[tokio::test]
     async fn full_event_queue_backpressures_without_losing_durable_order_or_blocking_control() {

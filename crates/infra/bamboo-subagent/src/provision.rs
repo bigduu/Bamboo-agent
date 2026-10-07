@@ -10,6 +10,8 @@
 //! older worker can read a newer spec (new fields are skipped) and a newer worker can read
 //! an older spec (missing fields default). Parent and worker binaries need not be upgraded
 //! in lockstep.
+//! Authority-bearing required capabilities are an exception: the parent must
+//! receive their explicit capability acknowledgement before any provision.
 
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +24,10 @@ pub const PROVISION_VERSION: u32 = 2;
 /// delivered. Older workers ignore the provision fields that carry the hard
 /// tool boundary, so the parent probes this capability before starting them.
 pub const TYPED_READ_ONLY_WORKER_CAPABILITY: &str = "typed_read_only_tool_policy_v1";
+pub const REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY: &str = "required_child_context_v1";
+pub const NATIVE_TOOL_CEILING_WORKER_CAPABILITY: &str = "native_tool_ceiling_v1";
+pub const INITIAL_INPUT_RELEASE_WORKER_CAPABILITY: &str = "owned_initial_input_release_v1";
+pub const CHILD_CREATION_IDENTITY_WORKER_CAPABILITY: &str = "durable_child_creation_identity_v1";
 
 /// Non-secret capability document printed by `bamboo subagent-worker
 /// --print-capabilities`. It is deliberately separate from `ProvisionSpec` so
@@ -37,7 +43,13 @@ impl WorkerCapabilityReport {
     pub fn current() -> Self {
         Self {
             provision_version: PROVISION_VERSION,
-            capabilities: vec![TYPED_READ_ONLY_WORKER_CAPABILITY.to_string()],
+            capabilities: vec![
+                INITIAL_INPUT_RELEASE_WORKER_CAPABILITY.to_string(),
+                TYPED_READ_ONLY_WORKER_CAPABILITY.to_string(),
+                REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY.to_string(),
+                CHILD_CREATION_IDENTITY_WORKER_CAPABILITY.to_string(),
+                NATIVE_TOOL_CEILING_WORKER_CAPABILITY.to_string(),
+            ],
         }
     }
 
@@ -120,6 +132,22 @@ pub struct ProvisionSpec {
 /// skills exactly as before.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Capabilities {
+    /// Host-owned initial typed input cannot enter SDK before exact ACK/release.
+    #[serde(default)]
+    pub initial_input_release_required: bool,
+    /// Every logical Child Run must carry its authoritative host birth.
+    /// Older workers must acknowledge this before receiving a provision.
+    #[serde(default)]
+    pub child_creation_identity: bool,
+    /// Host-authored immutable one-shot assignment. Requires an explicit probe;
+    /// this content flag does not add tools or change permission authority.
+    #[serde(default)]
+    pub required_child_context: bool,
+    /// Strict fresh local route: a positive ceiling must accompany this bit.
+    #[serde(default)]
+    pub native_tool_ceiling_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_tool_ceiling: Option<crate::proto::NativeToolCeiling>,
     /// Serialized MCP config — opaque to this leaf crate; the worker deserializes
     /// it into the domain `McpConfig`. Typically the portable (SSE /
     /// streamable-http) subset; host-bound stdio servers are excluded.
@@ -366,8 +394,8 @@ pub enum Placement {
     /// Parent spawns a local subprocess (current behavior).
     #[default]
     Local,
-    /// Connect to a resident worker already serving at `endpoint` (e.g.
-    /// `wss://gpu-host:8443`).
+    /// Connect through the scoped broker at `endpoint`; the selected worker
+    /// mailbox is held by Host policy, outside the child RunSpec.
     Remote { endpoint: String },
     /// Ask a control plane to assign an endpoint from a named pool.
     Schedulable { pool: String },
@@ -563,6 +591,58 @@ impl ProvisionSpec {
     /// honor only `mcp_proxy`; fail closed here instead (D4 from the drift
     /// audit: this invariant was documented but never guarded).
     pub fn validate(&self) -> Result<()> {
+        if self.capabilities.initial_input_release_required
+            && (!self.capabilities.required_child_context
+                || !self.capabilities.child_creation_identity
+                || !self.capabilities.native_tool_ceiling_required
+                || !self
+                    .capabilities
+                    .native_tool_ceiling
+                    .as_ref()
+                    .is_some_and(|ceiling| ceiling.tools.is_empty())
+                || !self.capabilities.enforce_permissions
+                || self.bus.is_none())
+        {
+            return Err(StoreError::Invalid(
+                "initial_input_release_unsupported".into(),
+            ));
+        }
+        if (self.capabilities.required_child_context
+            && !self.capabilities.native_tool_ceiling_required)
+            || self.capabilities.native_tool_ceiling_required
+                != self.capabilities.native_tool_ceiling.is_some()
+        {
+            return Err(StoreError::Invalid("native_tool_ceiling_required".into()));
+        }
+        if let Some(ceiling) = &self.capabilities.native_tool_ceiling {
+            ceiling
+                .validate()
+                .map_err(|code| StoreError::Invalid(code.into()))?;
+            if !matches!(self.executor, ExecutorSpec::BambooRuntime)
+                || !matches!(self.placement, Placement::Local)
+                || self.reusable
+                || !self.capabilities.required_child_context
+                || !self.capabilities.child_creation_identity
+                || !self.capabilities.enforce_permissions
+                || ceiling.spawn_depth != self.identity.depth
+                || self.capabilities.mcp.is_some()
+                || self.capabilities.mcp_proxy.is_some()
+                || self.capabilities.skills_dir.is_some()
+                || self.capabilities.nested_spawn
+            {
+                return Err(StoreError::Invalid(
+                    "native_tool_ceiling_unsupported".into(),
+                ));
+            }
+        }
+        if self.capabilities.child_creation_identity
+            && (!matches!(self.executor, ExecutorSpec::BambooRuntime)
+                || !matches!(self.placement, Placement::Local)
+                || (self.storage_dir.is_none()
+                    && !std::path::Path::new(&self.fabric_dir).is_absolute()))
+        {
+            return Err(StoreError::Invalid("Child creation identity requires a local Bamboo runtime and stable host cache root".into()));
+        }
         if self.capabilities.mcp.is_some() && self.capabilities.mcp_proxy.is_some() {
             return Err(StoreError::Invalid(
                 "capabilities.mcp and capabilities.mcp_proxy are mutually exclusive \
@@ -635,6 +715,16 @@ mod tests {
             credential_ref: None,
         });
         s
+    }
+
+    #[test]
+    fn initial_release_flag_rejects_inconsistent_provision() {
+        assert!(WorkerCapabilityReport::current().supports(INITIAL_INPUT_RELEASE_WORKER_CAPABILITY));
+        let mut spec = spec();
+        spec.capabilities.initial_input_release_required = true;
+        assert!(spec.validate().is_err());
+        spec.capabilities.initial_input_release_required = false;
+        assert!(spec.validate().is_ok(), "legacy provision unchanged");
     }
 
     #[test]
@@ -748,6 +838,11 @@ mod tests {
         // Round-trips with content.
         let mut s = spec();
         s.capabilities = Capabilities {
+            child_creation_identity: false,
+            required_child_context: false,
+            initial_input_release_required: false,
+            native_tool_ceiling_required: false,
+            native_tool_ceiling: None,
             mcp: Some(serde_json::json!({ "version": 1, "servers": [] })),
             skills_dir: Some("/home/u/.bamboo/skills".into()),
             mcp_proxy: None,
@@ -929,5 +1024,88 @@ mod tests {
             serde_json::to_value(&minimal_codex).unwrap(),
             serde_json::json!({"kind": "codex"})
         );
+    }
+
+    #[test]
+    fn native_ceiling_closed_startup_payload() {
+        use crate::proto::NativeToolCeiling;
+        let mut s = spec();
+        s.executor = ExecutorSpec::BambooRuntime;
+        s.identity.depth = 1;
+        s.storage_dir = Some("/isolated/native-fixture".into());
+        s.capabilities.enforce_permissions = true;
+        s.capabilities.required_child_context = true;
+        s.capabilities.child_creation_identity = true;
+        s.capabilities.native_tool_ceiling_required = true;
+        let ceiling = NativeToolCeiling {
+            version: 1,
+            child_session_id: "ceiling-child".into(),
+            parent_session_id: "ceiling-root".into(),
+            root_session_id: "ceiling-root".into(),
+            created_at: chrono::Utc::now(),
+            spawn_depth: 1,
+            project_id: None,
+            tools: vec!["Read".into()],
+        };
+        s.capabilities.native_tool_ceiling = Some(ceiling.clone());
+        assert!(s.validate().is_ok());
+        let mut missing = serde_json::to_value(&s).unwrap();
+        missing["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("native_tool_ceiling_required");
+        assert!(ProvisionSpec::from_json(&missing.to_string())
+            .unwrap()
+            .validate()
+            .is_err());
+        let wire = s.to_json().unwrap();
+        assert!(ProvisionSpec::from_json(&wire).unwrap().validate().is_ok());
+        let mut value = serde_json::to_value(&s).unwrap();
+        value["capabilities"]["native_tool_ceiling"]
+            .as_object_mut()
+            .unwrap()
+            .remove("project_id");
+        assert!(ProvisionSpec::from_json(&value.to_string()).is_err());
+        for (key, malformed) in [
+            ("version", serde_json::json!(2)),
+            ("parent_session_id", serde_json::json!("ceiling-child")),
+            ("tools", serde_json::json!(["Read", "Glob"])),
+            ("tools", serde_json::json!(["Read", "Read"])),
+            ("tools", serde_json::json!(["read_file"])),
+            (
+                "child_session_id",
+                serde_json::json!("x".repeat(NativeToolCeiling::MAX_BYTES)),
+            ),
+        ] {
+            let mut value = serde_json::to_value(&s).unwrap();
+            value["capabilities"]["native_tool_ceiling"][key] = malformed;
+            assert!(ProvisionSpec::from_json(&value.to_string())
+                .unwrap()
+                .validate()
+                .is_err());
+        }
+        let payload = serde_json::to_string(&ceiling).unwrap();
+        assert!(serde_json::from_str::<NativeToolCeiling>(&payload.replacen(
+            "\"version\":1",
+            "\"version\":1,\"version\":1",
+            1
+        ))
+        .is_err());
+        let mut value = serde_json::to_value(&s).unwrap();
+        value["capabilities"]["native_tool_ceiling"]["unknown"] = serde_json::json!(true);
+        assert!(ProvisionSpec::from_json(&value.to_string()).is_err());
+        let mut value = serde_json::to_value(&s).unwrap();
+        value["capabilities"]["native_tool_ceiling"] = serde_json::Value::Null;
+        assert!(ProvisionSpec::from_json(&value.to_string())
+            .unwrap()
+            .validate()
+            .is_err());
+        s.capabilities.native_tool_ceiling_required = false;
+        assert!(s.validate().is_err());
+        s.capabilities.native_tool_ceiling_required = true;
+        s.capabilities.nested_spawn = true;
+        assert!(s.validate().is_err());
+        s.capabilities.nested_spawn = false;
+        assert!(WorkerCapabilityReport::current().supports(NATIVE_TOOL_CEILING_WORKER_CAPABILITY));
     }
 }

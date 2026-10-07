@@ -1,27 +1,39 @@
 //! Bamboo session domain — Session, Message, Role, TaskList, and supporting types.
 
+pub mod actor;
+pub mod actor_snapshot;
+pub mod admission;
 pub mod authority;
 pub mod budget_types;
 pub mod composition;
 pub mod context_block;
 pub mod hook_types;
+pub mod host_registry;
 pub mod inbox;
 pub mod message_part;
 pub mod model_context;
+pub mod parent_question;
+pub mod parent_question_checkpoint;
+pub mod parent_request;
 pub mod permission;
 pub mod persistence;
 pub mod prompt_block;
 pub mod provider_transcript;
 pub mod response_control;
+pub mod root_mode_transition;
 pub mod runtime_metadata;
 pub mod runtime_metadata_access;
 pub mod runtime_state;
 pub mod supervisor_management;
 pub mod task;
+pub mod tool_authority;
 pub mod tool_types;
 pub mod types;
 
 // Re-exports for ergonomic access
+pub use actor::*;
+pub use actor_snapshot::*;
+pub use admission::*;
 pub use authority::*;
 pub use budget_types::{
     BudgetStrategy, ProviderPromptUsage, TokenBudget, TokenBudgetUsage, TokenUsageBreakdown,
@@ -29,17 +41,23 @@ pub use budget_types::{
 pub use composition::*;
 pub use context_block::*;
 pub use hook_types::*;
+pub use host_registry::*;
 pub use inbox::*;
 pub use message_part::{ImageUrlRef, MessagePart};
 pub use model_context::*;
+pub use parent_question::*;
+pub use parent_question_checkpoint::*;
+pub use parent_request::*;
 pub use permission::*;
 pub use persistence::*;
 pub use prompt_block::{CacheControl, PromptBlock};
 pub use provider_transcript::*;
 pub use response_control::*;
+pub use root_mode_transition::*;
 pub use runtime_metadata::SessionRuntimeMetadata;
 pub use runtime_state::*;
 pub use supervisor_management::*;
 pub use task::*;
+pub use tool_authority::*;
 pub use tool_types::{FunctionCall, ToolCall};
 pub use types::*;

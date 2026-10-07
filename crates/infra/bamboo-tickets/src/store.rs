@@ -1,0 +1,743 @@
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+
+use crate::{canonical_bytes, content_hash, Artifact, Error, Result, ScopeBinding, Snapshot};
+
+pub const MANAGED_ARTIFACT_PREFIX: &str = "artifact://ticket/";
+pub const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
+
+fn managed_artifact_hash(artifact: &Artifact) -> Result<Option<&str>> {
+    let Some(hash) = artifact.uri.strip_prefix(MANAGED_ARTIFACT_PREFIX) else {
+        return Ok(None);
+    };
+    if !valid_hash(hash) || hash != artifact.sha256 {
+        return Err(Error::InvalidTransition(
+            "managed Artifact URI/hash mismatch".into(),
+        ));
+    }
+    Ok(Some(hash))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Health {
+    Writable,
+    ReadOnly { reason: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultPoint {
+    BeforeWrite,
+    AfterWrite,
+    BeforeFileSync,
+    AfterFileSync,
+    BeforeDirectorySync,
+    AfterDirectorySync,
+    BeforeObjectRename,
+    AfterObjectRename,
+    BeforeHeadRename,
+    AfterHeadRename,
+    BeforeBackupRelease,
+    AfterBackupRelease,
+}
+
+/// A host/test hook: invoked at every actual persistence boundary. It may return
+/// an I/O failure or terminate a fixture process; never installed by a Worker.
+pub type PublicationFault = Arc<dyn Fn(FaultPoint) -> std::io::Result<()> + Send + Sync>;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Commit {
+    schema: u32,
+    seq: u64,
+    parent: Option<String>,
+    manifest: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Manifest {
+    schema: u32,
+    objects: BTreeMap<String, String>,
+}
+
+/// Host-only scope authority. Client reads must use a service published snapshot.
+pub struct FileStore {
+    root: PathBuf,
+    _writer_lock: File,
+    pub health: Health,
+    pub published: Option<(String, Snapshot)>,
+    fault: Option<PublicationFault>,
+    pub(crate) offline_original_writable: bool,
+    #[cfg(feature = "test-utils")]
+    operation_fault: Option<(String, PublicationFault)>,
+}
+
+impl Drop for FileStore {
+    fn drop(&mut self) {
+        // fork temporarily inherits the locked open-file description, even
+        // when exec will close it. Authority ends with this writer, not with
+        // an unrelated subprocess's inherited descriptor. An unlock failure
+        // remains conservative: closing the final descriptor still releases
+        // the lock; another writer never bypasses a retained lock.
+        let _ = FileExt::unlock(&self._writer_lock);
+    }
+}
+
+fn checked_file(path: &Path) -> Result<File> {
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(Error::AuthorityUnavailable("symlink in authority".into()));
+    }
+    Ok(File::open(path)?)
+}
+
+fn valid_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
+impl FileStore {
+    pub(crate) fn store_artifact(&self, bytes: &[u8]) -> Result<Artifact> {
+        if self.health != Health::Writable {
+            return Err(Error::AuthorityUnavailable(
+                "Artifact write requires writable authority".into(),
+            ));
+        }
+        if bytes.is_empty() || bytes.len() > MAX_ARTIFACT_BYTES {
+            return Err(Error::ContextBudgetExceeded);
+        }
+        let sha256 = self.write_object("objects", bytes)?;
+        Ok(Artifact {
+            uri: format!("{MANAGED_ARTIFACT_PREFIX}{sha256}"),
+            sha256,
+        })
+    }
+
+    pub(crate) fn read_artifact(&self, artifact: &Artifact, budget: usize) -> Result<Vec<u8>> {
+        let hash = managed_artifact_hash(artifact)?.ok_or_else(|| {
+            Error::AuthorityUnavailable("external Artifact requires a trusted resolver".into())
+        })?;
+        let metadata = checked_file(&self.root.join("objects").join(hash))?.metadata()?;
+        if metadata.len() > budget.min(MAX_ARTIFACT_BYTES) as u64 {
+            return Err(Error::ContextBudgetExceeded);
+        }
+        self.read_object("objects", hash)
+    }
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+    pub fn open(root: &Path, binding: ScopeBinding) -> Result<Self> {
+        if !cfg!(any(target_os = "macos", target_os = "linux")) {
+            return Err(Error::AuthorityUnavailable(
+                "filesystem platform not validated".into(),
+            ));
+        }
+        fs::create_dir_all(root)?;
+        if fs::symlink_metadata(root)?.file_type().is_symlink() {
+            return Err(Error::AuthorityUnavailable(
+                "authority root is a symlink".into(),
+            ));
+        }
+        let root = root.canonicalize()?;
+        let lock_path = root.join("writer.lock");
+        if lock_path.exists() && fs::symlink_metadata(&lock_path)?.file_type().is_symlink() {
+            return Err(Error::AuthorityUnavailable(
+                "writer lock is a symlink".into(),
+            ));
+        }
+        let writer_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        writer_lock.try_lock_exclusive().map_err(|_| {
+            Error::AuthorityUnavailable("another local writer holds the process lock".into())
+        })?;
+        let mut store = Self {
+            root,
+            _writer_lock: writer_lock,
+            health: Health::Writable,
+            published: None,
+            fault: None,
+            offline_original_writable: false,
+            #[cfg(feature = "test-utils")]
+            operation_fault: None,
+        };
+        let head = store.root.join("HEAD");
+        if head.exists() {
+            match store.load_head() {
+                Ok((hash, snapshot)) if snapshot.binding == binding => {
+                    store.published = Some((hash, snapshot));
+                }
+                Ok(_) => {
+                    store.health = Health::ReadOnly {
+                        reason: "scope binding mismatch".into(),
+                    }
+                }
+                Err(error) => {
+                    store.health = Health::ReadOnly {
+                        reason: error.to_string(),
+                    }
+                }
+            }
+        } else if store.root.join("commits").exists() || store.root.join("objects").exists() {
+            store.health = Health::ReadOnly {
+                reason: "HEAD missing; history is not a recovery oracle".into(),
+            };
+        } else {
+            for dir in ["objects", "manifests", "commits"] {
+                fs::create_dir(store.root.join(dir))?;
+            }
+            store.sync_dir(&store.root)?;
+            store.publish(Snapshot::empty(binding))?;
+        }
+        if store.root.join("BACKUP_READ_ONLY").exists() {
+            store.health = Health::ReadOnly {
+                reason: "backup requires verified stopped-authority migration".into(),
+            };
+        }
+        if let Some((_, snapshot)) = &store.published {
+            if let Some(receipt) = &snapshot.migration {
+                if receipt.stage != crate::MigrationStage::DestinationActivated
+                    || receipt.request.destination_root != store.root.to_string_lossy()
+                {
+                    store.health = Health::ReadOnly {
+                        reason: "retired or relocated authority; offline migration required".into(),
+                    };
+                }
+            }
+        }
+        Ok(store)
+    }
+
+    pub fn set_fault(&mut self, fault: Option<PublicationFault>) {
+        self.fault = fault;
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn set_operation_fault(&mut self, prefix: String, fault: PublicationFault) {
+        self.operation_fault = Some((prefix, fault));
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn publish_operation(&mut self, snapshot: Snapshot, id: &str) -> Result<String> {
+        let selected = self
+            .operation_fault
+            .as_ref()
+            .filter(|(prefix, _)| id.starts_with(prefix))
+            .map(|(_, fault)| fault.clone());
+        let previous = self.fault.clone();
+        if let Some(fault) = selected {
+            self.fault = Some(fault);
+        }
+        let result = self.publish(snapshot);
+        self.fault = previous;
+        result
+    }
+
+    fn hit(&self, point: FaultPoint) -> Result<()> {
+        if let Some(fault) = &self.fault {
+            fault(point)?;
+        }
+        Ok(())
+    }
+
+    fn sync_dir(&self, dir: &Path) -> Result<()> {
+        self.hit(FaultPoint::BeforeDirectorySync)?;
+        checked_file(dir)?.sync_all()?;
+        self.hit(FaultPoint::AfterDirectorySync)
+    }
+
+    fn write_synced(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        self.hit(FaultPoint::BeforeWrite)?;
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        file.write_all(bytes)?;
+        self.hit(FaultPoint::AfterWrite)?;
+        self.hit(FaultPoint::BeforeFileSync)?;
+        file.sync_all()?;
+        self.hit(FaultPoint::AfterFileSync)
+    }
+
+    fn write_object(&self, category: &str, bytes: &[u8]) -> Result<String> {
+        let hash = content_hash(bytes);
+        let dir = self.root.join(category);
+        if fs::symlink_metadata(&dir)?.file_type().is_symlink() {
+            return Err(Error::AuthorityUnavailable(
+                "authority directory is a symlink".into(),
+            ));
+        }
+        let final_path = dir.join(&hash);
+        if final_path.exists() {
+            if self.read_object(category, &hash)? != bytes {
+                return Err(Error::AuthorityUnavailable(
+                    "immutable object mismatch".into(),
+                ));
+            }
+        } else {
+            // Unpublished staging never carries authority. A failed partial write
+            // cannot poison the content-addressed name for an identical retry.
+            let staging = dir.join(format!(".staging-{}", uuid::Uuid::new_v4()));
+            self.write_synced(&staging, bytes)?;
+            self.hit(FaultPoint::BeforeObjectRename)?;
+            fs::rename(&staging, &final_path)?;
+            self.hit(FaultPoint::AfterObjectRename)?;
+        }
+        // An earlier attempt may have renamed this object and failed before
+        // flushing its directory. Identical bytes alone do not prove that the
+        // content-addressed name survives a crash before HEAD is acknowledged.
+        self.sync_dir(&dir)?;
+        Ok(hash)
+    }
+
+    fn read_object(&self, category: &str, hash: &str) -> Result<Vec<u8>> {
+        if !valid_hash(hash) {
+            return Err(Error::AuthorityUnavailable("invalid object hash".into()));
+        }
+        let dir = self.root.join(category);
+        if fs::symlink_metadata(&dir)?.file_type().is_symlink() {
+            return Err(Error::AuthorityUnavailable(
+                "authority directory is a symlink".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        checked_file(&dir.join(hash))?.read_to_end(&mut bytes)?;
+        if content_hash(&bytes) != hash {
+            return Err(Error::AuthorityUnavailable("object hash mismatch".into()));
+        }
+        Ok(bytes)
+    }
+
+    pub fn publish(&mut self, snapshot: Snapshot) -> Result<String> {
+        if self.health != Health::Writable {
+            return Err(Error::AuthorityUnavailable(format!("{:?}", self.health)));
+        }
+        let mut renamed = false;
+        let result = (|| {
+            let mut value = serde_json::to_value(&snapshot)?
+                .as_object()
+                .cloned()
+                .ok_or_else(|| Error::AuthorityUnavailable("snapshot is not an object".into()))?;
+            let mut objects = BTreeMap::new();
+            // Blob references participate in the same full manifest and fixed
+            // export as revisions. An orphan blob written before a failed
+            // Submission is harmless; referenced blobs must verify in full.
+            for artifact in snapshot_artifacts(&snapshot) {
+                if let Some(hash) = managed_artifact_hash(artifact)? {
+                    self.read_artifact(artifact, MAX_ARTIFACT_BYTES)?;
+                    objects.insert(format!("blob:{hash}"), hash.to_owned());
+                }
+            }
+            for category in [
+                "tickets",
+                "assignments",
+                "requests",
+                "submissions",
+                "receipts",
+                "intents",
+                "resolutions",
+            ] {
+                let items = value
+                    .remove(category)
+                    .and_then(|v| v.as_object().cloned())
+                    .ok_or_else(|| {
+                        Error::AuthorityUnavailable("missing snapshot section".into())
+                    })?;
+                for (id, object) in items {
+                    objects.insert(
+                        format!("{category}:{id}"),
+                        self.write_object("objects", &canonical_bytes(&object)?)?,
+                    );
+                }
+            }
+            objects.insert(
+                "header".into(),
+                self.write_object("objects", &canonical_bytes(&value)?)?,
+            );
+            let manifest = self.write_object(
+                "manifests",
+                &canonical_bytes(&Manifest {
+                    schema: snapshot.schema,
+                    objects,
+                })?,
+            )?;
+            let commit = Commit {
+                schema: snapshot.schema,
+                seq: snapshot.seq,
+                parent: self.published.as_ref().map(|(hash, _)| hash.clone()),
+                manifest,
+            };
+            let hash = self.write_object("commits", &canonical_bytes(&commit)?)?;
+            let staged_head = self.root.join(format!(".HEAD-{}", uuid::Uuid::new_v4()));
+            self.write_synced(&staged_head, hash.as_bytes())?;
+            self.hit(FaultPoint::BeforeHeadRename)?;
+            fs::rename(&staged_head, self.root.join("HEAD"))?;
+            renamed = true;
+            self.hit(FaultPoint::AfterHeadRename)?;
+            self.sync_dir(&self.root)?;
+            Ok(hash)
+        })();
+        match result {
+            Ok(hash) => {
+                self.published = Some((hash.clone(), snapshot));
+                Ok(hash)
+            }
+            Err(error) => {
+                if renamed {
+                    self.health = Health::ReadOnly {
+                        reason: format!("HEAD publication needs reconciliation: {error}"),
+                    };
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn load_head(&self) -> Result<(String, Snapshot)> {
+        let mut hash = String::new();
+        checked_file(&self.root.join("HEAD"))?.read_to_string(&mut hash)?;
+        let snapshot = self.load_snapshot(&hash)?;
+        let mut next = Some(hash.clone());
+        let mut seen = std::collections::BTreeSet::new();
+        let mut upper_seq = None;
+        while let Some(commit_hash) = next {
+            if !seen.insert(commit_hash.clone()) {
+                return Err(Error::AuthorityUnavailable("commit ancestry cycle".into()));
+            }
+            let ancestor = self.load_snapshot(&commit_hash)?;
+            if ancestor.binding != snapshot.binding
+                || upper_seq.is_some_and(|seq| ancestor.seq >= seq)
+            {
+                return Err(Error::AuthorityUnavailable(
+                    "invalid commit ancestry".into(),
+                ));
+            }
+            upper_seq = Some(ancestor.seq);
+            let commit: Commit =
+                serde_json::from_slice(&self.read_object("commits", &commit_hash)?)?;
+            next = commit.parent;
+        }
+        Ok((hash, snapshot))
+    }
+
+    pub fn load_snapshot(&self, hash: &str) -> Result<Snapshot> {
+        let commit: Commit = serde_json::from_slice(&self.read_object("commits", hash)?)?;
+        let manifest: Manifest =
+            serde_json::from_slice(&self.read_object("manifests", &commit.manifest)?)?;
+        if !matches!(commit.schema, 1..=4) || manifest.schema != commit.schema {
+            return Err(Error::AuthorityUnavailable("unsupported schema".into()));
+        }
+        let header = manifest
+            .objects
+            .get("header")
+            .ok_or_else(|| Error::AuthorityUnavailable("manifest has no header".into()))?;
+        let mut value: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&self.read_object("objects", header)?)?;
+        for category in [
+            "tickets",
+            "assignments",
+            "requests",
+            "submissions",
+            "receipts",
+            "intents",
+            "resolutions",
+        ] {
+            value.insert(category.into(), serde_json::json!({}));
+        }
+        for (key, hash) in &manifest.objects {
+            if key == "header" {
+                continue;
+            }
+            let (category, id) = key
+                .split_once(':')
+                .ok_or_else(|| Error::AuthorityUnavailable("malformed manifest key".into()))?;
+            if category == "blob" {
+                if id != hash {
+                    return Err(Error::AuthorityUnavailable(
+                        "blob manifest hash mismatch".into(),
+                    ));
+                }
+                self.read_artifact(
+                    &Artifact {
+                        uri: format!("{MANAGED_ARTIFACT_PREFIX}{hash}"),
+                        sha256: hash.clone(),
+                    },
+                    MAX_ARTIFACT_BYTES,
+                )?;
+                continue;
+            }
+            let section = value
+                .get_mut(category)
+                .and_then(|v| v.as_object_mut())
+                .ok_or_else(|| Error::AuthorityUnavailable("unknown manifest section".into()))?;
+            section.insert(
+                id.into(),
+                serde_json::from_slice(&self.read_object("objects", hash)?)?,
+            );
+        }
+        let snapshot: Snapshot = serde_json::from_value(serde_json::Value::Object(value))?;
+        if snapshot.schema != commit.schema || snapshot.seq != commit.seq {
+            return Err(Error::AuthorityUnavailable(
+                "snapshot header mismatch".into(),
+            ));
+        }
+        crate::migration::validate_migration(&snapshot)?;
+        for artifact in snapshot_artifacts(&snapshot) {
+            if let Some(hash) = managed_artifact_hash(artifact)? {
+                if manifest
+                    .objects
+                    .get(&format!("blob:{hash}"))
+                    .map(String::as_str)
+                    != Some(hash)
+                {
+                    return Err(Error::AuthorityUnavailable(
+                        "full manifest omits referenced Artifact".into(),
+                    ));
+                }
+            }
+        }
+        Ok(snapshot)
+    }
+
+    pub(crate) fn parent_commit(&self, hash: &str) -> Result<Option<String>> {
+        let commit: Commit = serde_json::from_slice(&self.read_object("commits", hash)?)?;
+        Ok(commit.parent)
+    }
+
+    /// Export one fixed commit and every immutable reachable ancestor/object.
+    /// The resulting directory is a backup, not a new writable authority.
+    pub fn export(&self, destination: &Path) -> Result<String> {
+        self.export_with_marker(
+            destination,
+            b"Original authority and runs must stop before migration.",
+            false,
+        )
+    }
+
+    pub(crate) fn export_migration(&self, destination: &Path, hash: &str) -> Result<String> {
+        self.export_with_marker(destination, format!("migration:{hash}").as_bytes(), true)
+    }
+
+    fn export_with_marker(
+        &self,
+        destination: &Path,
+        marker: &[u8],
+        resume: bool,
+    ) -> Result<String> {
+        let new_destination = !destination.exists();
+        if !new_destination {
+            if !resume || fs::symlink_metadata(destination)?.file_type().is_symlink() {
+                return Err(Error::InvalidTransition(
+                    "export destination exists or is not this migration".into(),
+                ));
+            }
+        } else {
+            fs::create_dir(destination)?;
+        }
+        let marker_path = destination.join("BACKUP_READ_ONLY");
+        if marker_path.exists() {
+            if read_checked(&marker_path)? != marker {
+                return Err(Error::IdempotencyConflict);
+            }
+        } else {
+            // The exact retired source binds this new path before mkdir. A
+            // crash during marker creation can leave only inert staging; no
+            // existing objects/HEAD or mismatching marker may be repaired.
+            for entry in fs::read_dir(destination)? {
+                let entry = entry?;
+                if !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".backup-staging-")
+                    || !entry.file_type()?.is_file()
+                {
+                    return Err(Error::AuthorityUnavailable(
+                        "unmarked export destination is not empty staging".into(),
+                    ));
+                }
+            }
+            let staging = destination.join(format!(".backup-staging-{}", uuid::Uuid::new_v4()));
+            self.write_synced(&staging, marker)?;
+            self.hit(FaultPoint::BeforeObjectRename)?;
+            fs::rename(staging, &marker_path)?;
+            self.hit(FaultPoint::AfterObjectRename)?;
+            self.sync_dir(destination)?;
+            if let Some(parent) = destination.parent() {
+                self.sync_dir(parent)?;
+            }
+        }
+        let head = self
+            .published
+            .as_ref()
+            .ok_or_else(|| Error::AuthorityUnavailable("no published snapshot".into()))?
+            .0
+            .clone();
+        for category in ["objects", "manifests", "commits"] {
+            let dir = destination.join(category);
+            if dir.exists() {
+                if !checked_file(&dir)?.metadata()?.is_dir() {
+                    return Err(Error::AuthorityUnavailable(
+                        "export category is not a directory".into(),
+                    ));
+                }
+            } else {
+                fs::create_dir(dir)?;
+            }
+        }
+        let mut next = Some(head.clone());
+        while let Some(hash) = next {
+            self.load_snapshot(&hash)?;
+            let bytes = self.read_object("commits", &hash)?;
+            let commit: Commit = serde_json::from_slice(&bytes)?;
+            self.copy_synced(destination, "commits", &hash, &bytes)?;
+            let bytes = self.read_object("manifests", &commit.manifest)?;
+            let manifest: Manifest = serde_json::from_slice(&bytes)?;
+            self.copy_synced(destination, "manifests", &commit.manifest, &bytes)?;
+            for hash in manifest.objects.values() {
+                self.copy_synced(
+                    destination,
+                    "objects",
+                    hash,
+                    &self.read_object("objects", hash)?,
+                )?;
+            }
+            next = commit.parent;
+        }
+        if destination.join("HEAD").exists() {
+            if read_checked(&destination.join("HEAD"))? != head.as_bytes() {
+                return Err(Error::IdempotencyConflict);
+            }
+        } else {
+            let staging = destination.join(format!(".HEAD-{}", uuid::Uuid::new_v4()));
+            self.write_synced(&staging, head.as_bytes())?;
+            self.hit(FaultPoint::BeforeHeadRename)?;
+            fs::rename(staging, destination.join("HEAD"))?;
+            self.hit(FaultPoint::AfterHeadRename)?;
+        }
+        for category in ["objects", "manifests", "commits"] {
+            self.sync_dir(&destination.join(category))?;
+        }
+        self.sync_dir(destination)?;
+        if let Some(parent) = destination.parent() {
+            self.sync_dir(parent)?;
+        }
+        Ok(head)
+    }
+
+    fn copy_synced(
+        &self,
+        destination: &Path,
+        category: &str,
+        hash: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let dir = destination.join(category);
+        let path = dir.join(hash);
+        if path.exists() {
+            return if read_checked(&path)? == bytes {
+                Ok(())
+            } else {
+                Err(Error::AuthorityUnavailable("corrupt export object".into()))
+            };
+        }
+        let staging = dir.join(format!(".staging-{}", uuid::Uuid::new_v4()));
+        self.write_synced(&staging, bytes)?;
+        self.hit(FaultPoint::BeforeObjectRename)?;
+        fs::rename(staging, path)?;
+        self.hit(FaultPoint::AfterObjectRename)?;
+        self.sync_dir(&dir)
+    }
+
+    pub(crate) fn publish_offline(&mut self, snapshot: Snapshot) -> Result<String> {
+        self.health = Health::Writable;
+        let result = self.publish(snapshot);
+        self.health = Health::ReadOnly {
+            reason: "offline migration; runtime permission withheld".into(),
+        };
+        result
+    }
+
+    pub(crate) fn release_backup(&self) -> Result<()> {
+        if self.root.join("BACKUP_READ_ONLY").exists() {
+            self.hit(FaultPoint::BeforeBackupRelease)?;
+            fs::remove_file(self.root.join("BACKUP_READ_ONLY"))?;
+            self.hit(FaultPoint::AfterBackupRelease)?;
+            self.sync_dir(&self.root)?;
+        }
+        Ok(())
+    }
+}
+
+fn snapshot_artifacts(snapshot: &Snapshot) -> impl Iterator<Item = &Artifact> {
+    snapshot
+        .submissions
+        .values()
+        .flat_map(|s| s.artifacts.iter())
+        .chain(
+            snapshot
+                .assignments
+                .values()
+                .flat_map(|a| a.effects.values().filter_map(|e| e.artifact.as_ref())),
+        )
+        .chain(
+            snapshot
+                .submissions
+                .values()
+                .flat_map(|s| s.effects.values().filter_map(|e| e.artifact.as_ref())),
+        )
+        .chain(
+            snapshot
+                .tickets
+                .values()
+                .filter_map(|w| w.import_source.as_ref().and_then(|s| s.artifact.as_ref())),
+        )
+        .chain(
+            snapshot
+                .legacy_attachment
+                .iter()
+                .filter_map(|s| s.artifact.as_ref()),
+        )
+        .chain(
+            snapshot
+                .migration
+                .iter()
+                .filter_map(|r| r.supervisor_snapshot.as_ref()),
+        )
+}
+
+fn read_checked(path: &Path) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    checked_file(path)?.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropped_writer_releases_lock_despite_inherited_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        let binding = ScopeBinding {
+            scope_id: "scope".into(),
+            supervisor_session_id: "supervisor".into(),
+            binding_revision: 1,
+        };
+        let store = FileStore::open(root.path(), binding.clone()).unwrap();
+        // A duplicate shares the open-file description, as a subprocess does
+        // between fork and exec. It does not own the TicketService lifetime.
+        let inherited = store._writer_lock.try_clone().unwrap();
+        assert!(FileStore::open(root.path(), binding.clone()).is_err());
+        drop(store);
+        let reopened = FileStore::open(root.path(), binding).unwrap();
+        assert_eq!(reopened.health, Health::Writable);
+        drop(inherited);
+    }
+}

@@ -21,7 +21,9 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{atomic_write, Result, StoreError};
+use crate::error::{
+    atomic_write, atomic_write_with_gate, atomic_write_with_gate_blocking, Result, StoreError,
+};
 
 /// Idempotency key for a delivered message.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -69,6 +71,12 @@ pub enum InboxKind {
     /// bus instead of a direct WS connection). The unification target — a local
     /// child is driven over the bus exactly like a deployed one.
     Run,
+    /// Legacy fixed-remote Run without a broker connection-generation fence.
+    /// New brokers and workers reject it; retained only for wire decoding.
+    LeasedRun,
+    /// Canonical fixed-remote Run bound to one broker-authenticated WorkerHost
+    /// connection generation. Old brokers/workers cannot decode this kind.
+    FencedRun,
     /// Child→parent: a durable sequenced event batch during an
     /// [`InboxKind::Run`]. Snapshot/ephemeral batches use the broker's bounded
     /// live lane instead. `correlation_id` identifies the owning Run.
@@ -95,6 +103,15 @@ pub enum InboxKind {
     /// `correlation_id` is the approval request `id`, so the worker routes it to
     /// the waiting tool call.
     ApprovalReply,
+    /// Child→parent: bounded, read-only tree page request for the active Run.
+    /// The body carries only a correlation id and optional cursor.
+    OwnedTreeRequest,
+    /// Parent→child: canonical Host page or a fail-closed null page.
+    OwnedTreeReply,
+    /// Worker→Host logical SubAgent invocation for the fenced active Run.
+    SubAgentRequest,
+    /// Host→Worker result or fail-closed denial for that invocation.
+    SubAgentReply,
     /// Typed logical-session envelope. This reuses the same Maildir
     /// claim/recover/ack protocol without making a worker mailbox id the
     /// durable address of a Bamboo Session.
@@ -214,6 +231,63 @@ impl Mailbox {
         Ok(msg.id.clone())
     }
 
+    /// The same Maildir delivery with a cancellation fence on the final
+    /// temp-file rename. A cancelled attempt publishes no visible message.
+    pub async fn deliver_with_gate(
+        &self,
+        msg: &InboxMessage,
+        gate: &bamboo_domain::AdmissionGate,
+    ) -> Result<bamboo_domain::AdmissionCommit<MsgId>> {
+        let bytes = serde_json::to_vec_pretty(msg).map_err(|e| StoreError::decode(&self.dir, e))?;
+        let nanos = msg.created_at.timestamp_nanos_opt().unwrap_or(0).max(0);
+        let name = format!("{nanos:020}-{}.json", msg.id.0);
+        Ok(
+            match atomic_write_with_gate(&self.new_dir().join(name), &bytes, Some(gate)).await? {
+                bamboo_domain::AdmissionCommit::Committed(()) => {
+                    bamboo_domain::AdmissionCommit::Committed(msg.id.clone())
+                }
+                bamboo_domain::AdmissionCommit::AlreadyCommitted => {
+                    bamboo_domain::AdmissionCommit::AlreadyCommitted
+                }
+                bamboo_domain::AdmissionCommit::Cancelled => {
+                    bamboo_domain::AdmissionCommit::Cancelled
+                }
+            },
+        )
+    }
+
+    /// Deliver in an already-started synchronous filesystem job. The caller
+    /// retains its original transaction locks; the optional gate only controls
+    /// the actual final rename. No nested async or blocking job is scheduled.
+    pub fn deliver_blocking(
+        &self,
+        msg: &InboxMessage,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+        observe: impl Fn(&str, &std::path::Path) -> std::io::Result<()>,
+    ) -> Result<bamboo_domain::AdmissionCommit<MsgId>> {
+        let bytes = serde_json::to_vec_pretty(msg).map_err(|e| StoreError::decode(&self.dir, e))?;
+        let nanos = msg.created_at.timestamp_nanos_opt().unwrap_or(0).max(0);
+        let name = format!("{nanos:020}-{}.json", msg.id.0);
+        Ok(
+            match atomic_write_with_gate_blocking(
+                &self.new_dir().join(name),
+                &bytes,
+                gate,
+                observe,
+            )? {
+                bamboo_domain::AdmissionCommit::Committed(()) => {
+                    bamboo_domain::AdmissionCommit::Committed(msg.id.clone())
+                }
+                bamboo_domain::AdmissionCommit::Cancelled => {
+                    bamboo_domain::AdmissionCommit::Cancelled
+                }
+                bamboo_domain::AdmissionCommit::AlreadyCommitted => {
+                    bamboo_domain::AdmissionCommit::AlreadyCommitted
+                }
+            },
+        )
+    }
+
     // ---- receiver side (single reader = the actor) ------------------------
 
     /// Claim and return all pending messages in `new/`, in delivery order.
@@ -242,9 +316,17 @@ impl Mailbox {
     /// Acknowledge a processed message by its claimed location (O(1); preferred —
     /// [`Delivered::cur_path`] carries it). Idempotent (no-op if already gone).
     pub async fn ack_delivered(&self, delivered: &Delivered) -> Result<()> {
+        self.ack_delivered_if_present(delivered).await.map(|_| ())
+    }
+
+    /// Delete exactly this claimed Maildir entry, reporting whether this call
+    /// removed it. Callers maintaining a live pending count must decrement
+    /// only for `true`; matching a message id could remove a different entry
+    /// if two deliveries happened to reuse the same id.
+    pub async fn ack_delivered_if_present(&self, delivered: &Delivered) -> Result<bool> {
         match tokio::fs::remove_file(&delivered.cur_path).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
             Err(e) => Err(StoreError::io(&delivered.cur_path, e)),
         }
     }
@@ -606,9 +688,28 @@ mod tests {
         let (_d, mb) = mailbox();
         mb.deliver(&msg(1)).await.unwrap();
         let batch = mb.drain().await.unwrap();
-        mb.ack_delivered(&batch[0]).await.unwrap();
+        assert!(mb.ack_delivered_if_present(&batch[0]).await.unwrap());
         assert!(mb.recover().await.unwrap().is_empty()); // cur/ empty
-                                                         // idempotent
-        mb.ack_delivered(&batch[0]).await.unwrap();
+        assert!(!mb.ack_delivered_if_present(&batch[0]).await.unwrap());
+        mb.ack_delivered(&batch[0]).await.unwrap(); // old API remains idempotent
+    }
+
+    #[tokio::test]
+    async fn ack_delivered_if_present_does_not_remove_another_entry_with_same_id() {
+        let (_d, mb) = mailbox();
+        let first = msg(1);
+        let mut second = msg(2);
+        second.id = first.id.clone();
+        second.created_at = first.created_at + chrono::Duration::seconds(1);
+        mb.deliver(&first).await.unwrap();
+        mb.deliver(&second).await.unwrap();
+        let batch = mb.drain().await.unwrap();
+        assert_eq!(batch.len(), 2);
+
+        assert!(mb.ack_delivered_if_present(&batch[0]).await.unwrap());
+        assert!(!mb.ack_delivered_if_present(&batch[0]).await.unwrap());
+        let remaining = mb.recover().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].msg.body, second.body);
     }
 }

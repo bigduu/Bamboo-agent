@@ -19,8 +19,8 @@ use super::response::{
 };
 use crate::app_state::AppState;
 use crate::handlers::agent::execute::runtime::{
-    reserve_runner, spawn_agent_execution, spawn_event_forwarder, RunnerReservation,
-    SpawnAgentExecution,
+    reserve_runner, spawn_agent_execution, spawn_event_forwarder_with_root_actor,
+    RunnerReservation, SpawnAgentExecution,
 };
 use bamboo_engine::model_areas::resolve_global_area_models;
 use bamboo_engine::model_config_helper::{
@@ -129,7 +129,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
 
     // ---- Reserve runner ----
     let session_tx = state.get_session_event_sender(session_id).await;
-    let (execution_reservation, run_id) =
+    let (mut execution_reservation, run_id) =
         match reserve_runner(state.get_ref(), session_id, &session_tx).await {
             RunnerReservation::Started(reservation) => {
                 let rid = reservation.run_id().to_string();
@@ -151,6 +151,18 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             }
         };
 
+    if let Err(error) = execution_reservation
+        .bind_root_actor(&state.agent, &session)
+        .await
+    {
+        execution_reservation.abandon().await;
+        return HttpResponse::Conflict().json(serde_json::json!({
+            "status": "rejected", "session_id": session_id,
+            "error": crate::error::error_value(error.to_string())
+        }));
+    }
+    let execution_persistence = execution_reservation.execution_persistence();
+
     // The reservation owns this exact turn now. Moving the owned marker out of
     // `pending` before persistence prevents an old terminal runner from being
     // used to classify the newly-starting turn.
@@ -159,7 +171,12 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     crate::handlers::agent::events::clear_pending_turn(&mut session);
 
     // ---- Save session before spawn (metadata-group merge) ----
-    if let Err(error) = state.persistence.merge_save_runtime(&mut session).await {
+    let saved = if let Some(persistence) = execution_persistence.as_ref() {
+        persistence.save_runtime_session(&mut session).await
+    } else {
+        state.persistence.merge_save_runtime(&mut session).await
+    };
+    if let Err(error) = saved {
         execution_reservation.abandon().await;
         rollback_startup(
             state,
@@ -175,10 +192,12 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             error
         ));
     }
-    state.sessions.insert(
-        session_id.to_string(),
-        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
-    );
+    if execution_persistence.is_none() {
+        state.sessions.insert(
+            session_id.to_string(),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
+        );
+    }
 
     let disabled_tools: BTreeSet<String> = disabled_tools.into_iter().collect();
     let disabled_skill_ids: BTreeSet<String> = disabled_skill_ids.into_iter().collect();
@@ -225,13 +244,14 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     // Create mpsc channel for agent loop.
     let (mpsc_tx, mpsc_rx) = mpsc::channel::<bamboo_agent_core::AgentEvent>(100);
 
-    let history_commit_barrier = spawn_event_forwarder(
+    let history_commit_barrier = spawn_event_forwarder_with_root_actor(
         state.clone(),
         session_id.to_string(),
         run_id.clone(),
         mpsc_rx,
         session_tx.clone(),
         gold_config.clone(),
+        execution_reservation.root_actor_writer(),
     );
     let model_roster = bamboo_engine::ModelRoster::from_areas(
         Some(ready.effective_model),
