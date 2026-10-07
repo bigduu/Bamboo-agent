@@ -9,7 +9,7 @@ pub(super) fn for_arguments<T: schemars::JsonSchema>() -> serde_json::Value {
     schema.to_value()
 }
 
-// Read/Glob historically advertise a plain number while serde parses usize.
+// Read/Glob/Grep historically advertise a plain number while serde parses usize.
 // Keep that provider contract without integer bounds or a float format.
 pub(super) fn number(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({"type": "number"})
@@ -22,7 +22,7 @@ mod tests {
     use bamboo_llm::providers::common::tool_schema::sanitize_openai_function_parameters_schema;
     use serde_json::json;
 
-    use crate::tools::{GlobTool, ReadTool, ViewImageTool, WriteTool};
+    use crate::tools::{GlobTool, GrepTool, ReadTool, ViewImageTool, WriteTool};
 
     fn anthropic_input_schema(
         tool: &dyn Tool,
@@ -157,6 +157,37 @@ mod tests {
                         "default": false,
                         "description": "Include gitignored files. Requires an explicit path; scan/result limits and fixed directory exclusions still apply."
                     }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
+        );
+    }
+
+    #[test]
+    fn grep_schema_preserves_existing_parameter_contract() {
+        assert_unchanged(
+            &GrepTool::new(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Regex pattern" },
+                    "path": { "type": "string", "description": "File or directory to search. An explicit file bypasses ignore rules. Narrow this for expensive or multiline searches." },
+                    "glob": { "type": "string", "description": "Glob file filter used to limit candidate files" },
+                    "output_mode": {
+                        "type": "string",
+                        "enum": ["content", "files_with_matches", "count"],
+                        "description": "Output mode. Prefer files_with_matches for broad discovery, then refine with Read or content mode."
+                    },
+                    "-B": { "type": "number", "description": "Lines before match" },
+                    "-A": { "type": "number", "description": "Lines after match" },
+                    "-C": { "type": "number", "description": "Lines before and after match" },
+                    "-n": { "type": "boolean", "description": "Show line numbers" },
+                    "-i": { "type": "boolean", "description": "Case insensitive" },
+                    "type": { "type": "string", "description": "File type filter (for example rust, js, ts, py)" },
+                    "head_limit": { "type": "number", "description": "Limit output entries. Keep this small for broad queries." },
+                    "multiline": { "type": "boolean", "description": "Enable multiline regex. Requires a narrowed path." },
+                    "include_ignored": { "type": "boolean", "default": false, "description": "Include gitignored files. Requires an explicit path; scan/result limits and fixed directory exclusions still apply." }
                 },
                 "required": ["pattern"],
                 "additionalProperties": false

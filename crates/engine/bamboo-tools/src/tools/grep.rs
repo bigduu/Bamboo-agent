@@ -3,11 +3,10 @@ use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolRe
 use globset::{GlobBuilder, GlobSet};
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
-use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use super::{search_traversal, workspace_state};
+use super::{parameter_schema, search_traversal, workspace_state};
 
 const DEFAULT_HEAD_LIMIT: usize = 200;
 const MAX_RESULT_BYTES: usize = 256 * 1024;
@@ -19,8 +18,9 @@ const SEARCH_SCOPE_TOO_BROAD_ERROR: &str =
 const MULTILINE_REQUIRES_NARROWED_PATH_ERROR: &str = "Multiline grep requires narrowed path.";
 const RESULT_TOO_LARGE_ERROR: &str = "Result too large; refine query and retry.";
 
-#[derive(Debug, Deserialize, Clone, Copy, Default)]
+#[derive(Debug, Deserialize, Clone, Copy, Default, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[schemars(inline)]
 enum OutputMode {
     Content,
     #[default]
@@ -28,31 +28,68 @@ enum OutputMode {
     Count,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 struct GrepArgs {
+    /// Regex pattern
     pattern: String,
+    /// File or directory to search. An explicit file bypasses ignore rules. Narrow this for expensive or multiline searches.
     #[serde(default)]
+    #[schemars(with = "String", skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    /// Glob file filter used to limit candidate files
     #[serde(default)]
+    #[schemars(with = "String", skip_serializing_if = "Option::is_none")]
     glob: Option<String>,
+    /// Output mode. Prefer files_with_matches for broad discovery, then refine with Read or content mode.
     #[serde(default)]
+    #[schemars(with = "OutputMode", skip_serializing_if = "Option::is_none")]
     output_mode: Option<OutputMode>,
+    /// Lines before match
     #[serde(rename = "-B", default)]
+    #[schemars(
+        schema_with = "parameter_schema::number",
+        skip_serializing_if = "Option::is_none"
+    )]
     before: Option<usize>,
+    /// Lines after match
     #[serde(rename = "-A", default)]
+    #[schemars(
+        schema_with = "parameter_schema::number",
+        skip_serializing_if = "Option::is_none"
+    )]
     after: Option<usize>,
+    /// Lines before and after match
     #[serde(rename = "-C", default)]
+    #[schemars(
+        schema_with = "parameter_schema::number",
+        skip_serializing_if = "Option::is_none"
+    )]
     context: Option<usize>,
+    /// Show line numbers
     #[serde(rename = "-n", default)]
+    #[schemars(with = "bool", skip_serializing_if = "Option::is_none")]
     line_numbers: Option<bool>,
+    /// Case insensitive
     #[serde(rename = "-i", default)]
+    #[schemars(with = "bool", skip_serializing_if = "Option::is_none")]
     case_insensitive: Option<bool>,
+    /// File type filter (for example rust, js, ts, py)
     #[serde(default)]
+    #[schemars(with = "String", skip_serializing_if = "Option::is_none")]
     r#type: Option<String>,
+    /// Limit output entries. Keep this small for broad queries.
     #[serde(default)]
+    #[schemars(
+        schema_with = "parameter_schema::number",
+        skip_serializing_if = "Option::is_none"
+    )]
     head_limit: Option<usize>,
+    /// Enable multiline regex. Requires a narrowed path.
     #[serde(default)]
+    #[schemars(with = "bool", skip_serializing_if = "Option::is_none")]
     multiline: Option<bool>,
+    /// Include gitignored files. Requires an explicit path; scan/result limits and fixed directory exclusions still apply.
     #[serde(default)]
     include_ignored: bool,
 }
@@ -292,30 +329,7 @@ impl Tool for GrepTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "pattern": { "type": "string", "description": "Regex pattern" },
-                "path": { "type": "string", "description": "File or directory to search. An explicit file bypasses ignore rules. Narrow this for expensive or multiline searches." },
-                "glob": { "type": "string", "description": "Glob file filter used to limit candidate files" },
-                "output_mode": {
-                    "type": "string",
-                    "enum": ["content", "files_with_matches", "count"],
-                    "description": "Output mode. Prefer files_with_matches for broad discovery, then refine with Read or content mode."
-                },
-                "-B": { "type": "number", "description": "Lines before match" },
-                "-A": { "type": "number", "description": "Lines after match" },
-                "-C": { "type": "number", "description": "Lines before and after match" },
-                "-n": { "type": "boolean", "description": "Show line numbers" },
-                "-i": { "type": "boolean", "description": "Case insensitive" },
-                "type": { "type": "string", "description": "File type filter (for example rust, js, ts, py)" },
-                "head_limit": { "type": "number", "description": "Limit output entries. Keep this small for broad queries." },
-                "multiline": { "type": "boolean", "description": "Enable multiline regex. Requires a narrowed path." },
-                "include_ignored": { "type": "boolean", "default": false, "description": "Include gitignored files. Requires an explicit path; scan/result limits and fixed directory exclusions still apply." }
-            },
-            "required": ["pattern"],
-            "additionalProperties": false
-        })
+        parameter_schema::for_arguments::<GrepArgs>()
     }
 
     async fn invoke(
@@ -466,6 +480,124 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn grep_args_preserve_flag_names_and_all_values() {
+        let parsed: GrepArgs = serde_json::from_value(json!({
+            "pattern": "needle",
+            "path": "src",
+            "glob": "**/*.rs",
+            "output_mode": "content",
+            "-B": 1,
+            "-A": 2,
+            "-C": 3,
+            "-n": true,
+            "-i": false,
+            "type": "rust",
+            "head_limit": 0,
+            "multiline": false,
+            "include_ignored": true,
+            "before": 99,
+            "after": 99,
+            "context": 99,
+            "line_numbers": false,
+            "case_insensitive": true
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.pattern, "needle");
+        assert_eq!(parsed.path.as_deref(), Some("src"));
+        assert_eq!(parsed.glob.as_deref(), Some("**/*.rs"));
+        assert!(matches!(parsed.output_mode, Some(OutputMode::Content)));
+        assert_eq!(parsed.before, Some(1));
+        assert_eq!(parsed.after, Some(2));
+        assert_eq!(parsed.context, Some(3));
+        assert_eq!(parsed.line_numbers, Some(true));
+        assert_eq!(parsed.case_insensitive, Some(false));
+        assert_eq!(parsed.r#type.as_deref(), Some("rust"));
+        assert_eq!(parsed.head_limit, Some(0));
+        assert_eq!(parsed.multiline, Some(false));
+        assert!(parsed.include_ignored);
+    }
+
+    #[test]
+    fn grep_args_preserve_defaults_nulls_and_unknown_fields() {
+        for value in [
+            json!({"pattern": "needle"}),
+            json!({
+                "pattern": "needle", "before": 1, "after": 1, "context": 1,
+                "line_numbers": true, "case_insensitive": true, "unknown": true
+            }),
+            json!({
+                "pattern": "needle", "path": null, "glob": null,
+                "output_mode": null, "-B": null, "-A": null, "-C": null,
+                "-n": null, "-i": null, "type": null, "head_limit": null,
+                "multiline": null
+            }),
+        ] {
+            let parsed: GrepArgs = serde_json::from_value(value).unwrap();
+            assert_eq!(parsed.pattern, "needle");
+            assert!(parsed.path.is_none());
+            assert!(parsed.glob.is_none());
+            assert!(parsed.output_mode.is_none());
+            assert!(parsed.before.is_none());
+            assert!(parsed.after.is_none());
+            assert!(parsed.context.is_none());
+            assert!(parsed.line_numbers.is_none());
+            assert!(parsed.case_insensitive.is_none());
+            assert!(parsed.r#type.is_none());
+            assert!(parsed.head_limit.is_none());
+            assert!(parsed.multiline.is_none());
+            assert!(!parsed.include_ignored);
+            assert!(matches!(
+                parsed.output_mode.unwrap_or_default(),
+                OutputMode::FilesWithMatches
+            ));
+        }
+    }
+
+    #[test]
+    fn grep_args_preserve_output_mode_spellings() {
+        for (name, expected) in [
+            ("content", OutputMode::Content),
+            ("files_with_matches", OutputMode::FilesWithMatches),
+            ("count", OutputMode::Count),
+        ] {
+            let parsed: GrepArgs =
+                serde_json::from_value(json!({"pattern": "needle", "output_mode": name})).unwrap();
+            assert_eq!(
+                std::mem::discriminant(&parsed.output_mode.unwrap()),
+                std::mem::discriminant(&expected)
+            );
+        }
+    }
+
+    #[test]
+    fn grep_args_preserve_invalid_argument_rejection() {
+        for value in [
+            json!({}),
+            json!({"pattern": null}),
+            json!({"pattern": 1}),
+            json!({"pattern": "needle", "include_ignored": null}),
+            json!({"pattern": "needle", "output_mode": "FilesWithMatches"}),
+            json!({"pattern": "needle", "output_mode": "unknown"}),
+            json!({"pattern": "needle", "output_mode": 1}),
+        ] {
+            assert!(serde_json::from_value::<GrepArgs>(value).is_err());
+        }
+        for key in ["-B", "-A", "-C", "head_limit"] {
+            for invalid in [json!(-1), json!(1.5), json!("1")] {
+                let mut value = json!({"pattern": "needle"});
+                value[key] = invalid;
+                assert!(serde_json::from_value::<GrepArgs>(value).is_err(), "{key}");
+            }
+        }
+        for key in ["-n", "-i", "multiline", "include_ignored"] {
+            let mut value = json!({"pattern": "needle"});
+            value[key] = json!(1);
+            assert!(serde_json::from_value::<GrepArgs>(value).is_err(), "{key}");
+        }
+    }
+
     async fn run(tool: &GrepTool, args: serde_json::Value) -> Result<ToolResult, ToolError> {
         match tool.invoke(args, ToolCtx::none("t")).await? {
             ToolOutcome::Completed(r) => Ok(r),
@@ -569,6 +701,32 @@ mod tests {
         assert!(output.contains(":4:four"));
         assert!(!output.contains(":1:one"));
         assert!(!output.contains(":5:five"));
+    }
+
+    #[tokio::test]
+    async fn grep_content_flags_preserve_context_override_and_case_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("flags.txt");
+        tokio::fs::write(&file, "one\ntwo\nNEEDLE\nfour\nfive\n")
+            .await
+            .unwrap();
+
+        let result = run(
+            &GrepTool::new(),
+            json!({
+                "pattern": "needle", "path": file, "output_mode": "content",
+                "-C": 1, "-B": 2, "-A": 0, "-n": true, "-i": true
+            }),
+        )
+        .await
+        .unwrap();
+
+        let lines = result_lines(&result);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].ends_with(":1:one"));
+        assert!(lines[1].ends_with(":2:two"));
+        assert!(lines[2].ends_with(":3:NEEDLE"));
+        assert!(!result.result.contains(":4:four"));
     }
 
     #[tokio::test]
