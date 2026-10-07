@@ -241,14 +241,43 @@ async fn json_rows_runtime_child() {
     let root = std::path::PathBuf::from(std::env::var_os("BAMBOO_DATA_DIR").unwrap());
     assert_eq!(bamboo_config::paths::bamboo_dir(), root);
     let counter = TiktokenTokenCounter::default();
-    for (session, credential, pgpass, compact) in [
-        ("json-rows-safe", false, false, false),
-        ("json-rows-safe-compact", false, false, true),
-        ("json-rows-credential", true, false, false),
-        ("json-rows-pgpass", true, true, false),
+    for (session, credential, pgpass_prefix, compact) in [
+        ("json-rows-safe", false, None, false),
+        ("json-rows-safe-compact", false, None, true),
+        ("json-rows-credential", true, None, false),
+        (
+            "json-rows-pgpass",
+            true,
+            Some("localhost:5432:app:alice:"),
+            false,
+        ),
+        (
+            "json-rows-pgpass-low-port",
+            true,
+            Some("db:543:app:alice:"),
+            false,
+        ),
+        (
+            "json-rows-pgpass-spaces",
+            true,
+            Some("db:5432:app name:alice smith:"),
+            false,
+        ),
+        (
+            "json-rows-pgpass-socket",
+            true,
+            Some("/tmp/pg socket:5432:app:alice:"),
+            false,
+        ),
+        (
+            "json-rows-pgpass-port-spelling",
+            true,
+            Some("db:005432:app:alice:"),
+            false,
+        ),
     ] {
         let mut rows = sample_rows(170);
-        if credential && !pgpass {
+        if credential && pgpass_prefix.is_none() {
             rows[0]["user_visible_current_activity_description"] =
                 Value::String("Authorization: Bearer synthetic-credential-value".into());
         }
@@ -257,8 +286,8 @@ async fn json_rows_runtime_child() {
         } else {
             serde_json::to_string_pretty(&rows).unwrap()
         };
-        let stderr = if pgpass {
-            format!("localhost:5432:app:alice:{}\n", "x".repeat(4_096))
+        let stderr = if let Some(prefix) = pgpass_prefix {
+            format!("{prefix}{}\n", "x".repeat(4_096))
         } else {
             "ordinary diagnostic\n".to_string()
         };
@@ -266,7 +295,6 @@ async fn json_rows_runtime_child() {
         assert_eq!(raw.lines().count(), 1);
         assert!(raw.len() > 4_096);
         assert!(raw.bytes().filter(|byte| *byte == b':').count() > 4);
-        assert_eq!(contains_secret_like_value(&raw), credential);
         let original_tokens = counter.count_text(&raw);
         assert!(
             original_tokens >= 10_000,
@@ -308,9 +336,9 @@ async fn json_rows_runtime_child() {
         assert!(note.contains(&bamboo_config::paths::path_to_display_string(path)));
         let stored = tokio::fs::read(path).await.unwrap();
         if credential {
-            assert_eq!(
-                stored,
-                b"[tee output omitted: credential-like content detected]\n"
+            assert!(
+                stored == b"[tee output omitted: credential-like content detected]\n",
+                "credential output must be withheld for {session}"
             );
             assert!(note.contains("credential-like output was omitted"));
             assert!(!note.contains("complete output"));
@@ -318,5 +346,6 @@ async fn json_rows_runtime_child() {
             assert_eq!(stored, raw.as_bytes());
             assert!(note.contains("no credential-like content detected"));
         }
+        assert_eq!(contains_secret_like_value(&raw), credential);
     }
 }

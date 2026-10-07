@@ -951,13 +951,12 @@ fn pgpass_target_is_plausible(host: &str, port: &str) -> bool {
 }
 
 fn oversized_pgpass_record(line: &str) -> bool {
-    // Inspect the same first four fields without allocating a large database,
-    // user or password. An oversized password remains indeterminate and is
-    // screened only after a plausible Pgpass record prefix has been established.
-    let mut host = String::new();
-    let mut port = String::new();
+    // Keep oversized records conservative without allocating their fields.
+    // A broad numeric-shaped or wildcard port distinguishes record prefixes
+    // from raw JSON; short-record target heuristics must not make these safe.
     let mut field_index = 0;
     let mut field_has_content = false;
+    let mut port_has_number_or_wildcard = false;
     let mut escaped = false;
     for character in line.chars() {
         if !escaped && character == '\\' {
@@ -968,7 +967,7 @@ fn oversized_pgpass_record(line: &str) -> bool {
             if !field_has_content {
                 return false;
             }
-            if field_index == 1 && !pgpass_target_is_plausible(&host, &port) {
+            if field_index == 1 && !port_has_number_or_wildcard {
                 return false;
             }
             if field_index == 3 {
@@ -979,23 +978,12 @@ fn oversized_pgpass_record(line: &str) -> bool {
             continue;
         }
         escaped = false;
-        if character.is_whitespace() {
-            return false;
-        }
-        match field_index {
-            0 => {
-                if host.len() + character.len_utf8() > 255 {
-                    return false;
-                }
-                host.push(character);
+        if field_index == 1 {
+            if character.is_ascii_digit() || character == '*' {
+                port_has_number_or_wildcard = true;
+            } else if !character.is_ascii_whitespace() && !matches!(character, '+' | '-') {
+                return false;
             }
-            1 => {
-                if port.len() + character.len_utf8() > 5 {
-                    return false;
-                }
-                port.push(character);
-            }
-            _ => {}
         }
         field_has_content = true;
     }
@@ -3462,20 +3450,80 @@ mod tests {
         assert!(contains_secret_like_value(&crlf));
     }
 
+    fn assert_oversized_pgpass_is_screened(prefix: &str) {
+        for length in [4_097, 8_192] {
+            let record = format!("{prefix}{}", "x".repeat(length - prefix.chars().count()));
+            assert_eq!(record.chars().count(), length);
+            assert!(contains_pgpass_record(&record), "prefix {prefix}");
+            assert!(contains_secret_like_value(&record), "prefix {prefix}");
+            assert_eq!(
+                sanitize_extraction_source(&record),
+                REDACTED_EXTRACTION_SOURCE
+            );
+            let wrapped = serde_json::json!({"stdout": record, "stderr": "", "exit_code": 0});
+            assert!(
+                contains_secret_like_value(&wrapped.to_string()),
+                "wrapped prefix {prefix}"
+            );
+        }
+    }
+
     #[test]
-    fn oversized_pgpass_requires_real_separators_and_valid_target() {
+    fn oversized_pgpass_retains_single_label_low_port_records() {
         for prefix in [
-            "not a host:5432:app:alice:",
+            "db:543:app:alice:",
+            "db:1:app:alice:",
+            "crate:123:module:item:",
+            "2026:09:17:20:",
+        ] {
+            assert_oversized_pgpass_is_screened(prefix);
+        }
+    }
+
+    #[test]
+    fn oversized_pgpass_retains_literal_database_and_user_whitespace() {
+        for prefix in [
+            "db:5432:app name:alice:",
+            "db:5432:app:alice smith:",
+            "db:5432:app\tname:alice\tsmith:",
+            r"db:5432:app\: reports:ali\\ce smith:",
+        ] {
+            assert_oversized_pgpass_is_screened(prefix);
+        }
+    }
+
+    #[test]
+    fn oversized_pgpass_retains_literal_host_shapes() {
+        for prefix in [
+            "/tmp/pg socket:5432:app:alice:".to_string(),
+            format!("{}:5432:app:alice:", "h".repeat(256)),
+            "数据库:5432:app:alice:".to_string(),
+        ] {
+            assert_oversized_pgpass_is_screened(&prefix);
+        }
+    }
+
+    #[test]
+    fn oversized_pgpass_retains_numeric_port_spellings() {
+        for prefix in [
+            "db:005432:app:alice:",
+            "db: 5432 :app:alice:",
+            "db:+65535:app:alice:",
             "db:0:app:alice:",
             "db:65536:app:alice:",
             "db:543212:app:alice:",
+        ] {
+            assert_oversized_pgpass_is_screened(prefix);
+        }
+    }
+
+    #[test]
+    fn oversized_pgpass_requires_real_separators_and_record_prefix() {
+        for prefix in [
             "db:port:app:alice:",
-            "crate:123:module:item:",
-            "2026:09:17:20:",
+            "ordinary:diagnostic:value:count:",
             "db:5432::alice:",
             "db:5432:app::",
-            "db:5432:app name:alice:",
-            "db:5432:app:alice smith:",
             r"db\:5432\:app\:alice\:",
         ] {
             let record = format!("{prefix}{}", "x".repeat(4_096));
