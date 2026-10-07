@@ -233,6 +233,11 @@ jobs:
           echo "Prepared Bamboo workspace manifests for version ${TARGET_VERSION}"
           git diff -- Cargo.toml crates/*/*/Cargo.toml
 
+      - name: Refresh the temporary stamped publication lockfile
+        # Source Cargo.lock also contains 0.0.0 workspace packages. --no-deps
+        # does not resolve/update it; refresh once before locked packaging.
+        run: cargo metadata --format-version 1 > /dev/null
+
       - name: Validate publish plan
         if: github.event.inputs.dry_run == 'true'
         shell: bash
@@ -241,8 +246,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          cargo metadata --format-version 1 >/dev/null
-          cargo check --workspace --all-targets
+          cargo check --locked --workspace --all-targets
 
           cat <<EOF
           Dry-run validation completed for Bamboo ${TARGET_VERSION}.
