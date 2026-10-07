@@ -216,14 +216,14 @@ jobs:
                   if re.search(r'\bversion\s*=\s*"[^"]+"', body):
                       updated_body = re.sub(
                           r'\bversion\s*=\s*"[^"]+"',
-                          f'version = "{target_version}"',
+                          f'version = "={target_version}"',
                           body,
                       )
                   else:
                       updated_body = body.rstrip()
                       if updated_body and not updated_body.rstrip().endswith(","):
                           updated_body += ","
-                      updated_body += f' version = "{target_version}"'
+                      updated_body += f' version = "={target_version}"'
 
                   lines[idx] = f"{indent}{dep_name} = {{{updated_body}}}"
 

@@ -298,3 +298,32 @@ test('workflow preserves the exact CI commit, shared publication queue and separ
   assert.match(ci, /cancel-in-progress: \$\{\{ github.event_name != 'push' \|\| github.ref != 'refs\/heads\/main' \}\}/)
   assert.match(ci, /node --test scripts\/ci-policy.test.cjs scripts\/crate-release.test.cjs/)
 })
+
+test('temporary manifest stamping uses exact internal dependency versions and real package versions', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-release-stamp-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const member = path.join(directory, 'crates/core/bamboo-domain')
+  fs.mkdirSync(member, { recursive: true })
+  fs.writeFileSync(path.join(directory, 'Cargo.toml'),
+    '[workspace.package]\nversion = "0.0.0"\n[package]\nname = "bamboo-agent"\nversion.workspace = true\n[dependencies]\n' +
+    'bamboo-domain = { path = "crates/core/bamboo-domain", version = "0.0.0" }\n' +
+    '[build-dependencies]\nbamboo-domain = { path = "crates/core/bamboo-domain" }\n')
+  fs.writeFileSync(path.join(member, 'Cargo.toml'), '[package]\nname = "bamboo-domain"\nversion.workspace = true\n')
+  const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+  const inline = workflow.split("          python3 - <<'PY'\n")[1].split('\n          PY')[0]
+    .split('\n').map((line) => line.replace(/^ {10}/, '')).join('\n')
+  const python = ['python3', 'python3.12', 'python3.14'].find((candidate) =>
+    spawnSync(candidate, ['-c', 'import tomllib']).status === 0)
+  assert.ok(python, 'Python >= 3.11 is required by the publication manifest policy')
+  const result = spawnSync(python, ['-c', inline], { cwd: directory, encoding: 'utf8',
+    env: { ...process.env, TARGET_VERSION: '2026.10.8' } })
+  assert.equal(result.status, 0, result.stderr)
+  const stamped = fs.readFileSync(path.join(directory, 'Cargo.toml'), 'utf8')
+  assert.match(stamped, /\[workspace.package\]\nversion = "2026.10.8"/)
+  assert.equal((stamped.match(/version = "=2026.10.8"/g) || []).length, 2)
+  assert.doesNotMatch(stamped, /\[workspace.package\]\nversion = "=/)
+  assert.match(fs.readFileSync('Cargo.toml', 'utf8'), /^version = "0.0.0"$/m)
+  const runner = fs.readFileSync('scripts/crate-release.cjs', 'utf8')
+  assert.match(runner, /'package', '--locked', '--allow-dirty', '--no-verify'/)
+  assert.match(runner, /'publish', '--locked', '--allow-dirty'/)
+})

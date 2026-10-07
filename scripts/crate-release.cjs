@@ -339,12 +339,12 @@ function makeContext(env = process.env) {
       return response ? (await response.json()).version : null
     },
     package: async (name, version) => {
-      command(['cargo', 'package', '--allow-dirty', '--no-verify', '-p', name])
+      command(['cargo', 'package', '--locked', '--allow-dirty', '--no-verify', '-p', name])
       const target = jsonCommand(['cargo', 'metadata', '--format-version', '1', '--no-deps']).target_directory
       return sha256(fs.readFileSync(path.join(target, 'package', `${name}-${version}.crate`)))
     },
     cargoPublish: async (name) => {
-      const result = spawnSync('cargo', ['publish', '--allow-dirty', '-p', name], {
+      const result = spawnSync('cargo', ['publish', '--locked', '--allow-dirty', '-p', name], {
         encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
       })
       if (result.error) throw result.error
