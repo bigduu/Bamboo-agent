@@ -41,6 +41,15 @@ pub struct ChildCompletionMessageSource {
     pub message_sha256: String,
 }
 
+/// Keep the existing source key (and its merge protection) while withholding
+/// the seal until the separate Host receipt proof has been committed. A plain
+/// source reader rejects this envelope, including after a process restart.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingDeliverySource {
+    pending_confirmation: ChildCompletionSource,
+}
+
 fn digest(value: impl Serialize) -> Option<String> {
     Some(hex::encode(Sha256::digest(
         serde_json::to_vec(&value).ok()?,
@@ -160,8 +169,83 @@ impl ChildCompletionSource {
         source.matches_snapshot(session).then_some(source)
     }
 
+    /// Withhold a prepared terminal seal during the transcript/proof gap.
+    /// Non-terminal handoffs have no source and need no deferred publication.
+    pub(crate) fn defer_for_durable_delivery(
+        session: &mut Session,
+        activation_run_id: &str,
+    ) -> Result<bool, String> {
+        if !Self::has_source_record(session) {
+            return Ok(false);
+        }
+        let source = Self::from_committed_session(session)
+            .filter(|source| source.activation_run_id == activation_run_id)
+            .ok_or_else(|| "Child delivery source does not match the final snapshot".to_string())?;
+        let pending = serde_json::to_string(&PendingDeliverySource {
+            pending_confirmation: source,
+        })
+        .map_err(|error| error.to_string())?;
+        session.metadata.insert(TERMINAL_SOURCE_KEY.into(), pending);
+        Ok(true)
+    }
+
+    /// Unwrap only the exact staged activation after its Host proof is known
+    /// committed. The caller must checkpoint this mutation before publishing
+    /// completion or ACKing delivery. Already-published legacy sources are inert.
+    pub(crate) fn publish_after_durable_delivery(
+        session: &mut Session,
+        activation_run_id: &str,
+    ) -> Result<bool, String> {
+        let Some(raw) = session.metadata.get(TERMINAL_SOURCE_KEY) else {
+            return Ok(false);
+        };
+        if raw.len() > 8192 {
+            return Err("Pending Child delivery source exceeds its size bound".into());
+        }
+        let pending = match serde_json::from_str::<PendingDeliverySource>(raw) {
+            Ok(pending) => pending,
+            // A historical published source can legitimately stop matching
+            // after a successor starts. It requires no publication mutation.
+            Err(_) => {
+                return serde_json::from_str::<Self>(raw)
+                    .map(|_| false)
+                    .map_err(|_| "Pending Child delivery source is malformed".to_string());
+            }
+        };
+        let source = pending.pending_confirmation;
+        if source.activation_run_id != activation_run_id || !source.matches_snapshot(session) {
+            return Err("Pending Child delivery source does not match this activation".into());
+        }
+        let raw = serde_json::to_string(&source).map_err(|error| error.to_string())?;
+        if raw.len() > 4096 {
+            return Err("Child delivery source exceeds its size bound".into());
+        }
+        session.metadata.insert(TERMINAL_SOURCE_KEY.into(), raw);
+        Ok(true)
+    }
+
     pub(crate) fn has_source_record(session: &Session) -> bool {
         session.metadata.contains_key(TERMINAL_SOURCE_KEY)
+    }
+
+    /// A successor must retire an older pending publication before dispatch.
+    /// Unknown/malformed records stay fail-closed rather than being erased.
+    pub(crate) fn retire_pending_delivery_for_successor(
+        session: &mut Session,
+        activation_run_id: &str,
+    ) -> bool {
+        let retire = session
+            .metadata
+            .get(TERMINAL_SOURCE_KEY)
+            .filter(|raw| raw.len() <= 8192)
+            .and_then(|raw| serde_json::from_str::<PendingDeliverySource>(raw).ok())
+            .is_some_and(|pending| {
+                pending.pending_confirmation.activation_run_id != activation_run_id
+            });
+        if retire {
+            session.metadata.remove(TERMINAL_SOURCE_KEY);
+        }
+        retire
     }
 
     pub(crate) fn after_final_save(session: &Session, saved: bool) -> Option<Self> {
@@ -324,6 +408,99 @@ mod tests {
         assert!(source
             .result(&child, &Session::new("parent", "model"))
             .is_none());
+    }
+
+    #[test]
+    fn pending_delivery_source_survives_restart_without_publishing_success() {
+        let mut child = final_child();
+        ChildCompletionSource::prepare(&mut child, "host-run-A", &HashSet::new());
+        assert!(
+            ChildCompletionSource::defer_for_durable_delivery(&mut child, "host-run-A").unwrap()
+        );
+        child.set_last_run_status("running");
+        let mut cold: Session =
+            serde_json::from_slice(&serde_json::to_vec(&child).unwrap()).unwrap();
+        assert!(ChildCompletionSource::has_source_record(&cold));
+        assert!(ChildCompletionSource::from_committed_session(&cold).is_none());
+        assert!(
+            ChildCompletionSource::publish_after_durable_delivery(&mut cold, "host-run-A").is_err()
+        );
+
+        cold.set_last_run_status("completed");
+        assert!(
+            ChildCompletionSource::publish_after_durable_delivery(&mut cold, "other-run").is_err()
+        );
+        assert!(ChildCompletionSource::from_committed_session(&cold).is_none());
+        assert!(
+            ChildCompletionSource::publish_after_durable_delivery(&mut cold, "host-run-A").unwrap()
+        );
+        assert_eq!(
+            ChildCompletionSource::from_committed_session(&cold)
+                .unwrap()
+                .activation_run_id,
+            "host-run-A"
+        );
+    }
+
+    #[test]
+    fn pending_delivery_source_rejects_changed_snapshot_and_prepare_replaces_it() {
+        let mut child = final_child();
+        ChildCompletionSource::prepare(&mut child, "host-run-A", &HashSet::new());
+        ChildCompletionSource::defer_for_durable_delivery(&mut child, "host-run-A").unwrap();
+        child.messages[1].content.push_str("changed");
+        assert!(
+            ChildCompletionSource::publish_after_durable_delivery(&mut child, "host-run-A")
+                .is_err()
+        );
+        assert!(ChildCompletionSource::from_committed_session(&child).is_none());
+
+        ChildCompletionSource::prepare(&mut child, "host-run-B", &HashSet::new());
+        assert_eq!(
+            ChildCompletionSource::from_committed_session(&child)
+                .unwrap()
+                .activation_run_id,
+            "host-run-B"
+        );
+    }
+
+    #[test]
+    fn published_historical_source_is_untouched_during_successor_recovery() {
+        let mut child = final_child();
+        ChildCompletionSource::prepare(&mut child, "host-run-A", &HashSet::new());
+        let source = child.metadata.get(TERMINAL_SOURCE_KEY).cloned();
+        child.set_last_run_status("running");
+        child.add_message(Message::user("successor task"));
+        child.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new("host-run-B"));
+        assert!(
+            !ChildCompletionSource::publish_after_durable_delivery(&mut child, "host-run-A")
+                .unwrap()
+        );
+        assert_eq!(child.metadata.get(TERMINAL_SOURCE_KEY), source.as_ref());
+        assert_eq!(child.last_run_status().as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn successor_retires_only_another_well_formed_pending_delivery() {
+        let mut child = final_child();
+        ChildCompletionSource::prepare(&mut child, "host-run-A", &HashSet::new());
+        ChildCompletionSource::defer_for_durable_delivery(&mut child, "host-run-A").unwrap();
+        assert!(
+            !ChildCompletionSource::retire_pending_delivery_for_successor(&mut child, "host-run-A")
+        );
+        assert!(ChildCompletionSource::has_source_record(&child));
+        assert!(
+            ChildCompletionSource::retire_pending_delivery_for_successor(&mut child, "host-run-B")
+        );
+        assert!(!ChildCompletionSource::has_source_record(&child));
+        child.metadata.insert(
+            TERMINAL_SOURCE_KEY.into(),
+            "{\"pending_confirmation\":{}}".into(),
+        );
+        assert!(
+            !ChildCompletionSource::retire_pending_delivery_for_successor(&mut child, "host-run-B")
+        );
+        assert!(ChildCompletionSource::has_source_record(&child));
+        assert!(ChildCompletionSource::from_committed_session(&child).is_none());
     }
 
     #[test]

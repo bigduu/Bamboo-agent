@@ -164,14 +164,29 @@ pub trait ExternalChildRunner: Send + Sync {
         Ok(false)
     }
 
-    /// Called only after the Host's final Child Session save returns. The
-    /// exact Child birth and activation run identify a pending broker terminal
-    /// receipt; a failed save leaves the mailbox unacknowledged.
+    /// Commit and read back any Host-only proof required for this terminal
+    /// delivery after the final Child Session save. Failure (including timeout)
+    /// prevents a committed completion source and successful runner finalization.
+    /// When the source is pending, publish its terminal status and seal with an
+    /// exact-snapshot canonical write before returning; the SDK verifies readback.
+    /// Legacy/default runners need no separate proof and retain save-only behavior.
+    async fn commit_durable_child_delivery(
+        &self,
+        _session: &Session,
+        _activation_run_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// ACK transport delivery only after the final Child save and required
+    /// Host proof commit both succeed. The exact Child birth and activation run
+    /// identify the pending receipt; failed commitment leaves it unacknowledged.
+    /// ACK delivery failure does not invalidate an already-proven completion.
     async fn confirm_durable_child_delivery(
         &self,
         _session: &Session,
         _activation_run_id: &str,
-        _save_succeeded: bool,
+        _history_committed: bool,
     ) -> Result<(), String> {
         Ok(())
     }
