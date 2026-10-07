@@ -14,6 +14,7 @@ pub mod goal;
 pub mod grep;
 pub mod kill_shell;
 pub mod memory_note;
+mod parameter_schema;
 pub mod read;
 pub mod read_tracker;
 pub mod registry;

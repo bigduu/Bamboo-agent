@@ -211,6 +211,18 @@ This extraction does not wire the pure input/history helpers or register the
 progressive catalog/read Tools. The legacy Instruction path remains the only
 live protocol; an atomic live cutover is a separate migration step.
 
+Chat's existing typed Instruction selection uses a private `legacy_selection`
+adapter. Candidate revisions and snapshots still come from the same Skills
+resolver, with isolated staging pins and the existing metadata checkpoint.
+Hooks, images, Root modes and input admission remain in the chat handler.
+
+The final selected-input commit retains the original persistence and runners
+guards through durable save, admission and pin handoff. It remains detached
+from response cancellation; those guards are released before activation.
+Ordinary requests keep their existing input and idempotent replay behavior.
+This adapter adds no caller grant, Session field, reader registration or
+additional writer. The pure prepared-input helpers remain unwired.
+
 ## License
 
 Project-owned code is licensed under the [MIT License](./LICENSE).

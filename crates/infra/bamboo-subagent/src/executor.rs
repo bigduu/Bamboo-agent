@@ -513,7 +513,9 @@ impl ChildExecutor for EchoExecutor {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    // Keep the 2ms timer independent of wall-clock descheduling when
+    // cancellation or a disconnected inbox is already ready.
+    #[tokio::test(start_paused = true)]
     async fn initial_release_wait_observes_timeout_disconnect_and_cancel() {
         let request = crate::proto::InitialInputReleaseRequest {
             version: 1,
@@ -547,11 +549,14 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-            assert!(error.contains(match case {
-                "timeout" => "timed out",
-                "cancel" => "cancelled",
-                _ => "missing",
-            }));
+            assert!(
+                error.contains(match case {
+                    "timeout" => "timed out",
+                    "cancel" => "cancelled",
+                    _ => "missing",
+                }),
+                "initial release case={case}, actual error={error:?}"
+            );
         }
     }
 
