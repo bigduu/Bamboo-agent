@@ -439,11 +439,12 @@ async fn reader_round_with(
         .await;
         assert!(result.is_err());
         assert_eq!(observed_tool_output_cap(&owned), None);
+        let persisted = storage.load_session(&session.id).await.unwrap().unwrap();
         return Observation {
             requests: Vec::new(),
             pages: pages.lock().unwrap().clone(),
             errors: errors.lock().unwrap().clone(),
-            persisted: storage.load_session(&session.id).await.unwrap().unwrap(),
+            persisted,
             raw,
             caps: caps.lock().unwrap().clone(),
             actual_cap: None,
