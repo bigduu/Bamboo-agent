@@ -1063,6 +1063,28 @@ fn assert_read_provider_blocks(
         );
         largest = largest.max(cost);
     }
+    let chat =
+        bamboo_llm::providers::common::openai_compat::messages_to_openai_compat_json(&messages);
+    let block = chat
+        .iter()
+        .find(|v| v["tool_call_id"] == ctx.tool_call_id.as_ref())
+        .unwrap();
+    assert_eq!(block["content"], result.result);
+    let cost = serde_json::to_vec(block).unwrap().len();
+    assert!(cost <= budget);
+    largest = largest.max(cost);
+    use bamboo_llm::protocol::{gemini::GeminiRequest, ToProvider};
+    let gemini: GeminiRequest = messages.to_vec().to_provider().unwrap();
+    let gemini = serde_json::to_value(gemini).unwrap();
+    let block = gemini["contents"][1]["parts"][0].clone();
+    assert_eq!(block["functionResponse"]["name"], ctx.tool_call_id.as_ref());
+    assert_eq!(
+        block["functionResponse"]["response"],
+        serde_json::from_str::<Value>(&result.result).unwrap()
+    );
+    let cost = serde_json::to_vec(&block).unwrap().len();
+    assert!(cost <= budget);
+    largest = largest.max(cost);
     assert_eq!(
         super::catalog::page_size(result, &ctx.tool_call_id).unwrap(),
         largest,
@@ -1623,4 +1645,248 @@ async fn skills_read_native_windows_junction_replacement_rejects_foreign_auxilia
             .await
             .is_err()
     );
+}
+
+// Bamboo-authored output preparation fixtures. Production has no caller-cap
+// producer: this test-only resolver composes the explicitly supplied current cap.
+struct BudgetResolver {
+    caller: Arc<Resolver>,
+    cap: RwLock<Option<u32>>,
+}
+#[async_trait]
+impl SkillCatalogCallerResolver for BudgetResolver {
+    async fn resolve(&self, ctx: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
+        let mut current = self.caller.resolve(ctx).await?;
+        current.response_bytes =
+            skill_response_byte_budget(current.response_bytes, *self.cap.read().await)?;
+        Ok(current)
+    }
+}
+fn budget_reader(fixture: &Fixture, cap: Option<u32>) -> (SkillsReadTool, Arc<BudgetResolver>) {
+    let resolver = Arc::new(BudgetResolver {
+        caller: fixture.resolver.clone(),
+        cap: RwLock::new(cap),
+    });
+    let reader = SkillsReadTool::new(SkillsListTool::new(
+        fixture.manager.clone(),
+        fixture.config.clone(),
+        fixture.repo.clone(),
+        resolver.clone(),
+    ));
+    (reader, resolver)
+}
+
+#[tokio::test]
+async fn skill_output_composed_known_caps_bound_all_real_converters_and_reconstruct_eof() {
+    let mut fixture = Fixture::new(1).await;
+    fixture.ctx.tool_call_id = "call-界\"\\🦀".repeat(16).into();
+    let expected = std::fs::read_to_string(
+        fixture
+            ._directory
+            .path()
+            .join("skills")
+            .join("catalog-0")
+            .join("references")
+            .join("raw.txt"),
+    )
+    .unwrap();
+    for cap in [0, 1024, 1500] {
+        let (reader, _) = budget_reader(&fixture, Some(cap));
+        let budget = skill_response_byte_budget(8_000, Some(cap)).unwrap();
+        let mut cursor = None;
+        let mut joined = String::new();
+        let mut seen = BTreeSet::new();
+        loop {
+            let (result, page) = read_page(
+                &reader,
+                &fixture.ctx,
+                "catalog-0",
+                "references/raw.txt",
+                cursor.as_deref(),
+            )
+            .await
+            .unwrap();
+            assert_read_provider_blocks(&result, &fixture.ctx, budget);
+            assert!(result.result.len() <= budget);
+            let contents = page["contents"].as_str().unwrap();
+            assert!(!contents.is_empty());
+            joined.push_str(contents);
+            if let Some(next) = page["next_cursor"].as_str() {
+                assert!(seen.insert(next.to_string()));
+                assert_eq!(
+                    next.rsplit(':').next().unwrap().parse::<usize>().unwrap(),
+                    joined.len()
+                );
+                cursor = Some(next.to_string());
+            } else {
+                break;
+            }
+            assert!(seen.len() <= expected.len());
+        }
+        assert_eq!(joined, expected);
+        if cap == 1024 {
+            assert!(!seen.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn skill_output_unknown_zero_and_tiny_caps_are_real_reader_errors_without_partial_pages() {
+    let fixture = Fixture::new(1).await;
+    for cap in [None, Some(1), Some(128)] {
+        let (reader, _) = budget_reader(&fixture, cap);
+        let error = read_page(
+            &reader,
+            &fixture.ctx,
+            "catalog-0",
+            "references/raw.txt",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, ToolError::Execution(_)),
+            "actual resolver/Reader failure: {error}"
+        );
+    }
+    fixture
+        .resolver
+        .0
+        .write()
+        .await
+        .as_mut()
+        .unwrap()
+        .response_bytes = 0;
+    let (reader, _) = budget_reader(&fixture, Some(0));
+    assert!(read_page(
+        &reader,
+        &fixture.ctx,
+        "catalog-0",
+        "references/empty.txt",
+        None
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+async fn skill_output_budget_composition_preserves_fresh_warm_and_cold_authority_denials() {
+    for change in [
+        "tighten", "unknown", "ceiling", "disabled", "ultra", "input", "manual", "mode", "raw",
+        "policy", "physical",
+    ] {
+        let fixture = Fixture::new(1).await;
+        let (warm, resolver) = budget_reader(&fixture, Some(1024));
+        let (_, first) = read_page(&warm, &fixture.ctx, "catalog-0", "references/raw.txt", None)
+            .await
+            .unwrap();
+        let cursor = first["next_cursor"].as_str().unwrap();
+        let mut session = fixture.repo.load("catalog-session").await.unwrap();
+        let root = fixture._directory.path().join("skills").join("catalog-0");
+        match change {
+            "tighten" => *resolver.cap.write().await = Some(512),
+            "unknown" => *resolver.cap.write().await = None,
+            "ceiling" => {
+                fixture.resolver.0.write().await.as_mut().unwrap().ceiling = Some(BTreeSet::new())
+            }
+            "disabled" => fixture
+                .config
+                .write()
+                .await
+                .skills
+                .disabled
+                .push("catalog-0".into()),
+            "ultra" => {
+                session.root_orchestration_only = true;
+                session.root_tool_authority_revision += 1;
+                fixture.repo.save(&mut session).await.unwrap();
+            }
+            "input" => {
+                let next = Message::user("new current input with no invocation");
+                session.messages.push(next.clone());
+                fixture.repo.save(&mut session).await.unwrap();
+                let mut current = fixture.resolver.0.write().await;
+                current.as_mut().unwrap().input_id = next.id;
+                current.as_mut().unwrap().invocation = None;
+            }
+            "manual" => {
+                fixture
+                    .resolver
+                    .0
+                    .write()
+                    .await
+                    .as_mut()
+                    .unwrap()
+                    .invocation = None
+            }
+            "mode" => {
+                fixture.resolver.0.write().await.as_mut().unwrap().mode = Some("../invalid".into())
+            }
+            "raw" => {
+                std::fs::write(root.join("references").join("raw.txt"), "foreign raw bytes")
+                    .unwrap();
+            }
+            "policy" => {
+                std::fs::write(
+                    root.join("agents").join("bamboo.yaml"),
+                    "invocation_policy:\n  explicit: false\n  automatic: false\n",
+                )
+                .unwrap();
+                fixture.manager.store().reload().await.unwrap();
+            }
+            "physical" => {
+                std::fs::rename(
+                    root.join("references").join("raw.txt"),
+                    root.join("references").join("old.txt"),
+                )
+                .unwrap();
+                std::fs::write(
+                    root.join("references").join("raw.txt"),
+                    "foreign physical file",
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            read_page(
+                &warm,
+                &fixture.ctx,
+                "catalog-0",
+                "references/raw.txt",
+                Some(cursor)
+            )
+            .await
+            .is_err(),
+            "warm {change}"
+        );
+        let cold = SkillsReadTool::new(SkillsListTool::new(
+            fixture.manager.clone(),
+            fixture.config.clone(),
+            fixture.repo.clone(),
+            resolver,
+        ));
+        assert!(
+            read_page(
+                &cold,
+                &fixture.ctx,
+                "catalog-0",
+                "references/raw.txt",
+                Some(cursor)
+            )
+            .await
+            .is_err(),
+            "cold old cursor {change}"
+        );
+        // A newly authorized capture may read current auxiliary bytes; old
+        // warm/cold cursors never authorize a replaced snapshot.
+        if !matches!(change, "tighten" | "raw" | "physical") {
+            assert!(
+                read_page(&cold, &fixture.ctx, "catalog-0", "references/raw.txt", None)
+                    .await
+                    .is_err(),
+                "cold fresh source {change}"
+            );
+        }
+    }
 }
