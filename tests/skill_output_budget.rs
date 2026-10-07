@@ -198,21 +198,28 @@ impl LLMProvider for RecordingProvider {
         let mut requests = self.requests.lock().unwrap();
         let index = requests.len();
         requests.push(messages.to_vec());
+        let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
         let cursor = messages
             .iter()
             .rev()
             .find(|m| {
                 m.role == Role::Tool
-                    && m.tool_call_id
-                        .as_deref()
-                        .is_some_and(|id| id.starts_with("actual-reader-call"))
+                    && m.tool_call_id.as_deref().is_some_and(|id| {
+                        if generation == 0 {
+                            id == "actual-reader-call"
+                                || id
+                                    .strip_prefix("actual-reader-call-")
+                                    .is_some_and(|suffix| suffix.parse::<usize>().is_ok())
+                        } else {
+                            id.starts_with(&format!("actual-reader-call-r{generation}-"))
+                        }
+                    })
             })
             .and_then(|m| serde_json::from_str::<Value>(&m.content).ok())
             .and_then(|page| page["next_cursor"].as_str().map(str::to_string));
         let chunks = if index == 0 || (self.eof && cursor.is_some()) {
             assert!(index < 50, "bounded fixture must advance to EOF");
             let mut args = self.args.lock().unwrap().clone();
-            let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
             if let Some(cursor) = cursor {
                 args["cursor"] = json!(cursor);
             }
@@ -407,6 +414,43 @@ async fn reader_round_with(
         Arc::new(Neighbor { started }),
         reader.clone(),
     ));
+    // A normal lower-level Core dispatch has no round-resolved budget or scope.
+    // Exercise the real getter-consuming Reader, without fabricating a scope/Err.
+    if repeat == Some(("unavailable", false)) {
+        assert!(session.effective_token_budget().is_none());
+        let call = ToolCall {
+            id: "lower-reader-unavailable".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "skills_read".into(),
+                arguments: json!({"package":package,"resource":"references/raw.txt"}).to_string(),
+            },
+        };
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.session_id = Some(&session.id);
+        let owned = ctx.to_tool_ctx();
+        assert_eq!(observed_tool_output_cap(&owned), None);
+        let result = bamboo_agent_core::tools::executor::execute_tool_call_with_context_outcome(
+            &call,
+            overlay.as_ref(),
+            None,
+            ctx,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(observed_tool_output_cap(&owned), None);
+        return Observation {
+            requests: Vec::new(),
+            pages: pages.lock().unwrap().clone(),
+            errors: errors.lock().unwrap().clone(),
+            persisted: storage.load_session(&session.id).await.unwrap().unwrap(),
+            raw,
+            caps: caps.lock().unwrap().clone(),
+            actual_cap: None,
+            resolved_cap: None,
+            previous_cap: None,
+        };
+    }
     let requests = Arc::new(Mutex::new(Vec::new()));
     let provider = Arc::new(RecordingProvider {
         args: Mutex::new(json!({"package":package,"resource":"references/raw.txt"})),
@@ -892,6 +936,43 @@ async fn skill_output_scoped_fresh_resolved_default_override_and_known_zero() {
     }
 }
 
+fn reader_arguments(observed: &Observation, id: &str) -> Value {
+    let call = observed
+        .persisted
+        .messages
+        .iter()
+        .flat_map(|message| message.tool_calls.iter().flatten())
+        .find(|call| call.id == id)
+        .unwrap();
+    serde_json::from_str(&call.function.arguments).unwrap()
+}
+
+#[tokio::test]
+async fn skill_output_unknown_dispatch_observation_is_real_failed_reader_call() {
+    let observed = reader_round_with(
+        8_000,
+        None,
+        true,
+        false,
+        false,
+        true,
+        Some(("unavailable", false)),
+    )
+    .await;
+    assert!(observed.actual_cap.is_none() && observed.resolved_cap.is_none());
+    assert!(observed.persisted.effective_token_budget().is_none());
+    assert!(observed.requests.is_empty() && observed.pages.is_empty());
+    assert_eq!(
+        observed.caps,
+        vec![("lower-reader-unavailable".into(), None)]
+    );
+    assert_eq!(observed.errors.len(), 1);
+    assert_eq!(observed.errors[0].0, "lower-reader-unavailable");
+    assert!(observed.errors[0]
+        .1
+        .contains("known current tool-output cap"));
+}
+
 #[tokio::test]
 async fn skill_output_scoped_runtime_cleared_defaults_resolve_again() {
     let observed = reader_round_with(
@@ -910,6 +991,12 @@ async fn skill_output_scoped_runtime_cleared_defaults_resolve_again() {
     assert!(observed.resolved_cap.is_some());
     assert_eq!(observed.actual_cap, observed.resolved_cap);
     assert_scoped_success(&observed);
+    assert!(reader_arguments(&observed, "actual-reader-call-r1-0")
+        .get("cursor")
+        .is_none());
+    let page: Value = serde_json::from_str(&observed.pages[0].1).unwrap();
+    let contents = page["contents"].as_str().unwrap();
+    assert!(!contents.is_empty() && observed.raw.starts_with(contents));
 }
 
 #[tokio::test]
@@ -969,6 +1056,21 @@ async fn skill_output_scoped_runtime_warm_and_cold_revocation_remains_mandatory(
                 continue;
             }
             assert_eq!(observed.errors.len(), 1, "{change}, cold={cold}");
+            if cold {
+                assert!(reader_arguments(&observed, "actual-reader-call-r1-0")
+                    .get("cursor")
+                    .is_none());
+            }
+            let cause = if change == "raw" {
+                "changed"
+            } else {
+                "not currently eligible"
+            };
+            assert!(
+                observed.errors[0].1.contains(cause),
+                "{change}, cold={cold}: {:?}",
+                observed.errors
+            );
             assert!(!observed.caps.is_empty());
             assert!(observed
                 .caps
