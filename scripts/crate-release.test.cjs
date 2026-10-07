@@ -283,6 +283,32 @@ test('dry run performs no registry/GitHub reads, draft reservation, tag or asset
   assert.deepEqual(calls, [])
 })
 
+test('manual versions obey Cargo SemVer before external operations and retain the existing build-metadata exclusion', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-release-semver-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(directory, 'src'))
+  fs.writeFileSync(path.join(directory, 'src/lib.rs'), '')
+  const valid = ['1.2.3', '1.2.3-rc.0', '1.2.3-184467440737095516160', '18446744073709551615.1.2']
+  const unsupported = ['1.2.3+001', '1.2.3-rc.0+build.001']
+  const invalid = ['1.2.3-a..b', '1.2.3-.', '1.2.3-01', '1.2.3-rc.01', '1.2.3+', '1.2.3+a..b',
+    '01.2.3', '1.02.3', '1.2.03', '18446744073709551616.1.2', '1.18446744073709551616.2', '1.2.18446744073709551616']
+  for (const version of [...valid, ...invalid, ...unsupported]) {
+    fs.writeFileSync(path.join(directory, 'Cargo.toml'), `[package]\nname="bamboo-semver-fixture"\nversion=${JSON.stringify(version)}\nedition="2021"\n`)
+    const cargo = spawnSync('cargo', ['metadata', '--offline', '--no-deps', '--format-version', '1'], { cwd: directory, encoding: 'utf8' })
+    if (valid.includes(version)) {
+      assert.equal(assertVersion(version), version)
+      assert.equal(cargo.status, 0, cargo.stderr)
+    } else {
+      if (unsupported.includes(version)) assert.equal(cargo.status, 0, cargo.stderr)
+      else assert.notEqual(cargo.status, 0, version)
+      const { context, calls } = fixture({ automatic: false, requestedVersion: version,
+        releases: async () => { throw new Error('Invalid version must not read external history') } })
+      await assert.rejects(() => plan(context), /Pass a real, explicit publish version/)
+      assert.deepEqual(calls, [])
+    }
+  }
+})
+
 test('automatic planning trusts registry and signed reservations while tags only occupy candidates', async () => {
   const reserved = makeReceipt({ version: '2026.10.11', identity: { ...clone(identity), sourceRevision: 'b'.repeat(40) } })
   const { context, calls } = fixture({
@@ -690,16 +716,109 @@ test('workflow preserves the exact CI commit, shared publication queue and separ
   const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
   assert.match(workflow, /workflow_run:\n    workflows: \[CI\]\n    types: \[completed\]\n    branches: \[main\]/)
   assert.match(workflow, /group: bamboo-crate-publication\n  queue: max\n  cancel-in-progress: false/)
-  assert.match(workflow, /ref: \$\{\{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha \|\| github.sha \}\}/)
-  assert.match(workflow, /contents: write/)
-  assert.match(workflow, /secrets.BAMBOO_RELEASE_TOKEN \|\| github.token/)
-  assert.equal((workflow.match(/BAMBOO_RELEASE_SIGNING_KEY: \$\{\{ secrets.BAMBOO_RELEASE_SIGNING_KEY \}\}/g) || []).length, 2)
+  assert.match(workflow, /permissions:\n  contents: read/)
+  assert.match(workflow, /environment: bamboo-release\n    permissions:\n      contents: write\n    steps: \*release-steps/)
+  assert.doesNotMatch(workflow.split('  dry-run:\n')[1].split('    steps:')[0], /environment:/)
+  assert.match(workflow, /ref: \$\{\{ steps.source.outputs.revision \}\}\n          fetch-depth: 0\n          persist-credentials: false/)
+  assert.ok(workflow.indexOf('Authorize the exact source') < workflow.indexOf('uses: actions/checkout'))
+  assert.ok(workflow.indexOf('Verify checkout matches') < workflow.indexOf('node scripts/'))
+  for (const name of ['CARGO_REGISTRY_TOKEN', 'BAMBOO_RELEASE_SIGNING_KEY']) {
+    assert.equal(workflow.split(`${name}: \${{ github.job == 'publish' && secrets.${name} || '' }}`).length - 1, 2)
+  }
+  assert.equal(workflow.split("GH_TOKEN: ${{ github.job == 'publish' && secrets.BAMBOO_RELEASE_TOKEN || github.token }}").length - 1, 2)
   assert.doesNotMatch(workflow, /VERSION="\$\{\{ github.event.inputs.version/)
   const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8')
   assert.match(ci, /group: ci-\$\{\{ github.event_name \}\}/)
   assert.match(ci, /queue: \$\{\{ github.event_name == 'push' && github.ref == 'refs\/heads\/main' && 'max' \|\| 'single' \}\}/)
   assert.match(ci, /cancel-in-progress: \$\{\{ github.event_name != 'push' \|\| github.ref != 'refs\/heads\/main' \}\}/)
   assert.match(ci, /node --test scripts\/ci-policy.test.cjs scripts\/crate-release.test.cjs/)
+})
+
+function workflowPython(name) {
+  return fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8').split(`      - name: ${name}`)[1]
+    .split("          python3 - <<'PY'\n")[1].split('\n          PY')[0]
+    .split('\n').map((line) => line.replace(/^ {10}/, '')).join('\n')
+}
+
+test('trusted inline bootstrap authorizes protected historical source and workflow before checkout, while dry feature source has no API calls', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-release-bootstrap-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const git = (...args) => {
+    const result = spawnSync('git', args, { cwd: directory, encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stderr)
+    return result.stdout.trim()
+  }
+  git('init', '-q')
+  const commit = (value) => {
+    fs.writeFileSync(path.join(directory, 'source'), value)
+    git('add', 'source')
+    git('-c', 'user.name=Bootstrap fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', value)
+    return git('rev-parse', 'HEAD')
+  }
+  const historical = commit('historical')
+  const main = commit('main')
+  const dev = commit('dev')
+  git('checkout', '--detach', historical)
+  const feature = commit('feature')
+  const bin = path.join(directory, 'bin')
+  fs.mkdirSync(bin)
+  const calls = path.join(directory, 'api-calls')
+  fs.writeFileSync(path.join(bin, 'gh'), `#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys
+route = sys.argv[2]
+with open(os.environ['FIXTURE_CALLS'], 'a') as stream: stream.write(route + '\\n')
+if os.environ.get('FIXTURE_API_FAILURE') == 'true': sys.exit(1)
+if '/branches/' in route:
+    name = route.rsplit('/', 1)[-1]
+    print(json.dumps({'name': name, 'protected': os.environ.get('FIXTURE_UNPROTECTED') != 'true', 'commit': {'sha': json.loads(os.environ['FIXTURE_TIPS'])[name]}}))
+else:
+    source, tip = route.rsplit('/', 1)[-1].split('...')
+    base = subprocess.check_output(['git', 'merge-base', source, tip], cwd=os.environ['FIXTURE_REPOSITORY'], text=True).strip()
+    status = 'identical' if source == tip else 'ahead' if base == source else 'behind' if base == tip else 'diverged'
+    print(json.dumps({'status': status, 'merge_base_commit': {'sha': base}}))
+`, { mode: 0o755 })
+  const eventPath = path.join(directory, 'event.json')
+  const output = path.join(directory, 'output')
+  const bootstrap = workflowPython('Authorize the exact source before checkout')
+  const run = (overrides = {}, event = {}) => {
+    fs.writeFileSync(eventPath, JSON.stringify(event))
+    fs.writeFileSync(output, '')
+    fs.writeFileSync(calls, '')
+    const result = spawnSync('python3', ['-c', bootstrap], { encoding: 'utf8', env: { ...process.env,
+      PATH: `${bin}:${process.env.PATH}`, GITHUB_REPOSITORY: 'bigduu/Bamboo-agent', GITHUB_EVENT_NAME: 'workflow_dispatch',
+      GITHUB_EVENT_PATH: eventPath, GITHUB_SHA: historical, GITHUB_OUTPUT: output, GITHUB_REF: 'refs/heads/dev',
+      GITHUB_REF_PROTECTED: 'true', GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/publish-crate.yml@refs/heads/dev',
+      GITHUB_WORKFLOW_SHA: dev, DRY_RUN: 'false', FIXTURE_REPOSITORY: directory, FIXTURE_CALLS: calls,
+      FIXTURE_TIPS: JSON.stringify({ dev, main }), ...overrides } })
+    return { ...result, output: fs.readFileSync(output, 'utf8'), calls: fs.readFileSync(calls, 'utf8') }
+  }
+  for (const source of [historical, dev, main]) {
+    const result = run({ GITHUB_SHA: source })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.output, `revision=${source}\n`)
+  }
+  for (const overrides of [{ GITHUB_SHA: feature }, { GITHUB_SHA: 'f'.repeat(40) }, { GITHUB_SHA: 'invalid' },
+    { GITHUB_WORKFLOW_SHA: feature }, { FIXTURE_UNPROTECTED: 'true' }, { FIXTURE_API_FAILURE: 'true' },
+    { GITHUB_REF: 'refs/heads/feature' }, { GITHUB_REF_PROTECTED: 'false' },
+    { GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/publish-crate.yml@refs/heads/feature' }]) {
+    const result = run(overrides)
+    assert.notEqual(result.status, 0)
+    assert.equal(result.output, '', 'Untrusted source cannot be handed to checkout or repository code')
+  }
+  const event = { workflow_run: { event: 'push', conclusion: 'success', head_branch: 'main', head_sha: historical,
+    repository: { full_name: 'bigduu/Bamboo-agent' }, head_repository: { full_name: 'bigduu/Bamboo-agent' } } }
+  const automatic = run({ GITHUB_EVENT_NAME: 'workflow_run', GITHUB_SHA: dev }, event)
+  assert.equal(automatic.status, 0, automatic.stderr)
+  assert.equal(automatic.output, `revision=${historical}\n`)
+  for (const change of [(run) => { run.head_repository.full_name = 'foreign/repository' }, (run) => { run.event = 'pull_request' }]) {
+    const changed = clone(event)
+    change(changed.workflow_run)
+    assert.notEqual(run({ GITHUB_EVENT_NAME: 'workflow_run' }, changed).status, 0)
+  }
+  const dry = run({ DRY_RUN: 'true', GITHUB_SHA: feature, GITHUB_REF: 'refs/heads/feature', GITHUB_REF_PROTECTED: 'false' })
+  assert.equal(dry.status, 0, dry.stderr)
+  assert.equal(dry.output, `revision=${feature}\n`)
+  assert.equal(dry.calls, '')
 })
 
 test('temporary manifest stamping uses exact internal dependency versions and real package versions', (t) => {
@@ -712,9 +831,7 @@ test('temporary manifest stamping uses exact internal dependency versions and re
     'bamboo-domain = { path = "crates/core/bamboo-domain", version = "0.0.0" }\n' +
     '[build-dependencies]\nbamboo-domain = { path = "crates/core/bamboo-domain" }\n')
   fs.writeFileSync(path.join(member, 'Cargo.toml'), '[package]\nname = "bamboo-domain"\nversion.workspace = true\n')
-  const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
-  const inline = workflow.split("          python3 - <<'PY'\n")[1].split('\n          PY')[0]
-    .split('\n').map((line) => line.replace(/^ {10}/, '')).join('\n')
+  const inline = workflowPython('Prepare workspace manifests for publish')
   const python = ['python3', 'python3.12', 'python3.14'].find((candidate) =>
     spawnSync(candidate, ['-c', 'import tomllib']).status === 0)
   assert.ok(python, 'Python >= 3.11 is required by the publication manifest policy')

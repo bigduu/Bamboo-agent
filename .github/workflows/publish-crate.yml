@@ -32,7 +32,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 # Both independent main releases and Zenith/manual dispatches reserve versions
 # under this same queue. Never cancel a run that can already have uploaded crates.
@@ -45,20 +45,76 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  publish:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'main' &&
-       github.event.workflow_run.head_repository.full_name == github.repository &&
-       github.event.workflow_run.repository.full_name == github.repository)
+  dry-run:
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run
     runs-on: ubuntu-latest
-    steps:
+    # This job has no Environment and receives no publication credentials.
+    steps: &release-steps
+      - name: Authorize the exact source before checkout
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ github.job == 'dry-run' }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          assert repository == "bigduu/Bamboo-agent"
+          event_name = os.environ["GITHUB_EVENT_NAME"]
+          with open(os.environ["GITHUB_EVENT_PATH"]) as stream:
+              event = json.load(stream)
+          source = os.environ["GITHUB_SHA"]
+          if event_name == "workflow_run":
+              run = event["workflow_run"]
+              assert run["event"] == "push" and run["conclusion"] == "success" and run["head_branch"] == "main"
+              assert run["repository"]["full_name"] == repository and run["head_repository"]["full_name"] == repository
+              source = run["head_sha"]
+          else:
+              assert event_name == "workflow_dispatch"
+          assert re.fullmatch(r"[0-9a-f]{40}", source)
+
+          if os.environ["DRY_RUN"] != "true":
+              assert os.environ["GITHUB_REF"] in {"refs/heads/dev", "refs/heads/main"}, "Publication workflow must run on dev or main"
+              assert os.environ["GITHUB_REF_PROTECTED"] == "true", "Publication workflow ref must be protected"
+              workflow_ref = os.environ["GITHUB_WORKFLOW_REF"]
+              assert workflow_ref in {f"{repository}/.github/workflows/publish-crate.yml@refs/heads/{name}" for name in ("dev", "main")}
+              workflow_source = os.environ["GITHUB_WORKFLOW_SHA"]
+              assert re.fullmatch(r"[0-9a-f]{40}", workflow_source)
+              def api(route):
+                  return json.loads(subprocess.check_output(["gh", "api", f"repos/{repository}/{route}"], text=True))
+              tips = []
+              for name in ("dev", "main"):
+                  branch = api(f"branches/{name}")
+                  assert branch["name"] == name and branch["protected"] is True, "Publication source branches must be protected"
+                  tip = branch["commit"]["sha"]
+                  assert re.fullmatch(r"[0-9a-f]{40}", tip)
+                  tips.append(tip)
+              for revision in {source, workflow_source}:
+                  accepted = False
+                  for tip in tips:
+                      comparison = api(f"compare/{revision}...{tip}")
+                      if comparison["status"] in {"ahead", "identical"} and comparison["merge_base_commit"]["sha"] == revision:
+                          accepted = True
+                          break
+                  assert accepted, "Publication source and workflow must belong to protected dev/main history"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+              stream.write(f"revision={source}\n")
+          PY
+
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ steps.source.outputs.revision }}
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify checkout matches the authorized source
+        env:
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+        run: test "$(git rev-parse HEAD)" = "${SOURCE_REVISION}"
 
       - name: Require the release policy in this source commit
         # A rerun of pre-policy main CI must not publish old source after the
@@ -120,9 +176,9 @@ jobs:
         env:
           # Historical queued source can contain workflows different from the
           # default dev branch. A release token with Workflows:write supports it.
-          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN || github.token }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
+          GH_TOKEN: ${{ github.job == 'publish' && secrets.BAMBOO_RELEASE_TOKEN || github.token }}
+          CARGO_REGISTRY_TOKEN: ${{ github.job == 'publish' && secrets.CARGO_REGISTRY_TOKEN || '' }}
+          BAMBOO_RELEASE_SIGNING_KEY: ${{ github.job == 'publish' && secrets.BAMBOO_RELEASE_SIGNING_KEY || '' }}
           PUBLISH_VERSION: ${{ github.event.inputs.version }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
           FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
@@ -266,11 +322,25 @@ jobs:
           python3 scripts/compute-publish-order.py
 
       - name: Publish verified crates and complete the GitHub Release
-        if: github.event.inputs.dry_run != 'true'
+        if: github.job == 'publish'
         env:
-          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN || github.token }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
+          GH_TOKEN: ${{ github.job == 'publish' && secrets.BAMBOO_RELEASE_TOKEN || github.token }}
+          CARGO_REGISTRY_TOKEN: ${{ github.job == 'publish' && secrets.CARGO_REGISTRY_TOKEN || '' }}
+          BAMBOO_RELEASE_SIGNING_KEY: ${{ github.job == 'publish' && secrets.BAMBOO_RELEASE_SIGNING_KEY || '' }}
           FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
           FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
         run: node scripts/crate-release.cjs publish
+
+  publish:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && !inputs.dry_run) ||
+      (github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       github.event.workflow_run.repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    environment: bamboo-release
+    permissions:
+      contents: write
+    steps: *release-steps

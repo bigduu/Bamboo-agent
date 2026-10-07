@@ -237,24 +237,39 @@ authenticated history is rejected without being re-signed.
 
 The existing manual workflow inputs remain available, including `dev` dispatches
 from Zenith and the explicit fixed legacy frontend rollback. Pass an unused real
-`version`; an occupied version can resume only with matching source/frontend
+Cargo-compatible SemVer `version`; invalid identifiers or overflowing core
+components fail before reserving anything. Build metadata remains unsupported
+by this workflow. An occupied version can resume only with matching source/frontend
 provenance. Historical releases without this provenance are rejected rather than
 blindly skipped. `dry_run=true` performs local validation without creating any
 draft, tag, or release asset. Manual releases do not replace the automatic main
 release as GitHub's latest release.
 
-Set `CARGO_REGISTRY_TOKEN` for crates.io and, for historical queued source with
-workflow files different from the default `dev` branch, `BAMBOO_RELEASE_TOKEN`
-with repository Contents write and Workflows write permissions. The workflow
+Publication uses the `bamboo-release` GitHub Environment, whose custom branch
+rules must allow only the `dev` and `main` branch types, with no tag rule.
+An inline bootstrap runs before checkout or repository code and verifies that
+both the exact source SHA and workflow SHA belong to protected dev/main history.
+This keeps queued historical commits available while excluding arbitrary branch
+code from publication credentials. Zenith's existing dev/main dispatch contract
+and exact run/source SHA remain unchanged. Feature-branch dry runs use a separate
+job with read-only permissions, no Environment, and no publication credentials.
+
+Keep the existing repository `CARGO_REGISTRY_TOKEN` for crates.io. Set
+`BAMBOO_RELEASE_TOKEN` in `bamboo-release` with repository Contents write and
+Workflows write permissions for historical source with workflow files different
+from the default `dev` branch. Remove its repository-level copy. The workflow
 otherwise uses `github.token`. Tag creation checks that authority before any
 crate upload and rejects a tag pointing to different source. A token permission
 failure leaves the candidate unpublished and requires configuration before rerun.
-Also set `BAMBOO_RELEASE_SIGNING_KEY` to 32 random bytes encoded as 64 lowercase
-hex characters. Keep this recovery authority stable independently of registry
+Also set `BAMBOO_RELEASE_SIGNING_KEY` in that Environment to 32 random bytes
+encoded as 64 lowercase hex characters, and remove its repository-level copy.
+Keep this recovery authority stable independently of registry
 and API token rotation. Missing or malformed keys fail before publication;
 replacing or losing the key makes existing authenticated receipts unverifiable.
 Stop and manually verify recovery evidence rather than accepting unsigned
 history or automatically re-signing it. A dry run does not require this key.
+The pre-existing repository-level Cargo token branch exposure is tracked
+separately in [#1699](https://github.com/bigduu/Bamboo-agent/issues/1699).
 
 ## Additional Notes
 

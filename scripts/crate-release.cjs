@@ -11,7 +11,7 @@ const { isDeepStrictEqual } = require('node:util')
 const RECEIPT_NAME = 'release-provenance.json'
 const SHA = /^[0-9a-f]{40}$/
 const DIGEST = /^[0-9a-f]{64}$/
-const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/
+const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/
 const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
 const AUTH_DOMAIN = 'bamboo-release-provenance/hmac-sha256/v1\0'
 
@@ -67,7 +67,10 @@ function readAuthenticatedReceipt(release, key, { required = false } = {}) {
 }
 
 function assertVersion(version) {
-  assert.ok(typeof version === 'string' && VERSION.test(version) && version !== '0.0.0',
+  const match = typeof version === 'string' && VERSION.exec(version)
+  assert.ok(match && version !== '0.0.0' && match.slice(1, 4).every((part) =>
+    part.length <= 20 && BigInt(part) <= 18446744073709551615n) &&
+    (!match[4] || match[4].split('.').every((part) => !/^\d+$/.test(part) || !/^0\d/.test(part))),
     'Pass a real, explicit publish version; source 0.0.0 is a placeholder')
   return version
 }
@@ -160,6 +163,7 @@ async function plan(context) {
     return { version: assertVersion(!requestedVersion || requestedVersion === 'latest'
       ? sourceVersion : requestedVersion), dryRun: true }
   }
+  if (!automatic) assertVersion(!requestedVersion || requestedVersion === 'latest' ? sourceVersion : requestedVersion)
   context.assertSigningKey()
   const releases = await context.releases()
   const receipts = []
