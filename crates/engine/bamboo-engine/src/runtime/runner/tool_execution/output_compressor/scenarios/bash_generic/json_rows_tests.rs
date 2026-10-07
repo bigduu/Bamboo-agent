@@ -269,6 +269,7 @@ async fn json_rows_runtime_child() {
             "fixture reaches semantic compression tier"
         );
         let outcome = ToolExecutionOutcome {
+            output_cap: None,
             portable_tool: None,
             permission_replay_origin: None,
             result: Ok(ToolResult::text(true, raw.clone())),
