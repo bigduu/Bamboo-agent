@@ -232,8 +232,9 @@ Every reservation and update is authenticated with a domain-separated HMAC
 over the complete canonical receipt. Only authenticated, source-bound receipts
 and crates.io versions advance the automatic allocator. Unsigned release/tag
 names only occupy individual candidates; 100 consecutive collisions stop the
-run before any publication. A matching unsigned reservation or any tampered
-authenticated history is rejected without being re-signed.
+run before any publication. Matching invalid reservations are rejected without
+being re-signed. Unrelated authentication, shape or placement failures have no
+allocation or source-order authority; transport failures still stop the run.
 
 The existing manual workflow inputs remain available, including `dev` dispatches
 from Zenith and the explicit fixed legacy frontend rollback. Pass an unused real
@@ -263,8 +264,12 @@ crate upload and rejects a tag pointing to different source. A token permission
 failure leaves the candidate unpublished and requires configuration before rerun.
 Also set `BAMBOO_RELEASE_SIGNING_KEY` in that Environment to 32 random bytes
 encoded as 64 lowercase hex characters, and remove its repository-level copy.
-Keep this recovery authority stable independently of registry
-and API token rotation. Missing or malformed keys fail before publication;
+Set the Environment variable `BAMBOO_RELEASE_SIGNING_KEY_SHA256` to the lowercase
+SHA-256 of the decoded 32 key bytes. Keep both names absent from repository/org
+configuration. This public digest checks key configuration before history reads
+or publication, so a wrong key cannot silently discard authenticated history.
+Keep this recovery authority stable independently of registry and API token
+rotation. Missing, malformed or mismatched configuration fails before publication;
 replacing or losing the key makes existing authenticated receipts unverifiable.
 Stop and manually verify recovery evidence rather than accepting unsigned
 history or automatically re-signing it. A dry run does not require this key.

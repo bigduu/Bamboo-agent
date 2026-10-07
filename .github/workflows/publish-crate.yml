@@ -179,6 +179,7 @@ jobs:
           GH_TOKEN: ${{ github.job == 'publish' && secrets.BAMBOO_RELEASE_TOKEN || github.token }}
           CARGO_REGISTRY_TOKEN: ${{ github.job == 'publish' && secrets.CARGO_REGISTRY_TOKEN || '' }}
           BAMBOO_RELEASE_SIGNING_KEY: ${{ github.job == 'publish' && secrets.BAMBOO_RELEASE_SIGNING_KEY || '' }}
+          BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ github.job == 'publish' && vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 || '' }}
           PUBLISH_VERSION: ${{ github.event.inputs.version }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
           FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
@@ -327,6 +328,7 @@ jobs:
           GH_TOKEN: ${{ github.job == 'publish' && secrets.BAMBOO_RELEASE_TOKEN || github.token }}
           CARGO_REGISTRY_TOKEN: ${{ github.job == 'publish' && secrets.CARGO_REGISTRY_TOKEN || '' }}
           BAMBOO_RELEASE_SIGNING_KEY: ${{ github.job == 'publish' && secrets.BAMBOO_RELEASE_SIGNING_KEY || '' }}
+          BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ github.job == 'publish' && vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 || '' }}
           FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
           FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
         run: node scripts/crate-release.cjs publish

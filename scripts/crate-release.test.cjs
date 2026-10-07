@@ -8,7 +8,7 @@ const { assertVersion, validateSource, validateReceipt, nextVersion, selectVersi
   plan, publish, sha256, githubArgs, receiptBody, readBodyReceipt,
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend,
   shouldMakeLatest, gitIsAncestor, canonicalJson, signReceipt, authenticateReceipt,
-  readAuthenticatedReceipt, assertSigningKey, verifyRegistrySource, highestStableVersion } = require('./crate-release.cjs')
+  readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration, verifyRegistrySource, highestStableVersion } = require('./crate-release.cjs')
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
 const sourceRevision = 'a'.repeat(40)
@@ -20,6 +20,7 @@ const frontendBytes = { manifestSha256: 'd'.repeat(64), archiveSha256: 'e'.repea
 const checksum = 'f'.repeat(64)
 const now = new Date('2026-10-07T12:00:00Z')
 const signingKey = '7'.repeat(64)
+const signingKeyDigest = sha256(Buffer.from(signingKey, 'hex'))
 const makeReceipt = (extra = {}) => signReceipt({ schemaVersion: 1, version: '2026.10.8',
   identity: clone(identity), crates: [...crates], frontendBytes: { ...frontendBytes },
   automatic: true, completed: false, ciRun: null, packageChecksums: {}, ...extra }, signingKey)
@@ -36,7 +37,7 @@ function fixture(extra = {}) {
     releases: async () => [], receipts: [], tags: async () => [], versions: async () => [],
     readReceipt: async (entry, options) => readAuthenticatedReceipt(entry, signingKey, options),
     verifyReceipt: (receipt) => authenticateReceipt(receipt, signingKey),
-    assertSigningKey: () => assertSigningKey(signingKey),
+    assertSigningKey: () => assertSigningConfiguration(signingKey, signingKeyDigest),
     tagSource: async () => sourceRevision,
     registryFrontier: async () => [],
     isAncestor: async () => { throw new Error('Unexpected source ancestry lookup') },
@@ -206,14 +207,100 @@ test('matching unsigned or bad-MAC automatic and manual drafts cannot be re-sign
   }
 })
 
-test('bad authenticated foreign history and accidental key replacement fail closed without privileged writes', async () => {
-  const foreign = makeReceipt({ identity: { ...clone(identity), sourceRevision: 'b'.repeat(40) } })
-  const { context, calls } = fixture({ releases: async () => [release(foreign)],
-    readReceipt: async (entry, options) => readAuthenticatedReceipt(entry, '8'.repeat(64), options) })
-  await assert.rejects(() => plan(context), /authentication failed/)
-  assert.deepEqual(calls, [])
-  foreign.authentication.mac = 'f'.repeat(64)
-  assert.throws(() => readAuthenticatedReceipt(release(foreign), signingKey), /authentication failed/)
+test('protected signing configuration rejects key drift before any history or publication call', async () => {
+  assertSigningConfiguration(signingKey, signingKeyDigest)
+  const configurations = [
+    ['8'.repeat(64), signingKeyDigest], [signingKey, undefined], [signingKey, ''],
+    [signingKey, 'F'.repeat(64)], [signingKey, 'f'.repeat(63)],
+    [signingKey, sha256(Buffer.from(signingKey))],
+  ]
+  for (const [key, digest] of configurations) {
+    let externalCalls = 0
+    const { context, calls } = fixture({
+      assertSigningKey: () => assertSigningConfiguration(key, digest),
+      releases: async () => { externalCalls++; return [] },
+      registryFrontier: async () => { externalCalls++; return [] },
+    })
+    const receipt = makeReceipt()
+    for (const action of [() => plan(context), () => publish(context, release(receipt), receipt),
+      () => shouldMakeLatest(context, release(receipt), receipt)]) {
+      await assert.rejects(action, (error) => {
+        assert.match(error.message, /configuration|SHA256/)
+        assert.ok(!String(error.stack).includes(key))
+        return true
+      })
+    }
+    assert.equal(externalCalls, 0)
+    assert.deepEqual(calls, [])
+  }
+})
+
+test('unrelated forged or misplaced signed history cannot block allocation, publication or latest', async () => {
+  const foreign = completedReceipt('2026.10.500', 'b'.repeat(40))
+  const badMac = clone(foreign)
+  badMac.authentication.mac = 'f'.repeat(64)
+  const malformed = signReceipt({ ...clone(foreign), crates: null }, signingKey)
+  const malformedBytes = signReceipt({ ...clone(foreign), frontendBytes: { manifestSha256: null } }, signingKey)
+  const invalidVersion = signReceipt({ ...clone(foreign), version: '1.2.3-a..b' }, signingKey)
+  const wrongRepository = signReceipt({ ...clone(foreign), identity: {
+    ...clone(foreign.identity), repository: 'foreign/repository' } }, signingKey)
+  const examples = [release(badMac), release(malformed), release(malformedBytes), release(invalidVersion), release(wrongRepository),
+    release(foreign, { tag_name: 'v2026.10.9999' }),
+    release(foreign, { target_commitish: 'c'.repeat(40) }), release(foreign)]
+  for (const [index, entry] of examples.entries()) {
+    let tagReads = 0
+    const { context, completions } = fixture({ releases: async () => [{ ...entry, id: 43, draft: false }],
+      versions: async () => ['2026.10.7'],
+      tagSource: async () => { tagReads++; return index === examples.length - 1 ? undefined : sourceRevision },
+    })
+    const result = await plan(context)
+    assert.equal(result.receipt.version, '2026.10.8')
+    await publish(context, result.release, result.receipt)
+    assert.deepEqual(completions, [{ version: '2026.10.8', makeLatest: true }])
+    assert.equal(tagReads, index === examples.length - 1 ? 3 : 0,
+      'Only valid authenticated metadata may reach tag lookup; unrelated invalid tag results have no authority')
+  }
+  const requested = clone(foreign)
+  requested.authentication.mac = 'f'.repeat(64)
+  const manual = fixture({ automatic: false, requestedVersion: requested.version,
+    releases: async () => [release(requested)] })
+  await assert.rejects(() => plan(manual.context), /authentication/)
+  assert.deepEqual(manual.calls, [])
+})
+
+test('history tag lookup transport failures still stop every publication boundary before crate writes', async () => {
+  const foreign = completedReceipt('2026.10.500', 'b'.repeat(40))
+  const failures = [new Error('GitHub request failed: HTTP 403'), new TypeError('fetch failed'),
+    new assert.AssertionError({ message: 'GitHub request failed: unknown HTTP 503' })]
+  for (const failure of failures) {
+    const { context, calls } = fixture({ releases: async () => [release(foreign, { id: 43, draft: false })],
+      tagSource: async () => { throw failure } })
+    const receipt = makeReceipt()
+    for (const action of [() => plan(context), () => publish(context, release(receipt), receipt),
+      () => shouldMakeLatest(context, release(receipt), receipt)]) {
+      await assert.rejects(action, (error) => error === failure)
+    }
+    assert.deepEqual(calls, [])
+  }
+})
+
+test('deep untrusted JSON authentication cannot block foreign history but still rejects current recovery', async () => {
+  const foreign = completedReceipt('2026.10.500', 'b'.repeat(40))
+  const encoded = JSON.stringify(foreign).slice(0, -1) + ',"extra":' + '['.repeat(10000) + '0' + ']'.repeat(10000) + '}'
+  const entry = release(foreign, { id: 43, draft: false,
+    body: `<!-- bamboo-release-provenance\n${encoded}\n-->` })
+  assert.ok(Buffer.byteLength(entry.body) > 20000 && Buffer.byteLength(entry.body) < 65536)
+  assert.throws(() => readAuthenticatedReceipt(entry, signingKey), RangeError)
+  const { context, completions } = fixture({ releases: async () => [entry],
+    versions: async () => ['2026.10.7'],
+    tagSource: async () => { throw new Error('Invalid authentication must not reach tag transport') } })
+  const result = await plan(context)
+  assert.equal(result.receipt.version, '2026.10.8')
+  await publish(context, result.release, result.receipt)
+  assert.deepEqual(completions, [{ version: '2026.10.8', makeLatest: true }])
+  const current = fixture({ releases: async () => [{ ...entry, target_commitish: sourceRevision }] })
+  await assert.rejects(() => plan(current.context), RangeError)
+  assert.deepEqual(current.calls, [])
 })
 
 test('unrelated unsigned releases and huge bare tags are bounded occupancy without allocation or source-order authority', async () => {
@@ -725,6 +812,9 @@ test('workflow preserves the exact CI commit, shared publication queue and separ
   for (const name of ['CARGO_REGISTRY_TOKEN', 'BAMBOO_RELEASE_SIGNING_KEY']) {
     assert.equal(workflow.split(`${name}: \${{ github.job == 'publish' && secrets.${name} || '' }}`).length - 1, 2)
   }
+  assert.equal(workflow.split("BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ github.job == 'publish' && vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 || '' }}").length - 1, 2)
+  assert.equal(fs.readFileSync('scripts/crate-release.cjs', 'utf8').split(
+    'assertSigningConfiguration(env.BAMBOO_RELEASE_SIGNING_KEY, env.BAMBOO_RELEASE_SIGNING_KEY_SHA256)').length - 1, 2)
   assert.equal(workflow.split("GH_TOKEN: ${{ github.job == 'publish' && secrets.BAMBOO_RELEASE_TOKEN || github.token }}").length - 1, 2)
   assert.doesNotMatch(workflow, /VERSION="\$\{\{ github.event.inputs.version/)
   const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8')

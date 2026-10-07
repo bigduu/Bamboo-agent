@@ -28,6 +28,14 @@ function assertSigningKey(key) {
   assert.ok(typeof key === 'string' && DIGEST.test(key), 'BAMBOO_RELEASE_SIGNING_KEY must be 32 bytes of lowercase hex')
 }
 
+function assertSigningConfiguration(key, expectedDigest) {
+  assertSigningKey(key)
+  assert.ok(typeof expectedDigest === 'string' && DIGEST.test(expectedDigest),
+    'Missing or invalid Environment BAMBOO_RELEASE_SIGNING_KEY_SHA256')
+  assert.ok(crypto.timingSafeEqual(Buffer.from(sha256(Buffer.from(key, 'hex')), 'hex'),
+    Buffer.from(expectedDigest, 'hex')), 'Release signing key does not match the protected Environment configuration')
+}
+
 function receiptMac(receipt, key) {
   assertSigningKey(key)
   const { authentication, ...payload } = receipt
@@ -57,8 +65,7 @@ function readAuthenticatedReceipt(release, key, { required = false } = {}) {
     if (required) throw error
     return null
   }
-  // Never silently discard authenticated history after an accidental key
-  // replacement, or let a tampered signed body lose source-order authority.
+  // Required reservations never accept or re-sign unauthenticated bytes.
   if (receipt && Object.prototype.hasOwnProperty.call(receipt, 'authentication')) {
     return authenticateReceipt(receipt, key)
   }
@@ -168,14 +175,9 @@ async function plan(context) {
   const releases = await context.releases()
   const receipts = []
   for (const release of releases) {
-    const required = (automatic && release.target_commitish === identity.sourceRevision) ||
-      (!automatic && release.tag_name === `v${!requestedVersion || requestedVersion === 'latest' ? sourceVersion : requestedVersion}`)
-    // Matching reservations must fail closed, never be silently re-signed.
-    // Other unsigned history is occupancy only, with no allocation authority.
-    const receipt = await context.readReceipt(release, { required })
-    if (!receipt) continue
-    await validateReleaseReceipt(context, release, receipt, identity.repository)
-    receipts.push(receipt)
+    const version = automatic ? null : !requestedVersion || requestedVersion === 'latest' ? sourceVersion : requestedVersion
+    const receipt = await readReleaseReceipt(context, release, identity, version)
+    if (receipt) receipts.push(receipt)
   }
   assert.equal(new Set(receipts.map((receipt) => receipt.version)).size, receipts.length,
     'Multiple authenticated reservations for one version')
@@ -205,6 +207,7 @@ async function plan(context) {
 }
 
 async function publish(context, release, receipt) {
+  context.assertSigningKey()
   context.verifyReceipt(receipt)
   validateReceipt(receipt, context.identity, context.crates)
   assert.equal(release.target_commitish, receipt.identity.sourceRevision)
@@ -248,25 +251,45 @@ async function publish(context, release, receipt) {
   }
 }
 
-async function validateReleaseReceipt(context, release, receipt, repository) {
-  validateReceipt(receipt, receipt.identity, receipt.crates)
-  assert.equal(receipt.identity.repository, repository)
-  assert.match(receipt.identity.sourceRevision, SHA)
-  assert.equal(release.target_commitish, receipt.identity.sourceRevision)
-  assert.equal(release.tag_name, `v${receipt.version}`)
+async function readReleaseReceipt(context, release, identity, version) {
+  let required = release.target_commitish === identity.sourceRevision ||
+    (version && release.tag_name === `v${version}`)
+  let receipt
+  try {
+    receipt = await context.readReceipt(release, { required })
+  } catch (error) {
+    if (required || !(error instanceof assert.AssertionError || error instanceof SyntaxError || error instanceof RangeError)) throw error
+    return null
+  }
+  if (!receipt) return null
+  required ||= receipt.identity?.sourceRevision === identity.sourceRevision
+  try {
+    assert.ok(receipt.identity && Array.isArray(receipt.crates), 'Invalid release receipt shape')
+    validateReceipt(receipt, receipt.identity, receipt.crates)
+    assert.equal(receipt.identity.repository, identity.repository)
+    assert.match(receipt.identity.sourceRevision, SHA)
+    assert.equal(release.target_commitish, receipt.identity.sourceRevision)
+    assert.equal(release.tag_name, `v${receipt.version}`)
+  } catch (error) {
+    if (required) throw error
+    return null
+  }
   const allowMissing = !receipt.completed && Object.keys(receipt.packageChecksums).length === 0
+  // Transport failures must propagate; only a successfully read, invalid tag
+  // placement can be ignored for unrelated history.
   const source = await context.tagSource(receipt.version, { allowMissing })
-  assert.ok((allowMissing && source === null) || source === receipt.identity.sourceRevision,
-    'Automatic release tag points to different source')
+  if ((allowMissing && source === null) || source === receipt.identity.sourceRevision) return receipt
+  assert.ok(!required, 'Automatic release tag points to different source')
+  return null
 }
 
 async function automaticReceipts(context, currentRelease, receipt, { stableOnly = false } = {}) {
+  context.assertSigningKey()
   const receipts = []
   for (const release of await context.releases()) {
     if (release.id === currentRelease.id || (stableOnly && (release.draft || release.prerelease))) continue
-    const previous = await context.readReceipt(release)
+    const previous = await readReleaseReceipt(context, release, receipt.identity, receipt.version)
     if (!previous?.automatic || (stableOnly && !previous.completed)) continue
-    await validateReleaseReceipt(context, release, previous, receipt.identity.repository)
     receipts.push(previous)
   }
   return receipts
@@ -467,7 +490,7 @@ function makeContext(env = process.env) {
   const automatic = validateSource({ eventName: env.GITHUB_EVENT_NAME, event, repository,
     sourceRevision, workflowRevision: env.GITHUB_SHA })
   if (env.DRY_RUN !== 'true') assert.ok(env.CARGO_REGISTRY_TOKEN, 'Missing CARGO_REGISTRY_TOKEN')
-  if (env.DRY_RUN !== 'true') assertSigningKey(env.BAMBOO_RELEASE_SIGNING_KEY)
+  if (env.DRY_RUN !== 'true') assertSigningConfiguration(env.BAMBOO_RELEASE_SIGNING_KEY, env.BAMBOO_RELEASE_SIGNING_KEY_SHA256)
   const frontendDirectory = 'crates/app/bamboo-server/frontend_package'
   const manifest = JSON.parse(fs.readFileSync(`${frontendDirectory}/frontend-manifest.json`, 'utf8'))
   const identity = { repository, sourceRevision, frontend: frontendIdentity(
@@ -535,13 +558,12 @@ function makeContext(env = process.env) {
     },
     readReceipt: async (release, options) => readAuthenticatedReceipt(release, env.BAMBOO_RELEASE_SIGNING_KEY, options),
     verifyReceipt: (receipt) => authenticateReceipt(receipt, env.BAMBOO_RELEASE_SIGNING_KEY),
-    assertSigningKey: () => assertSigningKey(env.BAMBOO_RELEASE_SIGNING_KEY),
+    assertSigningKey: () => assertSigningConfiguration(env.BAMBOO_RELEASE_SIGNING_KEY, env.BAMBOO_RELEASE_SIGNING_KEY_SHA256),
     isAncestor: async (ancestor, descendant) => gitIsAncestor(ancestor, descendant),
     tagSource: async (version, { allowMissing = false } = {}) => {
       const tag = github(repository, `git/ref/tags/v${assertVersion(version)}`, undefined, undefined, allowMissing)
       if (!tag) return null
-      assert.equal(tag.object.type, 'commit', 'Automatic release tag must be a direct commit ref')
-      return tag.object.sha
+      return tag.object?.type === 'commit' ? tag.object.sha : undefined
     },
     reserve: async (receipt) => github(repository, 'releases', {
       tag_name: `v${receipt.version}`, target_commitish: sourceRevision,
@@ -630,6 +652,6 @@ async function main() {
 module.exports = { assertVersion, validateSource, validateReceipt, nextVersion, selectVersion,
   plan, publish, makeContext, sha256, githubArgs, receiptBody, readBodyReceipt,
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
-  canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey,
+  canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
   verifyRegistrySource, highestStableVersion }
 if (require.main === module) main().catch((error) => { console.error(error); process.exitCode = 1 })
