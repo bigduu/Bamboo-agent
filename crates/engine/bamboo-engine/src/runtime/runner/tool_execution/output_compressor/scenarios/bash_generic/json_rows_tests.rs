@@ -241,29 +241,33 @@ async fn json_rows_runtime_child() {
     let root = std::path::PathBuf::from(std::env::var_os("BAMBOO_DATA_DIR").unwrap());
     assert_eq!(bamboo_config::paths::bamboo_dir(), root);
     let counter = TiktokenTokenCounter::default();
-    for (session, credential) in [("json-rows-safe", false), ("json-rows-credential", true)] {
+    for (session, credential, pgpass, compact) in [
+        ("json-rows-safe", false, false, false),
+        ("json-rows-safe-compact", false, false, true),
+        ("json-rows-credential", true, false, false),
+        ("json-rows-pgpass", true, true, false),
+    ] {
         let mut rows = sample_rows(170);
-        if credential {
+        if credential && !pgpass {
             rows[0]["user_visible_current_activity_description"] =
                 Value::String("Authorization: Bearer synthetic-credential-value".into());
         }
-        let stdout = serde_json::to_string_pretty(&rows).unwrap();
-        let canonical_raw = envelope(&stdout, "ordinary diagnostic\n");
-        // The legacy Pgpass guard screens long physical lines with four colons
-        // (#1694). This equivalent JSON encoding keeps that rule unchanged.
-        let encoded_stdout = serde_json::to_string(&stdout).unwrap();
-        let raw =
-            serde_json::to_string_pretty(&serde_json::from_str::<Value>(&canonical_raw).unwrap())
-                .unwrap()
-                .replace(&encoded_stdout, &encoded_stdout.replace(':', "\\u003a"));
-        assert_eq!(
-            serde_json::from_str::<Value>(&raw).unwrap(),
-            serde_json::from_str::<Value>(&canonical_raw).unwrap()
-        );
+        let stdout = if compact {
+            serde_json::to_string(&rows).unwrap()
+        } else {
+            serde_json::to_string_pretty(&rows).unwrap()
+        };
+        let stderr = if pgpass {
+            format!("localhost:5432:app:alice:{}\n", "x".repeat(4_096))
+        } else {
+            "ordinary diagnostic\n".to_string()
+        };
+        let raw = envelope(&stdout, &stderr);
+        assert_eq!(raw.lines().count(), 1);
+        assert!(raw.len() > 4_096);
+        assert!(raw.bytes().filter(|byte| *byte == b':').count() > 4);
         assert_eq!(contains_secret_like_value(&raw), credential);
-        // Use the ordinary encoding as the baseline so escaping cannot inflate
-        // the claimed token savings.
-        let original_tokens = counter.count_text(&canonical_raw);
+        let original_tokens = counter.count_text(&raw);
         assert!(
             original_tokens >= 10_000,
             "fixture reaches semantic compression tier"

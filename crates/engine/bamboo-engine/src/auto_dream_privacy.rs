@@ -928,6 +928,92 @@ fn parse_pgpass_fields(line: &str) -> Option<Vec<String>> {
     (fields.len() == 5).then_some(fields)
 }
 
+fn pgpass_target_is_plausible(host: &str, port: &str) -> bool {
+    let host_is_bounded_pg_target = !host.is_empty()
+        && host.len() <= 255
+        && !host.chars().any(char::is_whitespace)
+        && (host == "*"
+            || host.starts_with('/')
+            || host.contains(':')
+            || host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')));
+    let parsed_port = (port != "*" && port.len() <= 5)
+        .then(|| port.parse::<u16>().ok())
+        .flatten()
+        .filter(|port| *port > 0);
+    let port_is_valid = port == "*" || parsed_port.is_some();
+    let single_label_host =
+        host != "*" && !host.eq_ignore_ascii_case("localhost") && !host.contains(['.', ':', '/']);
+    let single_label_port_is_plausible =
+        !single_label_host || port == "*" || parsed_port.is_some_and(|port| port >= 1_024);
+    host_is_bounded_pg_target && port_is_valid && single_label_port_is_plausible
+}
+
+fn oversized_pgpass_record(line: &str) -> bool {
+    // Inspect the same first four fields without allocating a large database,
+    // user or password. An oversized password remains indeterminate and is
+    // screened only after a plausible Pgpass record prefix has been established.
+    let mut host = String::new();
+    let mut port = String::new();
+    let mut field_index = 0;
+    let mut field_has_content = false;
+    let mut escaped = false;
+    for character in line.chars() {
+        if !escaped && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if !escaped && character == ':' {
+            if !field_has_content {
+                return false;
+            }
+            if field_index == 1 && !pgpass_target_is_plausible(&host, &port) {
+                return false;
+            }
+            if field_index == 3 {
+                return true;
+            }
+            field_index += 1;
+            field_has_content = false;
+            continue;
+        }
+        escaped = false;
+        if character.is_whitespace() {
+            return false;
+        }
+        match field_index {
+            0 => {
+                if host.len() + character.len_utf8() > 255 {
+                    return false;
+                }
+                host.push(character);
+            }
+            1 => {
+                if port.len() + character.len_utf8() > 5 {
+                    return false;
+                }
+                port.push(character);
+            }
+            _ => {}
+        }
+        field_has_content = true;
+    }
+    false
+}
+
+fn oversized_pgpass_fallback(value: &str) -> bool {
+    // Retain the old conservative line check when a structured wrapper cannot
+    // be decoded within the existing inspection boundary. Successfully decoded
+    // JSON containers are inspected as fields instead of taking this fallback.
+    value.lines().any(|line| {
+        let line = line.trim();
+        !line.starts_with('#')
+            && line.chars().count() > 4_096
+            && line.bytes().filter(|byte| *byte == b':').count() >= 4
+    })
+}
+
 fn contains_pgpass_record(value: &str) -> bool {
     value.lines().any(|line| {
         let line = line.trim();
@@ -935,10 +1021,7 @@ fn contains_pgpass_record(value: &str) -> bool {
             return false;
         }
         if line.chars().count() > 4_096 {
-            // A record-shaped line that exceeds the parser bound is
-            // indeterminate, not safe. Do not let an oversized password turn
-            // the bounded parser into a privacy bypass.
-            return line.bytes().filter(|byte| *byte == b':').count() >= 4;
+            return oversized_pgpass_record(line);
         }
         let Some(fields) = parse_pgpass_fields(line) else {
             return false;
@@ -946,28 +1029,7 @@ fn contains_pgpass_record(value: &str) -> bool {
         let [host, port, database, user, password] = fields.as_slice() else {
             return false;
         };
-        let host_is_bounded_pg_target = !host.is_empty()
-            && host.len() <= 255
-            && !host.chars().any(char::is_whitespace)
-            && (host == "*"
-                || host.starts_with('/')
-                || host.contains(':')
-                || host.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
-                }));
-        let parsed_port = (port != "*" && port.len() <= 5)
-            .then(|| port.parse::<u16>().ok())
-            .flatten()
-            .filter(|port| *port > 0);
-        let port_is_valid = port == "*" || parsed_port.is_some();
-        let single_label_host = host != "*"
-            && !host.eq_ignore_ascii_case("localhost")
-            && !host.contains(['.', ':', '/']);
-        let single_label_port_is_plausible =
-            !single_label_host || port == "*" || parsed_port.is_some_and(|port| port >= 1_024);
-        host_is_bounded_pg_target
-            && port_is_valid
-            && single_label_port_is_plausible
+        pgpass_target_is_plausible(host, port)
             && [database, user, password]
                 .iter()
                 .all(|field| !field.is_empty() && !field.chars().any(char::is_whitespace))
@@ -1204,7 +1266,24 @@ fn yaml_contains_structured_environment_credential(value: &serde_yaml::Value) ->
         serde_yaml::Value::Tagged(value) => {
             yaml_contains_structured_environment_credential(&value.value)
         }
-        serde_yaml::Value::String(value) => contains_line_oriented_credential_assignment(value),
+        serde_yaml::Value::String(value) => {
+            if contains_line_oriented_credential_assignment(value) || contains_pgpass_record(value)
+            {
+                return true;
+            }
+            let candidate = value.trim_start();
+            if candidate.starts_with(['{', '[']) {
+                // JSON stdout can itself be a container. Reuse the existing
+                // decoder and field checks so ordinary compact rows stay safe.
+                return match serde_yaml::from_str::<serde_yaml::Value>(candidate) {
+                    Ok(
+                        document @ (serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_)),
+                    ) => yaml_contains_structured_environment_credential(&document),
+                    Ok(_) | Err(_) => oversized_pgpass_fallback(value),
+                };
+            }
+            contains_embedded_structured_credential(value)
+        }
         _ => false,
     }
 }
@@ -1267,7 +1346,8 @@ fn structured_multiline_scalar_hint(value: &str) -> bool {
 fn yaml_documents_contain_structured_credential(value: &str, fail_closed: bool) -> bool {
     for (index, document) in yaml_document_separator_pattern().split(value).enumerate() {
         if index >= MAX_STRUCTURED_DOCUMENTS {
-            return fail_closed && structured_multiline_scalar_hint(value);
+            return fail_closed
+                && (structured_multiline_scalar_hint(value) || oversized_pgpass_fallback(value));
         }
         if document.trim().is_empty() {
             continue;
@@ -1276,7 +1356,13 @@ fn yaml_documents_contain_structured_credential(value: &str, fail_closed: bool) 
             Ok(document) if yaml_contains_structured_environment_credential(&document) => {
                 return true;
             }
-            Err(_) if fail_closed && structured_multiline_scalar_hint(document) => return true,
+            Err(_)
+                if fail_closed
+                    && (structured_multiline_scalar_hint(document)
+                        || oversized_pgpass_fallback(document)) =>
+            {
+                return true;
+            }
             Ok(_) | Err(_) => {}
         }
     }
@@ -1285,7 +1371,7 @@ fn yaml_documents_contain_structured_credential(value: &str, fail_closed: bool) 
 
 fn structured_block_contains_credential(value: &str) -> bool {
     if value.len() > MAX_EMBEDDED_STRUCTURED_BLOCK_BYTES {
-        return structured_multiline_scalar_hint(value);
+        return structured_multiline_scalar_hint(value) || oversized_pgpass_fallback(value);
     }
     let parsed_toml = toml::from_str::<toml::Value>(value);
     yaml_documents_contain_structured_credential(value, true)
@@ -1331,7 +1417,9 @@ fn contains_embedded_structured_credential(value: &str) -> bool {
                 block_count += 1;
                 open_fence = None;
                 if block_count >= MAX_EMBEDDED_STRUCTURED_BLOCKS {
-                    return structured_multiline_scalar_hint(&value[offset + line.len()..]);
+                    let remaining = &value[offset + line.len()..];
+                    return structured_multiline_scalar_hint(remaining)
+                        || oversized_pgpass_fallback(remaining);
                 }
             }
         } else if let Some((marker, length)) = markdown_fence(line) {
@@ -1341,7 +1429,8 @@ fn contains_embedded_structured_credential(value: &str) -> bool {
     }
 
     if let Some((_, _, body_start)) = open_fence {
-        return structured_multiline_scalar_hint(&value[body_start..]);
+        let body = &value[body_start..];
+        return structured_multiline_scalar_hint(body) || oversized_pgpass_fallback(body);
     }
     false
 }
@@ -3324,6 +3413,203 @@ mod tests {
                 "secret case was not redacted: {case}"
             );
         }
+    }
+
+    #[test]
+    fn pgpass_target_rules_and_escapes_match_across_parser_bound() {
+        for prefix in [
+            "db:5432:app:alice:",
+            "123:5432:app:alice:",
+            "db.example.test:1:app:alice:",
+            "localhost:5432:app:alice:",
+            "*:5432:app:alice:",
+            "db:*:app:alice:",
+            "*:*:*:*:",
+            r"[2001\:db8\:\:1]:5432:app:alice:",
+            r"localhost:5432:app\:reports:ali\\ce:",
+            "/var/run/postgresql:5432:app:alice:",
+        ] {
+            for length in [4_096, 4_097, 8_192] {
+                let suffix = r"hun\:ter\\2";
+                let record = format!(
+                    "{prefix}{}{suffix}",
+                    "x".repeat(length - prefix.len() - suffix.len())
+                );
+                assert_eq!(record.len(), length);
+                assert!(contains_pgpass_record(&record), "Pgpass length {length}");
+                assert!(contains_secret_like_value(&record));
+                assert_eq!(
+                    sanitize_extraction_source(&record),
+                    REDACTED_EXTRACTION_SOURCE
+                );
+            }
+        }
+
+        for record in [
+            format!("db:5432:{}:alice:hunter2", "x".repeat(4_096)),
+            format!("db:5432:app:{}:hunter2", "x".repeat(4_096)),
+            format!("db:5432:app:alice:{}\\", "x".repeat(4_096)),
+            format!("db:5432:{}:alice:   ", "x".repeat(4_096)),
+        ] {
+            assert!(contains_pgpass_record(&record));
+            assert!(contains_secret_like_value(&record));
+        }
+
+        let comment = format!("# db:5432:app:alice:{}", "x".repeat(4_096));
+        assert!(!contains_pgpass_record(&comment));
+        let crlf = format!("{comment}\r\n\r\nlocalhost:5432:app:alice:hunter2\r\n");
+        assert!(contains_pgpass_record(&crlf));
+        assert!(contains_secret_like_value(&crlf));
+    }
+
+    #[test]
+    fn oversized_pgpass_requires_real_separators_and_valid_target() {
+        for prefix in [
+            "not a host:5432:app:alice:",
+            "db:0:app:alice:",
+            "db:65536:app:alice:",
+            "db:543212:app:alice:",
+            "db:port:app:alice:",
+            "crate:123:module:item:",
+            "2026:09:17:20:",
+            "db:5432::alice:",
+            "db:5432:app::",
+            "db:5432:app name:alice:",
+            "db:5432:app:alice smith:",
+            r"db\:5432\:app\:alice\:",
+        ] {
+            let record = format!("{prefix}{}", "x".repeat(4_096));
+            assert!(!contains_pgpass_record(&record), "prefix {prefix}");
+        }
+    }
+
+    #[test]
+    fn detector_does_not_redact_large_ordinary_json_as_pgpass() {
+        let rows = (0..170)
+            .map(|index| {
+                serde_json::json!({
+                    "index": index,
+                    "status": "complete",
+                    "description": "ordinary diagnostic",
+                })
+            })
+            .collect::<Vec<_>>();
+        let compact = serde_json::to_string(&rows).unwrap();
+        let envelope = serde_json::json!({
+            "command": "cat records.json",
+            "stdout": serde_json::to_string_pretty(&rows).unwrap(),
+            "stderr": "ordinary diagnostic\n",
+            "exit_code": 0,
+        })
+        .to_string();
+        for source in [
+            compact,
+            envelope,
+            "ordinary:diagnostic:value:count:32;".repeat(170),
+        ] {
+            assert!(source.len() > 4_096);
+            assert_eq!(source.lines().count(), 1);
+            assert!(source.bytes().filter(|byte| *byte == b':').count() > 4);
+            assert!(!contains_pgpass_record(&source));
+            assert!(!contains_secret_like_value(&source));
+            assert!(sanitize_extraction_source(&source) == source);
+        }
+    }
+
+    #[test]
+    fn detector_retains_credentials_in_large_json_markdown_and_text() {
+        let padding = "ordinary diagnostic ".repeat(256);
+        let pgpass = format!("localhost:5432:app:alice:{}", "x".repeat(4_096));
+        for source in [
+            serde_json::json!({"description": padding, "password": "hunter2"}).to_string(),
+            format!("{padding}\n| Field | Value |\n| --- | --- |\n| Password | hunter2 |"),
+            format!("{padding}\nDB_PASSWORD=hunter2"),
+            serde_json::json!({
+                "description": padding,
+                "activity": "Authorization: Bearer synthetic-credential-value",
+            })
+            .to_string(),
+            serde_json::json!({"stdout": pgpass, "exit_code": 0}).to_string(),
+        ] {
+            assert!(source.len() > 4_096);
+            assert!(!contains_pgpass_record(&source));
+            assert!(contains_secret_like_value(&source));
+            assert_eq!(
+                sanitize_extraction_source(&source),
+                REDACTED_EXTRACTION_SOURCE
+            );
+        }
+    }
+
+    #[test]
+    fn detector_retains_pgpass_in_oversized_json_fence() {
+        let body = oversized_json_pgpass_fixture();
+        assert!(body.len() > MAX_EMBEDDED_STRUCTURED_BLOCK_BYTES);
+        let source = format!("```json\n{body}\n```");
+        assert!(contains_secret_like_value(&source));
+        assert_eq!(
+            sanitize_extraction_source(&source),
+            REDACTED_EXTRACTION_SOURCE
+        );
+    }
+
+    #[test]
+    fn detector_retains_pgpass_in_nested_bash_fenced_json_stdout() {
+        let body = oversized_json_pgpass_fixture();
+        let source = bash_stdout_fixture(&format!("```json\n{body}\n```"));
+        assert!(contains_secret_like_value(&source));
+        assert_eq!(
+            sanitize_extraction_source(&source),
+            REDACTED_EXTRACTION_SOURCE
+        );
+    }
+
+    #[test]
+    fn detector_retains_pgpass_in_unclosed_json_fence() {
+        let body = oversized_json_pgpass_fixture();
+        for tail in [&body[..], body.strip_suffix('}').unwrap()] {
+            let source = format!("```json\n{tail}");
+            assert!(contains_secret_like_value(&source));
+            assert!(contains_secret_like_value(&bash_stdout_fixture(&source)));
+        }
+    }
+
+    #[test]
+    fn detector_retains_pgpass_after_structured_block_budget() {
+        let safe_blocks = "```json\n{}\n```\n".repeat(MAX_EMBEDDED_STRUCTURED_BLOCKS);
+        let body = oversized_json_pgpass_fixture();
+        let source = format!("{safe_blocks}```json\n{body}\n```");
+        assert!(contains_secret_like_value(&source));
+        assert!(contains_secret_like_value(&bash_stdout_fixture(&source)));
+    }
+
+    #[test]
+    fn detector_retains_pgpass_in_nested_bash_compact_json_stdout() {
+        let source = bash_stdout_fixture(&oversized_json_pgpass_fixture());
+        assert!(contains_secret_like_value(&source));
+        assert_eq!(
+            sanitize_extraction_source(&source),
+            REDACTED_EXTRACTION_SOURCE
+        );
+    }
+
+    fn oversized_json_pgpass_fixture() -> String {
+        serde_json::json!({
+            "description": "x".repeat(70_000),
+            "stdout": "localhost:5432:app:alice:hunter2",
+            "exit_code": 0,
+        })
+        .to_string()
+    }
+
+    fn bash_stdout_fixture(stdout: &str) -> String {
+        serde_json::json!({
+            "command": "cat records.json",
+            "stdout": stdout,
+            "stderr": "",
+            "exit_code": 0,
+        })
+        .to_string()
     }
 
     #[test]
