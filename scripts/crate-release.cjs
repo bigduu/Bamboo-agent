@@ -11,6 +11,7 @@ const { isDeepStrictEqual } = require('node:util')
 const RECEIPT_NAME = 'release-provenance.json'
 const SHA = /^[0-9a-f]{40}$/
 const DIGEST = /^[0-9a-f]{64}$/
+const U64_MAX = 18446744073709551615n
 const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/
 const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
 const AUTH_DOMAIN = 'bamboo-release-provenance/hmac-sha256/v1\0'
@@ -76,7 +77,7 @@ function readAuthenticatedReceipt(release, key, { required = false } = {}) {
 function assertVersion(version) {
   const match = typeof version === 'string' && VERSION.exec(version)
   assert.ok(match && version !== '0.0.0' && match.slice(1, 4).every((part) =>
-    part.length <= 20 && BigInt(part) <= 18446744073709551615n) &&
+    part.length <= 20 && BigInt(part) <= U64_MAX) &&
     (!match[4] || match[4].split('.').every((part) => !/^\d+$/.test(part) || !/^0\d/.test(part))),
     'Pass a real, explicit publish version; source 0.0.0 is a placeholder')
   return version
@@ -123,19 +124,19 @@ function validateReceipt(receipt, identity, crates, version = receipt?.version) 
 
 function nextVersion(versions, now = new Date(), occupiedVersions = []) {
   const prefix = `${now.getUTCFullYear()}.${now.getUTCMonth() + 1}.`
-  let maximum = 0
+  let maximum = 0n
   for (const version of versions) {
     if (!version.startsWith(prefix) || !/^\d+$/.test(version.slice(prefix.length))) continue
-    const counter = Number(version.slice(prefix.length))
-    assert.ok(Number.isSafeInteger(counter), 'Published release counter exceeds safe integer range')
-    maximum = Math.max(maximum, counter)
+    const counter = BigInt(version.slice(prefix.length))
+    assert.ok(counter <= U64_MAX, 'Published release counter exceeds Cargo u64 range')
+    if (counter > maximum) maximum = counter
   }
   const occupied = new Set(occupiedVersions)
   // Unauthenticated names can occupy a candidate, but cannot raise the max or
   // push publication through an unbounded number of attacker-created tags.
   for (let attempt = 0; attempt < 100; attempt++) {
-    assert.ok(Number.isSafeInteger(++maximum), 'Published release counter exceeds safe integer range')
-    const candidate = `${prefix}${maximum}`
+    assert.ok(++maximum <= U64_MAX, 'No automatic version remains in this UTC month: Cargo u64 limit')
+    const candidate = `${prefix}${maximum.toString()}`
     if (!occupied.has(candidate)) return candidate
   }
   assert.fail('Too many unauthenticated release/tag collisions; refusing automatic publication')
@@ -352,18 +353,35 @@ async function shouldMakeLatest(context, currentRelease, receipt) {
 function gitIsAncestor(ancestor, descendant, cwd) {
   for (const revision of [ancestor, descendant]) {
     assert.match(revision, SHA)
-    const exists = spawnSync('git', ['cat-file', '-e', `${revision}^{commit}`], { cwd, encoding: 'utf8' })
+    const exists = spawnCommand(['git', 'cat-file', '-e', `${revision}^{commit}`], { cwd })
     if (exists.error) throw exists.error
     if (exists.status !== 0) command(['git', 'fetch', '--no-tags', 'origin', revision], { cwd })
   }
-  const result = spawnSync('git', ['merge-base', '--is-ancestor', ancestor, descendant], { cwd, encoding: 'utf8' })
+  const result = spawnCommand(['git', 'merge-base', '--is-ancestor', ancestor, descendant], { cwd })
   if (result.error) throw result.error
   assert.ok(result.status === 0 || result.status === 1, `Unable to compare release source ancestry: ${result.stderr}`)
   return result.status === 0
 }
 
+function childProcessEnv(args, env = process.env) {
+  const githubAuth = new Set(['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'])
+  return Object.fromEntries(Object.entries(env).filter(([name]) => {
+    if (/^BAMBOO_RELEASE_/i.test(name)) return false
+    if (/^(GH|GITHUB)_.*(TOKEN|PAT)/i.test(name)) return args[0] === 'gh' && githubAuth.has(name)
+    if (/^CARGO_(REGISTRY_TOKEN|REGISTRIES_.*_TOKEN)$/i.test(name)) {
+      return args[0] === 'cargo' && args[1] === 'publish' && name === 'CARGO_REGISTRY_TOKEN'
+    }
+    return true
+  }))
+}
+
+function spawnCommand(args, options = {}) {
+  return spawnSync(args[0], args.slice(1), { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, ...options,
+    env: childProcessEnv(args, options.env || process.env) })
+}
+
 function command(args, options = {}) {
-  const result = spawnSync(args[0], args.slice(1), { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, ...options })
+  const result = spawnCommand(args, options)
   if (result.error) throw result.error
   assert.equal(result.status, 0, `${args.join(' ')} failed: ${result.stderr || result.stdout}`)
   return result.stdout
@@ -379,7 +397,7 @@ function githubArgs(repository, route, payload, method = payload === undefined ?
 
 function github(repository, route, payload, method, allowMissing = false) {
   const args = githubArgs(repository, route, payload, method)
-  const result = spawnSync(args[0], args.slice(1), { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
+  const result = spawnCommand(args, {
     input: payload === undefined ? undefined : JSON.stringify(payload) })
   if (result.error) throw result.error
   const parsed = result.stdout ? JSON.parse(result.stdout) : null
@@ -609,7 +627,7 @@ function makeContext(env = process.env) {
       return sha256(fs.readFileSync(path.join(target, 'package', `${name}-${version}.crate`)))
     },
     cargoPublish: async (name) => {
-      const result = spawnSync('cargo', ['publish', '--locked', '--allow-dirty', '-p', name], {
+      const result = spawnCommand(['cargo', 'publish', '--locked', '--allow-dirty', '-p', name], {
         encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
       })
       if (result.error) throw result.error
@@ -653,5 +671,5 @@ module.exports = { assertVersion, validateSource, validateReceipt, nextVersion, 
   plan, publish, makeContext, sha256, githubArgs, receiptBody, readBodyReceipt,
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
   canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
-  verifyRegistrySource, highestStableVersion }
+  verifyRegistrySource, highestStableVersion, spawnCommand, command }
 if (require.main === module) main().catch((error) => { console.error(error); process.exitCode = 1 })

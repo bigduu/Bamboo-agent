@@ -8,7 +8,8 @@ const { assertVersion, validateSource, validateReceipt, nextVersion, selectVersi
   plan, publish, sha256, githubArgs, receiptBody, readBodyReceipt,
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend,
   shouldMakeLatest, gitIsAncestor, canonicalJson, signReceipt, authenticateReceipt,
-  readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration, verifyRegistrySource, highestStableVersion } = require('./crate-release.cjs')
+  readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration, verifyRegistrySource, highestStableVersion,
+  command, spawnCommand } = require('./crate-release.cjs')
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
 const sourceRevision = 'a'.repeat(40)
@@ -89,10 +90,64 @@ test('date sequence advances beyond crate versions, tags and draft reservations 
   assert.equal(nextVersion(['2026.10.7', '2026.10.12', '2026.9.200', 'v0.3.0'], now), '2026.10.13')
   assert.equal(nextVersion(['2026.9.200'], now), '2026.10.1')
   assert.equal(nextVersion(['2026.10.9'], new Date('2026-11-01T00:00:00Z')), '2026.11.1')
-  assert.throws(() => nextVersion(['2026.10.999999999999999999999'], now), /safe integer/)
+  assert.throws(() => nextVersion(['2026.10.999999999999999999999'], now), /u64/)
   for (const value of ['', '0.0.0', 'latest', '2026.10.8\nX=secret', '2026.10.8;false']) {
     assert.throws(() => assertVersion(value))
   }
+})
+
+test('automatic counters preserve the full Cargo u64 range and stop before reserving an exhausted month', async () => {
+  assert.equal(nextVersion(['2026.10.9007199254740992'], now), '2026.10.9007199254740993')
+  assert.equal(nextVersion(['2026.10.9007199254740992'], now, ['2026.10.9007199254740993']),
+    '2026.10.9007199254740994')
+  assert.equal(nextVersion(['2026.10.18446744073709551614'], now), '2026.10.18446744073709551615')
+  assert.equal(assertVersion('2026.10.18446744073709551615'), '2026.10.18446744073709551615')
+  assert.equal(nextVersion(['2026.10.18446744073709551615'], new Date('2026-11-01T00:00:00Z')), '2026.11.1')
+  for (const [versions, tags] of [
+    [['2026.10.18446744073709551615'], []],
+    [['2026.10.18446744073709551614'], ['2026.10.18446744073709551615']],
+  ]) {
+    const { context, calls } = fixture({ versions: async () => versions, tags: async () => tags })
+    await assert.rejects(() => plan(context), /Cargo u64 limit/)
+    assert.deepEqual(calls, [], 'Exhaustion must not reserve a release, tag or upload')
+  }
+  const largeManual = fixture({ automatic: false, requestedVersion: '2026.10.9007199254740992' })
+  const result = await plan(largeManual.context)
+  assert.equal(result.receipt.version, '2026.10.9007199254740992')
+  const automatic = fixture({ releases: async () => [result.release], tagSource: async () => sourceRevision })
+  assert.equal((await plan(automatic.context)).receipt.version, '2026.10.9007199254740993')
+})
+
+test('real subprocesses receive only their own publication credentials', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-release-child-env-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const githubAuth = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']
+  const credentials = [...githubAuth, 'GH_AUTH_TOKEN', 'GITHUB_PAT', 'GH_PAT', 'gh_token',
+    'BAMBOO_RELEASE_TOKEN', 'BAMBOO_RELEASE_SIGNING_KEY', 'BAMBOO_RELEASE_SIGNING_KEY_SHA256',
+    'CARGO_REGISTRY_TOKEN', 'CARGO_REGISTRIES_OTHER_TOKEN']
+  const executable = `#!${process.execPath}\n` +
+    `const names = ${JSON.stringify(credentials)};\n` +
+    'console.log(JSON.stringify({ credentials: names.filter(name => process.env[name] !== undefined).sort(),\n' +
+    '  setting: process.env.NORMAL_SETTING, cargoHome: process.env.CARGO_HOME, rustupHome: process.env.RUSTUP_HOME }));\n'
+  for (const name of ['cargo', 'gh', 'git', 'python3', 'tar']) {
+    fs.writeFileSync(path.join(directory, name), executable, { mode: 0o755 })
+  }
+  const env = { PATH: `${directory}${path.delimiter}${process.env.PATH}`, HOME: directory,
+    CARGO_HOME: directory, RUSTUP_HOME: directory, NORMAL_SETTING: 'retained',
+    ...Object.fromEntries(credentials.map(name => [name, `dummy-${name}`])) }
+  const check = (args, expected, direct = false) => {
+    const output = direct ? spawnCommand(args, { env }).stdout : command(args, { env })
+    assert.deepEqual(JSON.parse(output), { credentials: [...expected].sort(), setting: 'retained',
+      cargoHome: directory, rustupHome: directory }, args.join(' '))
+  }
+  for (const action of ['metadata', 'package', 'check', 'test']) check(['cargo', action, '--locked'], [])
+  check(['cargo', 'publish', '--locked'], ['CARGO_REGISTRY_TOKEN'], true)
+  check(['gh', 'api', 'repos/fixture/releases'], githubAuth)
+  for (const args of [['git', 'cat-file'], ['git', 'merge-base'], ['python3', 'compute-publish-order.py'], ['tar', '-xOf']]) {
+    check(args, [])
+  }
+  const source = fs.readFileSync(path.join(__dirname, 'crate-release.cjs'), 'utf8')
+  assert.equal([...source.matchAll(/\bspawnSync\(/g)].length, 1, 'All direct child launches must use the credential filter')
 })
 
 test('automatic reruns reuse the source/frontend reservation and do not allocate another version', () => {
@@ -375,7 +430,8 @@ test('manual versions obey Cargo SemVer before external operations and retain th
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   fs.mkdirSync(path.join(directory, 'src'))
   fs.writeFileSync(path.join(directory, 'src/lib.rs'), '')
-  const valid = ['1.2.3', '1.2.3-rc.0', '1.2.3-184467440737095516160', '18446744073709551615.1.2']
+  const valid = ['1.2.3', '1.2.3-rc.0', '1.2.3-184467440737095516160', '18446744073709551615.1.2',
+    '2026.10.18446744073709551615']
   const unsupported = ['1.2.3+001', '1.2.3-rc.0+build.001']
   const invalid = ['1.2.3-a..b', '1.2.3-.', '1.2.3-01', '1.2.3-rc.01', '1.2.3+', '1.2.3+a..b',
     '01.2.3', '1.02.3', '1.2.03', '18446744073709551616.1.2', '1.18446744073709551616.2', '1.2.18446744073709551616']

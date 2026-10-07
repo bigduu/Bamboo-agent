@@ -235,6 +235,8 @@ names only occupy individual candidates; 100 consecutive collisions stop the
 run before any publication. Matching invalid reservations are rejected without
 being re-signed. Unrelated authentication, shape or placement failures have no
 allocation or source-order authority; transport failures still stop the run.
+The automatic counter retains Cargo's full unsigned 64-bit range; exhausting
+that range stops before reserving a release until the next UTC month.
 
 The existing manual workflow inputs remain available, including `dev` dispatches
 from Zenith and the explicit fixed legacy frontend rollback. Pass an unused real
@@ -254,6 +256,11 @@ This keeps queued historical commits available while excluding arbitrary branch
 code from publication credentials. Zenith's existing dev/main dispatch contract
 and exact run/source SHA remain unchanged. Feature-branch dry runs use a separate
 job with read-only permissions, no Environment, and no publication credentials.
+Publication subprocesses receive only the credentials they need: `gh` retains
+GitHub authentication, and only `cargo publish` retains `CARGO_REGISTRY_TOKEN`.
+Cargo metadata/package/check and the other subprocesses receive neither those
+tokens nor the receipt signing key. Cargo publish build scripts still inherit
+its required registry token; this does not change the existing Cargo contract.
 
 Keep the existing repository `CARGO_REGISTRY_TOKEN` for crates.io. Set
 `BAMBOO_RELEASE_TOKEN` in `bamboo-release` with repository Contents write and
