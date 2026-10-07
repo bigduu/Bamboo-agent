@@ -74,7 +74,10 @@ pub use actor_model_context::{
 pub use actor_transcript::{
     ActorTranscriptAppend, ActorTranscriptAppendError, ActorTranscriptGroupAppend,
 };
-pub use broker_receipt::{BrokerTerminalReceipt, BrokerTerminalRoute, HostToolYield};
+pub use broker_receipt::{
+    BrokerTerminalCompleteness, BrokerTerminalReceipt, BrokerTerminalRoute,
+    HostTerminalCompleteness, HostToolYield,
+};
 #[cfg(test)]
 mod actor_directory_lifetime_tests;
 mod actor_snapshot;
