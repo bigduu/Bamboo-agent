@@ -662,7 +662,9 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    use crate::tools::{FunctionCall, ToolSchema};
+    use crate::tools::{
+        observed_tool_output_cap, scope_tool_output_cap, FunctionCall, ToolCtx, ToolSchema,
+    };
 
     use super::*;
 
@@ -959,6 +961,115 @@ mod tests {
 
         assert!(saw_sub_start);
         assert!(saw_sub_complete);
+    }
+
+    #[derive(Default)]
+    struct SubActionCapProbe {
+        observations: std::sync::Mutex<Vec<(String, Option<u32>)>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for SubActionCapProbe {
+        async fn execute(&self, _call: &ToolCall) -> crate::tools::executor::Result<ToolResult> {
+            panic!("nested cap probe requires the actual dispatch context")
+        }
+
+        async fn execute_with_context(
+            &self,
+            call: &ToolCall,
+            ctx: ToolExecutionContext<'_>,
+        ) -> crate::tools::executor::Result<ToolResult> {
+            let tool_ctx = ctx.to_tool_ctx();
+            assert_eq!(tool_ctx.session_id.as_deref(), Some("nested-cap"));
+            assert_eq!(tool_ctx.tool_call_id.as_ref(), call.id);
+            let before = observed_tool_output_cap(&tool_ctx);
+            tokio::task::yield_now().await;
+            assert_eq!(observed_tool_output_cap(&tool_ctx), before);
+            self.observations
+                .lock()
+                .unwrap()
+                .push((call.id.clone(), before));
+            let result = if call.id == "call_child" {
+                serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+                    actions: vec![make_tool_call("call_grandchild", "nested_probe", "{}")],
+                    reason: "continue after the awaited child".into(),
+                })
+                .unwrap()
+            } else {
+                "grandchild complete".into()
+            };
+            Ok(ToolResult::text(true, result))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_new_call_sub_actions_do_not_inherit_parent_output_cap() {
+        for cap in [None, Some(0), Some(37)] {
+            let (event_tx, mut event_rx) = mpsc::channel(16);
+            let tools = SubActionCapProbe::default();
+            let mut session = Session::new("nested-cap", "test-model");
+            let parent = make_tool_call("call_parent", "parent_probe", "{}");
+            let mut parent_ctx = ToolCtx::none(parent.id.as_str());
+            parent_ctx.session_id = Some(Arc::from(session.id.as_str()));
+            let result = ToolResult::text(
+                true,
+                serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+                    actions: vec![make_tool_call("call_child", "nested_probe", "{}")],
+                    reason: "start the nested queue".into(),
+                })
+                .unwrap(),
+            );
+            let outcome = scope_tool_output_cap("nested-cap", &parent.id, cap, async {
+                assert_eq!(observed_tool_output_cap(&parent_ctx), cap);
+                let outcome = handle_tool_result_with_agentic_support(
+                    &result,
+                    &parent,
+                    &event_tx,
+                    &mut session,
+                    &tools,
+                    ToolExecutionSessionFlags::default(),
+                    None,
+                )
+                .await;
+                assert_eq!(observed_tool_output_cap(&parent_ctx), cap);
+                outcome
+            })
+            .await;
+            assert_eq!(outcome, ToolHandlingOutcome::Continue);
+            assert_eq!(observed_tool_output_cap(&parent_ctx), None);
+            assert_eq!(
+                *tools.observations.lock().unwrap(),
+                vec![
+                    ("call_child".into(), None),
+                    ("call_grandchild".into(), None)
+                ]
+            );
+            let last = session.messages.last().unwrap();
+            assert_eq!(last.tool_call_id.as_deref(), Some("call_grandchild"));
+            assert_eq!(last.content, "grandchild complete");
+            let mut starts = Vec::new();
+            let mut completions = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                match event {
+                    AgentEvent::ToolStart { tool_call_id, .. } => starts.push(tool_call_id),
+                    AgentEvent::ToolComplete {
+                        tool_call_id,
+                        result,
+                    } => {
+                        assert!(result.success);
+                        completions.push(tool_call_id);
+                    }
+                    AgentEvent::ToolError { error, .. } => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            assert_eq!(starts, ["call_child", "call_grandchild"]);
+            assert_eq!(completions, starts);
+        }
     }
 
     #[tokio::test]

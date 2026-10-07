@@ -2,8 +2,9 @@
 use async_trait::async_trait;
 use bamboo_agent_core::{
     tools::{
-        FunctionSchema, Tool, ToolCall, ToolClass, ToolCtx, ToolError, ToolExecutor,
-        ToolMutability, ToolOutcome, ToolResult, ToolSchema,
+        observed_tool_output_cap, scope_tool_output_cap, FunctionSchema, Tool, ToolCall, ToolClass,
+        ToolCtx, ToolError, ToolExecutionContext, ToolExecutor, ToolMutability, ToolOutcome,
+        ToolResult, ToolSchema,
     },
     AgentEvent, FunctionCall, Message, Role, Session, Storage,
 };
@@ -56,8 +57,40 @@ impl SkillCatalogCallerResolver for Caller {
     }
 }
 
+// Separate from the persisted-override adapter above: this consumer can only
+// compose the actual dispatch observation. Disk/model defaults never fill it.
+struct ScopedCaller {
+    caller: Arc<Caller>,
+    caps: Arc<Mutex<Vec<(String, Option<u32>)>>>,
+}
+#[async_trait]
+impl SkillCatalogCallerResolver for ScopedCaller {
+    async fn resolve(&self, ctx: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
+        let mut caller = self.caller.current.read().await.clone();
+        if self
+            .caller
+            .compose
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let cap = observed_tool_output_cap(ctx);
+            if cap.is_some() {
+                assert_eq!(ctx.session_id(), Some(caller.session_id.as_str()));
+            }
+            self.caps
+                .lock()
+                .unwrap()
+                .push((ctx.tool_call_id.to_string(), cap));
+            caller.response_bytes =
+                bamboo_server_tools::skill_response_byte_budget(caller.response_bytes, cap)?;
+        }
+        Ok(caller)
+    }
+}
+
 struct ObservedReader {
-    reader: SkillsReadTool,
+    reader: Arc<SkillsReadTool>,
+    replacement: Mutex<Option<Arc<SkillsReadTool>>>,
+    shadow: bool,
     started: Arc<Notify>,
     pages: Arc<Mutex<Vec<(String, String)>>>,
     errors: Arc<Mutex<Vec<(String, String)>>>,
@@ -79,7 +112,22 @@ impl Tool for ObservedReader {
     async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
         self.started.notify_one();
         let id = ctx.tool_call_id.clone();
-        let outcome = match self.reader.invoke(args, ctx).await {
+        let reader = self
+            .replacement
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.reader.clone());
+        let result = if self.shadow {
+            // Intentional same-name custom implementation, with no Reader/resolver call.
+            Ok(ToolOutcome::Completed(ToolResult::text(
+                true,
+                json!({"contents":"界🦀\n\"\\".repeat(2_000)}).to_string(),
+            )))
+        } else {
+            reader.invoke(args, ctx).await
+        };
+        let outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.errors
@@ -132,7 +180,8 @@ impl ToolExecutor for Neighbor {
 }
 
 struct RecordingProvider {
-    args: Value,
+    args: Mutex<Value>,
+    generation: std::sync::atomic::AtomicUsize,
     eof: bool,
     parallel: bool,
     requests: Arc<Mutex<Vec<Vec<Message>>>>,
@@ -149,25 +198,35 @@ impl LLMProvider for RecordingProvider {
         let mut requests = self.requests.lock().unwrap();
         let index = requests.len();
         requests.push(messages.to_vec());
+        let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
         let cursor = messages
             .iter()
             .rev()
             .find(|m| {
                 m.role == Role::Tool
-                    && m.tool_call_id
-                        .as_deref()
-                        .is_some_and(|id| id.starts_with("actual-reader-call"))
+                    && m.tool_call_id.as_deref().is_some_and(|id| {
+                        if generation == 0 {
+                            id == "actual-reader-call"
+                                || id
+                                    .strip_prefix("actual-reader-call-")
+                                    .is_some_and(|suffix| suffix.parse::<usize>().is_ok())
+                        } else {
+                            id.starts_with(&format!("actual-reader-call-r{generation}-"))
+                        }
+                    })
             })
             .and_then(|m| serde_json::from_str::<Value>(&m.content).ok())
             .and_then(|page| page["next_cursor"].as_str().map(str::to_string));
         let chunks = if index == 0 || (self.eof && cursor.is_some()) {
             assert!(index < 50, "bounded fixture must advance to EOF");
-            let mut args = self.args.clone();
+            let mut args = self.args.lock().unwrap().clone();
             if let Some(cursor) = cursor {
                 args["cursor"] = json!(cursor);
             }
             let mut calls = vec![ToolCall {
-                id: if index == 0 {
+                id: if generation > 0 {
+                    format!("actual-reader-call-r{generation}-{index}")
+                } else if index == 0 {
                     "actual-reader-call".into()
                 } else {
                     format!("actual-reader-call-{index}")
@@ -205,6 +264,10 @@ struct Observation {
     errors: Vec<(String, String)>,
     persisted: Session,
     raw: String,
+    caps: Vec<(String, Option<u32>)>,
+    actual_cap: Option<u32>,
+    resolved_cap: Option<u32>,
+    previous_cap: Option<u32>,
 }
 async fn public_reader_round(
     response_bytes: usize,
@@ -212,6 +275,27 @@ async fn public_reader_round(
     compose: bool,
     eof: bool,
     parallel: bool,
+) -> Observation {
+    reader_round(response_bytes, tokens, compose, eof, parallel, false).await
+}
+async fn reader_round(
+    response_bytes: usize,
+    tokens: Option<u32>,
+    compose: bool,
+    eof: bool,
+    parallel: bool,
+    scoped: bool,
+) -> Observation {
+    reader_round_with(response_bytes, tokens, compose, eof, parallel, scoped, None).await
+}
+async fn reader_round_with(
+    response_bytes: usize,
+    tokens: Option<u32>,
+    compose: bool,
+    eof: bool,
+    parallel: bool,
+    scoped: bool,
+    repeat: Option<(&str, bool)>,
 ) -> Observation {
     let dir = tempfile::tempdir().unwrap();
     let skills = dir.path().join("skills");
@@ -282,11 +366,20 @@ async fn public_reader_round(
         compose: std::sync::atomic::AtomicBool::new(false),
     });
     let config = Arc::new(RwLock::new(Config::default()));
+    let caps = Arc::new(Mutex::new(Vec::new()));
+    let resolver: Arc<dyn SkillCatalogCallerResolver> = if scoped {
+        Arc::new(ScopedCaller {
+            caller: caller.clone(),
+            caps: caps.clone(),
+        })
+    } else {
+        caller.clone()
+    };
     let catalog = SkillsListTool::new(
         manager.clone(),
         config.clone(),
         repo.clone(),
-        caller.clone(),
+        resolver.clone(),
     );
     let mut ctx = ToolCtx::none("locate-only");
     ctx.session_id = Some(session.id.clone().into());
@@ -309,20 +402,60 @@ async fn public_reader_round(
     let started = Arc::new(Notify::new());
     let pages = Arc::new(Mutex::new(Vec::new()));
     let errors = Arc::new(Mutex::new(Vec::new()));
+    let reader = Arc::new(ObservedReader {
+        reader: Arc::new(SkillsReadTool::new(catalog)),
+        replacement: Mutex::new(None),
+        shadow: repeat == Some(("shadow", false)),
+        started: started.clone(),
+        pages: pages.clone(),
+        errors: errors.clone(),
+    });
     let overlay = Arc::new(OverlayToolExecutor::new(
-        Arc::new(Neighbor {
-            started: started.clone(),
-        }),
-        Arc::new(ObservedReader {
-            reader: SkillsReadTool::new(catalog),
-            started,
-            pages: pages.clone(),
-            errors: errors.clone(),
-        }),
+        Arc::new(Neighbor { started }),
+        reader.clone(),
     ));
+    // A normal lower-level Core dispatch has no round-resolved budget or scope.
+    // Exercise the real getter-consuming Reader, without fabricating a scope/Err.
+    if repeat == Some(("unavailable", false)) {
+        assert!(session.effective_token_budget().is_none());
+        let call = ToolCall {
+            id: "lower-reader-unavailable".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "skills_read".into(),
+                arguments: json!({"package":package,"resource":"references/raw.txt"}).to_string(),
+            },
+        };
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.session_id = Some(&session.id);
+        let owned = ctx.to_tool_ctx();
+        assert_eq!(observed_tool_output_cap(&owned), None);
+        let result = bamboo_agent_core::tools::executor::execute_tool_call_with_context_outcome(
+            &call,
+            overlay.as_ref(),
+            None,
+            ctx,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(observed_tool_output_cap(&owned), None);
+        let persisted = storage.load_session(&session.id).await.unwrap().unwrap();
+        return Observation {
+            requests: Vec::new(),
+            pages: pages.lock().unwrap().clone(),
+            errors: errors.lock().unwrap().clone(),
+            persisted,
+            raw,
+            caps: caps.lock().unwrap().clone(),
+            actual_cap: None,
+            resolved_cap: None,
+            previous_cap: None,
+        };
+    }
     let requests = Arc::new(Mutex::new(Vec::new()));
     let provider = Arc::new(RecordingProvider {
-        args: json!({"package":package,"resource":"references/raw.txt"}),
+        args: Mutex::new(json!({"package":package,"resource":"references/raw.txt"})),
+        generation: std::sync::atomic::AtomicUsize::new(0),
         eof,
         parallel,
         requests: requests.clone(),
@@ -337,13 +470,121 @@ async fn public_reader_round(
         .storage(storage.clone())
         .persistence(persistence)
         .attachment_reader(storage.clone())
-        .skill_manager(manager)
+        .skill_manager(manager.clone())
         .metrics_collector(metrics)
-        .config(config)
-        .provider(provider)
+        .config(config.clone())
+        .provider(provider.clone())
         .default_tools(overlay)
         .build()
         .unwrap();
+    run_reader_runtime(&runtime, &mut session, dir.path()).await;
+    let mut previous_cap = None;
+    if let Some((change, cold)) = repeat.filter(|(change, _)| *change != "shadow") {
+        assert!(errors.lock().unwrap().is_empty());
+        let (id, raw) = pages.lock().unwrap()[0].clone();
+        let page: Value = serde_json::from_str(&raw).unwrap();
+        let cursor = page["next_cursor"]
+            .as_str()
+            .expect("first call must leave a continuation");
+        previous_cap = session
+            .effective_token_budget()
+            .map(|b| b.max_tool_output_tokens);
+        {
+            let recorded = requests.lock().unwrap();
+            let reply = exact_reply(recorded.last().unwrap(), &id);
+            assert_eq!(reply.content, raw);
+            assert_provider_pages(recorded.last().unwrap(), reply, Some(1_024));
+        }
+        match change {
+            "cap" => {
+                session
+                    .token_budget
+                    .as_mut()
+                    .unwrap()
+                    .max_tool_output_tokens = 2_048
+            }
+            "clear" => {
+                session.token_budget = None;
+                session.resolved_token_budget = None;
+            }
+            "ceiling" => caller.current.write().await.ceiling = Some(BTreeSet::new()),
+            "disabled" => config
+                .write()
+                .await
+                .skills
+                .disabled
+                .push("output-fixture".into()),
+            "input" => {
+                let next = Message::user("new current input without a Skill selection");
+                caller.current.write().await.input_id = next.id.clone();
+                caller.current.write().await.invocation = None;
+                session.messages.push(next);
+            }
+            "manual" => caller.current.write().await.invocation = None,
+            "session" => {
+                session.root_orchestration_only = true;
+                session.root_tool_authority_revision += 1;
+            }
+            "raw" => std::fs::write(bundle.join("references/raw.txt"), "foreign bytes").unwrap(),
+            "policy" => {
+                std::fs::write(
+                    bundle.join("agents/bamboo.yaml"),
+                    "invocation_policy:\n  explicit: false\n  automatic: false\n",
+                )
+                .unwrap();
+                manager.store().reload().await.unwrap();
+            }
+            _ => panic!("unknown repeat {change}"),
+        }
+        repo.save(&mut session).await.unwrap();
+        if cold {
+            *reader.replacement.lock().unwrap() =
+                Some(Arc::new(SkillsReadTool::new(SkillsListTool::new(
+                    manager.clone(),
+                    config.clone(),
+                    repo.clone(),
+                    resolver.clone(),
+                ))));
+        }
+        if !cold && change != "clear" {
+            provider.args.lock().unwrap()["cursor"] = json!(cursor);
+        }
+        provider
+            .generation
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        requests.lock().unwrap().clear();
+        pages.lock().unwrap().clear();
+        errors.lock().unwrap().clear();
+        caps.lock().unwrap().clear();
+        run_reader_runtime(&runtime, &mut session, dir.path()).await;
+    }
+    let requests = requests.lock().unwrap().clone();
+    let pages = pages.lock().unwrap().clone();
+    let errors = errors.lock().unwrap().clone();
+    let caps = caps.lock().unwrap().clone();
+    Observation {
+        requests,
+        pages,
+        errors,
+        persisted: storage.load_session(&session.id).await.unwrap().unwrap(),
+        raw,
+        caps,
+        actual_cap: session
+            .effective_token_budget()
+            .map(|b| b.max_tool_output_tokens),
+        previous_cap,
+        resolved_cap: session
+            .resolved_token_budget
+            .as_ref()
+            .map(|(_, b)| b.max_tool_output_tokens),
+    }
+}
+
+async fn run_reader_runtime(
+    runtime: &bamboo_engine::AgentRuntime,
+    session: &mut Session,
+    data_dir: &std::path::Path,
+) {
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(128);
     let events = tokio::spawn(async move {
         let mut events = Vec::new();
@@ -355,8 +596,9 @@ async fn public_reader_round(
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
         runtime.execute(
-            &mut session,
+            session,
             ExecuteRequestBuilder::new("", event_tx, CancellationToken::new())
+                .app_data_dir(data_dir.to_path_buf())
                 .model("test-model")
                 .selected_skill_ids(vec![])
                 .build(),
@@ -366,16 +608,6 @@ async fn public_reader_round(
     .unwrap()
     .unwrap();
     events.await.unwrap();
-    let requests = requests.lock().unwrap().clone();
-    let pages = pages.lock().unwrap().clone();
-    let errors = errors.lock().unwrap().clone();
-    Observation {
-        requests,
-        pages,
-        errors,
-        persisted: storage.load_session(&session.id).await.unwrap().unwrap(),
-        raw,
-    }
 }
 
 fn exact_reply<'a>(messages: &'a [Message], id: &str) -> &'a Message {
@@ -425,29 +657,31 @@ async fn skill_output_uncomposed_reader_still_uses_generic_same_name_hard_cap() 
 
 #[tokio::test]
 async fn skill_output_tiny_envelope_is_genuine_reader_error_and_plain_failed_same_id() {
-    let observed = public_reader_round(8_000, Some(256), true, false, true).await;
-    assert!(
-        observed.pages.is_empty(),
-        "never manufacture partial success JSON"
-    );
-    assert_eq!(observed.errors.len(), 1);
-    let (id, error) = &observed.errors[0];
-    let reply = exact_reply(&observed.requests[1], id);
-    assert_eq!(reply.tool_success, Some(false));
-    assert!(
-        reply.content.contains(error),
-        "Runtime must project the actual Reader ToolError"
-    );
-    assert!(serde_json::from_str::<Value>(&reply.content).is_err());
-    assert_eq!(
-        exact_reply(&observed.persisted.messages, id).content,
-        reply.content
-    );
-    assert_eq!(
-        exact_reply(&observed.requests[1], "neighbor-call").content,
-        "neighbor unchanged"
-    );
-    assert_provider_pages(&observed.requests[1], reply, None);
+    for scoped in [false, true] {
+        let observed = reader_round(8_000, Some(256), true, false, true, scoped).await;
+        assert!(
+            observed.pages.is_empty(),
+            "never manufacture partial success JSON"
+        );
+        assert_eq!(observed.errors.len(), 1);
+        let (id, error) = &observed.errors[0];
+        let reply = exact_reply(&observed.requests[1], id);
+        assert_eq!(reply.tool_success, Some(false));
+        assert!(
+            reply.content.contains(error),
+            "Runtime must project the actual Reader ToolError"
+        );
+        assert!(serde_json::from_str::<Value>(&reply.content).is_err());
+        assert_eq!(
+            exact_reply(&observed.persisted.messages, id).content,
+            reply.content
+        );
+        assert_eq!(
+            exact_reply(&observed.requests[1], "neighbor-call").content,
+            "neighbor unchanged"
+        );
+        assert_provider_pages(&observed.requests[1], reply, None);
+    }
 }
 
 #[tokio::test]
@@ -613,4 +847,495 @@ fn assert_provider_pages(messages: &[Message], reply: &Message, bound: Option<us
         .unwrap_or_else(|_| json!({"result":reply.content}));
     assert_eq!(block["functionResponse"]["response"], normalized);
     check(block);
+}
+
+#[tokio::test]
+async fn skill_output_scoped_original_uncomposed_page_requires_same_dispatch_budget() {
+    let observed = reader_round(8_000, Some(1_024), true, false, false, true).await;
+    assert_eq!(observed.pages.len(), 1);
+    let (id, raw) = &observed.pages[0];
+    assert_eq!(
+        exact_reply(&observed.requests[1], id).content,
+        *raw,
+        "original actual Reader JSON is truncated without same-dispatch composition"
+    );
+}
+
+#[tokio::test]
+async fn skill_output_scoped_producer_supplies_actual_runtime_reader_cap() {
+    let observed = reader_round(8_000, Some(1_024), true, false, false, true).await;
+    assert!(
+        observed.errors.is_empty(),
+        "scoped producer missing: {:?}",
+        observed.errors
+    );
+    assert_eq!(observed.pages.len(), 1);
+    assert_eq!(observed.actual_cap, Some(1_024));
+    assert!(!observed.caps.is_empty());
+    for (id, cap) in &observed.caps {
+        assert_eq!(id, "actual-reader-call");
+        assert_eq!(*cap, observed.actual_cap);
+    }
+    let (id, raw) = &observed.pages[0];
+    let reply = exact_reply(&observed.requests[1], id);
+    assert_eq!(reply.content, *raw);
+    assert_eq!(reply.tool_success, Some(true));
+    assert_provider_pages(&observed.requests[1], reply, Some(1_024));
+}
+
+fn assert_scoped_success(observed: &Observation) {
+    assert!(observed.errors.is_empty(), "{:?}", observed.errors);
+    assert!(!observed.pages.is_empty());
+    assert!(!observed.caps.is_empty());
+    for (id, cap) in &observed.caps {
+        assert!(observed.pages.iter().any(|(call, _)| call == id));
+        assert_eq!(*cap, observed.actual_cap);
+    }
+    let limit = observed
+        .actual_cap
+        .filter(|cap| *cap != 0)
+        .unwrap_or(8_000)
+        .min(8_000);
+    for (id, raw) in &observed.pages {
+        let next = observed
+            .requests
+            .iter()
+            .skip(1)
+            .find(|messages| {
+                messages
+                    .iter()
+                    .any(|m| m.tool_call_id.as_deref() == Some(id))
+            })
+            .unwrap();
+        let reply = exact_reply(next, id);
+        assert_eq!(reply.tool_success, Some(true));
+        assert_eq!(reply.content, *raw);
+        assert_eq!(exact_reply(&observed.persisted.messages, id).content, *raw);
+        assert_provider_pages(next, reply, Some(limit as usize));
+    }
+}
+
+#[tokio::test]
+async fn skill_output_scoped_fresh_resolved_default_override_and_known_zero() {
+    for tokens in [None, Some(1_024), Some(0)] {
+        let observed = reader_round(8_000, tokens, true, false, false, true).await;
+        assert_scoped_success(&observed);
+        assert!(observed.persisted.resolved_token_budget.is_none());
+        assert!(!serde_json::to_value(&observed.persisted)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("resolved_token_budget"));
+        match tokens {
+            None => {
+                assert!(observed.persisted.token_budget.is_none());
+                assert!(observed.resolved_cap.is_some());
+                assert_eq!(observed.actual_cap, observed.resolved_cap);
+            }
+            Some(cap) => assert_eq!(observed.actual_cap, Some(cap)),
+        }
+    }
+}
+
+fn reader_arguments(observed: &Observation, id: &str) -> Value {
+    let call = observed
+        .persisted
+        .messages
+        .iter()
+        .flat_map(|message| message.tool_calls.iter().flatten())
+        .find(|call| call.id == id)
+        .unwrap();
+    serde_json::from_str(&call.function.arguments).unwrap()
+}
+
+#[tokio::test]
+async fn skill_output_unknown_dispatch_observation_is_real_failed_reader_call() {
+    let observed = reader_round_with(
+        8_000,
+        None,
+        true,
+        false,
+        false,
+        true,
+        Some(("unavailable", false)),
+    )
+    .await;
+    assert!(observed.actual_cap.is_none() && observed.resolved_cap.is_none());
+    assert!(observed.persisted.effective_token_budget().is_none());
+    assert!(observed.requests.is_empty() && observed.pages.is_empty());
+    assert_eq!(
+        observed.caps,
+        vec![("lower-reader-unavailable".into(), None)]
+    );
+    assert_eq!(observed.errors.len(), 1);
+    assert_eq!(observed.errors[0].0, "lower-reader-unavailable");
+    assert!(observed.errors[0]
+        .1
+        .contains("known current tool-output cap"));
+}
+
+#[tokio::test]
+async fn skill_output_scoped_runtime_cleared_defaults_resolve_again() {
+    let observed = reader_round_with(
+        8_000,
+        Some(1_024),
+        true,
+        false,
+        false,
+        true,
+        Some(("clear", false)),
+    )
+    .await;
+    assert_eq!(observed.previous_cap, Some(1_024));
+    assert!(observed.persisted.token_budget.is_none());
+    assert!(observed.persisted.resolved_token_budget.is_none());
+    assert!(observed.resolved_cap.is_some());
+    assert_eq!(observed.actual_cap, observed.resolved_cap);
+    assert_scoped_success(&observed);
+    assert!(reader_arguments(&observed, "actual-reader-call-r1-0")
+        .get("cursor")
+        .is_none());
+    let page: Value = serde_json::from_str(&observed.pages[0].1).unwrap();
+    let contents = page["contents"].as_str().unwrap();
+    assert!(!contents.is_empty() && observed.raw.starts_with(contents));
+}
+
+#[tokio::test]
+async fn skill_output_scoped_continuation_rejects_changed_actual_cap() {
+    let observed = reader_round_with(
+        8_000,
+        Some(1_024),
+        true,
+        false,
+        false,
+        true,
+        Some(("cap", false)),
+    )
+    .await;
+    assert_eq!(observed.previous_cap, Some(1_024));
+    assert_eq!(observed.actual_cap, Some(2_048));
+    assert!(observed.caps.iter().all(|(_, cap)| *cap == Some(2_048)));
+    assert!(observed.pages.is_empty());
+    assert_eq!(observed.errors.len(), 1);
+    assert!(observed.errors[0].1.contains("changed"));
+    let reply = exact_reply(&observed.requests[1], &observed.errors[0].0);
+    assert_eq!(reply.tool_success, Some(false));
+    assert!(reply.content.contains(&observed.errors[0].1));
+    assert_provider_pages(&observed.requests[1], reply, None);
+}
+
+#[tokio::test]
+async fn skill_output_scoped_runtime_warm_and_cold_revocation_remains_mandatory() {
+    for change in [
+        "ceiling", "disabled", "input", "manual", "session", "raw", "policy",
+    ] {
+        for cold in [false, true] {
+            // An authorized fresh cold capture can read changed auxiliary bytes;
+            // only the historical warm continuation must reject that replacement.
+            if cold && change == "raw" {
+                continue;
+            }
+            let observed = reader_round_with(
+                8_000,
+                Some(1_024),
+                true,
+                false,
+                false,
+                true,
+                Some((change, cold)),
+            )
+            .await;
+            assert!(observed.pages.is_empty(), "{change}, cold={cold}");
+            if change == "session" {
+                // Root tightening is enforced even earlier than Reader freshness:
+                // no executor dispatch or cap observation may occur at all.
+                assert!(observed.errors.is_empty());
+                assert!(observed.caps.is_empty());
+                let reply = exact_reply(&observed.requests[1], "actual-reader-call-r1-0");
+                assert_eq!(reply.tool_success, Some(false));
+                assert_provider_pages(&observed.requests[1], reply, None);
+                continue;
+            }
+            assert_eq!(observed.errors.len(), 1, "{change}, cold={cold}");
+            if cold {
+                assert!(reader_arguments(&observed, "actual-reader-call-r1-0")
+                    .get("cursor")
+                    .is_none());
+            }
+            let cause = if change == "raw" {
+                "changed"
+            } else {
+                "not currently eligible"
+            };
+            assert!(
+                observed.errors[0].1.contains(cause),
+                "{change}, cold={cold}: {:?}",
+                observed.errors
+            );
+            assert!(!observed.caps.is_empty());
+            assert!(observed
+                .caps
+                .iter()
+                .all(|(_, cap)| *cap == observed.actual_cap));
+            let reply = exact_reply(&observed.requests[1], &observed.errors[0].0);
+            assert_eq!(reply.tool_success, Some(false));
+            assert!(reply.content.contains(&observed.errors[0].1));
+            assert_provider_pages(&observed.requests[1], reply, None);
+        }
+    }
+}
+
+#[tokio::test]
+async fn skill_output_scoped_parallel_pages_reconstruct_utf8_through_true_eof() {
+    let observed = reader_round(8_000, Some(1_024), true, true, true, true).await;
+    assert_scoped_success(&observed);
+    assert!(observed.pages.len() > 1);
+    let mut raw = String::new();
+    let mut cursors = BTreeSet::new();
+    for (index, (_, text)) in observed.pages.iter().enumerate() {
+        let page: Value = serde_json::from_str(text).unwrap();
+        let content = page["contents"].as_str().unwrap();
+        assert!(!content.is_empty());
+        raw.push_str(content);
+        if index + 1 == observed.pages.len() {
+            assert!(page["next_cursor"].is_null());
+        } else {
+            assert!(cursors.insert(page["next_cursor"].as_str().unwrap().to_string()));
+        }
+    }
+    assert_eq!(raw, observed.raw);
+    assert_eq!(
+        exact_reply(observed.requests.last().unwrap(), "neighbor-call").content,
+        "neighbor unchanged"
+    );
+}
+
+#[tokio::test]
+async fn skill_output_scoped_same_name_shadow_keeps_generic_truncation() {
+    let observed = reader_round_with(
+        8_000,
+        Some(1_024),
+        true,
+        false,
+        false,
+        true,
+        Some(("shadow", false)),
+    )
+    .await;
+    assert!(
+        observed.caps.is_empty(),
+        "shadow must not call the real Reader resolver"
+    );
+    assert_eq!(observed.pages.len(), 1);
+    let (id, raw) = &observed.pages[0];
+    let reply = exact_reply(&observed.requests[1], id);
+    assert_eq!(reply.tool_success, Some(true));
+    assert_ne!(reply.content, *raw);
+    assert!(reply.content.contains("tool output truncated"));
+    assert_provider_pages(&observed.requests[1], reply, None);
+}
+
+struct ScopeProbe(&'static str);
+#[async_trait]
+impl Tool for ScopeProbe {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn description(&self) -> &str {
+        "inline observation probe"
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({"type":"object"})
+    }
+    fn classify(&self, _: &Value) -> ToolClass {
+        ToolClass::READONLY_PARALLEL
+    }
+    async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
+        tokio::task::yield_now().await;
+        Ok(ToolOutcome::Completed(ToolResult::text(
+            true,
+            json!({
+                "cap": observed_tool_output_cap(&ctx), "call": ctx.tool_call_id.as_ref(),
+                "session":ctx.session_id(), "args":args
+            })
+            .to_string(),
+        )))
+    }
+}
+struct OpaqueExecutor(Arc<dyn ToolExecutor>);
+#[async_trait]
+impl ToolExecutor for OpaqueExecutor {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        self.0.execute(call).await
+    }
+    fn list_tools(&self) -> Vec<ToolSchema> {
+        self.0.list_tools()
+    }
+}
+struct ContextForwarder(Arc<dyn ToolExecutor>);
+#[async_trait]
+impl ToolExecutor for ContextForwarder {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        self.0.execute(call).await
+    }
+    async fn execute_with_context(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        self.0.execute_with_context(call, ctx).await
+    }
+    fn list_tools(&self) -> Vec<ToolSchema> {
+        self.0.list_tools()
+    }
+}
+
+#[tokio::test]
+async fn skill_output_scope_crosses_real_inline_wrappers_but_not_default_context_loss() {
+    let registry = bamboo_tools::tools::ToolRegistry::new();
+    registry.register(ScopeProbe("builtin_probe")).unwrap();
+    let builtin: Arc<dyn ToolExecutor> =
+        Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(registry));
+    let secondary_registry = bamboo_tools::tools::ToolRegistry::new();
+    secondary_registry
+        .register(ScopeProbe("secondary_probe"))
+        .unwrap();
+    let secondary = Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(
+        secondary_registry,
+    ));
+    let composite = Arc::new(bamboo_mcp::CompositeToolExecutor::new(builtin, secondary));
+    let overlay: Arc<dyn ToolExecutor> = Arc::new(OverlayToolExecutor::new(
+        composite,
+        Arc::new(ScopeProbe("overlay_probe")),
+    ));
+    let forwarded = ContextForwarder(overlay.clone());
+    let opaque = OpaqueExecutor(overlay.clone());
+    for name in ["builtin_probe", "secondary_probe", "overlay_probe"] {
+        let call = ToolCall {
+            id: "inline-call".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: json!({"exact":"界"}).to_string(),
+            },
+        };
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.session_id = Some("inline-session");
+        scope_tool_output_cap("inline-session", &call.id, Some(37), async {
+            let result = forwarded
+                .execute_with_context_outcome(&call, ctx)
+                .await
+                .unwrap()
+                .into_tool_result();
+            let value: Value = serde_json::from_str(&result.result).unwrap();
+            assert_eq!(value["cap"], 37);
+            assert_eq!(value["call"], call.id);
+            assert_eq!(value["session"], "inline-session");
+            assert_eq!(value["args"], json!({"exact":"界"}));
+            for result in [
+                opaque
+                    .execute_with_context_outcome(&call, ctx)
+                    .await
+                    .unwrap(),
+                overlay
+                    .execute_with_context_outcome(&call, ToolExecutionContext::none(&call.id))
+                    .await
+                    .unwrap(),
+            ] {
+                let value: Value = serde_json::from_str(&result.into_tool_result().result).unwrap();
+                assert!(value["cap"].is_null());
+                assert!(value["session"].is_null());
+                assert_eq!(value["call"], call.id);
+            }
+            let mut wrong = ctx;
+            wrong.tool_call_id = "different-call";
+            let result = forwarded
+                .execute_with_context_outcome(&call, wrong)
+                .await
+                .unwrap()
+                .into_tool_result();
+            let value: Value = serde_json::from_str(&result.result).unwrap();
+            assert!(value["cap"].is_null());
+        })
+        .await;
+        assert_eq!(observed_tool_output_cap(&ctx.to_tool_ctx()), None);
+    }
+}
+
+async fn remote_cap_rpc(body: actix_web::web::Json<Value>) -> actix_web::HttpResponse {
+    use actix_web::HttpResponse;
+    if body.get("id").is_none() {
+        return HttpResponse::Accepted().finish();
+    }
+    if body["method"] == "server/discover" {
+        return HttpResponse::Ok().json(json!({"jsonrpc":"2.0","id":body["id"],
+            "error":{"code":-32601,"message":"legacy remote fixture"}}));
+    }
+    let result = match body["method"].as_str().unwrap() {
+        "initialize" => json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{}},
+            "serverInfo":{"name":"remote-cap-fixture","version":"1"}}),
+        "tools/list" => json!({"tools":[{"name":"probe","description":"remote probe",
+            "inputSchema":{"type":"object"}}]}),
+        "tools/call" => {
+            assert_eq!(body["params"]["name"], "probe");
+            assert_eq!(body["params"]["arguments"], json!({"value":"unchanged"}));
+            assert!(body["params"].get("cap").is_none());
+            assert!(body["params"].get("session_id").is_none());
+            let mut ctx = ToolCtx::none("remote-call");
+            ctx.session_id = Some("remote-session".into());
+            json!({"content":[{"type":"text", "text":json!({
+                "cap":observed_tool_output_cap(&ctx)}).to_string()}],"isError":false})
+        }
+        _ => json!({}),
+    };
+    HttpResponse::Ok().json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+}
+
+#[actix_web::test]
+async fn skill_output_scope_does_not_cross_actual_mcp_http_dispatch() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = actix_web::HttpServer::new(|| {
+        actix_web::App::new().route("/mcp", actix_web::web::post().to(remote_cap_rpc))
+    })
+    .workers(1)
+    .listen(listener)
+    .unwrap()
+    .run();
+    let stop = server.handle();
+    let server = tokio::spawn(server);
+    let manager = Arc::new(bamboo_mcp::McpServerManager::new());
+    manager.start_server(serde_json::from_value(json!({"id":"remote", "name":null,
+        "transport":{"type":"streamable_http","url":format!("http://{address}/mcp"),"connect_timeout_ms":3_000},
+        "request_timeout_ms":3_000,"reconnect":{"enabled":false,"initial_backoff_ms":1,"max_backoff_ms":1,"max_attempts":1}
+    })).unwrap()).await.unwrap();
+    let executor = bamboo_mcp::McpToolExecutor::from_manager(manager.clone());
+    let name = executor.list_tools()[0].function.name.clone();
+    let call = ToolCall {
+        id: "remote-call".into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name,
+            arguments: json!({"value":"unchanged"}).to_string(),
+        },
+    };
+    let mut ctx = ToolExecutionContext::none(&call.id);
+    ctx.session_id = Some("remote-session");
+    for cap in [None, Some(0), Some(37)] {
+        let result = scope_tool_output_cap("remote-session", &call.id, cap, async {
+            assert_eq!(observed_tool_output_cap(&ctx.to_tool_ctx()), cap);
+            executor.execute_with_context_outcome(&call, ctx).await
+        })
+        .await
+        .unwrap()
+        .into_tool_result();
+        assert!(result.success);
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.result).unwrap(),
+            json!({"cap":null})
+        );
+    }
+    manager.shutdown_all().await;
+    stop.stop(true).await;
+    server.await.unwrap().unwrap();
 }
