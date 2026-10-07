@@ -724,13 +724,13 @@ async fn sdk_approval_replay_does_not_retain_a_completed_original_output_cap_sco
         fixture.approve(&request).await;
         fixture.reopen_store().await;
         let mut reloaded = fixture.reload(&id).await;
+        // Actual V2 loading clears stale Root overrides before SDK replay.
         assert_eq!(
             reloaded
                 .token_budget
                 .as_ref()
-                .unwrap()
-                .max_tool_output_tokens,
-            cap
+                .map(|budget| budget.max_tool_output_tokens),
+            None
         );
         let replay_agent = fixture.registered_agent(alias_config(), &["Bash"]);
         let provider_calls = fixture.probe.provider_calls.load(Ordering::SeqCst);
