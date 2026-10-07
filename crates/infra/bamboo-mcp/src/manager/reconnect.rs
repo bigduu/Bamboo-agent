@@ -175,12 +175,12 @@ impl McpServerManager {
         let init_result = client
             .initialize(config.request_timeout_ms)
             .await
-            .map_err(|error| {
+            .inspect_err(|error| {
                 error!(
-                    "Failed to initialize MCP server '{}' during {}: {}",
-                    server_id, phase, error
+                    server_id = %diagnostic_id("server", &[server_id]), phase,
+                    error_kind = error_kind(error), error_text_len = error_text_len(error),
+                    "Failed to initialize MCP server"
                 );
-                error
             })?;
         let instructions = init_result
             .instructions

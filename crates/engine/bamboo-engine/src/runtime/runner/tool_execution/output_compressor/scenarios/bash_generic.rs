@@ -2,6 +2,11 @@
 //!
 //! Applied to any Bash command that doesn't match a more specific scenario.
 
+mod json_rows;
+
+#[cfg(test)]
+mod json_rows_tests;
+
 use crate::runtime::runner::tool_execution::output_compressor::filters;
 use crate::runtime::runner::tool_execution::output_compressor::CompressionResult;
 use crate::runtime::runner::tool_execution::output_compressor::CompressionTier;
@@ -44,8 +49,13 @@ pub(crate) fn compress(raw_result: &str, tier: CompressionTier) -> CompressionRe
     let collapsed_stdout = filters::collapse_blank_lines(&clean_stdout);
     let collapsed_stderr = filters::collapse_blank_lines(&clean_stderr);
 
-    // Stage 2.5: Collapse duplicate lines (stack frames, repeated log lines)
-    let deduped_stdout = filters::collapse_duplicate_lines(&collapsed_stdout, 3);
+    // JSON rows retain their scalar spelling and multiplicity. Only the text
+    // fallback collapses duplicate lines (stack frames, repeated log lines).
+    let tabular_stdout = (stdout.len() >= MIN_COMPRESS_LEN)
+        .then(|| json_rows::compact(stdout))
+        .flatten();
+    let deduped_stdout =
+        tabular_stdout.unwrap_or_else(|| filters::collapse_duplicate_lines(&collapsed_stdout, 3));
     let deduped_stderr = filters::collapse_duplicate_lines(&collapsed_stderr, 3);
 
     // Stage 3: Cap lines

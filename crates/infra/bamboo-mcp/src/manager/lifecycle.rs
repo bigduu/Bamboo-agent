@@ -67,7 +67,7 @@ impl McpServerManager {
             return Err(McpError::AlreadyRunning(server_id));
         }
 
-        info!("Starting MCP server '{}'", server_id);
+        info!(server_id = %diagnostic_id("server", &[&server_id]), phase = "start", "Starting MCP server");
         let prepared = self.prepare_server_runtime(config, "start").await?;
         let publication = prepared.publication().clone();
         let base = self.authority.generation();
@@ -264,7 +264,7 @@ impl McpServerManager {
         match events {
             Ok(events) => {
                 events.activate();
-                info!("MCP server '{}' stopped", server_id);
+                info!(server_id = %diagnostic_id("server", &[server_id]), phase = "stop", status = "stopped", "MCP server stopped");
                 Ok(())
             }
             Err(error) => Err(error),
@@ -276,7 +276,7 @@ impl McpServerManager {
         server_id: &str,
         sequence: OwnedMutexGuard<()>,
     ) -> Result<PreparedEventBatch> {
-        info!("Stopping MCP server '{}'", server_id);
+        info!(server_id = %diagnostic_id("server", &[server_id]), phase = "stop", "Stopping MCP server");
         let base = self.authority.generation();
         let publication = base
             .servers
@@ -423,12 +423,16 @@ impl McpServerManager {
         let manager = self.clone();
         let server_id = expected.server_id().to_string();
         warn!(
-            "Recycling MCP server '{}' after repeated tool failures (disconnect + reconnect)",
-            server_id
+            server_id = %diagnostic_id("server", &[&server_id]), phase = "recycle",
+            "Recycling MCP server after repeated tool failures"
         );
         tokio::spawn(async move {
             if let Err(error) = manager.attempt_reconnection(expected).await {
-                warn!("MCP server '{}' recycle failed: {}", server_id, error);
+                warn!(
+                    server_id = %diagnostic_id("server", &[&server_id]), phase = "recycle",
+                    error_kind = error_kind(&error), error_text_len = error_text_len(&error),
+                    "MCP server recycle failed"
+                );
             }
         });
     }
@@ -448,7 +452,7 @@ impl McpServerManager {
 
     async fn refresh_tools_for_expected(&self, expected: ExpectedPublication) -> Result<bool> {
         let server_id = expected.server_id().to_string();
-        info!("Refreshing tools for MCP server '{}'", server_id);
+        info!(server_id = %diagnostic_id("server", &[&server_id]), phase = "refresh_tools", "Refreshing tools for MCP server");
         let client = expected.runtime().client_if_open()?;
         let new_tools = client
             .list_tools(expected.runtime().runtime.config.request_timeout_ms)
@@ -559,8 +563,14 @@ impl McpServerManager {
                     continue;
                 };
                 if should_reconnect {
+                    let server_id = diagnostic_id("server", &[expected.server_id()]);
                     if let Err(error) = manager.attempt_reconnection(expected).await {
-                        error!("MCP health-triggered reconnection failed: {}", error);
+                        error!(
+                            %server_id,
+                            phase = "health_reconnect", error_kind = error_kind(&error),
+                            error_text_len = error_text_len(&error),
+                            "MCP health-triggered reconnection failed"
+                        );
                     }
                 }
             }
@@ -596,9 +606,9 @@ impl McpServerManager {
             }
             Err(error) => {
                 warn!(
-                    "Health check failed for MCP server '{}': {}",
-                    expected.server_id(),
-                    error
+                    server_id = %diagnostic_id("server", &[expected.server_id()]),
+                    phase = "health_check", error_kind = "health_check",
+                    error_text_len = error.len(), "Health check failed for MCP server"
                 );
                 {
                     let mut info = runtime.runtime.info.write().await;
@@ -662,13 +672,23 @@ impl McpServerManager {
         expected: ExpectedPublication,
         notification: JsonRpcNotification,
     ) {
+        let server_id = diagnostic_id("server", &[expected.server_id()]);
         let method = notification.method.as_str();
         if TOOLS_LIST_CHANGED_METHODS.contains(&method) {
             if let Err(error) = self.refresh_tools_for_expected(expected).await {
-                warn!("Failed to refresh MCP tools after notification: {}", error);
+                warn!(
+                    %server_id, phase = "notification_refresh", error_kind = error_kind(&error),
+                    error_text_len = error_text_len(&error),
+                    "Failed to refresh MCP tools after notification"
+                );
             }
         } else {
-            tracing::trace!("MCP notification '{}' drained (no dispatcher)", method);
+            tracing::trace!(
+                %server_id,
+                method_id = %diagnostic_id("notification_method", &[method]),
+                method_len = method.len(), phase = "notification",
+                "MCP notification drained (no dispatcher)"
+            );
         }
     }
 }
