@@ -1284,4 +1284,110 @@ mod tests {
         assert!(hint.matches("re-running the module checks"));
         assert!(!hint.matches("xyz qrs unrelated"));
     }
+
+    #[test]
+    fn skill_output_utf8_byte_ceiling_bounds_actual_bundled_and_default_counters() {
+        use bamboo_compression::{HeuristicTokenCounter, TiktokenTokenCounter, TokenCounter};
+        let bundled = TiktokenTokenCounter::default();
+        let heuristic = HeuristicTokenCounter::default();
+        let ascii = (0..=127).map(char::from).collect::<String>();
+        let unicode = [
+            "界🦀é",
+            "\r\n\0\"\\",
+            "<|endoftext|><|endofprompt|>",
+            "\u{10ffff}\u{10000}\u{7ff}",
+        ];
+        let mut cases = vec![String::new(), ascii.clone(), "a".into(), "🦀".into()];
+        cases.extend(unicode.iter().map(|s| s.to_string()));
+        for byte in 0..=127 {
+            cases.push(char::from(byte).to_string());
+        }
+        let maximal = "界🦀\0\r\n\"\\<|endoftext|>".repeat(30_000);
+        let mut end = (512 * 1024).min(maximal.len());
+        while !maximal.is_char_boundary(end) {
+            end -= 1;
+        }
+        cases.push(maximal[..end].to_string());
+        for text in cases {
+            assert!(text.len() <= 512 * 1024);
+            for count in [bundled.count_text(&text), heuristic.count_text(&text)] {
+                assert!(
+                    count as usize <= text.len(),
+                    "actual count {count} > {} bytes",
+                    text.len()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_output_byte_sized_json_survives_generic_compression_and_zero_cap() {
+        use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
+        let raw = serde_json::json!({"contents":"界🦀\0\r\n\"\\<|endoftext|>".repeat(12),"next_cursor":null}).to_string();
+        let counter = TiktokenTokenCounter::default();
+        assert!(counter.count_text(&raw) as usize <= raw.len());
+        for cap in [raw.len() as u32, 0] {
+            let outcome = ToolExecutionOutcome {
+                permission_replay_origin: None,
+                portable_tool: None,
+                result: Ok(ToolResult::text(true, raw.clone())),
+                needs_human: None,
+                post_tool_hook_eligible: true,
+                tool_duration: std::time::Duration::ZERO,
+            };
+            let result =
+                maybe_compress("skills_read", "{}", "output-test", outcome, cap, None, None)
+                    .await
+                    .result
+                    .unwrap();
+            assert!(result.success);
+            assert_eq!(result.result, raw);
+            serde_json::from_str::<serde_json::Value>(&result.result).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_output_name_and_failed_ok_result_never_bypass_generic_hard_cap() {
+        use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
+        let raw = serde_json::json!({"contents":"🦀\"\\ variable content ".repeat(2_000),"next_cursor":"later"}).to_string();
+        assert!(TiktokenTokenCounter::default().count_text(&raw) > 128);
+        for name in [
+            "skills_read",
+            "default::skills_read",
+            "untrusted::skills_read",
+            "unrelated",
+        ] {
+            for success in [true, false] {
+                let outcome = ToolExecutionOutcome {
+                    permission_replay_origin: None,
+                    portable_tool: None,
+                    result: Ok(ToolResult::text(success, raw.clone())),
+                    needs_human: None,
+                    post_tool_hook_eligible: true,
+                    tool_duration: std::time::Duration::ZERO,
+                };
+                let result = maybe_compress(name, "{}", "output-test", outcome, 128, None, None)
+                    .await
+                    .result
+                    .unwrap();
+                assert_eq!(result.success, success);
+                assert_ne!(result.result, raw);
+                assert!(result.result.contains("tool output truncated"));
+            }
+        }
+        let error = "genuine execution error ".repeat(200);
+        let outcome = ToolExecutionOutcome {
+            permission_replay_origin: None,
+            portable_tool: None,
+            result: Err(error.clone()),
+            needs_human: None,
+            post_tool_hook_eligible: true,
+            tool_duration: std::time::Duration::ZERO,
+        };
+        let result = maybe_compress("skills_read", "{}", "output-test", outcome, 1, None, None)
+            .await
+            .result
+            .unwrap_err();
+        assert_eq!(result, error);
+    }
 }

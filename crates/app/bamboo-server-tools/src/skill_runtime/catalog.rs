@@ -458,10 +458,41 @@ struct AnthropicCache {
     kind: &'static str,
     ttl: &'static str,
 }
+#[derive(Serialize)]
+struct ChatOutput<'a> {
+    role: &'static str,
+    tool_call_id: &'a str,
+    content: &'a str,
+}
+#[derive(Serialize)]
+struct GeminiOutput<'a> {
+    #[serde(rename = "functionResponse")]
+    function_response: GeminiResponse<'a>,
+}
+#[derive(Serialize)]
+struct GeminiResponse<'a> {
+    name: &'a str,
+    response: Option<()>,
+}
 // Charge the actual largest page-bearing block, including 1h cache TTL.
+// List/read construct compact JSON objects. Gemini keeps that object, so its
+// raw serialized length replaces null in a borrowed skeleton without parsing,
+// retaining or cloning the page; all other providers carry an escaped string.
 pub(super) fn page_size(result: &ToolResult, call_id: &str) -> Result<usize, ToolError> {
     Ok([
         serialized_size(result)?,
+        serialized_size(&ChatOutput {
+            role: "tool",
+            tool_call_id: call_id,
+            content: &result.result,
+        })?,
+        serialized_size(&GeminiOutput {
+            function_response: GeminiResponse {
+                name: call_id,
+                response: None,
+            },
+        })? - 4
+            + result.result.len(),
         serialized_size(&OpenAiOutput {
             kind: "function_call_output",
             call_id,
