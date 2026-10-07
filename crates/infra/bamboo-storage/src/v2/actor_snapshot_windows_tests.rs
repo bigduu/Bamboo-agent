@@ -3,8 +3,9 @@
 
 use super::*;
 use bamboo_domain::{
-    ActorActivationClaim, ActorDirectoryPort, ActorSnapshotError as Error, ActorSnapshotLimits,
-    ActorSnapshotPort, ActorSnapshotPrincipal, Session, Storage,
+    ActorActivationClaim, ActorDirectoryEntry, ActorDirectoryPort, ActorSnapshotError as Error,
+    ActorSnapshotLimits, ActorSnapshotPort, ActorSnapshotPrincipal, PublicActorSubtreeSnapshot,
+    Session, Storage,
 };
 use std::ffi::OsStr;
 use std::io::{Seek, Write};
@@ -429,17 +430,347 @@ fn grow_after_open_is_capped_and_actual_bytes_debit_the_aggregate_budget() {
     }
 }
 
-fn durable_files(home: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
-    fn walk(directory: &std::path::Path, files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+#[test]
+fn unsupported_namespaces_selectors_and_object_kinds_fail_without_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    std::fs::write(home.join("sentinel"), b"PRIVATE sentinel bytes").unwrap();
+    std::fs::create_dir(home.join("sentinel-directory")).unwrap();
+    std::fs::write(
+        home.join("sentinel-directory/evidence"),
+        b"retained directory bytes",
+    )
+    .unwrap();
+    let before = durable_files(&home);
+    // These synthetic namespaces are rejected lexically before opening a root.
+    // Never canonicalize them or access a share, device or generic volume.
+    for path in [
+        r"relative",
+        r"C:drive-relative",
+        r"\rooted-without-drive",
+        r"\\snapshot-invalid-server\share\child",
+        r"\\?\UNC\snapshot-invalid-server\share\child",
+        r"\\.\snapshot-invalid-device",
+        r"\\?\Volume{00000000-0000-0000-0000-000000000000}\child",
+    ] {
+        assert_eq!(
+            actor_snapshot_reader::Directory::open_absolute(std::path::Path::new(path)).err(),
+            Some(Error::UnsupportedAuthority)
+        );
+        assert_eq!(durable_files(&home), before);
+    }
+    let directory = actor_snapshot_reader::Directory::open_absolute(&home).unwrap();
+    let retained = directory
+        .child(OsStr::new("sentinel-directory"))
+        .unwrap()
+        .unwrap();
+    let oversized = "a".repeat(32768);
+    for name in [
+        "",
+        ".",
+        "..",
+        "part/child",
+        r"part\child",
+        "file:stream",
+        "nul\0name",
+        oversized.as_str(),
+    ] {
+        assert_eq!(
+            directory.child(OsStr::new(name)).err(),
+            Some(Error::InconsistentAuthority)
+        );
+        let mut budget = actor_snapshot_reader::ReadBudget::new(ActorSnapshotLimits::default());
+        assert_eq!(
+            directory.read(name, 64, &mut budget).unwrap_err(),
+            Error::InconsistentAuthority
+        );
+        assert_eq!(durable_files(&home), before);
+    }
+    assert_eq!(
+        directory.child(OsStr::new("sentinel")).err(),
+        Some(Error::InconsistentAuthority)
+    );
+    let mut budget = actor_snapshot_reader::ReadBudget::new(ActorSnapshotLimits::default());
+    assert_eq!(
+        directory
+            .read("sentinel-directory", 64, &mut budget)
+            .unwrap_err(),
+        Error::InconsistentAuthority
+    );
+    assert_eq!(
+        actor_snapshot_reader::Directory::open_absolute(&home.join("sentinel")).err(),
+        Some(Error::UnsupportedAuthority)
+    );
+    assert_eq!(durable_files(&home), before);
+    assert_eq!(
+        directory
+            .read("sentinel", 64, &mut budget)
+            .unwrap()
+            .unwrap(),
+        b"PRIVATE sentinel bytes"
+    );
+    assert_eq!(
+        retained.read("evidence", 64, &mut budget).unwrap().unwrap(),
+        b"retained directory bytes"
+    );
+    assert_eq!(durable_files(&home), before);
+}
+
+#[tokio::test]
+async fn changed_birth_stale_actor_and_root_authority_fail_without_repair() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let store = SessionStoreV2::new(home.clone()).await.unwrap();
+    let mut root = Session::new("windows-authority-root", "model");
+    root.created_at = Utc::now() - chrono::Duration::seconds(30);
+    let mut parent = Session::new_child_of("windows-authority-parent", &root, "model", "Parent");
+    parent.created_at = root.created_at + chrono::Duration::seconds(10);
+    let mut child = Session::new_child_of("windows-authority-child", &parent, "model", "Child");
+    child.created_at = root.created_at + chrono::Duration::seconds(20);
+    for session in [&root, &parent, &child] {
+        store.save_session(session).await.unwrap();
+    }
+    let initialized = store.ensure_actor(&child.id).await.unwrap();
+    initialized.validate().unwrap();
+    assert_eq!(initialized.actor.ancestor_observations.len(), 2);
+    assert_eq!(
+        initialized.actor.ancestor_observations[0].session_created_at,
+        parent.created_at
+    );
+    assert_eq!(
+        initialized.actor.ancestor_observations[1].session_created_at,
+        root.created_at
+    );
+    let root_dir = home.join("sessions").join(&root.id);
+    let parent_dir = root_dir.join("children").join(&parent.id);
+    let child_dir = root_dir.join("children").join(&child.id);
+    for directory in [&root_dir, &parent_dir] {
+        assert!(!directory.join("actor-authority.json").exists());
+        assert!(!directory.join("actor-authority.initialized.json").exists());
+    }
+    let main_path = parent_dir.join("session.json");
+    let runtime_path = parent_dir.join(RUNTIME_SIDECAR_FILE);
+    let row_path = child_dir.join("actor-authority.json");
+    let marker_path = child_dir.join("actor-authority.initialized.json");
+    let proof_path = root_dir.join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE);
+    let original_main = std::fs::read(&main_path).unwrap();
+    let original_runtime = std::fs::read(&runtime_path).unwrap();
+    let original_row = std::fs::read(&row_path).unwrap();
+    let original_marker = std::fs::read(&marker_path).unwrap();
+    let original_proof = std::fs::read(&proof_path).unwrap();
+    let baseline = [
+        (&main_path, &original_main),
+        (&runtime_path, &original_runtime),
+        (&row_path, &original_row),
+        (&marker_path, &original_marker),
+        (&proof_path, &original_proof),
+    ];
+    let revocations = home.join(".root-revocations");
+    std::fs::create_dir_all(&revocations).unwrap();
+    let revocation_path = revocations.join(format!("{}.json", root.id));
+    store.flush_search_index().await;
+    let clean_home = durable_files(&home);
+    let original = readonly_snapshot(&store, &home, &root.id, &root.id)
+        .await
+        .unwrap();
+    assert_eq!(original.nodes.len(), 3);
+    // Public selectors fail before acquiring durable authority. Reader-relative
+    // names above have a separate InconsistentAuthority rejection contract.
+    let oversized = "a".repeat(257);
+    for selector in [
+        "",
+        " root",
+        "root ",
+        "..",
+        "part/child",
+        r"part\child",
+        "nul\0name",
+        oversized.as_str(),
+    ] {
+        for (requested_root, subtree) in
+            [(selector, root.id.as_str()), (root.id.as_str(), selector)]
+        {
+            assert_eq!(
+                readonly_snapshot(&store, &home, requested_root, subtree)
+                    .await
+                    .unwrap_err(),
+                Error::InvalidSelector
+            );
+        }
+    }
+    for mutation in 0..6 {
+        // Restore exact bytes and prove a clean tree before each independent
+        // failure; a stale ancestor must not mask a marker or Root-proof case.
+        for (path, bytes) in baseline {
+            std::fs::write(path, bytes).unwrap();
+        }
+        if revocation_path.exists() {
+            std::fs::remove_file(&revocation_path).unwrap();
+        }
+        assert_eq!(durable_files(&home), clean_home);
+        assert_eq!(
+            readonly_snapshot(&store, &home, &root.id, &root.id)
+                .await
+                .unwrap(),
+            original
+        );
+        let expected = match mutation {
+            0 => {
+                let changed_birth = parent.created_at + chrono::Duration::seconds(5);
+                assert!(parent.created_at < changed_birth && changed_birth < child.created_at);
+                let mut main: Session = serde_json::from_slice(&original_main).unwrap();
+                main.created_at = changed_birth;
+                std::fs::write(&main_path, compact_main::serialize_main(&main).unwrap()).unwrap();
+                let mut runtime: serde_json::Value =
+                    serde_json::from_slice(&original_runtime).unwrap();
+                runtime["created_at"] = serde_json::json!(changed_birth);
+                std::fs::write(&runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+                assert_eq!(std::fs::read(&row_path).unwrap(), original_row);
+                Error::StaleAuthority
+            }
+            1 => {
+                let mut row: ActorDirectoryEntry = serde_json::from_slice(&original_row).unwrap();
+                row.actor.observed_metadata_version =
+                    row.actor.observed_metadata_version.checked_add(1).unwrap();
+                row.validate().unwrap();
+                std::fs::write(&row_path, serde_json::to_vec(&row).unwrap()).unwrap();
+                Error::StaleAuthority
+            }
+            2 => {
+                std::fs::remove_file(&marker_path).unwrap();
+                assert_eq!(std::fs::read(&row_path).unwrap(), original_row);
+                Error::InconsistentAuthority
+            }
+            3 => {
+                std::fs::remove_file(&proof_path).unwrap();
+                Error::InconsistentAuthority
+            }
+            4 => {
+                let mut proof: serde_json::Value = serde_json::from_slice(&original_proof).unwrap();
+                assert_eq!(proof["state"], "committed");
+                proof["created_at"] =
+                    serde_json::json!(root.created_at + chrono::Duration::seconds(1));
+                std::fs::write(&proof_path, serde_json::to_vec(&proof).unwrap()).unwrap();
+                Error::StaleAuthority
+            }
+            _ => {
+                std::fs::write(
+                    &revocation_path,
+                    serde_json::to_vec(&serde_json::json!({
+                        "version": 1,
+                        "session_id": root.id,
+                        "revoked_through": root.created_at,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                Error::NotFound
+            }
+        };
+        assert_eq!(
+            readonly_snapshot(&store, &home, &root.id, &root.id)
+                .await
+                .unwrap_err(),
+            expected,
+            "authority mutation {mutation}"
+        );
+    }
+    for (path, bytes) in baseline {
+        std::fs::write(path, bytes).unwrap();
+    }
+    std::fs::remove_file(&revocation_path).unwrap();
+    assert_eq!(durable_files(&home), clean_home);
+    assert_eq!(
+        readonly_snapshot(&store, &home, &root.id, &root.id)
+            .await
+            .unwrap(),
+        original
+    );
+}
+
+#[tokio::test]
+async fn pending_task_and_copy_journals_leave_owned_home_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let store = SessionStoreV2::new(home.clone()).await.unwrap();
+    let root = Session::new("windows-pending-root", "model");
+    let child = Session::new_child_of("windows-pending-child", &root, "model", "Child");
+    store.save_session(&root).await.unwrap();
+    store.save_session(&child).await.unwrap();
+    store.flush_search_index().await;
+    for name in [RUNTIME_TASK_TRANSACTION_DIR, SESSION_COPY_TRANSACTION_DIR] {
+        std::fs::create_dir_all(home.join(name)).unwrap();
+    }
+    let clean_home = durable_files(&home);
+    let original = readonly_snapshot(&store, &home, &root.id, &root.id)
+        .await
+        .unwrap();
+    assert_eq!(original.nodes.len(), 2);
+    for name in [RUNTIME_TASK_TRANSACTION_DIR, SESSION_COPY_TRANSACTION_DIR] {
+        let directory = home.join(name);
+        let journal = directory.join("pending.json");
+        std::fs::write(&journal, b"PRIVATE journal incomplete").unwrap();
+        assert_eq!(
+            readonly_snapshot(&store, &home, &root.id, &root.id)
+                .await
+                .unwrap_err(),
+            Error::PendingTransaction
+        );
+        assert_eq!(
+            std::fs::read(&journal).unwrap(),
+            b"PRIVATE journal incomplete"
+        );
+        // Remove only this fixture journal. Keep both directories and the same
+        // open store; no recovery or reopen runs while the journal is present.
+        std::fs::remove_file(&journal).unwrap();
+        assert!(directory.is_dir());
+        assert_eq!(durable_files(&home), clean_home);
+        assert_eq!(
+            readonly_snapshot(&store, &home, &root.id, &root.id)
+                .await
+                .unwrap(),
+            original
+        );
+    }
+}
+
+async fn readonly_snapshot(
+    store: &SessionStoreV2,
+    home: &std::path::Path,
+    root: &str,
+    subtree: &str,
+) -> Result<PublicActorSubtreeSnapshot, Error> {
+    store.flush_search_index().await;
+    let before = durable_files(home);
+    let result = store
+        .actor_subtree_snapshot(
+            ActorSnapshotPrincipal::host_owner(),
+            root,
+            subtree,
+            ActorSnapshotLimits::default(),
+        )
+        .await;
+    store.flush_search_index().await;
+    assert_eq!(durable_files(home), before);
+    result
+}
+
+// Compare durable paths, directory/file kinds and bytes, not timestamps, ACLs
+// or transient writes. None keeps an empty directory distinct from an empty file.
+fn durable_files(home: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+    fn walk(
+        directory: &std::path::Path,
+        files: &mut std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
+    ) {
         for entry in std::fs::read_dir(directory).unwrap() {
             let entry = entry.unwrap();
             let path = entry.path();
             if entry.file_type().unwrap().is_dir() {
-                files.insert(path.clone(), vec![]);
+                files.insert(path.clone(), None);
                 walk(&path, files);
             } else {
                 assert!(entry.file_type().unwrap().is_file());
-                files.insert(path.clone(), std::fs::read(&path).unwrap());
+                files.insert(path.clone(), Some(std::fs::read(&path).unwrap()));
             }
         }
     }
