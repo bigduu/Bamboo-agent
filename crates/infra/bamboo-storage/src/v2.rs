@@ -5491,6 +5491,13 @@ impl SessionStoreV2 {
                 {
                     self.bump_actor_tree_revision(&root).await?;
                 }
+                self.cancel_descendant_activations_before_child_delete(
+                    &entry.root_session_id,
+                    session_id,
+                    guards,
+                    &tree,
+                )
+                .await?;
                 let abs_dir = self.abs_path_from_rel(&entry.rel_path);
                 let _ = self.remove_child_directory(&abs_dir, guards, &tree).await;
                 self.update_index(|index| {
