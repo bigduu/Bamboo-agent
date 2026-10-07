@@ -379,8 +379,6 @@ async fn run_child_spawn_inner(
         .await;
         return Err(setup_error);
     }
-    let (cancel_token, mut activation_registration) = execution_reservation.disarm_for_execution();
-
     // Publish the child's process-global workspace only after this task owns
     // both the exact runner slot and logical-session router. A rejected
     // cross-entry caller must not overwrite a live owner's tool root or
@@ -399,11 +397,22 @@ async fn run_child_spawn_inner(
     // state behind.
     session.set_last_run_status("running");
     session.clear_last_run_error();
-    let _ = ctx
+    let retired_pending =
+        crate::execution::ChildCompletionSource::retire_pending_delivery_for_successor(
+            &mut session,
+            &run_id,
+        );
+    let running_saved = ctx
         .agent
         .persistence()
         .save_runtime_session(&mut session)
         .await;
+    if retired_pending {
+        running_saved.map_err(|error| {
+            format!("Failed to retire previous Child terminal delivery before execution: {error}")
+        })?;
+    }
+    let (cancel_token, mut activation_registration) = execution_reservation.disarm_for_execution();
     // From here cancellation sees the exact Running runner, cancels its token,
     // and waits for its terminal snapshot. Before here it can only invalidate
     // the queued generation, which this guard has kept stable.
@@ -741,12 +750,46 @@ async fn run_child_spawn_inner(
                 .begin_finalization(&session_id_clone, &activation_run_id)
                 .await;
         }
+        // A rejected stale Actor has no accepted terminal receipt. Preserve
+        // its original fenced execution outcome rather than replacing it with
+        // a secondary generic-save error. Only a selected broker receipt makes
+        // this new durability gate authoritative for completion.
+        let receipt_gated = !matches!(&broker_receipt_prepared, Ok(false));
+        let mut source_deferred = false;
         let saved = match broker_receipt_prepared {
             Ok(true) => {
-                agent
-                    .persistence()
-                    .checkpoint_runtime_session(&mut session)
-                    .await
+                match crate::execution::ChildCompletionSource::defer_for_durable_delivery(
+                    &mut session,
+                    &activation_run_id,
+                ) {
+                    Ok(deferred) => {
+                        source_deferred = deferred;
+                        let intended_status = session.last_run_status();
+                        let intended_error = session.last_run_error();
+                        if deferred {
+                            // Status-only wait/read paths must also remain
+                            // non-terminal across a crash before proof commit.
+                            session.set_last_run_status("running");
+                            session.clear_last_run_error();
+                        }
+                        let saved = agent
+                            .persistence()
+                            .checkpoint_runtime_session(&mut session)
+                            .await;
+                        if deferred {
+                            if let Some(status) = intended_status {
+                                session.set_last_run_status(status);
+                            }
+                            if let Some(error) = intended_error {
+                                session.set_last_run_error(error);
+                            } else {
+                                session.clear_last_run_error();
+                            }
+                        }
+                        saved
+                    }
+                    Err(error) => Err(std::io::Error::other(error)),
+                }
             }
             Ok(false) => agent.persistence().save_runtime_session(&mut session).await,
             Err(error) => {
@@ -758,12 +801,99 @@ async fn run_child_spawn_inner(
                 Err(std::io::Error::other(error))
             }
         };
-        let history_committed = saved.is_ok();
+        // A saved transcript alone does not prove a broker terminal. Commit
+        // and read back the Host receipt before exposing any successful
+        // completion source, history barrier, or runner finalization.
+        let mut terminal_error = match &saved {
+            Ok(()) => {
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    external_runner.commit_durable_child_delivery(&session, &activation_run_id),
+                )
+                .await
+                {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(format!(
+                        "Host child delivery proof was not committed: {error}"
+                    )),
+                    Err(_) => Some("Host child delivery proof commitment timed out".to_string()),
+                }
+            }
+            Err(error) if receipt_gated => {
+                Some(format!("Final Child session was not committed: {error}"))
+            }
+            Err(_) => None,
+        };
+        if terminal_error.is_none() && source_deferred {
+            // The runner publishes the pending source with an exact-snapshot
+            // canonical write after proof commit. Verify that publication here;
+            // a generic checkpoint could merge newer input into a stale seal.
+            let published =
+                match crate::execution::ChildCompletionSource::publish_after_durable_delivery(
+                    &mut session,
+                    &activation_run_id,
+                ) {
+                    Ok(true) => {
+                        let expected =
+                            crate::execution::ChildCompletionSource::from_committed_session(
+                                &session,
+                            );
+                        match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            agent.storage().load_session(&session_id_clone),
+                        ).await {
+                        Ok(Ok(Some(durable))) if expected.is_some()
+                            && crate::execution::ChildCompletionSource::from_committed_session(&durable) == expected => {
+                                session = durable;
+                                Ok(())
+                            }
+                        Ok(Ok(_)) => Err("Canonical Child completion source readback did not match".into()),
+                        Ok(Err(error)) => Err(format!("Canonical Child completion source readback failed: {error}")),
+                        Err(_) => Err("Canonical Child completion source readback timed out".into()),
+                    }
+                    }
+                    Ok(false) => Err("Pending Child delivery source disappeared".into()),
+                    Err(error) => Err(error),
+                };
+            if let Err(error) = published {
+                terminal_error = Some(format!(
+                    "Child completion source was not committed: {error}"
+                ));
+            }
+        }
+        let history_committed = saved.is_ok() && terminal_error.is_none();
+        let result = if let Some(error) = &terminal_error {
+            tracing::error!(
+                session_id = %session_id_clone,
+                %error,
+                "Child terminal delivery remains unproved"
+            );
+            session.set_last_run_status("error");
+            session.set_last_run_error(error.clone());
+            // Retain the source record, pending or invalidated by the error
+            // status, so replay cannot fall back to a legacy source-less success.
+            // Preserve the durable transcript prefix with a checkpoint rather
+            // than replacing it while correcting the public read model.
+            if let Err(save_error) = agent
+                .persistence()
+                .checkpoint_runtime_session(&mut session)
+                .await
+            {
+                tracing::error!(
+                    session_id = %session_id_clone,
+                    %save_error,
+                    "failed to persist unproved Child terminal error"
+                );
+            }
+            Err(bamboo_agent_core::AgentError::LLM(error.clone()))
+        } else {
+            result
+        };
         let completion_source =
             crate::execution::ChildCompletionSource::after_final_save(&session, history_committed);
         let completed_at = Utc::now();
         let status = session.last_run_status().unwrap_or(status);
-        let error = if history_committed {
+        let error = if history_committed || terminal_error.is_some() {
             session.last_run_error()
         } else {
             error
@@ -777,8 +907,9 @@ async fn run_child_spawn_inner(
         }
         // A broker Outcome is only a transport receipt. The external runner
         // may ACK its exact Event/Outcome MsgIds now that the Host's canonical
-        // Child transcript and terminal status have been durably saved. Failed
-        // saves and failed ACKs leave broker messages unconfirmed for replay.
+        // Child transcript, terminal status and required receipt proof have
+        // been committed. Failed proof/save leaves messages unconfirmed for
+        // replay; ACK delivery errors alone never downgrade proven completion.
         match tokio::time::timeout(
             Duration::from_secs(5),
             external_runner.confirm_durable_child_delivery(
