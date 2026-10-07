@@ -1,3 +1,4 @@
+use crate::error::ResponseResult;
 use actix_web::{web, HttpRequest, HttpResponse, ResponseError};
 
 use super::{ChatRequest, ChatResponse};
@@ -71,15 +72,17 @@ async fn persist_and_cache_session_locked(
 async fn save_and_cache_session_locked(
     state: &AppState,
     session: &bamboo_agent_core::Session,
-) -> Result<(), HttpResponse> {
+) -> ResponseResult<()> {
     persist_and_cache_session_locked(state, session)
         .await
         .map_err(|error| {
-            HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": crate::error::error_value(format!(
-                    "Failed to persist chat session: {error}"
-                ))
-            }))
+            HttpResponse::InternalServerError()
+                .json(serde_json::json!({
+                    "error": crate::error::error_value(format!(
+                        "Failed to persist chat session: {error}"
+                    ))
+                }))
+                .into()
         })
 }
 
@@ -261,7 +264,7 @@ pub async fn handler(
         &*req,
     ) {
         Ok(prepared) => prepared,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Some(prepared) = prepared else {
         return handle_chat(state, req, &http_request).await;
@@ -385,68 +388,71 @@ async fn handle_chat(
             .flatten()
         })
     };
-    let workspace_validation = if let Some(requested_workspace) = requested_workspace {
-        crate::project_context::validate_explicit_session_workspace_with_resolver(
-            &state.project_store,
-            effective_project_id.as_ref(),
-            requested_workspace,
-            &state.workspace_resolver,
-        )
-        .map(Some)
-        .map_err(crate::project_context::session_workspace_error_response)
-    } else {
-        crate::project_context::validate_workspace_assignment_with_resolver(
-            &state.project_store,
-            effective_project_id.as_ref(),
-            fallback_workspace(),
-            &state.workspace_resolver,
-        )
-        .map_err(|error| match error {
-            crate::project_context::ProjectWorkspaceValidationError::Invalid {
-                code,
-                workspace,
-                message,
-            } => {
-                let mut response = if code.starts_with("project_path_") {
-                    HttpResponse::Conflict()
-                } else {
-                    HttpResponse::BadRequest()
-                };
-                response.json(serde_json::json!({
-                    "error": {
-                        "type": "api_error",
-                        "code": code,
-                        "message": message
-                    },
-                    "workspace": workspace,
-                }))
-            }
-            crate::project_context::ProjectWorkspaceValidationError::Conflict {
-                workspace,
-                owner_project_id,
-                session_project_id,
-            } => HttpResponse::Conflict().json(serde_json::json!({
-                "error": {
-                    "type": "api_error",
-                    "code": "project_workspace_conflict",
-                    "message": "Workspace belongs to another Project"
-                },
-                "workspace": workspace,
-                "owner_project_id": owner_project_id,
-                "session_project_id": session_project_id,
-            })),
-            crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
-                tracing::error!(%error, "failed to validate workspace Project ownership");
-                crate::error::json_error(
-                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to validate workspace Project ownership",
-                )
-            }
-        })
-    };
+    let workspace_validation: ResponseResult<_> =
+        if let Some(requested_workspace) = requested_workspace {
+            crate::project_context::validate_explicit_session_workspace_with_resolver(
+                &state.project_store,
+                effective_project_id.as_ref(),
+                requested_workspace,
+                &state.workspace_resolver,
+            )
+            .map(Some)
+            .map_err(|error| crate::project_context::session_workspace_error_response(error).into())
+        } else {
+            crate::project_context::validate_workspace_assignment_with_resolver(
+                &state.project_store,
+                effective_project_id.as_ref(),
+                fallback_workspace(),
+                &state.workspace_resolver,
+            )
+            .map_err(|error| {
+                Box::new(match error {
+                    crate::project_context::ProjectWorkspaceValidationError::Invalid {
+                        code,
+                        workspace,
+                        message,
+                    } => {
+                        let mut response = if code.starts_with("project_path_") {
+                            HttpResponse::Conflict()
+                        } else {
+                            HttpResponse::BadRequest()
+                        };
+                        response.json(serde_json::json!({
+                            "error": {
+                                "type": "api_error",
+                                "code": code,
+                                "message": message
+                            },
+                            "workspace": workspace,
+                        }))
+                    }
+                    crate::project_context::ProjectWorkspaceValidationError::Conflict {
+                        workspace,
+                        owner_project_id,
+                        session_project_id,
+                    } => HttpResponse::Conflict().json(serde_json::json!({
+                        "error": {
+                            "type": "api_error",
+                            "code": "project_workspace_conflict",
+                            "message": "Workspace belongs to another Project"
+                        },
+                        "workspace": workspace,
+                        "owner_project_id": owner_project_id,
+                        "session_project_id": session_project_id,
+                    })),
+                    crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
+                        tracing::error!(%error, "failed to validate workspace Project ownership");
+                        crate::error::json_error(
+                            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to validate workspace Project ownership",
+                        )
+                    }
+                })
+            })
+        };
     let final_workspace = match workspace_validation {
         Ok(workspace) => workspace,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let final_workspace_display = final_workspace
         .as_deref()
@@ -476,7 +482,7 @@ async fn handle_chat(
     };
     let model = match request::resolve_model(req.model.as_deref(), default_model.as_deref()) {
         Ok(model) => model,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     let global_default_prompt =
@@ -840,7 +846,7 @@ async fn handle_chat(
     .await
     {
         Ok(staging) => staging,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     // Publish the prepared checkpoint without any speculative Workflow
     // normalization. The in-memory turn keeps those changes for a successful
@@ -856,7 +862,7 @@ async fn handle_chat(
         if let Some(staging) = staged_workflow_activation.as_mut() {
             staging.release().await;
         }
-        return response;
+        return *response;
     }
     sync_runtime_workspace(
         state.as_ref(),
@@ -897,7 +903,7 @@ async fn handle_chat(
                 session.messages = messages.clone();
             }
             if let Err(response) = save_and_cache_session_locked(state.as_ref(), &session).await {
-                return response;
+                return *response;
             }
             return HttpResponse::BadRequest().json(serde_json::json!({
                 "error": crate::error::error_value(reason),
@@ -961,7 +967,7 @@ async fn handle_chat(
                 if let Some(staging) = staged_workflow_activation.as_mut() {
                     staging.release().await;
                 }
-                return response;
+                return *response;
             }
         };
     let queued = ingress_receipt.is_some();
@@ -997,7 +1003,7 @@ async fn handle_chat(
         if let Some(staging) = staged_workflow_activation.as_mut() {
             staging.release().await;
         }
-        return response;
+        return *response;
     }
 
     let mut queued_input = if queue_root_input && !queued {
@@ -1113,12 +1119,12 @@ async fn handle_chat(
         )
         .await
         {
-            return response;
+            return *response;
         }
     } else {
         // Re-save to persist image attachments (if any).
         if let Err(response) = save_and_cache_session_locked(state.as_ref(), &session).await {
-            return response;
+            return *response;
         }
         drop(workflow_commit_guard);
         if !queued {

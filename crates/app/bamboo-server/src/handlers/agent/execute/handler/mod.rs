@@ -44,7 +44,7 @@ pub async fn handler(
         &*req,
     ) {
         Ok(prepared) => prepared,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Some(prepared) = prepared else {
         return handle_execute(state, session_id, req).await;
@@ -78,7 +78,7 @@ pub async fn handle_execute(
     if let Err(response) =
         crate::handlers::agent::chat::admit_for_execute(&state, &session_id).await
     {
-        return response;
+        return *response;
     }
     let startup_turn_id = state
         .storage

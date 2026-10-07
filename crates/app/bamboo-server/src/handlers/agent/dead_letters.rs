@@ -1,5 +1,7 @@
 //! HostOwner administration of one durable SessionInbox lifetime.
 
+use crate::error::ResponseResult;
+
 use actix_web::{http::header, web, HttpRequest, HttpResponse};
 use bamboo_domain::{SessionInboxAdministrationPrincipal, SessionInboxError, SessionMessageId};
 use chrono::{DateTime, Utc};
@@ -54,21 +56,22 @@ fn inbox_error(error_value: SessionInboxError) -> HttpResponse {
 async fn principal_for(
     state: &AppState,
     target: &str,
-) -> Result<(SessionInboxAdministrationPrincipal, DateTime<Utc>), HttpResponse> {
+) -> ResponseResult<(SessionInboxAdministrationPrincipal, DateTime<Utc>)> {
     use actix_web::http::StatusCode;
     match state.storage.load_session(target).await {
         Ok(Some(session)) if session.id == target => Ok((
             SessionInboxAdministrationPrincipal::authenticated_host_owner_for(&session),
             session.created_at,
         )),
-        Ok(None) => Err(error(StatusCode::NOT_FOUND, "session_not_found")),
-        Ok(Some(_)) => Err(error(StatusCode::CONFLICT, "session_identity_conflict")),
+        Ok(None) => Err(error(StatusCode::NOT_FOUND, "session_not_found").into()),
+        Ok(Some(_)) => Err(error(StatusCode::CONFLICT, "session_identity_conflict").into()),
         Err(cause) => {
             tracing::error!(session_id = %target, error = %cause, "failed to load dead-letter target");
             Err(error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "session_storage_unavailable",
-            ))
+            )
+            .into())
         }
     }
 }
@@ -96,7 +99,7 @@ pub async fn inspect(
     let target = path.into_inner();
     let (principal, session_created_at) = match principal_for(&state, &target).await {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     match state
         .session_inbox
@@ -167,7 +170,7 @@ pub async fn retry(
     }
     let (principal, session_created_at) = match principal_for(&state, &target).await {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if body.session_created_at != session_created_at {
         return error(StatusCode::CONFLICT, "session_lifetime_mismatch");
