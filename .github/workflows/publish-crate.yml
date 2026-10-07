@@ -236,7 +236,9 @@ jobs:
       - name: Refresh the temporary stamped publication lockfile
         # Source Cargo.lock also contains 0.0.0 workspace packages. --no-deps
         # does not resolve/update it; refresh once before locked packaging.
-        run: cargo metadata --format-version 1 > /dev/null
+        run: |
+          cargo metadata --format-version 1 > /dev/null
+          python3 scripts/crate-release-lock.py
 
       - name: Validate publish plan
         if: github.event.inputs.dry_run == 'true'

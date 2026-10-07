@@ -353,8 +353,34 @@ test('stamped source lockfile is refreshed before the first locked package', (t)
   const marker = '      - name: Refresh the temporary stamped publication lockfile'
   assert.ok(workflow.indexOf('      - name: Prepare workspace manifests for publish') < workflow.indexOf(marker))
   assert.ok(workflow.indexOf(marker) < workflow.indexOf('      - name: Publish verified crates'))
-  assert.match(workflow, /run: cargo metadata --format-version 1 > \/dev\/null/)
+  assert.match(workflow, /cargo metadata --format-version 1 > \/dev\/null\n          python3 scripts\/crate-release-lock.py/)
   success(['cargo', 'metadata', '--format-version', '1', '--offline'])
+  const python = ['python3', 'python3.12', 'python3.14'].find((candidate) => spawnSync(candidate, ['-c', 'import tomllib']).status === 0)
+  success([python, path.join(__dirname, 'crate-release-lock.py')])
   success(packageArgs)
   assert.match(fs.readFileSync(path.join(directory, 'Cargo.lock'), 'utf8'), /version = "2026.10.8"/)
+})
+
+test('temporary lock refresh preserves the exact tested external dependency multiset', () => {
+  const python = ['python3', 'python3.12', 'python3.14'].find((candidate) => spawnSync(candidate, ['-c', 'import tomllib']).status === 0)
+  assert.ok(python)
+  const external = { name: 'external', version: '1.0.0', source: 'registry+https://example.invalid/index', checksum: 'a'.repeat(64) }
+  const source = { package: [{ name: 'workspace', version: '0.0.0' }, external] }
+  const stamped = { package: [clone(external), { name: 'workspace', version: '2026.10.8' }] }
+  const script = 'import importlib.util,json,sys\n' +
+    'spec=importlib.util.spec_from_file_location("lock_policy",sys.argv[1])\n' +
+    'module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)\n' +
+    'module.assert_external_lock_unchanged(json.loads(sys.argv[2]),json.loads(sys.argv[3]))\n'
+  const check = (candidate) => spawnSync(python, ['-c', script, path.join(__dirname, 'crate-release-lock.py'),
+    JSON.stringify(source), JSON.stringify(candidate)], { encoding: 'utf8' })
+  assert.equal(check(stamped).status, 0)
+  for (const field of ['name', 'version', 'source', 'checksum']) {
+    const changed = clone(stamped)
+    changed.package[0][field] += '-changed'
+    const result = check(changed)
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /External dependency lock changed/)
+  }
+  assert.notEqual(check({ package: [stamped.package[1]] }).status, 0)
+  assert.notEqual(check({ package: [...stamped.package, clone(external)] }).status, 0)
 })
