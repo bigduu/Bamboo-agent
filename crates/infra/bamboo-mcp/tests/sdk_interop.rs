@@ -14,6 +14,7 @@ struct Fixture {
     calls: Arc<AtomicUsize>,
     cancelled: Arc<AtomicUsize>,
     subscription_tx: Option<tokio::sync::mpsc::UnboundedSender<rmcp::service::SubscriptionSink>>,
+    output_schema: Option<Value>,
 }
 
 impl ServerHandler for Fixture {
@@ -51,9 +52,12 @@ impl ServerHandler for Fixture {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
         let second = request.and_then(|request| request.cursor).is_some();
-        let tool: Tool = serde_json::from_value(json!({"name":if second {"slow"} else {"echo"},
-            "description":"SDK interop", "inputSchema":{"type":"object"}}))
-        .unwrap();
+        let mut definition = json!({"name":if second {"slow"} else {"echo"},
+            "description":"SDK interop", "inputSchema":{"type":"object"}});
+        if let Some(schema) = &self.output_schema {
+            definition["outputSchema"] = schema.clone();
+        }
+        let tool: Tool = serde_json::from_value(definition).unwrap();
         Ok(ListToolsResult {
             next_cursor: (!second).then(|| "second-page".into()),
             ..ListToolsResult::with_all_items(vec![tool])
@@ -89,6 +93,7 @@ fn fixture() -> Fixture {
         calls: Arc::new(AtomicUsize::new(0)),
         cancelled: Arc::new(AtomicUsize::new(0)),
         subscription_tx: None,
+        output_schema: None,
     }
 }
 
@@ -132,6 +137,75 @@ async fn modern_sdk_discovery_pagination_and_structured_result() {
     client.disconnect().await.unwrap();
     assert!(!client.is_connected().await);
     server.waiting().await.unwrap();
+}
+
+async fn assert_idn_output_schema_validation(draft: &str, format: &str, valid: &str) {
+    let schema = json!({
+        "$schema": draft,
+        "type": "object",
+        "properties": {"result": {"type": "string", "format": format}},
+        "required": ["result"],
+        "additionalProperties": false
+    });
+    let mut handler = fixture();
+    handler.output_schema = Some(schema.clone());
+    let (client_io, server_io) = tokio::io::duplex(32 * 1024);
+    let mut client = McpProtocolClient::new(client_io);
+    let (initialized, server) = tokio::join!(client.initialize(1_000), handler.serve(server_io));
+    initialized.unwrap();
+    let server = server.unwrap();
+
+    // Discover the advertised schema so production list_tools caches the validator.
+    let tools = client.list_tools(1_000).await.unwrap();
+    let tool = tools.iter().find(|tool| tool.name == "echo").unwrap();
+    assert_eq!(tool.output_schema.as_ref(), Some(&schema));
+
+    let invalid = json!({"result": "not a valid domain or email"});
+    match client
+        .call_tool("echo", json!({"value": invalid}), 1_000)
+        .await
+        .unwrap_err()
+    {
+        McpError::Protocol(message) => {
+            assert!(message.contains("structuredContent does not conform to outputSchema"));
+            assert!(message.contains(format), "{draft} {format}: {message}");
+        }
+        error => panic!("{draft} {format}: unexpected error {error}"),
+    }
+
+    let valid = json!({"result": valid});
+    let result = client
+        .call_tool("echo", json!({"value": valid.clone()}), 1_000)
+        .await
+        .unwrap();
+    assert!(!result.is_error);
+    assert_eq!(
+        result.structured_content,
+        McpStructuredContent::Value(valid)
+    );
+    client.disconnect().await.unwrap();
+    server.waiting().await.unwrap();
+}
+
+#[tokio::test]
+async fn output_schema_rejects_invalid_draft7_idn_hostname_and_accepts_unicode() {
+    assert_idn_output_schema_validation(
+        "http://json-schema.org/draft-07/schema#",
+        "idn-hostname",
+        "例え.テスト",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn output_schema_rejects_invalid_draft4_6_7_idn_email_and_accepts_unicode() {
+    for draft in [
+        "http://json-schema.org/draft-04/schema#",
+        "http://json-schema.org/draft-06/schema#",
+        "http://json-schema.org/draft-07/schema#",
+    ] {
+        assert_idn_output_schema_validation(draft, "idn-email", "user@例え.テスト").await;
+    }
 }
 
 #[tokio::test]
