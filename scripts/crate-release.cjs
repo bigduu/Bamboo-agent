@@ -180,7 +180,7 @@ async function publish(context, release, receipt) {
 async function completedAutomaticReceipts(context, currentRelease, receipt, { stableOnly = false } = {}) {
   const receipts = []
   for (const release of await context.releases()) {
-    if (release.draft || (stableOnly && release.prerelease) || release.id === currentRelease.id) continue
+    if (release.id === currentRelease.id || (stableOnly && (release.draft || release.prerelease))) continue
     const previous = await context.readReceipt(release)
     if (!previous?.automatic || !previous.completed) continue
     validateReceipt(previous, previous.identity, previous.crates)
