@@ -6,7 +6,8 @@ const { spawnSync } = require('node:child_process')
 const { test } = require('node:test')
 const { assertVersion, validateSource, validateReceipt, nextVersion, selectVersion,
   plan, publish, sha256, githubArgs, receiptBody, readBodyReceipt,
-  frontendIdentity, verifyPackageArchive, preserveFrontend } = require('./crate-release.cjs')
+  frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend,
+  shouldMakeLatest, gitIsAncestor } = require('./crate-release.cjs')
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
 const sourceRevision = 'a'.repeat(40)
@@ -25,11 +26,14 @@ const release = (receipt, extra = {}) => ({ id: 42, tag_name: `v${receipt.versio
 
 function fixture(extra = {}) {
   const calls = []
+  const completions = []
   const published = new Map()
   const context = { automatic: true, identity: clone(identity), crates: [...crates],
     frontendBytes: { ...frontendBytes }, requestedVersion: '', sourceVersion: '0.0.0', now,
     releases: async () => [], receipts: [], tags: async () => [], versions: async () => [],
     readReceipt: async (entry) => readBodyReceipt(entry),
+    tagSource: async () => { throw new Error('Unexpected completed source tag lookup') },
+    isAncestor: async () => { throw new Error('Unexpected source ancestry lookup') },
     reserve: async (receipt) => { calls.push('reserve'); return release(receipt) },
     ensureTag: async () => { calls.push('tag') },
     ensureFrontend: async () => { calls.push('frontend') },
@@ -39,9 +43,13 @@ function fixture(extra = {}) {
     cargoPublish: async (crate) => { calls.push(`publish:${crate}`); published.set(crate, { checksum }); return { status: 0, output: '' } },
     verifyArchive: async (crate) => { calls.push(`verify:${crate}`) },
     wait: async () => { calls.push('wait') },
-    complete: async () => { calls.push('complete') }, ...extra }
-  return { context, calls, published }
+    complete: async (_entry, receipt, makeLatest) => { calls.push('complete'); completions.push({ version: receipt.version, makeLatest }) }, ...extra }
+  return { context, calls, published, completions }
 }
+
+const completedReceipt = (version, revision) => makeReceipt({ version,
+  identity: { ...clone(identity), sourceRevision: revision }, completed: true,
+  packageChecksums: Object.fromEntries(crates.map((crate) => [crate, checksum])) })
 
 test('automatic release accepts only the exact successful same-repository main push CI', () => {
   const base = { eventName: 'workflow_run', repository: identity.repository, sourceRevision,
@@ -193,6 +201,107 @@ test('completed CI reruns verify all actual artifacts without changing latest or
   assert.deepEqual(calls, crates.map((crate) => `verify:${crate}`))
 })
 
+test('older failed automatic reservations resume without replacing a newer main source as latest', async () => {
+  const newerSource = 'b'.repeat(40)
+  const older = makeReceipt({ packageChecksums: { 'bamboo-domain': checksum } })
+  const newer = completedReceipt('2026.10.9', newerSource)
+  const { context, published, completions } = fixture({
+    releases: async () => [release(older), release(newer, { id: 43, draft: false })],
+    tagSource: async () => newerSource,
+    isAncestor: async (ancestor, descendant) => ancestor === sourceRevision && descendant === newerSource,
+  })
+  published.set('bamboo-domain', { checksum })
+  const result = await plan(context)
+  await publish(context, result.release, result.receipt)
+  assert.deepEqual(completions, [{ version: older.version, makeLatest: false }])
+})
+
+test('older main CI first planned later cannot upload a higher version or become latest', async () => {
+  const newerSource = 'b'.repeat(40)
+  const newer = completedReceipt('2026.10.10', newerSource)
+  const { context, completions, calls } = fixture({
+    releases: async () => [release(newer, { id: 43, draft: false })],
+    tagSource: async () => newerSource,
+    isAncestor: async (ancestor, descendant) => ancestor === sourceRevision && descendant === newerSource,
+  })
+  const result = await plan(context)
+  assert.equal(result.receipt.version, '2026.10.11')
+  assert.equal(await shouldMakeLatest(context, result.release, result.receipt), false)
+  await assert.rejects(() => publish(context, result.release, result.receipt), /cannot publish at or above/)
+  assert.deepEqual(completions, [])
+  assert.deepEqual(calls, ['reserve', 'tag', 'frontend'])
+})
+
+test('a newer main source becomes latest after a fresh completed-release ancestry check', async () => {
+  const newerSource = 'b'.repeat(40)
+  const older = completedReceipt('2026.10.9', sourceRevision)
+  let reads = 0
+  const { context, completions } = fixture({ identity: { ...clone(identity), sourceRevision: newerSource },
+    releases: async () => ++reads === 1 ? [] : [release(older, { id: 43, draft: false })],
+    tagSource: async () => sourceRevision,
+    isAncestor: async (ancestor, descendant) => ancestor === sourceRevision && descendant === newerSource,
+  })
+  const result = await plan(context)
+  await publish(context, result.release, result.receipt)
+  assert.equal(reads, 3)
+  assert.deepEqual(completions, [{ version: result.receipt.version, makeLatest: true }])
+})
+
+test('manual publication never changes latest or needs automatic source ordering', async () => {
+  const { context, completions } = fixture({ automatic: false,
+    releases: async () => { throw new Error('Manual completion must not query latest ordering') } })
+  const receipt = makeReceipt({ automatic: false })
+  await publish(context, release(receipt), receipt)
+  assert.deepEqual(completions, [{ version: receipt.version, makeLatest: false }])
+})
+
+test('latest uses numeric versions only for the same source and rejects unproven completed tag identity', async () => {
+  const current = makeReceipt({ version: '2026.10.9' })
+  const other = completedReceipt('2026.10.10', sourceRevision)
+  const { context } = fixture({ releases: async () => [release(other, { id: 43, draft: false })],
+    tagSource: async () => sourceRevision })
+  assert.equal(await shouldMakeLatest(context, release(current), current), false)
+  current.version = '2026.10.11'
+  assert.equal(await shouldMakeLatest(context, release(current), current), true)
+  context.tagSource = async () => 'b'.repeat(40)
+  await assert.rejects(() => shouldMakeLatest(context, release(current), current), /tag points to different source/)
+  const divergent = completedReceipt('2026.10.1', 'b'.repeat(40))
+  context.releases = async () => [release(divergent, { id: 43, draft: false })]
+  context.tagSource = async () => divergent.identity.sourceRevision
+  context.isAncestor = async () => false
+  assert.equal(await shouldMakeLatest(context, release(current), current), false)
+})
+
+test('Git source ordering handles descendants published after checkout and rejects divergent history', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-release-ancestry-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const origin = path.join(directory, 'origin')
+  const checkout = path.join(directory, 'checkout')
+  fs.mkdirSync(origin)
+  const git = (...args) => {
+    const result = spawnSync('git', args, { cwd: origin, encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stderr)
+    return result.stdout.trim()
+  }
+  git('init', '-q')
+  const commit = (contents) => {
+    fs.writeFileSync(path.join(origin, 'source'), contents)
+    git('add', 'source')
+    git('-c', 'user.name=Release fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', contents)
+    return git('rev-parse', 'HEAD')
+  }
+  const older = commit('older main')
+  git('clone', '--no-local', '-q', origin, checkout)
+  const newer = commit('newer main')
+  assert.equal(gitIsAncestor(older, newer, checkout), true)
+  assert.equal(gitIsAncestor(newer, older, checkout), false)
+  assert.equal(gitIsAncestor(newer, newer, checkout), true)
+  git('checkout', '-qb', 'divergent', older)
+  const divergent = commit('rewritten main')
+  assert.equal(gitIsAncestor(newer, divergent, checkout), false)
+  assert.throws(() => gitIsAncestor(older, '0'.repeat(40), checkout), /failed/)
+})
+
 test('rate limiting is retried, while fatal publish and registry failures keep the release draft', async () => {
   let attempts = 0
   const { context, calls, published } = fixture({ cargoPublish: async (crate) => {
@@ -261,11 +370,46 @@ test('real staged frontend timestamps change but a retry restores the reserved o
   let restored
   await preserveFrontend({ receipt, stagedBytes: { manifestSha256: '9'.repeat(64), archiveSha256: '8'.repeat(64) },
     assets: [firstManifest, first.zip], readAsset: async (asset) => asset,
+    verifyFiles: async (bytes) => verifyPreservedFrontend([Buffer.from(`${JSON.stringify(second.manifest, null, 2)}\n`), second.zip], bytes),
     writeFiles: async (bytes) => { restored = bytes },
     saveReceipt: async () => { throw new Error('Must not change reserved bytes') },
     upload: async () => { throw new Error('Must not overwrite preserved assets') },
   })
   assert.deepEqual(restored, [firstManifest, first.zip])
+  const trusted = [Buffer.from(`${JSON.stringify(second.manifest, null, 2)}\n`), second.zip]
+  for (const field of ['schema_version', 'frontend_name', 'frontend_version', 'bundle_hash', 'entry']) {
+    const changed = { ...first.manifest, [field]: 'foreign value' }
+    assert.throws(() => verifyPreservedFrontend(trusted,
+      [Buffer.from(`${JSON.stringify(changed, null, 2)}\n`), first.zip]), /manifest differs/)
+  }
+  const originalZip = path.join(directory, 'original.zip')
+  fs.writeFileSync(originalZip, first.zip)
+  const mutate = 'from zipfile import ZipFile,ZipInfo\nimport sys,stat\n' +
+    'mode=sys.argv[3]\n' +
+    'with ZipFile(sys.argv[1]) as original, ZipFile(sys.argv[2],"w") as changed:\n' +
+    ' for info in original.infolist():\n' +
+    '  data=original.read(info)\n' +
+    '  if mode=="payload" and info.filename=="index.html": data=data.replace(b"fixed",b"evil!")\n' +
+    '  if mode=="manifest" and info.filename=="frontend-manifest.json": data=data.replace(b"2026",b"2025")\n' +
+    '  if mode=="symlink" and info.filename=="index.html": info.external_attr=(stat.S_IFLNK|0o777)<<16\n' +
+    '  changed.writestr(info,data)\n' +
+    ' if mode=="extra": changed.writestr("evil.js",b"malicious")\n' +
+    ' if mode=="duplicate": changed.writestr("index.html",b"malicious")\n'
+  for (const [mode, message] of [['payload', /ZIP payload differs/], ['manifest', /embedded manifest differs/],
+    ['symlink', /ZIP entry type differs/], ['extra', /ZIP entry inventory differs/], ['duplicate', /ZIP entry inventory differs/]]) {
+    const changedZip = path.join(directory, `${mode}.zip`)
+    const mutation = spawnSync('python3', ['-c', mutate, originalZip, changedZip, mode], { encoding: 'utf8' })
+    assert.equal(mutation.status, 0, mutation.stderr)
+    const malicious = [firstManifest, fs.readFileSync(changedZip)]
+    const forged = makeReceipt({ frontendBytes: { manifestSha256: sha256(malicious[0]), archiveSha256: sha256(malicious[1]) } })
+    let wrote = false
+    await assert.rejects(() => preserveFrontend({ receipt: forged, stagedBytes: frontendBytes,
+      assets: malicious, readAsset: async (asset) => asset,
+      verifyFiles: async (bytes) => verifyPreservedFrontend(trusted, bytes),
+      writeFiles: async () => { wrote = true }, saveReceipt: async () => { wrote = true }, upload: async () => { wrote = true },
+    }), message)
+    assert.equal(wrote, false, `${mode}: self-consistent forged receipt must not replace trusted staging`)
+  }
 })
 
 test('interrupted initial frontend upload can recover before any crate, while packaged releases never adopt changed bytes', async () => {

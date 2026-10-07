@@ -137,6 +137,7 @@ async function plan(context) {
 async function publish(context, release, receipt) {
   validateReceipt(receipt, context.identity, context.crates)
   assert.equal(release.target_commitish, receipt.identity.sourceRevision)
+  await assertAutomaticVersionOrder(context, release, receipt)
   for (const crate of receipt.crates) {
     let existing = await context.registry(crate, receipt.version)
     if (!existing) {
@@ -172,8 +173,77 @@ async function publish(context, release, receipt) {
   if (!receipt.completed || release.draft) {
     receipt.completed = true
     await context.saveReceipt(release, receipt)
-    await context.complete(release, receipt)
+    await context.complete(release, receipt, await shouldMakeLatest(context, release, receipt))
   }
+}
+
+async function completedAutomaticReceipts(context, currentRelease, receipt) {
+  const receipts = []
+  for (const release of await context.releases()) {
+    if (release.draft || release.id === currentRelease.id) continue
+    const previous = await context.readReceipt(release)
+    if (!previous?.automatic || !previous.completed) continue
+    validateReceipt(previous, previous.identity, previous.crates)
+    assert.equal(previous.identity.repository, receipt.identity.repository)
+    assert.match(previous.identity.sourceRevision, SHA)
+    assert.equal(release.target_commitish, previous.identity.sourceRevision)
+    assert.equal(release.tag_name, `v${previous.version}`)
+    assert.equal(await context.tagSource(previous.version), previous.identity.sourceRevision,
+      'Completed automatic release tag points to different source')
+    receipts.push(previous)
+  }
+  return receipts
+}
+
+function compareAutomaticVersions(left, right) {
+  const components = (version) => {
+    assert.match(version, /^\d+\.\d+\.\d+$/, 'Automatic versions must be numeric')
+    return version.split('.').map(BigInt)
+  }
+  const first = components(left)
+  const second = components(right)
+  const difference = first.findIndex((value, index) => value !== second[index])
+  return difference < 0 ? 0 : first[difference] > second[difference] ? 1 : -1
+}
+
+async function assertAutomaticVersionOrder(context, release, receipt) {
+  if (!receipt.automatic) return
+  for (const previous of await completedAutomaticReceipts(context, release, receipt)) {
+    if (previous.identity.sourceRevision !== receipt.identity.sourceRevision &&
+        compareAutomaticVersions(receipt.version, previous.version) >= 0) {
+      assert.ok(await context.isAncestor(previous.identity.sourceRevision, receipt.identity.sourceRevision),
+        'Older or unproven main source cannot publish at or above a completed newer source version')
+    }
+  }
+}
+
+async function shouldMakeLatest(context, currentRelease, receipt) {
+  if (!receipt.automatic) return false
+  // A retry may finish after a newer main source. Release numbers describe
+  // allocation time, so a late first attempt for old CI can have a larger one.
+  for (const previous of await completedAutomaticReceipts(context, currentRelease, receipt)) {
+    if (previous.identity.sourceRevision === receipt.identity.sourceRevision) {
+      if (compareAutomaticVersions(previous.version, receipt.version) > 0) return false
+    } else if (!await context.isAncestor(previous.identity.sourceRevision, receipt.identity.sourceRevision)) {
+      // Only a proven descendant can take latest from a completed auto source;
+      // old recovery and divergent/rewritten history both retain the latest.
+      return false
+    }
+  }
+  return true
+}
+
+function gitIsAncestor(ancestor, descendant, cwd) {
+  for (const revision of [ancestor, descendant]) {
+    assert.match(revision, SHA)
+    const exists = spawnSync('git', ['cat-file', '-e', `${revision}^{commit}`], { cwd, encoding: 'utf8' })
+    if (exists.error) throw exists.error
+    if (exists.status !== 0) command(['git', 'fetch', '--no-tags', 'origin', revision], { cwd })
+  }
+  const result = spawnSync('git', ['merge-base', '--is-ancestor', ancestor, descendant], { cwd, encoding: 'utf8' })
+  if (result.error) throw result.error
+  assert.ok(result.status === 0 || result.status === 1, `Unable to compare release source ancestry: ${result.stderr}`)
+  return result.status === 0
 }
 
 function command(args, options = {}) {
@@ -236,11 +306,35 @@ function verifyPackageArchive(bytes, receipt, name, expected, entry) {
   }
 }
 
-async function preserveFrontend({ receipt, stagedBytes, assets, readAsset, writeFiles, saveReceipt, upload }) {
+function verifyPreservedFrontend(staged, restored) {
+  const semanticManifest = (bytes) => {
+    const source = bytes.toString('utf8')
+    const manifest = JSON.parse(source)
+    assert.equal(source, `${JSON.stringify(manifest, null, 2)}\n`, 'Preserved frontend manifest must be canonical')
+    assert.equal(new Date(manifest.built_at).toISOString(), manifest.built_at)
+    const { built_at, ...semantic } = manifest
+    return semantic
+  }
+  assert.deepEqual(semanticManifest(restored[0]), semanticManifest(staged[0]),
+    'Preserved frontend manifest differs from the verified pinned package')
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-release-frontend-'))
+  try {
+    for (const [prefix, bytes] of [['staged', staged], ['restored', restored]]) {
+      fs.writeFileSync(path.join(directory, `${prefix}.json`), bytes[0])
+      fs.writeFileSync(path.join(directory, `${prefix}.zip`), bytes[1])
+    }
+    command(['python3', path.join(__dirname, 'crate-release-frontend.py'), directory])
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+}
+
+async function preserveFrontend({ receipt, stagedBytes, assets, readAsset, verifyFiles, writeFiles, saveReceipt, upload }) {
   if (assets.every(Boolean)) {
     const bytes = await Promise.all(assets.map(readAsset))
     if (sha256(bytes[0]) === receipt.frontendBytes.manifestSha256 &&
         sha256(bytes[1]) === receipt.frontendBytes.archiveSha256) {
+      await verifyFiles(bytes)
       await writeFiles(bytes)
       return
     }
@@ -274,9 +368,11 @@ function makeContext(env = process.env) {
     env.FRONTEND_PACKAGE, env.FRONTEND_VERSION, manifest,
     JSON.parse(fs.readFileSync('scripts/frontend-package-lock.json', 'utf8')),
   ) }
+  const stagedFrontend = [fs.readFileSync(`${frontendDirectory}/frontend-manifest.json`),
+    fs.readFileSync(`${frontendDirectory}/lotus-frontend.zip`)]
   const frontendBytes = {
-    manifestSha256: sha256(fs.readFileSync(`${frontendDirectory}/frontend-manifest.json`)),
-    archiveSha256: sha256(fs.readFileSync(`${frontendDirectory}/lotus-frontend.zip`)),
+    manifestSha256: sha256(stagedFrontend[0]),
+    archiveSha256: sha256(stagedFrontend[1]),
   }
   assert.ok(['@bigduu/lotus-next', '@bigduu/lotus'].includes(identity.frontend.packageName))
   assertVersion(identity.frontend.packageVersion)
@@ -303,6 +399,12 @@ function makeContext(env = process.env) {
       return versions
     },
     readReceipt: async (release) => readBodyReceipt(release),
+    isAncestor: async (ancestor, descendant) => gitIsAncestor(ancestor, descendant),
+    tagSource: async (version) => {
+      const tag = github(repository, `git/ref/tags/v${assertVersion(version)}`)
+      assert.equal(tag.object.type, 'commit', 'Completed automatic release tag must be a direct commit ref')
+      return tag.object.sha
+    },
     reserve: async (receipt) => github(repository, 'releases', {
       tag_name: `v${receipt.version}`, target_commitish: sourceRevision,
       name: `Bamboo v${receipt.version}`, draft: true, body: receiptBody(receipt),
@@ -328,6 +430,7 @@ function makeContext(env = process.env) {
       await preserveFrontend({ receipt, stagedBytes: frontendBytes, assets,
         readAsset: async (asset) => command(['gh', 'api', `repos/${repository}/releases/assets/${asset.id}`,
           '-H', 'Accept: application/octet-stream'], { encoding: null }),
+        verifyFiles: async (bytes) => verifyPreservedFrontend(stagedFrontend, bytes),
         writeFiles: async (bytes) => bytes.forEach((content, index) => fs.writeFileSync(path.join(frontendDirectory, names[index]), content)),
         saveReceipt: async () => context.saveReceipt(release, receipt),
         upload: async () => command(['gh', 'release', 'upload', `v${receipt.version}`,
@@ -361,10 +464,10 @@ function makeContext(env = process.env) {
       verifyPackageArchive(bytes, receipt, name, checksum, entry)
     },
     wait: async (seconds) => new Promise((resolve) => setTimeout(resolve, seconds * 1000)),
-    complete: async (release, receipt) => {
+    complete: async (release, receipt, makeLatest) => {
       command(['gh', 'release', 'upload', `v${receipt.version}`, receiptFile, '--clobber', '--repo', repository])
       return github(repository, `releases/${release.id}`, {
-        draft: false, make_latest: receipt.automatic ? 'true' : 'false', body: receiptBody(receipt),
+        draft: false, make_latest: makeLatest ? 'true' : 'false', body: receiptBody(receipt),
       }, 'PATCH')
     },
   }
@@ -390,5 +493,5 @@ async function main() {
 
 module.exports = { assertVersion, validateSource, validateReceipt, nextVersion, selectVersion,
   plan, publish, makeContext, sha256, githubArgs, receiptBody, readBodyReceipt,
-  frontendIdentity, verifyPackageArchive, preserveFrontend }
+  frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor }
 if (require.main === module) main().catch((error) => { console.error(error); process.exitCode = 1 })

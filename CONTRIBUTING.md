@@ -206,13 +206,20 @@ a normal promotion; this change does not itself promote the existing dev backlog
 Automatic releases and manual/Zenith dispatches share one publication queue.
 A draft Release reserves the version and stores canonical source/frontend
 provenance atomically in its body before any crate upload. Its frontend assets
-preserve the initial staged bytes for retries. Each expected crate checksum is
-recorded before publishing, and the downloaded crate must match that checksum,
+preserve the initial staged bytes for retries; restored manifest semantics and
+ZIP payloads must still match the independently verified fixed npm package.
+Each expected crate checksum is recorded before publishing, and the downloaded
+crate must match that checksum,
 its `.cargo_vcs_info.json` source SHA, and (for bamboo-server) the preserved
 embedded frontend bytes. The GitHub Release becomes public only after every
 crate is verified. Rerun a failed Publish Crate run to continue the same source
 and version; a completed automatic CI rerun verifies existing artifacts without
 publishing again or changing the latest release.
+An older main CI recovery remains public without replacing a completed newer
+main source as GitHub's latest; source ancestry takes precedence over the date
+sequence allocated when each run first starts.
+Before any crate upload, an older or unproven main source at or above an already
+completed newer source version is rejected, preserving crates.io version order.
 
 The existing manual workflow inputs remain available, including `dev` dispatches
 from Zenith and the explicit fixed legacy frontend rollback. Pass an unused real
