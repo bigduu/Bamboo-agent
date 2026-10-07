@@ -3052,6 +3052,9 @@ async fn run_pipeline_inner(
         } else {
             0
         };
+        // Consume the completed observation round once. Ordinary/overflow
+        // retries receive the same request-only advice, never a new User turn.
+        let observation_progress_hint = tool_policy_guard.observation_progress_hint();
         for attempt in 1..=MAX_LLM_TURN_ATTEMPTS + extra_attempts {
             if config.goal_loop_active() && extra_attempts > 0 {
                 if let Some(delay_ms) = crate::runtime::goal_recovery::pending_delay(
@@ -3082,6 +3085,7 @@ async fn run_pipeline_inner(
                 &state.session_id,
                 &state.model_name,
                 &tool_schemas,
+                observation_progress_hint,
                 Some(
                     crate::runtime::runner::round_lifecycle::PromptMemoryExposureFrame {
                         round_id: &round_id,
@@ -3173,6 +3177,7 @@ async fn run_pipeline_inner(
                                 &state.session_id,
                                 &state.model_name,
                                 &tool_schemas_after_recovery,
+                                observation_progress_hint,
                                 Some(
                                     crate::runtime::runner::round_lifecycle::PromptMemoryExposureFrame {
                                         round_id: &round_id,

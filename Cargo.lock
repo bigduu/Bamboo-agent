@@ -1682,6 +1682,7 @@ dependencies = [
  "ignore",
  "regex",
  "reqwest",
+ "schemars",
  "serde",
  "serde_json",
  "serde_yaml",
