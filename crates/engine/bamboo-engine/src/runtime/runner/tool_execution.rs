@@ -61,6 +61,8 @@ mod output_compressor;
 mod per_call;
 mod policy;
 #[cfg(test)]
+mod progress_hint_tests;
+#[cfg(test)]
 mod supervisor_dispatch_tests;
 mod task;
 pub(crate) mod tool_error_collector;
@@ -274,6 +276,8 @@ async fn execute_and_apply_single_tool_call(
         }
     };
 
+    // Compare raw output: changing evidence hidden by compression is still progress.
+    policy_guard.observe_raw_observation(tool_call, &outcome.result);
     // Compress tool output before applying
     let task_hint = build_task_compression_hint(task_context);
     let outcome = output_compressor::maybe_compress(
@@ -496,6 +500,7 @@ pub(crate) async fn execute_round_tool_calls(
         config.max_tool_calls_per_round,
         config.max_consecutive_failures_per_tool,
     );
+    policy_guard.begin_observation_round(round);
 
     // Pre-classify all tool calls to avoid repeated normalization.
     let scheduling_modes: Vec<ToolSchedulingMode> = if config
@@ -749,6 +754,9 @@ pub(crate) async fn execute_round_tool_calls(
                 individual_durations.join(", ")
             );
 
+            for (batch_call, outcome) in batch.iter().zip(&outcomes) {
+                policy_guard.observe_raw_observation(batch_call, &outcome.result);
+            }
             // Compress all outcomes in parallel before applying sequentially.
             let max_tool_tokens = session
                 .effective_token_budget()
@@ -865,6 +873,16 @@ pub(crate) async fn execute_round_tool_calls(
         }
     }
 
+    // Place guidance after the complete paired tool-result batch so it cannot
+    // split an assistant tool-call message from its remaining tool responses.
+    if let Some(hint) = policy_guard.observation_progress_hint() {
+        let mut message = bamboo_agent_core::Message::user(hint);
+        message.metadata = Some(serde_json::json!({
+            "hidden_from_ui": true,
+            "runtime_kind": "observation_progress_hint",
+        }));
+        session.add_message(message);
+    }
     Ok(state.into_result())
 }
 

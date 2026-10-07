@@ -7,11 +7,13 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
 
+use super::parameter_schema;
 use super::read_tracker::{self, MAX_TRACKED_FILE_SIZE};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ViewImageArgs {
+    /// Absolute path to a local PNG, JPEG, GIF, or WebP image
     path: String,
 }
 
@@ -59,17 +61,7 @@ impl Tool for ViewImageTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute path to a local PNG, JPEG, GIF, or WebP image"
-                }
-            },
-            "required": ["path"],
-            "additionalProperties": false
-        })
+        parameter_schema::for_arguments::<ViewImageArgs>()
     }
 
     async fn invoke(

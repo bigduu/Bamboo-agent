@@ -399,10 +399,9 @@ pub(super) async fn maybe_compress(
         };
 
         if compressed.was_compressed {
-            // Tee-save full output when compression occurred.
+            // Recovery files screen output and never receive command arguments.
             let tee_note =
-                tee::tee_save_if_needed(session_id, args_json, &original, &compressed.compressed)
-                    .await;
+                tee::tee_save_if_needed(session_id, &original, &compressed.compressed).await;
 
             // Replace result with compressed version (+ optional tee note).
             result.result = match tee_note {
