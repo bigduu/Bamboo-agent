@@ -3319,7 +3319,7 @@ mod hook_tests {
                     max_tool_output_tokens: n,
                     ..Default::default()
                 });
-                let initial = session.token_budget.clone();
+                let initial = serde_json::to_value(&session.token_budget).unwrap();
                 let entered = Arc::new(tokio::sync::Notify::new());
                 let release = Arc::new(tokio::sync::Notify::new());
                 let mut runner = crate::runtime::hooks::HookRunner::new();
@@ -3349,7 +3349,10 @@ mod hook_tests {
                 assert_eq!(outcome.output_cap, Some(cap));
                 assert_eq!(*concrete.output_caps.lock().unwrap(), vec![cap]);
                 assert_eq!(outcome.result.unwrap().result, "exact dispatch");
-                assert_eq!(session.token_budget, initial);
+                assert_eq!(
+                    serde_json::to_value(&session.token_budget).unwrap(),
+                    initial
+                );
                 assert!(session.resolved_token_budget.is_none());
                 if matches!(
                     decision,
