@@ -13,6 +13,58 @@ const SHA = /^[0-9a-f]{40}$/
 const DIGEST = /^[0-9a-f]{64}$/
 const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/
 const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+const AUTH_DOMAIN = 'bamboo-release-provenance/hmac-sha256/v1\0'
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+function assertSigningKey(key) {
+  // Never put a secret in an assertion's actual/expected fields or logs.
+  assert.ok(typeof key === 'string' && DIGEST.test(key), 'BAMBOO_RELEASE_SIGNING_KEY must be 32 bytes of lowercase hex')
+}
+
+function receiptMac(receipt, key) {
+  assertSigningKey(key)
+  const { authentication, ...payload } = receipt
+  return crypto.createHmac('sha256', Buffer.from(key, 'hex')).update(AUTH_DOMAIN).update(canonicalJson(payload)).digest()
+}
+
+function signReceipt(receipt, key) {
+  receipt.authentication = { schemaVersion: 1, algorithm: 'hmac-sha256', mac: receiptMac(receipt, key).toString('hex') }
+  return receipt
+}
+
+function authenticateReceipt(receipt, key) {
+  const authentication = receipt?.authentication
+  assert.ok(authentication?.schemaVersion === 1 && authentication.algorithm === 'hmac-sha256' &&
+    typeof authentication.mac === 'string' && DIGEST.test(authentication.mac) &&
+    Object.keys(authentication).sort().join(',') === 'algorithm,mac,schemaVersion', 'Missing or invalid release receipt authentication')
+  assert.ok(crypto.timingSafeEqual(receiptMac(receipt, key), Buffer.from(authentication.mac, 'hex')),
+    'Release receipt authentication failed')
+  return receipt
+}
+
+function readAuthenticatedReceipt(release, key, { required = false } = {}) {
+  let receipt
+  try {
+    receipt = readBodyReceipt(release)
+  } catch (error) {
+    if (required) throw error
+    return null
+  }
+  // Never silently discard authenticated history after an accidental key
+  // replacement, or let a tampered signed body lose source-order authority.
+  if (receipt && Object.prototype.hasOwnProperty.call(receipt, 'authentication')) {
+    return authenticateReceipt(receipt, key)
+  }
+  assert.ok(!required, 'Missing release receipt authentication')
+  return null
+}
 
 function assertVersion(version) {
   assert.ok(typeof version === 'string' && VERSION.test(version) && version !== '0.0.0',
@@ -59,7 +111,7 @@ function validateReceipt(receipt, identity, crates, version = receipt?.version) 
   return receipt
 }
 
-function nextVersion(versions, now = new Date()) {
+function nextVersion(versions, now = new Date(), occupiedVersions = []) {
   const prefix = `${now.getUTCFullYear()}.${now.getUTCMonth() + 1}.`
   let maximum = 0
   for (const version of versions) {
@@ -68,18 +120,25 @@ function nextVersion(versions, now = new Date()) {
     assert.ok(Number.isSafeInteger(counter), 'Published release counter exceeds safe integer range')
     maximum = Math.max(maximum, counter)
   }
-  assert.ok(Number.isSafeInteger(maximum + 1))
-  return `${prefix}${maximum + 1}`
+  const occupied = new Set(occupiedVersions)
+  // Unauthenticated names can occupy a candidate, but cannot raise the max or
+  // push publication through an unbounded number of attacker-created tags.
+  for (let attempt = 0; attempt < 100; attempt++) {
+    assert.ok(Number.isSafeInteger(++maximum), 'Published release counter exceeds safe integer range')
+    const candidate = `${prefix}${maximum}`
+    if (!occupied.has(candidate)) return candidate
+  }
+  assert.fail('Too many unauthenticated release/tag collisions; refusing automatic publication')
 }
 
 function selectVersion({ automatic, requestedVersion, sourceVersion, identity, crates,
-  releases, receipts, versions, now }) {
+  releases, receipts, versions, occupiedVersions = [], now }) {
   if (automatic) {
     const matches = receipts.filter((receipt) => receipt.automatic &&
       isDeepStrictEqual(receipt.identity, identity))
     assert.ok(matches.length <= 1, 'Multiple automatic reservations for one source identity')
     if (matches.length) return validateReceipt(matches[0], identity, crates).version
-    return nextVersion(versions, now)
+    return nextVersion(versions, now, occupiedVersions)
   }
   const version = assertVersion(!requestedVersion || requestedVersion === 'latest'
     ? sourceVersion : requestedVersion)
@@ -88,7 +147,8 @@ function selectVersion({ automatic, requestedVersion, sourceVersion, identity, c
     const receipt = receipts.find((entry) => entry.version === version)
     validateReceipt(receipt, identity, crates, version)
   } else {
-    assert.ok(!versions.includes(version), `Version ${version} is already occupied without matching provenance`)
+    assert.ok(!versions.includes(version) && !occupiedVersions.includes(version),
+      `Version ${version} is already occupied without matching provenance`)
   }
   return version
 }
@@ -100,20 +160,26 @@ async function plan(context) {
     return { version: assertVersion(!requestedVersion || requestedVersion === 'latest'
       ? sourceVersion : requestedVersion), dryRun: true }
   }
+  context.assertSigningKey()
   const releases = await context.releases()
   const receipts = []
   for (const release of releases) {
-    if ((automatic && release.target_commitish === identity.sourceRevision) ||
-        (!automatic && release.tag_name === `v${!requestedVersion || requestedVersion === 'latest' ? sourceVersion : requestedVersion}`)) {
-      // An existing version may be resumed only with a trusted, matching receipt.
-      const receipt = await context.readReceipt(release)
-      if (receipt) receipts.push(receipt)
-    }
+    const required = (automatic && release.target_commitish === identity.sourceRevision) ||
+      (!automatic && release.tag_name === `v${!requestedVersion || requestedVersion === 'latest' ? sourceVersion : requestedVersion}`)
+    // Matching reservations must fail closed, never be silently re-signed.
+    // Other unsigned history is occupancy only, with no allocation authority.
+    const receipt = await context.readReceipt(release, { required })
+    if (!receipt) continue
+    await validateReleaseReceipt(context, release, receipt, identity.repository)
+    receipts.push(receipt)
   }
-  const versions = [...await context.versions(crates),
+  assert.equal(new Set(receipts.map((receipt) => receipt.version)).size, receipts.length,
+    'Multiple authenticated reservations for one version')
+  const versions = [...await context.versions(crates), ...receipts.map((receipt) => receipt.version)]
+  const occupiedVersions = [
     ...releases.map((release) => release.tag_name.replace(/^v/, '')),
     ...await context.tags()]
-  const version = selectVersion({ ...context, releases, receipts, versions })
+  const version = selectVersion({ ...context, releases, receipts, versions, occupiedVersions })
   const release = releases.find((entry) => entry.tag_name === `v${version}`)
   if (release) {
     assert.equal(release.target_commitish, identity.sourceRevision, 'Reserved release target commit changed')
@@ -135,6 +201,7 @@ async function plan(context) {
 }
 
 async function publish(context, release, receipt) {
+  context.verifyReceipt(receipt)
   validateReceipt(receipt, context.identity, context.crates)
   assert.equal(release.target_commitish, receipt.identity.sourceRevision)
   await assertAutomaticVersionOrder(context, release, receipt)
@@ -177,19 +244,25 @@ async function publish(context, release, receipt) {
   }
 }
 
+async function validateReleaseReceipt(context, release, receipt, repository) {
+  validateReceipt(receipt, receipt.identity, receipt.crates)
+  assert.equal(receipt.identity.repository, repository)
+  assert.match(receipt.identity.sourceRevision, SHA)
+  assert.equal(release.target_commitish, receipt.identity.sourceRevision)
+  assert.equal(release.tag_name, `v${receipt.version}`)
+  const allowMissing = !receipt.completed && Object.keys(receipt.packageChecksums).length === 0
+  const source = await context.tagSource(receipt.version, { allowMissing })
+  assert.ok((allowMissing && source === null) || source === receipt.identity.sourceRevision,
+    'Automatic release tag points to different source')
+}
+
 async function automaticReceipts(context, currentRelease, receipt, { stableOnly = false } = {}) {
   const receipts = []
   for (const release of await context.releases()) {
     if (release.id === currentRelease.id || (stableOnly && (release.draft || release.prerelease))) continue
     const previous = await context.readReceipt(release)
     if (!previous?.automatic || (stableOnly && !previous.completed)) continue
-    validateReceipt(previous, previous.identity, previous.crates)
-    assert.equal(previous.identity.repository, receipt.identity.repository)
-    assert.match(previous.identity.sourceRevision, SHA)
-    assert.equal(release.target_commitish, previous.identity.sourceRevision)
-    assert.equal(release.tag_name, `v${previous.version}`)
-    assert.equal(await context.tagSource(previous.version), previous.identity.sourceRevision,
-      'Automatic release tag points to different source')
+    await validateReleaseReceipt(context, release, previous, receipt.identity.repository)
     receipts.push(previous)
   }
   return receipts
@@ -207,7 +280,7 @@ function compareAutomaticVersions(left, right) {
 }
 
 async function assertAutomaticVersionOrder(context, release, receipt) {
-  if (!receipt.automatic) return
+  if (!context.automatic) return
   for (const previous of await automaticReceipts(context, release, receipt)) {
     if (previous.identity.sourceRevision !== receipt.identity.sourceRevision &&
         compareAutomaticVersions(receipt.version, previous.version) >= 0) {
@@ -215,10 +288,21 @@ async function assertAutomaticVersionOrder(context, release, receipt) {
         'Older or unproven main source cannot publish at or above a reserved newer source version')
     }
   }
+  for (const previous of await context.registryFrontier()) {
+    if (previous.sourceRevision !== receipt.identity.sourceRevision) {
+      if (compareAutomaticVersions(receipt.version, previous.version) >= 0) {
+        assert.ok(await context.isAncestor(previous.sourceRevision, receipt.identity.sourceRevision),
+          'Older or unproven main source cannot overtake verified registry source')
+      } else {
+        assert.ok(!await context.isAncestor(previous.sourceRevision, receipt.identity.sourceRevision),
+          'Newer main source cannot publish below verified registry version')
+      }
+    }
+  }
 }
 
 async function shouldMakeLatest(context, currentRelease, receipt) {
-  if (!receipt.automatic) return false
+  if (!context.automatic) return false
   // A retry may finish after a newer main source. Release numbers describe
   // allocation time, so a late first attempt for old CI can have a larger one.
   for (const previous of await automaticReceipts(context, currentRelease, receipt, { stableOnly: true })) {
@@ -229,6 +313,11 @@ async function shouldMakeLatest(context, currentRelease, receipt) {
       // old recovery and divergent/rewritten history both retain the latest.
       return false
     }
+  }
+  for (const previous of await context.registryFrontier()) {
+    if (previous.sourceRevision === receipt.identity.sourceRevision) {
+      if (compareAutomaticVersions(previous.version, receipt.version) > 0) return false
+    } else if (!await context.isAncestor(previous.sourceRevision, receipt.identity.sourceRevision)) return false
   }
   return true
 }
@@ -297,13 +386,25 @@ function frontendIdentity(packageName, packageVersion, manifest, lock) {
 }
 
 function verifyPackageArchive(bytes, receipt, name, expected, entry) {
-  assert.equal(sha256(bytes), expected, `Downloaded package checksum mismatch for ${name}`)
-  const vcs = JSON.parse(entry('.cargo_vcs_info.json').toString('utf8'))
-  assert.equal(vcs.git.sha1, receipt.identity.sourceRevision, `Published ${name} source revision mismatch`)
+  assert.equal(verifyRegistrySource(bytes, expected, entry), receipt.identity.sourceRevision,
+    `Published ${name} source revision mismatch`)
   if (name === 'bamboo-server') {
     assert.equal(sha256(entry('frontend_package/frontend-manifest.json')), receipt.frontendBytes.manifestSha256)
     assert.equal(sha256(entry('frontend_package/lotus-frontend.zip')), receipt.frontendBytes.archiveSha256)
   }
+}
+
+function verifyRegistrySource(bytes, checksum, entry) {
+  assert.match(checksum, DIGEST)
+  assert.equal(sha256(bytes), checksum, 'Downloaded package checksum mismatch')
+  const revision = JSON.parse(entry('.cargo_vcs_info.json').toString('utf8')).git?.sha1
+  assert.match(revision, SHA, 'Registry archive has no valid source revision')
+  return revision
+}
+
+function highestStableVersion(versions) {
+  return versions.filter((version) => /^\d+\.\d+\.\d+$/.test(version))
+    .reduce((highest, version) => highest === null || compareAutomaticVersions(version, highest) > 0 ? version : highest, null)
 }
 
 function verifyPreservedFrontend(staged, restored) {
@@ -362,6 +463,7 @@ function makeContext(env = process.env) {
   const automatic = validateSource({ eventName: env.GITHUB_EVENT_NAME, event, repository,
     sourceRevision, workflowRevision: env.GITHUB_SHA })
   if (env.DRY_RUN !== 'true') assert.ok(env.CARGO_REGISTRY_TOKEN, 'Missing CARGO_REGISTRY_TOKEN')
+  if (env.DRY_RUN !== 'true') assertSigningKey(env.BAMBOO_RELEASE_SIGNING_KEY)
   const frontendDirectory = 'crates/app/bamboo-server/frontend_package'
   const manifest = JSON.parse(fs.readFileSync(`${frontendDirectory}/frontend-manifest.json`, 'utf8'))
   const identity = { repository, sourceRevision, frontend: frontendIdentity(
@@ -383,7 +485,19 @@ function makeContext(env = process.env) {
   const directory = path.join(env.RUNNER_TEMP || os.tmpdir(), `bamboo-release-${env.GITHUB_RUN_ID}`)
   fs.mkdirSync(directory, { recursive: true })
   const receiptFile = path.join(directory, RECEIPT_NAME)
+  const verifiedSources = new Map()
   const paginated = (route) => jsonCommand(['gh', 'api', '--paginate', '--slurp', `repos/${repository}/${route}`]).flat()
+  const registryVersions = async (name) => {
+    const response = await registryFetch(`https://crates.io/api/v1/crates/${name}`, true)
+    return response ? (await response.json()).versions.map((version) => version.num) : []
+  }
+  const downloadArchive = async (name, version) => {
+    const response = await registryFetch(`https://crates.io/api/v1/crates/${name}/${version}/download`)
+    const bytes = Buffer.from(await response.arrayBuffer())
+    const archive = path.join(directory, `${name}-${version}.crate`)
+    fs.writeFileSync(archive, bytes)
+    return { bytes, entry: (file) => command(['tar', '-xOf', archive, `${name}-${version}/${file}`], { encoding: null }) }
+  }
   const context = { automatic, identity, frontendBytes, crates, receiptFile,
     requestedVersion: env.PUBLISH_VERSION || '',
     sourceVersion: fs.readFileSync('Cargo.toml', 'utf8').match(/^version = "([^"]+)"$/m)?.[1],
@@ -393,21 +507,42 @@ function makeContext(env = process.env) {
     versions: async (names) => {
       const versions = []
       for (const name of names) {
-        const response = await registryFetch(`https://crates.io/api/v1/crates/${name}`, true)
-        if (response) versions.push(...(await response.json()).versions.map((version) => version.num))
+        versions.push(...await registryVersions(name))
       }
       return versions
     },
-    readReceipt: async (release) => readBodyReceipt(release),
+    registryFrontier: async () => {
+      const frontier = []
+      // Refresh each list at both publication boundaries. Only immutable
+      // archive/version/checksum proofs are cached, never a moving latest.
+      for (const name of crates) {
+        const version = highestStableVersion(await registryVersions(name))
+        if (version === null) continue
+        const metadata = await context.registry(name, version)
+        assert.ok(metadata, 'Registry frontier version disappeared')
+        const key = `${name}@${version}:${metadata.checksum}`
+        if (!verifiedSources.has(key)) {
+          const { bytes, entry } = await downloadArchive(name, version)
+          verifiedSources.set(key, verifyRegistrySource(bytes, metadata.checksum, entry))
+        }
+        frontier.push({ version, sourceRevision: verifiedSources.get(key) })
+      }
+      return frontier
+    },
+    readReceipt: async (release, options) => readAuthenticatedReceipt(release, env.BAMBOO_RELEASE_SIGNING_KEY, options),
+    verifyReceipt: (receipt) => authenticateReceipt(receipt, env.BAMBOO_RELEASE_SIGNING_KEY),
+    assertSigningKey: () => assertSigningKey(env.BAMBOO_RELEASE_SIGNING_KEY),
     isAncestor: async (ancestor, descendant) => gitIsAncestor(ancestor, descendant),
-    tagSource: async (version) => {
-      const tag = github(repository, `git/ref/tags/v${assertVersion(version)}`)
+    tagSource: async (version, { allowMissing = false } = {}) => {
+      const tag = github(repository, `git/ref/tags/v${assertVersion(version)}`, undefined, undefined, allowMissing)
+      if (!tag) return null
       assert.equal(tag.object.type, 'commit', 'Automatic release tag must be a direct commit ref')
       return tag.object.sha
     },
     reserve: async (receipt) => github(repository, 'releases', {
       tag_name: `v${receipt.version}`, target_commitish: sourceRevision,
-      name: `Bamboo v${receipt.version}`, draft: true, body: receiptBody(receipt),
+      name: `Bamboo v${receipt.version}`, draft: true,
+      body: receiptBody(signReceipt(receipt, env.BAMBOO_RELEASE_SIGNING_KEY)),
     }),
     ensureTag: async (_release, receipt) => {
       const ref = `tags/v${receipt.version}`
@@ -420,6 +555,7 @@ function makeContext(env = process.env) {
       assert.equal(tag.object.sha, sourceRevision, 'Reserved release tag points to different source')
     },
     saveReceipt: async (release, receipt) => {
+      signReceipt(receipt, env.BAMBOO_RELEASE_SIGNING_KEY)
       fs.writeFileSync(receiptFile, `${JSON.stringify(receipt, null, 2)}\n`)
       github(repository, `releases/${release.id}`, { body: receiptBody(receipt) }, 'PATCH')
     },
@@ -456,11 +592,7 @@ function makeContext(env = process.env) {
       return { status: result.status, output }
     },
     verifyArchive: async (name, receipt, checksum) => {
-      const response = await registryFetch(`https://crates.io/api/v1/crates/${name}/${receipt.version}/download`)
-      const bytes = Buffer.from(await response.arrayBuffer())
-      const archive = path.join(directory, `${name}-${receipt.version}.crate`)
-      fs.writeFileSync(archive, bytes)
-      const entry = (file) => command(['tar', '-xOf', archive, `${name}-${receipt.version}/${file}`], { encoding: null })
+      const { bytes, entry } = await downloadArchive(name, receipt.version)
       verifyPackageArchive(bytes, receipt, name, checksum, entry)
     },
     wait: async (seconds) => new Promise((resolve) => setTimeout(resolve, seconds * 1000)),
@@ -493,5 +625,7 @@ async function main() {
 
 module.exports = { assertVersion, validateSource, validateReceipt, nextVersion, selectVersion,
   plan, publish, makeContext, sha256, githubArgs, receiptBody, readBodyReceipt,
-  frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor }
+  frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
+  canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey,
+  verifyRegistrySource, highestStableVersion }
 if (require.main === module) main().catch((error) => { console.error(error); process.exitCode = 1 })

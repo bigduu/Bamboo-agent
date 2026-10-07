@@ -7,7 +7,8 @@ const { test } = require('node:test')
 const { assertVersion, validateSource, validateReceipt, nextVersion, selectVersion,
   plan, publish, sha256, githubArgs, receiptBody, readBodyReceipt,
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend,
-  shouldMakeLatest, gitIsAncestor } = require('./crate-release.cjs')
+  shouldMakeLatest, gitIsAncestor, canonicalJson, signReceipt, authenticateReceipt,
+  readAuthenticatedReceipt, assertSigningKey, verifyRegistrySource, highestStableVersion } = require('./crate-release.cjs')
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
 const sourceRevision = 'a'.repeat(40)
@@ -18,33 +19,47 @@ const crates = ['bamboo-domain', 'bamboo-server', 'bamboo-agent']
 const frontendBytes = { manifestSha256: 'd'.repeat(64), archiveSha256: 'e'.repeat(64) }
 const checksum = 'f'.repeat(64)
 const now = new Date('2026-10-07T12:00:00Z')
-const makeReceipt = (extra = {}) => ({ schemaVersion: 1, version: '2026.10.8',
+const signingKey = '7'.repeat(64)
+const makeReceipt = (extra = {}) => signReceipt({ schemaVersion: 1, version: '2026.10.8',
   identity: clone(identity), crates: [...crates], frontendBytes: { ...frontendBytes },
-  automatic: true, completed: false, ciRun: null, packageChecksums: {}, ...extra })
+  automatic: true, completed: false, ciRun: null, packageChecksums: {}, ...extra }, signingKey)
 const release = (receipt, extra = {}) => ({ id: 42, tag_name: `v${receipt.version}`,
   target_commitish: receipt.identity.sourceRevision, draft: true, body: receiptBody(receipt), ...extra })
 
 function fixture(extra = {}) {
   const calls = []
   const completions = []
+  const bodies = []
   const published = new Map()
   const context = { automatic: true, identity: clone(identity), crates: [...crates],
     frontendBytes: { ...frontendBytes }, requestedVersion: '', sourceVersion: '0.0.0', now,
     releases: async () => [], receipts: [], tags: async () => [], versions: async () => [],
-    readReceipt: async (entry) => readBodyReceipt(entry),
-    tagSource: async () => { throw new Error('Unexpected completed source tag lookup') },
+    readReceipt: async (entry, options) => readAuthenticatedReceipt(entry, signingKey, options),
+    verifyReceipt: (receipt) => authenticateReceipt(receipt, signingKey),
+    assertSigningKey: () => assertSigningKey(signingKey),
+    tagSource: async () => sourceRevision,
+    registryFrontier: async () => [],
     isAncestor: async () => { throw new Error('Unexpected source ancestry lookup') },
-    reserve: async (receipt) => { calls.push('reserve'); return release(receipt) },
+    reserve: async (receipt) => {
+      calls.push('reserve')
+      const entry = release(signReceipt(receipt, signingKey))
+      bodies.push(entry.body)
+      return entry
+    },
     ensureTag: async () => { calls.push('tag') },
     ensureFrontend: async () => { calls.push('frontend') },
-    saveReceipt: async (_entry, receipt) => { calls.push(`save:${Object.keys(receipt.packageChecksums).length}:${receipt.completed}`) },
+    saveReceipt: async (_entry, receipt) => {
+      signReceipt(receipt, signingKey)
+      bodies.push(receiptBody(receipt))
+      calls.push(`save:${Object.keys(receipt.packageChecksums).length}:${receipt.completed}`)
+    },
     registry: async (crate) => published.get(crate) || null,
     package: async (crate) => { calls.push(`package:${crate}`); return checksum },
     cargoPublish: async (crate) => { calls.push(`publish:${crate}`); published.set(crate, { checksum }); return { status: 0, output: '' } },
     verifyArchive: async (crate) => { calls.push(`verify:${crate}`) },
     wait: async () => { calls.push('wait') },
     complete: async (_entry, receipt, makeLatest) => { calls.push('complete'); completions.push({ version: receipt.version, makeLatest }) }, ...extra }
-  return { context, calls, published, completions }
+  return { context, calls, published, completions, bodies }
 }
 
 const completedReceipt = (version, revision) => makeReceipt({ version,
@@ -120,20 +135,161 @@ test('receipt is included atomically at reservation and PATCH updates do not del
   assert.throws(() => validateReceipt({ ...receipt, completed: true }, identity, crates), /every package checksum/)
 })
 
+test('receipt authentication covers every payload field and extra JSON keys with stable object ordering', () => {
+  const original = makeReceipt()
+  assert.deepEqual(authenticateReceipt(clone(original), signingKey), original)
+  const reordered = Object.fromEntries(Object.entries(original).reverse())
+  reordered.identity = Object.fromEntries(Object.entries(reordered.identity).reverse())
+  authenticateReceipt(reordered, signingKey)
+  const mutations = [
+    (r) => { r.schemaVersion = 2 }, (r) => { r.version = '2026.9999.9999' },
+    (r) => { r.identity.repository = 'foreign/repo' }, (r) => { r.identity.sourceRevision = 'b'.repeat(40) },
+    (r) => { r.identity.frontend.packageName = '@bigduu/lotus' },
+    (r) => { r.identity.frontend.packageVersion = '2026.9.23' },
+    (r) => { r.identity.frontend.bundleHash = `sha256:${'9'.repeat(64)}` },
+    (r) => { r.identity.frontend.lock.sourceRevision = 'e'.repeat(40) },
+    (r) => { r.crates.reverse() }, (r) => { r.frontendBytes.manifestSha256 = '8'.repeat(64) },
+    (r) => { r.frontendBytes.archiveSha256 = '8'.repeat(64) },
+    (r) => { r.packageChecksums['bamboo-domain'] = checksum },
+    (r) => { r.automatic = false }, (r) => { r.completed = true }, (r) => { r.ciRun = 'https://example.invalid/ci' },
+    (r) => { r.extra = true }, (r) => { r.identity.extra = true },
+    (r) => { Object.defineProperty(r, '__proto__', { value: { compromised: true }, enumerable: true }) },
+    (r) => { r.identity.constructor = { compromised: true } },
+  ]
+  for (const mutate of mutations) {
+    const changed = clone(original)
+    mutate(changed)
+    assert.throws(() => authenticateReceipt(changed, signingKey), /authentication failed/)
+  }
+  const proto = JSON.parse('{"__proto__":{"x":1},"constructor":2}')
+  assert.equal(canonicalJson(proto), '{"__proto__":{"x":1},"constructor":2}')
+  assert.equal({}.x, undefined)
+})
+
+test('missing or malformed signing keys fail before external calls without revealing their value', async () => {
+  for (const key of [undefined, '', 'private-key-should-not-appear', 'f'.repeat(63), 'G'.repeat(64)]) {
+    const { context, calls } = fixture({ assertSigningKey: () => assertSigningKey(key),
+      releases: async () => { throw new Error('Key failure must precede any external call') } })
+    await assert.rejects(() => plan(context), (error) => {
+      assert.match(error.message, /SIGNING_KEY/)
+      if (key) assert.ok(!String(error.stack).includes(key))
+      return true
+    })
+    assert.deepEqual(calls, [])
+  }
+})
+
+test('missing, malformed, wrong-key and modified receipt authentication cannot be resumed', () => {
+  const original = makeReceipt()
+  for (const authentication of [undefined, { ...original.authentication, mac: 'f' },
+    { ...original.authentication, mac: 'g'.repeat(64) }, { ...original.authentication, algorithm: 'none' },
+    { ...original.authentication, extra: true }]) {
+    assert.throws(() => authenticateReceipt({ ...original, authentication }, signingKey), /authentication/)
+  }
+  assert.throws(() => authenticateReceipt(original, '8'.repeat(64)), /authentication failed/)
+  assert.deepEqual(readAuthenticatedReceipt(release(original), signingKey), original)
+})
+
+test('matching unsigned or bad-MAC automatic and manual drafts cannot be re-signed into a privileged publication', async () => {
+  for (const version of ['2026.9999.9999', '2026.10.9999']) {
+    for (const automatic of [true, false]) {
+      for (const unsigned of [true, false]) {
+        const forged = makeReceipt({ version, automatic })
+        if (unsigned) delete forged.authentication
+        else forged.authentication.mac = 'f'.repeat(64)
+        const { context, calls } = fixture({ automatic, requestedVersion: automatic ? '' : version,
+          releases: async () => [release(forged)] })
+        await assert.rejects(() => plan(context), /authentication/)
+        assert.deepEqual(calls, [])
+      }
+    }
+  }
+})
+
+test('bad authenticated foreign history and accidental key replacement fail closed without privileged writes', async () => {
+  const foreign = makeReceipt({ identity: { ...clone(identity), sourceRevision: 'b'.repeat(40) } })
+  const { context, calls } = fixture({ releases: async () => [release(foreign)],
+    readReceipt: async (entry, options) => readAuthenticatedReceipt(entry, '8'.repeat(64), options) })
+  await assert.rejects(() => plan(context), /authentication failed/)
+  assert.deepEqual(calls, [])
+  foreign.authentication.mac = 'f'.repeat(64)
+  assert.throws(() => readAuthenticatedReceipt(release(foreign), signingKey), /authentication failed/)
+})
+
+test('unrelated unsigned releases and huge bare tags are bounded occupancy without allocation or source-order authority', async () => {
+  const forged = makeReceipt({ version: '2026.10.999999999999999999999999',
+    identity: { ...clone(identity), sourceRevision: 'b'.repeat(40) }, completed: true,
+    packageChecksums: Object.fromEntries(crates.map((crate) => [crate, checksum])) })
+  delete forged.authentication
+  const { context, completions } = fixture({ releases: async () => [release(forged, { id: 43, draft: false })],
+    versions: async () => ['2026.10.7'], tags: async () => ['2026.10.8', '2026.10.9999', '2026.9999.9999'],
+    tagSource: async () => { throw new Error('Unsigned history cannot authorize a source lookup') } })
+  const result = await plan(context)
+  assert.equal(result.receipt.version, '2026.10.9')
+  await publish(context, result.release, result.receipt)
+  assert.deepEqual(completions, [{ version: '2026.10.9', makeLatest: true }])
+  const blocked = fixture({ versions: async () => ['2026.10.7'],
+    tags: async () => Array.from({ length: 100 }, (_, i) => `2026.10.${i + 8}`) })
+  await assert.rejects(() => plan(blocked.context), /Too many unauthenticated/)
+  assert.deepEqual(blocked.calls, [])
+})
+
+test('authenticated history still rejects tag, target, repository and duplicate version replay', async () => {
+  const receipt = makeReceipt()
+  for (const changed of [release(receipt, { tag_name: 'v2026.10.99' }),
+    release(receipt, { target_commitish: 'b'.repeat(40) }),
+    release(makeReceipt({ identity: { ...clone(identity), repository: 'foreign/repo' } }))]) {
+    const { context, calls } = fixture({ releases: async () => [changed] })
+    await assert.rejects(() => plan(context))
+    assert.deepEqual(calls, [])
+  }
+  const duplicate = fixture({ releases: async () => [release(receipt), release(receipt, { id: 43 })] })
+  await assert.rejects(() => plan(duplicate.context), /Multiple authenticated reservations/)
+  assert.deepEqual(duplicate.calls, [])
+})
+
+test('reservation and each partial/completed update persist a newly authenticated receipt', async () => {
+  const { context, bodies } = fixture()
+  const result = await plan(context)
+  await publish(context, result.release, result.receipt)
+  const receipts = bodies.map((body) => readAuthenticatedReceipt({ body }, signingKey, { required: true }))
+  assert.deepEqual(receipts.map((r) => [Object.keys(r.packageChecksums).length, r.completed]),
+    [[0, false], [1, false], [2, false], [3, false], [3, true]])
+  assert.equal(new Set(receipts.map((r) => r.authentication.mac)).size, 5)
+  const stale = { ...receipts[1], authentication: receipts[0].authentication }
+  assert.throws(() => authenticateReceipt(stale, signingKey), /authentication failed/)
+})
+
+test('signed manual reservations retain explicit resume and cannot be relabeled as an automatic reservation', async () => {
+  const manual = makeReceipt({ automatic: false })
+  const { context, calls, completions } = fixture({ automatic: false, requestedVersion: manual.version,
+    releases: async () => [release(manual)] })
+  const resumed = await plan(context)
+  await publish(context, resumed.release, resumed.receipt)
+  assert.ok(!calls.includes('reserve'))
+  assert.deepEqual(completions, [{ version: manual.version, makeLatest: false }])
+  const automatic = fixture({ releases: async () => [release(manual)] })
+  const planned = await plan(automatic.context)
+  assert.equal(planned.receipt.version, '2026.10.9')
+  assert.equal(planned.receipt.automatic, true)
+})
+
 test('dry run performs no registry/GitHub reads, draft reservation, tag or asset writes', async () => {
   const forbidden = async () => { throw new Error('External call during dry run') }
   const { context, calls } = fixture({ automatic: false, requestedVersion: '2026.10.8', dryRun: true,
     releases: forbidden, tags: forbidden, versions: forbidden, reserve: forbidden,
-    ensureTag: forbidden, ensureFrontend: forbidden, saveReceipt: forbidden })
+    ensureTag: forbidden, ensureFrontend: forbidden, saveReceipt: forbidden, assertSigningKey: forbidden })
   assert.deepEqual(await plan(context), { version: '2026.10.8', dryRun: true })
   assert.deepEqual(calls, [])
 })
 
-test('automatic planning accounts for all workspace crate versions, tags and drafts under the queue', async () => {
+test('automatic planning trusts registry and signed reservations while tags only occupy candidates', async () => {
+  const reserved = makeReceipt({ version: '2026.10.11', identity: { ...clone(identity), sourceRevision: 'b'.repeat(40) } })
   const { context, calls } = fixture({
-    releases: async () => [release(makeReceipt({ version: '2026.10.11' }), { target_commitish: 'b'.repeat(40) })],
+    releases: async () => [release(reserved)],
     versions: async (names) => { assert.deepEqual(names, crates); return ['2026.10.9'] },
     tags: async () => ['2026.10.12'],
+    tagSource: async () => reserved.identity.sourceRevision,
   })
   const result = await plan(context)
   assert.equal(result.receipt.version, '2026.10.13')
@@ -207,7 +363,7 @@ test('older failed automatic reservations resume without replacing a newer main 
   const newer = completedReceipt('2026.10.9', newerSource)
   const { context, published, completions } = fixture({
     releases: async () => [release(older), release(newer, { id: 43, draft: false })],
-    tagSource: async () => newerSource,
+    tagSource: async (version) => version === older.version ? sourceRevision : newerSource,
     isAncestor: async (ancestor, descendant) => ancestor === sourceRevision && descendant === newerSource,
   })
   published.set('bamboo-domain', { checksum })
@@ -308,6 +464,70 @@ test('a newer main partial publication keeps its reserved version ahead of a lat
   assert.equal(result.receipt.version, '2026.10.11')
   await assert.rejects(() => publish(context, result.release, result.receipt), /cannot publish at or above/)
   assert.deepEqual(calls, ['reserve', 'tag', 'frontend'])
+})
+
+test('deleting a newer receipt cannot let a late older source overtake verified registry artifacts', async () => {
+  const newerSource = 'b'.repeat(40)
+  for (const partial of [true, false]) {
+    for (const missingMarker of [true, false]) {
+      const newer = makeReceipt({ version: '2026.10.10', completed: !partial,
+        identity: { ...clone(identity), sourceRevision: newerSource },
+        packageChecksums: partial ? { 'bamboo-domain': checksum } : Object.fromEntries(crates.map((crate) => [crate, checksum])) })
+      delete newer.authentication
+      const { context, calls } = fixture({ versions: async () => ['2026.10.10'],
+        releases: async () => [release(newer, { id: 43, draft: partial, ...(missingMarker ? { body: '' } : {}) })],
+        registryFrontier: async () => [{ version: newer.version, sourceRevision: newerSource }], isAncestor: async () => false })
+      const result = await plan(context)
+      assert.equal(result.receipt.version, '2026.10.11')
+      await assert.rejects(() => publish(context, result.release, result.receipt), /cannot overtake verified registry source/)
+      assert.deepEqual(calls, ['reserve', 'tag', 'frontend'])
+    }
+  }
+})
+
+test('older reserved low versions can recover after history deletion without changing latest from newer registry source', async () => {
+  const receipt = makeReceipt()
+  const { context, completions } = fixture({ releases: async () => [release(receipt)],
+    registryFrontier: async () => [{ version: '2026.10.9', sourceRevision: 'b'.repeat(40) }], isAncestor: async () => false })
+  const result = await plan(context)
+  await publish(context, result.release, result.receipt)
+  assert.deepEqual(completions, [{ version: receipt.version, makeLatest: false }])
+})
+
+test('newer automatic sources cannot recover below older registry versions while same-source recovery is allowed', async () => {
+  const olderSource = 'b'.repeat(40)
+  const receipt = makeReceipt()
+  const denied = fixture({ registryFrontier: async () => [{ version: '2026.10.9', sourceRevision: olderSource }],
+    isAncestor: async () => true })
+  await assert.rejects(() => publish(denied.context, release(receipt), receipt), /cannot publish below verified registry version/)
+  assert.deepEqual(denied.calls, [])
+  const allowed = fixture({ registryFrontier: async () => [{ version: '2026.10.9', sourceRevision }],
+    isAncestor: async () => { throw new Error('Identical source needs no ancestry lookup') } })
+  await publish(allowed.context, release(receipt), receipt)
+  assert.deepEqual(allowed.completions, [{ version: receipt.version, makeLatest: false }])
+})
+
+test('manual recovery of an originally automatic reservation preserves its signature without claiming latest', async () => {
+  const receipt = makeReceipt()
+  const { context, completions } = fixture({ automatic: false, requestedVersion: receipt.version,
+    releases: async () => [release(receipt)], registryFrontier: async () => { throw new Error('Manual recovery needs no automatic ordering') } })
+  const result = await plan(context)
+  await publish(context, result.release, result.receipt)
+  assert.equal(result.receipt.automatic, true)
+  authenticateReceipt(result.receipt, signingKey)
+  assert.deepEqual(completions, [{ version: receipt.version, makeLatest: false }])
+})
+
+test('registry source selection is refreshed at completion and uses numeric stable versions across months', async () => {
+  assert.equal(highestStableVersion(['2026.9.9999', '2026.10.1', '2026.11.1-beta', '0.3.0']), '2026.10.1')
+  assert.equal(highestStableVersion(['2026.11.1-beta']), null)
+  let reads = 0
+  const { context, completions } = fixture({ registryFrontier: async () => ++reads === 1 ? [] :
+    [{ version: '2026.10.9', sourceRevision: 'b'.repeat(40) }], isAncestor: async () => false })
+  const receipt = makeReceipt()
+  await publish(context, release(receipt), receipt)
+  assert.equal(reads, 2)
+  assert.deepEqual(completions, [{ version: receipt.version, makeLatest: false }])
 })
 
 test('Git source ordering handles descendants published after checkout and rejects divergent history', (t) => {
@@ -473,6 +693,7 @@ test('workflow preserves the exact CI commit, shared publication queue and separ
   assert.match(workflow, /ref: \$\{\{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha \|\| github.sha \}\}/)
   assert.match(workflow, /contents: write/)
   assert.match(workflow, /secrets.BAMBOO_RELEASE_TOKEN \|\| github.token/)
+  assert.equal((workflow.match(/BAMBOO_RELEASE_SIGNING_KEY: \$\{\{ secrets.BAMBOO_RELEASE_SIGNING_KEY \}\}/g) || []).length, 2)
   assert.doesNotMatch(workflow, /VERSION="\$\{\{ github.event.inputs.version/)
   const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8')
   assert.match(ci, /group: ci-\$\{\{ github.event_name \}\}/)
@@ -536,11 +757,22 @@ test('stamped source lockfile is refreshed before the first locked package', (t)
   assert.ok(workflow.indexOf('      - name: Prepare workspace manifests for publish') < workflow.indexOf(marker))
   assert.ok(workflow.indexOf(marker) < workflow.indexOf('      - name: Publish verified crates'))
   assert.match(workflow, /cargo metadata --format-version 1 > \/dev\/null\n          python3 scripts\/crate-release-lock.py/)
-  success(['cargo', 'metadata', '--format-version', '1', '--offline'])
+  const resolved = JSON.parse(success(['cargo', 'metadata', '--format-version', '1', '--offline']).stdout)
   const python = ['python3', 'python3.12', 'python3.14'].find((candidate) => spawnSync(candidate, ['-c', 'import tomllib']).status === 0)
   success([python, path.join(__dirname, 'crate-release-lock.py')])
   success(packageArgs)
   assert.match(fs.readFileSync(path.join(directory, 'Cargo.lock'), 'utf8'), /version = "2026.10.8"/)
+  const archive = path.join(resolved.target_directory, 'package/bamboo-release-lock-fixture-2026.10.8.crate')
+  const bytes = fs.readFileSync(archive)
+  const entry = (name) => {
+    const result = spawnSync('tar', ['-xOf', archive, `bamboo-release-lock-fixture-2026.10.8/${name}`])
+    assert.equal(result.status, 0, result.stderr.toString())
+    return result.stdout
+  }
+  assert.equal(verifyRegistrySource(bytes, sha256(bytes), entry), success(['git', 'rev-parse', 'HEAD']).stdout.trim())
+  assert.throws(() => verifyRegistrySource(bytes, '0'.repeat(64), entry), /checksum mismatch/)
+  assert.throws(() => verifyRegistrySource(bytes, sha256(bytes), () => Buffer.from('{"git":{}}')))
+  assert.throws(() => verifyRegistrySource(bytes, sha256(bytes), () => Buffer.from('{"git":{"sha1":"invalid"}}')))
 })
 
 test('temporary lock refresh preserves the exact tested external dependency multiset', () => {

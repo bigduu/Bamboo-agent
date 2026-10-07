@@ -197,9 +197,9 @@ Feature pull requests target `dev`. A normal protected `dev → main` promotion
 starts comprehensive CI for its merge commit. After that exact `main` push CI
 succeeds, Publish Crate automatically publishes the workspace dependency closure
 to crates.io and creates a GitHub Release at the same commit. It selects an unused
-`YYYY.M.N` UTC sequence after all existing crate versions, tags, and draft
-reservations. Source manifests keep their `0.0.0` placeholders; the temporary
-publishing checkout stamps the selected version and embeds the exact committed
+`YYYY.M.N` UTC sequence after existing crate versions and authenticated draft
+reservations, avoiding occupied tags. Source manifests keep their `0.0.0`
+placeholders; the temporary publishing checkout stamps the selected version and embeds the exact committed
 frontend package. The workflow and release policy must first reach `main` through
 a normal promotion; this change does not itself promote the existing dev backlog.
 
@@ -221,6 +221,19 @@ sequence allocated when each run first starts.
 Before any crate upload, an older or unproven main source at or above a newer
 source's reserved version is rejected, including partial publications. This
 preserves crates.io version order while the newer source is still recovering.
+The highest stable numeric registry version of each crate is also checked
+against its downloaded checksum and actual Git source SHA. This preserves
+source order and GitHub latest selection even if Release metadata is deleted.
+A newer main source also cannot recover below an older source's published
+registry version. Same-source and older-source lower-version recoveries remain
+available without displacing a higher version at the same source as latest.
+
+Every reservation and update is authenticated with a domain-separated HMAC
+over the complete canonical receipt. Only authenticated, source-bound receipts
+and crates.io versions advance the automatic allocator. Unsigned release/tag
+names only occupy individual candidates; 100 consecutive collisions stop the
+run before any publication. A matching unsigned reservation or any tampered
+authenticated history is rejected without being re-signed.
 
 The existing manual workflow inputs remain available, including `dev` dispatches
 from Zenith and the explicit fixed legacy frontend rollback. Pass an unused real
@@ -236,6 +249,12 @@ with repository Contents write and Workflows write permissions. The workflow
 otherwise uses `github.token`. Tag creation checks that authority before any
 crate upload and rejects a tag pointing to different source. A token permission
 failure leaves the candidate unpublished and requires configuration before rerun.
+Also set `BAMBOO_RELEASE_SIGNING_KEY` to 32 random bytes encoded as 64 lowercase
+hex characters. Keep this recovery authority stable independently of registry
+and API token rotation. Missing or malformed keys fail before publication;
+replacing or losing the key makes existing authenticated receipts unverifiable.
+Stop and manually verify recovery evidence rather than accepting unsigned
+history or automatically re-signing it. A dry run does not require this key.
 
 ## Additional Notes
 

@@ -122,6 +122,7 @@ jobs:
           # default dev branch. A release token with Workflows:write supports it.
           GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN || github.token }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
           PUBLISH_VERSION: ${{ github.event.inputs.version }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
           FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
@@ -269,6 +270,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN || github.token }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
           FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
           FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
         run: node scripts/crate-release.cjs publish
