@@ -193,6 +193,7 @@ pub(crate) async fn execute_llm_round(
     session_id: &str,
     model_name: &str,
     tool_schemas: &[ToolSchema],
+    observation_progress_hint: Option<&str>,
     prompt_memory_exposure: Option<PromptMemoryExposureFrame<'_>>,
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
     let request_tool_schemas =
@@ -225,6 +226,7 @@ pub(crate) async fn execute_llm_round(
         reasoning_effort: config.reasoning_effort,
         max_context_tokens: prepared.budget.max_context_tokens,
         max_output_tokens: prepared.budget.max_output_tokens,
+        observation_progress_hint,
         prompt_memory_exposure,
     };
 
@@ -541,6 +543,7 @@ mod tests {
             "chat-model",
             &tools,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -583,6 +586,7 @@ mod tests {
             "sticky-round-tools",
             "chat-model",
             &tools,
+            None,
             None,
         )
         .await
@@ -629,6 +633,7 @@ mod tests {
             "sticky-round-tools",
             "chat-model",
             &tools,
+            None,
             None,
         )
         .await

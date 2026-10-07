@@ -56,6 +56,7 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_context_tokens: u32,
     pub max_output_tokens: u32,
+    pub observation_progress_hint: Option<&'a str>,
     pub prompt_memory_exposure: Option<PromptMemoryExposureFrame<'a>>,
 }
 
@@ -614,6 +615,7 @@ pub(super) async fn project_request_usage(
         effective_tool_schemas.as_ref(),
         model,
         loading_mode,
+        None,
     );
     let tool_footprint = llm
         .provider_visible_tool_footprint(
@@ -648,6 +650,7 @@ fn build_request_envelope_reconciled(
         tool_schemas,
         model,
         CapabilityLoadingMode::LegacyFullCatalog,
+        None,
     )
 }
 
@@ -658,6 +661,7 @@ fn build_request_envelope_reconciled_for_loading_mode(
     tool_schemas: &[ToolSchema],
     model: &str,
     loading_mode: CapabilityLoadingMode,
+    observation_progress_hint: Option<&str>,
 ) -> PreparedRequestEnvelope {
     let requested_family = ProviderFamily::from_provider_type(config.provider_type.as_deref());
     let requested_protocol = requested_family.map(|family| match family {
@@ -796,6 +800,11 @@ fn build_request_envelope_reconciled_for_loading_mode(
         } else {
             conversation_messages.push(message.clone());
         }
+    }
+    // Advisory context belongs only to this request, after the complete tool
+    // result batch. Reconcile it before ledger/native transcript anchoring.
+    if let Some(hint) = observation_progress_hint {
+        conversation_messages.push(Message::user(hint));
     }
 
     // Canonical prompt structure — where Bamboo OWNS assembly and providers are
@@ -1258,6 +1267,7 @@ pub(super) async fn execute_llm_stream(
         .is_none()
         && responses_continuation_enabled(&responses_policy, provider_type);
     let mut checkpoint_reprepares = 0usize;
+    let mut observation_progress_hint = frame.observation_progress_hint;
     let (mut prepared_envelope, previous_response_id, final_usage) = loop {
         let tool_schemas = effective_schemas.as_ref();
         // Owned (not borrowed) so the immutable borrow of `session` ends here and
@@ -1277,6 +1287,7 @@ pub(super) async fn execute_llm_stream(
             tool_schemas,
             model,
             loading_mode,
+            observation_progress_hint,
         );
         // `prepare_round_context` reserves the already-durable ledger history. The
         // reconciliation above can append a new host-state snapshot, so verify the
@@ -1315,6 +1326,11 @@ pub(super) async fn execute_llm_stream(
         {
             session.model_context_state = previous_model_context_state;
             session.provider_transcript = previous_provider_transcript;
+            // Advice is optional. Reuse the existing candidate snapshots and
+            // rebuild without it before rejecting an otherwise sendable request.
+            if observation_progress_hint.take().is_some() {
+                continue;
+            }
             return Err(AgentError::Budget(format!(
                 "final known provider-visible request exceeds ledger-safe limits: message_input_tokens={}, tool_schema_input_tokens={}, input_tokens={}, input_limit={request_input_limit}, tool_schema_known_segments={}, tool_schema_late_bound_segments={}, tool_schema_bytes={}, tool_schema_chars={}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
                 final_usage.message_input_tokens,
