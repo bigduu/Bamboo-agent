@@ -2759,6 +2759,7 @@ async fn s_t2_5_watchdog_timeout_completes_with_timeout_status() {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalDeliveryFailure {
+    UnreceiptedExecutionError,
     Prepare,
     Checkpoint,
     Proof,
@@ -2773,6 +2774,13 @@ struct TerminalDeliveryPersistence {
 #[async_trait]
 impl bamboo_domain::RuntimeSessionPersistence for TerminalDeliveryPersistence {
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        if self.failure == TerminalDeliveryFailure::UnreceiptedExecutionError
+            && crate::execution::ChildCompletionSource::has_source_record(session)
+        {
+            return Err(std::io::Error::other(
+                "injected unfenced final-save rejection",
+            ));
+        }
         self.inner.save_runtime_session(session).await
     }
 
@@ -2834,6 +2842,11 @@ impl ExternalChildRunner for TerminalDeliveryRunner {
     ) -> crate::runtime::runner::Result<()> {
         self.calls.lock().await.push("execute");
         session.add_message(Message::assistant("durable terminal answer", None));
+        if self.failure == TerminalDeliveryFailure::UnreceiptedExecutionError {
+            return Err(bamboo_agent_core::AgentError::LLM(
+                "actor activation fence is stale or expired".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -2845,6 +2858,9 @@ impl ExternalChildRunner for TerminalDeliveryRunner {
         self.calls.lock().await.push("prepare");
         if self.failure == TerminalDeliveryFailure::Prepare {
             return Err("injected receipt preparation failure".into());
+        }
+        if self.failure == TerminalDeliveryFailure::UnreceiptedExecutionError {
+            return Ok(false);
         }
         Ok(true)
     }
@@ -2924,6 +2940,7 @@ impl crate::execution::ChildCompletionHandler for TerminalDeliveryCompletion {
 #[tokio::test]
 async fn terminal_delivery_failure_matrix_gates_success_before_transport_ack() {
     for failure in [
+        TerminalDeliveryFailure::UnreceiptedExecutionError,
         TerminalDeliveryFailure::Prepare,
         TerminalDeliveryFailure::Checkpoint,
         TerminalDeliveryFailure::Proof,
@@ -2964,6 +2981,43 @@ async fn terminal_delivery_failure_matrix_gates_success_before_transport_ack() {
             .await
             .expect("terminal callback must settle")
             .unwrap();
+        if failure == TerminalDeliveryFailure::UnreceiptedExecutionError {
+            // The old owned-Actor rejection is the execution outcome. An
+            // unrelated generic save failure must not replace that diagnostic
+            // or claim durable history/ACK for the unfenced snapshot.
+            assert_eq!(completion.status, "error");
+            assert!(completion
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("actor activation fence is stale or expired")));
+            assert!(completion.source.is_none());
+            assert_eq!(
+                *calls.lock().await,
+                vec!["execute", "prepare", "unconfirmed"]
+            );
+            let durable = harness
+                .storage
+                .load_session(&harness.child_session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!durable
+                .messages
+                .iter()
+                .any(|message| message.content == "durable terminal answer"));
+            assert!(!crate::execution::ChildCompletionSource::has_source_record(
+                &durable
+            ));
+            while let Ok(event) = child_rx.try_recv() {
+                assert!(!matches!(event, AgentEvent::SessionHistoryCommitted { .. }));
+            }
+            let runners = harness.ctx.agent_runners.read().await;
+            assert!(
+                matches!(&runners.get(&harness.child_session_id).unwrap().status,
+                crate::execution::AgentStatus::Error(error) if error.contains("actor activation fence is stale or expired"))
+            );
+            continue;
+        }
         let success = failure == TerminalDeliveryFailure::Ack;
         assert_eq!(
             completion.status,
@@ -3030,6 +3084,7 @@ async fn terminal_delivery_failure_matrix_gates_success_before_transport_ack() {
         }
         assert_eq!(history_barriers, usize::from(success), "{failure:?}");
         let expected = match failure {
+            TerminalDeliveryFailure::UnreceiptedExecutionError => unreachable!(),
             TerminalDeliveryFailure::Prepare | TerminalDeliveryFailure::Checkpoint => {
                 vec!["execute", "prepare", "unconfirmed"]
             }

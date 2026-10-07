@@ -750,6 +750,11 @@ async fn run_child_spawn_inner(
                 .begin_finalization(&session_id_clone, &activation_run_id)
                 .await;
         }
+        // A rejected stale Actor has no accepted terminal receipt. Preserve
+        // its original fenced execution outcome rather than replacing it with
+        // a secondary generic-save error. Only a selected broker receipt makes
+        // this new durability gate authoritative for completion.
+        let receipt_gated = !matches!(&broker_receipt_prepared, Ok(false));
         let mut source_deferred = false;
         let saved = match broker_receipt_prepared {
             Ok(true) => {
@@ -814,7 +819,10 @@ async fn run_child_spawn_inner(
                     Err(_) => Some("Host child delivery proof commitment timed out".to_string()),
                 }
             }
-            Err(error) => Some(format!("Final Child session was not committed: {error}")),
+            Err(error) if receipt_gated => {
+                Some(format!("Final Child session was not committed: {error}"))
+            }
+            Err(_) => None,
         };
         if terminal_error.is_none() && source_deferred {
             // The runner publishes the pending source with an exact-snapshot
@@ -853,7 +861,7 @@ async fn run_child_spawn_inner(
                 ));
             }
         }
-        let history_committed = terminal_error.is_none();
+        let history_committed = saved.is_ok() && terminal_error.is_none();
         let result = if let Some(error) = &terminal_error {
             tracing::error!(
                 session_id = %session_id_clone,
