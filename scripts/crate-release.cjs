@@ -177,10 +177,10 @@ async function publish(context, release, receipt) {
   }
 }
 
-async function completedAutomaticReceipts(context, currentRelease, receipt) {
+async function completedAutomaticReceipts(context, currentRelease, receipt, { stableOnly = false } = {}) {
   const receipts = []
   for (const release of await context.releases()) {
-    if (release.draft || release.id === currentRelease.id) continue
+    if (release.draft || (stableOnly && release.prerelease) || release.id === currentRelease.id) continue
     const previous = await context.readReceipt(release)
     if (!previous?.automatic || !previous.completed) continue
     validateReceipt(previous, previous.identity, previous.crates)
@@ -221,7 +221,7 @@ async function shouldMakeLatest(context, currentRelease, receipt) {
   if (!receipt.automatic) return false
   // A retry may finish after a newer main source. Release numbers describe
   // allocation time, so a late first attempt for old CI can have a larger one.
-  for (const previous of await completedAutomaticReceipts(context, currentRelease, receipt)) {
+  for (const previous of await completedAutomaticReceipts(context, currentRelease, receipt, { stableOnly: true })) {
     if (previous.identity.sourceRevision === receipt.identity.sourceRevision) {
       if (compareAutomaticVersions(previous.version, receipt.version) > 0) return false
     } else if (!await context.isAncestor(previous.identity.sourceRevision, receipt.identity.sourceRevision)) {

@@ -272,6 +272,19 @@ test('latest uses numeric versions only for the same source and rejects unproven
   assert.equal(await shouldMakeLatest(context, release(current), current), false)
 })
 
+test('GitHub prereleases do not determine stable latest but their numeric crate versions still preserve source order', async () => {
+  const newerSource = 'b'.repeat(40)
+  const newer = completedReceipt('2026.10.10', newerSource)
+  const { context, calls } = fixture({
+    releases: async () => [release(newer, { id: 43, draft: false, prerelease: true })],
+    tagSource: async () => newerSource, isAncestor: async () => false,
+  })
+  const current = makeReceipt({ version: '2026.10.11' })
+  assert.equal(await shouldMakeLatest(context, release(current), current), true)
+  await assert.rejects(() => publish(context, release(current), current), /cannot publish at or above/)
+  assert.deepEqual(calls, [])
+})
+
 test('Git source ordering handles descendants published after checkout and rejects divergent history', (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-release-ancestry-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
