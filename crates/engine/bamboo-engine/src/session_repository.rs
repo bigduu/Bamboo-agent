@@ -21,6 +21,13 @@ use bamboo_storage::LockedSessionStore;
 
 use crate::{read_cached_session, SessionCache};
 
+#[path = "session_repository_root_inbox.rs"]
+mod root_inbox;
+
+#[path = "session_repository_parent_outcome.rs"]
+mod parent_outcome;
+pub use parent_outcome::{ParentOutcomeRoute, ParentOutcomeWriter};
+
 #[cfg(test)]
 type PostDurableHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
@@ -31,6 +38,13 @@ pub struct SessionRepository {
     cache: SessionCache,
     storage: Arc<dyn Storage>,
     persistence: Arc<LockedSessionStore>,
+    root_actor_directory: Option<Arc<dyn bamboo_domain::ActorDirectoryPort>>,
+    root_actor_owner: Option<(
+        Arc<dyn bamboo_domain::ActorDirectoryPort>,
+        Arc<bamboo_domain::RootActorRuntimeWrite>,
+    )>,
+    root_actor_writers:
+        Arc<dashmap::DashMap<String, std::sync::Weak<bamboo_domain::RootActorRuntimeWrite>>>,
     #[cfg(test)]
     post_durable_hook: Option<PostDurableHook>,
 }
@@ -45,9 +59,145 @@ impl SessionRepository {
             cache,
             storage,
             persistence,
+            root_actor_directory: None,
+            root_actor_owner: None,
+            root_actor_writers: Arc::new(Default::default()),
             #[cfg(test)]
             post_durable_hook: None,
         }
+    }
+
+    async fn bind_root_actor_execution_inner(
+        &self,
+        session: &Session,
+        run_id: &str,
+    ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
+        if session.kind != bamboo_domain::SessionKind::Root
+            || !session.authority_identity.is_ordinary()
+        {
+            return Ok(None);
+        }
+        let Some(directory) = self.root_actor_directory.clone() else {
+            return Ok(None);
+        };
+        if !self.storage.supports_root_actor_runtime_write() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Root Actor execution requires a fenced storage writer",
+            ));
+        }
+        let Some(durable) = self.storage.load_root_authority(&session.id).await? else {
+            return Err(root_actor_binding_error(
+                "Root must be persisted before activation",
+            ));
+        };
+        if session.created_at != durable.created_at
+            || session.id != durable.id
+            || session.project_id_meta() != durable.project_id_meta()
+            || session.authority_identity != durable.authority_identity
+        {
+            return Err(root_actor_binding_error(
+                "Root identity changed before activation",
+            ));
+        }
+        let lease_duration = std::time::Duration::from_secs(15);
+        let now = chrono::Utc::now();
+        let claimed = directory
+            .claim_activation(&bamboo_domain::ActorActivationClaim {
+                actor_id: session.id.clone(),
+                run_id: run_id.to_string(),
+                lease_owner: format!("root-execution-{}", uuid::Uuid::new_v4()),
+                lease_expires_at: now + chrono::Duration::seconds(15),
+                inbox_generation: session
+                    .session_inbox_admission()
+                    .map_or(0, |a| a.last_admitted_sequence),
+                placement_ref: None,
+                now,
+            })
+            .await
+            .map_err(root_actor_binding_error)?;
+        let owner = bamboo_domain::RootActorRuntimeWrite {
+            fence: claimed.fence(),
+            created_at: durable.created_at,
+        };
+        let bound = self.bind_root_response_writer(owner.clone())?;
+        let live_owner = bound
+            .root_actor_owner
+            .as_ref()
+            .expect("bound Root owner")
+            .1
+            .clone();
+        let abandon_directory = directory.clone();
+        let abandon_fence = owner.fence.clone();
+        let binding = bamboo_domain::RootActorExecutionBinding::new(
+            Arc::new(bound),
+            directory.clone(),
+            owner,
+            lease_duration,
+            move || {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let _ = abandon_directory
+                            .finish_activation(
+                                &abandon_fence,
+                                chrono::Utc::now(),
+                                bamboo_domain::ActorActivationFinish::Cancelled,
+                            )
+                            .await;
+                    });
+                }
+            },
+        );
+        directory
+            .start_activation(&binding.owner.fence, chrono::Utc::now())
+            .await
+            .map_err(root_actor_binding_error)?;
+        // Keep only a weak route to this exact execution's capability. Host
+        // parent-outcome adapters never reconstruct an owner from observation.
+        self.root_actor_writers
+            .insert(session.id.clone(), Arc::downgrade(&live_owner));
+        Ok(Some(binding))
+    }
+
+    /// Build a response coordinator from the exact reserved execution's
+    /// capability. This does not claim or observe a different Actor owner.
+    pub(crate) fn bind_root_response_writer(
+        &self,
+        owner: bamboo_domain::RootActorRuntimeWrite,
+    ) -> std::io::Result<Self> {
+        let directory = self.root_actor_directory.clone().ok_or_else(|| {
+            root_actor_binding_error("Root response requires its Host Actor directory")
+        })?;
+        let host_cache = self.cache.clone();
+        let publisher: bamboo_domain::RootActorRuntimePublisher = Arc::new(move |saved| {
+            host_cache.insert(
+                saved.id.clone(),
+                Arc::new(crate::SessionSnapshot::new(saved.clone())),
+            );
+        });
+        let bound_store = self
+            .persistence
+            .bind_root_actor_writer(owner.clone(), publisher)?;
+        // Deferred repository callbacks can only update this execution-private
+        // cache. The shared Host cache is published inside V2's physical guard.
+        let mut bound = Self::new(
+            Arc::new(Default::default()),
+            self.storage.clone(),
+            Arc::new(bound_store),
+        );
+        bound.root_actor_owner = Some((directory.clone(), Arc::new(owner)));
+        bound.root_actor_writers = self.root_actor_writers.clone();
+        Ok(bound)
+    }
+
+    /// Enable durable ordinary Root execution ownership in a Host whose
+    /// storage implements the named final writer boundary.
+    pub fn with_root_actor_directory(
+        mut self,
+        directory: Arc<dyn bamboo_domain::ActorDirectoryPort>,
+    ) -> Self {
+        self.root_actor_directory = Some(directory);
+        self
     }
 
     #[cfg(test)]
@@ -145,6 +295,25 @@ impl SessionRepository {
             .await
     }
 
+    /// Persist a blocked approval replay before starting its successor. A
+    /// A save error may arrive after the rewritten result was committed. When
+    /// the save was attempted, evict the old approval from cache under the
+    /// same session lock so the next attempt reloads durable state.
+    pub async fn save_replay_resolution(&self, session: &mut Session) -> std::io::Result<()> {
+        self.persistence
+            .merge_save_runtime_and_publish(session, |saved, committed| {
+                if committed {
+                    self.cache.insert(
+                        saved.id.clone(),
+                        Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                    );
+                } else {
+                    self.cache.remove(&saved.id);
+                }
+            })
+            .await
+    }
+
     /// Atomically mutate the latest durable runtime session and refresh the
     /// cache with the saved value. This is the safe path for narrow metadata
     /// indexes that can be updated concurrently with runner message writes.
@@ -183,13 +352,12 @@ impl SessionRepository {
     }
 
     /// Load a session, reconciling the memory and storage copies via a
-    /// preference heuristic: storage wins when it is strictly newer, or when it
-    /// is the same age but still carries a pending question memory lost. Storage
-    /// is **never** preferred when it is strictly older than memory.
+    /// preference heuristic: a live durable Root birth or mode epoch wins first;
+    /// otherwise storage wins when it is strictly newer, or when it is the same
+    /// age but still carries a pending question memory lost.
     ///
-    /// The cache is refreshed cache-aside but with a no-regression guarantee:
-    /// `load_merged` never overwrites a newer cached session with an older
-    /// storage copy, so it is safe to call from hot read paths.
+    /// The cache is refreshed cache-aside. Timestamps cannot make a stale
+    /// Root birth or mode epoch outrank verified durable authority.
     pub async fn load_merged_checked(&self, session_id: &str) -> std::io::Result<Option<Session>> {
         let _guard = self.persistence.acquire_lock(session_id).await;
         let memory_session = read_cached_session(&self.cache, session_id);
@@ -199,6 +367,8 @@ impl SessionRepository {
 
         Ok(match (memory_session, storage_session) {
             (Some(memory), Some(storage)) => {
+                let root_authority_preference =
+                    root_authority_storage_preference(&memory, &storage);
                 let prefer_storage = should_prefer_storage(&memory, &storage);
                 let diverged = prefer_storage || memory.messages.len() != storage.messages.len();
                 let chosen_len = if prefer_storage {
@@ -231,10 +401,13 @@ impl SessionRepository {
                 // write back when we actually reconciled *to storage* (a memory
                 // win is already the cached copy; re-inserting it would needlessly
                 // replace a possibly-live Arc) AND the reconciled copy is not
-                // older than what memory already holds. This is what makes
-                // `load_merged` safe on hot read paths — it can never clobber a
-                // freshly-updated session with a stale storage copy.
-                if prefer_storage && chosen.updated_at >= memory_updated_at {
+                // older than what memory already holds, except when durable
+                // storage proved a new Root birth or higher mode epoch. Those
+                // authority changes must survive cross-process clock skew.
+                if prefer_storage
+                    && (root_authority_preference == Some(true)
+                        || chosen.updated_at >= memory_updated_at)
+                {
                     self.cache.insert(
                         session_id.to_string(),
                         Arc::new(crate::SessionSnapshot::new(chosen.clone())),
@@ -328,6 +501,10 @@ fn adopt_task_control_plane(target: &mut Session, durable: &Session) {
 }
 
 fn should_prefer_storage(memory_session: &Session, storage_session: &Session) -> bool {
+    if let Some(prefer_storage) = root_authority_storage_preference(memory_session, storage_session)
+    {
+        return prefer_storage;
+    }
     // Never reconcile *backwards* to a strictly-older storage copy: if memory is
     // newer it is authoritative (e.g. it just answered and cleared a pending
     // question while storage still holds the stale one). Respecting `updated_at`
@@ -342,11 +519,83 @@ fn should_prefer_storage(memory_session: &Session, storage_session: &Session) ->
         || (memory_session.pending_question.is_none() && storage_session.pending_question.is_some())
 }
 
+/// `load_session` has already checked that the storage copy is live. Its Root
+/// birth therefore outranks any cached incarnation with the same ID, even if
+/// the new lifetime reset the mode epoch or a process clock moved backwards.
+/// Within one birth, only a higher durable epoch is an authority advance.
+fn root_authority_storage_preference(
+    memory_session: &Session,
+    storage_session: &Session,
+) -> Option<bool> {
+    use bamboo_domain::SessionKind;
+
+    if memory_session.kind != SessionKind::Root || storage_session.kind != SessionKind::Root {
+        return None;
+    }
+    if memory_session.created_at != storage_session.created_at
+        || memory_session.authority_identity != storage_session.authority_identity
+    {
+        return Some(true);
+    }
+    (memory_session.root_mode_transition_epoch != storage_session.root_mode_transition_epoch)
+        .then_some(
+            storage_session.root_mode_transition_epoch > memory_session.root_mode_transition_epoch,
+        )
+}
+
 /// `SessionRepository` is the canonical `RuntimeSessionPersistence`: the runtime
 /// can persist a session through the same coordinator (merge-on-write + cache
 /// refresh) instead of a bespoke adapter.
 #[async_trait::async_trait]
 impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
+    fn inherited_child_wait(&self) -> Option<bamboo_domain::InheritedChildWait> {
+        bamboo_domain::RuntimeSessionPersistence::inherited_child_wait(self.persistence.as_ref())
+    }
+
+    fn bind_inherited_child_wait(
+        &self,
+        inherited: bamboo_domain::InheritedChildWait,
+    ) -> std::io::Result<Arc<dyn bamboo_domain::RuntimeSessionPersistence>> {
+        let mut bound = self.clone();
+        bound.persistence = Arc::new(
+            self.persistence
+                .as_ref()
+                .bind_inherited_child_wait(inherited),
+        );
+        Ok(Arc::new(bound))
+    }
+
+    fn root_actor_writer(&self) -> Option<bamboo_domain::RootActorRuntimeWrite> {
+        self.root_actor_owner
+            .as_ref()
+            .map(|(_, owner)| (**owner).clone())
+    }
+
+    fn root_actor_execution_required(&self, session: &Session) -> bool {
+        self.root_actor_directory.is_some()
+            && session.kind == bamboo_domain::SessionKind::Root
+            && session.authority_identity.is_ordinary()
+    }
+
+    async fn bind_root_actor_execution(
+        &self,
+        session: &Session,
+        run_id: &str,
+    ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
+        let repository = self.clone();
+        let session = session.clone();
+        let run_id = run_id.to_string();
+        // The complete claim/start handoff owns its state if the adapter stops
+        // waiting. An unobserved returned binding drops its exact-fence cleanup.
+        tokio::spawn(async move {
+            repository
+                .bind_root_actor_execution_inner(&session, &run_id)
+                .await
+        })
+        .await
+        .map_err(|error| root_actor_binding_error(format!("Root binding task failed: {error}")))?
+    }
+
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         // Runtime authorization reads through this same cache. Refresh it even
         // when durable storage fails so a current activation can never observe
@@ -356,6 +605,34 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .merge_save_runtime_and_publish(session, |saved, _| {
                 #[cfg(test)]
                 self.run_post_durable_hook("save_runtime_session", &saved.id);
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            })
+            .await
+    }
+
+    async fn save_finalized_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.persistence
+            .merge_save_finalized_runtime_and_publish(session, |saved, _| {
+                #[cfg(test)]
+                self.run_post_durable_hook("save_finalized_runtime_session", &saved.id);
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            })
+            .await
+    }
+
+    async fn save_finalized_runtime_with_inherited_child_wait(
+        &self,
+        session: &mut Session,
+        inherited: &bamboo_domain::session::runtime_state::WaitingForChildrenState,
+    ) -> std::io::Result<()> {
+        self.persistence
+            .merge_save_inherited_child_wait_and_publish(session, inherited, |saved, _| {
                 self.cache.insert(
                     saved.id.clone(),
                     Arc::new(crate::SessionSnapshot::new(saved.clone())),
@@ -569,6 +846,16 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .await
     }
 
+    async fn admit_root_inbox(
+        &self,
+        session: &mut Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        active_run_id: Option<&str>,
+    ) -> std::io::Result<Option<bamboo_domain::RootInboxAdmission>> {
+        self.admit_owned_root_inbox(session, inbox, active_run_id)
+            .await
+    }
+
     async fn checkpoint_retrieval_window(
         &self,
         expected_base: &Session,
@@ -638,6 +925,18 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
     }
 
     async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+        if let Some((directory, owner)) = self.root_actor_owner.as_ref() {
+            if session_id != owner.fence.actor_id {
+                return Err(root_actor_binding_error(
+                    "bound execution cannot load another Root",
+                ));
+            }
+            directory
+                .validate_fence(&owner.fence, chrono::Utc::now())
+                .await
+                .map_err(root_actor_binding_error)?;
+            return self.storage.load_session(session_id).await;
+        }
         self.try_load(session_id).await
     }
 
@@ -690,6 +989,10 @@ mod tests {
     }
 
     struct FailingSaveStorage {
+        persisted: Mutex<Option<Session>>,
+    }
+
+    struct AmbiguousReplaySaveStorage {
         persisted: Mutex<Option<Session>>,
     }
 
@@ -781,6 +1084,24 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl Storage for AmbiguousReplaySaveStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            *self.persisted.lock().unwrap() = Some(session.clone());
+            Err(std::io::Error::other(
+                "injected post-commit replay save error",
+            ))
+        }
+
+        async fn load_session(&self, _session_id: &str) -> std::io::Result<Option<Session>> {
+            Ok(self.persisted.lock().unwrap().clone())
+        }
+
+        async fn delete_session(&self, _session_id: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+    }
+
     fn test_repo(storage: Arc<dyn Storage>) -> SessionRepository {
         let cache: SessionCache = Arc::default();
         let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
@@ -792,6 +1113,107 @@ mod tests {
             session.id.clone(),
             Arc::new(crate::SessionSnapshot::new(session.clone())),
         );
+    }
+
+    #[tokio::test]
+    async fn merged_root_prefers_live_recreated_birth_even_when_epoch_resets() {
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let repo = test_repo(storage.clone());
+        let id = "root-recreated-same-id";
+        let mut stale = Session::new(id, "stale");
+        stale.root_mode_transition_epoch = 3;
+        stale.updated_at += chrono::Duration::hours(1);
+        cache_put(&repo, &stale);
+
+        let mut recreated = Session::new(id, "recreated");
+        recreated.created_at = stale.created_at + chrono::Duration::seconds(1);
+        recreated.updated_at = stale.created_at + chrono::Duration::seconds(1);
+        storage.save_session(&recreated).await.unwrap();
+
+        let loaded = repo.load_merged_checked(id).await.unwrap().unwrap();
+        assert_eq!(loaded.model, "recreated");
+        assert_eq!(loaded.root_mode_transition_epoch, 0);
+        assert_eq!(
+            loaded.root_mode_birth_token(),
+            recreated.root_mode_birth_token()
+        );
+        let cached = read_cached_session(repo.cache(), id).expect("new birth cached");
+        assert_eq!(cached.model, "recreated");
+        assert_eq!(
+            cached.root_mode_birth_token(),
+            recreated.root_mode_birth_token()
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_root_caches_higher_durable_epoch_despite_clock_skew() {
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let repo = test_repo(storage.clone());
+        let id = "root-mode-clock-skew";
+        let mut stale = Session::new(id, "model");
+        stale.updated_at += chrono::Duration::hours(1);
+        cache_put(&repo, &stale);
+
+        let mut durable = stale.clone();
+        durable.root_mode_transition_epoch = 1;
+        durable.root_orchestration_only = true;
+        durable.root_tool_authority_revision = 1;
+        durable.updated_at = durable.created_at;
+        storage.save_session(&durable).await.unwrap();
+
+        let loaded = repo.load_merged_checked(id).await.unwrap().unwrap();
+        assert_eq!(loaded.root_mode_transition_epoch, 1);
+        assert!(loaded.root_orchestration_only);
+        let cached = read_cached_session(repo.cache(), id).expect("higher epoch cached");
+        assert_eq!(cached.root_mode_transition_epoch, 1);
+        assert!(cached.root_orchestration_only);
+    }
+
+    #[tokio::test]
+    async fn runtime_merge_save_adopts_root_mode_terminal_tuple_even_for_policy_neutral_fence() {
+        use bamboo_domain::{RootModeOperationAction, RootModeOperationRequest};
+
+        for action in [
+            RootModeOperationAction::Select,
+            RootModeOperationAction::Recover,
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let concrete = Arc::new(
+                bamboo_storage::SessionStoreV2::new(home.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let storage: Arc<dyn Storage> = concrete.clone();
+            let repo = test_repo(storage.clone());
+            let mut running = Session::new("runtime-root-mode-merge", "model");
+            storage.save_session(&running).await.unwrap();
+            cache_put(&repo, &running);
+            let request = RootModeOperationRequest {
+                session_id: running.id.clone(),
+                operation_id: format!("0:{}", uuid::Uuid::new_v4()),
+                birth_token: running.root_mode_birth_token(),
+                expected_epoch: 0,
+                requested_enabled: true,
+                action,
+            };
+            storage.root_mode_operation(&request).await.unwrap();
+
+            // This save can race a host mode operation before the next runtime
+            // boundary. The production merge must preserve that durable tuple.
+            running.add_message(bamboo_agent_core::Message::assistant("run result", None));
+            repo.save(&mut running).await.unwrap();
+            assert_eq!(running.root_mode_transition_epoch, 1);
+            assert_eq!(running.root_mode_operations.len(), 1);
+            assert_eq!(
+                running.root_orchestration_only_enabled(),
+                action == RootModeOperationAction::Select
+            );
+            let durable = storage.load_session(&running.id).await.unwrap().unwrap();
+            assert_eq!(durable.root_mode_transition_epoch, 1);
+            assert_eq!(durable.root_mode_operations, running.root_mode_operations);
+            assert_eq!(durable.messages.last().unwrap().content, "run result");
+            concrete.flush_search_index().await;
+        }
     }
 
     fn task_list(session_id: &str, title: &str) -> bamboo_domain::TaskList {
@@ -1815,7 +2237,10 @@ mod tests {
         stale.updated_at = Utc::now() - chrono::Duration::seconds(10);
         storage.save_session(&stale).await.unwrap();
 
-        let mut fresh = Session::new(id.to_string(), "m");
+        // This is a fresher snapshot of the same Root birth, not a recreated
+        // Session with the same ID (whose live durable birth takes precedence).
+        let mut fresh = stale.clone();
+        fresh.clear_pending_question();
         fresh.updated_at = Utc::now();
         cache_put(&repo, &fresh);
 
@@ -1917,6 +2342,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalized_runtime_save_reconciles_late_child_completion_in_disk_and_cache() {
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, AgentStatusState, ChildWaitPolicy, WaitingForChildrenState,
+        };
+
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let repo = test_repo(storage.clone());
+        let id = "late-child-finalization";
+        let mut parent = Session::new(id, "model");
+        let mut runtime = AgentRuntimeState::new("parent-run");
+        runtime.status = AgentStatusState::Suspended;
+        let mut wait = WaitingForChildrenState::for_children(
+            vec!["child-1".to_string()],
+            ChildWaitPolicy::All,
+            Utc::now(),
+        );
+        wait.registered_by_tool_call_id = Some("tc_wait".to_string());
+        runtime.waiting_for_children = Some(wait);
+        parent.agent_runtime_state = Some(runtime);
+        parent.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+        parent.set_last_run_status("suspended");
+        storage.save_session(&parent).await.unwrap();
+        cache_put(&repo, &parent);
+
+        let mut stale_runner = parent.clone();
+        let mut completed = parent;
+        let completed_runtime = completed.agent_runtime_state.as_mut().unwrap();
+        completed_runtime.waiting_for_children = None;
+        completed_runtime.status = AgentStatusState::Idle;
+        completed_runtime.suspension = None;
+        completed.metadata.remove("runtime.suspend_reason");
+        let mut outcome = bamboo_agent_core::Message::user("completed child result");
+        outcome.metadata = Some(serde_json::json!({
+            "runtime_kind": "child_completion_resume"
+        }));
+        completed.add_message(outcome);
+        storage.save_session(&completed).await.unwrap();
+
+        bamboo_domain::RuntimeSessionPersistence::save_finalized_runtime_session(
+            &repo,
+            &mut stale_runner,
+        )
+        .await
+        .unwrap();
+
+        let durable = storage.load_session(id).await.unwrap().unwrap();
+        let cached = read_cached_session(repo.cache(), id).expect("final snapshot published");
+        for saved in [&durable, &cached] {
+            assert!(saved
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .waiting_for_children
+                .is_none());
+            assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
+            assert_eq!(saved.last_run_status().as_deref(), Some("completed"));
+            assert!(saved
+                .messages
+                .iter()
+                .any(|message| message.content == "completed child result"));
+        }
+    }
+
+    #[tokio::test]
     async fn inherent_save_leaves_existing_cache_untouched_when_storage_fails() {
         let id = "inherent-save-failure";
         let previous = Session::new(id, "previous");
@@ -1935,6 +2427,64 @@ mod tests {
                 .model,
             "previous",
             "fallible inherent save must publish only after a durable commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_replay_ambiguous_save_evicts_same_age_stale_approval_cache() {
+        let id = "blocked-replay-ambiguous-save";
+        let mut approved = Session::new(id, "model");
+        approved.metadata.insert(
+            crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY.into(),
+            "call-1".into(),
+        );
+        let storage: Arc<dyn Storage> = Arc::new(AmbiguousReplaySaveStorage {
+            persisted: Mutex::new(Some(approved.clone())),
+        });
+        let repo = test_repo(storage);
+        cache_put(&repo, &approved);
+
+        let mut resolved = approved.clone();
+        resolved
+            .metadata
+            .remove(crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY);
+        assert!(repo.save_replay_resolution(&mut resolved).await.is_err());
+        assert!(read_cached_session(repo.cache(), id).is_none());
+        let reloaded = repo.load_merged_checked(id).await.unwrap().unwrap();
+        assert_eq!(reloaded.updated_at, approved.updated_at);
+        assert!(!reloaded
+            .metadata
+            .contains_key(crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn blocked_replay_precommit_save_error_reloads_retryable_approval() {
+        let id = "blocked-replay-precommit-save";
+        let mut approved = Session::new(id, "model");
+        approved.metadata.insert(
+            crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY.into(),
+            "call-1".into(),
+        );
+        let storage: Arc<dyn Storage> = Arc::new(FailingSaveStorage {
+            persisted: Mutex::new(Some(approved.clone())),
+        });
+        let repo = test_repo(storage);
+        cache_put(&repo, &approved);
+
+        let mut resolved = approved.clone();
+        resolved
+            .metadata
+            .remove(crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY);
+        assert!(repo.save_replay_resolution(&mut resolved).await.is_err());
+        assert!(read_cached_session(repo.cache(), id).is_none());
+        let reloaded = repo.load_merged_checked(id).await.unwrap().unwrap();
+        assert_eq!(reloaded.updated_at, approved.updated_at);
+        assert_eq!(
+            reloaded
+                .metadata
+                .get(crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY)
+                .map(String::as_str),
+            Some("call-1")
         );
     }
 
@@ -2107,4 +2657,116 @@ mod tests {
             Some("keep")
         );
     }
+
+    #[tokio::test]
+    async fn repository_final_save_publishes_host_checkpointed_parent_question() {
+        use bamboo_domain::{
+            FunctionCall, ParentQuestion, ParentQuestionCheckpointV1, PendingQuestion,
+            PendingQuestionSource, ToolCall,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = store.clone();
+        let repo = test_repo(storage);
+        let parent = Session::new("repository-question-parent", "model");
+        store.save_session(&parent).await.unwrap();
+        let mut child =
+            Session::new_child_of("repository-question-child", &parent, "model", "assignment");
+        child.add_message(bamboo_agent_core::Message::user("assignment"));
+        child.set_last_run_status("running");
+        store.save_session(&child).await.unwrap();
+        cache_put(&repo, &child);
+
+        let assistant = bamboo_agent_core::Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "question-call".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "AgenticQuestion".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+        );
+        let result = bamboo_agent_core::Message::tool_result_with_status(
+            "question-call",
+            "Clarification needed: Which option?",
+            true,
+        );
+        let pending = PendingQuestion {
+            tool_call_id: "question-call".into(),
+            tool_name: "AgenticQuestion".into(),
+            question: "Which option?".into(),
+            options: vec!["A".into(), "B".into()],
+            allow_custom: true,
+            source: PendingQuestionSource::AgenticClarification,
+        };
+        let observation = ParentQuestionCheckpointV1 {
+            version: 1,
+            prefix_message_count: child.messages.len(),
+            prefix_digest: ParentQuestion::prefix_digest(&child.messages).unwrap(),
+            suffix: vec![assistant, result.clone()],
+            tool_call_id: pending.tool_call_id.clone(),
+            tool_result_message_id: result.id.clone(),
+            question_digest: ParentQuestion::question_digest(&pending, &result.id),
+            pending,
+        };
+        let (_, question) = store
+            .checkpoint_parent_question(&child, &parent, &observation)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut old_run = child.clone();
+        old_run.metadata.insert(
+            "runtime.actor_parent_question_handoff".into(),
+            "true".into(),
+        );
+        old_run.set_last_run_status("suspended");
+        old_run.add_message(bamboo_agent_core::Message::assistant(
+            "old terminal text",
+            None,
+        ));
+        cache_put(&repo, &old_run);
+        bamboo_domain::RuntimeSessionPersistence::save_runtime_session(&repo, &mut old_run)
+            .await
+            .unwrap();
+
+        let cached = repo.load(&child.id).await.unwrap();
+        let reopened = bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+            .await
+            .unwrap()
+            .load_session(&child.id)
+            .await
+            .unwrap()
+            .unwrap();
+        for saved in [&cached, &reopened] {
+            assert_eq!(saved.last_run_status().as_deref(), Some("suspended"));
+            assert_eq!(saved.messages.len(), child.messages.len() + 2);
+            assert!(!saved
+                .messages
+                .iter()
+                .any(|message| message.content == "old terminal text"));
+            assert_eq!(
+                saved.pending_question.as_ref().unwrap().source,
+                PendingQuestionSource::DirectParent
+            );
+            assert_eq!(
+                ParentQuestion::for_pending(&parent, saved).unwrap().id,
+                question.id
+            );
+        }
+    }
+}
+
+fn root_actor_binding_error(reason: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        bamboo_domain::SessionAuthorityConflict(format!("Root Actor execution rejected: {reason}")),
+    )
 }

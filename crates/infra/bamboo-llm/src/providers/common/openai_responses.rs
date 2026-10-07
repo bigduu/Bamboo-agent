@@ -419,6 +419,9 @@ pub fn tools_to_responses_json(tools: &[ToolSchema]) -> Vec<Value> {
                 "name": t.function.name,
                 "description": t.function.description,
                 "parameters": sanitize_openai_function_parameters_schema(&t.function.parameters),
+                // Our schemas use omission for optional routing fields. Responses
+                // may normalize an unspecified strict mode into required fields.
+                "strict": false,
             })
         })
         .collect()
@@ -456,18 +459,14 @@ fn responses_tool_search_json(execution: ResponsesToolSearchExecution) -> Value 
         ResponsesToolSearchExecution::Client => json!({
             "type": "tool_search",
             "execution": "client",
-            "description": "Search the current Bamboo tool, Skill, and Workflow catalog by capability.",
+            "description": "Search the current eligible Deferred tools by name, description, and parameter metadata.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
                         "maxLength": bamboo_domain::MAX_DISCOVERY_QUERY_CHARS,
-                        "description": "Short capability query, such as git status, browser testing, or release workflow."
-                    },
-                    "kinds": {
-                        "type": "array",
-                        "items": {"type": "string", "enum": ["tool", "skill", "workflow"]}
+                        "description": "Short tool capability query, such as git status or browser testing."
                     },
                     "limit": {
                         "type": "integer",
@@ -2955,6 +2954,22 @@ mod tests {
     }
 
     #[test]
+    fn build_responses_body_sends_explicit_none_reasoning_effort() {
+        let body = build_responses_body(
+            "gpt-5.6-sol",
+            &[],
+            &[],
+            Some(32_000),
+            Some(ReasoningEffort::Disabled),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(body["reasoning"]["effort"], "none");
+    }
+
+    #[test]
     fn build_responses_body_keeps_legacy_models_on_xhigh() {
         let body = build_responses_body(
             "gpt-4o",
@@ -3192,6 +3207,40 @@ mod tests {
         assert_eq!(out[0]["description"], "Search things");
         assert!(out[0].get("function").is_none());
         assert!(out[0].get("parameters").is_some());
+        assert_eq!(out[0]["strict"], false);
+    }
+
+    #[test]
+    fn ordinary_responses_tools_preserve_optional_delegation_fields() {
+        let tools = vec![ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "SubAgent".to_string(),
+                description: "Delegate a task; omit unused routing fields".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "intent": {"type": "string", "enum": ["chat", "inspect", "control", "ask_parent"]},
+                        "target": {"type": "string"},
+                        "role": {"type": "string"},
+                        "message": {"type": "string"},
+                        "reply_to": {"type": "string"}
+                    }
+                }),
+            },
+        }];
+        let out = tools_to_responses_json(&tools);
+        assert_eq!(out[0]["strict"], false);
+        assert!(out[0]["parameters"].get("required").is_none());
+        assert_eq!(
+            out[0]["parameters"]["properties"]
+                .as_object()
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(out[0]["parameters"]["additionalProperties"], false);
     }
 
     fn loading_schema(name: &str) -> ToolSchema {
@@ -3206,6 +3255,22 @@ mod tests {
                 }),
             },
         }
+    }
+
+    #[test]
+    fn codex_client_search_schema_is_tools_only_with_bounded_query_and_limit() {
+        let search = responses_tool_search_json(ResponsesToolSearchExecution::Client);
+        assert_eq!(search["execution"], "client");
+        assert!(search["parameters"]["properties"].get("kinds").is_none());
+        assert_eq!(
+            search["parameters"]["properties"]["query"]["maxLength"],
+            bamboo_domain::MAX_DISCOVERY_QUERY_CHARS
+        );
+        assert_eq!(
+            search["parameters"]["properties"]["limit"]["maximum"],
+            bamboo_domain::MAX_DISCOVERY_RESULTS
+        );
+        assert_eq!(search["parameters"]["additionalProperties"], false);
     }
 
     #[test]

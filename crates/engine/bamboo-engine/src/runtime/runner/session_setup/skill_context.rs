@@ -1,10 +1,5 @@
 use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::Session;
-use bamboo_skills::runtime_metadata::{
-    LAST_LOADED_SKILL_ID_METADATA_KEY, LAST_LOADED_SKILL_SUMMARY_METADATA_KEY,
-    LOADED_SKILL_IDS_METADATA_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
-    SKILL_RUNTIME_SELECTION_SOURCE_KEY,
-};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -598,79 +593,16 @@ pub(super) fn selection_matches_loaded_activation(
     session: &Session,
     selection: &SkillContextLoadResult,
 ) -> bool {
-    if selection.selection_source.as_deref() != Some("explicit")
-        || selection.selected_skill_ids.len() != 1
-    {
-        return false;
-    }
-    let skill_id = selection.selected_skill_ids[0].as_str();
-    let loaded_matches = session
-        .metadata
-        .get(LOADED_SKILL_IDS_METADATA_KEY)
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-        .is_some_and(|loaded| loaded == selection.selected_skill_ids);
-    let active_matches = session
-        .metadata
-        .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
-        .and_then(|raw| serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw).ok())
-        .is_some_and(|active| {
-            active.id == skill_id
-                && active.status == bamboo_skills::WorkflowActivationStatus::Active
-        });
-    loaded_matches
-        && active_matches
-        && session
-            .metadata
-            .contains_key(bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY)
+    super::legacy_instruction::selection_matches_loaded_activation(session, selection)
 }
 
-/// Clear a prior activation only when a newly resolved selection supersedes it.
-/// The new candidate pin is kept so the model-issued `load_skill` call can load
-/// the exact catalog revision selected during this setup pass.
 pub(super) fn reset_activation_state_for_new_selection(
     session: &mut Session,
     selection: &SkillContextLoadResult,
 ) {
-    if selection.selection_source.is_none()
-        || selection_matches_loaded_activation(session, selection)
-    {
-        return;
-    }
-    for key in [
-        LOADED_SKILL_IDS_METADATA_KEY,
-        LAST_LOADED_SKILL_ID_METADATA_KEY,
-        LAST_LOADED_SKILL_SUMMARY_METADATA_KEY,
-        bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY,
-        bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY,
-        bamboo_skills::WORKFLOW_ACTIVATION_EVENT_METADATA_KEY,
-        bamboo_skills::WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY,
-        bamboo_skills::WORKFLOW_CONTEXT_CACHE_METADATA_KEY,
-    ] {
-        session.metadata.remove(key);
-    }
+    super::legacy_instruction::reset_activation_state_for_new_selection(session, selection)
 }
 
 pub(crate) fn explicit_activation_pending(session: &Session) -> bool {
-    let selected_skill_ids = session
-        .metadata
-        .get(SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY)
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-        .unwrap_or_default();
-    if session
-        .metadata
-        .get(SKILL_RUNTIME_SELECTION_SOURCE_KEY)
-        .is_none_or(|source| source != "explicit")
-        || selected_skill_ids.len() != 1
-        || session
-            .metadata
-            .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY)
-    {
-        return false;
-    }
-    let selection = SkillContextLoadResult {
-        selected_skill_ids,
-        selection_source: Some("explicit".to_string()),
-        ..Default::default()
-    };
-    !selection_matches_loaded_activation(session, &selection)
+    super::legacy_instruction::explicit_activation_pending(session)
 }

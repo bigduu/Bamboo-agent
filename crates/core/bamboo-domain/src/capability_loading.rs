@@ -44,13 +44,20 @@ pub enum CapabilityLoadingMode {
 /// Core guarantees exact current-Session recall after older activation traces
 /// leave the active context without making the broad Root `session_history`
 /// viewer Core.
-pub const CORE_TOOL_NAMES: [&str; 6] = [
+pub const CORE_TOOL_NAMES: [&str; 12] = [
     "Bash",
     "Read",
     "Grep",
     "Edit",
     "Write",
     "session_history_current",
+    // Host registers these only when the opt-in Supervisor scope exists.
+    "work_overview",
+    "work_search",
+    "work_inspect",
+    "work_changes",
+    "work_update",
+    "work_dispatch",
 ];
 
 /// Host protocol helpers that must not enter model catalogs or discovery.
@@ -80,7 +87,7 @@ pub fn discovery_control_fallback_schema() -> ToolSchema {
         schema_type: "function".to_string(),
         function: FunctionSchema {
             name: DISCOVERY_CONTROL_FALLBACK_TOOL_NAME.to_string(),
-            description: "Search Bamboo tools, Skills, and Workflows and load complete callable definitions into conversation history.".to_string(),
+            description: "Search eligible Deferred tools by name, description, and parameter metadata; load complete callable definitions into conversation history. Explicit kinds may request the legacy Skill/Workflow catalog.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -92,7 +99,7 @@ pub fn discovery_control_fallback_schema() -> ToolSchema {
                     },
                     "kinds": {
                         "type": "array",
-                        "description": "Optional capability kinds to search.",
+                        "description": "Defaults to Tools. Include skill or workflow explicitly for compatibility catalog lookup.",
                         "items": {
                             "type": "string",
                             "enum": ["tool", "skill", "workflow"]
@@ -454,7 +461,13 @@ mod tests {
                 "Grep",
                 "Edit",
                 "Write",
-                "session_history_current"
+                "session_history_current",
+                "work_overview",
+                "work_search",
+                "work_inspect",
+                "work_changes",
+                "work_update",
+                "work_dispatch",
             ]
         );
         for name in CORE_TOOL_NAMES {
@@ -527,7 +540,7 @@ mod tests {
             );
         }
         for name in SERVER_CAPABILITY_NAMES {
-            let expected = if name == "session_history_current" {
+            let expected = if CORE_TOOL_NAMES.contains(&name) {
                 CapabilityLoadingClass::Core
             } else {
                 CapabilityLoadingClass::Deferred

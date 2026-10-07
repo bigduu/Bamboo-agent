@@ -139,13 +139,7 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
     if let Some(event_tx) = event_tx {
         for message in &turn_refresh.committed_messages {
             let _ = event_tx
-                .send(AgentEvent::MessageAppended {
-                    session_id: session.id.clone(),
-                    message_id: message.id.clone(),
-                    role: message.role.clone(),
-                    content: message.content.clone(),
-                    created_at: message.created_at,
-                })
+                .send(AgentEvent::message_appended(&session.id, message))
                 .await;
         }
     }
@@ -156,6 +150,18 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
             .get_or_insert_with(AgentRuntimeState::default)
             .set_permission_mode(disk_mode);
     }
+
+    // Publish only already-durable messages above, then stop before any prompt
+    // preparation or provider/tool execution uses an input with unresolved ACK.
+    if let Some(error) = turn_refresh.admission_error {
+        return Err(AgentError::Tool(error));
+    }
+
+    // A host may tighten Root authority during the prior round's final tool.
+    // Refresh its bounded durable proof before prompt/catalog construction so
+    // the next provider request cannot advertise an already-revoked tool.
+    super::state_bridge::refresh_round_root_tool_authority(session, config.storage.as_ref())
+        .await?;
 
     ensure_not_cancelled(
         cancel_token,

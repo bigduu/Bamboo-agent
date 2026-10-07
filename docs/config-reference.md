@@ -660,7 +660,7 @@ section through Bamboo's settings API instead of hand-editing it while the
 server is running.
 
 With no matching user or provider value, Bamboo falls back to a global default
-of 1M total context / 128K output. There is deliberately **no built-in
+of 1M total context / 32K per-request output allowance. There is deliberately **no built-in
 per-model table**, so stale hard-coded model names cannot override live
 provider metadata.
 

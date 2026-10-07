@@ -1,0 +1,27 @@
+name: PR Cache Cleanup
+
+on:
+  pull_request:
+    branches: [ dev, main ]
+    types: [ closed ]
+
+jobs:
+  cleanup:
+    name: Cleanup PR Cache
+    # pull_request tokens from forks cannot delete repository caches. This
+    # workflow never checks out or executes code from the closed PR.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete only this PR's merge-ref caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+          gh cache delete --all --ref "refs/pull/${PR_NUMBER}/merge" --succeed-on-no-caches

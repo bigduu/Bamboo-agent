@@ -1,5 +1,6 @@
 use crate::counter::{TiktokenTokenCounter, TokenCounter};
 use crate::limits::{create_budget_for_model, ModelLimitsRegistry};
+use crate::skill_history::{is_skill_tool_name, SkillNameMatch};
 use crate::{BudgetStrategy, TokenBudget};
 use bamboo_domain::MessagePhase;
 use bamboo_domain::{
@@ -10,12 +11,9 @@ use bamboo_domain::{
 /// Checks if a message is part of a skill tool chain (load_skill / read_skill_resource).
 fn is_skill_tool_chain_message(message: &Message) -> bool {
     message.tool_calls.as_ref().is_some_and(|calls| {
-        calls.iter().any(|call| {
-            matches!(
-                call.function.name.as_str(),
-                "load_skill" | "read_skill_resource"
-            )
-        })
+        calls
+            .iter()
+            .any(|call| is_skill_tool_name(&call.function.name, SkillNameMatch::Exact))
     })
 }
 
@@ -1728,6 +1726,88 @@ mod tests {
             !compressed_ids.contains(protected_msg.id.as_str()),
             "never_compress message should NOT be in the compressed set"
         );
+    }
+
+    #[test]
+    fn legacy_skill_tooling_matches_exact_names_without_narrowing_roles() {
+        for role in [
+            bamboo_domain::Role::Assistant,
+            bamboo_domain::Role::User,
+            bamboo_domain::Role::Tool,
+            bamboo_domain::Role::System,
+        ] {
+            for (name, expected) in [
+                ("load_skill", true),
+                ("read_skill_resource", true),
+                ("LOAD_SKILL", false),
+                ("namespace::load_skill", false),
+                ("mcp__server__load_skill", false),
+            ] {
+                let mut message = Message::assistant("", None);
+                message.role = role.clone();
+                message.tool_calls = Some(vec![ToolCall {
+                    id: "candidate-call".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: name.into(),
+                        arguments: "{}".into(),
+                    },
+                }]);
+                assert_eq!(
+                    is_skill_tool_chain_message(&message),
+                    expected,
+                    "{role:?}/{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_skill_mixed_calls_keep_all_results_through_plan_and_apply() {
+        for name in ["load_skill", "read_skill_resource"] {
+            let mut session = Session::new("mixed-skill-history", "gpt-4o-mini");
+            let calls = [("skill-call", name), ("other-call", "Read")]
+                .into_iter()
+                .map(|(id, name)| ToolCall {
+                    id: id.into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: name.into(),
+                        arguments: "{}".into(),
+                    },
+                })
+                .collect();
+            session.add_message(Message::assistant("", Some(calls)));
+            session.add_message(Message::tool_result("skill-call", "skill payload"));
+            session.add_message(Message::tool_result("other-call", "unrelated payload"));
+            let protected_ids: Vec<_> = session.messages.iter().map(|m| m.id.clone()).collect();
+            let original_chain = serde_json::to_vec(&session.messages).unwrap();
+            for index in 0..4 {
+                session.add_message(Message::user(format!("question {index}")));
+                session.add_message(Message::assistant(format!("answer {index}"), None));
+            }
+            let protection = protected_compression_message_ids(&session.messages);
+            assert!(protected_ids.iter().all(|id| protection.contains(id)));
+            let plan = build_forced_compression_plan_with_summary(
+                &session,
+                "gpt-4o-mini",
+                Some(&make_budget()),
+                "summary".into(),
+                CompressionTriggerType::Auto,
+            )
+            .unwrap();
+            assert!(!plan.compressed_message_ids.is_empty());
+            assert!(protected_ids
+                .iter()
+                .all(|id| !plan.compressed_message_ids.contains(id)));
+            assert!(apply_compression_plan(&mut session, plan) > 0);
+            let retained: Vec<_> = session
+                .messages
+                .iter()
+                .filter(|message| protected_ids.contains(&message.id))
+                .collect();
+            assert_eq!(serde_json::to_vec(&retained).unwrap(), original_chain);
+        }
     }
 
     #[test]

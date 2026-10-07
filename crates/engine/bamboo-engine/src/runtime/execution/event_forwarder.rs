@@ -14,11 +14,24 @@ use bamboo_agent_core::AgentEvent;
 
 use super::runner_state::AgentRunner;
 
+fn visible_terminal_reason(event: &AgentEvent) -> Option<&'static str> {
+    match event {
+        AgentEvent::Complete { .. } => Some("complete"),
+        AgentEvent::Cancelled { .. } => Some("cancelled"),
+        AgentEvent::Error { .. } => Some("error"),
+        _ => None,
+    }
+}
+
 /// Inbox to the account-wide change feed: `(session_id, event)` before the
 /// writer assigns a seq. Threaded as `Option` so engine-internal callers that
 /// have no feed (tests, standalone embeddings) can pass `None`. Defined here so
 /// the engine stays free of any `bamboo-server` dependency.
 pub type AccountFeedInbox = mpsc::Sender<(Option<String>, AgentEvent)>;
+
+#[cfg(test)]
+#[path = "root_actor_event_forwarder_tests.rs"]
+mod root_actor_tests;
 
 /// Completion signal for the durable history barrier emitted at the end of a
 /// run. The runner must not become replaceable until the forwarder has actually
@@ -104,6 +117,118 @@ fn mirror_to_account_feed(inbox: &Option<AccountFeedInbox>, session_id: &str, ev
 mod tests {
     use super::*;
 
+    use bamboo_agent_core::ToolResult;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn generic_forwarder_projects_native_download_without_changing_ordinary_results() {
+        let session_id = "generic-download-display";
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(16);
+        let mut runner = AgentRunner::new();
+        runner.status = super::super::runner_state::AgentStatus::Running;
+        runner.event_sender = broadcast_tx.clone();
+        let run_id = runner.run_id.clone();
+        let runners = Arc::new(RwLock::new(HashMap::from([(
+            session_id.to_string(),
+            runner,
+        )])));
+        let (input, forwarder) =
+            create_event_forwarder(session_id.to_string(), run_id, broadcast_tx, runners, None);
+        assert!(matches!(
+            broadcast_rx.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { .. }
+        ));
+
+        let private = "private-file-url-and-bytes";
+        input
+            .send(AgentEvent::ToolStart {
+                tool_call_id: "download".into(),
+                tool_name: "browser".into(),
+                arguments: json!({"action":"download","selector":private,"expected_epoch":9}),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::ToolError {
+                tool_call_id: "download".into(),
+                error: private.into(),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::ToolComplete {
+                tool_call_id: "download".into(),
+                result: ToolResult::text(false, private),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::ToolStart {
+                tool_call_id: "read".into(),
+                tool_name: "Read".into(),
+                arguments: json!({"path":"readme.md"}),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::ToolComplete {
+                tool_call_id: "read".into(),
+                result: ToolResult::text(true, "ordinary Read result"),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::HookLifecycle {
+                hook_name: private.into(),
+                point: bamboo_domain::AgentHookPoint::AfterToolExecution,
+                phase: private.into(),
+                duration_ms: 7,
+                decision: bamboo_domain::HookResult::WithContext {
+                    result: Box::new(bamboo_domain::HookResult::Deny {
+                        reason: private.into(),
+                    }),
+                    text: private.into(),
+                },
+            })
+            .await
+            .unwrap();
+        drop(input);
+
+        let mut visible = Vec::new();
+        for _ in 0..6 {
+            visible.push(
+                tokio::time::timeout(std::time::Duration::from_secs(5), broadcast_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        for event in &visible[..3] {
+            assert!(!serde_json::to_string(event).unwrap().contains(private));
+        }
+        assert!(
+            matches!(&visible[2], AgentEvent::ToolComplete { result, .. }
+            if result.result == "Tool result hidden" && result.images.is_empty())
+        );
+        assert!(
+            matches!(&visible[4], AgentEvent::ToolComplete { result, .. }
+            if result.result == "ordinary Read result")
+        );
+        assert!(!serde_json::to_string(&visible[5])
+            .unwrap()
+            .contains(private));
+        assert!(matches!(
+            &visible[5],
+            AgentEvent::HookLifecycle {
+                point: bamboo_domain::AgentHookPoint::AfterToolExecution,
+                duration_ms: 7,
+                decision: bamboo_domain::HookResult::WithContext { .. },
+                ..
+            }
+        ));
+        forwarder.await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn hundreds_of_child_streams_progress_while_global_registry_is_locked() {
         let runners = Arc::new(RwLock::new(HashMap::new()));
@@ -182,6 +307,63 @@ mod tests {
         let (session_id, mirrored) = rx.recv().await.unwrap();
         assert_eq!(session_id.as_deref(), Some("parent-1"));
         assert!(matches!(mirrored, AgentEvent::ChildApprovalChanged { .. }));
+    }
+
+    #[tokio::test]
+    async fn child_browser_approval_is_redacted_before_broadcast_replay_and_account_feed() {
+        let session_id = "child-browser-private";
+        let private = "private-download-selector";
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(8);
+        let mut runner = AgentRunner::new();
+        runner.status = super::super::runner_state::AgentStatus::Running;
+        runner.event_sender = broadcast_tx.clone();
+        let run_id = runner.run_id.clone();
+        let runners = Arc::new(RwLock::new(HashMap::from([(
+            session_id.to_string(),
+            runner,
+        )])));
+        let (account_tx, mut account_rx) = mpsc::channel(8);
+        let (event_tx, forwarder) = create_event_forwarder(
+            session_id.into(),
+            run_id,
+            broadcast_tx,
+            runners.clone(),
+            Some(account_tx),
+        );
+        assert!(matches!(
+            broadcast_rx.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { .. }
+        ));
+        event_tx
+            .send(AgentEvent::ChildApprovalChanged {
+                parent_session_id: "parent-private".into(),
+                child_session_id: session_id.into(),
+                child_attempt: 4,
+                request_id: "request-private".into(),
+                version: 7,
+                status: "denied".into(),
+                reason: Some(private.into()),
+                tool_name: "browser".into(),
+                permission: private.into(),
+                resource: format!("browser:17:download:css:{private}"),
+                created_at: "2026-09-24T00:00:00Z".into(),
+                resolved_at: Some("2026-09-24T00:00:01Z".into()),
+            })
+            .await
+            .unwrap();
+        let live = broadcast_rx.recv().await.unwrap();
+        assert!(!serde_json::to_string(&live).unwrap().contains(private));
+        let _started = account_rx.recv().await.unwrap();
+        let (route, feed) = account_rx.recv().await.unwrap();
+        assert_eq!(route.as_deref(), Some("parent-private"));
+        assert!(!serde_json::to_string(&feed).unwrap().contains(private));
+        assert!(
+            !serde_json::to_string(&runners.read().await[session_id].last_critical_events)
+                .unwrap()
+                .contains(private)
+        );
+        drop(event_tx);
+        forwarder.await.unwrap();
     }
 
     #[tokio::test]
@@ -276,6 +458,49 @@ mod tests {
             "old Started/Need/Complete must all be suppressed"
         );
     }
+
+    #[tokio::test]
+    async fn wrapped_child_lifecycle_reaches_bounded_legacy_replay_consumer() {
+        let session_id = "root";
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(8);
+        let mut runner = AgentRunner::new();
+        runner.status = super::super::runner_state::AgentStatus::Running;
+        runner.event_sender = broadcast_tx.clone();
+        let run_id = runner.run_id.clone();
+        let runners = Arc::new(RwLock::new(HashMap::from([(session_id.into(), runner)])));
+        let (input, forwarder) = create_event_forwarder(
+            session_id.into(),
+            run_id,
+            broadcast_tx,
+            runners.clone(),
+            None,
+        );
+        assert!(matches!(
+            broadcast_rx.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { .. }
+        ));
+        let legacy = AgentEvent::SubAgentEvent {
+            parent_session_id: "root".into(),
+            child_session_id: "parent".into(),
+            event: Box::new(AgentEvent::SubAgentStarted {
+                parent_session_id: "parent".into(),
+                child_session_id: "grandchild".into(),
+                title: Some("work".into()),
+            }),
+        };
+        input.send(legacy).await.unwrap();
+        assert!(matches!(
+            broadcast_rx.recv().await.unwrap(),
+            AgentEvent::SubAgentEvent { .. }
+        ));
+        let guard = runners.read().await;
+        let cached = &guard[session_id].last_critical_events;
+        assert_eq!(cached.len(), 1);
+        assert!(matches!(&cached[0], AgentEvent::SubAgentEvent { .. }));
+        drop(guard);
+        drop(input);
+        forwarder.await.unwrap();
+    }
 }
 
 /// Create an MPSC channel for agent events and spawn a forwarding task
@@ -318,33 +543,124 @@ pub fn create_event_forwarder_with_history_commit_barrier(
     tokio::task::JoinHandle<()>,
     HistoryCommitBarrier,
 ) {
+    create_event_forwarder_with_root_actor(
+        session_id,
+        run_id,
+        broadcast_tx,
+        runners,
+        account_feed_inbox,
+        None,
+    )
+}
+
+async fn publish_forwarded_event(
+    root_actor: Option<&crate::events::RootActorEventPublication>,
+    session_id: &str,
+    event: &AgentEvent,
+    publish: Box<dyn FnOnce() -> bool + Send>,
+) -> std::io::Result<()> {
+    if let Some(owner) = root_actor {
+        owner
+            .publish(event.session_id().unwrap_or(session_id), event, publish)
+            .await
+    } else if publish() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("event publication was retired"))
+    }
+}
+
+/// The Root adapter passes its immutable capability before any Started frame.
+/// Legacy Child/Supervisor/standalone callers keep the existing queue behavior.
+pub fn create_event_forwarder_with_root_actor(
+    session_id: String,
+    run_id: String,
+    broadcast_tx: broadcast::Sender<AgentEvent>,
+    runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+    account_feed_inbox: Option<AccountFeedInbox>,
+    root_actor: Option<crate::events::RootActorEventPublication>,
+) -> (
+    mpsc::Sender<AgentEvent>,
+    tokio::task::JoinHandle<()>,
+    HistoryCommitBarrier,
+) {
     let (mpsc_tx, mut mpsc_rx) = mpsc::channel::<AgentEvent>(100);
     let (history_commit_acknowledger, history_commit_barrier) = history_commit_barrier();
-
-    let forwarder = tokio::spawn(async move {
-        // The exact reservation generation is captured synchronously by the
-        // caller. Never re-read the replaceable runner registry here: this
-        // task may be scheduled only after a clarification handoff installs a
-        // successor, which would mis-tag the old terminal as the new run.
+    let forward = async move {
+        if root_actor
+            .as_ref()
+            .is_some_and(|owner| !owner.matches_execution(&session_id, &run_id))
+        {
+            tracing::warn!(%session_id, %run_id, "Root forwarder handoff does not match its execution");
+            return;
+        }
+        // A bound Root never enters the legacy account queue.
+        let legacy_feed = if root_actor.is_some() {
+            None
+        } else {
+            account_feed_inbox
+        };
         let started_event = AgentEvent::ExecutionStarted {
             run_id: run_id.clone(),
             session_id: session_id.clone(),
             started_at: Utc::now().to_rfc3339(),
         };
-        let publication = {
-            let runners = runners.read().await;
-            let Some(runner) = runners
+        let (publication, visible_messages) = {
+            let guard = runners.clone().read_owned().await;
+            let Some(runner) = guard
                 .get(&session_id)
                 .filter(|runner| runner.run_id == run_id)
             else {
                 return;
             };
-            mirror_to_account_feed(&account_feed_inbox, &session_id, &started_event);
-            let _ = broadcast_tx.send(started_event);
-            runner.event_publication.clone()
+            let publication = runner.event_publication.clone();
+            let visible_messages = runner.visible_messages.clone();
+            let feed = legacy_feed.clone();
+            let sid = session_id.clone();
+            let tx = broadcast_tx.clone();
+            let frame = started_event.clone();
+            if let Err(error) = publish_forwarded_event(
+                root_actor.as_ref(),
+                &session_id,
+                &frame,
+                Box::new(move || {
+                    let _guard = guard;
+                    mirror_to_account_feed(&feed, &sid, &started_event);
+                    let _ = tx.send(started_event);
+                    true
+                }),
+            )
+            .await
+            {
+                tracing::warn!(%session_id, %run_id, %error, "Root Started publication rejected");
+                return;
+            }
+            (publication, visible_messages)
         };
-
+        let mut tool_event_display = bamboo_agent_core::NativeToolEventDisplay::default();
         while let Some(event) = mpsc_rx.recv().await {
+            match &event {
+                AgentEvent::VisibleMessageStart {
+                    message_id,
+                    created_at,
+                } => {
+                    if !publication.publish(|| {
+                        visible_messages.start(message_id.clone(), created_at.to_owned())
+                    }) {
+                        return;
+                    }
+                    continue;
+                }
+                AgentEvent::VisibleMessageDiscard { message_id } => {
+                    if !publication.publish(|| visible_messages.discard(message_id)) {
+                        return;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            let event = tool_event_display.project(event);
+            let event = crate::external_agents::live::approval_event_for_display(event);
             let needs_runner_update = event.is_replayable_session_state()
                 || matches!(
                     &event,
@@ -353,70 +669,99 @@ pub fn create_event_forwarder_with_history_commit_barrier(
                         | AgentEvent::ToolLifecycle { .. }
                         | AgentEvent::RunnerProgress { .. }
                 );
-            if !needs_runner_update {
-                let is_history_commit =
-                    matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
-                if !publication.publish(|| {
-                    mirror_to_account_feed(&account_feed_inbox, &session_id, &event);
-                    let _ = broadcast_tx.send(event);
-                }) {
+            let is_history_commit = matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
+            let frame = event.clone();
+            let feed = legacy_feed.clone();
+            let sid = session_id.clone();
+            let tx = broadcast_tx.clone();
+            let result = if !needs_runner_update {
+                let visible_token = match &event {
+                    AgentEvent::Token { content } => Some(content.clone()),
+                    _ => None,
+                };
+                let terminal_reason = visible_terminal_reason(&event);
+                // Ephemeral token traffic retains its independent hot path.
+                let owner = root_actor
+                    .as_ref()
+                    .filter(|_| event.is_durable_change() || terminal_reason.is_some());
+                let publication = publication.clone();
+                let visible = visible_messages.clone();
+                publish_forwarded_event(
+                    owner,
+                    &session_id,
+                    &frame,
+                    Box::new(move || {
+                        publication.publish(|| {
+                            if let Some(content) = visible_token {
+                                visible.append(content);
+                            }
+                            mirror_to_account_feed(&feed, &sid, &event);
+                            let _ = tx.send(event);
+                            if let Some(reason) = terminal_reason {
+                                visible.mark_terminal(reason);
+                            }
+                            if is_history_commit {
+                                visible.history_committed();
+                            }
+                        })
+                    }),
+                )
+                .await
+            } else {
+                let mut guard = runners.clone().write_owned().await;
+                if !guard
+                    .get(&session_id)
+                    .is_some_and(|runner| runner.run_id == run_id)
+                {
                     return;
                 }
-                if is_history_commit {
-                    history_commit_acknowledger.acknowledge();
-                }
-                continue;
-            }
-            let mut runners = runners.write().await;
-            let Some(runner) = runners
-                .get_mut(&session_id)
-                .filter(|runner| runner.run_id == run_id)
-            else {
-                // A clarification handoff installed a successor before this
-                // delayed forwarder/frame ran. Drop the entire stale stream;
-                // broadcasting even its Started/Need would corrupt the shared
-                // session generation state.
-                return;
+                let publication = publication.clone();
+                publish_forwarded_event(
+                    root_actor.as_ref(),
+                    &session_id,
+                    &frame,
+                    Box::new(move || {
+                        let runner = guard.get_mut(&sid).expect("retained exact runner guard");
+                        runner.last_event_at = Some(Utc::now());
+                        publication.touch();
+                        if event.is_replayable_session_state() {
+                            runner.push_critical_event(event.clone());
+                        }
+                        match &event {
+                            AgentEvent::TokenBudgetUpdated { .. } => {
+                                runner.last_budget_event = Some(event.clone())
+                            }
+                            AgentEvent::ToolStart { tool_name, .. } => {
+                                runner.last_tool_name = Some(tool_name.clone());
+                                runner.last_tool_phase = Some("begin".into());
+                            }
+                            AgentEvent::ToolLifecycle {
+                                tool_name, phase, ..
+                            } => {
+                                runner.last_tool_name = Some(tool_name.clone());
+                                runner.last_tool_phase = Some(phase.clone());
+                            }
+                            AgentEvent::RunnerProgress { round_count, .. } => {
+                                runner.round_count = *round_count;
+                                runner.visible_messages.begin_round(*round_count);
+                            }
+                            _ => {}
+                        }
+                        mirror_to_account_feed(&feed, &sid, &event);
+                        let _ = tx.send(event);
+                        true
+                    }),
+                )
+                .await
             };
-            runner.last_event_at = Some(Utc::now());
-            publication.touch();
-
-            // Cache live state before publication so a subscriber installed
-            // between a clarification pause and its response sees the exact
-            // boundary. This generic forwarder powers Connect, schedules,
-            // SDK spawn, and child-resume paths, so it must preserve the same
-            // replay invariant as the server-owned forwarder.
-            if event.is_replayable_session_state() {
-                runner.push_critical_event(event.clone());
+            if let Err(error) = result {
+                tracing::warn!(%session_id, %run_id, %error, "Root runtime publication rejected");
+                return;
             }
-
-            match &event {
-                AgentEvent::TokenBudgetUpdated { .. } => {
-                    runner.last_budget_event = Some(event.clone());
-                }
-                AgentEvent::ToolStart { tool_name, .. } => {
-                    runner.last_tool_name = Some(tool_name.clone());
-                    runner.last_tool_phase = Some("begin".to_string());
-                }
-                AgentEvent::ToolLifecycle {
-                    tool_name, phase, ..
-                } => {
-                    runner.last_tool_name = Some(tool_name.clone());
-                    runner.last_tool_phase = Some(phase.clone());
-                }
-                AgentEvent::RunnerProgress { round_count, .. } => {
-                    runner.round_count = *round_count;
-                }
-                _ => {}
-            }
-            let is_history_commit = matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
-            mirror_to_account_feed(&account_feed_inbox, &session_id, &event);
-            let _ = broadcast_tx.send(event);
             if is_history_commit {
                 history_commit_acknowledger.acknowledge();
             }
         }
-    });
-
-    (mpsc_tx, forwarder, history_commit_barrier)
+    };
+    (mpsc_tx, tokio::spawn(forward), history_commit_barrier)
 }

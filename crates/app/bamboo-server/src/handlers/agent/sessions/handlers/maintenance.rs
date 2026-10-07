@@ -30,6 +30,7 @@ pub async fn clear_session(
             "session_id": session_id
         })));
     }
+    let _ = state.browser.close(&session_id).await;
 
     // History/chat treat the process cache as authoritative while no runner is
     // active. Replace it with the just-cleared durable snapshot before
@@ -196,6 +197,9 @@ pub async fn cleanup_sessions(
         })?;
 
     if !result.deleted_session_ids.is_empty() {
+        for session_id in &result.deleted_session_ids {
+            let _ = state.browser.retire(session_id).await;
+        }
         // Best-effort cancel any in-flight executions.
         {
             let mut runners = state.agent_runners.write().await;

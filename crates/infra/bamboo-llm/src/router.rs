@@ -19,13 +19,7 @@ impl ProviderModelRouter {
 
     /// Resolve the provider for a given model reference.
     pub fn route(&self, target: &ProviderModelRef) -> Result<Arc<dyn LLMProvider>, LLMError> {
-        self.registry.get(&target.provider).ok_or_else(|| {
-            LLMError::Auth(format!(
-                "Provider '{}' not available. Available: {}",
-                target.provider,
-                self.registry.provider_names().join(", ")
-            ))
-        })
+        self.registry.provider_for_model(target)
     }
 
     /// Resolve the canonical provider type for a given model reference.

@@ -98,9 +98,17 @@ impl Tool for SessionControlTool {
             Err(SessionMessengerError::Activation {
                 receipt, source, ..
             }) => (receipt, "activation_pending", Some(source.to_string())),
+            Err(SessionMessengerError::ActivationEligibility {
+                receipt, source, ..
+            }) => (
+                receipt,
+                "activation_retry_required",
+                Some(source.to_string()),
+            ),
             Err(error) => return Err(ToolError::Execution(error.to_string())),
         };
-        Ok(ToolOutcome::Completed(ToolResult::text(true, json!({
+        let activation_retry_required = activation == "activation_retry_required";
+        Ok(ToolOutcome::Completed(ToolResult::text(!activation_retry_required, json!({
             "action": "followup", "target_session_id": target_session_id,
             "operation_id": operation_id, "admitted": true,
             "receipt_id": delivery.id, "generation": delivery.generation,

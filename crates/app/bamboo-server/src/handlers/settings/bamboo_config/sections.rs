@@ -1376,7 +1376,6 @@ fn validate_mcp_public_shape(candidate: &McpConfig) -> Result<(), String> {
     for server in &candidate.servers {
         match &server.transport {
             bamboo_mcp::TransportConfig::Stdio(_) => {}
-            bamboo_mcp::TransportConfig::Sse(config) => validate_public_url(&config.url)?,
             bamboo_mcp::TransportConfig::StreamableHttp(config) => {
                 validate_public_url(&config.url)?
             }
@@ -1407,7 +1406,6 @@ fn validate_mcp_settings_public_shape(candidate: &McpConfig) -> Result<(), Strin
                     );
                 }
             }
-            TransportConfig::Sse(http) => validate_mcp_public_headers(&http.headers)?,
             TransportConfig::StreamableHttp(http) => validate_mcp_public_headers(&http.headers)?,
         }
     }
@@ -1567,10 +1565,6 @@ fn secret_free_mcp_config(config: &McpConfig) -> McpConfig {
                 stdio.env_encrypted.clear();
                 stdio.env_credential_refs.clear();
             }
-            TransportConfig::Sse(http) => {
-                http.url = safe_url_diagnostic(Some(&http.url)).unwrap_or_default();
-                make_headers_secret_free(&mut http.headers);
-            }
             TransportConfig::StreamableHttp(http) => {
                 http.url = safe_url_diagnostic(Some(&http.url)).unwrap_or_default();
                 make_headers_secret_free(&mut http.headers);
@@ -1612,9 +1606,6 @@ fn mcp_credential_status(
                         .and_then(|raw_reference| by_ref.get(raw_reference.as_str()).copied());
                     env.insert(name, mcp_credential_status_value(status));
                 }
-            }
-            TransportConfig::Sse(http) => {
-                collect_mcp_header_status(&http.headers, &by_ref, &mut headers)
             }
             TransportConfig::StreamableHttp(http) => {
                 collect_mcp_header_status(&http.headers, &by_ref, &mut headers)
@@ -1681,9 +1672,6 @@ fn retain_mcp_server_managed_refs(current: &McpConfig, candidate: &mut McpConfig
                     .filter(|(name, _)| candidate.env.contains_key(name.as_str()))
                     .map(|(name, reference)| (name.clone(), reference.clone()))
                     .collect();
-            }
-            (TransportConfig::Sse(current), TransportConfig::Sse(candidate)) => {
-                retain_mcp_header_refs(&current.headers, &mut candidate.headers)
             }
             (
                 TransportConfig::StreamableHttp(current),
@@ -1764,7 +1752,6 @@ fn mcp_credential_refs(
                     })?);
                 }
             }
-            TransportConfig::Sse(http) => collect_mcp_header_refs(&http.headers, &mut references)?,
             TransportConfig::StreamableHttp(http) => {
                 collect_mcp_header_refs(&http.headers, &mut references)?
             }
@@ -1821,7 +1808,6 @@ fn current_mcp_header_ref(
         return Ok(None);
     };
     let headers = match &server.transport {
-        TransportConfig::Sse(http) => &http.headers,
         TransportConfig::StreamableHttp(http) => &http.headers,
         TransportConfig::Stdio(_) => return Ok(None),
     };
@@ -1902,7 +1888,6 @@ fn apply_mcp_header_change(
     match (server, value) {
         (Some(server), Some(value)) if !value.is_empty() => {
             let headers = match &mut server.transport {
-                TransportConfig::Sse(http) => &mut http.headers,
                 TransportConfig::StreamableHttp(http) => &mut http.headers,
                 TransportConfig::Stdio(_) => {
                     return Err(ConfigSectionMutationError::Invalid(
@@ -1929,7 +1914,6 @@ fn apply_mcp_header_change(
         }
         (Some(server), None) => {
             let headers = match &mut server.transport {
-                TransportConfig::Sse(http) => Some(&mut http.headers),
                 TransportConfig::StreamableHttp(http) => Some(&mut http.headers),
                 TransportConfig::Stdio(_) => None,
             };

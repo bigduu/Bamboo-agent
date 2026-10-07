@@ -315,6 +315,117 @@ fn independent_v4_migration_rebuilds_search_projections_and_is_idempotent() {
 }
 
 #[test]
+fn stale_legacy_version_on_complete_v5_index_preserves_search_data() {
+    for stale_version in ["3", "4"] {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("search.db");
+        drop(legacy_db(&path));
+        init_db(&path).unwrap();
+
+        let conn = open_db(&path).unwrap();
+        let tables = [
+            "sessions_search",
+            "session_messages_search",
+            "sessions_search_fts",
+            "session_messages_search_fts",
+            "session_messages_current_search_fts",
+        ];
+        let before = tables
+            .iter()
+            .map(|table| {
+                rows(
+                    &conn,
+                    &format!("SELECT rowid, * FROM {table} ORDER BY rowid"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let schema_before = rows(&conn, "SELECT name, sql FROM sqlite_schema ORDER BY name");
+        let search_before = search_snapshot(&path, "quartz");
+        conn.execute(
+            "UPDATE session_search_meta SET value=?1 WHERE key='schema_version'",
+            [stale_version],
+        )
+        .unwrap();
+        drop(conn);
+
+        init_db(&path).unwrap();
+        let conn = open_db(&path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM session_search_meta WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "5"
+        );
+        assert_eq!(
+            rows(&conn, "SELECT name, sql FROM sqlite_schema ORDER BY name"),
+            schema_before
+        );
+        for (table, expected) in tables.into_iter().zip(before) {
+            assert_eq!(
+                rows(
+                    &conn,
+                    &format!("SELECT rowid, * FROM {table} ORDER BY rowid")
+                ),
+                expected,
+                "{table} changed while repairing stale version {stale_version}"
+            );
+        }
+        assert_identity_alignment(&conn);
+        assert_eq!(search_snapshot(&path, "quartz"), search_before);
+    }
+}
+
+#[test]
+fn stale_legacy_version_does_not_complete_partial_v5_index() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("search.db");
+    drop(legacy_db(&path));
+    init_db(&path).unwrap();
+
+    let conn = open_db(&path).unwrap();
+    conn.execute_batch(
+        "UPDATE session_search_meta SET value='3' WHERE key='schema_version';
+         DROP TABLE session_messages_current_search_fts;",
+    )
+    .unwrap();
+    let schema_before = rows(&conn, "SELECT name, sql FROM sqlite_schema ORDER BY name");
+    let messages_before = rows(
+        &conn,
+        "SELECT rowid, * FROM session_messages_search ORDER BY rowid",
+    );
+    drop(conn);
+
+    assert!(init_db(&path)
+        .unwrap_err()
+        .to_string()
+        .contains("unsupported search FTS shape: session_messages_current_search_fts"));
+    let conn = open_db(&path).unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT name, sql FROM sqlite_schema ORDER BY name"),
+        schema_before
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT rowid, * FROM session_messages_search ORDER BY rowid"
+        ),
+        messages_before
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT value FROM session_search_meta WHERE key='schema_version'",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "3"
+    );
+}
+
+#[test]
 #[ignore = "manual synthetic v4-to-v5 migration evidence for #1156"]
 fn benchmark_v4_to_v5_search_projection_rebuild() {
     use std::sync::atomic::{AtomicBool, Ordering};

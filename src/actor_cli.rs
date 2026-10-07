@@ -341,6 +341,16 @@ async fn connect_and_stream(endpoint: &str, prompt: &str, raw: bool) -> Result<(
                         // This CLI does not route gated-tool approvals; ignore.
                         // (The production host in actor_adapter answers these.)
                     }
+                    Ok(Some(ChildFrame::OwnedTreeRequest { id, .. })) => {
+                        // The standalone CLI has no canonical Session authority.
+                        let _ = client.send(ParentFrame::OwnedTreeReply { id, page: None }).await;
+                    }
+                    Ok(Some(ChildFrame::SubAgentRequest { id, .. })) => {
+                        let _ = client.send(ParentFrame::SubAgentReply {
+                            id,
+                            result: serde_json::json!({"error":"canonical SubAgent Host authority unavailable"}),
+                        }).await;
+                    }
                     Ok(Some(ChildFrame::SessionMessageAdmitted { .. })) => {
                         // The standalone CLI never forwards canonical SessionInbox
                         // claims, so no confirmation is expected here.

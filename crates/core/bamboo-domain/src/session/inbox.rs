@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{Message, MessagePart, Role};
+use super::{Message, MessagePart, Role, Session};
 
 /// Serialize JSON with every object key sorted recursively.
 ///
@@ -247,6 +247,63 @@ pub struct SessionMessageEnvelope {
 }
 
 impl SessionMessageEnvelope {
+    /// Carry a validated chat prompt through the existing typed instruction
+    /// payload. Its User presentation and stable turn identity are retained;
+    /// only the owned Root consumer applies the prompt at its checkpoint.
+    pub fn with_root_chat_prompt(
+        mut self,
+        system_prompt: String,
+    ) -> Result<Self, SessionMessageValidationError> {
+        let SessionMessageBody::Content(content) = &self.body else {
+            return Err(SessionMessageValidationError::KindSourceBodyMismatch);
+        };
+        if self.source != SessionMessageSource::User || self.kind != SessionMessageKind::UserInput {
+            return Err(SessionMessageValidationError::KindSourceBodyMismatch);
+        }
+        let content = content.clone();
+        self.source = SessionMessageSource::Runtime {
+            subsystem: "chat".into(),
+        };
+        self.kind = SessionMessageKind::RuntimeInstruction;
+        self.body = SessionMessageBody::RuntimeInstruction(SessionRuntimeInstruction {
+            instruction: "root_chat_turn_v1".into(),
+            content: Some(content.clone()),
+            data: Some(serde_json::json!({ "system_prompt": system_prompt })),
+            provider_message: Some(SessionProviderMessage {
+                content,
+                metadata: Default::default(),
+                never_compress: false,
+            }),
+        });
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn root_chat_prompt(&self) -> Result<Option<&str>, SessionMessageValidationError> {
+        let SessionMessageBody::RuntimeInstruction(instruction) = &self.body else {
+            return Ok(None);
+        };
+        if instruction.instruction != "root_chat_turn_v1" {
+            return Ok(None);
+        }
+        if self.kind != SessionMessageKind::RuntimeInstruction
+            || self.source
+                != (SessionMessageSource::Runtime {
+                    subsystem: "chat".into(),
+                })
+        {
+            return Err(SessionMessageValidationError::KindSourceBodyMismatch);
+        }
+        instruction
+            .data
+            .as_ref()
+            .and_then(|data| data.get("system_prompt"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|prompt| !prompt.trim().is_empty())
+            .map(Some)
+            .ok_or(SessionMessageValidationError::EmptyRuntimeContent)
+    }
+
     /// Reserved user-guidance correlation markers include a server-selected
     /// run fence. The fence controls scheduling, not the logical retry identity.
     pub fn is_guidance(&self) -> bool {
@@ -266,6 +323,24 @@ impl SessionMessageEnvelope {
                 .as_deref()
                 .and_then(|value| value.strip_prefix("session-guidance-after-run:"))
                 == Some(run_id)
+    }
+
+    /// A child completion admitted while its parent Run still owns the turn
+    /// belongs to that Run's successor. The coordinator writes this fence in
+    /// the durable envelope before clearing the parent's wait.
+    pub fn child_outcome_waits_for_run(&self, run_id: &str) -> bool {
+        self.kind == SessionMessageKind::ChildOutcome
+            && matches!(&self.source, SessionMessageSource::Runtime { subsystem }
+                if subsystem == "child_completion_coordinator")
+            && self
+                .correlation_id
+                .as_deref()
+                .and_then(|value| value.strip_prefix("child_completion_after_run:"))
+                == Some(run_id)
+    }
+
+    pub fn waits_for_successor_of_run(&self, run_id: &str) -> bool {
+        self.guidance_waits_for_run(run_id) || self.child_outcome_waits_for_run(run_id)
     }
 
     pub fn user_input(target_session_id: impl Into<String>, text: impl Into<String>) -> Self {
@@ -369,6 +444,7 @@ impl SessionMessageEnvelope {
             }
             _ => {}
         }
+        self.root_chat_prompt()?;
         Ok(())
     }
 
@@ -397,7 +473,17 @@ impl SessionMessageEnvelope {
                 "data": instruction.data,
             }),
         };
-        let correlation_id = if self.is_guidance()
+        let correlation_id = if self.kind == SessionMessageKind::ChildOutcome
+            && matches!(&self.source, SessionMessageSource::Runtime { subsystem }
+                if subsystem == "child_completion_coordinator")
+            && self.correlation_id.as_deref().is_some_and(|value| {
+                value.starts_with("child_completion_after_run:")
+                    || value.starts_with("child_completion:")
+            }) {
+            // The first admitted envelope owns the exact run fence across
+            // duplicate completion callbacks and restarts.
+            Some("child_completion")
+        } else if self.is_guidance()
             && self
                 .correlation_id
                 .as_deref()
@@ -687,12 +773,216 @@ pub enum SessionActivationPolicy {
     InterruptSpecificWait,
 }
 
+/// Permission to activate this specific message, published with its delivery.
+/// This never releases a coordinator's staged queue prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionInboxActivationIntent {
+    version: u32,
+    policy: SessionActivationPolicy,
+}
+
+impl SessionInboxActivationIntent {
+    pub fn new(policy: SessionActivationPolicy) -> Self {
+        Self { version: 1, policy }
+    }
+
+    pub fn policy(&self) -> Result<SessionActivationPolicy, SessionInboxError> {
+        if self.version != 1 {
+            return Err(SessionInboxError::InvalidClaim(
+                "unsupported SessionInbox activation intent version".into(),
+            ));
+        }
+        Ok(self.policy)
+    }
+}
+
 /// Opaque claim returned to the single consumer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionInboxClaim {
     pub envelope: SessionMessageEnvelope,
     pub generation: u64,
+    /// This item's effective permission at the claim boundary. Aggregate
+    /// backlog generations describe wakeups, never another item's policy.
+    pub activation_policy: SessionActivationPolicy,
     pub claim_id: String,
+}
+
+/// Caller-owned identity for the opt-in storage lease protocol. Runtime
+/// consumers must supply a fresh identity for each independent consumer.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionInboxConsumerId(String);
+
+impl SessionInboxConsumerId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for SessionInboxConsumerId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for SessionInboxConsumerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionInboxConsumerId(<opaque>)")
+    }
+}
+
+/// Durable storage authority, independent of transcript/provider authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionInboxLeaseToken {
+    pub consumer: SessionInboxConsumerId,
+    pub epoch: u64,
+    pub expires_at: DateTime<Utc>,
+    pub incarnation: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionInboxOwnedClaim {
+    pub claim: SessionInboxClaim,
+    pub lease: SessionInboxLeaseToken,
+}
+
+/// The caller supplies a trusted clock; no background expiry driver is implied.
+#[derive(Debug, Clone)]
+pub struct SessionInboxLeaseRequest {
+    pub consumer: SessionInboxConsumerId,
+    pub now: DateTime<Utc>,
+    pub duration: chrono::Duration,
+}
+
+impl SessionInboxLeaseRequest {
+    pub fn expires_at(&self) -> Result<DateTime<Utc>, SessionInboxError> {
+        if self.consumer.as_str().is_empty()
+            || self.consumer.as_str().len() > 128
+            || self.duration <= chrono::Duration::zero()
+            || self.duration > chrono::Duration::hours(1)
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "invalid Inbox lease request".into(),
+            ));
+        }
+        self.now
+            .checked_add_signed(self.duration)
+            .ok_or_else(|| SessionInboxError::InvalidClaim("Inbox lease expiry overflow".into()))
+    }
+}
+
+/// Bounded operational evidence, deliberately excluding identity and payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInboxLeaseInspection {
+    pub generation: u64,
+    pub epoch: u64,
+    pub expires_at: DateTime<Utc>,
+    pub expired: bool,
+    pub reclaim_count: u64,
+    pub manual_retry_count: u64,
+    /// Explicit consumer failures only; lease expiry is not a failure.
+    pub failure_count: u32,
+    pub last_error_code: Option<String>,
+    pub retry_after: Option<DateTime<Utc>>,
+}
+
+/// One exact, currently claimable Inbox item. This is a wake hint, never a
+/// claim or execution grant: the consumer must still pass the storage CAS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInboxWakeCandidate {
+    pub id: SessionMessageId,
+    pub generation: u64,
+    pub activation_policy: SessionActivationPolicy,
+    pub coordinator_generation: u64,
+    pub lease_epoch: Option<u64>,
+    /// Durable lease expiry, retry deadline, or manual retry time that made
+    /// this incarnation claimable. None means an unleased delivery.
+    pub ready_after: Option<DateTime<Utc>>,
+}
+
+/// Computed under the same queue lock as `claim_owned`. Staged and dead-letter
+/// items are omitted; `next_due_at` is the earliest eligible lease transition
+/// skipped during the ordered scan, including when a later item is ready now.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionInboxWakeReadiness {
+    pub ready: Option<SessionInboxWakeCandidate>,
+    pub next_due_at: Option<DateTime<Utc>>,
+}
+
+/// A bounded, non-sensitive diagnostic code supplied by the current owner.
+/// Free-form exception text, payloads and credentials must not be persisted.
+#[derive(Debug, Clone)]
+pub struct SessionInboxFailureReport {
+    pub now: DateTime<Utc>,
+    pub error_code: String,
+}
+
+impl SessionInboxFailureReport {
+    pub fn validate(&self) -> Result<(), SessionInboxError> {
+        if self.error_code.is_empty()
+            || self.error_code.len() > 64
+            || !self.error_code.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'-' | b'.')
+            })
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "Inbox failure requires a bounded diagnostic code".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionInboxFailureOutcome {
+    RetryScheduled {
+        failure_count: u32,
+        retry_after: DateTime<Utc>,
+    },
+    DeadLettered {
+        failure_count: u32,
+    },
+}
+
+/// Host management identity for one exact Session lifetime. A gateway must
+/// prove local bypass or authenticated host credentials and authorization for
+/// this Session before constructing the principal from a request.
+#[derive(Clone)]
+pub struct SessionInboxAdministrationPrincipal {
+    target_session_id: String,
+    target_created_at: DateTime<Utc>,
+}
+
+impl SessionInboxAdministrationPrincipal {
+    pub fn authenticated_host_owner_for(session: &Session) -> Self {
+        Self {
+            target_session_id: session.id.clone(),
+            target_created_at: session.created_at,
+        }
+    }
+
+    pub fn authorizes(&self, session: &Session) -> bool {
+        self.target_session_id == session.id && self.target_created_at == session.created_at
+    }
+}
+
+/// Bounded dead-letter evidence. It intentionally excludes message payloads
+/// and lease consumer identities, but retains exact retry selectors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInboxDeadLetterInspection {
+    pub id: SessionMessageId,
+    pub generation: u64,
+    pub failure_count: u32,
+    pub last_error_code: String,
+    pub dead_lettered_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -700,14 +990,19 @@ pub struct SessionInboxBacklog {
     pub pending: usize,
     pub claimed: usize,
     pub generation: u64,
-    /// Highest inbox generation whose producer durably authorized execution.
+    /// Highest inbox generation with durable execution permission, either from
+    /// its own immediate intent or the coordinator's authorized prefix.
     ///
     /// Admission alone is intentionally insufficient: child/Bash coordinators
     /// can stage several sibling outcomes while a durable wait remains armed,
     /// then authorize the accumulated prefix only after the wait policy is
     /// satisfied.
     pub activation_generation: u64,
-    /// Highest authorized generation carrying an explicit external-steering
+    /// The coordinator's separately authorized prefix. Unlike per-message
+    /// immediate intent, this advances only after the coordinator releases
+    /// staged outcomes and lets activation recover a newly released older item.
+    pub coordinator_generation: u64,
+    /// Highest pending, authorized generation carrying an explicit steering
     /// policy that may interrupt a specific child/Bash wait.
     pub interrupt_generation: u64,
     /// Oldest generation still present in `new/` or `cur/`.
@@ -715,8 +1010,9 @@ pub struct SessionInboxBacklog {
 }
 
 impl SessionInboxBacklog {
-    /// True only when at least one durable queue item is covered by the
-    /// producer's activation watermark.
+    /// True only when a durable queue item has permission from its immediate
+    /// intent or the coordinator prefix. Inspection computes the highest
+    /// eligible generation; it never grants intervening staged siblings.
     pub fn activation_pending(&self) -> bool {
         self.oldest_generation
             .is_some_and(|oldest| oldest <= self.activation_generation)
@@ -747,6 +1043,8 @@ impl Default for SessionInboxLimits {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionInboxError {
+    #[error("session message admission was cancelled before the durable commit")]
+    AdmissionCancelled,
     #[error("session inbox target not found: {0}")]
     TargetNotFound(String),
     #[error("session inbox payload is {actual} bytes, limit is {limit}")]
@@ -763,10 +1061,155 @@ pub enum SessionInboxError {
 /// but every address is a stable logical session id.
 #[async_trait]
 pub trait SessionInboxPort: Send + Sync {
+    /// Host-only access to the concrete durable Inbox when an Actor-fenced
+    /// transcript seed must hold the same process lock as claim and ACK.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
+    /// Irreversibly opt this queue into owned claims. Legacy claim/ACK APIs
+    /// must fail closed afterwards. This does not enable production expiry.
+    async fn claim_owned(
+        &self,
+        _target_session_id: &str,
+        _limit: usize,
+        _active_run_id: Option<&str>,
+        _request: &SessionInboxLeaseRequest,
+    ) -> Result<Vec<SessionInboxOwnedClaim>, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "owned Inbox leases unsupported".into(),
+        ))
+    }
+
+    async fn renew_owned(
+        &self,
+        _target_session_id: &str,
+        _claim: &SessionInboxOwnedClaim,
+        _request: &SessionInboxLeaseRequest,
+    ) -> Result<SessionInboxOwnedClaim, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "owned Inbox leases unsupported".into(),
+        ))
+    }
+
+    /// Requires the caller's durable transcript checkpoint, just like `ack`.
+    /// Terminal retries require the exact lease identity; expiry cannot undo ACK.
+    async fn ack_owned(
+        &self,
+        _target_session_id: &str,
+        _claim: &SessionInboxOwnedClaim,
+        _now: DateTime<Utc>,
+    ) -> Result<(), SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "owned Inbox leases unsupported".into(),
+        ))
+    }
+
+    async fn inspect_owned_leases(
+        &self,
+        _target_session_id: &str,
+        _limit: usize,
+        _now: DateTime<Utc>,
+    ) -> Result<Vec<SessionInboxLeaseInspection>, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "owned Inbox leases unsupported".into(),
+        ))
+    }
+
+    /// Release only this exact live claim for recovery. Preserve its typed body
+    /// and counters; an expired or replaced token cannot release a successor.
+    async fn release_owned(
+        &self,
+        _target_session_id: &str,
+        _claim: &SessionInboxOwnedClaim,
+    ) -> Result<(), SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "owned Inbox release unsupported".into(),
+        ))
+    }
+
+    /// Read exact wake readiness from the canonical queue and lease state.
+    /// Backends without a joint lock and exact eligibility check fail closed.
+    async fn inspect_wake_readiness(
+        &self,
+        _target_session_id: &str,
+        _now: DateTime<Utc>,
+    ) -> Result<SessionInboxWakeReadiness, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "exact Inbox wake inspection unsupported".into(),
+        ))
+    }
+
+    /// Only an exact, live owner may report a processing failure. An explicit
+    /// report is distinct from expiry/reclaim and can schedule bounded retry.
+    async fn fail_owned(
+        &self,
+        _target_session_id: &str,
+        _claim: &SessionInboxOwnedClaim,
+        _report: &SessionInboxFailureReport,
+    ) -> Result<SessionInboxFailureOutcome, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "owned Inbox failure reporting unsupported".into(),
+        ))
+    }
+
+    async fn inspect_dead_letters(
+        &self,
+        _target_session_id: &str,
+        _limit: usize,
+        _principal: &SessionInboxAdministrationPrincipal,
+    ) -> Result<Vec<SessionInboxDeadLetterInspection>, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "Inbox dead-letter inspection unsupported".into(),
+        ))
+    }
+
+    /// The trusted host must authorize this exact target, message and
+    /// generation before requesting a manual retry.
+    async fn retry_dead_letter(
+        &self,
+        _target_session_id: &str,
+        _id: &SessionMessageId,
+        _generation: u64,
+        _now: DateTime<Utc>,
+        _principal: &SessionInboxAdministrationPrincipal,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "Inbox dead-letter retry unsupported".into(),
+        ))
+    }
+
     async fn deliver(
         &self,
         envelope: &SessionMessageEnvelope,
     ) -> Result<SessionInboxReceipt, SessionInboxError>;
+
+    /// Check the caller's cancellation gate at the durable inbox publication
+    /// point. Backends without an integrated commit fence fail closed.
+    async fn deliver_with_gate(
+        &self,
+        _envelope: &SessionMessageEnvelope,
+        _gate: &super::AdmissionGate,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "cancellation-aware SessionInbox admission is unsupported".into(),
+        ))
+    }
+
+    /// Publish permission for this message in the same commit as its delivery.
+    /// Implementations must bind the intent to exact-id retry semantics and
+    /// retain the cancellation gate at that publication boundary. It does not
+    /// authorize an earlier staged sibling. Unsupported backends fail closed.
+    async fn deliver_with_activation_intent(
+        &self,
+        _envelope: &SessionMessageEnvelope,
+        _policy: SessionActivationPolicy,
+        _gate: Option<&super::AdmissionGate>,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "immediate SessionInbox activation intent is unsupported".into(),
+        ))
+    }
 
     /// Admit one typed Supervisor peer message while retaining canonical
     /// incarnation, relationship, Project and target lifetime authority locks
@@ -794,6 +1237,17 @@ pub trait SessionInboxPort: Send + Sync {
         policy: SessionActivationPolicy,
     ) -> Result<(), SessionInboxError>;
 
+    /// Read the coordinator prefix independently from immediate per-message
+    /// permission. Legacy backends have no immediate intent and need no hole
+    /// recovery. Backends supporting immediate intent must expose their true
+    /// coordinator prefix here. This value alone is never pending-work proof.
+    async fn coordinator_activation_generation(
+        &self,
+        _target_session_id: &str,
+    ) -> Result<u64, SessionInboxError> {
+        Ok(0)
+    }
+
     async fn claim(
         &self,
         target_session_id: &str,
@@ -812,7 +1266,8 @@ pub trait SessionInboxPort: Send + Sync {
         Ok(claims
             .into_iter()
             .filter(|claim| {
-                !active_run_id.is_some_and(|run_id| claim.envelope.guidance_waits_for_run(run_id))
+                !active_run_id
+                    .is_some_and(|run_id| claim.envelope.waits_for_successor_of_run(run_id))
             })
             .collect())
     }
@@ -891,6 +1346,39 @@ pub trait SessionActivationPort: Send + Sync {
 mod tests {
     use super::*;
     use crate::{ImageUrlRef, Role};
+
+    #[test]
+    fn root_chat_prompt_keeps_turn_presentation_and_semantic_retry_identity() {
+        let user = SessionMessageEnvelope::user_input("root", "visible User turn");
+        let first = user
+            .clone()
+            .with_root_chat_prompt("new System prompt".into())
+            .unwrap();
+        let retry = user
+            .clone()
+            .with_root_chat_prompt("new System prompt".into())
+            .unwrap();
+        assert_eq!(first.idempotency_semantics(), retry.idempotency_semantics());
+        let message = first.to_provider_message().unwrap();
+        assert_eq!(message.id, user.id.as_str());
+        assert_eq!(message.created_at, user.created_at);
+        assert_eq!(message.role, Role::User);
+        assert_eq!(message.content, "visible User turn");
+        assert!(!message.never_compress);
+        assert_eq!(first.root_chat_prompt().unwrap(), Some("new System prompt"));
+        let changed = user
+            .with_root_chat_prompt("different System prompt".into())
+            .unwrap();
+        assert_ne!(
+            first.idempotency_semantics(),
+            changed.idempotency_semantics()
+        );
+        let mut forged = first;
+        forged.source = SessionMessageSource::Runtime {
+            subsystem: "unrelated".into(),
+        };
+        assert!(forged.validate().is_err());
+    }
 
     #[test]
     fn multimodal_envelope_round_trips_and_keeps_provider_role_valid() {

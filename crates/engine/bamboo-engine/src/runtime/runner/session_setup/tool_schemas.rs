@@ -3,31 +3,39 @@ use bamboo_agent_core::tools::{ToolExecutor, ToolSchema};
 use bamboo_agent_core::Session;
 use bamboo_domain::{
     resolve_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
-    ClassifiedToolIdentity, ClassifiedToolSchema, EffectiveCallableSet,
+    ClassifiedToolIdentity, ClassifiedToolSchema, EffectiveCallableSet, SessionKind,
 };
+#[cfg(test)]
 use bamboo_skills::runtime_metadata::{
-    LOADED_SKILL_IDS_METADATA_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
-    SKILL_RUNTIME_SELECTION_SOURCE_KEY,
+    SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY, SKILL_RUNTIME_SELECTION_SOURCE_KEY,
 };
 use bamboo_tools::exposure::{activated_discoverable_tools, expandable_tool_short_description};
 
 const EXPOSURE_SIGNATURE: &str = "prompt_tool_exposure_signature";
 const EXPOSURE_ACTIVATED: &str = "prompt_tool_exposure_activated";
+const PHYSICAL_SUBAGENT_TOOLS: [&str; 3] = ["ask_agent", "deploy_agent", "cluster"];
 
 pub(crate) fn effective_guide_activation(
     config: &AgentLoopConfig,
     session: &Session,
 ) -> std::collections::BTreeSet<String> {
-    if config.freeze_tool_exposure_for_cache {
-        if let Some(frozen) = session
+    let mut activated = if config.freeze_tool_exposure_for_cache {
+        session
             .metadata
             .get(EXPOSURE_ACTIVATED)
             .and_then(|raw| serde_json::from_str(raw).ok())
-        {
-            return frozen;
-        }
+            .unwrap_or_else(|| activated_discoverable_tools(session))
+    } else {
+        activated_discoverable_tools(session)
+    };
+    // Ultra Roots rely on delegation for execution, so the compact contract
+    // must be visible even if guide exposure froze before the mode was selected.
+    // This derived presentation policy neither persists user activation nor
+    // changes the live catalog or execution authority.
+    if session.root_orchestration_only_enabled() {
+        activated.insert("SubAgent".to_string());
     }
-    activated_discoverable_tools(session)
+    activated
 }
 
 /// Capture presentation only; the catalog and execution authority are rebuilt live.
@@ -145,6 +153,18 @@ fn resolve_catalog_with_activation(
     tool_schemas.extend(config.additional_tool_schemas.clone());
     tool_schemas.sort_by(|left, right| left.function.name.cmp(&right.function.name));
     tool_schemas.dedup_by(|left, right| left.function.name == right.function.name);
+    if config.ticket_worker_plan.is_some() {
+        // Ticket native execution has a Host file capability rather than the
+        // ambient Builtin Read/Write schema. Keep catalog and executor identical.
+        tool_schemas = tools.list_tools();
+        for schema in tool_schemas
+            .iter_mut()
+            .filter(|s| s.function.name == "Task")
+        {
+            schema.function.description = "Update only this Assignment's private Steps. Include question:{prompt} with tasks to durably ask a User question and end this one-shot run. Answers arrive in a fresh Assignment's versioned context; a question never confers approval.".into();
+            schema.function.parameters["properties"]["question"] = serde_json::json!({"type":"object","additionalProperties":false,"required":["prompt"],"properties":{"prompt":{"type":"string","minLength":1,"maxLength":2048}}});
+        }
+    }
     // Resolve the disabled set LIVE each round (#136): when a resolver is wired
     // (server path) a tool disabled/re-enabled mid-run takes effect on the next
     // round, because this list is rebuilt unfiltered every round; with no resolver
@@ -159,36 +179,7 @@ fn resolve_catalog_with_activation(
         });
     }
 
-    // Once a single explicitly selected workflow reaches a terminal activation
-    // result, stop advertising load_skill so the model-issued attempt occurs
-    // exactly once. A typed degraded result is terminal too: the main session
-    // continues without workflow instructions instead of retrying forever.
-    // Automatic catalogs keep the tool available until the model chooses a
-    // candidate.
-    let loaded_skill_ids = session
-        .metadata
-        .get(LOADED_SKILL_IDS_METADATA_KEY)
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-        .unwrap_or_default();
-    let selected_skill_ids = session
-        .metadata
-        .get(SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY)
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-        .unwrap_or_default();
-    let explicit_selection = session
-        .metadata
-        .get(SKILL_RUNTIME_SELECTION_SOURCE_KEY)
-        .is_some_and(|source| source == "explicit");
-    let explicit_activation_is_current = explicit_selection
-        && !loaded_skill_ids.is_empty()
-        && loaded_skill_ids == selected_skill_ids;
-    let explicit_activation_degraded = explicit_selection
-        && session
-            .metadata
-            .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY);
-    if explicit_activation_is_current || explicit_activation_degraded {
-        tool_schemas.retain(|schema| schema.function.name != "load_skill");
-    }
+    super::legacy_instruction::retain_terminal_activation_tools(session, &mut tool_schemas);
 
     // Legacy providers keep Deferred schemas visible during migration;
     // activation only controls the depth of the existing tool-guide summaries.
@@ -228,6 +219,18 @@ fn resolve_catalog_with_activation(
         .collect::<std::collections::BTreeSet<_>>();
     by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
     prefer_delegated_plan_tool(session, &mut by_execution_name);
+    // Root and Child models delegate through the logical SubAgent facade. Keep the
+    // physical broker/deployment tools registered for existing direct callers,
+    // but omit their schemas (including namespaced aliases) from every Root/Child
+    // model catalog and capability-discovery projection.
+    if matches!(session.kind, SessionKind::Root | SessionKind::Child) {
+        by_execution_name
+            .retain(|_, entry| !PHYSICAL_SUBAGENT_TOOLS.contains(&entry.alias_fallback_name()));
+    }
+    // Apply the durable Root authority to exact registered execution names.
+    // This catalog feeds both provider schemas and capability discovery, so
+    // aliases and custom registrations cannot reintroduce a denied tool.
+    by_execution_name.retain(|name, _| session.allows_model_tool_execution(name));
 
     let mut catalog = by_execution_name.into_values().collect::<Vec<_>>();
     catalog.sort_by(|left, right| {

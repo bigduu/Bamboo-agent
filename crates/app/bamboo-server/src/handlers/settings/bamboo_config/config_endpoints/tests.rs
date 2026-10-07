@@ -220,6 +220,62 @@ async fn compatibility_config_get_hides_all_access_control_verifiers() {
 }
 
 #[actix_web::test]
+async fn context_management_patch_is_published_without_restart() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let app_state = web::Data::new(state);
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::get().to(super::get_bamboo_config))
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+    let patch = serde_json::json!({
+        "context_management": {
+            "strategy": "retrieval_window",
+            "retrieval_window": {
+                "history_tool_required": true,
+                "fallback_strategy": "none"
+            }
+        }
+    });
+
+    let saved: serde_json::Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(patch)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        saved["context_management"]["strategy"], "retrieval_window",
+        "the save response must reflect the live strategy"
+    );
+    assert_eq!(
+        app_state.config.read().await.context_management.strategy,
+        bamboo_config::ContextManagementStrategy::RetrievalWindow,
+        "the committed strategy must become live without a restart"
+    );
+
+    let reloaded: serde_json::Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get().uri("/bamboo/config").to_request(),
+    )
+    .await;
+    assert_eq!(
+        reloaded["context_management"]["strategy"],
+        "retrieval_window"
+    );
+}
+
+#[actix_web::test]
 async fn redacted_full_payload_update_preserves_access_control_and_rejects_mutation() {
     use crate::app_state::AppState;
     use actix_web::{http::StatusCode, test, web, App};

@@ -11,6 +11,7 @@ pub use agent::events::{
     AgentEvent, GoldCheckpoint, GoldConfidence, GoldDecision, TitleSource, TokenUsage,
 };
 pub use agent::hooks::AgentHook;
+pub use agent::tool_event_display::NativeToolEventDisplay;
 pub use agent::types::{parse_prompt_external_memory_sections, PromptSnapshotExternalMemoryParts};
 pub use agent::types::{
     CompressionEvent, CompressionTriggerType, ConversationSummary, ImageOcrLine, ImageOcrResult,

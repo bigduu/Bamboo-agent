@@ -205,6 +205,29 @@ fn canonicalize_remembered_matcher(
     Ok(())
 }
 
+fn reject_remembered_focused_browser_decision(
+    session: &bamboo_agent_core::Session,
+    request: &bamboo_tools::permission::PermissionRequest,
+    decision: &PermissionDecision,
+) -> Result<(), AppError> {
+    if matches!(
+        decision.decision,
+        PermissionDecisionKind::AllowOnce | PermissionDecisionKind::DenyOnce
+    ) {
+        return Ok(());
+    }
+    let focused_from_original_args =
+        super::pending::pending_tool_arguments_exact(session, &request.request_id).is_some_and(
+            |args| bamboo_tools::permission::is_focused_browser_input(&request.tool_name, &args),
+        );
+    if request.is_focused_browser_input() || focused_from_original_args {
+        return Err(AppError::Forbidden(
+            "focused browser input permits only one-shot decisions".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn resolved_decision_conflict(
     current: &PermissionDecision,
     submitted: &PermissionDecision,
@@ -263,6 +286,11 @@ pub async fn submit_permission_decision(
             .load_session(&session_id)
             .await
             .ok_or_else(|| AppError::NotFound("session".to_string()))?;
+        if let Some(request) =
+            super::pending::persisted_permission_request(&session, &decision.request_id)
+        {
+            reject_remembered_focused_browser_decision(&session, &request, &decision)?;
+        }
         if let Some(pending) = session.pending_question.as_ref() {
             if pending.tool_call_id != decision.request_id {
                 return Ok(HttpResponse::Conflict().json(serde_json::json!({
@@ -300,6 +328,11 @@ pub async fn submit_permission_decision(
                 &session,
                 &decision.request_id,
             ) {
+                if let Some(request) =
+                    super::pending::persisted_permission_request(&session, &decision.request_id)
+                {
+                    reject_remembered_focused_browser_decision(&session, &request, &decision)?;
+                }
                 if !same_durable_decision_semantics(&receipt.decision, &decision) {
                     return Ok(resolved_decision_conflict(&receipt.decision, &decision));
                 }
@@ -321,6 +354,7 @@ pub async fn submit_permission_decision(
             let request =
                 super::pending::persisted_permission_request(&session, &decision.request_id)
                     .ok_or_else(|| AppError::NotFound("pending permission request".to_string()))?;
+            reject_remembered_focused_browser_decision(&session, &request, &decision)?;
             canonicalize_remembered_matcher(&request, &mut decision)?;
             let snapshot = state.permission_section.snapshot();
             let recovered = recovered_durable_decision(&request, &snapshot.data.durable_rules)?
@@ -367,6 +401,7 @@ pub async fn submit_permission_decision(
                 "actual_request_generation": request.request_generation,
             })));
         }
+        reject_remembered_focused_browser_decision(&session, &request, &decision)?;
         canonicalize_remembered_matcher(&request, &mut decision)?;
         config.register_pending_request(request.clone());
 
@@ -591,7 +626,7 @@ pub async fn submit_permission_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_agent_core::{Message, PendingQuestionSource, Session};
+    use bamboo_agent_core::{FunctionCall, Message, PendingQuestionSource, Session, ToolCall};
     use bamboo_engine::execution::{AgentRunner, AgentStatus};
     use bamboo_tools::permission::{
         PermissionMatcherKind, PermissionMode, PermissionReasonCode, PermissionRequest,
@@ -650,6 +685,197 @@ mod tests {
             PendingQuestionSource::PauseTool,
         );
         session
+    }
+
+    #[actix_web::test]
+    async fn focused_browser_pending_request_rejects_forged_remembered_decisions() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = web::Data::new(
+            AppState::new(dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        for (index, args) in [
+            serde_json::json!({"action":"type","text":"private text","expected_epoch":17}),
+            serde_json::json!({"action":"key","key":"Tab","expected_epoch":17}),
+            serde_json::json!({"action":"press","key":"Enter","expected_epoch":17}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session_id = format!("focused-browser-approval-{index}");
+            let request_id = format!("focused-browser-call-{index}");
+            let context = bamboo_tools::permission::check_permissions("browser", &args)
+                .expect("valid browser permission")
+                .expect("browser interaction requires permission")
+                .remove(0);
+            let mut request = test_permission_request(
+                &session_id,
+                &request_id,
+                0,
+                PermissionRequest::ordinary_decisions(true),
+            );
+            request.tool_name = "browser".to_string();
+            request.permission_type = PermissionType::BrowserInteraction;
+            request.resource = context.resource;
+            request.operation_summary = context.operation_description;
+            request.suggested_matchers = bamboo_tools::permission::conservative_matchers(
+                PermissionType::BrowserInteraction,
+                &request.resource,
+            );
+            assert!(request.is_focused_browser_input());
+
+            let mut session = parked_permission_session(&request);
+            session.messages.insert(
+                0,
+                Message::assistant(
+                    "",
+                    Some(vec![ToolCall {
+                        id: request_id.clone(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "browser".to_string(),
+                            arguments: args.to_string(),
+                        },
+                    }]),
+                ),
+            );
+            state.save_and_cache_session(&mut session).await;
+
+            for decision_kind in [
+                PermissionDecisionKind::AllowSession,
+                PermissionDecisionKind::AllowWorkspace,
+                PermissionDecisionKind::AllowGlobal,
+                PermissionDecisionKind::DenySession,
+            ] {
+                let error = submit_permission_decision(
+                    state.clone(),
+                    web::Path::from(session_id.clone()),
+                    web::Json(PermissionDecision {
+                        request_id: request_id.clone(),
+                        request_generation: request.request_generation.clone(),
+                        decision: decision_kind,
+                        matcher_id: Some("exact_resource".to_string()),
+                        expected_policy_revision: Some(0),
+                        confirm_global: decision_kind == PermissionDecisionKind::AllowGlobal,
+                    }),
+                )
+                .await
+                .expect_err("focused input rejects remembered decisions even in a stale contract");
+                assert!(matches!(error, AppError::Forbidden(_)));
+            }
+            assert!(state
+                .load_session(&session_id)
+                .await
+                .expect("session remains parked")
+                .pending_question
+                .is_some());
+        }
+    }
+
+    #[actix_web::test]
+    async fn restarted_focused_browser_approval_uses_original_resource_after_redacted_preview() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let session_id = "focused-browser-redacted-restart";
+        let request_id = "focused-browser-redacted-call";
+        let original_resource = "browser:17:type:focused:private-fingerprint";
+        let mut request = test_permission_request(
+            session_id,
+            request_id,
+            0,
+            PermissionRequest::forced_decisions(),
+        );
+        request.tool_name = "browser".to_string();
+        request.permission_type = PermissionType::BrowserInteraction;
+        request.resource = original_resource.to_string();
+        request.operation_summary = "Type into focused browser element".to_string();
+        request.suggested_matchers[0].value = original_resource.to_string();
+        let mut session = parked_permission_session(&request);
+        session.messages.insert(
+            0,
+            Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: request_id.to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "browser".to_string(),
+                        arguments: serde_json::json!({
+                            "action":"type",
+                            "text":"private input",
+                            "expected_epoch":17,
+                        })
+                        .to_string(),
+                    },
+                }]),
+            ),
+        );
+        let initial = web::Data::new(
+            AppState::new(dir.path().to_path_buf())
+                .await
+                .expect("initial app state"),
+        );
+        initial.save_and_cache_session(&mut session).await;
+        drop(initial);
+
+        let restarted = web::Data::new(
+            AppState::new(dir.path().to_path_buf())
+                .await
+                .expect("restarted app state"),
+        );
+        let preview = super::super::pending::get_pending_question(
+            restarted.clone(),
+            web::Path::from(session_id.to_string()),
+        )
+        .await
+        .expect("pending preview after restart");
+        assert_eq!(preview.status(), actix_web::http::StatusCode::OK);
+        let body = actix_web::body::to_bytes(preview.into_body())
+            .await
+            .expect("preview body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("preview JSON");
+        assert_eq!(body["permission_request"]["resource"], "[redacted]");
+        assert_eq!(body["tool_arguments"]["text"], "[redacted]");
+        assert!(!body.to_string().contains("private-fingerprint"));
+        assert_eq!(
+            restarted
+                .permission_checker
+                .permission_config()
+                .expect("permission config")
+                .pending_request(session_id, request_id)
+                .expect("original request remains registered")
+                .resource,
+            original_resource
+        );
+
+        let response = submit_permission_decision(
+            restarted.clone(),
+            web::Path::from(session_id.to_string()),
+            web::Json(PermissionDecision {
+                request_id: body["permission_request"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                request_generation: body["permission_request"]["request_generation"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                decision: PermissionDecisionKind::AllowOnce,
+                matcher_id: None,
+                expected_policy_revision: Some(0),
+                confirm_global: false,
+            }),
+        )
+        .await
+        .expect("redacted preview still permits the exact parked approval");
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("approval body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("approval JSON");
+        assert_eq!(body["success"], true);
+        assert_eq!(body["replayed"], false);
+        assert_eq!(body["receipt"]["decision"]["decision"], "allow_once");
     }
 
     fn unrelated_rule() -> DurablePermissionRule {

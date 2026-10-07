@@ -8,7 +8,9 @@ pub mod account_sink;
 pub mod change_feed;
 pub mod journal;
 pub mod replayable;
+mod root_actor;
 
 pub use account_sink::AccountEventSink;
 pub use change_feed::ChangeEvent;
 pub use replayable::publish_replayable_session_event;
+pub use root_actor::RootActorEventPublication;

@@ -22,8 +22,16 @@ const STRICT_ARGUMENT_TOOL_NAMES: [&str; 11] = [
 ];
 
 fn normalize_tool_for_policy(raw_tool_name: &str) -> String {
-    bamboo_tools::normalize_tool_ref(raw_tool_name)
-        .unwrap_or_else(|| normalize_tool_name(raw_tool_name).trim().to_string())
+    let name = bamboo_tools::normalize_tool_ref(raw_tool_name)
+        .unwrap_or_else(|| normalize_tool_name(raw_tool_name).trim().to_string());
+    if bamboo_tools::resolve_alias(&name)
+        .unwrap_or(&name)
+        .eq_ignore_ascii_case("SubAgent")
+    {
+        "SubAgent".to_string()
+    } else {
+        name
+    }
 }
 
 pub(super) fn validate_tool_call_arguments(tool_call: &ToolCall) -> Result<(), String> {
@@ -91,16 +99,23 @@ impl ToolPolicyPrecheckViolation {
                 tool_name,
                 consecutive_failures,
                 limit,
-            } => format!(
-                "Tool policy blocked '{}': {} consecutive failures reached circuit limit ({}) in this round",
-                tool_name, consecutive_failures, limit
-            ),
+            } => {
+                let scope = if tool_name == "SubAgent" {
+                    "run"
+                } else {
+                    "round"
+                };
+                format!(
+                    "Tool policy blocked '{}': {} consecutive failures reached circuit limit ({}) in this {}",
+                    tool_name, consecutive_failures, limit, scope
+                )
+            }
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct ToolPolicyGuard {
+pub(crate) struct ToolPolicyGuard {
     max_tool_calls_per_round: usize,
     max_consecutive_failures_per_tool: usize,
     executed_calls: usize,
@@ -108,7 +123,7 @@ pub(super) struct ToolPolicyGuard {
 }
 
 impl ToolPolicyGuard {
-    pub(super) fn new(
+    pub(crate) fn new(
         max_tool_calls_per_round: usize,
         max_consecutive_failures_per_tool: usize,
     ) -> Self {
@@ -118,6 +133,32 @@ impl ToolPolicyGuard {
             executed_calls: 0,
             consecutive_failures: HashMap::new(),
         }
+    }
+
+    pub(crate) fn begin_round(
+        &mut self,
+        max_tool_calls_per_round: usize,
+        max_consecutive_failures_per_tool: usize,
+    ) {
+        self.max_tool_calls_per_round = max_tool_calls_per_round;
+        self.max_consecutive_failures_per_tool = max_consecutive_failures_per_tool;
+        self.executed_calls = 0;
+        // Preserve delegation failures across model turns. Other tools keep
+        // their existing per-round circuit behavior.
+        self.consecutive_failures
+            .retain(|name, _| name == "SubAgent");
+    }
+
+    pub(crate) fn delegation_failure_message(&self) -> Option<String> {
+        let failures = *self.consecutive_failures.get("SubAgent")?;
+        (failures >= self.max_consecutive_failures_per_tool).then(|| format!(
+            "SubAgent delegation stopped after {failures} consecutive failures in this run \
+             (limit {}). Review the tool errors and correct the call before starting a new run. \
+             To create a child use {{\"role\":\"explorer\",\"message\":\"Complete bounded task\"}}; \
+             omit unused target and reply_to. Reply to a pending parent request only with \
+             its exact reply_to id and message, omitting target and role.",
+            self.max_consecutive_failures_per_tool
+        ))
     }
 
     pub(super) fn check_before_execution(
@@ -287,5 +328,57 @@ mod tests {
         );
 
         assert!(guard.check_before_execution(&call, 0).is_ok());
+    }
+
+    #[test]
+    fn only_delegation_failures_survive_round_boundaries() {
+        let mut guard = ToolPolicyGuard::new(2, 3);
+        let delegation = tool_call("SubAgent", "{}");
+        let read = tool_call("Read", "{}");
+        for _ in 0..3 {
+            guard.begin_round(2, 3);
+            assert!(guard.check_before_execution(&delegation, 0).is_ok());
+            assert!(guard.check_before_execution(&read, 0).is_ok());
+            guard.observe_outcome(&delegation, &Err("invalid arguments".into()));
+            guard.observe_outcome(&read, &Err("missing file".into()));
+        }
+        guard.begin_round(2, 3);
+        assert!(guard.check_before_execution(&delegation, 0).is_err());
+        assert!(guard.check_before_execution(&read, 0).is_ok());
+        assert!(guard
+            .delegation_failure_message()
+            .unwrap()
+            .contains("3 consecutive failures"));
+        assert!(ToolPolicyGuard::new(2, 3)
+            .delegation_failure_message()
+            .is_none());
+    }
+
+    #[test]
+    fn corrected_delegation_resets_cross_round_streak() {
+        let mut guard = ToolPolicyGuard::default();
+        let call = tool_call("SubAgent", "{}");
+        for _ in 0..2 {
+            guard.begin_round(80, 3);
+            guard.observe_outcome(&call, &Err("invalid arguments".into()));
+        }
+        guard.begin_round(80, 3);
+        guard.observe_outcome(&call, &Ok(ToolResult::text(true, "child created")));
+        for _ in 0..2 {
+            guard.begin_round(80, 3);
+            guard.observe_outcome(&call, &Err("invalid arguments".into()));
+        }
+        assert!(guard.check_before_execution(&call, 0).is_ok());
+        assert!(guard.delegation_failure_message().is_none());
+    }
+
+    #[test]
+    fn delegation_aliases_share_one_failure_streak() {
+        let mut guard = ToolPolicyGuard::default();
+        for name in ["SubAgent", "server::SubAgent", "SUB_SESSION_MANAGER"] {
+            guard.begin_round(80, 3);
+            guard.observe_outcome(&tool_call(name, "{}"), &Err("invalid arguments".into()));
+        }
+        assert!(guard.delegation_failure_message().is_some());
     }
 }

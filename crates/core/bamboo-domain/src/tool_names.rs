@@ -115,12 +115,14 @@ pub const SERVER_TOOL_NAMES: [&str; 12] = [
 ///
 /// This superset is used by catalogs and discovery without broadening the
 /// legacy `normalize_tool_ref`/`is_builtin_tool` acceptance surface above.
-pub const SERVER_CAPABILITY_NAMES: [&str; 18] = [
+pub const SERVER_CAPABILITY_NAMES: [&str; 26] = [
     "Plan",
     "SubAgent",
     "Project",
     "archive_context",
     "ask_agent",
+    "browser",
+    "browser_eval",
     "cluster",
     "compact_context",
     "deploy_agent",
@@ -134,6 +136,12 @@ pub const SERVER_CAPABILITY_NAMES: [&str; 18] = [
     "session_history",
     "session_history_current",
     "workflow_run",
+    "work_overview",
+    "work_search",
+    "work_inspect",
+    "work_changes",
+    "work_update",
+    "work_dispatch",
 ];
 
 /// Resolve any model- or host-facing tool reference to one canonical identity.

@@ -1863,11 +1863,15 @@ mod tests {
         )
     }
 
-    fn current_marker(root: &Path) -> ClonePublicationMarker {
-        let bytes =
-            std::fs::read(root.join("skills/.review.clone-v1.json")).expect("durable marker");
+    fn marker_journal(root: &Path, relative: impl AsRef<Path>) -> CloneMarkerJournal {
+        let bytes = std::fs::read(root.join(relative)).expect("marker bytes");
         let journal = parse_clone_marker_journal(&bytes, "review").expect("marker journal");
         assert!(journal.partial.is_empty());
+        journal
+    }
+
+    fn current_marker(root: &Path) -> ClonePublicationMarker {
+        let journal = marker_journal(root, "skills/.review.clone-v1.json");
         journal.current().cloned().expect("current marker")
     }
 
@@ -2040,17 +2044,60 @@ mod tests {
     }
 
     #[test]
-    fn completed_target_deletion_retires_reclones_and_upgrades_revision() {
+    fn completed_target_deletion_retires_and_republishes_without_inode_assumptions() {
         let root = tempfile::tempdir().expect("root");
         publish_revision(root.path(), 7, 'a', PublicationFault::None).expect("revision seven");
-        let first_identity = current_marker(root.path()).target_identity;
+        let initial = current_marker(root.path());
+        assert_eq!(initial.phase, ClonePublicationPhase::Complete);
+        assert_eq!(initial.source_revision, 7);
         std::fs::remove_dir_all(root.path().join("skills/review")).expect("delete clone");
 
-        publish_revision(root.path(), 8, 'b', PublicationFault::None).expect("revision eight");
+        let mut revision_eight_files = review_files();
+        revision_eight_files.insert(
+            "revision.txt".to_string(),
+            BuiltinSkillFile {
+                bytes: b"revision eight\n".to_vec(),
+                executable: false,
+            },
+        );
+        publish_builtin_clone_with_fault(
+            root.path(),
+            "review",
+            8,
+            &"b".repeat(64),
+            &revision_eight_files,
+            PublicationFault::None,
+        )
+        .expect("revision eight");
+
+        let retired_journal = marker_journal(
+            root.path(),
+            PathBuf::from(CLONE_TRANSACTION_DIRECTORY)
+                .join(clone_rollover_directory_name("review"))
+                .join(CLONE_ROLLOVER_RETIRED),
+        );
+        let retired = retired_journal.current().expect("retired marker");
+        assert_eq!(retired.phase, ClonePublicationPhase::Retired);
+        assert_eq!(retired.source_revision, 7);
+        assert_eq!(retired.source_content_digest, "a".repeat(64));
+        assert_eq!(retired.bundle_digest, initial.bundle_digest);
+
         let marker = current_marker(root.path());
         assert_eq!(marker.phase, ClonePublicationPhase::Complete);
         assert_eq!(marker.source_revision, 8);
-        assert_ne!(marker.target_identity, first_identity);
+        assert_eq!(marker.source_content_digest, "b".repeat(64));
+        assert_eq!(
+            marker.bundle_digest,
+            builtin_clone_bundle_digest(&revision_eight_files)
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("skills/review/revision.txt"))
+                .expect("revision eight bytes"),
+            b"revision eight\n"
+        );
+
+        // Directory identities may legally compare equal after deletion and recreation.
+        // The retired journal and the new exact bytes are the deterministic evidence.
     }
 
     #[test]

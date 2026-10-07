@@ -247,6 +247,7 @@ fn parse_legacy_markdown_adapter(
         id: id.to_string(),
         name: id.to_string(),
         description,
+        short_description: None,
         license: None,
         compatibility: None,
         metadata: Some(serde_json::json!({

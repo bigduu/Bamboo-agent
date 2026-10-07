@@ -129,8 +129,9 @@ async fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
     fs::read(path).await
 }
 
-// Deserialize only identity fields from main. In particular, this does not
-// allocate its potentially large message history or use it as a fallback.
+// The strict generic authority port retains the legacy main-pair check for
+// Ordinary Roots. Only the fixed default Supervisor has a separate bounded
+// management proof that can replace that transcript-sized read.
 #[derive(Deserialize)]
 struct MainIdentity {
     id: String,
@@ -147,6 +148,14 @@ struct MainIdentity {
     authority_identity: SessionAuthorityIdentity,
     #[serde(default)]
     supervisor_management: Option<SupervisorManagementState>,
+    #[serde(default)]
+    root_orchestration_only: bool,
+    #[serde(default)]
+    root_tool_authority_revision: u64,
+    #[serde(default)]
+    root_mode_transition_epoch: u64,
+    #[serde(default)]
+    root_mode_operations: Vec<RootModeOperationReceipt>,
 }
 
 impl SessionStoreV2 {
@@ -157,7 +166,10 @@ impl SessionStoreV2 {
         id: &str,
     ) -> io::Result<Option<Session>> {
         validate_session_id(id)?;
-        if self.root_directory_is_revoked(id).await? {
+        // The default Supervisor can reuse its fixed ID after revocation.
+        // Its birth check must use the bounded committed proof below; the
+        // ordinary lifetime helper scans the transcript-sized main file.
+        if id != DEFAULT_SUPERVISOR_SESSION_ID && self.root_directory_is_revoked(id).await? {
             return Ok(None);
         }
         if !real_directory(&self.sessions_dir).await? {
@@ -167,29 +179,10 @@ impl SessionStoreV2 {
         if !real_directory(&directory).await? {
             return Ok(None);
         }
-        let main: MainIdentity =
-            serde_json::from_slice(&read_regular(&directory.join("session.json")).await?)
-                .map_err(|_| invalid("invalid canonical session.json"))?;
         let mut side: Session =
             serde_json::from_slice(&read_regular(&directory.join(RUNTIME_SIDECAR_FILE)).await?)
                 .map_err(|_| invalid("invalid canonical runtime.json"))?;
         validate_identity(&side)?;
-        validate_management(
-            &main.authority_identity,
-            main.supervisor_management.as_ref(),
-        )?;
-        validate_management_overlay(
-            main.supervisor_management.as_ref(),
-            side.supervisor_management.as_ref(),
-        )?;
-        let ordinary_legacy_root =
-            matches!(main.authority_identity, SessionAuthorityIdentity::Ordinary)
-                && main.root_session_id.is_empty();
-        let main_root = if ordinary_legacy_root {
-            id
-        } else {
-            &main.root_session_id
-        };
         let side_root = if matches!(side.authority_identity, SessionAuthorityIdentity::Ordinary)
             && side.root_session_id.is_empty()
         {
@@ -197,20 +190,59 @@ impl SessionStoreV2 {
         } else {
             &side.root_session_id
         };
-        if main.id != id
-            || side.id != id
-            || main.kind != SessionKind::Root
+        if side.id != id
             || side.kind != SessionKind::Root
-            || main_root != id
             || side_root != id
-            || main.parent_session_id.is_some()
             || side.parent_session_id.is_some()
-            || main.spawn_depth != 0
             || side.spawn_depth != 0
-            || main.authority_identity != side.authority_identity
-            || main.created_at != side.created_at
+            || (side.root_orchestration_only && side.root_tool_authority_revision == 0)
         {
             return Err(invalid("canonical Root identity mismatch"));
+        }
+        self.validate_root_tool_authority_against_proof(id, &side)
+            .await?;
+        self.validate_supervisor_proof(&side).await?;
+        if !matches!(
+            side.authority_identity,
+            SessionAuthorityIdentity::Supervisor { .. }
+        ) {
+            let main_bytes = read_regular(&directory.join("session.json")).await?;
+            compact_main::validate_full_main(&main_bytes)?;
+            let main: MainIdentity = serde_json::from_slice(&main_bytes)
+                .map_err(|_| invalid("invalid canonical session.json"))?;
+            validate_management(
+                &main.authority_identity,
+                main.supervisor_management.as_ref(),
+            )?;
+            let main_root = if main.root_session_id.is_empty() {
+                id
+            } else {
+                &main.root_session_id
+            };
+            if main.id != id
+                || main.kind != SessionKind::Root
+                || main_root != id
+                || main.parent_session_id.is_some()
+                || main.spawn_depth != 0
+                || main.authority_identity != side.authority_identity
+                || main.created_at != side.created_at
+                || (main.root_orchestration_only && main.root_tool_authority_revision == 0)
+                || side.root_tool_authority_revision < main.root_tool_authority_revision
+                || (side.root_tool_authority_revision == main.root_tool_authority_revision
+                    && side.root_orchestration_only != main.root_orchestration_only)
+                || side.root_mode_transition_epoch != main.root_mode_transition_epoch
+                || side.root_mode_operations != main.root_mode_operations
+            {
+                return Err(invalid("canonical Root identity mismatch"));
+            }
+        }
+        if id == DEFAULT_SUPERVISOR_SESSION_ID
+            && self
+                .root_revocation(id)
+                .await?
+                .is_some_and(|cutoff| side.created_at <= cutoff)
+        {
+            return Ok(None);
         }
         side.root_session_id = id.to_string();
         side.messages.clear();
@@ -226,7 +258,8 @@ impl SessionStoreV2 {
     ) -> io::Result<SupervisorBootstrapReceipt> {
         let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let _task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked().await?;
+        self.recover_all_runtime_task_transactions_locked(&_task)
+            .await?;
         self.recover_all_session_copy_transactions_locked().await?;
         let _session = self
             .acquire_session_maintenance_lock(DEFAULT_SUPERVISOR_SESSION_ID)
@@ -243,6 +276,7 @@ impl SessionStoreV2 {
                 Err(error) if error.kind() == io::ErrorKind::NotFound)
             {
                 if let Ok(bytes) = read_regular(&directory.join("session.json")).await {
+                    compact_main::validate_full_main(&bytes)?;
                     if let Ok(main) = serde_json::from_slice::<Session>(&bytes) {
                         if main.id == DEFAULT_SUPERVISOR_SESSION_ID
                             && main.kind == SessionKind::Root
@@ -320,6 +354,8 @@ impl SessionStoreV2 {
         session.title = "Supervisor".to_string();
         session.title_generated = true;
         session.authority_identity = SessionAuthorityIdentity::Supervisor { incarnation_id };
+        let main_bytes = compact_main::serialize_main(&session)?;
+        let runtime_bytes = serde_json::to_vec_pretty(&session).map_err(io::Error::other)?;
         let staging = self
             .bamboo_home_dir
             .join(format!(".supervisor-bootstrap-{}", Uuid::new_v4()));
@@ -330,10 +366,11 @@ impl SessionStoreV2 {
         let result = async {
             fs::create_dir(staging.join("children")).await?;
             fs::create_dir(staging.join("attachments")).await?;
-            let bytes = serde_json::to_vec_pretty(&session)
-                .map_err(|error| other_io_error(error.to_string()))?;
-            durable_atomic_write(&staging.join("session.json"), &bytes).await?;
-            durable_atomic_write(&staging.join(RUNTIME_SIDECAR_FILE), &bytes).await?;
+            durable_atomic_write(&staging.join("session.json"), &main_bytes).await?;
+            durable_atomic_write(&staging.join(RUNTIME_SIDECAR_FILE), &runtime_bytes).await?;
+            Self::stage_actor_tree_revision(&staging, &session).await?;
+            Self::write_staged_root_tool_proof(&staging, &session).await?;
+            Self::write_staged_supervisor_proof(&staging, &session).await?;
             sync_directory(&staging).await?;
             self.maybe_fail_root_publication(RootPublicationFault::BeforePublish)?;
             atomic_rename(&staging, &destination).await?;

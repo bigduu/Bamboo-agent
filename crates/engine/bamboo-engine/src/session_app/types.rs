@@ -75,6 +75,12 @@ pub struct ChatTurnInput {
     pub message: String,
     pub system_prompt: Option<String>,
     pub enhance_prompt: Option<String>,
+    /// Explicit, durable root delegation guidance selection. Omission keeps
+    /// the current Session value; `false` turns it off.
+    pub root_orchestration_prompt: Option<bool>,
+    /// Explicit Root tool authority selection. Omission retains the durable
+    /// choice; both enable and disable are rejected for Child sessions.
+    pub root_orchestration_only: Option<bool>,
     pub workspace_path: Option<String>,
     /// Caller-owned live-config default. This is distinct from an explicit
     /// request field so an omitted workspace can still prefer the freshly

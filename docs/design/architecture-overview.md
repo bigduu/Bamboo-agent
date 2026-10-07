@@ -1,8 +1,26 @@
 # Architecture Overview — Broker-mediated remote sub-agents
 
 > 本文是面向"怎么部署 / 项目结构 / 部署能力实现"的总览。
-> 配套设计文档:`docs/remote-mailbox-broker-design.md`(broker 设计 + SHIPPED 段)、
-> `docs/remote-actor-plan.md`(远程 actor 接缝 P0/P1/P2)。
+> 配套设计文档: [SubAgent Actor runtime](subagent-actor-runtime-design.md)、
+> [broker 设计](remote-mailbox-broker-design.md) 和 [远端 Actor 方案](remote-actor-plan.md)。
+
+## #791 当前交付边界（2026-09-29）
+
+`ActorSession`（持久 `Session.id`）是逻辑身份、历史和父子归属的唯一权威；
+`ActorActivation` 是有租约和 fencing 的一次 Run，`WorkerHost` 只是可替换容量。
+Root 和 Child 的模型工具目录在子代理能力上只暴露逻辑 `SubAgent`，`deploy_agent`、`ask_agent` 和
+`cluster` 保留为 Host/兼容调用，不能作为新的 Actor 身份来源。
+
+规范本地 Child 和**固定远端** Child 已能通过 broker 执行。固定远端使用经 PeerPolicy
+认证的 WSS `Run` 和每次 Run 的 `EnvironmentLease` v1：Host 捕获干净 Git 工作区的
+commit/内容摘要，Worker 在执行前核验本机工作区。HostRegistry 和调度器已能记录
+经 broker 认证的容量并原子预留 slot，但尚未接入通用自动放置和故障转移。
+
+**仍待 #791 验收**：通用远端 Run 管理与跨 Host 迁移/故障转移；Docker、SSH 和调度池
+WorkerHost 的统一 ActorActivation；干净 Git 快照以外的 EnvironmentLease、artifact 和
+能力代理边界；失联或 ACK 不确定时 broker receipt 的活性修复。下文第 2–6 节保留
+历史 `deploy_agent`/`ask_agent` 部署链路，以说明物理 worker 管理；不能将其当作已
+完成的规范 SubAgent 路径。
 
 整个系统是**中心辐射(hub-and-spoke)**拓扑:一个中心消息总线(broker),一个编排者
 (orchestrator),N 个可部署到任意环境的 worker。三者都是**同一个 `bamboo` 二进制**的不
@@ -26,26 +44,30 @@
    │  · root agent loop        │     │  · 连 broker、订阅自己邮箱      │
    │  · 跑真实 MCP servers      │     │  · serve_executor 等任务        │
    │  · serve_mcp_proxy 服务    │     │  · 能力 = 内置 + 同步skills+MCP │
-   │  · 工具 deploy_agent       │     │                                 │
-   │         ask_agent          │     │                                 │
+   │  · 模型工具 SubAgent       │     │                                 │
+   │  · Host 管理物理容量       │     │                                 │
    └────────────────────────────┘     └─────────────────────────────────┘
 ```
 
 | 角色 | 子命令 | 职责 |
 |---|---|---|
 | **broker** | `bamboo broker serve` | 网络消息总线 + 持久邮箱;鉴权;路由/推送 |
-| **orchestrator** | `bamboo serve`(根 agent) | 跑 root agent loop + 真实 MCP servers + MCP 代理服务;暴露 `deploy_agent`/`ask_agent` 工具 |
-| **worker** | `bamboo broker-agent serve` | 被部署到本地/Docker/远端,连 broker,执行被指派的任务 |
+| **orchestrator** | `bamboo serve`(根 agent) | 持有 ActorDirectory、SessionInbox 和规范 Child Run；模型通过 `SubAgent` 编排，Host 管理 broker/worker |
+| **worker** | `bamboo broker-agent serve` | 连 broker、提供执行容量；只有经 Host 绑定的 Run 才能修改规范 ActorSession |
 
-**位置无关**是核心:worker 起来后只认 `broker endpoint + token + 自己的 id`;编排者只按
-id 寻址。这是 **push 模型**(master 主动部署执行环境),不是互相发现。
+规范 Actor 按 `Session.id` 寻址。broker mailbox、worker id 和 endpoint 是物理投递信息，
+不能替代 ActorId。broker 是中心辐射的传输层，归属和权限仍由 Host 的 ActorDirectory 判定。
 
 ---
 
-## 2. 一次部署的端到端流程
+## 2. 遗留物理 worker 部署流程（兼容路径）
+
+下面流程描述 `deploy_agent`/`ask_agent` 对物理 worker 的操作。它可供 Host/兼容调用，
+但不创建可替换 Host 上继续执行的规范 Child ActorSession。规范 Child 经 `SubAgent`
+创建持久 Session、准入 SessionInbox，再由 Host 绑定 ActorActivation 并发送 broker Run。
 
 ```
-编排者 LLM
+旧兼容调用方
    │  调用工具
    ▼
 deploy_agent(action="deploy", env="local"|"docker"|"ssh", model=…, [echo])
@@ -107,21 +129,24 @@ workspace 四层:`core`(类型/接口)→ `infra`(独立服务)→ `engine`(核�
 | `src/broker_agent.rs` | `broker-agent serve`:`build_spec` 填 `Capabilities`,拉起 executor(echo 或真）|
 | `src/subagent_worker.rs` | `BambooRuntimeExecutor` —— 真 agent loop;按 `Capabilities` 装 MCP / skills / proxy |
 
-### `crates/app/bamboo-server-tools` — LLM 可调用工具
+### `crates/app/bamboo-server-tools` — 逻辑工具与兼容工具
 | 文件 | 内容 |
 |---|---|
-| `ask_agent.rs` | `ask_agent` 工具(query/steer 指挥别的 agent)|
-| `deploy_agent.rs` | `deploy_agent` 工具(deploy/stop/list + `DeployedRegistry` 保活)|
+| `sub_agent.rs` / `sub_agent_facade.rs` | 模型可见的逻辑 `SubAgent`（创建、纠偏、检查、控制、父请求回复）|
+| `ask_agent.rs` | 兼容查询/物理 worker 通信；不进入 Root/Child 模型目录 |
+| `deploy_agent.rs` | 兼容物理部署/停止/列表，`DeployedRegistry` 是物理句柄缓存，不是 ActorDirectory |
 
 ### `crates/app/bamboo-server` — 编排者
 | 位置 | 内容 |
 |---|---|
 | `app_state/builder.rs` | 配了 `subagents.broker` 就 spawn `serve_mcp_proxy`(backend = 真 `McpToolExecutor`)|
-| `app_state/tools.rs` | Root 工具面叠 `ask_agent` + `deploy_agent`（仅当配了 broker）|
+| `app_state/tools.rs` | 注册规范 `SubAgent` 和 Host 兼容调用；模型目录在 engine 中滤除物理工具 |
+| `app_state/wake_reconciler.rs` | 启动与周期性扫描持久 SessionInbox，修复错过的唤醒 |
+| `app_state/actor_events.rs` | 验证当前 ActorActivation 后投影 Actor 事件 |
 
 ---
 
-## 4. 部署能力的实现原理
+## 4. 遗留部署能力的实现原理
 
 ### ① `Deployer` trait —— "在某环境拉起 worker" 的抽象(`deploy.rs`)
 三个实现生成**同一条** `bamboo broker-agent serve …` 命令,只是放在不同环境跑:
@@ -130,13 +155,14 @@ LocalProcessDeployer   Command::new(bamboo_bin).args(…)                       
 DockerDeployer         docker run --rm --network host -v ~/.bamboo:ro <image> … 容器
 SshDeployer            ssh -tt host 'BAMBOO_BROKER_TOKEN=… bamboo …'(shell 转义) 远端
 ```
-- **token 走环境变量,绝不进 argv**(`ps` 看不到)。
+- 物理部署使用旧 broker 凭证传递方式；它不是按 ActorActivation 缩窄的权限边界。
 - 返回 `DeployedAgent`:`kill_on_drop` 子进程句柄 + 可选清理命令(docker `rm -f`)。
 
-### ② 保活注册表(`deploy_agent.rs` 的 `DeployedRegistry`)
+### ② 物理句柄缓存(`deploy_agent.rs` 的 `DeployedRegistry`)
 `DeployedAgent` 是 kill-on-drop 的——部署完若丢弃句柄,进程立刻被杀。所以工具把句柄存进
 `Arc<Mutex<HashMap<id, DeployedAgent>>>`,**随 server 生命周期存活**;`action=stop` 取出并
-优雅关闭,`action=list` 枚举。
+优雅关闭,`action=list` 枚举。缓存随 server 消失，不承担规范 Actor 的持久身份、
+transcript 或故障转移；这些属于 ActorDirectory/SessionStore。
 
 ### ③ 位置无关的接缝(Phase 0,让"远程"成为可能)
 把三个"本地死结"抽象成 trait,默认实现逐行复刻现状、零行为变化:
@@ -164,7 +190,7 @@ Docker=只读挂载 `-v ~/.bamboo:/root/.bamboo:ro`;ssh=远端那份)→ 填 `Ca
 
 ---
 
-## 5. CLI 命令面
+## 5. CLI 与工具面
 
 ```bash
 # 中心 broker(可对外)
@@ -176,13 +202,17 @@ bamboo broker-agent serve --broker ws://host:9600 --token $T \
     [--mcp-proxy bamboo-orchestrator]                        # 把 MCP 代理回编排者
 
 # 编排者:config 里设 subagents.broker {endpoint, token}
-#   → root agent 自动获得 deploy_agent + ask_agent 两个工具
+#   → Host 获得 broker 传输/兼容管理能力；Root/Child 模型仍只见 SubAgent
 ```
 
-工具(LLM 在 loop 内调用):
+下列工具是 Host/兼容调用，不进入 Root/Child 的模型目录：
 - `deploy_agent(action=deploy, env=local|docker|ssh, model, image?, host?, echo?)` → `{id}`
 - `deploy_agent(action=stop, id)` / `deploy_agent(action=list)`
 - `ask_agent(target=id, question, mode=query|steer, timeout_secs?)` → `{answer}`
+
+模型创建、继续、检查和控制规范 Child 时调用 `SubAgent`，以 ActorId 寻址。
+Host 执行时从持久 Session/Inbox 和当前 activation fence 推导权限，不使用模型传入的
+worker id、broker mailbox、endpoint 或容器 id 作为身份。
 
 ---
 
@@ -191,15 +221,17 @@ bamboo broker-agent serve --broker ws://host:9600 --token $T \
 ```jsonc
 "subagents": {
   "max_concurrent": 200,
-  "broker": { "endpoint": "ws://broker-host:9600", "token": "…" },  // 启用 broker 工具 + MCP 代理服务
+  "broker": { "endpoint": "ws://broker-host:9600", "token": "…" },  // broker 传输与 Host 兼容服务
   "mcp_role_allowlist": [                                          // 可选(issue #54):按角色收窄代理工具面
     { "role": "researcher", "tools": ["fetch_url"] },
     { "role": "sandboxed", "tools": [] }                           // 空数组 = 显式锁死(0 工具)
   ]
 }
 ```
-配了 `subagents.broker` 才会:Root 工具面挂上 `deploy_agent`/`ask_agent`,且 server 启动
-`serve_mcp_proxy`。
+配了 `subagents.broker` 后 Host 可注册 `deploy_agent`/`ask_agent` 兼容调用并启动
+`serve_mcp_proxy`；Root/Child 的模型目录仍滤除物理工具。远端规范 Run 还要求 scoped
+PeerPolicy、当前 ActorActivation、精确 broker 身份及 EnvironmentLease；一个 endpoint/token
+配置本身不授予执行权限。
 
 `mcp_role_allowlist` 为空(默认)= 每个角色都不受限,行为与 #54 之前完全一致。列出的角色只能
 看到/调用其 `tools` 里的工具(manifest 过滤 + Call 兜底拒绝双重生效);未列出的角色仍不受限。
@@ -217,11 +249,11 @@ sub-agent 的完整事件流只发布到它自己的 session channel；parent ch
 `SubAgentStarted` / `SubAgentHeartbeat` / `SubAgentCompleted`。因此 200 个并行 child
 不会把逐 token 事件递归复制到每一层祖先，前端打开 child session 时仍可直接订阅其完整事件。
 
-actor wire 使用 `ActorEventBatch`，路由键为 logical session，fence 由
-`activation_id + execution_epoch + source_actor_id` 组成，batch 内用单调 `seq` 排序。本地 actor
-和 `Schedulable` Cluster actor 走 broker path；迟到的旧 worker frame 会在 host 侧被拒绝。
-固定 `Placement::Remote` 目前仍走 direct WebSocket，只共享 batch wire，尚未统一到 broker 的
-durable path。
+actor wire 使用 `ActorEventBatch`，路由键为 logical Session。规范本地 Child 与固定
+`Placement::Remote` Child 均走 broker；Host 根据持久 ActorDirectory 的 activation/lease
+fence 和单调序列验收 Event/Outcome，迟到的旧 worker frame 不得推进新 Run。历史直连
+WebSocket 是兼容路径，不能作为规范远端 Actor 的确认或故障转移证明。Schedulable
+Cluster 的物理部署能力仍需接入统一 ActorActivation 才满足 #791。
 
 | QoS | 典型事件 | 传输语义 |
 |---|---|---|
@@ -229,9 +261,10 @@ durable path。
 | `snapshot` | runner/token-budget/context-pressure gauge | 有界 live lane；过载可丢，后续 batch 的 sequence gap 可暴露丢失 |
 | `ephemeral` | token/reasoning token/heartbeat | 有界 live lane；批量，过载可丢 |
 
-`task_list_item_progress` 是 delta，不是全量 snapshot，因此走 `durable`。当前 host 对 sequence gap
-只记录告警；“向前端发出 reload control 并从 session snapshot 恢复”仍是下一阶段契约，不能把
-现有告警等同于已经完成恢复。
+`task_list_item_progress` 是 delta，不是全量 snapshot，因此走 `durable`。当前
+`ActorEventRouter` 能拒绝失序、重复和旧 activation frame，并以有界 replay window 报告
+sequence gap；Lotus Next 对其可见 Actor 使用快照/历史恢复。端到端持久 event cursor 与
+所有 broker 失联边界的恢复仍需 #791 的故障注入验收。
 
 每个 worker 固定使用一条 inbound subscription，加 control/event 两条 outbound uplink；连接数不再随
 并行 Run 数量线性增加。control 与 event 队列独立，cancel/approval/admission 不会排在 token 后面；
@@ -240,24 +273,16 @@ active actor，但 warm-idle pool 单独限制为 16，避免为了并发上限�
 
 ### 7.1 当前边界与下一阶段
 
-当前实现解决的是事件放大、队列无界增长和 worker uplink 随 Run 增长的问题，尚不是完整的
-可重放 Session Home。合并更高并发 Cluster 执行前还需要：
+当前已经有分离的 control/event uplink、有界事件 replay、Host 侧 Run receipt，以及
+broker PeerPolicy 认证的 Host 容量观测和原子 slot 预留。这些基础仍不等于完整的跨 Host
+Actor 管理。#791 还需：
 
-1. `Outcome` 携带最终 event-seq watermark；尾部 live batch 丢失时也能检测，而不依赖下一批事件。
-2. durable Event/Outcome 在 host 验证、幂等 apply 并 checkpoint cursor 后再 ACK；不能在
-   `BrokerChildLink` 解码后立即 ACK。
-3. control/event uplink 由统一 supervisor 管理；关键 lane 断开即撤销 worker readiness，Outcome
-   投递失败不得把原 Run 标成已处理。
-4. executor 目前已有本地 Run-slot 隔离：安全默认值为 1，只有无共享可变状态的实现可显式提高；
-   因此真实 `BambooRuntimeExecutor` 不会并行复用 permission config / escalation bridge。下一步仍需
-   worker 对外发布 `max_slots` 并由 scheduler 原子租约；全局 200 并行由多个 worker/slot 提供。
-5. parent ingress 改为少量 session-hash shard，而不是每 Run 一条 WebSocket；否则 200 个本地
-   worker 的 broker accepted FD 加 host client FD 会逼近常见的 `RLIMIT_NOFILE=1024`。
-6. 持久化 `session_id -> home_node + home_epoch + lease`；frontend 使用
-   `snapshot + cursor + live tail`，非 home gateway proxy 或订阅共享 session topic。
-
-此外，`source_node_id` 尚未由 broker 可信地 stamp，worker role/actor identity 仍是 bearer-token
-连接自报。跨节点 fencing 最终应绑定认证连接身份，而不是只信任 payload。
+1. 将 scheduler 预留、broker 连接代际、ActorActivation 和 EnvironmentLease 绑定到
+   一次原子可恢复的 Run 准入；Host 失联后在另一个合格 Host 上重试同一 ActorId。
+2. 完成不确定 ACK/receipt 的活性修复，证明断线和重放后不会丢失旧 Outcome 或双写 transcript。
+3. 在高并发和重启故障注入下证明事件缺口能以规范快照/历史恢复，并证明 100+ Actor
+   只对可见对象建立有界订阅；当前 UI 的 129 Actor 浏览器用例使用模拟快照。
+4. 对复用的 WorkerHost 验证跨 Root/Project 的 transcript、批准、取消、workspace 和密钥清理。
 
 滚动升级时，`execution_epoch = 0` 选择旧的逐事件 wire；新 host 发出的非零 epoch 才启用 batch
 协议。`ChildOutcome.transcript` 目前只是兼容字段：host 不消费它，session checkpoint 才是 transcript
@@ -277,15 +302,9 @@ active actor，但 warm-idle pool 单独限制为 16，避免为了并发上限�
 
 ---
 
-## 8. 演进与延后(roadmap)
+## 9. 演进与延后(roadmap)
 
-已交付:**Change A**(actor-only)→ **Phase 0**(远程接缝)→ **Phase 1**(broker + serve + 部署 + ask)
-→ **P1**(skills + URL MCP 同步)→ **P2**(MCP-over-broker 代理)。
-
-明确延后到 **P3**:
-- 用 scoped secrets envelope 取代 Docker 整目录挂载(避免把全量密钥暴露给容器)
-- ssh/远端的 skills bundle 投递(content-addressed)
-- 按 subagent profile / role 的 allowlist 收窄同步集
-- MCP 代理断线重连;manifest 只暴露 stdio(现在暴露全部,功能正确但 SSE 多一跳)
-- `bind_tls`/`wss://` + 远端 `ConnectLauncher`/`Placement::Remote` 全链路(remote-actor-plan.md P1)
-- 联邦式 broker 互相指挥 —— **明确不做**(中心辐射)
+已交付的物理部署、ask 和 MCP 代理能力属于兼容链路。#791 已交付规范本地 Child、固定
+scoped WSS broker Child Run、干净 Git EnvironmentLease v1、HostRegistry/slot 预留基础。
+通用 auto/pinned 调度执行、跨 Host 迁移/故障转移、Docker/SSH/scheduled 统一身份，及
+更广的 EnvironmentLease/Artifact Store 仍待验收。联邦式 broker 不在 #791 范围内。

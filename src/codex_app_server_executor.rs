@@ -1723,6 +1723,7 @@ done
                             auto_approve_permissions,
                             session_id: format!("stub-{approved:?}-{auto_approve_permissions}"),
                             workspace_path: Some(root.path().to_string_lossy().into_owned()),
+                            environment_lease: None,
                             inherit_session_grants: false,
                             policy: serde_json::to_value(
                                 bamboo_tools::permission::SerializablePermissionConfig::default(),
@@ -2050,6 +2051,7 @@ exit 2
                         auto_approve_permissions: true,
                         session_id: "codex-app-server-explicit-deny".to_string(),
                         workspace_path: Some(root.path().to_string_lossy().into_owned()),
+                        environment_lease: None,
                         inherit_session_grants: false,
                         policy: serde_json::to_value(policy).unwrap(),
                     }),
