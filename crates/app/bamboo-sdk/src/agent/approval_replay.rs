@@ -22,6 +22,8 @@ pub(super) enum ReplayDisposition {
     AwaitingApproval(PendingQuestion),
 }
 
+const REPLAY_SAVE_RECOVERY_REQUIRED_KEY: &str = "permission.replay_save_recovery_required";
+
 fn invalid(message: &str) -> AgentError {
     AgentError::Tool(format!("permission replay {message}"))
 }
@@ -120,6 +122,14 @@ impl Agent {
         session: &mut Session,
         event_tx: &mpsc::Sender<AgentEvent>,
     ) -> Result<ReplayDisposition, AgentError> {
+        if session
+            .metadata
+            .contains_key(REPLAY_SAVE_RECOVERY_REQUIRED_KEY)
+        {
+            return Err(invalid(
+                "blocked replay save outcome is uncertain; reload the session from durable storage",
+            ));
+        }
         let call_id = session
             .metadata
             .get(PERMISSION_REEXECUTE_METADATA_KEY)
@@ -214,19 +224,40 @@ impl Agent {
 
         let tool_call = target.tool_call();
         let tool_name = &tool_call.function.name;
-        let replay_owner = execution_name.clone().unwrap_or_else(|| {
+        let replay_owner = execution_name.clone().or_else(|| {
             resolve_tool_reference_name(tool_name, |name| executor.owns_exact_tool(name))
-                .unwrap_or_else(|| tool_name.clone())
         });
-        let executing_supervisor =
-            validate_permission_replay_authority(session, &target, &replay_owner)?;
+        let executing_supervisor = validate_permission_replay_authority(
+            session,
+            &target,
+            replay_owner.as_deref().unwrap_or(tool_name),
+        )?;
         let decision = refresh_approval_replay_posture(
             self.storage().as_ref(),
             session,
             self.permission_mode,
-            execution_name.as_deref().unwrap_or(tool_name),
+            replay_owner.as_deref(),
         )
         .await?;
+        let flags = match decision {
+            ApprovalReplayDecision::Execute(flags) => flags,
+            ApprovalReplayDecision::BlockedByPlan(_) => {
+                self.persist_blocked_permission_replay(session, &target, format!(
+                    "Plan mode blocked approved mutating tool '{tool_name}'; the stale approval was not executed")).await?;
+                return Ok(ReplayDisposition::Continue);
+            }
+            ApprovalReplayDecision::BlockedByRootToolAuthority => {
+                self.persist_blocked_permission_replay(session, &target, format!(
+                    "Root orchestration policy blocked approved tool '{tool_name}'; the stale approval was not executed")).await?;
+                return Ok(ReplayDisposition::Continue);
+            }
+            ApprovalReplayDecision::BlockedByUnavailableTool => {
+                self.persist_blocked_permission_replay(session, &target, format!(
+                    "Approved tool '{tool_name}' is no longer available; the stale approval was not executed")).await?;
+                return Ok(ReplayDisposition::Continue);
+            }
+        };
+        let replay_owner = replay_owner.expect("Execute requires a registered execution owner");
         if request.is_some() {
             let config = self
                 .permission_checker
@@ -235,18 +266,6 @@ impl Agent {
                 .ok_or_else(|| invalid("typed authorization requires a PermissionConfig"))?;
             restore_permission_replay_authorization(&config, session, &target, &replay_owner)?;
         }
-        let flags = match decision {
-            ApprovalReplayDecision::Execute(flags) => flags,
-            ApprovalReplayDecision::BlockedByPlan(_) => {
-                if !apply_permission_replay_result(session, &target, format!(
-                    "Plan mode blocked approved mutating tool '{tool_name}'; the stale approval was not executed"), false) {
-                    return Err(invalid("result occurrence changed"));
-                }
-                clear_markers(session);
-                self.save_permission_replay(session).await?;
-                return Ok(ReplayDisposition::Continue);
-            }
-        };
 
         let is_mutating = bamboo_tools::orchestrator::classify_tool(tool_name)
             == bamboo_tools::orchestrator::ToolMutability::Mutating;
@@ -365,6 +384,42 @@ impl Agent {
             }));
         }
         Ok(ReplayDisposition::Continue)
+    }
+
+    async fn persist_blocked_permission_replay(
+        &self,
+        session: &mut Session,
+        target: &PermissionReplayTarget,
+        reason: String,
+    ) -> Result<(), AgentError> {
+        let before = session.clone();
+        if !apply_permission_replay_result(session, target, reason, false) {
+            return Err(invalid("result occurrence changed"));
+        }
+        clear_markers(session);
+        if let Err(error) = self.save_permission_replay(session).await {
+            // A save may commit the blocked result and then report a late I/O
+            // error. The caller owns this Session and may retry the same value,
+            // so reconcile directly with durable storage before returning.
+            match self.storage().load_session(&session.id).await {
+                Ok(Some(durable))
+                    if before
+                        .clone()
+                        .adopt_root_tool_authority_from(&durable)
+                        .is_ok() =>
+                {
+                    *session = durable;
+                }
+                Ok(Some(_)) | Ok(None) | Err(_) => {
+                    *session = before;
+                    session
+                        .metadata
+                        .insert(REPLAY_SAVE_RECOVERY_REQUIRED_KEY.into(), "true".into());
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn save_permission_replay(&self, session: &mut Session) -> Result<(), AgentError> {

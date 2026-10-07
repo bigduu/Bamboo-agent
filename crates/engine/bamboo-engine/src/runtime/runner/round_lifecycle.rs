@@ -40,9 +40,56 @@ pub(in crate::runtime::runner) fn is_openai_client_tool_search_boundary(
 }
 
 fn request_tool_schemas_for_loading_mode<'a>(
+    session: &Session,
     tool_schemas: &'a [ToolSchema],
     mode: bamboo_domain::CapabilityLoadingMode,
+    required_tool: Option<&str>,
 ) -> Cow<'a, [ToolSchema]> {
+    if session.root_orchestration_only_enabled() {
+        // The full bounded catalog is already selected for this Root. A
+        // provider-specific discovery gateway must not reintroduce an
+        // unapproved tenth tool after that selection.
+        return Cow::Owned(
+            tool_schemas
+                .iter()
+                .filter(|schema| {
+                    bamboo_domain::ClassifiedToolSchema::new((**schema).clone()).is_some_and(
+                        |entry| session.allows_model_tool_execution(entry.execution_name()),
+                    )
+                })
+                .cloned()
+                .collect(),
+        );
+    }
+    if mode == bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog {
+        // Legacy providers keep every other Deferred function unchanged. Only
+        // the shared browser is replaced with a small discovery gateway until
+        // this chat has a validated browser definition in its own history.
+        if !crate::runtime::runner::loop_execution::legacy_browser_needs_discovery(
+            session,
+            tool_schemas,
+            required_tool,
+        ) {
+            return Cow::Borrowed(tool_schemas);
+        }
+
+        let mut projected = tool_schemas
+            .iter()
+            .filter(|schema| schema.function.name != "browser")
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut discovery = bamboo_domain::discovery_control_fallback_schema();
+        discovery.function.description = "Search for and load the browser page shared with this chat. Use query `browser`; its full action schema becomes available after discovery.".into();
+        discovery.function.parameters = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"query": {"type": "string", "enum": ["browser"]}},
+            "required": ["query"]
+        });
+        projected.push(discovery);
+        return Cow::Owned(projected);
+    }
+
     if mode != bamboo_domain::CapabilityLoadingMode::StickyFallback {
         return Cow::Borrowed(tool_schemas);
     }
@@ -71,7 +118,12 @@ pub(crate) async fn request_tool_schemas_for_session<'a>(
 ) -> Cow<'a, [ToolSchema]> {
     let required_tool = required_tool_for_session(session);
     let capability_loading_mode = llm.capability_loading_mode(model_name, required_tool).await;
-    request_tool_schemas_for_loading_mode(tool_schemas, capability_loading_mode)
+    request_tool_schemas_for_loading_mode(
+        session,
+        tool_schemas,
+        capability_loading_mode,
+        required_tool,
+    )
 }
 
 pub(crate) struct RoundLlmExecutionOutput {
@@ -246,7 +298,8 @@ pub(crate) async fn maybe_apply_mid_turn_context_compression(
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_llm_round, is_openai_client_tool_search_boundary, request_tool_schemas_for_session,
+        execute_llm_round, is_openai_client_tool_search_boundary,
+        request_tool_schemas_for_loading_mode, request_tool_schemas_for_session,
     };
     use async_trait::async_trait;
     use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
@@ -341,6 +394,92 @@ mod tests {
         }
     }
 
+    #[test]
+    fn legacy_browser_projection_is_browser_only_and_explicit_required_tool_bypasses_it() {
+        let session = Session::new("legacy-browser", "chat-model");
+        let mut browser = schema("browser");
+        browser.function.parameters = json!({
+            "type":"object",
+            "properties":{
+                "action":{"type":"string","enum":["navigate","snapshot","click","fill","press","scroll","screenshot"]},
+                "url":{"type":"string"},
+                "selector":{"type":"string"},
+                "text":{"type":"string"},
+                "expected_epoch":{"type":"integer"}
+            },
+            "required":["action"],
+            "additionalProperties":false
+        });
+        let tools = vec![schema("Read"), schema("Glob"), browser];
+        let initial = request_tool_schemas_for_loading_mode(
+            &session,
+            &tools,
+            CapabilityLoadingMode::LegacyFullCatalog,
+            None,
+        );
+        let names = initial
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Read", "Glob", "discover_capabilities"]);
+        assert_eq!(
+            serde_json::to_value(&initial[1]).unwrap(),
+            serde_json::to_value(&tools[1]).unwrap(),
+            "other Deferred tools stay unchanged"
+        );
+        assert!(initial[2].function.description.contains("browser page"));
+        assert_eq!(
+            initial[2].function.parameters["properties"]["query"]["enum"],
+            json!(["browser"])
+        );
+
+        let explicit = request_tool_schemas_for_loading_mode(
+            &session,
+            &tools,
+            CapabilityLoadingMode::LegacyFullCatalog,
+            Some("browser"),
+        );
+        assert_eq!(
+            serde_json::to_value(explicit.as_ref()).unwrap(),
+            serde_json::to_value(&tools).unwrap()
+        );
+        let other_required = request_tool_schemas_for_loading_mode(
+            &session,
+            &tools,
+            CapabilityLoadingMode::LegacyFullCatalog,
+            Some("load_skill"),
+        );
+        assert!(other_required
+            .iter()
+            .all(|tool| tool.function.name != "browser"));
+        let native = request_tool_schemas_for_loading_mode(
+            &session,
+            &tools,
+            CapabilityLoadingMode::Progressive,
+            None,
+        );
+        assert_eq!(
+            serde_json::to_value(native.as_ref()).unwrap(),
+            serde_json::to_value(&tools).unwrap()
+        );
+        assert_eq!(
+            bamboo_domain::ClassifiedToolSchema::new(tools[2].clone())
+                .unwrap()
+                .loading_class(),
+            bamboo_domain::CapabilityLoadingClass::Deferred
+        );
+        let no_browser = request_tool_schemas_for_loading_mode(
+            &session,
+            &tools[..2],
+            CapabilityLoadingMode::LegacyFullCatalog,
+            None,
+        );
+        assert_eq!(
+            serde_json::to_value(no_browser.as_ref()).unwrap(),
+            serde_json::to_value(&tools[..2]).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn sticky_overflow_projection_uses_core_plus_discovery_catalog() {
         let provider = Arc::new(StickyCapturingProvider {
@@ -368,6 +507,50 @@ mod tests {
         assert!(request_tools.iter().all(|tool| {
             tool.function.name != "ReadArchive" && tool.function.name != "Workspace"
         }));
+    }
+
+    #[tokio::test]
+    async fn selected_root_provider_never_receives_discovery_or_denied_tools() {
+        let provider = Arc::new(StickyCapturingProvider {
+            requests: Mutex::new(Vec::new()),
+        });
+        let llm: Arc<dyn LLMProvider> = provider.clone();
+        let mut session = Session::new("selected-root-tools", "chat-model");
+        session.set_root_orchestration_only(true).unwrap();
+        session.add_message(Message::user("coordinate this task"));
+        let config = AgentLoopConfig {
+            model_name: Some("chat-model".to_string()),
+            ..Default::default()
+        };
+        let tools = vec![
+            schema("Read"),
+            schema("SubAgent"),
+            schema("Plan"),
+            schema("Task"),
+            schema("Bash"),
+            schema("discover_capabilities"),
+        ];
+        let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+        execute_llm_round(
+            &mut session,
+            &config,
+            &llm,
+            &event_tx,
+            &CancellationToken::new(),
+            "selected-root-tools",
+            "chat-model",
+            &tools,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            provider.requests.lock().unwrap()[0]
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Read", "SubAgent", "Plan", "Task"]
+        );
     }
 
     #[tokio::test]

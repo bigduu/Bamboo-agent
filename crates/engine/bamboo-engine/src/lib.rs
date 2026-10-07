@@ -13,6 +13,7 @@ pub mod llm_summarizer;
 pub mod message_hooks;
 pub mod model_areas;
 pub mod model_config_helper;
+pub mod placement_scheduler;
 pub mod project_context;
 pub mod prompt_defaults;
 pub mod resolved_defaults;
@@ -21,10 +22,14 @@ pub mod sdk;
 pub mod session_activation;
 pub mod session_app;
 pub mod session_cache;
+pub mod ticket_runtime;
+pub mod ticket_worker_plan;
 pub use session_cache::SessionSnapshot;
 pub mod session_messaging;
 pub mod session_repository;
 pub use session_repository::SessionRepository;
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
 pub mod title_gen;
 pub mod token_usage_log;
 pub mod workflow_run;
@@ -70,6 +75,10 @@ pub use runtime::config::{
     GuardianSpawner, ImageFallbackConfig, ImageFallbackMode,
 };
 pub use runtime::execution::runner_state::{AgentRunner, AgentStatus};
+pub use runtime::execution::{
+    VisibleAssistantMessage, VisibleMessageEvent, VisibleMessageEventKind, VisibleMessageSnapshot,
+    VisibleMessageStream,
+};
 pub use runtime::hooks::{
     test_lifecycle_handler, test_lifecycle_shell_command, HookRunner, LifecycleHookEvent,
     LifecycleHookTestOutput, LifecycleScriptRunner, ScriptHook, ShellCommandHook, ShellHookEvent,
@@ -121,3 +130,6 @@ pub mod task_evaluation {
 pub mod agent {
     pub use crate::runtime::agent::*;
 }
+
+#[cfg(test)]
+mod inherited_wait_regression_tests;

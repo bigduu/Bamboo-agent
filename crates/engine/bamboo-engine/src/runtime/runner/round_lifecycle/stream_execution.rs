@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error as StdError;
 use std::sync::Arc;
 
@@ -14,8 +14,8 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
     build_goal_context_block, build_history_boundary_context_block,
     build_instruction_overlay_context_block, build_plan_mode_context_block,
     build_plan_runtime_context_block, build_project_resources_context_block,
-    build_session_identity_context_block, build_task_list_context_block,
-    build_workspace_context_block,
+    build_root_orchestration_context_block, build_session_identity_context_block,
+    build_task_list_context_block, build_workspace_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
@@ -29,9 +29,9 @@ use bamboo_agent_core::{
 use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenCounter};
 use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
-    provider_transcript_boundary_sha256, CompressionEventKind, CompressionTriggerType,
-    ModelContextEventKind, ModelContextResetReason, ProviderFamily, ProviderProtocol,
-    ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    provider_transcript_boundary_sha256, CapabilityLoadingMode, CompressionEventKind,
+    CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, ProviderFamily,
+    ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::provider::ResponsesRequestOptions;
 use bamboo_llm::{
@@ -66,6 +66,8 @@ const INTERRUPTED_ASSISTANT_OUTPUT_KIND: &str = "interrupted_assistant_output";
 const AGENT_LOOP_REQUEST_PURPOSE: &str = "agent_loop";
 const PROMPT_CACHE_KEY_DOMAIN: &[u8] = b"bamboo/openai/responses/prompt-cache-key/v1\0";
 const MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES: usize = 2;
+const LOADED_BROWSER_ACKNOWLEDGEMENT: &str =
+    "Browser loaded. Its complete schema is in the tools for this request.";
 
 fn context_management_telemetry(
     session: &Session,
@@ -147,6 +149,9 @@ fn append_interrupted_assistant_output(
         None,
         (!partial.reasoning_content.is_empty()).then_some(partial.reasoning_content),
     );
+    if let Some(identity) = partial.visible_message {
+        message = identity.apply_to(message);
+    }
     message.phase = Some(MessagePhase::Commentary);
     message.reasoning_signature = None;
     message.metadata = Some(serde_json::json!({
@@ -164,23 +169,24 @@ fn append_interrupted_assistant_output(
 pub(crate) fn discard_latest_interrupted_assistant_output(
     session: &mut Session,
     attempt_tail_message_id: Option<&str>,
-) -> bool {
-    let interrupted = session.messages.last().is_some_and(|message| {
+) -> Option<String> {
+    let interrupted_message_id = session.messages.last().and_then(|message| {
         if Some(message.id.as_str()) == attempt_tail_message_id {
-            return false;
+            return None;
         }
-        message
+        (message
             .metadata
             .as_ref()
             .and_then(|metadata| metadata.get("runtime_kind"))
             .and_then(serde_json::Value::as_str)
-            == Some(INTERRUPTED_ASSISTANT_OUTPUT_KIND)
+            == Some(INTERRUPTED_ASSISTANT_OUTPUT_KIND))
+        .then(|| message.id.clone())
     });
-    if interrupted {
+    if interrupted_message_id.is_some() {
         session.messages.pop();
         session.updated_at = chrono::Utc::now();
     }
-    interrupted
+    interrupted_message_id
 }
 
 fn session_previous_response_id(session: &Session) -> Option<&str> {
@@ -428,6 +434,9 @@ pub(super) struct ProjectedRequestUsage {
     /// Complete token cost of model-context snapshot messages that carry the
     /// current archived-history boundary.
     pub history_boundary_input_tokens: u32,
+    /// The transformed message vector after any provider-only history
+    /// projection. Refit must subtract this count rather than durable bytes.
+    pub prepared_message_input_tokens: u32,
 }
 
 fn measure_request_usage(
@@ -513,13 +522,14 @@ fn measure_request_usage(
         tool_schema_late_bound_segment_count,
         ledger_rendered_bytes,
         history_boundary_input_tokens,
+        prepared_message_input_tokens: 0,
     }
 }
 
 pub(in crate::runtime::runner) fn required_tool_for_session(
     session: &Session,
 ) -> Option<&'static str> {
-    crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(session)
+    crate::runtime::runner::session_setup::legacy_instruction::explicit_activation_pending(session)
         .then_some("load_skill")
 }
 
@@ -539,6 +549,36 @@ pub(in crate::runtime::runner) fn effective_tool_schemas<'a>(
     )
 }
 
+fn legacy_browser_results_for_projection(
+    session: &Session,
+    tool_schemas: &[ToolSchema],
+    loading_mode: CapabilityLoadingMode,
+) -> Option<BTreeMap<String, String>> {
+    if loading_mode != CapabilityLoadingMode::LegacyFullCatalog
+        || !tool_schemas
+            .iter()
+            .any(|schema| schema.function.name == "browser")
+    {
+        return None;
+    }
+    let results =
+        crate::runtime::runner::loop_execution::legacy_browser_loaded_result_content(session);
+    (!results.is_empty()).then_some(results)
+}
+
+fn project_legacy_browser_history(messages: &mut [Message], results: &BTreeMap<String, String>) {
+    for message in messages {
+        if message.role == Role::Tool
+            && message.content_parts.is_none()
+            && results
+                .get(&message.id)
+                .is_some_and(|original| original == &message.content)
+        {
+            message.content = LOADED_BROWSER_ACKNOWLEDGEMENT.to_string();
+        }
+    }
+}
+
 /// Project the exact PromptIR message input after ledger reconciliation without
 /// mutating the live session. Context preparation uses this shadow pass to
 /// reserve space for snapshots that are created only after ordinary message
@@ -554,12 +594,26 @@ pub(super) async fn project_request_usage(
     let mut shadow = session.clone();
     let required_tool = required_tool_for_session(&shadow);
     let effective_tool_schemas = effective_tool_schemas(&shadow, tool_schemas);
-    let envelope = build_request_envelope_reconciled(
+    let loading_mode = llm.capability_loading_mode(model, required_tool).await;
+    let browser_results = legacy_browser_results_for_projection(
+        &shadow,
+        effective_tool_schemas.as_ref(),
+        loading_mode,
+    );
+    let prepared_message_input_tokens = if let Some(results) = browser_results.as_ref() {
+        let mut projected = prepared_context.messages.clone();
+        project_legacy_browser_history(&mut projected, results);
+        TiktokenTokenCounter::default().count_messages(&projected)
+    } else {
+        TiktokenTokenCounter::default().count_messages(&prepared_context.messages)
+    };
+    let envelope = build_request_envelope_reconciled_for_loading_mode(
         &mut shadow,
         prepared_context,
         config,
         effective_tool_schemas.as_ref(),
         model,
+        loading_mode,
     );
     let tool_footprint = llm
         .provider_visible_tool_footprint(
@@ -574,15 +628,36 @@ pub(super) async fn project_request_usage(
                 "provider-visible tool footprint projection failed: {error}"
             ))
         })?;
-    Ok(measure_request_usage(&shadow, &envelope, &tool_footprint))
+    let mut usage = measure_request_usage(&shadow, &envelope, &tool_footprint);
+    usage.prepared_message_input_tokens = prepared_message_input_tokens;
+    Ok(usage)
 }
 
+#[cfg(test)]
 fn build_request_envelope_reconciled(
     session: &mut Session,
     prepared_context: &PreparedContext,
     config: &AgentLoopConfig,
     tool_schemas: &[ToolSchema],
     model: &str,
+) -> PreparedRequestEnvelope {
+    build_request_envelope_reconciled_for_loading_mode(
+        session,
+        prepared_context,
+        config,
+        tool_schemas,
+        model,
+        CapabilityLoadingMode::LegacyFullCatalog,
+    )
+}
+
+fn build_request_envelope_reconciled_for_loading_mode(
+    session: &mut Session,
+    prepared_context: &PreparedContext,
+    config: &AgentLoopConfig,
+    tool_schemas: &[ToolSchema],
+    model: &str,
+    loading_mode: CapabilityLoadingMode,
 ) -> PreparedRequestEnvelope {
     let requested_family = ProviderFamily::from_provider_type(config.provider_type.as_deref());
     let requested_protocol = requested_family.map(|family| match family {
@@ -629,6 +704,9 @@ fn build_request_envelope_reconciled(
     // not participate in `build_compression_context_blocks`: a fork/copy must
     // never inherit a stale Session ID through generated summary text.
     let mut context_blocks = vec![build_session_identity_context_block(session)];
+    if let Some(block) = build_root_orchestration_context_block(session) {
+        context_blocks.push(block);
+    }
     let newly_activated = activated_discoverable_tools(session)
         .difference(&activated)
         .cloned()
@@ -911,7 +989,7 @@ fn build_request_envelope_reconciled(
                 .collect()
         })
         .unwrap_or_default();
-    let ir = PromptIR {
+    let mut ir = PromptIR {
         system_text: lane_system,
         system_blocks,
         segments: vec![
@@ -922,6 +1000,17 @@ fn build_request_envelope_reconciled(
         cache: cache_plan,
         continuation: None,
     };
+    if let Some(results) =
+        legacy_browser_results_for_projection(session, tool_schemas, loading_mode)
+    {
+        if let Some(transcript) = ir
+            .segments
+            .iter_mut()
+            .find(|segment| segment.role == SegmentRole::ModelTranscript)
+        {
+            project_legacy_browser_history(&mut transcript.messages, &results);
+        }
+    }
 
     // Prefix-drift diagnostics must observe only bytes that actually participate
     // in the cacheable head. Keeping dynamic assembly sections here would both
@@ -1164,7 +1253,10 @@ pub(super) async fn execute_llm_stream(
     // never persisted upstream, so its id must not be sent back (it would 400
     // with `previous_response_not_found`) nor kept in session metadata.
     let responses_policy = engine_responses_policy();
-    let continuation_enabled = responses_continuation_enabled(&responses_policy, provider_type);
+    let continuation_enabled = bamboo_domain::ChildContextBinding::from_session(session)
+        .map_err(|error| AgentError::Budget(error.to_string()))?
+        .is_none()
+        && responses_continuation_enabled(&responses_policy, provider_type);
     let mut checkpoint_reprepares = 0usize;
     let (mut prepared_envelope, previous_response_id, final_usage) = loop {
         let tool_schemas = effective_schemas.as_ref();
@@ -1177,12 +1269,14 @@ pub(super) async fn execute_llm_stream(
         };
         let previous_model_context_state = session.model_context_state.clone();
         let previous_provider_transcript = session.provider_transcript.clone();
-        let prepared_envelope = build_request_envelope_reconciled(
+        let loading_mode = llm.capability_loading_mode(model, required_tool).await;
+        let prepared_envelope = build_request_envelope_reconciled_for_loading_mode(
             session,
             &prepared_context,
             config,
             tool_schemas,
             model,
+            loading_mode,
         );
         // `prepare_round_context` reserves the already-durable ledger history. The
         // reconciliation above can append a new host-state snapshot, so verify the
@@ -1208,7 +1302,14 @@ pub(super) async fn execute_llm_stream(
             }
         };
         let final_usage = measure_request_usage(session, &prepared_envelope, &tool_footprint);
-        let request_input_limit = max_context_tokens.saturating_sub(max_output_tokens);
+        let mut request_input_limit = max_context_tokens.saturating_sub(max_output_tokens);
+        if bamboo_domain::ChildContextBinding::from_session(session)
+            .map_err(|error| AgentError::Budget(error.to_string()))?
+            .is_some()
+        {
+            request_input_limit =
+                request_input_limit.min(prepared_context.token_usage.budget_limit);
+        }
         if final_usage.input_tokens > request_input_limit
             || final_usage.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
         {
@@ -1337,6 +1438,20 @@ pub(super) async fn execute_llm_stream(
     // The provider future itself is covered by the same transport-idle policy as
     // the returned stream. This bounds proxies that accept the request but never
     // return response headers, a phase the per-frame watchdog cannot observe.
+    if let Some(binding) = bamboo_domain::ChildContextBinding::from_session(session)
+        .map_err(|error| AgentError::Budget(error.to_string()))?
+    {
+        // Check the provider-bound IR after reconciliation/checkpoint/reprepare,
+        // rather than treating a retained Session message as proof of delivery.
+        binding
+            .validate_messages(&session.id, &prepared_envelope.ir.body_chat())
+            .map_err(|error| AgentError::Budget(error.to_string()))?;
+        if prepared_envelope.ir.continuation.is_some() {
+            return Err(AgentError::Budget(
+                bamboo_domain::ChildContextPacketError::Invalid.to_string(),
+            ));
+        }
+    }
     let stream = crate::runtime::stream::handler::await_stream_bootstrap(
         llm.chat_stream_ir(
             &prepared_envelope.ir,
@@ -1428,7 +1543,7 @@ pub(super) async fn execute_llm_stream(
     // model-issued call, then later rounds stream normally once activation is
     // mirrored into the runner-owned Session.
     let stream_output_result =
-        if crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(
+        if crate::runtime::runner::session_setup::legacy_instruction::explicit_activation_pending(
             session,
         ) {
             crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(

@@ -20,10 +20,47 @@
 //! Everything else (other 4xx, JSON errors, success) is returned to the caller
 //! immediately and unchanged.
 
-use std::sync::OnceLock;
+use std::future::Future;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use reqwest::{RequestBuilder, Response, StatusCode};
+
+/// Secret-free evidence from the most recent retryable HTTP response while
+/// establishing one provider stream. A fresh observer is scoped to each
+/// bootstrap request so concurrent sessions cannot exchange diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitialHttpRetry {
+    pub status: u16,
+    pub delay: Duration,
+}
+
+#[derive(Debug, Default)]
+pub struct InitialHttpRetryObserver(Mutex<Option<InitialHttpRetry>>);
+
+impl InitialHttpRetryObserver {
+    pub fn last(&self) -> Option<InitialHttpRetry> {
+        *self.0.lock().expect("initial HTTP retry observer poisoned")
+    }
+
+    fn record(&self, status: StatusCode, delay: Duration) {
+        *self.0.lock().expect("initial HTTP retry observer poisoned") = Some(InitialHttpRetry {
+            status: status.as_u16(),
+            delay,
+        });
+    }
+}
+
+tokio::task_local! {
+    static INITIAL_HTTP_RETRY_OBSERVER: Arc<InitialHttpRetryObserver>;
+}
+
+pub async fn observe_initial_http_retries<F: Future>(
+    observer: Arc<InitialHttpRetryObserver>,
+    future: F,
+) -> F::Output {
+    INITIAL_HTTP_RETRY_OBSERVER.scope(observer, future).await
+}
 
 /// Default number of *retries* after the first attempt (issue #18: "max 3
 /// retries"). Total default attempts = `DEFAULT_MAX_RETRIES + 1`.
@@ -215,6 +252,9 @@ where
                     .map(|d| d.min(RETRY_AFTER_CEILING))
                     .unwrap_or_else(|| backoff_delay(config, attempt));
 
+                let _ =
+                    INITIAL_HTTP_RETRY_OBSERVER.try_with(|observer| observer.record(status, delay));
+
                 tracing::warn!(
                     "[{provider}] transient HTTP {} on attempt {}/{}; retrying in {}ms",
                     status.as_u16(),
@@ -331,6 +371,66 @@ mod tests {
         let resp = run(&fast_config(3), &server).await.unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(hits.load(Ordering::SeqCst), 3, "two 429s then one success");
+    }
+
+    #[tokio::test]
+    async fn initial_retry_observer_records_only_status_and_delay() {
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .respond_with(FlakyResponder {
+                fail_count: 1,
+                first_status: 429,
+                hits,
+            })
+            .mount(&server)
+            .await;
+        let observer = Arc::new(InitialHttpRetryObserver::default());
+
+        let response =
+            observe_initial_http_retries(observer.clone(), run(&fast_config(2), &server))
+                .await
+                .unwrap();
+        assert_eq!(response.status(), 200);
+        let retry = observer.last().expect("429 must be observed before retry");
+        assert_eq!(retry.status, 429);
+        assert!(retry.delay <= Duration::from_millis(5));
+    }
+
+    #[tokio::test]
+    async fn concurrent_initial_retry_observers_are_isolated() {
+        let first = Arc::new(InitialHttpRetryObserver::default());
+        let second = Arc::new(InitialHttpRetryObserver::default());
+        let ((), ()) = tokio::join!(
+            observe_initial_http_retries(first.clone(), async {
+                INITIAL_HTTP_RETRY_OBSERVER.with(|observer| {
+                    observer.record(StatusCode::TOO_MANY_REQUESTS, Duration::from_secs(60))
+                });
+                tokio::task::yield_now().await;
+                assert_eq!(
+                    INITIAL_HTTP_RETRY_OBSERVER
+                        .with(|observer| observer.last())
+                        .unwrap()
+                        .status,
+                    429
+                );
+            }),
+            observe_initial_http_retries(second.clone(), async {
+                INITIAL_HTTP_RETRY_OBSERVER.with(|observer| {
+                    observer.record(StatusCode::SERVICE_UNAVAILABLE, Duration::from_secs(1))
+                });
+                tokio::task::yield_now().await;
+                assert_eq!(
+                    INITIAL_HTTP_RETRY_OBSERVER
+                        .with(|observer| observer.last())
+                        .unwrap()
+                        .status,
+                    503
+                );
+            }),
+        );
+        assert_eq!(first.last().unwrap().status, 429);
+        assert_eq!(second.last().unwrap().status, 503);
     }
 
     #[tokio::test]

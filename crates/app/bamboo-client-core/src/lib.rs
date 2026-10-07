@@ -19,6 +19,8 @@ fn default_allow_custom() -> bool {
 #[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    #[serde(rename = "none")]
+    Disabled,
     Low,
     Medium,
     High,
@@ -27,10 +29,18 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    pub const ALL: [Self; 5] = [Self::Low, Self::Medium, Self::High, Self::Xhigh, Self::Max];
+    pub const ALL: [Self; 6] = [
+        Self::Disabled,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Xhigh,
+        Self::Max,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Disabled => "none",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -45,6 +55,14 @@ impl ReasoningEffort {
 #[derive(Serialize, Clone, Debug)]
 pub struct ChatRequest {
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     /// Stable Project membership for a new root session. Existing sessions may
@@ -67,6 +85,10 @@ pub struct ChatRequest {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct ChatResponse {
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub ingress_seq: Option<u64>,
     pub session_id: String,
     pub stream_url: String,
     pub status: String,
@@ -79,6 +101,10 @@ mod chat_request_tests {
     #[test]
     fn chat_request_serializes_project_identity_for_new_root_session() {
         let value = serde_json::to_value(ChatRequest {
+            message_id: None,
+            thread_id: None,
+            in_reply_to: None,
+            correlation_id: None,
             message: "hello".to_string(),
             session_id: None,
             project_id: Some("project-client".to_string()),

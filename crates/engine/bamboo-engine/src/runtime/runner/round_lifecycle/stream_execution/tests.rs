@@ -8,13 +8,18 @@ use futures::stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{context_management_telemetry, execute_llm_stream, LlmStreamFrame};
+use super::{
+    context_management_telemetry, discard_latest_interrupted_assistant_output, execute_llm_stream,
+    LlmStreamFrame, INTERRUPTED_ASSISTANT_OUTPUT_KIND,
+};
 use bamboo_agent_core::agent::types::{ConversationSummary, TaskItem, TaskItemStatus, TaskList};
-use bamboo_agent_core::tools::{FunctionSchema, ToolSchema};
+use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
 use bamboo_agent_core::{
     AgentError, AgentEvent, Message, ProviderPromptUsage, Role, Session, TokenBudgetUsage,
 };
-use bamboo_compression::{BudgetStrategy, PreparedContext, TokenBudget, TokenUsageBreakdown};
+use bamboo_compression::{
+    BudgetStrategy, PreparedContext, TokenBudget, TokenCounter, TokenUsageBreakdown,
+};
 use bamboo_llm::{
     Config, LLMChunk, LLMProvider, LLMRequestOptions, LLMStream, ProviderVisibleToolFootprint,
     ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind,
@@ -23,6 +28,27 @@ use bamboo_metrics::storage::MetricsStorage;
 use chrono::Utc;
 
 use super::super::PromptMemoryExposureFrame;
+
+#[test]
+fn interrupted_retry_rollback_returns_exact_removed_visible_message_id() {
+    let mut session = Session::new("retry-rollback", "model");
+    let mut interrupted = Message::assistant("partial visible text", None);
+    interrupted.id = "visible-attempt-1".to_string();
+    interrupted.metadata = Some(serde_json::json!({
+        "runtime_kind": INTERRUPTED_ASSISTANT_OUTPUT_KIND,
+    }));
+    session.add_message(interrupted.clone());
+
+    let removed = discard_latest_interrupted_assistant_output(&mut session, None);
+    assert_eq!(removed.as_deref(), Some("visible-attempt-1"));
+    assert!(session.messages.is_empty());
+
+    session.add_message(interrupted);
+    let protected =
+        discard_latest_interrupted_assistant_output(&mut session, Some("visible-attempt-1"));
+    assert!(protected.is_none());
+    assert_eq!(session.messages.len(), 1);
+}
 
 fn isolate_prompt_safe_env_cache() -> MutexGuard<'static, ()> {
     let guard = crate::runtime::tests::env_cache_lock_acquire();
@@ -492,8 +518,24 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
     let first = event_rx.recv().await.expect("budget event expected");
     assert!(matches!(first, AgentEvent::TokenBudgetUpdated { .. }));
 
-    let second = event_rx.recv().await.expect("token event expected");
-    assert!(matches!(second, AgentEvent::Token { .. }));
+    let second = event_rx
+        .recv()
+        .await
+        .expect("visible message identity expected");
+    let visible_message = stream_output
+        .visible_message
+        .as_ref()
+        .expect("visible token must carry a stable identity");
+    assert!(matches!(
+        second,
+        AgentEvent::VisibleMessageStart {
+            message_id,
+            created_at,
+        } if message_id == visible_message.message_id && created_at == visible_message.created_at
+    ));
+
+    let third = event_rx.recv().await.expect("token event expected");
+    assert!(matches!(third, AgentEvent::Token { content } if content == "hi"));
     assert_eq!(
         llm.requested_text_verbosity
             .lock()
@@ -2659,6 +2701,115 @@ fn workspace_prepared_context() -> PreparedContext {
 }
 
 #[test]
+fn selected_root_orchestration_prompt_is_provider_visible_on_start_and_resume_only() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("STABLE_GUIDE_MARKER".to_string());
+    let prepared = workspace_prepared_context();
+
+    let mut ordinary = Session::new("ordinary-root", "test-model");
+    let ordinary_envelope = super::build_request_envelope_reconciled(
+        &mut ordinary,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(ordinary_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .all(|message| !message.content.contains("context_type: root_orchestration")));
+
+    let mut root = Session::new("selected-root", "test-model");
+    root.set_root_orchestration_prompt_enabled(true);
+    let initial =
+        super::build_request_envelope_reconciled(&mut root, &prepared, &config, &[], "test-model");
+    assert_eq!(initial.ir.system_text, ordinary_envelope.ir.system_text);
+    assert_eq!(
+        message_shape(initial.ir.run(bamboo_llm::SegmentRole::StablePrefix)),
+        message_shape(
+            ordinary_envelope
+                .ir
+                .run(bamboo_llm::SegmentRole::StablePrefix)
+        ),
+        "the selected enhancement must not duplicate or move the tool schema"
+    );
+    let first_blocks = initial
+        .ir
+        .run(bamboo_llm::SegmentRole::ModelTranscript)
+        .iter()
+        .filter(|message| message.content.contains("context_type: root_orchestration"))
+        .collect::<Vec<_>>();
+    assert_eq!(first_blocks.len(), 1);
+    assert!(first_blocks[0]
+        .content
+        .contains("delegate a read-only Plan"));
+    assert!(first_blocks[0]
+        .content
+        .contains("Inspect authoritative child progress"));
+
+    let stored = serde_json::to_string(&root).expect("persist selected root");
+    let mut resumed: Session = serde_json::from_str(&stored).expect("reload selected root");
+    let mut resumed_prepared = workspace_prepared_context();
+    resumed_prepared.messages.push(Message::user("continue"));
+    let resumed_envelope = super::build_request_envelope_reconciled(
+        &mut resumed,
+        &resumed_prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(resumed_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .any(|message| message.content == "continue"));
+    assert!(resumed_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .any(|message| message.content == first_blocks[0].content));
+    assert_eq!(
+        resumed
+            .model_context_state
+            .as_ref()
+            .expect("durable context ledger")
+            .events
+            .iter()
+            .filter(|event| event.block_type == bamboo_domain::ContextBlockType::RootOrchestration)
+            .count(),
+        1,
+        "resuming must replay the one durable instruction, not append a duplicate"
+    );
+
+    resumed.set_root_orchestration_prompt_enabled(false);
+    let disabled = super::build_request_envelope_reconciled(
+        &mut resumed,
+        &resumed_prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(disabled.prefix_epoch > initial.prefix_epoch);
+    assert!(disabled
+        .ir
+        .body_chat()
+        .iter()
+        .all(|message| !message.content.contains("context_type: root_orchestration")));
+
+    let mut child = Session::new_child_of("child", &resumed, "test-model", "child");
+    child.set_root_orchestration_prompt_enabled(true);
+    let child_envelope =
+        super::build_request_envelope_reconciled(&mut child, &prepared, &config, &[], "test-model");
+    assert!(child_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .all(|message| !message.content.contains("context_type: root_orchestration")));
+}
+
+#[test]
 fn session_identity_is_model_visible_after_invariant_prefix_without_cross_session_drift() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut config = test_config("BASE_IDENTITY");
@@ -3211,6 +3362,7 @@ fn plan_llm_request_model_transcript_path_records_observability() {
         tool_schema_late_bound_segment_count: 1,
         ledger_rendered_bytes: 64,
         history_boundary_input_tokens: 0,
+        prepared_message_input_tokens: 0,
     };
     let planned = super::plan_llm_request(&envelope, "session-plan", None, 3, None, usage);
 
@@ -4414,4 +4566,373 @@ fn activated_guidance_appends_to_transcript_without_rewriting_cached_head() {
         after.ir.run(bamboo_llm::SegmentRole::ModelTranscript).len(),
         third.ir.run(bamboo_llm::SegmentRole::ModelTranscript).len()
     );
+}
+
+fn browser_history_fixture() -> (Session, ToolSchema, String) {
+    let browser = provider_visible_schema(
+        "browser",
+        "BROWSER_SCHEMA_ONLY_MARKER: operate the shared page",
+        serde_json::json!({
+            "type":"object",
+            "properties":{
+                "action":{"type":"string","enum":["navigate","snapshot","click"]},
+                "selector":{"type":"string","description":"Select an element in the active page"},
+                "expected_epoch":{"type":"integer"}
+            },
+            "required":["action"]
+        }),
+    );
+    let mut session = Session::new("browser-history", "test-model");
+    session.add_message(Message::system("system"));
+    session.add_message(Message::user("Find the browser"));
+    let call = ToolCall {
+        id: "browser-discovery".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME.to_string(),
+            arguments: r#"{"query":"browser"}"#.to_string(),
+        },
+    };
+    let mut assistant = Message::assistant("", Some(vec![call]));
+    assistant.never_compress = true;
+    assistant.metadata = Some(serde_json::json!({
+        "runtime_kind":"sticky_capability_discovery","version":1
+    }));
+    session.add_message(assistant);
+    let full_result = format!(
+        "<loaded_tools>{}</loaded_tools>",
+        serde_json::json!({"tools":[serde_json::to_value(&browser).unwrap()]})
+    );
+    let mut result =
+        Message::tool_result_with_status("browser-discovery", full_result.clone(), true);
+    result.never_compress = true;
+    result.metadata = Some(serde_json::json!({
+        "runtime_kind":"sticky_capability_discovery",
+        "version":1,
+        "canonical_new_names":["browser"]
+    }));
+    session.add_message(result);
+    (session, browser, full_result)
+}
+
+fn browser_history_prepared(session: &Session) -> PreparedContext {
+    PreparedContext {
+        messages: session.messages.clone(),
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    }
+}
+
+#[test]
+fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let (mut session, browser, full_result) = browser_history_fixture();
+    let config = test_config("system");
+    let mut before_session = session.clone();
+    before_session.messages.truncate(2);
+    let before_tools = super::super::request_tool_schemas_for_loading_mode(
+        &before_session,
+        std::slice::from_ref(&browser),
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
+    );
+    let before_prepared = browser_history_prepared(&before_session);
+    let before = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut before_session,
+        &before_prepared,
+        &config,
+        before_tools.as_ref(),
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+    );
+    let before_wire = serde_json::to_string(&serde_json::json!({
+        "messages":before.ir.flatten(),"tools":before_tools.as_ref()
+    }))
+    .unwrap();
+    assert!(before_wire.contains("discover_capabilities"));
+    assert!(!before_wire.contains("BROWSER_SCHEMA_ONLY_MARKER"));
+
+    let loaded_tools = super::super::request_tool_schemas_for_loading_mode(
+        &session,
+        std::slice::from_ref(&browser),
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
+    );
+    assert_eq!(loaded_tools[0].function.name, "browser");
+    assert_eq!(
+        crate::runtime::runner::loop_execution::legacy_browser_loaded_result_content(&session)
+            .len(),
+        1
+    );
+    let prepared = browser_history_prepared(&session);
+    let persisted_messages = session.messages.clone();
+    let mut duplicate_session = session.clone();
+    let duplicate = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut duplicate_session,
+        &prepared,
+        &config,
+        loaded_tools.as_ref(),
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::Progressive,
+    );
+    let duplicate_wire = serde_json::to_vec(&serde_json::json!({
+        "messages":duplicate.ir.flatten(),"tools":loaded_tools.as_ref()
+    }))
+    .unwrap();
+    let after = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut session,
+        &prepared,
+        &config,
+        loaded_tools.as_ref(),
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+    );
+    let after_messages = after.ir.flatten();
+    assert_eq!(
+        after_messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("browser-discovery"))
+            .unwrap()
+            .content,
+        super::LOADED_BROWSER_ACKNOWLEDGEMENT
+    );
+    let after_wire = serde_json::to_string(&serde_json::json!({
+        "messages":after_messages,"tools":loaded_tools.as_ref()
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(loaded_tools.as_ref()).unwrap(),
+        serde_json::json!([browser])
+    );
+    assert!(!after_wire.contains("<loaded_tools>"));
+    assert!(after_wire.contains(super::LOADED_BROWSER_ACKNOWLEDGEMENT));
+    assert!(!after_wire.contains(&full_result));
+    assert!(after_wire.len() < duplicate_wire.len());
+    assert_eq!(
+        serde_json::to_value(&session.messages).unwrap(),
+        serde_json::to_value(&persisted_messages).unwrap()
+    );
+    assert_eq!(session.messages.last().unwrap().content, full_result);
+
+    let mut resumed: Session =
+        serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+    let resumed_prepared = browser_history_prepared(&resumed);
+    let resumed_request = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut resumed,
+        &resumed_prepared,
+        &config,
+        loaded_tools.as_ref(),
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+    );
+    assert_eq!(
+        resumed_request
+            .ir
+            .flatten()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("browser-discovery"))
+            .unwrap()
+            .content,
+        super::LOADED_BROWSER_ACKNOWLEDGEMENT
+    );
+
+    let disabled = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut resumed,
+        &resumed_prepared,
+        &config,
+        &[],
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+    );
+    assert!(disabled
+        .ir
+        .flatten()
+        .iter()
+        .any(|message| message.content == full_result));
+    assert!(duplicate
+        .ir
+        .flatten()
+        .iter()
+        .any(|message| message.content == full_result));
+    let sticky = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut resumed,
+        &resumed_prepared,
+        &config,
+        loaded_tools.as_ref(),
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::StickyFallback,
+    );
+    assert!(sticky
+        .ir
+        .flatten()
+        .iter()
+        .any(|message| message.content == full_result));
+}
+
+#[test]
+fn legacy_browser_history_projection_requires_a_canonical_result() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let (mut session, browser, full_result) = browser_history_fixture();
+    session.messages.last_mut().unwrap().metadata = None;
+    let prepared = browser_history_prepared(&session);
+    let envelope = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut session,
+        &prepared,
+        &test_config("system"),
+        &[browser],
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+    );
+    assert!(envelope
+        .ir
+        .flatten()
+        .iter()
+        .any(|message| message.content == full_result));
+}
+
+#[test]
+fn legacy_browser_history_projection_preserves_other_discovery_results() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let (mut session, browser, _) = browser_history_fixture();
+    let other = provider_visible_schema(
+        "ReadArchive",
+        "Read archived repository files",
+        serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+    );
+    session.add_message(Message::assistant(
+        "",
+        Some(vec![ToolCall {
+            id: "other-discovery".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME.to_string(),
+                arguments: r#"{"query":"ReadArchive"}"#.to_string(),
+            },
+        }]),
+    ));
+    let other_result = format!(
+        "<loaded_tools>{}</loaded_tools>",
+        serde_json::json!({"tools":[other]})
+    );
+    let mut result =
+        Message::tool_result_with_status("other-discovery", other_result.clone(), true);
+    result.never_compress = true;
+    result.metadata = Some(serde_json::json!({
+        "runtime_kind":"sticky_capability_discovery",
+        "version":1,
+        "canonical_new_names":["ReadArchive"]
+    }));
+    session.add_message(result);
+    let prepared = browser_history_prepared(&session);
+    let envelope = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut session,
+        &prepared,
+        &test_config("system"),
+        &[browser],
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+    );
+    let transcript = envelope.ir.flatten();
+    assert!(transcript.iter().any(|message| {
+        message.tool_call_id.as_deref() == Some("browser-discovery")
+            && message.content == super::LOADED_BROWSER_ACKNOWLEDGEMENT
+    }));
+    assert!(transcript.iter().any(|message| {
+        message.tool_call_id.as_deref() == Some("other-discovery")
+            && message.content == other_result
+    }));
+}
+
+#[tokio::test]
+async fn legacy_browser_usage_projection_counts_compact_provider_history() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let (session, browser, _) = browser_history_fixture();
+    let prepared = browser_history_prepared(&session);
+    let provider: Arc<dyn LLMProvider> = mock_llm(vec![LLMChunk::Done]);
+    let config = test_config("system");
+    let projected = super::project_request_usage(
+        &session,
+        &prepared,
+        &config,
+        std::slice::from_ref(&browser),
+        "test-model",
+        &provider,
+    )
+    .await
+    .unwrap();
+    let unprojected =
+        bamboo_compression::TiktokenTokenCounter::default().count_messages(&prepared.messages);
+    assert!(projected.prepared_message_input_tokens < unprojected);
+    let disabled =
+        super::project_request_usage(&session, &prepared, &config, &[], "test-model", &provider)
+            .await
+            .unwrap();
+    assert_eq!(disabled.prepared_message_input_tokens, unprojected);
+    let non_browser = provider_visible_schema(
+        "ReadArchive",
+        "Read archived repository files",
+        serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+    );
+    let non_browser_projected = super::project_request_usage(
+        &session,
+        &prepared,
+        &config,
+        &[non_browser],
+        "test-model",
+        &provider,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        non_browser_projected.prepared_message_input_tokens,
+        unprojected
+    );
+}
+
+#[tokio::test]
+async fn legacy_browser_dispatch_sends_acknowledgement_and_retains_durable_definition() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let (mut session, browser, full_result) = browser_history_fixture();
+    let prepared = browser_history_prepared(&session);
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let provider: Arc<dyn LLMProvider> = llm.clone();
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+
+    execute_llm_stream(
+        &mut session,
+        &test_config("system"),
+        &provider,
+        &prepared,
+        &[browser],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "browser-history",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let requested = llm.requested_messages.lock().unwrap();
+    assert_eq!(
+        requested
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("browser-discovery"))
+            .unwrap()
+            .content,
+        super::LOADED_BROWSER_ACKNOWLEDGEMENT
+    );
+    assert_eq!(*llm.requested_tool_names.lock().unwrap(), vec!["browser"]);
+    assert_eq!(session.messages.last().unwrap().content, full_result);
 }

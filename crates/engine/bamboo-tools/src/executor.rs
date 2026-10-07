@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
@@ -36,6 +36,74 @@ fn preview_for_log(value: &str, max_chars: usize) -> String {
         preview.push_str("...");
     }
     preview.replace('\n', "\\n").replace('\r', "\\r")
+}
+
+fn parse_warning_log_details<'a>(
+    execution_name: &str,
+    args_raw: &str,
+    warning: &'a str,
+) -> (String, &'a str) {
+    let canonical = canonical_tool_name(execution_name);
+    if canonical.eq_ignore_ascii_case("browser") || canonical.eq_ignore_ascii_case("browser_eval") {
+        // A repaired JSON warning embeds its own preview, so both strings
+        // must be hidden when browser input may contain focused typed text.
+        ("[redacted]".to_string(), "[redacted]")
+    } else {
+        (preview_for_log(args_raw, 180), warning)
+    }
+}
+
+fn is_browser_download_action(tool_name: &str, args: &serde_json::Value) -> bool {
+    tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
+        && args.get("action").and_then(serde_json::Value::as_str) == Some("download")
+}
+
+fn approval_tool_name_for_display(tool_name: &str) -> String {
+    if canonical_tool_name(tool_name).eq_ignore_ascii_case("browser") {
+        "browser".to_string()
+    } else {
+        tool_name.to_string()
+    }
+}
+
+fn approval_parameters_for_display(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
+    if canonical_tool_name(tool_name).eq_ignore_ascii_case("browser_eval") {
+        return serde_json::json!({
+            "code":"[redacted]",
+            "expected_url":"[redacted]",
+            "expected_epoch":args.get("expected_epoch").and_then(serde_json::Value::as_u64),
+        });
+    }
+    if is_browser_download_action(tool_name, args) {
+        let mut display = serde_json::json!({"action":"download"});
+        if let Some(epoch) = args
+            .get("expected_epoch")
+            .and_then(serde_json::Value::as_u64)
+        {
+            display["expected_epoch"] = serde_json::json!(epoch);
+        }
+        return display;
+    }
+    if crate::permission::is_private_browser_file_input(tool_name, args) {
+        return serde_json::json!({"action":"set_file_input","file":"[redacted]"});
+    }
+    if crate::permission::is_native_browser_select(tool_name, args) {
+        // The display event is emitted before all schema paths necessarily
+        // reject extra fields. Only the action is safe to expose here.
+        return serde_json::json!({"action":"select_option"});
+    }
+    let mut display = args.clone();
+    if let Some(parameters) = display.as_object_mut() {
+        if crate::permission::is_focused_browser_input(tool_name, args) {
+            parameters.remove("text");
+            parameters.remove("key");
+        }
+    }
+    display
 }
 
 fn copy_legacy_arg_if_missing(
@@ -113,6 +181,7 @@ fn normalize_resolved_builtin_args(
 /// Built-in tool executor that uses ToolRegistry for dynamic dispatch
 pub struct BuiltinToolExecutor {
     registry: ToolRegistry,
+    native_tool_ceiling: Option<BTreeSet<String>>,
     permission_checker: Option<Arc<dyn PermissionChecker>>,
     /// Framework-owned tool instances whose identity affects compatibility
     /// argument handling or file-change events. Arc identity prevents a custom
@@ -134,6 +203,7 @@ impl BuiltinToolExecutor {
             registry,
             permission_checker: None,
             framework_builtin_tools,
+            native_tool_ceiling: None,
             tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
@@ -146,6 +216,7 @@ impl BuiltinToolExecutor {
             registry,
             permission_checker: Some(permission_checker),
             framework_builtin_tools,
+            native_tool_ceiling: None,
             tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
@@ -170,6 +241,7 @@ impl BuiltinToolExecutor {
             registry,
             permission_checker: None,
             framework_builtin_tools: BTreeMap::new(),
+            native_tool_ceiling: None,
             tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
@@ -188,6 +260,7 @@ impl BuiltinToolExecutor {
             registry,
             permission_checker: Some(permission_checker),
             framework_builtin_tools: BTreeMap::new(),
+            native_tool_ceiling: None,
             tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
@@ -277,7 +350,9 @@ impl BuiltinToolExecutor {
         }
         let _ = registry.register(RequestPermissionsTool::new());
         let _ = registry.register(SleepTool::new());
-        let _ = registry.register(TaskTool::new());
+        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, TaskTool::new()) {
+            framework_tools.insert(name, tool);
+        }
         let _ = registry.register(ViewImageTool::new());
         let _ = registry.register(WebFetchTool::new());
         // NOTE: GetCurrentDir + SetWorkspace are now aliases for Workspace.
@@ -304,6 +379,40 @@ impl BuiltinToolExecutor {
         self.framework_builtin_tools
             .get(execution_name)
             .is_some_and(|builtin| Arc::ptr_eq(builtin, tool))
+    }
+
+    /// Observe the registered Arc, not a same-name custom replacement.
+    pub fn eligible_native_tool(&self, name: &str) -> bool {
+        matches!(name, "Bash" | "Edit" | "Glob" | "Read" | "Task" | "Write")
+            && self.registry.get(name).is_some_and(|tool| {
+                self.is_framework_builtin_instance(name, &tool)
+                    && self
+                        .native_tool_ceiling
+                        .as_ref()
+                        .is_none_or(|set| set.contains(name))
+            })
+    }
+
+    /// Install an immutable positive ceiling. Reinstallation can only narrow it.
+    pub fn with_native_tool_ceiling(mut self, names: Vec<String>) -> Result<Self, ToolError> {
+        let set: BTreeSet<_> = names.iter().cloned().collect();
+        if set.len() != names.len()
+            || names.len() > 6
+            || names.iter().any(|name| !self.eligible_native_tool(name))
+        {
+            return Err(ToolError::Execution("native_tool_ceiling_invalid".into()));
+        }
+        self.native_tool_ceiling = Some(set);
+        Ok(self)
+    }
+
+    fn check_native_ceiling(&self, name: &str, tool: &Arc<dyn Tool>) -> Result<(), ToolError> {
+        if self.native_tool_ceiling.as_ref().is_some_and(|set| {
+            !set.contains(name) || !self.is_framework_builtin_instance(name, tool)
+        }) {
+            return Err(ToolError::Execution("native_tool_ceiling_denied".into()));
+        }
+        Ok(())
     }
 
     fn normalize_registered_builtin_args(
@@ -345,12 +454,16 @@ impl BuiltinToolExecutor {
 
     /// Get guide for a tool
     pub fn get_guide(&self, tool_name: &str) -> Option<Arc<dyn ToolGuide>> {
+        if self.native_tool_ceiling.is_some() && !self.eligible_native_tool(tool_name) {
+            return None;
+        }
         self.registry.get_guide(tool_name)
     }
 
     fn parse_execution_args(
         &self,
         call: &ToolCall,
+        execution_name: &str,
         ctx: &ToolExecutionContext<'_>,
     ) -> serde_json::Value {
         if let Some(pre_parsed) = ctx.pre_parsed_args {
@@ -359,13 +472,15 @@ impl BuiltinToolExecutor {
         let args_raw = call.function.arguments.trim();
         let (parsed, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
         if let Some(warning) = parse_warning {
+            let (args_preview, warning) =
+                parse_warning_log_details(execution_name, args_raw, &warning);
             tracing::warn!(
                 "Builtin tool argument parsing fallback applied: session_id={:?}, tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", warning={}",
                 ctx.session_id,
                 call.id,
                 call.function.name,
                 args_raw.len(),
-                preview_for_log(args_raw, 180),
+                args_preview,
                 warning
             );
         }
@@ -382,8 +497,9 @@ impl BuiltinToolExecutor {
             .registry
             .get(execution_name)
             .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", execution_name)))?;
+        self.check_native_ceiling(execution_name, &tool)?;
         check_raw_tool_input(execution_name, &call.function.arguments)?;
-        let mut args = self.parse_execution_args(call, &ctx);
+        let mut args = self.parse_execution_args(call, execution_name, &ctx);
         check_parsed_tool_input(execution_name, &args)?;
         self.normalize_registered_builtin_args(
             &call.function.name,
@@ -420,7 +536,7 @@ impl BuiltinToolExecutor {
 
     /// Build enhanced prompt for all registered tools
     pub fn build_enhanced_prompt(&self, context: GuideBuildContext) -> String {
-        EnhancedPromptBuilder::build(Some(&self.registry), &self.registry.list_tools(), &context)
+        EnhancedPromptBuilder::build(Some(&self.registry), &self.list_tools(), &context)
     }
 }
 
@@ -553,6 +669,13 @@ impl ToolExecutor for BuiltinToolExecutor {
         resolved_args: &serde_json::Value,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
+        if self.native_tool_ceiling.is_some() {
+            let tool = self
+                .registry
+                .get(execution_name)
+                .ok_or_else(|| ToolError::Execution("native_tool_ceiling_denied".into()))?;
+            self.check_native_ceiling(execution_name, &tool)?;
+        }
         let tool_name = execution_name.to_string();
         let args = resolved_args.clone();
         if ctx.auto_approve_permissions && tool_name.eq_ignore_ascii_case("request_permissions") {
@@ -581,6 +704,49 @@ impl ToolExecutor for BuiltinToolExecutor {
                 let operation_summary = context.operation_description.clone();
                 let risk_level = context.risk_level();
                 let permission_type = context.permission_type;
+                let focused_browser_input =
+                    crate::permission::is_focused_browser_input(&tool_name, &args);
+                let native_browser_select =
+                    crate::permission::is_native_browser_select(&tool_name, &args);
+                let browser_eval =
+                    canonical_tool_name(&tool_name).eq_ignore_ascii_case("browser_eval");
+                let browser_download = is_browser_download_action(&tool_name, &args);
+                let private_browser_file_input = !browser_download
+                    && crate::permission::is_private_browser_file_input(&tool_name, &args);
+                let private_browser_display = focused_browser_input
+                    || native_browser_select
+                    || browser_eval
+                    || browser_download
+                    || private_browser_file_input;
+                let denied_message = if browser_eval {
+                    "Browser page script denied by policy"
+                } else if private_browser_file_input {
+                    "Browser file input denied by policy"
+                } else if native_browser_select {
+                    "Browser selection denied by policy"
+                } else if browser_download {
+                    "Browser download denied by policy"
+                } else {
+                    "Browser input denied by policy"
+                };
+                let check_failed_message = if browser_eval {
+                    "Browser page script permission check failed"
+                } else if private_browser_file_input {
+                    "Browser file input permission check failed"
+                } else if native_browser_select {
+                    "Browser selection permission check failed"
+                } else if browser_download {
+                    "Browser download permission check failed"
+                } else {
+                    "Browser input permission check failed"
+                };
+                let approval_display_resource = if browser_eval {
+                    "Execute browser page JavaScript".to_string()
+                } else if private_browser_display {
+                    operation_summary.clone()
+                } else {
+                    resource.clone()
+                };
                 let platform_hard_deny = permission_checker.hard_deny_reason(&context);
                 let config = permission_checker.permission_config();
                 let proxy = crate::approval::current_approval_proxy();
@@ -633,7 +799,11 @@ impl ToolExecutor for BuiltinToolExecutor {
                     }) {
                         crate::permission::PermissionOutcome::Allow { .. } => continue,
                         crate::permission::PermissionOutcome::Deny { reason, .. } => {
-                            return Err(ToolError::Execution(reason.message));
+                            return Err(ToolError::Execution(if private_browser_display {
+                                denied_message.to_string()
+                            } else {
+                                reason.message
+                            }));
                         }
                         crate::permission::PermissionOutcome::Ask(request)
                             if matches!(
@@ -657,10 +827,14 @@ impl ToolExecutor for BuiltinToolExecutor {
                     // Compatibility path for custom checkers that do not expose a
                     // typed config. It remains one-shot only and fail-closed.
                     if let Some(reason) = platform_hard_deny {
-                        return Err(ToolError::Execution(reason));
+                        return Err(ToolError::Execution(if private_browser_display {
+                            denied_message.to_string()
+                        } else {
+                            reason
+                        }));
                     }
-                    let force_ask =
-                        permission_checker.requires_forced_confirmation(&tool_name, &args);
+                    let force_ask = focused_browser_input
+                        || permission_checker.requires_forced_confirmation(&tool_name, &args);
                     let hook_allows = matches!(
                         hook_permission_override,
                         Some(crate::HookPermissionOverride::Allow)
@@ -670,7 +844,12 @@ impl ToolExecutor for BuiltinToolExecutor {
                     {
                         continue;
                     }
-                    let decision = if force_ask {
+                    let decision = if focused_browser_input {
+                        // Configless checkers may have cached grants, and the
+                        // trait's default forced path checks that cache first.
+                        // A focused action must ask again for this occurrence.
+                        permission_checker.request_confirmation(context).await
+                    } else if force_ask {
                         permission_checker.check_or_request_forced(context).await
                     } else if let Some(session_id) = ctx.session_id {
                         permission_checker
@@ -684,7 +863,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                         Ok(false) => {
                             return Err(ToolError::Execution(format!(
                                 "Permission denied for: {}",
-                                resource
+                                approval_display_resource
                             )));
                         }
                         Err(PermissionError::ConfirmationRequired { .. }) => {
@@ -711,13 +890,23 @@ impl ToolExecutor for BuiltinToolExecutor {
                                 matched_rule: None,
                                 allowed_decisions:
                                     crate::permission::PermissionRequest::forced_decisions(),
-                                suggested_matchers: crate::permission::conservative_matchers(
-                                    permission_type,
-                                    &resource,
-                                ),
+                                suggested_matchers: if focused_browser_input {
+                                    Vec::new()
+                                } else {
+                                    crate::permission::conservative_matchers(
+                                        permission_type,
+                                        &resource,
+                                    )
+                                },
                             }
                         }
-                        Err(other) => return Err(permission_error_to_tool_error(other)),
+                        Err(other) => {
+                            return Err(if private_browser_display {
+                                ToolError::Execution(check_failed_message.to_string())
+                            } else {
+                                permission_error_to_tool_error(other)
+                            });
+                        }
                     }
                 };
 
@@ -725,12 +914,25 @@ impl ToolExecutor for BuiltinToolExecutor {
                 // one-shot decisions are advertised until its protocol supports
                 // a stronger scope. No boolean downgrade can create a grant.
                 if let Some(proxy) = proxy {
+                    let mut display_request = request.clone();
+                    if canonical_tool_name(&tool_name).eq_ignore_ascii_case("browser") {
+                        display_request.tool_name = "browser".to_string();
+                    }
+                    if private_browser_display {
+                        display_request.resource = "[redacted]".to_string();
+                        display_request.matched_rule = None;
+                        display_request.suggested_matchers.clear();
+                        if browser_eval {
+                            display_request.operation_summary =
+                                "Execute browser page JavaScript".to_string();
+                        }
+                    }
                     let approved = proxy
                         .request_approval(crate::approval::ApprovalAsk {
-                            tool_name: tool_name.clone(),
+                            tool_name: approval_tool_name_for_display(&tool_name),
                             permission: permission_type.description().to_string(),
-                            resource: resource.clone(),
-                            permission_request: Some(request.clone()),
+                            resource: approval_display_resource.clone(),
+                            permission_request: Some(display_request),
                         })
                         .await;
                     if approved {
@@ -738,26 +940,27 @@ impl ToolExecutor for BuiltinToolExecutor {
                     }
                     return Err(ToolError::Execution(format!(
                         "Permission denied by host for: {}",
-                        resource
+                        approval_display_resource
                     )));
                 }
 
                 // Interactive sessions pause through the legacy question shape
                 // while carrying the complete typed request alongside it.
                 if let Some(tx) = ctx.event_tx {
+                    let approval_parameters = approval_parameters_for_display(&tool_name, &args);
                     let _ = tx
                         .send(bamboo_agent_core::AgentEvent::ToolApprovalRequested {
                             tool_call_id: call.id.clone(),
-                            tool_name: tool_name.clone(),
-                            parameters: args.clone(),
+                            tool_name: approval_tool_name_for_display(&tool_name),
+                            parameters: approval_parameters,
                         })
                         .await;
 
                     let question = format!(
                         "**Permission required**\n\nThe `{}` tool needs approval to {} on:\n\n`{}`",
-                        tool_name,
+                        approval_tool_name_for_display(&tool_name),
                         permission_type.description(),
-                        resource
+                        approval_display_resource
                     );
                     if let Some(config) = config {
                         config.register_pending_request(request.clone());
@@ -766,7 +969,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                         "status": "awaiting_permission_approval",
                         "question": question,
                         "permission_type": permission_type,
-                        "resource": resource,
+                        "resource": approval_display_resource,
                         "options": ["Approve", "Deny"],
                         "allow_custom": false,
                         "permission_request": request,
@@ -781,7 +984,7 @@ impl ToolExecutor for BuiltinToolExecutor {
 
                 return Err(ToolError::Execution(format!(
                     "Permission approval required for: {}",
-                    resource
+                    approval_display_resource
                 )));
             }
         }
@@ -790,15 +993,35 @@ impl ToolExecutor for BuiltinToolExecutor {
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
-        self.registry.list_tools()
+        self.registry
+            .list_tools()
+            .into_iter()
+            .filter(|schema| {
+                self.native_tool_ceiling.is_none()
+                    || self.eligible_native_tool(&schema.function.name)
+            })
+            .collect()
     }
 
     fn owns_exact_tool(&self, tool_name: &str) -> bool {
         self.registry.contains(tool_name)
+            && (self.native_tool_ceiling.is_none() || self.eligible_native_tool(tool_name))
+    }
+
+    fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+        self.owns_exact_tool(name)
+            .then_some(self as &dyn ToolExecutor)
     }
 
     fn tool_mutability(&self, tool_name: &str) -> crate::ToolMutability {
         let resolved = resolve_registered_tool_name(&self.registry, tool_name);
+        if self.native_tool_ceiling.is_some()
+            && resolved
+                .as_deref()
+                .is_none_or(|name| !self.eligible_native_tool(name))
+        {
+            return crate::ToolMutability::Mutating;
+        }
         resolved
             .as_deref()
             .and_then(|name| self.registry.get(name))
@@ -812,6 +1035,13 @@ impl ToolExecutor for BuiltinToolExecutor {
 
     fn tool_concurrency_safe(&self, tool_name: &str) -> bool {
         let resolved = resolve_registered_tool_name(&self.registry, tool_name);
+        if self.native_tool_ceiling.is_some()
+            && resolved
+                .as_deref()
+                .is_none_or(|name| !self.eligible_native_tool(name))
+        {
+            return false;
+        }
         resolved
             .as_deref()
             .and_then(|name| self.registry.get(name))
@@ -836,6 +1066,9 @@ impl ToolExecutor for BuiltinToolExecutor {
                 .map(|tool| (execution_name, tool))
         }) {
             Some((execution_name, tool)) => {
+                if self.check_native_ceiling(execution_name, &tool).is_err() {
+                    return (crate::ToolMutability::Mutating, false);
+                }
                 self.normalize_registered_builtin_args(reference, execution_name, &tool, &mut args);
                 let class = tool.classify(&args);
                 (class.mutability, class.parallel_safe)
@@ -943,6 +1176,7 @@ impl BuiltinToolExecutorBuilder {
             registry: self.registry,
             permission_checker: self.permission_checker,
             framework_builtin_tools: self.framework_builtin_tools,
+            native_tool_ceiling: None,
             tool_event_publisher: self.tool_event_publisher,
         }
     }
@@ -976,6 +1210,245 @@ mod tests {
 
     fn make_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
         make_tool_call_with_id("call_1", name, args)
+    }
+
+    #[test]
+    fn malformed_browser_arguments_redact_both_log_previews() {
+        for (tool_name, raw) in [
+            (
+                "browser",
+                r#"{"action":"type","text":"private browser input"#,
+            ),
+            (
+                "default::browser",
+                r#"{"action":"type","text":"private browser input"#,
+            ),
+            ("browser_eval", r#"{"code":"private page source"#),
+            ("default::browser_eval", r#"{"code":"private page source"#),
+        ] {
+            let (_, warning) = parse_tool_args_best_effort(raw);
+            let warning = warning.expect("malformed JSON must have a warning");
+            assert!(warning.contains("private"));
+            let (preview, logged_warning) = parse_warning_log_details(tool_name, raw, &warning);
+            assert_eq!(preview, "[redacted]");
+            assert_eq!(logged_warning, "[redacted]");
+            let (ordinary_preview, ordinary_warning) =
+                parse_warning_log_details("Write", raw, &warning);
+            assert!(ordinary_preview.contains("private"));
+            assert_eq!(ordinary_warning, warning);
+        }
+    }
+
+    #[test]
+    fn native_select_approval_event_hides_values_without_changing_execution_args() {
+        let args = json!({
+            "action":"select_option",
+            "selector":"select[data-private='account']",
+            "values":["private-option-value"],
+            "expected_epoch":17,
+            "text":"private-text",
+            "url":"https://example.com/?private=query",
+            "nested":{"secret":"private-nested"},
+        });
+        let original = args.clone();
+        let display = approval_parameters_for_display("browser", &args);
+        assert_eq!(display, json!({"action":"select_option"}));
+        assert_eq!(
+            approval_parameters_for_display("default::browser", &args),
+            json!({"action":"select_option"})
+        );
+        assert_eq!(args, original);
+        assert!(!display.to_string().contains("private-option-value"));
+        assert!(!display.to_string().contains("data-private"));
+        assert!(!display.to_string().contains("private-query"));
+        assert!(!display.to_string().contains("private-nested"));
+        assert_eq!(approval_parameters_for_display("Write", &args), args);
+    }
+
+    #[test]
+    fn browser_download_approval_event_hides_selector_and_extra_fields() {
+        let args = json!({
+            "action":"download",
+            "selector":"a[data-secret='private-selector']",
+            "expected_epoch":17,
+            "url":"https://example.test/private-url",
+            "extra":{"secret":"private-extra"},
+            "data_base64":"private-file-bytes",
+        });
+        let original = args.clone();
+        for name in ["browser", "default::browser", "private-selector::browser"] {
+            assert_eq!(
+                approval_parameters_for_display(name, &args),
+                json!({"action":"download","expected_epoch":17})
+            );
+            assert_eq!(approval_tool_name_for_display(name), "browser");
+        }
+        assert_eq!(approval_tool_name_for_display("Read"), "Read");
+        assert_eq!(
+            args, original,
+            "display projection must not change execution args"
+        );
+        let malformed_epoch = json!({
+            "action":"download",
+            "selector":"private-selector",
+            "expected_epoch":"private-epoch",
+        });
+        assert_eq!(
+            approval_parameters_for_display("browser", &malformed_epoch),
+            json!({"action":"download"})
+        );
+        assert_eq!(approval_parameters_for_display("Write", &args), args);
+    }
+
+    #[tokio::test]
+    async fn browser_download_approval_projects_display_but_retains_exact_request() {
+        struct CaptureApprovalProxy(Arc<std::sync::Mutex<Option<crate::approval::ApprovalAsk>>>);
+
+        #[async_trait]
+        impl crate::approval::ApprovalProxy for CaptureApprovalProxy {
+            async fn request_approval(&self, ask: crate::approval::ApprovalAsk) -> bool {
+                *self.0.lock().expect("capture approval") = Some(ask);
+                false
+            }
+        }
+
+        for tool_name in ["browser", "default::browser", "private-selector::browser"] {
+            let args = json!({
+                "action":"download",
+                "selector":"a[data-secret='private-selector']",
+                "expected_epoch":17,
+            });
+            let resource = crate::permission::check_permissions("browser", &args)
+                .expect("valid browser permission")
+                .expect("download requires approval")
+                .remove(0)
+                .resource;
+            let config = Arc::new(crate::permission::PermissionConfig::new());
+            let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(
+                config.clone(),
+            ));
+            let executor = BuiltinToolExecutorBuilder::new()
+                .with_tool(ExactRoutingTool {
+                    name: "browser",
+                    label: "should-not-run",
+                    args_sensitive: false,
+                })
+                .expect("register browser stub")
+                .with_permission_checker(checker)
+                .build();
+            let call = make_tool_call(tool_name, args);
+            let (tx, mut rx) = mpsc::channel(4);
+            let context = ToolExecutionContext {
+                session_id: Some("browser-download-approval"),
+                event_tx: Some(&tx),
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let result = executor
+                .execute_with_context(&call, context)
+                .await
+                .expect("download must pause for approval");
+            let payload: serde_json::Value =
+                serde_json::from_str(&result.result).expect("approval payload");
+            assert_eq!(payload["status"], "awaiting_permission_approval");
+            assert_eq!(
+                payload["resource"],
+                "Download from selected browser element"
+            );
+            assert!(payload["question"]
+                .as_str()
+                .unwrap()
+                .contains("Download from selected browser element"));
+            assert!(!payload["question"].as_str().unwrap().contains(&resource));
+            assert!(!payload["question"]
+                .as_str()
+                .unwrap()
+                .contains("private-selector"));
+            assert_eq!(payload["permission_request"]["resource"], resource);
+            assert_eq!(payload["permission_request"]["tool_name"], "browser");
+            assert_eq!(call.function.name, tool_name);
+            assert_eq!(
+                config
+                    .pending_request("browser-download-approval", &call.id)
+                    .expect("authoritative pending request")
+                    .resource,
+                resource
+            );
+            assert_eq!(
+                config
+                    .pending_request("browser-download-approval", &call.id)
+                    .expect("authoritative pending request")
+                    .tool_name,
+                "browser"
+            );
+            assert!(matches!(
+                rx.recv().await.expect("approval event"),
+                AgentEvent::ToolApprovalRequested { tool_name, parameters, .. }
+                    if tool_name == "browser"
+                        && parameters == json!({"action":"download","expected_epoch":17})
+            ));
+
+            let captured = Arc::new(std::sync::Mutex::new(None));
+            let proxy: Arc<dyn crate::approval::ApprovalProxy> =
+                Arc::new(CaptureApprovalProxy(Arc::clone(&captured)));
+            let relay_call = make_tool_call(
+                tool_name,
+                json!({
+                    "action":"download",
+                    "selector":"a[data-secret='private-selector']",
+                    "expected_epoch":17,
+                }),
+            );
+            let relay_context = ToolExecutionContext {
+                session_id: Some("browser-download-relay"),
+                ..ToolExecutionContext::none(&relay_call.id)
+            };
+            let denied = crate::approval::with_approval_proxy(
+                Some(proxy),
+                executor.execute_with_context(&relay_call, relay_context),
+            )
+            .await
+            .expect_err("host denied download");
+            assert!(matches!(&denied, ToolError::Execution(_)));
+            assert!(!denied.to_string().contains(&resource));
+            let ask = captured
+                .lock()
+                .expect("captured proxy")
+                .clone()
+                .expect("host saw approval request");
+            assert_eq!(ask.tool_name, "browser");
+            assert_eq!(
+                ask.permission_request.as_ref().unwrap().tool_name,
+                "browser"
+            );
+            assert_eq!(ask.resource, "Download from selected browser element");
+            assert_eq!(
+                ask.permission_request.as_ref().unwrap().resource,
+                "[redacted]"
+            );
+            assert!(ask
+                .permission_request
+                .unwrap()
+                .suggested_matchers
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn browser_file_input_approval_event_hides_bytes_and_metadata() {
+        let args = json!({
+            "action":"set_file_input","selector":"#upload","filename":"private.txt",
+            "mime_type":"text/plain","data_base64":"cHJpdmF0ZSBieXRlcw==",
+            "expected_epoch":17,
+        });
+        let original = args.clone();
+        for tool in ["browser", "default::browser"] {
+            assert_eq!(
+                approval_parameters_for_display(tool, &args),
+                json!({"action":"set_file_input","file":"[redacted]"})
+            );
+        }
+        assert_eq!(args, original);
+        assert_eq!(approval_parameters_for_display("Write", &args), args);
     }
 
     #[tokio::test]
@@ -1148,6 +1621,7 @@ mod tests {
             registry,
             permission_checker: None,
             framework_builtin_tools: BTreeMap::from([("Write".to_string(), tool)]),
+            native_tool_ceiling: None,
             tool_event_publisher: publisher,
         }
     }
@@ -1848,6 +2322,499 @@ mod tests {
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn configless_checker_still_asks_for_focused_browser_input_under_bypass_and_hook_allow() {
+        struct ConfiglessPromptChecker(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl crate::permission::PermissionChecker for ConfiglessPromptChecker {
+            async fn needs_confirmation(
+                &self,
+                _permission_type: crate::permission::PermissionType,
+                _resource: &str,
+            ) -> bool {
+                // Simulate a preexisting cached grant. Focused input must
+                // still call request_confirmation for each occurrence.
+                false
+            }
+
+            async fn request_confirmation(
+                &self,
+                context: crate::permission::PermissionContext,
+            ) -> Result<bool, crate::permission::PermissionError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(crate::permission::PermissionError::confirmation_required(
+                    context,
+                ))
+            }
+
+            fn grant_session_permission(
+                &self,
+                _permission_type: crate::permission::PermissionType,
+                _resource: String,
+            ) {
+            }
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(ExactRoutingTool {
+                name: "browser",
+                label: "browser-was-invoked",
+                args_sensitive: false,
+            })
+            .expect("register browser stub")
+            .with_permission_checker(Arc::new(ConfiglessPromptChecker(Arc::clone(&requests))))
+            .build();
+
+        for (index, args) in [
+            json!({"action":"type","text":"private text","expected_epoch":17}),
+            json!({"action":"key","key":"private-key","expected_epoch":17}),
+            json!({"action":"press","key":"private-key","expected_epoch":17}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let call = make_tool_call_with_id(&format!("focused-{index}"), "browser", args);
+            let (event_tx, mut event_rx) = mpsc::channel(4);
+            let ctx = ToolExecutionContext {
+                executing_supervisor: None,
+                session_id: Some("configless-browser"),
+                root_session_id: None,
+                tool_call_id: &call.id,
+                event_tx: Some(&event_tx),
+                available_tool_schemas: None,
+                bypass_permissions: true,
+                auto_approve_permissions: false,
+                plan_read_only: false,
+                can_async_resume: false,
+                bash_completion_sink: None,
+                pre_parsed_args: None,
+            };
+            let result = crate::with_hook_permission_override(
+                Some(crate::HookPermissionOverride::Allow),
+                &call.id,
+                executor.execute_with_context(&call, ctx),
+            )
+            .await
+            .expect("focused browser input must pause for approval");
+            let payload: serde_json::Value =
+                serde_json::from_str(&result.result).expect("approval payload");
+            assert_eq!(payload["status"], "awaiting_permission_approval");
+            assert_eq!(
+                payload["permission_request"]["allowed_decisions"],
+                json!(["allow_once", "deny_once"])
+            );
+            assert_eq!(
+                payload["permission_request"]["suggested_matchers"],
+                json!([])
+            );
+            let displayed = payload.to_string();
+            assert!(!displayed.contains("private-key"));
+            assert!(!displayed.contains("private text"));
+            let event = event_rx.recv().await.expect("approval event");
+            assert!(matches!(
+                event,
+                AgentEvent::ToolApprovalRequested { parameters, .. }
+                    if parameters.get("text").is_none() && parameters.get("key").is_none()
+            ));
+            assert_eq!(requests.load(Ordering::SeqCst), index + 1);
+        }
+
+        let selector_call = make_tool_call(
+            "browser",
+            json!({"action":"press","selector":"#save","key":"Enter","expected_epoch":17}),
+        );
+        let ctx = ToolExecutionContext {
+            session_id: Some("configless-browser"),
+            bypass_permissions: true,
+            ..ToolExecutionContext::none(&selector_call.id)
+        };
+        let result = executor
+            .execute_with_context(&selector_call, ctx)
+            .await
+            .expect("selector-bound press keeps compatibility bypass");
+        assert!(result.success);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn focused_browser_type_approval_redacts_display_and_ignores_hook_allow() {
+        struct NeverInvokeBrowser;
+
+        #[async_trait]
+        impl Tool for NeverInvokeBrowser {
+            fn name(&self) -> &str {
+                "browser"
+            }
+
+            fn description(&self) -> &str {
+                "test browser approval boundary"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type":"object"})
+            }
+
+            async fn invoke(
+                &self,
+                _args: serde_json::Value,
+                _ctx: ToolCtx,
+            ) -> Result<ToolOutcome, ToolError> {
+                panic!("focused browser input must pause before invocation")
+            }
+        }
+
+        struct CaptureApprovalProxy(Arc<std::sync::Mutex<Option<crate::approval::ApprovalAsk>>>);
+
+        #[async_trait]
+        impl crate::approval::ApprovalProxy for CaptureApprovalProxy {
+            async fn request_approval(&self, ask: crate::approval::ApprovalAsk) -> bool {
+                *self.0.lock().expect("capture approval") = Some(ask);
+                false
+            }
+        }
+
+        let args = json!({"action":"type","text":"private browser text","expected_epoch":17});
+        let context = crate::permission::check_permissions("browser", &args)
+            .expect("valid browser permission")
+            .expect("browser interaction needs approval")
+            .remove(0);
+        let private_resource = context.resource.clone();
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config
+            .grant_typed_scoped_session_permission(
+                "browser-redaction",
+                context.permission_type,
+                crate::permission::conservative_matchers(
+                    context.permission_type,
+                    &private_resource,
+                )
+                .remove(0),
+            )
+            .expect("remembered grant");
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(NeverInvokeBrowser)
+            .expect("register browser stub")
+            .with_permission_checker(checker)
+            .build();
+        let call = make_tool_call("browser", args);
+        let (tx, mut rx) = mpsc::channel(4);
+        let interactive = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: Some("browser-redaction"),
+            root_session_id: None,
+            tool_call_id: &call.id,
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: true,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+        let result = crate::with_hook_permission_override(
+            Some(crate::HookPermissionOverride::Allow),
+            &call.id,
+            executor.execute_with_context(&call, interactive),
+        )
+        .await
+        .expect("focused input must pause even under hook allow and bypass");
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.result).expect("approval payload");
+        let question = payload["question"].as_str().expect("visible question");
+        assert_eq!(payload["resource"], "Type into focused browser element");
+        assert!(!question.contains("private browser text"));
+        assert!(!question.contains(&private_resource));
+        assert_eq!(
+            payload["permission_request"]["resource"], private_resource,
+            "the typed request still binds the exact parked invocation"
+        );
+        assert_eq!(
+            payload["permission_request"]["allowed_decisions"],
+            json!(["allow_once", "deny_once"])
+        );
+        let event = rx.recv().await.expect("approval event");
+        assert!(matches!(
+            event,
+            AgentEvent::ToolApprovalRequested { parameters, .. }
+                if parameters.get("text").is_none()
+        ));
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let proxy: Arc<dyn crate::approval::ApprovalProxy> =
+            Arc::new(CaptureApprovalProxy(Arc::clone(&captured)));
+        let delegated = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: Some("browser-redaction"),
+            root_session_id: None,
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: true,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+        let denied = crate::with_hook_permission_override(
+            Some(crate::HookPermissionOverride::Allow),
+            &call.id,
+            crate::approval::with_approval_proxy(
+                Some(proxy),
+                executor.execute_with_context(&call, delegated),
+            ),
+        )
+        .await;
+        assert!(matches!(denied, Err(ToolError::Execution(_))));
+        let ask = captured
+            .lock()
+            .expect("captured proxy")
+            .clone()
+            .expect("host saw approval request");
+        assert_eq!(ask.resource, "Type into focused browser element");
+        assert!(!ask.resource.contains("private browser text"));
+        assert!(!ask.resource.contains(&private_resource));
+        let delegated_request = ask.permission_request.expect("delegated typed request");
+        assert_eq!(delegated_request.resource, "[redacted]");
+        assert!(delegated_request.suggested_matchers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn browser_eval_approval_hides_source_url_query_and_private_resource() {
+        struct PromptChecker;
+
+        #[async_trait]
+        impl crate::permission::PermissionChecker for PromptChecker {
+            async fn needs_confirmation(
+                &self,
+                _permission_type: crate::permission::PermissionType,
+                _resource: &str,
+            ) -> bool {
+                true
+            }
+
+            async fn request_confirmation(
+                &self,
+                context: crate::permission::PermissionContext,
+            ) -> Result<bool, crate::permission::PermissionError> {
+                Err(crate::permission::PermissionError::confirmation_required(
+                    context,
+                ))
+            }
+
+            fn grant_session_permission(
+                &self,
+                _permission_type: crate::permission::PermissionType,
+                _resource: String,
+            ) {
+            }
+        }
+
+        struct CaptureProxy(Arc<std::sync::Mutex<Option<crate::approval::ApprovalAsk>>>);
+
+        #[async_trait]
+        impl crate::approval::ApprovalProxy for CaptureProxy {
+            async fn request_approval(&self, ask: crate::approval::ApprovalAsk) -> bool {
+                *self.0.lock().expect("capture approval") = Some(ask);
+                false
+            }
+        }
+
+        let args = json!({
+            "code":"document.title = 'private-source'",
+            "expected_url":"https://example.com/?token=private-query",
+            "expected_epoch":17,
+        });
+        let private_resource = crate::permission::check_permissions("browser_eval", &args)
+            .expect("valid eval permission")
+            .expect("eval needs approval")
+            .remove(0)
+            .resource;
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(ExactRoutingTool {
+                name: "browser_eval",
+                label: "eval-was-invoked",
+                args_sensitive: false,
+            })
+            .expect("register eval stub")
+            .with_permission_checker(Arc::new(PromptChecker))
+            .build();
+        let call = make_tool_call("browser_eval", args);
+        let (tx, mut rx) = mpsc::channel(4);
+        let interactive = ToolExecutionContext {
+            session_id: Some("browser-eval-approval"),
+            event_tx: Some(&tx),
+            ..ToolExecutionContext::none(&call.id)
+        };
+        let result = executor
+            .execute_with_context(&call, interactive)
+            .await
+            .expect("eval pauses for approval");
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(payload["status"], "awaiting_permission_approval");
+        assert_eq!(payload["resource"], "Execute browser page JavaScript");
+        assert_eq!(payload["permission_request"]["resource"], private_resource);
+        for secret in ["private-source", "private-query", &private_resource] {
+            assert!(!payload["question"].as_str().unwrap().contains(secret));
+        }
+        let event = rx.recv().await.expect("approval event");
+        assert!(matches!(
+            event,
+            AgentEvent::ToolApprovalRequested { parameters, .. }
+                if parameters["code"] == "[redacted]"
+                    && parameters["expected_url"] == "[redacted]"
+                    && parameters["expected_epoch"] == 17
+                    && !parameters.to_string().contains("private-")
+        ));
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let proxy: Arc<dyn crate::approval::ApprovalProxy> =
+            Arc::new(CaptureProxy(Arc::clone(&captured)));
+        let delegated = ToolExecutionContext {
+            session_id: Some("browser-eval-approval"),
+            ..ToolExecutionContext::none(&call.id)
+        };
+        let denied = crate::approval::with_approval_proxy(
+            Some(proxy),
+            executor.execute_with_context(&call, delegated),
+        )
+        .await;
+        assert!(matches!(denied, Err(ToolError::Execution(_))));
+        let ask = captured.lock().unwrap().clone().expect("approval request");
+        assert_eq!(ask.resource, "Execute browser page JavaScript");
+        let display_request = ask.permission_request.as_ref().expect("typed request");
+        assert_eq!(display_request.resource, "[redacted]");
+        assert_eq!(
+            display_request.operation_summary,
+            "Execute browser page JavaScript"
+        );
+        assert!(display_request.suggested_matchers.is_empty());
+        for secret in ["private-source", "private-query", &private_resource] {
+            assert!(!format!("{ask:?}").contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn private_browser_approval_errors_hide_exact_resource_in_both_checker_paths() {
+        enum Failure {
+            Denied,
+            Error,
+            HardDeny,
+        }
+
+        struct FailingChecker {
+            failure: Failure,
+            config: Option<Arc<crate::permission::PermissionConfig>>,
+        }
+
+        #[async_trait]
+        impl crate::permission::PermissionChecker for FailingChecker {
+            async fn needs_confirmation(
+                &self,
+                _permission_type: crate::permission::PermissionType,
+                _resource: &str,
+            ) -> bool {
+                true
+            }
+
+            async fn request_confirmation(
+                &self,
+                context: crate::permission::PermissionContext,
+            ) -> Result<bool, crate::permission::PermissionError> {
+                match self.failure {
+                    Failure::Denied => Ok(false),
+                    Failure::Error => Err(crate::permission::PermissionError::CheckFailed(
+                        context.resource,
+                    )),
+                    Failure::HardDeny => panic!("hard deny must stop before confirmation"),
+                }
+            }
+
+            fn grant_session_permission(
+                &self,
+                _permission_type: crate::permission::PermissionType,
+                _resource: String,
+            ) {
+            }
+
+            fn permission_config(&self) -> Option<Arc<crate::permission::PermissionConfig>> {
+                self.config.clone()
+            }
+
+            fn hard_deny_reason(
+                &self,
+                context: &crate::permission::PermissionContext,
+            ) -> Option<String> {
+                matches!(self.failure, Failure::HardDeny).then(|| context.resource.clone())
+            }
+        }
+
+        for (tool_name, args, secrets) in [
+            (
+                "browser",
+                json!({"action":"type","text":"private browser text","expected_epoch":17}),
+                &["private browser text"][..],
+            ),
+            (
+                "browser_eval",
+                json!({"code":"private page source","expected_url":"https://example.com/?token=private-query","expected_epoch":17}),
+                &["private page source", "private-query"][..],
+            ),
+            (
+                "browser",
+                json!({"action":"download","selector":"a[data-secret='private-selector']","expected_epoch":17}),
+                &["private-selector"][..],
+            ),
+        ] {
+            let private_resource = crate::permission::check_permissions(tool_name, &args)
+                .expect("valid browser permission")
+                .expect("browser interaction needs approval")
+                .remove(0)
+                .resource;
+            for (label, failure, config) in [
+                ("configless-denied", Failure::Denied, None),
+                ("configless-error", Failure::Error, None),
+                ("configless-hard-deny", Failure::HardDeny, None),
+                (
+                    "config-backed-hard-deny",
+                    Failure::HardDeny,
+                    Some(Arc::new(crate::permission::PermissionConfig::new())),
+                ),
+            ] {
+                let executor = BuiltinToolExecutorBuilder::new()
+                    .with_tool(ExactRoutingTool {
+                        name: tool_name,
+                        label: "browser-was-invoked",
+                        args_sensitive: false,
+                    })
+                    .expect("register browser stub")
+                    .with_permission_checker(Arc::new(FailingChecker { failure, config }))
+                    .build();
+                let call = make_tool_call_with_id(label, tool_name, args.clone());
+                let ctx = ToolExecutionContext {
+                    session_id: Some("private-browser-error"),
+                    ..ToolExecutionContext::none(&call.id)
+                };
+                let error = executor
+                    .execute_with_context(&call, ctx)
+                    .await
+                    .expect_err(label);
+                let displayed = error.to_string();
+                assert!(
+                    !displayed.contains(&private_resource),
+                    "{label}: {displayed}"
+                );
+                for secret in secrets {
+                    assert!(!displayed.contains(secret), "{label}: {displayed}");
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -3968,5 +4935,230 @@ mod tests {
         for (label, publisher) in publishers {
             assert_real_write_succeeds_with_publisher(publisher, label).await;
         }
+    }
+
+    #[tokio::test]
+    async fn native_ceiling_covers_all_seven_entrypoints_and_sync_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("denied.txt");
+        let executor = BuiltinToolExecutor::new()
+            .with_native_tool_ceiling(vec!["Glob".into(), "Read".into()])
+            .unwrap();
+        let call = make_tool_call("Write", json!({"file_path":path,"content":"forbidden"}));
+        let ctx = ToolExecutionContext::none(&call.id);
+        let args = json!({"file_path":path,"content":"forbidden"});
+        assert!(executor.execute(&call).await.is_err());
+        assert!(executor.execute_with_context(&call, ctx).await.is_err());
+        assert!(executor
+            .execute_with_context_outcome(&call, ctx)
+            .await
+            .is_err());
+        assert!(executor
+            .execute_exact_with_context_outcome(&call, "Write", ctx)
+            .await
+            .is_err());
+        assert!(executor.check_permissions_for(&call, &ctx).await.is_err());
+        assert!(executor
+            .check_permissions_for_exact(&call, "Write", &ctx)
+            .await
+            .is_err());
+        assert!(executor
+            .check_permissions_for_resolved(&call, "Write", &args, &ctx)
+            .await
+            .is_err());
+        executor.register_tool(EchoArgsTool).unwrap();
+        assert!(executor
+            .execute(&make_tool_call("echo_args", json!({"v":"late"})))
+            .await
+            .is_err());
+        for name in [
+            "SubAgent",
+            "load_skill",
+            "read_skill_resource",
+            "composition",
+            "Bash",
+            "Edit",
+            "Grep",
+        ] {
+            let forged = make_tool_call(name, json!({}));
+            assert!(executor.execute(&forged).await.is_err());
+        }
+        assert!(!path.exists());
+        assert_eq!(
+            executor
+                .list_tools()
+                .iter()
+                .map(|schema| schema.function.name.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["Read", "Glob"])
+        );
+        assert!(!executor.owns_exact_tool("Write"));
+        assert!(executor.exact_tool_owner("Write").is_none());
+        assert!(executor.get_guide("Write").is_none());
+        assert_eq!(
+            executor.tool_mutability("Write"),
+            crate::ToolMutability::Mutating
+        );
+        assert!(!executor.tool_concurrency_safe("Write"));
+        assert!(!executor.call_parallel_classification(&call).1);
+        fs::write(&path, "actual native read").await.unwrap();
+        let read = make_tool_call("default::read_file", json!({"path":path}));
+        assert!(executor.execute(&read).await.unwrap().success);
+        assert!(BuiltinToolExecutor::with_registry(ToolRegistry::new())
+            .with_native_tool_ceiling(vec!["Read".into()])
+            .is_err());
+        assert!(BuiltinToolExecutor::new()
+            .with_native_tool_ceiling(vec!["Read".into(), "Read".into()])
+            .is_err());
+        assert!(BuiltinToolExecutor::new()
+            .with_native_tool_ceiling(vec!["SubAgent".into()])
+            .is_err());
+        assert!(BuiltinToolExecutorBuilder::new()
+            .with_default_tools()
+            .build()
+            .with_native_tool_ceiling(vec!["Grep".into()])
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn task_only_native_ceiling_has_no_filesystem_or_shell_surface() {
+        let executor = BuiltinToolExecutor::new()
+            .with_native_tool_ceiling(vec!["Task".into()])
+            .unwrap();
+        assert_eq!(
+            executor
+                .list_tools()
+                .iter()
+                .map(|s| s.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Task"]
+        );
+        let call = make_tool_call(
+            "Task",
+            json!({"tasks":[{"content":"Own step","status":"pending"}]}),
+        );
+        assert!(executor.execute(&call).await.unwrap().success);
+        for name in ["Bash", "Read", "Write", "Edit", "SubAgent"] {
+            assert!(executor
+                .execute(&make_tool_call(name, json!({})))
+                .await
+                .is_err());
+            assert!(!executor.owns_exact_tool(name));
+        }
+        assert!(executor.eligible_native_tool("Task"));
+    }
+
+    struct CeilingReplacement(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Tool for CeilingReplacement {
+        fn name(&self) -> &str {
+            "Write"
+        }
+        fn description(&self) -> &str {
+            "custom replacement"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type":"object"})
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolCtx) -> Result<ToolOutcome, ToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(ToolError::Execution("replacement invoked".into()))
+        }
+    }
+    struct CeilingPermissionBarrier {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl PermissionChecker for CeilingPermissionBarrier {
+        async fn needs_confirmation(&self, _: crate::permission::PermissionType, _: &str) -> bool {
+            self.entered.notify_one();
+            self.release.notified().await;
+            false
+        }
+        async fn request_confirmation(
+            &self,
+            _: crate::permission::PermissionContext,
+        ) -> Result<bool, PermissionError> {
+            Ok(true)
+        }
+        fn grant_session_permission(&self, _: crate::permission::PermissionType, _: String) {}
+    }
+    #[tokio::test]
+    async fn native_ceiling_captured_original_survives_permission_await_without_invoking_replacement(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("captured.txt");
+        let checker = Arc::new(CeilingPermissionBarrier {
+            entered: Default::default(),
+            release: Default::default(),
+        });
+        let executor = Arc::new(
+            BuiltinToolExecutor::new_with_permissions(checker.clone())
+                .with_native_tool_ceiling(vec!["Write".into()])
+                .unwrap(),
+        );
+        let call = make_tool_call(
+            "Write",
+            json!({"file_path":path,"content":"original native"}),
+        );
+        let owned_executor = executor.clone();
+        let owned_call = call.clone();
+        let running = tokio::spawn(async move { owned_executor.execute(&owned_call).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            checker.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        assert!(executor.registry().unregister("Write"));
+        executor
+            .register_tool(CeilingReplacement(invocations.clone()))
+            .unwrap();
+        checker.release.notify_one();
+        assert!(running.await.unwrap().unwrap().success);
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "original native");
+        assert!(executor.execute(&call).await.is_err());
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+        assert!(executor.list_tools().is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_ceiling_keeps_read_only_and_resource_hard_denies_under_all_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never.txt");
+        let base = Arc::new(crate::permission::AllowAllPermissionChecker);
+        let checker = Arc::new(crate::permission::ReadOnlyCommandChecker::new(base));
+        let executor = BuiltinToolExecutor::new_with_permissions(checker)
+            .with_native_tool_ceiling(vec!["Write".into()])
+            .unwrap();
+        let call = make_tool_call("Write", json!({"file_path":path,"content":"denied"}));
+        let policy = Arc::new(crate::permission::PermissionConfig::new());
+        policy.add_rule(crate::permission::PermissionRule::new(
+            crate::permission::PermissionType::WriteFile,
+            path.to_string_lossy(),
+            false,
+        ));
+        let resource_denied = BuiltinToolExecutor::new_with_permissions(Arc::new(
+            crate::permission::ConfigPermissionChecker::new(policy),
+        ))
+        .with_native_tool_ceiling(vec!["Write".into()])
+        .unwrap();
+        for (auto_approve_permissions, bypass_permissions) in
+            [(false, false), (true, false), (false, true)]
+        {
+            let ctx = ToolExecutionContext {
+                auto_approve_permissions,
+                bypass_permissions,
+                ..ToolExecutionContext::none(&call.id)
+            };
+            assert!(executor.execute_with_context(&call, ctx).await.is_err());
+            assert!(resource_denied
+                .execute_with_context(&call, ctx)
+                .await
+                .is_err());
+        }
+        assert!(!path.exists());
     }
 }

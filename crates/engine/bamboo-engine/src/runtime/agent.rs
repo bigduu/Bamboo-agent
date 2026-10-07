@@ -53,6 +53,19 @@ impl Agent {
         Agent { runtime }
     }
 
+    /// One execution's immutable persistence capability. Shared tool/provider
+    /// resources remain on the existing runtime; default callers stay unbound.
+    #[doc(hidden)]
+    pub fn with_execution_persistence(
+        &self,
+        persistence: Arc<dyn RuntimeSessionPersistence>,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.persistence = persistence;
+        runtime.inherited_child_wait_captured = true;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Return a new builder.
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
@@ -156,6 +169,38 @@ impl Agent {
     /// Execute and finalize a direct run whose ownership was acquired by
     /// [`begin_direct_execution`](Self::begin_direct_execution).
     pub async fn execute_direct_registered(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        lease: DirectExecutionLease,
+    ) -> crate::runtime::runner::Result<()> {
+        let inherited = self.persistence().inherited_child_wait().or_else(|| {
+            (!self.runtime.inherited_child_wait_captured)
+                .then(|| bamboo_domain::InheritedChildWait::capture(session))
+                .flatten()
+        });
+        let agent = if let Some(inherited) = inherited {
+            inherited
+                .validate_session(session)
+                .map_err(|error| bamboo_agent_core::AgentError::LLM(error.to_string()))?;
+            if self.persistence().inherited_child_wait().is_some() {
+                self.clone()
+            } else {
+                self.with_execution_persistence(
+                    self.persistence()
+                        .bind_inherited_child_wait(inherited)
+                        .map_err(|error| bamboo_agent_core::AgentError::LLM(error.to_string()))?,
+                )
+            }
+        } else {
+            self.with_execution_persistence(self.persistence().clone())
+        };
+        agent
+            .execute_direct_registered_bound(session, req, lease)
+            .await
+    }
+
+    async fn execute_direct_registered_bound(
         &self,
         session: &mut Session,
         req: ExecuteRequest,
@@ -272,9 +317,9 @@ impl Agent {
     }
 
     /// Execute the same durable SessionInbox boundary used by the agent loop
-    /// before its first provider call. Actor workers use this after embedding
-    /// initial RunSpec deliveries, so those messages cannot race the first
-    /// reasoning context.
+    /// before its first provider call. This compatibility method reports only
+    /// the merge count; it cannot confirm successful ACK. Execution entry points
+    /// must use [`Self::admit_session_inbox_at_safe_boundary_checked`] instead.
     pub async fn admit_session_inbox_at_safe_boundary(
         &self,
         session: &mut bamboo_agent_core::Session,
@@ -287,6 +332,26 @@ impl Agent {
         )
         .await
         .merged
+    }
+
+    /// Confirm the durable admission boundary before entering provider execution.
+    /// An ACK error is unresolved even after receipt publication. Preserve the
+    /// checkpoint and existing claim recovery, but reject this activation.
+    pub async fn admit_session_inbox_at_safe_boundary_checked(
+        &self,
+        session: &mut bamboo_agent_core::Session,
+    ) -> Result<usize, bamboo_agent_core::AgentError> {
+        let refresh = crate::runtime::runner::state_bridge::refresh_turn_boundary_with_inbox(
+            session,
+            Some(self.storage()),
+            Some(self.persistence()),
+            self.session_inbox(),
+        )
+        .await;
+        if let Some(error) = refresh.admission_error {
+            return Err(bamboo_agent_core::AgentError::Tool(error));
+        }
+        Ok(refresh.merged)
     }
 
     pub fn activation_router(

@@ -86,7 +86,6 @@ pub async fn mcp_list(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
     for server in servers {
         let transport = match &server.transport {
             TransportConfig::Stdio(_) => "stdio",
-            TransportConfig::Sse(_) => "sse",
             TransportConfig::StreamableHttp(_) => "streamable_http",
         };
         let name = server.name.as_deref().unwrap_or("");

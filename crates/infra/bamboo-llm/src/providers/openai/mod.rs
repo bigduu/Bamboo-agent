@@ -1929,6 +1929,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_sends_optional_subagent_schema_with_explicit_non_strict_mode() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(RESPONSES_SSE_OK),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = responses_provider(&server);
+        let tools = vec![ToolSchema {
+            schema_type: "function".into(),
+            function: FunctionSchema {
+                name: "SubAgent".into(),
+                description: "Delegate a bounded task; omit unused routing fields".into(),
+                parameters: serde_json::json!({
+                    "type":"object", "additionalProperties":false,
+                    "properties": {
+                        "intent":{"type":"string"}, "target":{"type":"string"},
+                        "role":{"type":"string"}, "message":{"type":"string"},
+                        "reply_to":{"type":"string"}
+                    }
+                }),
+            },
+        }];
+        let _stream = provider
+            .chat_stream(&[Message::user("audit worktrees")], &tools, None, "gpt-5.2")
+            .await
+            .expect("ordinary Responses request");
+        let requests = server.received_requests().await.expect("recorded requests");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["tools"][0]["name"], "SubAgent");
+        assert_eq!(body["tools"][0]["strict"], false);
+        assert!(body["tools"][0]["parameters"].get("required").is_none());
+        assert_eq!(
+            body["tools"][0]["parameters"]["additionalProperties"],
+            false
+        );
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[tokio::test]
     async fn responses_forces_named_required_tool_on_wire() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

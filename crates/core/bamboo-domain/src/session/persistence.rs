@@ -16,6 +16,60 @@ pub enum RetrievalWindowCheckpointOutcome {
     Rebased,
 }
 
+/// Immutable execution provenance for an already-persisted untagged Child wait.
+/// This capability is captured once from the execution's initial snapshot; it
+/// is not Session metadata and must never be reconstructed at a later save.
+#[derive(Debug, Clone)]
+pub struct InheritedChildWait {
+    session_id: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    wait: crate::WaitingForChildrenState,
+}
+
+impl InheritedChildWait {
+    pub fn capture(session: &Session) -> Option<Self> {
+        let wait = session
+            .agent_runtime_state
+            .as_ref()?
+            .waiting_for_children
+            .as_ref()?;
+        if wait.registered_by_tool_call_id.is_some() {
+            return None;
+        }
+        Some(Self {
+            session_id: session.id.clone(),
+            created_at: session.created_at,
+            wait: wait.clone(),
+        })
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn wait(&self) -> &crate::WaitingForChildrenState {
+        &self.wait
+    }
+
+    pub fn validate_session(&self, session: &Session) -> io::Result<()> {
+        if session.id != self.session_id || session.created_at != self.created_at {
+            return Err(io::Error::other(crate::SessionAuthorityConflict(
+                "inherited child wait session changed identity or birth".into(),
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Provider-boundary admission through the bound Root writer. None from the
+/// port below means this execution does not use ordinary Root authority.
+#[derive(Debug, Default)]
+pub struct RootInboxAdmission {
+    pub merged: usize,
+    pub committed_messages: Vec<crate::Message>,
+    pub admission_error: Option<String>,
+}
+
 /// Merge messages from a live runner snapshot into an already-durable
 /// transcript without ever removing or rewriting a durable message.
 ///
@@ -131,8 +185,77 @@ pub fn restore_missing_admitted_inbox_messages(session: &mut Session, durable: &
 ///   `metadata_version`) before writing, so UI edits are never clobbered.
 #[async_trait::async_trait]
 pub trait RuntimeSessionPersistence: Send + Sync {
+    /// An execution-private binding, never reconstructed from mutable state.
+    fn inherited_child_wait(&self) -> Option<InheritedChildWait> {
+        None
+    }
+
+    /// Return an execution-private view retaining the captured wait provenance
+    /// through every intermediate save. Unsupported persisters fail closed.
+    fn bind_inherited_child_wait(
+        &self,
+        _inherited: InheritedChildWait,
+    ) -> io::Result<Arc<dyn RuntimeSessionPersistence>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            crate::SessionAuthorityConflict(
+                "execution-scoped inherited child wait persistence is unsupported".into(),
+            ),
+        ))
+    }
+
+    /// Immutable capability already captured by this concrete execution.
+    /// An unbound Host/default persister never supplies a current owner.
+    fn root_actor_writer(&self) -> Option<crate::RootActorRuntimeWrite> {
+        None
+    }
+
+    /// Whether this Host requires an explicit execution capability for the
+    /// proposed Root. A route without a bound event/persistence handoff must
+    /// reject before claiming or making a provider call.
+    fn root_actor_execution_required(&self, _session: &Session) -> bool {
+        false
+    }
+
+    /// Host execution binding, never a request DTO. Legacy embedders have no
+    /// ActorDirectory; a host that enables one must reject unsupported storage
+    /// before claiming rather than returning an unfenced writer.
+    async fn bind_root_actor_execution(
+        &self,
+        _session: &Session,
+        _run_id: &str,
+    ) -> io::Result<Option<RootActorExecutionBinding>> {
+        Ok(None)
+    }
+
     /// Persist the session, merging any newer authoritative metadata from disk.
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()>;
+
+    /// Persist a runner's final snapshot. Implementations with a per-session
+    /// lock should reconcile a tool-registered child wait against the latest
+    /// durable wait inside that lock: a child may finish after the runner's
+    /// last read but before this save. The default retains compatibility for
+    /// in-memory and test persisters without that concurrent completion path.
+    async fn save_finalized_runtime_session(&self, session: &mut Session) -> io::Result<()> {
+        self.save_runtime_session(session).await
+    }
+
+    /// Finalize a wait inherited by this execution. Backends must reconcile
+    /// against durable state inside their cross-process write transaction.
+    /// Unsupported adapters fail closed rather than reopen a read/save race.
+    async fn save_finalized_runtime_with_inherited_child_wait(
+        &self,
+        session: &mut Session,
+        inherited: &crate::session::runtime_state::WaitingForChildrenState,
+    ) -> io::Result<()> {
+        let _ = (session, inherited);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            crate::SessionAuthorityConflict(
+                "atomic inherited child wait finalization is unsupported".into(),
+            ),
+        ))
+    }
 
     /// Authoritatively seed one validated actor activation.
     ///
@@ -308,6 +431,15 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         self.save_runtime_session(session).await
     }
 
+    async fn admit_root_inbox(
+        &self,
+        _session: &mut Session,
+        _inbox: Arc<dyn crate::SessionInboxPort>,
+        _active_run_id: Option<&str>,
+    ) -> io::Result<Option<RootInboxAdmission>> {
+        Ok(None)
+    }
+
     /// Atomically commit a staged retrieval-window transcript rewrite.
     ///
     /// `expected_base` is the exact pre-archive Session used for planning.
@@ -426,10 +558,93 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     }
 }
 
+/// Ownership passed from the canonical repository into one concrete runtime.
+/// The runtime owns renewal and finish; dropping an execution must release its
+/// own fence without ever finishing a replacement owner.
+pub struct RootActorExecutionBinding {
+    pub persistence: Arc<dyn RuntimeSessionPersistence>,
+    pub directory: Arc<dyn crate::ActorDirectoryPort>,
+    pub owner: crate::RootActorRuntimeWrite,
+    pub lease_duration: std::time::Duration,
+    abandon: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl RootActorExecutionBinding {
+    pub fn new(
+        persistence: Arc<dyn RuntimeSessionPersistence>,
+        directory: Arc<dyn crate::ActorDirectoryPort>,
+        owner: crate::RootActorRuntimeWrite,
+        lease_duration: std::time::Duration,
+        abandon: impl FnOnce() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            persistence,
+            directory,
+            owner,
+            lease_duration,
+            abandon: Some(Box::new(abandon)),
+        }
+    }
+
+    /// The runtime calls this only after handing finish to an owned detached
+    /// job, so cancellation of the waiter cannot strand this execution.
+    pub fn disarm_abandonment(&mut self) {
+        self.abandon.take();
+    }
+}
+
+impl Drop for RootActorExecutionBinding {
+    fn drop(&mut self) {
+        if let Some(abandon) = self.abandon.take() {
+            abandon();
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T> {
+    fn inherited_child_wait(&self) -> Option<InheritedChildWait> {
+        (**self).inherited_child_wait()
+    }
+
+    fn bind_inherited_child_wait(
+        &self,
+        inherited: InheritedChildWait,
+    ) -> io::Result<Arc<dyn RuntimeSessionPersistence>> {
+        (**self).bind_inherited_child_wait(inherited)
+    }
+
+    fn root_actor_writer(&self) -> Option<crate::RootActorRuntimeWrite> {
+        (**self).root_actor_writer()
+    }
+
+    fn root_actor_execution_required(&self, session: &Session) -> bool {
+        (**self).root_actor_execution_required(session)
+    }
+
+    async fn bind_root_actor_execution(
+        &self,
+        session: &Session,
+        run_id: &str,
+    ) -> io::Result<Option<RootActorExecutionBinding>> {
+        (**self).bind_root_actor_execution(session, run_id).await
+    }
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).save_runtime_session(session).await
+    }
+
+    async fn save_finalized_runtime_session(&self, session: &mut Session) -> io::Result<()> {
+        (**self).save_finalized_runtime_session(session).await
+    }
+
+    async fn save_finalized_runtime_with_inherited_child_wait(
+        &self,
+        session: &mut Session,
+        inherited: &crate::session::runtime_state::WaitingForChildrenState,
+    ) -> io::Result<()> {
+        (**self)
+            .save_finalized_runtime_with_inherited_child_wait(session, inherited)
+            .await
     }
 
     async fn seed_runtime_activation(&self, session: &mut Session) -> io::Result<()> {
@@ -508,6 +723,17 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
 
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).checkpoint_runtime_session(session).await
+    }
+
+    async fn admit_root_inbox(
+        &self,
+        session: &mut Session,
+        inbox: Arc<dyn crate::SessionInboxPort>,
+        active_run_id: Option<&str>,
+    ) -> io::Result<Option<RootInboxAdmission>> {
+        (**self)
+            .admit_root_inbox(session, inbox, active_run_id)
+            .await
     }
 
     async fn checkpoint_retrieval_window(

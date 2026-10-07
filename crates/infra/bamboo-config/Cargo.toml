@@ -25,7 +25,6 @@ hex = "0.4"
 base64 = "0.23"
 url = "2"
 uuid = { workspace = true }
-fs2 = "0.4"
 notify = "8"
 
 [target.'cfg(unix)'.dependencies]

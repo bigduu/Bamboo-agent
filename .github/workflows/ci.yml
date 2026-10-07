@@ -37,18 +37,21 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        if: github.event_name != 'pull_request' || github.base_ref == 'main'
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
 
+      - name: Test CI workflow policy
+        run: node --test scripts/ci-policy.test.cjs
+
       - name: Test frontend artifact and release policies
         if: github.event_name != 'pull_request' || github.base_ref == 'main'
-        run: node --test scripts/ci-policy.test.cjs scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
+        run: node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
 
       - name: Stage frontend package
         if: github.event_name != 'pull_request' || github.base_ref == 'main'
@@ -60,12 +63,18 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-test-${{ runner.os }}
-          cache-on-failure: true
+          # Keep iterative dev PR caches; main PRs restore from their base branch.
+          save-if: ${{ github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'dev') }}
 
       - name: Verify published server crate owns the frontend package
         if: github.event_name != 'pull_request' || github.base_ref == 'main'
@@ -87,12 +96,19 @@ jobs:
       - name: Build locked Rust workspace
         run: cargo build --locked
 
-      - name: Test locked Rust workspace
-        run: cargo test --locked
+      - name: Compile locked Rust test targets
+        timeout-minutes: 15
+        run: cargo test --locked --no-run
+        env:
+          RUST_MIN_STACK: "8388608"
 
-      - name: Run all-feature Rust tests
-        if: github.event_name != 'pull_request' || github.base_ref == 'main'
-        run: cargo test --locked --all-features --lib --tests
+      - name: Test locked Rust workspace
+        timeout-minutes: 30
+        run: cargo test --locked
+        # Deep actor-runtime tests need the same thread stack on CI as the
+        # verified local workspace sweep; Rust's default is too small on Linux.
+        env:
+          RUST_MIN_STACK: "8388608"
 
       - name: Build examples
         if: github.event_name != 'pull_request' || github.base_ref == 'main'
@@ -122,7 +138,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-msrv-1.95-${{ runner.os }}
-          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Test MSRV graph audit
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
@@ -142,7 +158,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -154,7 +170,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-tls-fixture-${{ matrix.os }}
-          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Verify OpenSSL
         run: openssl version
@@ -164,7 +180,7 @@ jobs:
         run: scripts/run-macos-server-lib-tests.sh
 
       - name: Run TLS fixture tests
-        if: runner.os != 'macOS'
+        if: runner.os == 'Windows'
         run: cargo test --locked -p bamboo-server --lib server::tls::tests -- --nocapture
 
   tool-event-recorder-e2e:
@@ -185,7 +201,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-tool-event-recorder-${{ matrix.os }}
-          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Run native recorder contract and lifecycle tests
         run: cargo test --locked -p bamboo-tool-event-recorder-example -- --nocapture --test-threads=1
@@ -204,10 +220,10 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-e2e-${{ runner.os }}
-          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
-      - name: Run E2E tests
-        run: cargo test --test e2e_tests --all-features
+      - name: Run all-feature library and integration tests
+        run: cargo test --locked --all-features --lib --tests
 
   lint:
     name: Lint
@@ -225,7 +241,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-lint-${{ runner.os }}
-          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -268,6 +284,7 @@ jobs:
           node-version: lts/*
 
       - name: Test frontend artifact and release policies
+        if: runner.os != 'Linux'
         run: node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
 
       - name: Stage frontend package
@@ -284,12 +301,24 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-build-${{ matrix.os }}
-          cache-on-failure: true
+          # Promotion builds do not run on main pushes; retain warm caches within
+          # a live promotion PR and permit manual runs on main to seed its base.
+          save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
+
+      - name: Verify portable Skill source publication
+        run: cargo test --locked -p bamboo-skills progressive::source_tests -- --test-threads=1
+
+      - name: Verify portable selected Skill source
+        run: cargo test --locked -p bamboo-skills progressive::read_tests -- --test-threads=1
+
+      - name: Verify portable Skill read Tool
+        run: cargo test --locked -p bamboo-server-tools skill_runtime::catalog_tests -- --test-threads=1
 
       - name: Build
         run: cargo build --release --verbose
 
       - name: Verify portable frontend package contract
+        if: runner.os != 'Linux'
         run: cargo test --locked -p bamboo-server --test frontend_build_contract
 
   docs:
@@ -306,7 +335,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-docs-${{ runner.os }}
-          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build documentation
         run: cargo doc --no-deps
@@ -325,7 +354,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-security-${{ runner.os }}
-          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-audit
         # Pinned + --locked for reproducible, non-drifting CI runs (was

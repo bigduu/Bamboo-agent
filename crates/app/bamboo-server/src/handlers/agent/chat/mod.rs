@@ -5,6 +5,7 @@
 mod handler;
 mod types;
 
+pub(crate) use handler::admit_for_execute;
 pub use handler::handler;
 pub use types::{ChatImage, ChatRequest, ChatResponse};
 

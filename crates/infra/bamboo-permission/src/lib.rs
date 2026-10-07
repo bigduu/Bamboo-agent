@@ -67,5 +67,7 @@ pub use storage::{
     default_permission_document, PermissionSection, PermissionStorage, PermissionStorageError,
 };
 pub use tool_permissions::{
-    check_permissions, check_tool_rules, is_delete_command, MAX_PROACTIVE_PERMISSION_BATCH,
+    check_permissions, check_tool_rules, is_delete_command, is_focused_browser_input,
+    is_native_browser_select, is_private_browser_file_input, validate_browser_file_input,
+    MAX_PROACTIVE_PERMISSION_BATCH,
 };

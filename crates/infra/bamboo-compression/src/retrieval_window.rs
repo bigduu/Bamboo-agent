@@ -4,11 +4,11 @@
 //! It selects complete, provider-safe logical turns that a later lifecycle step
 //! may archive after capability and persistence invariants have been verified.
 
+use crate::skill_history::{is_skill_tool_name, SkillNameMatch};
 use crate::{TiktokenTokenCounter, TokenBudget, TokenCounter};
 use bamboo_domain::{
-    canonical_tool_name, sha256_hex, CompressionEvent, CompressionEventKind,
-    CompressionTriggerType, Message, MessagePart, ModelContextResetReason, Role, Session,
-    TokenBudgetUsage,
+    sha256_hex, CompressionEvent, CompressionEventKind, CompressionTriggerType, Message,
+    MessagePart, ModelContextResetReason, Role, Session, TokenBudgetUsage,
 };
 use chrono::Utc;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -26,12 +26,12 @@ pub struct RetrievalWindowPolicy {
     pub target_usage_percent: u8,
 }
 
-/// Provider-aware token accounting supplied to the pure planner.
+/// Provider-prepared token estimates supplied to the pure planner.
 ///
 /// Most persisted text messages can be estimated directly. Messages containing
-/// images cannot: attachment references are resolved and image token costs are
-/// provider-specific. Callers that have prepared the provider request can
-/// replace the complete token cost of any message by its stable message ID.
+/// images need a model-visible image estimate rather than tokenizing attachment
+/// URLs or base64 text. Callers that prepared the request can replace the whole
+/// message estimate by its stable message ID.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetrievalWindowTokenAccounting {
     /// Provider-visible prompt/tool tokens outside `Session.messages` that
@@ -63,8 +63,8 @@ pub struct RetrievalWindowCandidatePlan {
     /// Versioned digest of every token-relevant active message field and its
     /// order at planning time.
     pub active_state_sha256: String,
-    /// Versioned digest of the fixed prompt cost and complete provider-prepared
-    /// message token override map used by this exact plan.
+    /// Versioned digest of the fixed prompt cost and provider-prepared message
+    /// token estimate overrides used by this plan.
     pub token_accounting_sha256: String,
     /// Active message plus fixed prompt tokens before candidate selection.
     pub active_tokens_before: u32,
@@ -87,7 +87,7 @@ pub struct RetrievalWindowCandidatePlan {
     pub boundary_reclaimable_tokens: u32,
     /// Tokens contributed by active system messages.
     pub system_message_tokens: u32,
-    /// Active messages whose complete cost came from provider-aware accounting.
+    /// Active messages whose cost came from provider-prepared estimates.
     pub provider_message_token_override_count: usize,
     /// Active message tokens that cannot be selected by this plan.
     pub protected_active_tokens: u32,
@@ -1523,7 +1523,7 @@ fn count_provider_visible_message_tokens(
     // Provider lowering differs by role: some adapters replace `content` with
     // these parts, while tool-result adapters can expose both. Text can be
     // counted conservatively here. Image cost depends on provider preparation
-    // and attachment resolution, so it must come from a complete message-level
+    // and attachment resolution, so it must come from a whole-message estimate
     // override rather than the persisted URL text.
     if let Some(parts) = message.content_parts.as_deref() {
         for part in parts {
@@ -1690,10 +1690,9 @@ fn mark_protocol_safety(groups: &mut [LogicalGroup<'_>]) {
 fn logical_group_has_protected_skill(group: &LogicalGroup<'_>) -> bool {
     group.messages.iter().any(|indexed| {
         indexed.message.tool_calls.as_ref().is_some_and(|calls| {
-            calls.iter().any(|call| {
-                let tool_name = canonical_tool_name(&call.function.name);
-                matches!(tool_name.as_str(), "load_skill" | "read_skill_resource")
-            })
+            calls
+                .iter()
+                .any(|call| is_skill_tool_name(&call.function.name, SkillNameMatch::Canonical))
         })
     })
 }
@@ -3131,6 +3130,91 @@ mod tests {
             assert_eq!(
                 serde_json::to_vec(&session).expect("session should serialize"),
                 before
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_skill_retrieval_canonical_names_do_not_narrow_roles() {
+        for role in [Role::Assistant, Role::User, Role::Tool, Role::System] {
+            for (name, expected) in [
+                ("load_skill", true),
+                ("read_skill_resource", true),
+                ("default::LoAd_SkIlL", true),
+                ("outer::inner::READ_SKILL_RESOURCE", true),
+                ("mcp__server__load_skill", false),
+                ("load_skill_extra", false),
+            ] {
+                let mut message = tool_call("candidate", "candidate-call", 1, name);
+                message.role = role.clone();
+                let group = LogicalGroup::preamble(IndexedMessage {
+                    session_index: 0,
+                    message: &message,
+                });
+                assert_eq!(
+                    logical_group_has_protected_skill(&group),
+                    expected,
+                    "{role:?}/{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_skill_mixed_retrieval_rejects_protected_and_incomplete_groups_without_mutation() {
+        let mut session = Session::new("mixed-retrieval-skill", "test-model");
+        session.add_message(system("system", 5));
+        session.add_message(user("old-u", 10));
+        let mut mixed = tool_call("mixed-call", "skill-call", 10, "Read");
+        mixed.tool_calls.as_mut().unwrap().push(ToolCall {
+            id: "other-call".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "Grep".into(),
+                arguments: "{}".into(),
+            },
+        });
+        session.add_message(mixed);
+        session.add_message(tool_result("skill-result", "skill-call", 10));
+        session.add_message(tool_result("other-result", "other-call", 10));
+        session.add_message(assistant("old-final", 10));
+        add_turn(&mut session, "recent", 10);
+        let plan = plan_with_counter(&session, 50, 1, 0).unwrap();
+        assert_eq!(
+            plan.message_ids_to_archive,
+            [
+                "old-u",
+                "mixed-call",
+                "skill-result",
+                "other-result",
+                "old-final"
+            ]
+        );
+        for name in ["namespace::LoAd_SkIlL", "READ_SKILL_RESOURCE"] {
+            let mut candidate = session.clone();
+            candidate.messages[2].tool_calls.as_mut().unwrap()[0]
+                .function
+                .name = name.into();
+            assert_apply_error_without_mutation(
+                &mut candidate,
+                &plan,
+                RetrievalWindowApplyError::ProtectedSkillChain,
+            );
+            let mut partial = plan.clone();
+            partial
+                .message_ids_to_archive
+                .retain(|id| id != "other-result");
+            partial.archive_message_count -= 1;
+            assert_apply_error_without_mutation(
+                &mut candidate,
+                &partial,
+                RetrievalWindowApplyError::IncompleteLogicalGroup,
+            );
+            candidate.messages[4].tool_call_id = Some("missing-call".into());
+            assert_apply_error_without_mutation(
+                &mut candidate,
+                &plan,
+                RetrievalWindowApplyError::UnsafeToolProtocol,
             );
         }
     }

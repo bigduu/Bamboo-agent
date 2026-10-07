@@ -1,0 +1,12 @@
+{
+  "name": "bamboo-browser-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bamboo-owned browser host for the shared Lotus workbench",
+  "scripts": {
+    "test:runtime": "node --test host.test.cjs"
+  },
+  "dependencies": {
+    "playwright-core": "1.62.1"
+  }
+}

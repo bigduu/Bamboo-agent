@@ -75,7 +75,7 @@ struct McpServerConfigFlatDisk {
     #[serde(default)]
     startup_timeout_ms: Option<u64>,
 
-    // sse shape
+    // remote HTTP shape
     #[serde(default)]
     url: Option<String>,
     #[serde(default, deserialize_with = "deserialize_headers")]
@@ -133,12 +133,20 @@ where
     }
 
     Err(de::Error::custom(
-        "MCP SSE headers must be an object map or an array",
+        "MCP HTTP headers must be an object map or an array",
     ))
 }
 
 impl McpServerConfigFlatDisk {
     fn into_internal(self) -> Result<McpServerConfig, String> {
+        if self
+            .transport_kind
+            .as_deref()
+            .is_some_and(|kind| kind != "streamable_http")
+            || (self.command.is_some() && self.transport_kind.is_some())
+        {
+            return Err("Unsupported MCP transport_kind".to_string());
+        }
         let enabled = self.enabled.unwrap_or(!self.disabled);
 
         let request_timeout_ms = self
@@ -170,26 +178,18 @@ impl McpServerConfigFlatDisk {
                 let connect_timeout_ms = self
                     .connect_timeout_ms
                     .unwrap_or_else(default_connect_timeout);
-                if self.transport_kind.as_deref() == Some("streamable_http") {
-                    TransportConfig::StreamableHttp(StreamableHttpConfig {
-                        url,
-                        headers,
-                        connect_timeout_ms,
-                    })
-                } else {
-                    TransportConfig::Sse(SseConfig {
-                        url,
-                        headers,
-                        connect_timeout_ms,
-                    })
-                }
+                TransportConfig::StreamableHttp(StreamableHttpConfig {
+                    url,
+                    headers,
+                    connect_timeout_ms,
+                })
             }
             (Some(_), Some(_)) => {
                 return Err("MCP server config cannot contain both 'command' and 'url'".to_string())
             }
             (None, None) => {
                 return Err(
-                    "MCP server config must contain either 'command' (stdio) or 'url' (sse)"
+                    "MCP server config must contain either 'command' (stdio) or 'url' (streamable_http)"
                         .to_string(),
                 )
             }
@@ -267,7 +267,7 @@ struct McpServerDiskOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     startup_timeout_ms: Option<u64>,
 
-    // sse transport shape
+    // remote HTTP transport shape
     #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -289,8 +289,7 @@ struct McpServerDiskOut {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     denied_tools: Vec<String>,
 
-    // Full transport config for StreamableHttp (and future non-SSE/non-stdio transports).
-    // Stdio and SSE are serialized inline (command/url) for Claude Desktop compatibility.
+    // Supported transports are serialized inline (command/url) for mainstream MCP configurations.
     #[serde(skip_serializing_if = "Option::is_none")]
     transport: Option<TransportConfig>,
 }
@@ -341,39 +340,6 @@ impl From<&McpServerConfig> for McpServerDiskOut {
                 out.env_encrypted = stdio.env_encrypted.clone();
                 out.env_credential_refs = stdio.env_credential_refs.clone();
                 out.startup_timeout_ms = Some(stdio.startup_timeout_ms);
-            }
-            TransportConfig::Sse(sse) => {
-                out.url = Some(sse.url.clone());
-                out.headers = sse
-                    .headers
-                    .iter()
-                    .filter(|header| {
-                        !header.name.trim().is_empty()
-                            && (header.value_encrypted.is_none() || !header.value.is_empty())
-                    })
-                    .map(|h| (h.name.clone(), h.value.clone()))
-                    .collect();
-                out.headers_encrypted = sse
-                    .headers
-                    .iter()
-                    .filter_map(|header| {
-                        header
-                            .value_encrypted
-                            .as_ref()
-                            .map(|value| (header.name.clone(), value.clone()))
-                    })
-                    .collect();
-                out.header_credential_refs = sse
-                    .headers
-                    .iter()
-                    .filter_map(|header| {
-                        header
-                            .credential_ref
-                            .as_ref()
-                            .map(|value| (header.name.clone(), value.clone()))
-                    })
-                    .collect();
-                out.connect_timeout_ms = Some(sse.connect_timeout_ms);
             }
             TransportConfig::StreamableHttp(config) => {
                 out.url = Some(config.url.clone());
@@ -463,8 +429,10 @@ impl<'de> Deserialize<'de> for McpConfig {
             entry_obj.insert("id".to_string(), Value::String(id.clone()));
 
             // Accept either our internal full shape or the mainstream flattened shape.
-            if let Ok(server) = serde_json::from_value::<McpServerConfig>(entry.clone()) {
-                servers.push(server);
+            if entry.get("transport").is_some() {
+                servers.push(
+                    serde_json::from_value::<McpServerConfig>(entry).map_err(de::Error::custom)?,
+                );
                 continue;
             }
 
@@ -528,7 +496,6 @@ pub fn default_healthcheck_interval() -> u64 {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum TransportConfig {
     Stdio(StdioConfig),
-    Sse(SseConfig),
     #[serde(rename = "streamable_http")]
     StreamableHttp(StreamableHttpConfig),
 }
@@ -567,24 +534,11 @@ pub fn default_startup_timeout() -> u64 {
     20000 // 20 seconds
 }
 
-/// SSE transport configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SseConfig {
-    /// SSE endpoint URL
-    pub url: String,
-    /// Additional headers
-    #[serde(default)]
-    pub headers: Vec<HeaderConfig>,
-    /// Connection timeout in milliseconds
-    #[serde(default = "default_connect_timeout")]
-    pub connect_timeout_ms: u64,
-}
-
 pub fn default_connect_timeout() -> u64 {
     10000 // 10 seconds
 }
 
-/// MCP Streamable HTTP transport configuration (MCP 2.0, 2025-03-26).
+/// MCP Streamable HTTP transport configuration.
 ///
 /// Uses a single HTTP endpoint for both sending and receiving JSON-RPC messages.
 /// The server URL should point to the MCP endpoint (e.g. `http://localhost:3000/mcp`).
@@ -781,43 +735,29 @@ mod tests {
     }
 
     #[test]
-    fn test_sse_config() {
-        let json = r#"{
-            "type": "sse",
-            "url": "http://localhost:8080/sse",
-            "headers": [
-                {"name": "Authorization", "value": "Bearer token123"}
-            ],
-            "connect_timeout_ms": 5000
-        }"#;
-        let config: TransportConfig = serde_json::from_str(json).unwrap();
-        match config {
-            TransportConfig::Sse(sse) => {
-                assert_eq!(sse.url, "http://localhost:8080/sse");
-                assert_eq!(sse.headers.len(), 1);
-                assert_eq!(sse.headers[0].name, "Authorization");
-                assert_eq!(sse.headers[0].value, "Bearer token123");
-                assert_eq!(sse.connect_timeout_ms, 5000);
-            }
-            _ => panic!("Expected SSE transport"),
+    fn retired_sse_is_rejected_in_every_config_shape() {
+        let transport = serde_json::json!({"type": "sse", "url": "https://example.test/sse"});
+        assert!(serde_json::from_value::<TransportConfig>(transport.clone()).is_err());
+        for entry in [
+            serde_json::json!({"transport": transport}),
+            serde_json::json!({"transport": transport, "url": "https://example.test/mcp"}),
+            serde_json::json!({"url": "https://example.test/sse", "transport_kind": "sse"}),
+        ] {
+            assert!(
+                serde_json::from_value::<McpConfig>(serde_json::json!({"remote": entry})).is_err()
+            );
         }
     }
 
     #[test]
-    fn test_sse_config_minimal() {
-        let json = r#"{
-            "type": "sse",
-            "url": "http://localhost:8080/sse"
-        }"#;
-        let config: TransportConfig = serde_json::from_str(json).unwrap();
-        match config {
-            TransportConfig::Sse(sse) => {
-                assert_eq!(sse.url, "http://localhost:8080/sse");
-                assert!(sse.headers.is_empty());
-                assert_eq!(sse.connect_timeout_ms, 10000); // default
-            }
-            _ => panic!("Expected SSE transport"),
-        }
+    fn url_only_config_defaults_to_streamable_http() {
+        let config: McpConfig = serde_json::from_value(
+            serde_json::json!({"remote": {"url": "https://example.test/mcp"}}),
+        )
+        .unwrap();
+        assert!(
+            matches!(&config.servers[0].transport, TransportConfig::StreamableHttp(http) if http.url == "https://example.test/mcp")
+        );
     }
 
     #[test]
@@ -954,8 +894,8 @@ mod tests {
                 {
                     "id": "web-server",
                     "transport": {
-                        "type": "sse",
-                        "url": "http://localhost:3000/sse"
+                        "type": "streamable_http",
+                        "url": "http://localhost:3000/http"
                     }
                 }
             ]
@@ -1056,19 +996,6 @@ mod tests {
                     }),
                 ),
                 server(
-                    "sse",
-                    TransportConfig::Sse(SseConfig {
-                        url: "https://example.test/sse".to_string(),
-                        headers: vec![HeaderConfig {
-                            name: "Authorization".to_string(),
-                            value: "sse-secret".to_string(),
-                            value_encrypted: Some("sse-ciphertext".to_string()),
-                            credential_ref: None,
-                        }],
-                        connect_timeout_ms: default_connect_timeout(),
-                    }),
-                ),
-                server(
                     "http",
                     TransportConfig::StreamableHttp(StreamableHttpConfig {
                         url: "https://example.test/mcp".to_string(),
@@ -1087,11 +1014,6 @@ mod tests {
         let value = serde_json::to_value(&cfg).unwrap();
         assert_eq!(value["stdio"]["env"]["TOKEN"], "stdio-secret");
         assert_eq!(value["stdio"]["env_encrypted"]["TOKEN"], "stdio-ciphertext");
-        assert_eq!(value["sse"]["headers"]["Authorization"], "sse-secret");
-        assert_eq!(
-            value["sse"]["headers_encrypted"]["Authorization"],
-            "sse-ciphertext"
-        );
         assert_eq!(value["http"]["headers"]["Authorization"], "http-secret");
         assert_eq!(
             value["http"]["headers_encrypted"]["Authorization"],
@@ -1109,19 +1031,6 @@ mod tests {
         };
         assert_eq!(stdio.env["TOKEN"], "stdio-secret");
         assert_eq!(stdio.env_encrypted["TOKEN"], "stdio-ciphertext");
-        let sse_server = round_trip
-            .servers
-            .iter()
-            .find(|server| server.id == "sse")
-            .unwrap();
-        let TransportConfig::Sse(sse) = &sse_server.transport else {
-            panic!("expected SSE transport");
-        };
-        assert_eq!(sse.headers[0].value, "sse-secret");
-        assert_eq!(
-            sse.headers[0].value_encrypted.as_deref(),
-            Some("sse-ciphertext")
-        );
         let http_server = round_trip
             .servers
             .iter()

@@ -342,7 +342,7 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
                 Some("stdio") => {
                     transport.remove("env_encrypted");
                 }
-                Some("sse") => {
+                Some("streamable_http") => {
                     if let Some(headers) =
                         transport.get_mut("headers").and_then(|v| v.as_array_mut())
                     {

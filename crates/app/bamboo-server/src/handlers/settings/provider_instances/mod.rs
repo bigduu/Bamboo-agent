@@ -208,6 +208,11 @@ fn validate_provider_type(provider_type: &str) -> Result<(), AppError> {
 
 fn validate_instance_config(instance: &ProviderInstanceConfig) -> Result<(), AppError> {
     validate_provider_type(&instance.provider_type)?;
+    let mut config = bamboo_config::Config::default();
+    config
+        .provider_instances
+        .insert("instance".into(), instance.clone());
+    bamboo_config::validate_runtime_model_admission(&config).map_err(AppError::BadRequest)?;
 
     if let Some(request_overrides) = &instance.request_overrides {
         let original = serde_json::to_value(request_overrides).map_err(|error| {
@@ -717,6 +722,39 @@ mod tests {
             enabled: None,
             config: serde_json::json!({ "api_key": api_key }),
         }
+    }
+
+    #[test]
+    fn admission_rejects_malformed_lists_and_removal_of_assigned_models() {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!("all"),
+            serde_json::json!([42]),
+            serde_json::json!([""]),
+        ] {
+            let mut request = create_request("sk-real");
+            request.config["runtime_models"] = value;
+            assert!(build_instance_from_create(&request).is_err());
+        }
+        let mut request = create_request("sk-real");
+        request.config["model"] = serde_json::json!("chat");
+        request.config["runtime_models"] = serde_json::json!(["chat", "custom/id"]);
+        let instance = build_instance_from_create(&request).unwrap();
+        let update = UpdateInstanceRequest {
+            label: None,
+            enabled: None,
+            config: Some(serde_json::json!({"runtime_models":["custom/id"]})),
+        };
+        assert!(apply_instance_update(&instance, &update).is_err());
+        let update = UpdateInstanceRequest {
+            config: Some(serde_json::json!({"model":null,"runtime_models":[]})),
+            ..update
+        };
+        let empty = apply_instance_update(&instance, &update).unwrap();
+        assert_eq!(
+            instance_config_to_api(&empty, true)["runtime_models"],
+            serde_json::json!([])
+        );
     }
 
     #[test]

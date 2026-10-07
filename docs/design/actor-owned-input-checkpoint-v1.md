@@ -1,0 +1,9 @@
+# Owned Actor input checkpoint v1
+
+`FileSessionInbox::checkpoint_actor_input` is an explicit storage-only API for initialized Running ordinary Root/Child Actors and the exact v3 physical cur claim. Sealed Supervisor/other authority, invalid source or unsupported content fails closed. No Actor/admission/provider/worker/expiry caller is enabled; the return is not execution permission and this API does not ACK.
+
+New and Already first compare the complete current messages/native/admission prefix. Lost-response retries with a precommit prefix must reload. User and Main cursor are one atomic replacement; Runtime, compact authority, native lane, prior raw entries and unrelated control bytes remain unchanged.
+
+The closed `_bamboo_owned_input_checkpoint` User metadata object requires v1, exact envelope ID/target/birth, original positive generation, explicit nullable original intent and frozen policy. Only its strictly validated reserved key is stripped by the private matcher before unchanged Domain matching. Missing/ambiguous/malformed evidence or same-ID conflict never appends a duplicate. Recovery supports the original physical Envelope, including its presentation/retry fields, under a current replacement owner; obsolete lease identities are not dedupe identity. The generic Domain matcher rejects decorated Users; production integration needs separate acceptance.
+
+Every started complete std publication/cleanup job owns actual lifecycle → Task → Session → Inbox process/FileExt guards. Fresh final Actor/Inbox lease checks follow the real BeforeReplace barrier. Postrename/readback failure is OutcomeUnconfirmed, requiring reload; caller cancellation and whole-runtime shutdown do not promise unstarted async phases run. This proves cooperative current V2 physical writes, not global mixed-binary exclusion or exactly-once provider effects.

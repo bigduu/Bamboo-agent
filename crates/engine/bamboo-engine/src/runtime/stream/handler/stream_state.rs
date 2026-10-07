@@ -1,11 +1,15 @@
 use bamboo_agent_core::tools::ToolCallAccumulator;
+use chrono::Utc;
+use uuid::Uuid;
 
 use super::{
     InterruptedStreamOutput, PartialToolCallSnapshot, ProviderUsageSnapshot, StreamHandlingOutput,
+    VisibleMessageIdentity,
 };
 
 pub(super) struct StreamAccumulationState {
     response_id: Option<String>,
+    visible_message: Option<VisibleMessageIdentity>,
     content: String,
     reasoning_content: String,
     /// Provider-minted signature covering `reasoning_content` (#520). `None`
@@ -28,6 +32,7 @@ impl StreamAccumulationState {
     pub(super) fn new() -> Self {
         Self {
             response_id: None,
+            visible_message: None,
             content: String::new(),
             reasoning_content: String::new(),
             reasoning_signature: None,
@@ -42,6 +47,18 @@ impl StreamAccumulationState {
             input_tokens: 0,
             provider_transcript_items: Vec::new(),
         }
+    }
+
+    pub(super) fn ensure_visible_message(&mut self) -> Option<VisibleMessageIdentity> {
+        if self.visible_message.is_some() {
+            return None;
+        }
+        let identity = VisibleMessageIdentity {
+            message_id: Uuid::new_v4().to_string(),
+            created_at: Utc::now(),
+        };
+        self.visible_message = Some(identity.clone());
+        Some(identity)
     }
 
     pub(super) fn append_token(&mut self, token: &str) {
@@ -221,6 +238,7 @@ impl StreamAccumulationState {
     pub(super) fn into_output(self) -> StreamHandlingOutput {
         StreamHandlingOutput {
             response_id: self.response_id,
+            visible_message: self.visible_message,
             content: self.content,
             reasoning_content: self.reasoning_content,
             reasoning_signature: self.reasoning_signature,
@@ -238,6 +256,7 @@ impl StreamAccumulationState {
 
     pub(super) fn into_interrupted_output(self) -> InterruptedStreamOutput {
         InterruptedStreamOutput {
+            visible_message: self.visible_message,
             content: self.content,
             reasoning_content: self.reasoning_content,
             partial_tool_calls: self
