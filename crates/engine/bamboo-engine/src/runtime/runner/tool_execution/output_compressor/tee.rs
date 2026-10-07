@@ -96,8 +96,19 @@ async fn tee_save(root: &Path, session_id: &str, output: &str) -> std::io::Resul
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options.open(&path).await?;
+    let file = options.open(&path).await?;
+    complete_tee_write(file, path, output).await
+}
+
+async fn complete_tee_write(
+    mut file: tokio::fs::File,
+    path: PathBuf,
+    output: &str,
+) -> std::io::Result<PathBuf> {
     file.write_all(output.as_bytes()).await?;
+    // Tokio may accept bytes before its blocking write completes. Wait before
+    // publishing a path that another file handle must be able to read.
+    file.flush().await?;
     Ok(path)
 }
 
@@ -187,6 +198,83 @@ async fn cleanup_expired(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    struct ReleaseBlockedWorker(Option<std::sync::mpsc::Sender<()>>);
+
+    impl ReleaseBlockedWorker {
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for ReleaseBlockedWorker {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    #[test]
+    fn recovery_path_waits_for_real_file_write_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pending.log");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let mut release = ReleaseBlockedWorker(Some(release_tx));
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+            });
+            started_rx.await.unwrap();
+
+            let output = "complete ordinary output\nwith a second line\n";
+            let mut write = Box::pin(complete_tee_write(
+                tokio::fs::File::from_std(file),
+                path.clone(),
+                output,
+            ));
+            let first_poll = poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await;
+            let bytes_before_release = std::fs::read(&path);
+
+            // Drain the blocker before assertions, including when the old code
+            // incorrectly publishes a path. The guard also releases on panic.
+            release.release();
+            blocker.await.unwrap();
+            assert!(
+                first_poll.is_pending(),
+                "a recovery path must wait for the queued file write"
+            );
+            assert!(bytes_before_release.unwrap().is_empty());
+            let saved_path = write.await.unwrap();
+            assert_eq!(saved_path, path);
+            assert_eq!(std::fs::read_to_string(saved_path).unwrap(), output);
+        });
+    }
+
+    #[tokio::test]
+    async fn failed_file_write_completion_does_not_publish_recovery_path() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("readonly.log");
+        std::fs::write(&path, "existing bytes").unwrap();
+        let file = tokio::fs::File::from_std(std::fs::File::open(&path).unwrap());
+        let result = complete_tee_write(file, path.clone(), "replacement bytes").await;
+        assert!(result.is_err(), "failed completion must not publish a path");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "existing bytes");
+    }
 
     fn default_retention() -> Duration {
         retention_from_days(None)
