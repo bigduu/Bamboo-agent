@@ -3227,6 +3227,42 @@ mod optional_model_e2e {
                 .expect("inspect old canonical pin")
                 .expect("old activation remains until durable save returns");
             assert_eq!(live_before_handoff.skills[0].id, "plan");
+            assert!(
+                state.agent_runners.try_write().is_err(),
+                "detached commit retains the original runners read guard"
+            );
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(30),
+                    state.persistence.acquire_lock(session_id)
+                )
+                .await
+                .is_err(),
+                "final save does not drop/reacquire the original persistence guard"
+            );
+            let durable = state
+                .storage
+                .load_session(session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let snapshot: bamboo_skills::SkillActivationSnapshot = serde_json::from_str(
+                durable
+                    .metadata
+                    .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(snapshot.skills["review"].revision, review.revision);
+            assert_eq!(
+                durable
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == bamboo_agent_core::Role::User
+                        && message.content == "commit despite response cancellation")
+                    .count(),
+                1
+            );
             // Dropping the Actix response future simulates a disconnected
             // client. The detached commit task must retain both locks and
             // finish cache/feed/pin publication.
@@ -3283,6 +3319,168 @@ mod optional_model_e2e {
         .await
         .expect("detached commit releases the persistence lock");
         drop(guard);
+    }
+
+    #[actix_web::test]
+    async fn typed_chat_stale_selection_preserves_full_checkpoint_and_pin_identity() {
+        let state = new_state().await;
+        let session_id = "legacy-stale-full-checkpoint";
+        let selection = seed_active_instruction_workflow(&state, session_id, "plan").await;
+        let mut before = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        for (key, value) in [
+            ("workflow.future.private", "workflow opaque bytes"),
+            ("skill_runtime_future_private", "runtime opaque bytes"),
+            ("skill_mode", "code"),
+            ("unrelated.private", "outside checkpoint"),
+        ] {
+            before.metadata.insert(key.to_string(), value.to_string());
+        }
+        state.save_and_cache_session(&mut before).await;
+        let pin_before = state
+            .skill_manager
+            .pinned_activation_for_workspace(session_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let checkpoint = |session: &Session| -> std::collections::BTreeMap<String, String> {
+            session
+                .metadata
+                .iter()
+                .filter(|(key, _)| {
+                    key.starts_with("workflow.")
+                        || key.starts_with("skill_runtime_")
+                        || matches!(key.as_str(), "selected_skill_ids" | "skill_mode")
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        };
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let response = test::call_service(&app, test::TestRequest::post()
+            .uri("/api/v1/chat").set_json(serde_json::json!({
+                "session_id": session_id, "message": "stale request must not append", "model": "test-model",
+                "workflow_selection": {"id": selection.id, "source": selection.source, "revision": selection.revision + 1, "args": selection.args}
+            })).to_request()).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "workflow_revision_mismatch");
+        let after = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint(&after), checkpoint(&before));
+        assert_eq!(
+            after.metadata.get("unrelated.private"),
+            before.metadata.get("unrelated.private")
+        );
+        assert_eq!(
+            serde_json::to_value(&after.messages).unwrap(),
+            serde_json::to_value(&before.messages).unwrap()
+        );
+        let pin_after = state
+            .skill_manager
+            .pinned_activation_for_workspace(session_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pin_after.descriptor.skill_revisions,
+            pin_before.descriptor.skill_revisions
+        );
+        assert_eq!(pin_after.skills[0].id, pin_before.skills[0].id);
+        let lock = tokio::time::timeout(
+            CONCURRENCY_ASSERT_TIMEOUT,
+            state.persistence.acquire_lock(session_id),
+        )
+        .await
+        .expect("rejection releases the same persistence lock");
+        drop(lock);
+        assert!(state.agent_runners.try_write().is_ok());
+    }
+
+    #[actix_web::test]
+    async fn ordinary_chat_without_selection_replays_exact_native_user_without_pin() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let session_id = "legacy-ordinary-no-selection";
+        let request = || {
+            test::TestRequest::post().uri("/api/v1/chat")
+            .insert_header(("Idempotency-Key", "legacy-ordinary-native-replay"))
+            .set_json(serde_json::json!({"session_id": session_id, "message": "ordinary 原样输入", "model": "test-model"}))
+            .to_request()
+        };
+        let first = test::call_service(&app, request()).await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = test::read_body(first).await;
+        let first_session = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let users = |session: &Session| -> Vec<bamboo_agent_core::Message> {
+            session
+                .messages
+                .iter()
+                .filter(|message| message.role == bamboo_agent_core::Role::User)
+                .cloned()
+                .collect()
+        };
+        let original = users(&first_session);
+        assert_eq!(original.len(), 1);
+        assert_eq!(original[0].content, "ordinary 原样输入");
+        assert!(!original[0].id.is_empty());
+        assert!(original[0].content_parts.is_none());
+        let retry = test::call_service(&app, request()).await;
+        assert_eq!(retry.status(), StatusCode::CREATED);
+        assert_eq!(test::read_body(retry).await, first_body);
+        let replayed = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(users(&replayed)).unwrap(),
+            serde_json::to_value(original).unwrap(),
+            "id, role, timestamp, text and parts survive exact replay"
+        );
+        assert!(!replayed
+            .metadata
+            .contains_key(bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY));
+        assert!(!replayed
+            .metadata
+            .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY));
+        assert!(state
+            .skill_manager
+            .pinned_activation_for_workspace(session_id, None)
+            .await
+            .unwrap()
+            .is_none());
+        let lock = tokio::time::timeout(
+            CONCURRENCY_ASSERT_TIMEOUT,
+            state.persistence.acquire_lock(session_id),
+        )
+        .await
+        .expect("ordinary chat releases its original lock");
+        drop(lock);
+        assert!(state.agent_runners.try_write().is_ok());
     }
 
     // These fixtures supply borrowed, already-correlated data to a pure helper.
