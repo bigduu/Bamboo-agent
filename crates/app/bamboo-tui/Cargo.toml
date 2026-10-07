@@ -20,7 +20,7 @@ futures = "0.3"
 # TUI
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
-tui-textarea-2 = "0.12"
+tui-textarea-2 = "0.13"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
