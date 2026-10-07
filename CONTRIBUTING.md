@@ -232,9 +232,12 @@ Every reservation and update is authenticated with a domain-separated HMAC
 over the complete canonical receipt. Only authenticated, source-bound receipts
 and crates.io versions advance the automatic allocator. Unsigned release/tag
 names only occupy individual candidates; 100 consecutive collisions stop the
-run before any publication. Matching invalid reservations are rejected without
-being re-signed. Unrelated authentication, shape or placement failures have no
-allocation or source-order authority; transport failures still stop the run.
+run before any publication. Explicit manual reservations and authenticated
+receipts for the current source fail on invalid recovery evidence without
+being re-signed. A public target SHA alone does not establish receipt authority.
+Unauthenticated names remain occupancy only. Unrelated shape or placement
+failures have no allocation or source-order authority; transport failures still
+stop the run.
 The automatic counter retains Cargo's full unsigned 64-bit range; exhausting
 that range stops before reserving a release until the next UTC month.
 

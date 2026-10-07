@@ -253,8 +253,8 @@ async function publish(context, release, receipt) {
 }
 
 async function readReleaseReceipt(context, release, identity, version) {
-  let required = release.target_commitish === identity.sourceRevision ||
-    (version && release.tag_name === `v${version}`)
+  // Public target SHAs do not establish receipt relevance without authentication.
+  let required = Boolean(!context.automatic && version && release.tag_name === `v${version}`)
   let receipt
   try {
     receipt = await context.readReceipt(release, { required })

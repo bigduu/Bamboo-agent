@@ -246,18 +246,41 @@ test('missing, malformed, wrong-key and modified receipt authentication cannot b
   assert.deepEqual(readAuthenticatedReceipt(release(original), signingKey), original)
 })
 
-test('matching unsigned or bad-MAC automatic and manual drafts cannot be re-signed into a privileged publication', async () => {
+test('explicit manual unsigned or bad-MAC drafts cannot be re-signed into a privileged publication', async () => {
   for (const version of ['2026.9999.9999', '2026.10.9999']) {
-    for (const automatic of [true, false]) {
-      for (const unsigned of [true, false]) {
-        const forged = makeReceipt({ version, automatic })
-        if (unsigned) delete forged.authentication
-        else forged.authentication.mac = 'f'.repeat(64)
-        const { context, calls } = fixture({ automatic, requestedVersion: automatic ? '' : version,
-          releases: async () => [release(forged)] })
-        await assert.rejects(() => plan(context), /authentication/)
-        assert.deepEqual(calls, [])
-      }
+    for (const unsigned of [true, false]) {
+      const forged = makeReceipt({ version, automatic: false })
+      if (unsigned) delete forged.authentication
+      else forged.authentication.mac = 'f'.repeat(64)
+      const { context, calls } = fixture({ automatic: false, requestedVersion: version,
+        releases: async () => [release(forged)] })
+      await assert.rejects(() => plan(context), /authentication/)
+      assert.deepEqual(calls, [])
+    }
+  }
+})
+
+test('unauthenticated drafts targeting the public current SHA only occupy their names during automatic publication', async () => {
+  for (const version of ['2026.10.8', '2026.10.9999']) {
+    for (const mode of ['missing', 'unsigned', 'bad-mac', 'malformed-json']) {
+      const forged = makeReceipt({ version })
+      if (mode === 'unsigned') delete forged.authentication
+      else forged.authentication.mac = 'f'.repeat(64)
+      const body = mode === 'missing' ? 'No canonical receipt' : mode === 'malformed-json'
+        ? '<!-- bamboo-release-provenance\n{\n-->' : receiptBody(forged)
+      const entry = release(forged, { id: 43, body })
+      const original = clone(entry)
+      const { context, calls, bodies, completions } = fixture({ releases: async () => [entry],
+        versions: async () => ['2026.10.7'],
+        tagSource: async () => { throw new Error('Unauthenticated target cannot authorize a tag lookup') } })
+      const result = await plan(context)
+      const expectedVersion = version === '2026.10.8' ? '2026.10.9' : '2026.10.8'
+      assert.equal(result.receipt.version, expectedVersion)
+      await publish(context, result.release, result.receipt)
+      assert.deepEqual(completions, [{ version: expectedVersion, makeLatest: true }])
+      assert.equal(calls.filter(call => call === 'reserve').length, 1)
+      assert.deepEqual(entry, original, 'The attacker record must never be modified or re-signed')
+      assert.ok(bodies.every(body => readAuthenticatedReceipt({ body }, signingKey).version === expectedVersion))
     }
   }
 })
@@ -339,10 +362,10 @@ test('history tag lookup transport failures still stop every publication boundar
   }
 })
 
-test('deep untrusted JSON authentication cannot block foreign history but still rejects current recovery', async () => {
+test('deep untrusted JSON authentication cannot block automatic history but still rejects explicit manual recovery', async () => {
   const foreign = completedReceipt('2026.10.500', 'b'.repeat(40))
   const encoded = JSON.stringify(foreign).slice(0, -1) + ',"extra":' + '['.repeat(10000) + '0' + ']'.repeat(10000) + '}'
-  const entry = release(foreign, { id: 43, draft: false,
+  const entry = release(foreign, { id: 43, draft: false, target_commitish: sourceRevision,
     body: `<!-- bamboo-release-provenance\n${encoded}\n-->` })
   assert.ok(Buffer.byteLength(entry.body) > 20000 && Buffer.byteLength(entry.body) < 65536)
   assert.throws(() => readAuthenticatedReceipt(entry, signingKey), RangeError)
@@ -353,7 +376,7 @@ test('deep untrusted JSON authentication cannot block foreign history but still 
   assert.equal(result.receipt.version, '2026.10.8')
   await publish(context, result.release, result.receipt)
   assert.deepEqual(completions, [{ version: '2026.10.8', makeLatest: true }])
-  const current = fixture({ releases: async () => [{ ...entry, target_commitish: sourceRevision }] })
+  const current = fixture({ automatic: false, requestedVersion: foreign.version, releases: async () => [entry] })
   await assert.rejects(() => plan(current.context), RangeError)
   assert.deepEqual(current.calls, [])
 })
@@ -380,6 +403,7 @@ test('authenticated history still rejects tag, target, repository and duplicate 
   const receipt = makeReceipt()
   for (const changed of [release(receipt, { tag_name: 'v2026.10.99' }),
     release(receipt, { target_commitish: 'b'.repeat(40) }),
+    release(signReceipt({ ...clone(receipt), crates: null }, signingKey)),
     release(makeReceipt({ identity: { ...clone(identity), repository: 'foreign/repo' } }))]) {
     const { context, calls } = fixture({ releases: async () => [changed] })
     await assert.rejects(() => plan(context))
