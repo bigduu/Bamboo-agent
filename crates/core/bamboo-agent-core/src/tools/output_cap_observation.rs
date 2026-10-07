@@ -199,17 +199,17 @@ mod tests {
     async fn child_blocking_and_detached_tasks_do_not_inherit_parent_scope() {
         let release = Arc::new(Notify::new());
         let signal = release.clone();
-        let detached = scope_tool_output_cap("s", "c", Some(41), async {
+        let (detached,) = scope_tool_output_cap("s", "c", Some(41), async {
             let child = tokio::spawn(async { observed_tool_output_cap(&context(Some("s"), "c")) });
             let blocking =
                 tokio::task::spawn_blocking(|| observed_tool_output_cap(&context(Some("s"), "c")));
             assert_eq!(child.await.unwrap(), None);
             assert_eq!(blocking.await.unwrap(), None);
             assert_eq!(observed_tool_output_cap(&context(Some("s"), "c")), Some(41));
-            tokio::spawn(async move {
+            (tokio::spawn(async move {
                 signal.notified().await;
                 observed_tool_output_cap(&context(Some("s"), "c"))
-            })
+            }),)
         })
         .await;
         release.notify_one();
