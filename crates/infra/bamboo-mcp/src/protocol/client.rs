@@ -2,6 +2,7 @@
 //! subscriptions, cancellation and transports belong exclusively to `rmcp`.
 use super::models::{JsonRpcNotification, McpInitializeResult};
 use crate::error::{McpError, Result};
+use crate::manager::log_privacy::diagnostic_id;
 use crate::types::{McpCallResult, McpStructuredContent, McpTool};
 use futures::future::BoxFuture;
 use rmcp::model::{
@@ -38,7 +39,13 @@ impl BambooClientHandler {
                 // A full UI queue must never block SDK response dispatch.
                 let _ = self.notifications.try_send(notification);
             }
-            Err(error) => tracing::warn!(%error, "Unable to project MCP notification"),
+            Err(error) => tracing::warn!(
+                phase = "notification_projection",
+                error_kind = "serialization",
+                error_line = error.line(),
+                error_column = error.column(),
+                "Unable to project MCP notification"
+            ),
         }
     }
 }
@@ -262,8 +269,12 @@ impl McpProtocolClient {
                     Ok(validator) => {
                         validators.insert(tool.name.to_string(), Arc::new(validator));
                     }
-                    Err(error) => {
-                        tracing::warn!(%error, "Ignoring MCP tool with invalid output schema");
+                    Err(_) => {
+                        tracing::warn!(
+                            tool_id = %diagnostic_id("tool", &[tool.name.as_ref()]),
+                            phase = "tools_list", error_kind = "invalid_output_schema",
+                            "Ignoring MCP tool with invalid output schema"
+                        );
                         continue;
                     }
                 }

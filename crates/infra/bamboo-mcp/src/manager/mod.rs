@@ -18,7 +18,11 @@ mod config_sync;
 mod fingerprint;
 pub(crate) mod generation;
 mod lifecycle;
+#[path = "../log_privacy.rs"]
+pub(crate) mod log_privacy;
 mod reconnect;
+
+use log_privacy::{diagnostic_id, error_kind, error_text_len};
 
 use generation::{
     ExpectedPublication, GenerationAuthority, McpRuntimeGeneration, ServerPublication,
@@ -26,6 +30,9 @@ use generation::{
 };
 pub use generation::{McpRuntimeSnapshot, PublicationId, ResolvedMcpCall, RuntimeId};
 
+#[cfg(test)]
+#[path = "../log_privacy_tests.rs"]
+mod log_privacy_tests;
 #[cfg(test)]
 mod tests;
 
@@ -162,15 +169,21 @@ impl McpServerQos {
             state.circuit_open_until =
                 Some(Instant::now() + StdDuration::from_millis(self.config.circuit_open_ms));
             warn!(
-                "MCP QoS opening circuit for server '{}' after {} consecutive failures (tool '{}', last_error={})",
-                server_id, state.consecutive_failures, tool_name, error
+                server_id = %diagnostic_id("server", &[server_id]),
+                owner_id = %diagnostic_id("owner", &[server_id, tool_name]),
+                phase = "qos_circuit", consecutive_failures = state.consecutive_failures,
+                error_kind = error_kind(error), error_text_len = error_text_len(error),
+                "MCP QoS opening circuit"
             );
         }
 
         if state.consecutive_failures >= self.config.reconnect_failure_threshold {
             warn!(
-                "MCP server '{}' hit {} consecutive failures (tool '{}', last_error={}) — recycling (disconnect + reconnect)",
-                server_id, state.consecutive_failures, tool_name, error
+                server_id = %diagnostic_id("server", &[server_id]),
+                owner_id = %diagnostic_id("owner", &[server_id, tool_name]),
+                phase = "qos_recycle", consecutive_failures = state.consecutive_failures,
+                error_kind = error_kind(error), error_text_len = error_text_len(error),
+                "MCP server recycling after repeated failures"
             );
             state.consecutive_failures = 0;
             state.circuit_open_until = None;
@@ -501,7 +514,11 @@ impl McpServerManager {
         let server_ids: Vec<String> = self.list_servers();
         for server_id in server_ids {
             if let Err(e) = self.stop_server(&server_id).await {
-                error!("Error stopping server '{}': {}", server_id, e);
+                error!(
+                    server_id = %diagnostic_id("server", &[&server_id]), phase = "shutdown",
+                    error_kind = error_kind(&e), error_text_len = error_text_len(&e),
+                    "Error stopping MCP server"
+                );
             }
         }
     }
