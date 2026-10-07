@@ -39,7 +39,7 @@ test("routine dev pull requests run locked Rust, formatting, and policy checks",
   )
   assert.match(
     testJob,
-    /- name: Test CI workflow policy\n        run: node --test scripts\/ci-policy\.test\.cjs\n/u,
+    /- name: Test CI workflow policy\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs\n/u,
   )
   assert.match(
     testJob,

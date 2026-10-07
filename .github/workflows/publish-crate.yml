@@ -1,6 +1,10 @@
 name: Publish Crate
 
 on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:
@@ -28,16 +32,39 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
+
+# Both independent main releases and Zenith/manual dispatches reserve versions
+# under this same queue. Never cancel a run that can already have uploaded crates.
+concurrency:
+  group: bamboo-crate-publication
+  queue: max
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   publish:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       github.event.workflow_run.repository.full_name == github.repository)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Require the release policy in this source commit
+        # A rerun of pre-policy main CI must not publish old source after the
+        # workflow lands on the default dev branch. The next main promotion
+        # carries both the workflow and this policy into its exact source.
+        run: test -f scripts/crate-release.cjs
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -88,29 +115,18 @@ jobs:
           shared-key: bamboo-publish-crate-${{ runner.os }}
           cache-on-failure: true
 
-      - name: Resolve publish version
+      - name: Reserve or resume the exact release identity
         id: version
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ -n "${{ github.event.inputs.version }}" ] && [ "${{ github.event.inputs.version }}" != "latest" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            VERSION="$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')"
-          fi
-
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Resolved version: ${VERSION}"
-
-      - name: Refuse to publish the placeholder version
-        # Source ships 0.0.0 on purpose — it's obviously not a real version, so it
-        # can't silently ship. The release train passes the real date-based
-        # version; never publish the 0.0.0 placeholder.
-        if: steps.version.outputs.version == '0.0.0'
-        run: |
-          echo "::error::Bamboo version resolved to the 0.0.0 placeholder. Pass a version input (the release train provides one from the Zenith config)."
-          exit 1
+        env:
+          # Historical queued source can contain workflows different from the
+          # default dev branch. A release token with Workflows:write supports it.
+          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN || github.token }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          PUBLISH_VERSION: ${{ github.event.inputs.version }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
+          FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
+        run: node scripts/crate-release.cjs plan
 
       - name: Prepare workspace manifests for publish
         shell: bash
@@ -215,7 +231,7 @@ jobs:
           PY
 
           echo "Prepared Bamboo workspace manifests for version ${TARGET_VERSION}"
-          git diff -- Cargo.toml crates/*/Cargo.toml
+          git diff -- Cargo.toml crates/*/*/Cargo.toml
 
       - name: Validate publish plan
         if: github.event.inputs.dry_run == 'true'
@@ -242,126 +258,11 @@ jobs:
           EOF
           python3 scripts/compute-publish-order.py
 
-      - name: Publish to crates.io
+      - name: Publish verified crates and complete the GitHub Release
         if: github.event.inputs.dry_run != 'true'
-        shell: bash
         env:
+          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN || github.token }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          TARGET_VERSION: ${{ steps.version.outputs.version }}
-          CRATES_IO_USER_AGENT: bamboo-publish-crate/1.0 (+https://github.com/${{ github.repository }})
-        run: |
-          set -euo pipefail
-
-          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
-            echo "Missing CARGO_REGISTRY_TOKEN secret."
-            exit 1
-          fi
-
-          crate_exists() {
-            local crate="$1"
-            local version="$2"
-            local status
-
-            status="$(curl -sS -o /dev/null -w "%{http_code}" \
-              -H "User-Agent: ${CRATES_IO_USER_AGENT}" \
-              "https://crates.io/api/v1/crates/${crate}/${version}" || true)"
-
-            [ "${status}" = "200" ]
-          }
-
-          wait_for_crate() {
-            local crate="$1"
-            local version="$2"
-            local max_attempts=30
-            local attempt=1
-
-            echo "Waiting for ${crate}@${version} to appear on crates.io"
-            while [ "${attempt}" -le "${max_attempts}" ]; do
-              if crate_exists "${crate}" "${version}"; then
-                echo "Found ${crate}@${version} on crates.io"
-                return 0
-              fi
-
-              echo "Attempt ${attempt}/${max_attempts}: ${crate}@${version} not visible yet; retrying in 10s..."
-              attempt=$((attempt + 1))
-              sleep 10
-            done
-
-            echo "Timed out waiting for ${crate}@${version} on crates.io"
-            return 1
-          }
-
-          publish_one() {
-            local crate="$1"
-            local output status attempt=1
-            local max_attempts=25
-
-            if crate_exists "${crate}" "${TARGET_VERSION}"; then
-              echo "${crate}@${TARGET_VERSION} already exists on crates.io; skipping publish."
-              wait_for_crate "${crate}" "${TARGET_VERSION}"
-              return 0
-            fi
-
-            while [ "${attempt}" -le "${max_attempts}" ]; do
-              echo "Publishing ${crate}@${TARGET_VERSION} (attempt ${attempt}/${max_attempts})"
-              set +e
-              output="$(cargo publish --allow-dirty -p "${crate}" 2>&1)"
-              status=$?
-              set -e
-              echo "${output}"
-
-              if [ ${status} -eq 0 ] || echo "${output}" | grep -qi "already exists on crates.io index"; then
-                wait_for_crate "${crate}" "${TARGET_VERSION}"
-                return 0
-              fi
-
-              # crates.io throttles brand-new crate names (HTTP 429). This only
-              # bites while bootstrapping never-before-published names; publishing
-              # new versions of existing crates is not limited this way. Honor the
-              # advertised retry time and try again.
-              if echo "${output}" | grep -qi "429 Too Many Requests"; then
-                local retry_after wait_s target_epoch now_epoch
-                retry_after="$(printf '%s\n' "${output}" | grep -oiE "try again after [A-Za-z0-9:, ]*GMT" | head -1 | sed -E 's/^try again after //I')"
-                wait_s=120
-                if [ -n "${retry_after}" ]; then
-                  target_epoch="$(date -u -d "${retry_after}" +%s 2>/dev/null || echo 0)"
-                  now_epoch="$(date -u +%s)"
-                  if [ "${target_epoch}" -gt 0 ]; then
-                    wait_s=$(( target_epoch - now_epoch + 10 ))
-                  fi
-                fi
-                [ "${wait_s}" -lt 15 ] && wait_s=15
-                [ "${wait_s}" -gt 1200 ] && wait_s=1200
-                echo "Rate limited by crates.io; waiting ${wait_s}s before retrying ${crate} (until ${retry_after:-unknown})..."
-                sleep "${wait_s}"
-                attempt=$((attempt + 1))
-                continue
-              fi
-
-              # Any other failure is fatal.
-              return ${status}
-            done
-
-            echo "Gave up on ${crate} after ${max_attempts} attempts (persistent rate limiting)."
-            return 1
-          }
-
-          # Publish order is derived from the real dependency graph
-          # (scripts/compute-publish-order.py via `cargo metadata`), NOT a
-          # hand-maintained list. The old hand-list had drifted to 9 crates while
-          # the workspace grew to 20 in bamboo-agent's closure — so deps like
-          # bamboo-config were never published and dependents failed with
-          # "no matching package". Computing it keeps publish in lock-step.
-          mapfile -t crates < <(python3 scripts/compute-publish-order.py)
-
-          if [ "${#crates[@]}" -eq 0 ]; then
-            echo "Computed an empty publish order; aborting."
-            exit 1
-          fi
-          echo "Publish order (${#crates[@]} crates): ${crates[*]}"
-
-          for crate in "${crates[@]}"; do
-            publish_one "${crate}"
-          done
-
-          echo "Published Bamboo crates for version ${TARGET_VERSION}"
+          FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
+          FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
+        run: node scripts/crate-release.cjs publish
