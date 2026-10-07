@@ -176,6 +176,7 @@ async fn execute_and_apply_single_tool_call(
                 tool_name
             );
             let outcome = per_call::ToolExecutionOutcome {
+                output_cap: None,
                 permission_replay_origin: None,
                 needs_human: None,
                 portable_tool: None,
@@ -230,6 +231,7 @@ async fn execute_and_apply_single_tool_call(
             per_call::execute_model_requested_tool_call_only(
                 effective_callable_set,
                 per_call::ToolExecutionOnlyContext {
+                    output_cap: None,
                     tool_call,
                     event_tx,
                     metrics_collector,
@@ -264,6 +266,7 @@ async fn execute_and_apply_single_tool_call(
                 message
             );
             per_call::ToolExecutionOutcome {
+                output_cap: None,
                 permission_replay_origin: None,
                 needs_human: None,
                 portable_tool: None,
@@ -274,6 +277,16 @@ async fn execute_and_apply_single_tool_call(
         }
     };
 
+    // Use exactly the scalar observed by this dispatch, including unknown/zero.
+    // Pre-dispatch failures retain the original local projection.
+    let max_tool_tokens = outcome
+        .output_cap
+        .unwrap_or_else(|| {
+            session
+                .effective_token_budget()
+                .map(|budget| budget.max_tool_output_tokens)
+        })
+        .unwrap_or(0);
     // Compress tool output before applying
     let task_hint = build_task_compression_hint(task_context);
     let outcome = output_compressor::maybe_compress(
@@ -281,10 +294,7 @@ async fn execute_and_apply_single_tool_call(
         &tool_call.function.arguments,
         session_id,
         outcome,
-        session
-            .effective_token_budget()
-            .map(|b| b.max_tool_output_tokens)
-            .unwrap_or(0),
+        max_tool_tokens,
         build_context_pressure(session),
         task_hint.as_ref(),
     )
@@ -646,6 +656,9 @@ pub(crate) async fn execute_round_tool_calls(
             let executing_supervisor =
                 ExecutingSupervisorObservation::capture_from_executing_session(session);
             let root_orchestration_only = session.root_orchestration_only_enabled();
+            let output_cap = session
+                .effective_token_budget()
+                .map(|budget| budget.max_tool_output_tokens);
             let outcomes = tokio::time::timeout(
                 batch_timeout,
                 join_all(batch.iter().map(|tool_call| {
@@ -656,6 +669,7 @@ pub(crate) async fn execute_round_tool_calls(
                             per_call::execute_model_requested_tool_call_only(
                                 effective_callable_set,
                                 per_call::ToolExecutionOnlyContext {
+                                    output_cap,
                                     tool_call,
                                     event_tx,
                                     metrics_collector,
@@ -677,6 +691,7 @@ pub(crate) async fn execute_round_tool_calls(
                         .await
                         .unwrap_or_else(|_| {
                             Ok(per_call::ToolExecutionOutcome {
+                                output_cap: None,
                                 permission_replay_origin: None,
                                 needs_human: None,
                                 portable_tool: per_call::portable_tool_for_admitted_call(
@@ -706,6 +721,7 @@ pub(crate) async fn execute_round_tool_calls(
                     .iter()
                     .map(|batch_call| {
                         Ok(per_call::ToolExecutionOutcome {
+                            output_cap: None,
                             permission_replay_origin: None,
                             needs_human: None,
                             portable_tool: per_call::portable_tool_for_admitted_call(
@@ -769,6 +785,10 @@ pub(crate) async fn execute_round_tool_calls(
                         });
                     let task_hint = task_hint.clone();
                     async move {
+                        let max_tool_tokens = outcome
+                            .output_cap
+                            .map(|cap| cap.unwrap_or(0))
+                            .unwrap_or(max_tool_tokens);
                         output_compressor::maybe_compress(
                             &tool_name,
                             &args,
@@ -2362,5 +2382,304 @@ mod tests {
             session.force_manual_compression.as_deref(),
             Some("preserve error traces")
         );
+    }
+    struct CapRecordingExecutor {
+        parallel: bool,
+        rendezvous: tokio::sync::Barrier,
+        seen: Mutex<Vec<(String, Option<u32>)>>,
+        pending: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for CapRecordingExecutor {
+        async fn execute(
+            &self,
+            _: &ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
+            panic!("cap fixture requires actual context forwarding")
+        }
+        async fn execute_with_context_outcome(
+            &self,
+            call: &ToolCall,
+            ctx: ToolExecutionContext<'_>,
+        ) -> bamboo_agent_core::tools::executor::Result<ToolOutcome> {
+            let owned = ctx.to_tool_ctx();
+            let cap = bamboo_agent_core::tools::observed_tool_output_cap(&owned);
+            self.seen.lock().unwrap().push((call.id.clone(), cap));
+            if self.parallel {
+                self.rendezvous.wait().await;
+            }
+            if self.pending {
+                std::future::pending::<()>().await;
+            }
+            tokio::task::yield_now().await;
+            assert_eq!(
+                bamboo_agent_core::tools::observed_tool_output_cap(&owned),
+                cap
+            );
+            Ok(ToolOutcome::Completed(ToolResult::text(
+                true,
+                cap_fixture_text(),
+            )))
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            vec![ToolSchema {
+                schema_type: "function".into(),
+                function: FunctionSchema {
+                    name: "cap_probe".into(),
+                    description: "output parity fixture".into(),
+                    parameters: json!({"type":"object"}),
+                },
+            }]
+        }
+        fn call_parallel_classification(
+            &self,
+            _: &ToolCall,
+        ) -> (bamboo_agent_core::tools::ToolMutability, bool) {
+            (
+                bamboo_agent_core::tools::ToolMutability::ReadOnly,
+                self.parallel,
+            )
+        }
+    }
+
+    fn cap_fixture_text() -> String {
+        (0..600)
+            .map(|n| format!("value-{n}: 界🦀 escaped \\\"\n"))
+            .collect()
+    }
+
+    fn cap_budget(cap: u32) -> bamboo_domain::TokenBudget {
+        bamboo_domain::TokenBudget {
+            max_tool_output_tokens: cap,
+            ..Default::default()
+        }
+    }
+
+    async fn cap_fixture_round(
+        session: &mut Session,
+        concrete: Arc<CapRecordingExecutor>,
+        config: crate::runtime::config::AgentLoopConfig,
+    ) -> Vec<AgentEvent> {
+        let calls = [
+            named_call("cap-a", "cap_probe"),
+            named_call("cap-b", "cap_probe"),
+        ];
+        let tools: Arc<dyn ToolExecutor> = concrete;
+        let schemas = tools.list_tools();
+        let callable = legacy_effective_callable_set(&schemas);
+        let llm: Arc<dyn LLMProvider> = Arc::new(BoundaryNoopProvider);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let sid = session.id.clone();
+        let frame = crate::runtime::runner::round_frame::RoundFrame {
+            session_id: &sid,
+            round_id: "cap-round",
+            turn: 0,
+            debug_enabled: false,
+            event_tx: &event_tx,
+            metrics_collector: None,
+            config: &config,
+            llm: &llm,
+            tools: &tools,
+        };
+        let result = execute_round_tool_calls(RoundToolExecution {
+            tool_calls: &calls,
+            frame: &frame,
+            session,
+            runtime_state: &mut AgentRuntimeState::new(&sid),
+            policy_guard: &mut super::ToolPolicyGuard::default(),
+            task_context: &mut None,
+            compression_model_name: None,
+            compression_model_provider: None,
+            tool_schemas: &schemas,
+            effective_callable_set: &callable,
+        })
+        .await
+        .unwrap();
+        assert!(!result.awaiting_clarification);
+        std::iter::from_fn(|| event_rx.try_recv().ok()).collect()
+    }
+
+    fn cap_executor(parallel: bool, pending: bool) -> Arc<CapRecordingExecutor> {
+        Arc::new(CapRecordingExecutor {
+            parallel,
+            pending,
+            rendezvous: tokio::sync::Barrier::new(2),
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    // Run unchanged before and after adding the Engine producer. Both execution
+    // schedules feed the real generic compressor and same-ID result application.
+    #[tokio::test]
+    async fn original_engine_sequential_parallel_output_cap_parity() {
+        for parallel in [false, true] {
+            for cap in [None, Some(0), Some(64), Some(512)] {
+                let mut session = Session::new("cap-parity", "model");
+                session.token_budget = cap.map(cap_budget);
+                let executor = cap_executor(parallel, false);
+                let events =
+                    cap_fixture_round(&mut session, executor.clone(), Default::default()).await;
+                assert_eq!(executor.seen.lock().unwrap().len(), 2);
+                for id in ["cap-a", "cap-b"] {
+                    let replies: Vec<_> = session
+                        .messages
+                        .iter()
+                        .filter(|m| m.tool_call_id.as_deref() == Some(id))
+                        .collect();
+                    assert_eq!(replies.len(), 1);
+                    assert_eq!(replies[0].tool_success, Some(true));
+                    if cap.unwrap_or(0) == 0 {
+                        assert_eq!(replies[0].content, cap_fixture_text());
+                    } else {
+                        assert!(replies[0].content.contains("tool output truncated"));
+                        assert_ne!(replies[0].content, cap_fixture_text());
+                    }
+                    println!(
+                        "parity parallel={parallel} cap={cap:?} id={id} bytes={} content={:?}",
+                        replies[0].content.len(),
+                        replies[0].content
+                    );
+                    assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == id)));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_cap_tracks_host_replacement_fallback_and_actual_unknown_single_dispatch() {
+        let mut session = Session::new("cap-single", "model");
+        let sid = session.id.clone();
+        let executor = cap_executor(false, false);
+        let tools: Arc<dyn ToolExecutor> = executor.clone();
+        let schemas = tools.list_tools();
+        let callable = legacy_effective_callable_set(&schemas);
+        let config = crate::runtime::config::AgentLoopConfig::default();
+        let (event_tx, _event_rx) = mpsc::channel(128);
+        let mut runtime = AgentRuntimeState::new(&sid);
+        let mut state = super::loop_state::RoundExecutionState::default();
+        let mut policy = super::policy::ToolPolicyGuard::default();
+        let cases = [
+            (Some(64), Some(512), Some(64)),
+            (Some(128), Some(512), Some(128)),
+            (None, Some(512), Some(512)),
+            (None, None, None),
+            (Some(0), Some(512), Some(0)),
+        ];
+        for (index, (override_cap, resolved, expected)) in cases.into_iter().enumerate() {
+            session.token_budget = override_cap.map(cap_budget);
+            session.resolved_token_budget = resolved.map(|n| ("model".into(), cap_budget(n)));
+            let call = named_call(&format!("host-call-{index}"), "cap_probe");
+            let control = super::execute_and_apply_single_tool_call(
+                &call,
+                &event_tx,
+                None,
+                &sid,
+                "host-round",
+                index,
+                &mut session,
+                &tools,
+                &config,
+                &callable,
+                &schemas,
+                &mut runtime,
+                &mut None,
+                &mut state,
+                &mut policy,
+                0,
+            )
+            .await
+            .unwrap();
+            assert!(!control.should_break && !control.stop_round);
+            assert_eq!(
+                executor.seen.lock().unwrap().last(),
+                Some(&(call.id.clone(), expected))
+            );
+            let result = session.messages.last().unwrap();
+            assert_eq!(result.tool_call_id.as_deref(), Some(call.id.as_str()));
+            assert_eq!(result.tool_success, Some(true));
+            assert_eq!(
+                result.content.contains("tool output truncated"),
+                expected.unwrap_or(0) > 0
+            );
+            if expected.unwrap_or(0) == 0 {
+                assert_eq!(result.content, cap_fixture_text());
+            }
+            assert_eq!(
+                session
+                    .effective_token_budget()
+                    .map(|b| b.max_tool_output_tokens),
+                expected
+            );
+            let mut ctx = bamboo_agent_core::tools::ToolCtx::none(call.id);
+            ctx.session_id = Some(sid.clone().into());
+            assert_eq!(
+                bamboo_agent_core::tools::observed_tool_output_cap(&ctx),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_cap_parallel_dispatches_keep_exact_ids_and_scalar_through_pending_polls() {
+        for cap in [None, Some(0), Some(64)] {
+            let mut session = Session::new("cap-parallel", "model");
+            session.token_budget = cap.map(cap_budget);
+            let executor = cap_executor(true, false);
+            cap_fixture_round(&mut session, executor.clone(), Default::default()).await;
+            let mut seen = executor.seen.lock().unwrap().clone();
+            seen.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(seen, vec![("cap-a".into(), cap), ("cap-b".into(), cap)]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scoped_cap_actual_per_tool_and_batch_timeout_leave_only_same_id_errors() {
+        for batch_timeout in [false, true] {
+            let mut session = Session::new("cap-timeout", "model");
+            session.token_budget = Some(cap_budget(43));
+            let executor = cap_executor(true, true);
+            let config = crate::runtime::config::AgentLoopConfig {
+                per_tool_timeout_secs: if batch_timeout { 10 } else { 1 },
+                parallel_batch_timeout_secs: if batch_timeout { 1 } else { 10 },
+                ..Default::default()
+            };
+            cap_fixture_round(&mut session, executor.clone(), config).await;
+            assert_eq!(
+                executor.seen.lock().unwrap().len(),
+                2,
+                "both actual dispatch scopes started"
+            );
+            for id in ["cap-a", "cap-b"] {
+                let replies: Vec<_> = session
+                    .messages
+                    .iter()
+                    .filter(|m| m.tool_call_id.as_deref() == Some(id))
+                    .collect();
+                assert_eq!(replies.len(), 1);
+                assert_eq!(replies[0].tool_success, Some(false));
+                assert!(replies[0].content.contains(if batch_timeout {
+                    "Parallel batch timed out"
+                } else {
+                    "Tool 'cap_probe' timed out"
+                }));
+                let mut ctx = bamboo_agent_core::tools::ToolCtx::none(id);
+                ctx.session_id = Some(session.id.clone().into());
+                assert_eq!(
+                    bamboo_agent_core::tools::observed_tool_output_cap(&ctx),
+                    None
+                );
+            }
+            let healthy = cap_executor(true, false);
+            session.messages.clear();
+            session.token_budget = Some(cap_budget(0));
+            cap_fixture_round(&mut session, healthy.clone(), Default::default()).await;
+            assert!(healthy
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, cap)| *cap == Some(0)));
+        }
     }
 }

@@ -249,6 +249,24 @@ than emitting partial successful JSON or claiming EOF. Their plain failure text
 has no successful-page token-bound promise. Test-owned Reader overlays exercise
 this composition through the actual Runtime and outbound provider converters;
 they do not install a production Reader or establish configured-provider access.
-The live same-dispatch producer of model-resolved default token caps remains a
-separate requirement: persisted Session omits that resolved budget. Production
-caller resolution and output composition remain disconnected until cutover.
+Engine observes the actual Session's output cap after continuing BeforeTool
+hooks and scopes that scalar to the same executor future and exact Session/call
+IDs. Generic compression receives that same captured value. A known zero keeps
+its finite Reader envelope; an unknown value is not replaced with a saved or
+model-name-derived default. Pre-dispatch blocks and synthesized timeouts retain
+the original local compression projection and carry no retained observation.
+
+`scope_tool_output_cap` and `observed_tool_output_cap` support same-future
+in-process composition without changing public context, Session or SDK layouts.
+The scope is host-constructible data, never a caller or Source permission grant.
+A genuine Reader still performs fresh caller, input, ceiling, configuration,
+Session, Source and cache validation on every page. Inline forwarding preserves
+matching context; nested new-call IDs, SDK approval replay, opaque/no-context
+executors and remote transports do not acquire a cap from old Session history.
+Unwrapped spawned/blocking tasks and detached completions do not inherit it.
+Moving a whole scoped future preserves its own per-poll observation, and scope
+exit, cancellation and unwind restore the caller's previous scope.
+
+Production Reader registration, current-input intent transport, default trusted
+caller resolution and output-helper composition remain disconnected until the
+separate atomic cutover. Existing legacy execution remains the only live path.

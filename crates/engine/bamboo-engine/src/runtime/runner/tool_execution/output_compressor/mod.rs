@@ -674,6 +674,7 @@ mod tests {
         .to_string();
         let args = r##"{"action":"download","selector":"#link","expected_epoch":17}"##;
         let outcome = || ToolExecutionOutcome {
+            output_cap: None,
             permission_replay_origin: None,
             result: Ok(ToolResult::text(true, raw.clone())),
             needs_human: None,
@@ -750,6 +751,7 @@ mod tests {
             guard.check_before_execution(&call, 0).unwrap();
             let raw = serde_json::json!({ "data_base64": "QUJD".repeat(4096) }).to_string();
             let outcome = ToolExecutionOutcome {
+                output_cap: None,
                 permission_replay_origin: None,
                 result: Ok(ToolResult::text(true, raw)),
                 needs_human: None,
@@ -1328,6 +1330,7 @@ mod tests {
         assert!(counter.count_text(&raw) as usize <= raw.len());
         for cap in [raw.len() as u32, 0] {
             let outcome = ToolExecutionOutcome {
+                output_cap: None,
                 permission_replay_origin: None,
                 portable_tool: None,
                 result: Ok(ToolResult::text(true, raw.clone())),
@@ -1359,6 +1362,7 @@ mod tests {
         ] {
             for success in [true, false] {
                 let outcome = ToolExecutionOutcome {
+                    output_cap: None,
                     permission_replay_origin: None,
                     portable_tool: None,
                     result: Ok(ToolResult::text(success, raw.clone())),
@@ -1377,6 +1381,7 @@ mod tests {
         }
         let error = "genuine execution error ".repeat(200);
         let outcome = ToolExecutionOutcome {
+            output_cap: None,
             permission_replay_origin: None,
             portable_tool: None,
             result: Err(error.clone()),
@@ -1389,5 +1394,63 @@ mod tests {
             .result
             .unwrap_err();
         assert_eq!(result, error);
+    }
+
+    #[tokio::test]
+    async fn scoped_cap_metadata_never_bypasses_generic_compressor_argument_or_error_path() {
+        let raw = "🦀 variable escaped \" \\ ".repeat(1000);
+        for observation in [None, Some(None), Some(Some(0)), Some(Some(64))] {
+            for name in ["skills_read", "ordinary_custom_tool"] {
+                let make_outcome = |result| ToolExecutionOutcome {
+                    output_cap: observation,
+                    permission_replay_origin: None,
+                    portable_tool: None,
+                    result,
+                    needs_human: None,
+                    post_tool_hook_eligible: true,
+                    tool_duration: std::time::Duration::ZERO,
+                };
+                let compressed = maybe_compress(
+                    name,
+                    "{}",
+                    "scoped-compressor",
+                    make_outcome(Ok(ToolResult::text(true, raw.clone()))),
+                    64,
+                    None,
+                    None,
+                )
+                .await;
+                assert_eq!(compressed.output_cap, observation);
+                let result = compressed.result.unwrap();
+                assert!(result.success);
+                assert!(result.result.contains("tool output truncated"));
+                assert_ne!(result.result, raw);
+                let unbounded = maybe_compress(
+                    name,
+                    "{}",
+                    "scoped-compressor",
+                    make_outcome(Ok(ToolResult::text(true, raw.clone()))),
+                    0,
+                    None,
+                    None,
+                )
+                .await;
+                assert_eq!(unbounded.output_cap, observation);
+                assert_eq!(unbounded.result.unwrap().result, raw);
+                let error = "genuine Reader failure".repeat(100);
+                let failed = maybe_compress(
+                    name,
+                    "{}",
+                    "scoped-compressor",
+                    make_outcome(Err(error.clone())),
+                    1,
+                    None,
+                    None,
+                )
+                .await;
+                assert_eq!(failed.output_cap, observation);
+                assert_eq!(failed.result.unwrap_err(), error);
+            }
+        }
     }
 }

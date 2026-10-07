@@ -1,8 +1,9 @@
 use super::*;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{
-    FunctionCall, Tool, ToolCall, ToolCtx, ToolError, ToolExecutionContext,
-    ToolExecutionSessionFlags, ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
+    observed_tool_output_cap, scope_tool_output_cap, FunctionCall, Tool, ToolCall, ToolCtx,
+    ToolError, ToolExecutionContext, ToolExecutionSessionFlags, ToolExecutor, ToolOutcome,
+    ToolResult, ToolSchema,
 };
 use bamboo_domain::{AgentRuntimeState, PendingQuestionSource, RuntimeSessionPersistence};
 use bamboo_engine::session_app::respond::{
@@ -39,6 +40,7 @@ struct Invocation {
 #[derive(Default)]
 struct Probe {
     calls: Mutex<Vec<Invocation>>,
+    output_caps: Mutex<Vec<(String, String, Option<u32>)>>,
     actions: AtomicUsize,
     provider_calls: AtomicUsize,
     fail_execution: AtomicBool,
@@ -231,6 +233,11 @@ impl Tool for RegisteredProbeTool {
                 }
             }
         }
+        self.probe.output_caps.lock().unwrap().push((
+            session_id.into(),
+            ctx.tool_call_id.to_string(),
+            observed_tool_output_cap(&ctx),
+        ));
         self.probe.calls.lock().unwrap().push(Invocation {
             name: self.name.clone(),
             arguments: args.clone(),
@@ -674,6 +681,82 @@ async fn typed_alias_approved_replay_reaches_the_registered_bash_owner() {
     assert!(calls[0].supervisor_absent);
     assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 1);
     assert!(fixture.probe.provider_calls.load(Ordering::SeqCst) > calls_before);
+}
+
+#[tokio::test]
+async fn sdk_approval_replay_does_not_retain_a_completed_original_output_cap_scope() {
+    // Keep the positive limit large enough for the real permission payload.
+    for cap in [0, 4096] {
+        let mut fixture = Fixture::new().await;
+        let agent = fixture.registered_agent(alias_config(), &["Bash"]);
+        let id = format!("replay-cap-{cap}");
+        let mut session = Session::new(&id, "test-model");
+        session.token_budget = Some(bamboo_domain::TokenBudget {
+            max_tool_output_tokens: cap,
+            ..Default::default()
+        });
+        let mut original_ctx = ToolCtx::none(CALL);
+        original_ctx.session_id = Some(Arc::from(id.as_str()));
+        *fixture.probe.next_call.lock().unwrap() = Some(alias_call());
+
+        // A real original SDK dispatch parks for approval. Its host scope
+        // ends before approval/reload; replay must not resurrect that scalar.
+        scope_tool_output_cap(&id, CALL, Some(cap), async {
+            assert_eq!(observed_tool_output_cap(&original_ctx), Some(cap));
+            Box::pin(agent.run(&mut session, "operate")).await.unwrap();
+            assert_eq!(observed_tool_output_cap(&original_ctx), Some(cap));
+        })
+        .await;
+        assert_eq!(observed_tool_output_cap(&original_ctx), None);
+        assert!(session.pending_question.is_some());
+        assert!(fixture.probe.output_caps.lock().unwrap().is_empty());
+        assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+        let request = current_request(&session);
+        assert_eq!(request.request_id, CALL);
+        let waiting_result_id = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+            .unwrap()
+            .id
+            .clone();
+        fixture.approve(&request).await;
+        fixture.reopen_store().await;
+        let mut reloaded = fixture.reload(&id).await;
+        assert_eq!(
+            reloaded
+                .token_budget
+                .as_ref()
+                .unwrap()
+                .max_tool_output_tokens,
+            cap
+        );
+        let replay_agent = fixture.registered_agent(alias_config(), &["Bash"]);
+        let provider_calls = fixture.probe.provider_calls.load(Ordering::SeqCst);
+        Box::pin(replay_agent.resume(&mut reloaded)).await.unwrap();
+
+        assert_eq!(
+            *fixture.probe.output_caps.lock().unwrap(),
+            vec![(id.clone(), CALL.into(), None)]
+        );
+        assert_eq!(observed_tool_output_cap(&original_ctx), None);
+        assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 1);
+        assert!(fixture.probe.provider_calls.load(Ordering::SeqCst) > provider_calls);
+        assert!(reloaded.pending_question.is_none());
+        assert!(result_message(&reloaded, &waiting_result_id)["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("REAL OUTPUT"));
+        let calls = fixture.probe.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].arguments, json!({"command": "current-command"}));
+        assert_eq!(
+            calls[0].generation.as_deref(),
+            Some(request.request_generation.as_str())
+        );
+    }
 }
 
 #[tokio::test]
