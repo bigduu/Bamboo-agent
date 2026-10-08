@@ -3184,7 +3184,7 @@ impl ExternalChildRunner for ActorChildRunner {
                     .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY))
             && matches!(spec.placement, Placement::Local)
             && matches!(spec.executor, ExecutorSpec::BambooRuntime))
-        .then(|| spec.capabilities.native_tool_ceiling.as_ref())
+        .then_some(spec.capabilities.native_tool_ceiling.as_ref())
         .flatten()
         .filter(|ceiling| {
             bamboo_subagent::proto::LocalToolMessages::supports_tools(
@@ -3662,9 +3662,7 @@ impl ExternalChildRunner for ActorChildRunner {
                     remote_canonical_lineage(session_inbox_runtime.as_ref().unwrap(), session)
                         .await;
                 if current.as_ref().ok() != lineage.as_ref()
-                    || bound_activation_run_id
-                        .as_deref()
-                        .map_or(true, str::is_empty)
+                    || bound_activation_run_id.as_deref().is_none_or(str::is_empty)
                     || cancel_token.is_cancelled()
                 {
                     if let (Some(binding), Some(run_id)) = (
@@ -7816,8 +7814,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     let canonical_store = plain_input
         .map(|activation| activation.store.as_ref())
         .or(actor_directory_store);
-    let remote_claim_fence =
-        canonical_activation.and_then(|fence| actor_directory_store.map(|store| (store, fence)));
+    let remote_claim_fence = actor_directory_store.zip(canonical_activation);
     let mut remote_cancel_deadline: Option<tokio::time::Instant> = None;
     let mut display = ActorEventDisplay::default();
     let mut readonly = readonly_output

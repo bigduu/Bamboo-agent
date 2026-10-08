@@ -904,7 +904,7 @@ pub fn apply_child_session_update(
     update: ChildSessionUpdate,
 ) -> Result<usize, ChildSessionError> {
     let should_refresh_assignment = update.refreshes_assignment();
-    if super::named_profile::has_named_profile(&child)
+    if super::named_profile::has_named_profile(child)
         && (should_refresh_assignment
             || update.assignment_background.is_some()
             || update.model_ref_override.is_some()
@@ -914,7 +914,7 @@ pub fn apply_child_session_update(
             "named_profile_contract_is_frozen; create a new Child to select another profile or model".into()));
     }
     if (should_refresh_assignment || update.assignment_background.is_some())
-        && bamboo_domain::ChildContextBinding::from_session(&child)
+        && bamboo_domain::ChildContextBinding::from_session(child)
             .map_err(|error| ChildSessionError::Execution(error.to_string()))?
             .is_some()
     {
@@ -945,19 +945,19 @@ pub fn apply_child_session_update(
         let effective_responsibility = normalize_required_text(
             update
                 .responsibility
-                .or_else(|| metadata_text(&child, "responsibility")),
+                .or_else(|| metadata_text(child, "responsibility")),
             "responsibility",
         )?;
         let effective_subagent_type = normalize_required_text(
             update
                 .subagent_type
-                .or_else(|| metadata_text(&child, "subagent_type")),
+                .or_else(|| metadata_text(child, "subagent_type")),
             "subagent_type",
         )?;
         let effective_prompt = normalize_required_text(
             update
                 .prompt
-                .or_else(|| metadata_text(&child, "assignment_prompt")),
+                .or_else(|| metadata_text(child, "assignment_prompt")),
             "prompt",
         )?;
 
