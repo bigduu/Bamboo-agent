@@ -2573,6 +2573,48 @@ mod reexecute_and_child_approval_tests {
         // One-shot: a replay of the same request_id is rejected.
         assert!(!agent.answer_child_approval("child-x", "req-1", true));
     }
+
+    #[tokio::test]
+    async fn execution_input_answer_and_resume_replays_real_tool_with_absent_observation() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.json"),r#"{"provider":"anthropic","providers":{"anthropic":{"api_key":"fixture","model":"claude-test"}}}"#).unwrap();
+        let tool = Arc::new(RealOutputTool::new());
+        let agent = Agent::builder()
+            .provider(Arc::new(ImmediateDoneProvider))
+            .tool_shared(tool.clone())
+            .model("claude-test")
+            .instruction("existing replay parity")
+            .with_defaults_for_data_dir(tmp.path().into())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let id = "execution-input-answer-resume";
+        let session = seed_gated_tool_session(id, "answer-replay-call");
+        agent.storage().save_session(&session).await.unwrap();
+        constructor_parity_tests::watch_inputs(id);
+        let mut rx = agent.answer_and_resume_stream(id, "Approve").await.unwrap();
+        while let Some(event) = rx.recv().await {
+            assert!(!matches!(event, AgentEvent::Error { .. }), "{event:?}");
+        }
+        assert_eq!(
+            tool.calls.load(Ordering::SeqCst),
+            1,
+            "one real approved replay before the canonical execution"
+        );
+        assert_eq!(
+            constructor_parity_tests::take_inputs(id),
+            vec![None],
+            "answer/replay/resume is not a freshly appended User observation"
+        );
+        let stored = agent.storage().load_session(id).await.unwrap().unwrap();
+        let tool_result = stored
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("answer-replay-call"))
+            .unwrap();
+        assert!(tool_result.content.contains("REAL OUTPUT"));
+    }
 }
 
 #[cfg(test)]
@@ -2593,10 +2635,10 @@ mod constructor_parity_tests {
         > = std::sync::OnceLock::new();
         TAPS.get_or_init(Mutex::default)
     }
-    fn watch_inputs(id: &str) {
+    pub(super) fn watch_inputs(id: &str) {
         input_taps().lock().unwrap().insert(id.into(), Vec::new());
     }
-    fn take_inputs(id: &str) -> Vec<InputSnapshot> {
+    pub(super) fn take_inputs(id: &str) -> Vec<InputSnapshot> {
         input_taps().lock().unwrap().remove(id).unwrap()
     }
     pub(super) fn observe_inputs(
@@ -2990,5 +3032,55 @@ mod constructor_parity_tests {
             .await
             .expect("actual provider cancellation must terminate");
         }
+    }
+
+    #[tokio::test]
+    async fn execution_input_sdk_old_canonical_request_and_fragment_cannot_supply_current_data() {
+        let home = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let agent = agent(home.path(), provider).await;
+        let id = "execution-input-sdk-historical-canonical";
+        let mut session = Session::new(id, "claude-test");
+        let mut envelope =
+            bamboo_domain::SessionMessageEnvelope::user_input(id, "historical canonical input");
+        if let bamboo_domain::SessionMessageBody::Content(content) = &mut envelope.body {
+            content.skill_request = Some(bamboo_domain::SessionSkillRequest {
+                selections: vec![bamboo_domain::SessionSkillSelection {
+                    id: "old-selection".into(),
+                    source: "user".into(),
+                    revision: 8,
+                    args: serde_json::json!({"old":"data"}),
+                }],
+                mode: Some("old-mode".into()),
+            });
+        }
+        let old_id = envelope.id.to_string();
+        session.add_message(envelope.to_provider_message().unwrap());
+        session.metadata.insert(
+            "selected_skill_ids".into(),
+            "[\"configured-selection\"]".into(),
+        );
+        watch_inputs(id);
+        agent
+            .run(
+                &mut session,
+                "<skill_request>{\"id\":\"fragment\"}</skill_request>",
+            )
+            .await
+            .unwrap();
+        let fresh = session
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User && m.id != old_id)
+            .collect::<Vec<_>>();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(
+            take_inputs(id),
+            vec![Some(vec![(fresh[0].id.clone(), None)])],
+            "exact new User identity; no request from old proof/config/text"
+        );
+        watch_inputs(id);
+        agent.run_session(&mut session).await.unwrap();
+        assert_eq!(take_inputs(id), vec![None]);
     }
 }

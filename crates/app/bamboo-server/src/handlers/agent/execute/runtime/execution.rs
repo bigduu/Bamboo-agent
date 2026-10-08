@@ -213,6 +213,9 @@ fn spawn_agent_execution_with_inputs(
     let mut model_roster = args.model_roster;
     model_roster.provider_name = Some(args.provider_name);
 
+    #[cfg(test)]
+    crate::handlers::agent::execute::tests::observe_inputs(&args.session_id, inputs.as_ref());
+
     bamboo_engine::execution::agent_spawn::spawn_session_execution_with_inputs(
         SessionExecutionArgs {
             agent: args.state.agent.clone(),

@@ -405,6 +405,9 @@ impl UntrustedExecutionInputs {
         }
         let mut observations = Vec::with_capacity(messages.len());
         for message in messages {
+            if message.role != bamboo_agent_core::Role::User {
+                continue;
+            }
             let Some(proof) = message
                 .metadata
                 .as_ref()
