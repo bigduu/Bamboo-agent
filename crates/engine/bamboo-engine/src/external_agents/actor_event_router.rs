@@ -55,7 +55,7 @@ pub(super) enum ActorEventRouteError {
 
 #[derive(Debug)]
 pub(super) enum ActorEventRoute {
-    Publish(ActorEventEnvelope),
+    Publish(Box<ActorEventEnvelope>),
     Duplicate,
     Suppressed,
 }
@@ -217,7 +217,7 @@ impl ActorEventRouter {
         };
         self.next_sequence = next_sequence;
         self.remember(&envelope);
-        Ok(ActorEventRoute::Publish(envelope))
+        Ok(ActorEventRoute::Publish(Box::new(envelope)))
     }
 
     /// Consume the final, admitted pump after its validated Terminal. This is a
