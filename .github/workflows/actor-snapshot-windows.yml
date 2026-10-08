@@ -2,220 +2,146 @@ name: Actor Snapshot Windows
 
 on:
   workflow_dispatch:
-  pull_request:
-    branches: [dev, main]
-    paths:
-      - '.github/workflows/actor-snapshot-windows.yml'
-      # Shared build inputs can change the native reader or its test binaries.
-      - '.cargo/config.toml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/**/Cargo.toml'
-      # Snapshot and Directory share the store, session types and write paths.
-      - 'crates/infra/bamboo-storage/**'
-      - 'crates/core/bamboo-domain/**'
-      # The gateway exercises real AppState, host authentication and run tokens.
-      - 'crates/app/bamboo-server/src/app_state/**'
-      - 'crates/app/bamboo-server/src/lib.rs'
-      - 'crates/app/bamboo-server/src/routes/agent.rs'
-      - 'crates/app/bamboo-server/src/routes/bamboo_v1.rs'
-      - 'crates/app/bamboo-server/src/routes/mod.rs'
-      - 'crates/app/bamboo-server/src/codex_run_tokens.rs'
-      - 'crates/app/bamboo-server/src/error.rs'
-      - 'crates/app/bamboo-server/src/handlers/agent/actor_snapshot.rs'
-      - 'crates/app/bamboo-server/src/handlers/agent/mod.rs'
-      - 'crates/app/bamboo-server/src/handlers/settings/mod.rs'
-      - 'crates/app/bamboo-server/src/handlers/settings/access_control.rs'
-      - 'crates/engine/bamboo-engine/src/external_agents/actor_adapter.rs'
-      - 'crates/infra/bamboo-config/src/config.rs'
-      - 'crates/infra/bamboo-config/src/encryption.rs'
-      - 'crates/infra/bamboo-config/src/lib.rs'
-      - 'crates/app/bamboo-server/build.rs'
-      - 'crates/app/bamboo-server/frontend_build.rs'
 
 permissions:
   contents: read
 
 concurrency:
-  group: actor-snapshot-windows-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: actor-snapshot-windows-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: never
   BAMBOO_FRONTEND_BUILD_MODE: api-only
-  RUST_MIN_STACK: '8388608'
+  PYTHONUTF8: '1'
 
 jobs:
-  windows:
-    name: Actor Snapshot (Windows)
-    runs-on: windows-2025
+  parent-birth-native:
+    name: Parent birth (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
-    defaults:
-      run:
-        shell: pwsh
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2025]
     steps:
       - uses: actions/checkout@v7
         with:
+          fetch-depth: 3
           persist-credentials: false
-
-      - name: Record checkout and native junction evidence
-        env:
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          $evidence = Join-Path $env:RUNNER_TEMP 'actor-snapshot-evidence'
-          New-Item -ItemType Directory -Force $evidence | Out-Null
-          @(
-            "checkout=$(git rev-parse HEAD)"
-            "github_sha=$env:GITHUB_SHA"
-            "pr_head=$env:PR_HEAD_SHA"
-            "runner_os=$env:RUNNER_OS"
-            "runner_arch=$env:RUNNER_ARCH"
-            "image_os=$env:ImageOS"
-            "image_version=$env:ImageVersion"
-            "stack=$env:RUST_MIN_STACK"
-            "frontend=$env:BAMBOO_FRONTEND_BUILD_MODE"
-            "lock_sha256=$((Get-FileHash Cargo.lock -Algorithm SHA256).Hash)"
-          ) | Tee-Object -FilePath "$evidence/host.txt"
-          Get-CimInstance Win32_OperatingSystem |
-            Select-Object Caption, Version, BuildNumber, OSArchitecture |
-            Format-List | Out-String | Tee-Object -FilePath "$evidence/host.txt" -Append
-          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
-            throw 'Acceptance requires native Windows x64'
-          }
-
-          # Do not infer junction support from cross-compilation or skipped tests.
-          $probe = Join-Path $env:RUNNER_TEMP 'actor-snapshot-junction-probe'
-          $target = Join-Path $probe 'target'
-          $link = Join-Path $probe 'link'
-          New-Item -ItemType Directory -Force $target | Out-Null
-          & cmd /C mklink /J $link $target 2>&1 |
-            Tee-Object -FilePath "$evidence/junction.txt"
-          if ($LASTEXITCODE -ne 0) { throw 'Native junction creation failed' }
-          $junction = Get-Item -LiteralPath $link -Force
-          $junction | Format-List FullName, LinkType, Target, Attributes |
-            Out-String | Tee-Object -FilePath "$evidence/junction.txt" -Append
-          if ($junction.LinkType -ne 'Junction') { throw 'Expected a real junction' }
-          & fsutil reparsepoint query $link 2>&1 |
-            Tee-Object -FilePath "$evidence/junction.txt" -Append
-          if ($LASTEXITCODE -ne 0) { throw 'Native junction query failed' }
-
-      - name: Install Rust 1.99 MSVC
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
         with:
-          toolchain: 1.99.0-x86_64-pc-windows-msvc
-
-      - name: Record and verify toolchain
-        run: |
-          $evidence = Join-Path $env:RUNNER_TEMP 'actor-snapshot-evidence'
-          & rustc -vV 2>&1 | Tee-Object -FilePath "$evidence/toolchain.txt"
-          if ($LASTEXITCODE -ne 0) { throw 'rustc version failed' }
-          $version = Get-Content "$evidence/toolchain.txt"
-          if ($version -notcontains 'host: x86_64-pc-windows-msvc' -or
-              $version -notcontains 'release: 1.99.0') {
-            throw 'Acceptance requires Rust 1.99.0 on native Windows/MSVC'
-          }
-          & cargo -V 2>&1 | Tee-Object -FilePath "$evidence/toolchain.txt" -Append
-          if ($LASTEXITCODE -ne 0) { throw 'cargo version failed' }
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
+          python-version: '3.14'
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          shared-key: bamboo-actor-snapshot-windows-2025-msvc-1.99
-          save-if: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' }}
-
-      - name: Compile and verify all 30 selected native tests
-        timeout-minutes: 20
+          toolchain: '1.99.0'
+      - name: Verify exact source and execute bounded native regressions
+        shell: python
         run: |
-          $evidence = Join-Path $env:RUNNER_TEMP 'actor-snapshot-evidence'
-          function Assert-TestList($package, $filter, $expectedNames, $logName) {
-            $log = Join-Path $evidence $logName
-            "cargo test --locked -p $package --lib $filter -- --list" |
-              Set-Content $log
-            & cargo test --locked -p $package --lib $filter -- --list 2>&1 |
-              Tee-Object -FilePath $log -Append
-            if ($LASTEXITCODE -ne 0) { throw "Compilation/list failed: $filter" }
-            $output = Get-Content $log
-            $names = @($output | ForEach-Object {
-              if ($_ -match '^(.+): test$') { $Matches[1] }
-            })
-            $expected = @($expectedNames | ForEach-Object { "$filter$_" })
-            $noun = if ($expected.Count -eq 1) { 'test' } else { 'tests' }
-            if ($names.Count -ne $expected.Count -or
-                @(Compare-Object ($expected | Sort-Object) ($names | Sort-Object) -CaseSensitive).Count -ne 0 -or
-                @($output | Where-Object { $_ -eq "$($expected.Count) $noun, 0 benchmarks" }).Count -ne 1) {
-              throw "Selected tests differ from the required native acceptance set: $filter"
-            }
-          }
-          # Listing compiles the exact package/feature selection used below.
-          # A combined -p storage -p server build would unify storage/test-utils.
-          Assert-TestList 'bamboo-storage' 'v2::actor_snapshot_windows_tests::' @(
-            'changed_birth_stale_actor_and_root_authority_fail_without_repair'
-            'grow_after_open_is_capped_and_actual_bytes_debit_the_aggregate_budget'
-            'live_actor_fence_authorizes_self_and_descendants_but_not_siblings_or_foreign_roots'
-            'regular_file_symlink_replacement_is_rejected_and_open_handle_retains_original'
-            'nested_snapshot_is_private_read_only_and_stable_after_restart'
-            'pending_task_and_copy_journals_leave_owned_home_unchanged'
-            'retained_directory_and_file_handles_reject_reparse_replacement'
-            'stale_identity_and_tight_budgets_fail_without_partial_tree'
-            'unsupported_namespaces_selectors_and_object_kinds_fail_without_writes'
-          ) 'snapshot-list.log'
-          Assert-TestList 'bamboo-server' 'handlers::agent::actor_snapshot::tests::' @(
-            'canonical_gateway_requires_trusted_host_owner_and_keeps_codex_response_scope'
-            'corrupt_and_unsupported_authority_return_private_typed_errors_without_writes'
-          ) 'gateway-list.log'
-          Assert-TestList 'bamboo-storage' 'v2::actor_directory::tests::' @(
-            'active_child_cannot_rebind_its_own_project'
-            'active_grandchild_cannot_observe_middle_parent_project_rebind'
-            'active_root_allows_one_ui_revision_but_blocks_ambiguous_ui_gap'
-            'child_project_must_match_its_current_parent'
-            'corrupt_or_mismatched_authority_fails_closed_without_repair'
-            'delayed_resident_cleanup_cannot_retire_replacement_activation'
-            'duplicate_physical_actor_id_fails_closed_across_stale_stores'
-            'expired_owner_cannot_checkpoint_or_finish_new_attempt'
-            'host_policy_and_intent_survive_reassignment_and_physical_replacement'
-            'independent_stores_serialize_competing_owners'
-            'initialized_marker_prevents_lost_sidecar_from_resetting_attempt'
-            'only_host_binding_sets_policy_and_live_or_regressive_changes_are_rejected'
-            'orphaned_nested_child_cannot_publish_activation_authority'
-            'persisted_session_precedes_claim_and_attempt_survives_restart'
-            'recreated_middle_parent_cannot_revive_grandchild_fence'
-            'retirement_fences_owner_and_preserves_identity'
-            'root_project_aba_cannot_revive_an_old_active_fence'
-            'root_project_rebinds_only_when_no_activation_is_live'
-            'store_opened_before_creation_discovers_root_and_child_from_durable_files'
-          ) 'directory-list.log'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          import time
 
-      - name: Execute 9 snapshot, 2 gateway and 19 directory tests
-        timeout-minutes: 5
-        run: |
-          $evidence = Join-Path $env:RUNNER_TEMP 'actor-snapshot-evidence'
-          function Assert-TestRun($package, $filter, $expectedCount, $logName) {
-            $log = Join-Path $evidence $logName
-            "cargo test --locked -p $package --lib $filter -- --nocapture --test-threads=1" |
-              Set-Content $log
-            & cargo test --locked -p $package --lib $filter -- --nocapture --test-threads=1 2>&1 |
-              Tee-Object -FilePath $log -Append
-            if ($LASTEXITCODE -ne 0) { throw "Native tests failed: $filter" }
-            $output = Get-Content $log
-            $summaries = @($output | Where-Object { $_ -match '^test result:' })
-            $passed = "^test result: ok\. $expectedCount passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$"
-            if ($summaries.Count -ne 1 -or $summaries[0] -notmatch $passed) {
-              throw "Native test counts did not prove $expectedCount passed, zero failed/ignored: $filter"
-            }
-            "$filter : $expectedCount passed; zero failed/ignored" |
-              Tee-Object -FilePath "$evidence/verified-counts.txt" -Append
-          }
-          Assert-TestRun 'bamboo-storage' 'v2::actor_snapshot_windows_tests::' 9 'snapshot-run.log'
-          Assert-TestRun 'bamboo-server' 'handlers::agent::actor_snapshot::tests::' 2 'gateway-run.log'
-          Assert-TestRun 'bamboo-storage' 'v2::actor_directory::tests::' 19 'directory-run.log'
-          # This receipts the existing reader tests, not all of #1338 or #791.
-          Get-Content "$evidence/verified-counts.txt" | Add-Content $env:GITHUB_STEP_SUMMARY
+          source = '12209d6e594fc93f1a93adebb4e72681ee224109'
+          workflow = '.github/workflows/actor-snapshot-windows.yml'
+          evidence = Path(os.environ['RUNNER_TEMP']) / '1318-platform-evidence'
+          evidence.mkdir(parents=True, exist_ok=True)
+          os.environ['CARGO_TARGET_DIR'] = str(Path(os.environ['RUNNER_TEMP']) / '1318-cargo-target')
+          os.environ['CARGO_BUILD_BUILD_DIR'] = str(Path(os.environ['RUNNER_TEMP']) / '1318-cargo-build')
 
-      - name: Retain native Windows evidence even on failure
+          def call(args):
+              return subprocess.check_output(args, text=True, encoding='utf-8').strip()
+
+          def hashed(path):
+              data = Path(path).read_bytes()
+              return {'path': path, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+
+          head = call(['git', 'rev-parse', 'HEAD'])
+          parent = call(['git', 'rev-parse', 'HEAD^'])
+          changed = call(['git', 'diff', '--name-only', source, head]).splitlines()
+          if parent != source or changed != [workflow]:
+              raise RuntimeError('Carrier must differ from the reviewed candidate only by its workflow')
+          overrides = ['RUST_MIN_STACK', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTC_BOOTSTRAP']
+          if any(os.environ.get(key) for key in overrides):
+              raise RuntimeError('Native validation requires ordinary Rust with no stack/wrapper/flag overrides')
+          rustc = call(['rustc', '-vV'])
+          expected_host = 'x86_64-pc-windows-msvc' if sys.platform == 'win32' else 'x86_64-unknown-linux-gnu'
+          if f'host: {expected_host}' not in rustc or 'release: 1.99.0' not in rustc:
+              raise RuntimeError('Unexpected native platform or Rust version')
+          source_files = call(['git', 'diff', '--name-only', source + '^', source]).splitlines()
+          receipt = {'candidate': source, 'carrier': head, 'carrier_parent': parent, 'source_tree': call(['git', 'rev-parse', source + '^{tree}']), 'changed_from_candidate': changed, 'runner_os': os.environ.get('RUNNER_OS'), 'runner_arch': os.environ.get('RUNNER_ARCH'), 'image_os': os.environ.get('ImageOS'), 'image_version': os.environ.get('ImageVersion'), 'rustc': rustc, 'cargo': call(['cargo', '-V']), 'environment': {key: os.environ.get(key) for key in overrides + ['CARGO_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR', 'BAMBOO_FRONTEND_BUILD_MODE']}, 'source_files': [hashed(path) for path in source_files], 'lock': hashed('Cargo.lock'), 'runs': []}
+
+          def save():
+              (evidence / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
+
+          save()
+
+          def names(path, prefix=''):
+              text = Path(path).read_text(encoding='utf-8')
+              return sorted(prefix + name for name in re.findall(r'#\[(?:tokio::test(?:\([^\]]*\))?|test)\]\s*(?:async\s+)?fn\s+([A-Za-z0-9_]+)', text))
+
+          def execute(name, args):
+              start = time.monotonic()
+              result = subprocess.run(args, capture_output=True, text=True, encoding='utf-8', errors='replace')
+              out = evidence / (name + '.stdout.log')
+              err = evidence / (name + '.stderr.log')
+              out.write_text(result.stdout, encoding='utf-8')
+              err.write_text(result.stderr, encoding='utf-8')
+              receipt['runs'].append({'name': name, 'args': args, 'exit_code': result.returncode, 'duration_seconds': time.monotonic() - start, 'stdout': hashed(str(out)), 'stderr': hashed(str(err))})
+              save()
+              print(result.stdout, flush=True)
+              print(result.stderr, flush=True)
+              if result.returncode:
+                  raise RuntimeError('Native cargo invocation failed: ' + name)
+              return result.stdout
+
+          def verify(label, selection, expected):
+              args = ['cargo', 'test', '--locked', '-p', 'bamboo-storage', '--all-features'] + selection
+              listed = execute(label + '-list', args + ['--', '--list'])
+              actual = sorted(re.findall(r'^(.+): test$', listed, flags=re.MULTILINE))
+              if actual != expected or not expected:
+                  raise RuntimeError('Native compiled test identities differ for ' + label)
+              output = execute(label + '-run', args + ['--', '--nocapture', '--test-threads=1'])
+              summaries = re.findall(r'^test result:.*$', output, flags=re.MULTILINE)
+              pattern = rf'test result: ok\. {len(expected)} passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+'
+              if len(summaries) != 1 or re.fullmatch(pattern, summaries[0]) is None:
+                  raise RuntimeError('Native executed count or ignored/failed count differs for ' + label)
+              receipt['runs'][-1]['verified_passed'] = len(expected)
+              receipt['runs'][-1]['verified_ignored'] = 0
+              save()
+
+          storage = 'crates/infra/bamboo-storage/'
+          integration = names(storage + 'tests/parent_birth_investigation.rs')
+          if len(integration) != 13:
+              raise RuntimeError('Expected exactly 13 parent-birth regressions')
+          verify('parent-birth', ['--test', 'parent_birth_investigation'], integration)
+          verify('birth-codec', ['--lib', 'v2::compact_main_tests::compact_parent_birth_requires_v2_and_preserves_legacy_v1'], ['v2::compact_main_tests::compact_parent_birth_requires_v2_and_preserves_legacy_v1'])
+          directory = names(storage + 'src/v2/actor_directory.rs', 'v2::actor_directory::tests::')
+          if len(directory) != 19:
+              raise RuntimeError('Expected exactly 19 existing Directory regressions')
+          verify('directory', ['--lib', 'v2::actor_directory::tests::'], directory)
+          module = 'actor_snapshot_windows_tests' if sys.platform == 'win32' else 'actor_snapshot_tests'
+          snapshot = names(storage + 'src/v2/' + module + '.rs', 'v2::' + module + '::')
+          expected_snapshot = 9 if sys.platform == 'win32' else 34
+          if len(snapshot) != expected_snapshot:
+              raise RuntimeError('Unexpected selected platform Reader test identities')
+          verify('snapshot', ['--lib', 'v2::' + module + '::'], snapshot)
+          receipt['completed'] = True
+          receipt['verified_passed'] = sum(run.get('verified_passed', 0) for run in receipt['runs'])
+          save()
+          print(json.dumps({'candidate': source, 'carrier': head, 'platform': sys.platform, 'passed': receipt['verified_passed'], 'failed': 0, 'ignored': 0}), flush=True)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write(f"Candidate `{source}`; workflow-only carrier `{head}`; native {expected_host}; {receipt['verified_passed']} passed, zero failed/ignored; default stack.\n")
+      - name: Retain exact native evidence even on failure
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: actor-snapshot-windows-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/actor-snapshot-evidence/
+          name: parent-birth-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/1318-platform-evidence/
           if-no-files-found: error
           retention-days: 14
