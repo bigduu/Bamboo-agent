@@ -26,7 +26,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_MIN_STACK: "8388608"
-      BAMBOO_ACTOR_FIXTURE_DIAGNOSTIC_DIR: ${{ runner.temp }}/bamboo-host-diagnostics/${{ matrix.kind }}
     steps:
       - name: Read diagnostic-only carrier
         uses: actions/checkout@v7
@@ -43,6 +42,7 @@ jobs:
         shell: bash
         env:
           SOURCE_SHA: ${{ matrix.source }}
+          BAMBOO_ACTOR_FIXTURE_DIAGNOSTIC_DIR: ${{ runner.temp }}/bamboo-host-diagnostics/${{ matrix.kind }}
         run: |
           python3 - <<'PYTHON'
           import pathlib, subprocess, hashlib, os, json
@@ -71,10 +71,14 @@ jobs:
       - name: Run actual Root integration file with CI default concurrency
         working-directory: candidate
         timeout-minutes: 20
+        env:
+          BAMBOO_ACTOR_FIXTURE_DIAGNOSTIC_DIR: ${{ runner.temp }}/bamboo-host-diagnostics/${{ matrix.kind }}
         run: cargo test --locked -p bamboo-agent --test local_zero_tool_actor -- --nocapture
       - name: Preserve actual Host logs and cleanup receipts
         if: always()
         shell: bash
+        env:
+          BAMBOO_ACTOR_FIXTURE_DIAGNOSTIC_DIR: ${{ runner.temp }}/bamboo-host-diagnostics/${{ matrix.kind }}
         run: |
           python3 - <<'PYTHON'
           import pathlib, hashlib, os, json
