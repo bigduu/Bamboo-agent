@@ -1,0 +1,104 @@
+name: 1630 Default Stack Proof
+on:
+  push:
+    branches: ['bamboo/proof/1630-default-stack-723e2430-mac-01a11916']
+permissions:
+  contents: read
+concurrency:
+  group: bamboo-1630-paired-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  paired:
+    name: Worker default stack before and after
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    env:
+      CARGO_TERM_COLOR: never
+      BAMBOO_FRONTEND_BUILD_MODE: api-only
+      CARGO_TARGET_DIR: ${{ runner.temp }}/bamboo1630-target
+      CARGO_BUILD_BUILD_DIR: ${{ runner.temp }}/bamboo1630-build
+      BEFORE_SHA: ba3e2dfe37c52f4ca9d0b33955501d8c61c412c8
+      AFTER_SHA: 723e2430c7dbfdf529e18fdac7a75428abba54c2
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install exact Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+      - name: Cache proof artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-1630-default-stack-1.99
+          cache-directories: ${{ runner.temp }}/bamboo1630-build
+          save-if: false
+      - name: Serial immutable-source default-stack proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset RUST_MIN_STACK
+          cat > "$RUNNER_TEMP/bamboo1630-paired-proof.py" <<'PYPROOF'
+          import hashlib,json,os,pathlib,re,subprocess,sys,time
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'bamboo1630-proof';out.mkdir(exist_ok=True)
+          env=os.environ.copy();env.pop('RUST_MIN_STACK',None)
+          fixture='subagent_worker::tests::real_worker_tool_checkpoints_question_before_suspending'
+          command=['cargo','test','--locked','--all-features','--lib','--tests',fixture,'--','--exact','--nocapture']
+          runner={k:env.get(k) for k in ['ImageOS','ImageVersion','RUNNER_OS','RUNNER_ARCH','RUST_MIN_STACK','CARGO_TARGET_DIR','CARGO_BUILD_BUILD_DIR','BAMBOO_FRONTEND_BUILD_MODE']}
+          runner['rustc']=subprocess.check_output(['rustc','--version','--verbose'],text=True)
+          runner['cargo']=subprocess.check_output(['cargo','--version'],text=True)
+          runner['os_release']=pathlib.Path('/etc/os-release').read_text()
+          (out/'runner.json').write_text(json.dumps(runner,indent=2)+'\n')
+          print(json.dumps(runner),flush=True)
+          receipts=[]
+          for label,sha in [('before',os.environ['BEFORE_SHA']),('after',os.environ['AFTER_SHA'])]:
+           subprocess.run(['git','checkout','--detach',sha],check=True)
+           actual=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip();assert actual==sha
+           assert not subprocess.check_output(['git','status','--porcelain'],text=True).strip()
+           tree=subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip()
+           graph=subprocess.run(['cargo','metadata','--locked','--all-features','--format-version','1'],env=env,capture_output=True)
+           (out/(label+'.metadata.json')).write_bytes(graph.stdout);(out/(label+'.metadata.stderr.log')).write_bytes(graph.stderr)
+           assert graph.returncode==0, graph.stderr.decode(errors='replace')
+           data=json.loads(graph.stdout)
+           nodes=sorted(data['resolve']['nodes'],key=lambda node:node['id'])
+           normalized=json.dumps(nodes,sort_keys=True,separators=(',',':')).encode()
+           graph_sha=hashlib.sha256(normalized).hexdigest()
+           start=time.time()
+           with (out/(label+'.stdout.log')).open('wb') as stdout,(out/(label+'.stderr.log')).open('wb') as stderr:
+            try:
+             result=subprocess.run(command,env=env,stdout=stdout,stderr=stderr,timeout=2100)
+             timed_out=False
+            except subprocess.TimeoutExpired:
+             result=subprocess.CompletedProcess(command,124);timed_out=True
+           receipt=dict(case=label,sha=actual,tree=tree,command=command,returncode=result.returncode,timed_out=timed_out,elapsed_seconds=round(time.time()-start,3),RUST_MIN_STACK=env.get('RUST_MIN_STACK'),graph_nodes=len(nodes),graph_sha256=graph_sha)
+           for stream in ['stdout','stderr']:
+            blob=(out/(label+'.'+stream+'.log')).read_bytes()
+            receipt[stream]=dict(bytes=len(blob),sha256=hashlib.sha256(blob).hexdigest())
+           (out/(label+'.receipt.json')).write_text(json.dumps(receipt,indent=2)+'\n')
+           receipts.append(receipt)
+           print(json.dumps(receipt),flush=True)
+           print((out/(label+'.stdout.log')).read_text(errors='replace'),flush=True)
+           print((out/(label+'.stderr.log')).read_text(errors='replace'),flush=True)
+          before,after=receipts
+          before_out=(out/'before.stdout.log').read_text(errors='replace');before_err=(out/'before.stderr.log').read_text(errors='replace')
+          after_out=(out/'after.stdout.log').read_text(errors='replace')
+          proof={
+           'before_actual_default_stack_failure': before['returncode']==101 and 'running 1 test' in before_out and ('overflowed its stack' in before_err or 'stack overflow' in before_err) and fixture in before_err,
+           'after_actual_default_stack_pass': after['returncode']==0 and 'running 1 test' in after_out and f'test {fixture} ... ok' in after_out and '1 passed; 0 failed; 0 ignored' in after_out,
+           'same_graph': before['graph_sha256']==after['graph_sha256'] and before['graph_nodes']==after['graph_nodes'],
+           'no_stack_override': before['RUST_MIN_STACK'] is None and after['RUST_MIN_STACK'] is None,
+           'same_runner_and_toolchain':True,
+          }
+          summary=dict(before=before,after=after,runner=runner,proof=proof,accepted=all(proof.values()))
+          (out/'summary.json').write_text(json.dumps(summary,indent=2)+'\n');print(json.dumps(summary),flush=True)
+          sys.exit(0 if summary['accepted'] else 1)
+          PYPROOF
+          python3 "$RUNNER_TEMP/bamboo1630-paired-proof.py"
+      - name: Preserve complete before and after evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bamboo-1630-default-stack-723e2430
+          path: ${{ runner.temp }}/bamboo1630-proof
+          if-no-files-found: error
