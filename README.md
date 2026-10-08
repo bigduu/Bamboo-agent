@@ -291,3 +291,13 @@ exit, cancellation and unwind restore the caller's previous scope.
 Production Reader registration, current-input intent transport, default trusted
 caller resolution and output-helper composition remain disconnected until the
 separate atomic cutover. Existing legacy execution remains the only live path.
+
+Server and deployed workers construct the existing `load_skill` and
+`read_skill_resource` overlays through `assemble_legacy_skill_tools` in
+`skill_runtime/assembly.rs`. Server retains its Project store and the actual
+permission-checked pre-Skill context registry; workers retain their absent
+optional adapters. Strict-native workers bypass this construction, and SDK
+defaults retain their existing tool registration. The old classes remain
+exported. This refactor preserves legacy invocation, resource and metadata
+behavior; it does not register progressive catalog/read Tools or wire the
+prepared ordinary-input helpers. The atomic live cutover remains separate.
