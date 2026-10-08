@@ -261,6 +261,16 @@ mod execution_input_http {
         web::Data<crate::AppState>,
         Arc<AtomicBool>,
     ) {
+        state_with_provider(ack_failure, Arc::new(LocalProvider)).await
+    }
+    async fn state_with_provider(
+        ack_failure: Option<bool>,
+        provider: Arc<dyn LLMProvider>,
+    ) -> (
+        tempfile::TempDir,
+        web::Data<crate::AppState>,
+        Arc<AtomicBool>,
+    ) {
         let home = tempfile::tempdir().unwrap();
         let mut config = bamboo_llm::Config::from_data_dir(Some(home.path().into()));
         config.provider = "openai".into();
@@ -268,7 +278,6 @@ mod execution_input_http {
             model: Some("test-model".into()),
             ..Default::default()
         });
-        let provider: Arc<dyn LLMProvider> = Arc::new(LocalProvider);
         let mut state =
             crate::AppState::new_with_provider(home.path().into(), config, provider.clone())
                 .await
@@ -668,5 +677,181 @@ mod execution_input_http {
                 .unwrap(),
             "rejection-successor-b",
         );
+    }
+    struct RunningProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        started: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        messages: std::sync::Mutex<Vec<Vec<bamboo_agent_core::Message>>>,
+    }
+    #[async_trait]
+    impl LLMProvider for RunningProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            tools: &[bamboo_agent_core::tools::ToolSchema],
+            max: Option<u32>,
+            model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.messages.lock().unwrap().push(messages.to_vec());
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.started.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+            }
+            LocalProvider.chat_stream(messages, tools, max, model).await
+        }
+    }
+
+    #[actix_web::test]
+    async fn native_running_owner_consumes_current_turn_at_next_real_provider_boundary_once() {
+        let provider = Arc::new(RunningProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            messages: std::sync::Mutex::new(Vec::new()),
+        });
+        let (_home, state, _fault) = state_with_provider(None, provider.clone()).await;
+        let mut parent = bamboo_agent_core::Session::new("native-running-parent", "test-model");
+        state.save_and_cache_session(&mut parent).await;
+        let id = "native-running-owned-child";
+        let mut child =
+            bamboo_agent_core::Session::new_child_of(id, &parent, "test-model", "Child");
+        state.save_and_cache_session(&mut child).await;
+        let mut feed = state.account_sink.subscribe();
+        let initial = chat(&state, id, None).await;
+        let first = initial["message_id"].as_str().unwrap().to_owned();
+        let (status, started) = execute(&state, id, None).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        let run = started["run_id"].as_str().unwrap().to_owned();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            provider.started.acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+        assert!(state
+            .agent_runners
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|r| r.run_id == run && matches!(r.status, AgentStatus::Running)));
+        let text = "current Native while blocked 原样\nnext";
+        let request = serde_json::from_value::<crate::handlers::agent::chat::ChatRequest>(
+            serde_json::json!({
+                "session_id":id,"message":text,"model":"test-model"
+            }),
+        )
+        .unwrap();
+        let response = crate::handlers::agent::chat::handler(
+            state.clone(),
+            test::TestRequest::post()
+                .peer_addr("127.0.0.1:5700".parse().unwrap())
+                .to_http_request(),
+            web::Json(request),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let second = receipt["message_id"].as_str().unwrap().to_owned();
+        assert!(receipt["ingress_seq"].as_u64().unwrap() > 0);
+        let second_id = SessionMessageId::parse(second.clone()).unwrap();
+        assert!(!state
+            .storage
+            .load_session(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.id == second));
+        assert!(!state
+            .session_inbox
+            .was_admitted(id, &second_id)
+            .await
+            .unwrap());
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+        let blocked = state.admit_chat_for_execute(id).await.unwrap();
+        assert!(blocked.inputs.is_none());
+        assert!(!blocked.generate_title);
+        let (status, repeated) = execute(&state, id, None).await;
+        assert_eq!(status, StatusCode::OK, "{repeated}");
+        assert_eq!(repeated["status"], "already_running");
+        if let Some(repeated_run) = repeated["run_id"].as_str() {
+            assert_eq!(repeated_run, run);
+        }
+        assert!(state
+            .agent_runners
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|r| r.run_id == run));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+        provider.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                if state.agent_runners.read().await.get(id).is_some_and(|r|
+                    r.run_id == run && matches!(r.status, AgentStatus::Completed))
+                    && state.session_inbox.was_admitted(id, &second_id).await.unwrap()
+                    && provider.messages.lock().unwrap().iter().skip(1).any(|rows|
+                        rows.iter().any(|m| m.id == second && m.content == text)) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("same actual owner checkpoints/ACKs and presents Native to a next real provider request");
+        let snapshots = provider.messages.lock().unwrap();
+        assert!(!snapshots[0].iter().any(|m| m.id == second));
+        assert!(snapshots.iter().skip(1).any(|rows| rows
+            .iter()
+            .filter(|m| m.id == second && m.content == text && m.content_parts.is_none())
+            .count()
+            == 1));
+        drop(snapshots);
+        let cold = state.storage.load_session(id).await.unwrap().unwrap();
+        for input in [&first, &second] {
+            assert_eq!(cold.messages.iter().filter(|m| &m.id == input).count(), 1);
+        }
+        let load = cold
+            .messages
+            .iter()
+            .filter(|m| m.tool_call_id.as_deref() == Some("execution-input-existing-load"))
+            .collect::<Vec<_>>();
+        assert_eq!(load.len(), 1);
+        assert_eq!(load[0].tool_success, Some(true));
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 0);
+        let mut events = std::collections::BTreeMap::<String, usize>::new();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !events.contains_key(&first) || !events.contains_key(&second) {
+                let change = feed.recv().await.unwrap();
+                if let bamboo_agent_core::AgentEvent::MessageAppended { message_id, .. } =
+                    &change.event
+                {
+                    if message_id == &first || message_id == &second {
+                        *events.entry(message_id.clone()).or_default() += 1;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("actual durable append events for both Native inputs");
+        while let Ok(change) = feed.try_recv() {
+            if let bamboo_agent_core::AgentEvent::MessageAppended { message_id, .. } = &change.event
+            {
+                if message_id == &first || message_id == &second {
+                    *events.entry(message_id.clone()).or_default() += 1;
+                }
+            }
+        }
+        assert_eq!(events.get(&first), Some(&1));
+        assert_eq!(events.get(&second), Some(&1));
+        let no_new = state.admit_chat_for_execute(id).await.unwrap();
+        assert!(no_new.inputs.is_none());
+        assert!(!no_new.generate_title);
     }
 }

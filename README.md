@@ -247,9 +247,9 @@ This adapter adds no caller grant, Session field, reader registration or
 additional writer. The pure prepared-input helpers remain unwired.
 
 Native chat and queued HTTP input use private constructors for the same User
-Message and inbox envelope. Native chat retains its attachment storage, append
-and pending marker; queued input retains authenticated admission and its durable
-retry identity. The four fresh-input SDK wrappers share one synchronous append
+Message and inbox envelope. Native chat retains its real ID, timestamp and nondeduplicated attachments;
+the existing consumer checkpoints its User and pending handoff. Queued input
+retains authenticated admission and its durable retry identity. The four fresh-input SDK wrappers share one synchronous append
 helper at their original call positions, including synchronous stream creation.
 Session-only execution and resume retain their supplied history. These helpers
 preserve the existing public and serialized layouts and introduce no Skill
@@ -345,8 +345,8 @@ whole-envelope Inbox limit. Guidance, peer messages and child/runtime
 presentation cannot turn this data into a fresh User request.
 
 Execution wrappers can carry a separately owned `UntrustedExecutionInputs`
-parameter into the execution-private config. HTTP checked queue admission
-supplies only this call's newly committed User IDs after ACK succeeds; SDK
+parameter into the execution-private config. HTTP checked Native and queue admission
+supply only this call's newly committed User IDs after ACK succeeds; SDK
 `run`, `run_with_cancel`, `run_stream` and `run_stream_cancellable` supply the
 exact User each just appended, with no request derived from its text.
 Old session/resume/custom execute/spawn entrypoints default to `None`.
@@ -358,7 +358,7 @@ Admission/startup failure drops the local data; transcript recovery cannot
 mint it again. No message/images, Skill bodies or Source authority objects
 are retained. This remains unwired caller data, without preparation, Reader
 registration, resource reads, grants or a live Skill cutover. Native nonqueued
-Chat still requires its own accepted fresh handoff; history cannot supply it.
+Chat uses the same checked Inbox handoff; NoNew and history cannot reconstruct it.
 
 A separate unwired Engine helper can project borrowed request records into one
 bounded, untrusted batch. It checks all original I-W request data, then charges
