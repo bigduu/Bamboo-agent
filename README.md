@@ -348,3 +348,13 @@ mint it again. No message/images, Skill bodies or Source authority objects
 are retained. This remains unwired caller data, without preparation, Reader
 registration, resource reads, grants or a live Skill cutover. Native nonqueued
 Chat still requires its own accepted fresh handoff; history cannot supply it.
+
+A separate unwired Engine helper can project borrowed request records into one
+bounded, untrusted batch. It checks all original I-W request data, then charges
+one private compact view including exact session/execution/input IDs, canonical
+source/kind/wrapper provenance, original timestamps and explicit absent requests.
+The whole batch is limited to 128 records and 256 KiB of compact UTF-8 bytes;
+record/selection slots are bounded separately. Owned data copies only validated
+lengths, without retaining Message/image/Source objects or source capacities.
+The helper establishes no New/current-input evidence, publication or permission;
+queued observation, execution transport and live Skill cutover remain separate.
