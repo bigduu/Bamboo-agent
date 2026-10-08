@@ -311,6 +311,7 @@ impl Collector {
         }
         if main.created_at != side.created_at
             || main.parent_session_id != side.parent_session_id
+            || main.parent_created_at != side.parent_created_at
             || main.spawn_depth != side.spawn_depth
             || project != side_project
         {

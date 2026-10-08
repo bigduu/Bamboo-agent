@@ -14,12 +14,16 @@ const NATIVE_NAMES: [&str; 5] = ["Bash", "Edit", "Glob", "Read", "Write"];
 
 /// Only the host catalog producer constructs this value. No request decoder,
 /// serialization or Debug output exposes its private instruction body.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedChildProfile {
     identity: NamedAgentProfileIdentity,
     prompt: String,
     model: Option<ProviderModelRef>,
     tools: Vec<String>,
     read_only: bool,
+    parent_id: String,
+    parent_created_at: chrono::DateTime<chrono::Utc>,
+    parent_project: crate::project_context::SessionProjectIdentity,
 }
 
 impl std::fmt::Debug for ResolvedChildProfile {
@@ -36,6 +40,23 @@ fn rejected() -> ChildSessionError {
 
 fn hash(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+/// Host-only creation from the exact preflight snapshot. No model tool can supply it.
+pub async fn create_profile_child(
+    port: &dyn super::ChildSessionPort,
+    input: super::CreateChildInput,
+    profile: ResolvedChildProfile,
+) -> Result<super::CreateChildResult, super::ChildSessionError> {
+    super::actions::create_profile_child_action(port, input, profile).await
+}
+
+/// Existing committed Child seal; rejects changed input/output and pending delivery.
+/// A Host activation is distinct from the local SDK runtime's run identifier.
+pub fn committed_child_activation(child: &Session) -> Option<String> {
+    crate::execution::ChildCompletionSource::from_committed_session(child)
+        .map(|source| source.activation_run_id)
+        .filter(|id| !id.is_empty())
 }
 
 impl ResolvedChildProfile {
@@ -102,6 +123,10 @@ impl ResolvedChildProfile {
             model,
             tools,
             read_only,
+            parent_id: parent.id.clone(),
+            parent_created_at: parent.created_at,
+            parent_project:
+                crate::project_context::ProjectContextResolver::session_project_identity(parent),
         })
     }
 
@@ -109,7 +134,7 @@ impl ResolvedChildProfile {
         self.model.as_ref()
     }
 
-    pub(super) fn read_only(&self) -> bool {
+    pub fn read_only(&self) -> bool {
         self.read_only
     }
 
@@ -125,6 +150,13 @@ impl ResolvedChildProfile {
         child: &mut Session,
         parent: &Session,
     ) -> Result<(), ChildSessionError> {
+        if parent.id != self.parent_id
+            || parent.created_at != self.parent_created_at
+            || crate::project_context::ProjectContextResolver::session_project_identity(parent)
+                != self.parent_project
+        {
+            return Err(rejected());
+        }
         let base = child
             .metadata
             .get("base_system_prompt")
@@ -414,6 +446,64 @@ mod tests {
             "openai"
         )
         .is_err());
+    }
+
+    #[test]
+    fn workflow_committed_activation_validates_native_host_idle_snapshot() {
+        let mut child = Session::new_child("child", "parent", "model", "reviewer");
+        child.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new(""));
+        child.add_message(Message::user("assignment"));
+        child.add_message(Message::assistant("report", None));
+        child.set_last_run_status("completed");
+        crate::execution::ChildCompletionSource::prepare(
+            &mut child,
+            "host-activation",
+            &Default::default(),
+        );
+        assert_eq!(
+            committed_child_activation(&child).as_deref(),
+            Some("host-activation")
+        );
+        for change in 0..3 {
+            let mut changed = child.clone();
+            match change {
+                0 => changed.messages[0].content = "new input".into(),
+                1 => changed.messages[1].content = "new output".into(),
+                _ => changed.created_at += chrono::Duration::nanoseconds(1),
+            }
+            assert!(committed_child_activation(&changed).is_none());
+        }
+        crate::execution::ChildCompletionSource::defer_for_durable_delivery(
+            &mut child,
+            "host-activation",
+        )
+        .unwrap();
+        assert!(committed_child_activation(&child).is_none());
+    }
+
+    #[test]
+    fn workflow_pinned_profile_rejects_replaced_parent_or_changed_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(home.join("agents")).unwrap();
+        std::fs::write(
+            home.join("agents/reviewer.md"),
+            definition("reviewer", "tools:\n  allow: [Read]"),
+        )
+        .unwrap();
+        let parent = Session::new("parent", "model");
+        for replaced in [Session::new("parent", "model"), {
+            let mut changed = parent.clone();
+            changed.set_project_id_meta("different-project");
+            changed
+        }] {
+            let profile = selected(&home, "reviewer", &parent);
+            let mut child = Session::new_child_of("child", &replaced, "model", "role");
+            child
+                .metadata
+                .insert("base_system_prompt".into(), "base".into());
+            assert!(profile.bind(&mut child, &replaced).is_err());
+        }
     }
 
     #[test]

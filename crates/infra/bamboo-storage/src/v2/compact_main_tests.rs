@@ -785,3 +785,50 @@ async fn compact_started_main_replace_keeps_old_or_new_whole_encoding_after_call
         assert_eq!(std::fs::read(directory.join("session.json")).unwrap(), new);
     }
 }
+
+#[test]
+fn compact_parent_birth_requires_v2_and_preserves_legacy_v1() {
+    let root = Session::new("birth-codec-root", "model");
+    let mut child = Session::new_child_of("birth-codec-child", &root, "model", "Child");
+    let raw = encoded(&child);
+    assert_eq!(compact_main::PREFIX.len(), compact_main::PREFIX_V2.len());
+    assert!(raw.starts_with(compact_main::PREFIX_V2));
+    let projected = compact_main::decode_v1_section(section(&raw), compact_main::SECTION_CAP)
+        .unwrap()
+        .into_snapshot_session();
+    assert_eq!(projected.parent_created_at, Some(root.created_at));
+    assert!(compact_main::validate_full_main(&raw).is_ok());
+    let mut downgraded = raw.clone();
+    downgraded[..compact_main::PREFIX.len()].copy_from_slice(compact_main::PREFIX);
+    assert!(compact_main::validate_full_main(&downgraded).is_err());
+    for value in [None, Some(Value::Null), Some(json!("invalid birth"))] {
+        let mut changed = payload(&raw);
+        match value {
+            Some(value) => changed["parent_created_at"] = value,
+            None => {
+                changed.as_object_mut().unwrap().remove("parent_created_at");
+            }
+        }
+        let mut malformed = with_payload(&changed, &child);
+        malformed[..compact_main::PREFIX_V2.len()].copy_from_slice(compact_main::PREFIX_V2);
+        assert!(
+            compact_main::decode_v1_section(section(&malformed), compact_main::SECTION_CAP)
+                .is_err()
+        );
+        assert!(compact_main::validate_full_main(&malformed).is_err());
+    }
+    assert!(compact_main::validate_full_main(&corrupt_flat(
+        &raw,
+        "parent_created_at",
+        Value::Null
+    ))
+    .is_err());
+    child.parent_created_at = None;
+    let legacy = encoded(&child);
+    assert!(legacy.starts_with(compact_main::PREFIX));
+    assert!(compact_main::validate_full_main(&legacy).is_ok());
+    assert!(encoded(&root).starts_with(compact_main::PREFIX));
+    let mut invalid_root = root;
+    invalid_root.parent_created_at = Some(invalid_root.created_at);
+    assert!(compact_main::serialize_main(&invalid_root).is_err());
+}

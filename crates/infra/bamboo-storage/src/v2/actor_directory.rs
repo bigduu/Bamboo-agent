@@ -232,6 +232,38 @@ impl SessionStoreV2 {
         &self,
         actor: &ActorSession,
     ) -> Result<Vec<ActorAncestorObservation>, ActorDirectoryError> {
+        self.validate_actor_lineage_with_record(actor, Some(actor))
+            .await
+    }
+
+    pub(super) async fn validate_actor_lineage_with_record(
+        &self,
+        actor: &ActorSession,
+        recorded: Option<&ActorSession>,
+    ) -> Result<Vec<ActorAncestorObservation>, ActorDirectoryError> {
+        let own_rel = if actor.parent_actor_id.is_some() {
+            Self::child_rel_path(&actor.root_actor_id, &actor.actor_id)
+        } else {
+            Self::root_rel_path(&actor.actor_id)
+        };
+        let own_kind = if actor.parent_actor_id.is_some() {
+            bamboo_domain::SessionKind::Child
+        } else {
+            bamboo_domain::SessionKind::Root
+        };
+        let mut current_session = self
+            .load_session_from_dir_strict(
+                &self.abs_path_from_rel(&own_rel),
+                &actor.actor_id,
+                own_kind,
+                &actor.root_actor_id,
+            )
+            .await
+            .map_err(storage)?
+            .ok_or_else(|| ActorDirectoryError::NotFound(actor.actor_id.clone()))?;
+        if !actor.matches_session(&current_session) {
+            return Err(ActorDirectoryError::InvalidIdentity);
+        }
         let mut current = actor.clone();
         let mut lineage = Vec::new();
         while let Some(parent_id) = current.parent_actor_id.clone() {
@@ -261,7 +293,25 @@ impl SessionStoreV2 {
                 .await
                 .map_err(storage)?
                 .ok_or_else(|| ActorDirectoryError::NotFound(parent_id.clone()))?;
-            let parent = ActorSession::from_session(&parent)?;
+            // Missing creation proof is readable, but never permits a first
+            // activation. A legacy Actor already activated before this upgrade
+            // may continue only against its original complete ancestor births.
+            match current_session.parent_created_at {
+                Some(birth) if birth == parent.created_at => {}
+                None if recorded.is_some_and(|record| {
+                    record.current_attempt > 0
+                        && record
+                            .ancestor_observations
+                            .get(lineage.len())
+                            .is_some_and(|old| {
+                                old.actor_id == parent.id
+                                    && old.session_created_at == parent.created_at
+                            })
+                }) => {}
+                _ => return Err(ActorDirectoryError::InvalidIdentity),
+            }
+            current_session = parent;
+            let parent = ActorSession::from_session(&current_session)?;
             if parent.root_actor_id != *root_id
                 || parent.spawn_depth.checked_add(1) != Some(current.spawn_depth)
                 || parent.project_id != current.project_id
@@ -300,8 +350,25 @@ impl SessionStoreV2 {
         if session.id != actor_id {
             return Err(ActorDirectoryError::InvalidIdentity);
         }
+        let existing = if Self::regular_actor_file(path).await? {
+            let raw = fs::read(path).await.map_err(storage)?;
+            let entry: ActorDirectoryEntry =
+                serde_json::from_slice(&raw).map_err(|_| ActorDirectoryError::Corrupt)?;
+            entry.validate()?;
+            if !entry.actor.matches_session(&session) {
+                return Err(ActorDirectoryError::InvalidIdentity);
+            }
+            Some(entry)
+        } else {
+            None
+        };
         let mut expected = ActorSession::from_session(&session)?;
-        expected.ancestor_observations = self.validate_actor_lineage(&expected).await?;
+        expected.ancestor_observations = self
+            .validate_actor_lineage_with_record(
+                &expected,
+                existing.as_ref().map(|entry| &entry.actor),
+            )
+            .await?;
         let marker_path = directory.join(ACTOR_INITIALIZED_FILE);
         let marker = match Self::regular_actor_file(&marker_path).await? {
             true => {
@@ -318,15 +385,8 @@ impl SessionStoreV2 {
             }
             false => None,
         };
-        let mut entry = match Self::regular_actor_file(path).await? {
-            true => {
-                let raw = fs::read(path).await.map_err(storage)?;
-                let entry: ActorDirectoryEntry =
-                    serde_json::from_slice(&raw).map_err(|_| ActorDirectoryError::Corrupt)?;
-                entry.validate()?;
-                if !entry.actor.matches_session(&session) {
-                    return Err(ActorDirectoryError::InvalidIdentity);
-                }
+        let mut entry = match existing {
+            Some(entry) => {
                 if marker.is_none() {
                     // Only the fully inert first publication can survive a
                     // crash before marker durability. A prior claim without
@@ -342,7 +402,7 @@ impl SessionStoreV2 {
                 }
                 entry
             }
-            false if marker.is_none() => {
+            None if marker.is_none() => {
                 // The Session was durably visible before this publication. A
                 // crash before the marker leaves an inert Cold actor. No claim
                 // is returned until BOTH files have been durably published.
@@ -352,7 +412,7 @@ impl SessionStoreV2 {
                     .await?;
                 entry
             }
-            false => return Err(ActorDirectoryError::Corrupt),
+            None => return Err(ActorDirectoryError::Corrupt),
         };
         let project_changed = entry.actor.project_id != expected.project_id;
         if kind == bamboo_domain::SessionKind::Child && project_changed {

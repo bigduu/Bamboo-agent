@@ -1376,6 +1376,10 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 );
                 format!("{}-run-{}", self.child_id, uuid::Uuid::new_v4())
             });
+        let workflow_usage_requested = run.messages.iter().any(|message| {
+            message["role"] == "system"
+                && message["metadata"][bamboo_subagent::proto::WORKFLOW_USAGE_REQUESTED_KEY] == true
+        });
         let expected_activation_run_id = run.activation_run_id.clone();
         match self.agent.storage().load_session(&logical_session_id).await {
             Ok(Some(current)) => {
@@ -2286,6 +2290,24 @@ impl ChildExecutor for BambooRuntimeExecutor {
         steer_done.cancel();
         let _ = steer_task.await;
         let _ = forward.await; // flush remaining events before the terminal frame
+        if workflow_usage_requested {
+            if let (Some(activation), Some(runtime)) = (
+                expected_activation_run_id.as_ref(),
+                session.agent_runtime_state.as_ref(),
+            ) {
+                let usage = bamboo_subagent::proto::WorkflowAgentUsage {
+                    kind: bamboo_subagent::proto::WorkflowAgentUsage::TYPE.into(),
+                    activation_run_id: activation.clone(),
+                    child_session_id: session.id.clone(),
+                    child_created_at: session.created_at,
+                    prompt_tokens: runtime.round.total_prompt_tokens,
+                    completion_tokens: runtime.round.total_completion_tokens,
+                };
+                tail_events
+                    .emit(serde_json::to_value(usage).expect("non-content Workflow usage"))
+                    .await;
+            }
+        }
 
         if let Some(checkpoint) = question_checkpoint
             .lock()
@@ -3790,6 +3812,16 @@ mod tests {
                 1 => chunks.push(Ok(LLMChunk::Token(LOCAL_HISTORY_REPORT.into()))),
                 _ => panic!("local history fixture unexpectedly requested round {round}"),
             }
+            // Explicit provider counts also exercise canonical provider-first accounting.
+            chunks.push(Ok(LLMChunk::ProviderUsage {
+                input_tokens: Some(if round == 0 { 11 } else { 13 }),
+                output_tokens: Some(if round == 0 { 7 } else { 5 }),
+                total_tokens: Some(18),
+                reasoning_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
+            }));
             chunks.push(Ok(LLMChunk::Done));
             Ok(Box::pin(futures::stream::iter(chunks)))
         }
@@ -3946,6 +3978,49 @@ mod tests {
         executor.native_tool_ceiling = Some(ceiling);
         executor.local_tool_history = true;
         (temp, executor, store, provider, run)
+    }
+
+    #[tokio::test]
+    async fn workflow_agent_worker_observes_all_provider_requests_once() {
+        use bamboo_subagent::proto::{WorkflowAgentUsage, WORKFLOW_USAGE_REQUESTED_KEY};
+        let (_temp, executor, _store, provider, mut run) =
+            strict_local_history_read_fixture(false).await;
+        run.messages[0]["metadata"] = serde_json::json!({ (WORKFLOW_USAGE_REQUESTED_KEY): true });
+        let (events, mut rx, _control) = EventSink::channel_with_control();
+        let outcome = ChildExecutor::run(
+            &executor,
+            run.clone(),
+            events,
+            SteerInbox::disconnected(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
+        assert_eq!(provider.calls.lock().unwrap().len(), 2);
+        let mut observations = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if event["type"] == WorkflowAgentUsage::TYPE {
+                observations.push(serde_json::from_value::<WorkflowAgentUsage>(event).unwrap());
+            }
+        }
+        assert_eq!(observations.len(), 1);
+        let usage = &observations[0];
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens()
+            ),
+            (24, 12, 36)
+        );
+        assert_eq!(
+            Some(usage.activation_run_id.as_str()),
+            run.activation_run_id.as_deref()
+        );
+        assert_eq!(
+            usage.child_session_id,
+            run.logical_session.unwrap().session_id
+        );
     }
 
     async fn assert_strict_local_history_read(with_reasoning: bool, over_broker: bool) {

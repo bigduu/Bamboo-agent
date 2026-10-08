@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Weak,
+};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -36,19 +39,27 @@ type SecretResolutionFuture<'a> =
 pub struct NamedAgentSpec {
     pub name: String,
     pub allowed_capabilities: BTreeSet<String>,
+    pub profile:
+        Option<Arc<crate::session_app::child_session::named_profile::ResolvedChildProfile>>,
+    pub cost_supported: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct AgentStepResult {
     pub output: Value,
     pub tokens: u64,
-    pub cost_micros: u64,
+    pub cost_micros: Option<u64>,
+    /// A completed attempt may fail after consuming tokens; its usage still counts.
+    pub failure: Option<WorkflowFailure>,
+    /// Process-local ownership handoff; absent for ports without retained results.
+    pub attempt_id: Option<String>,
 }
 
 #[async_trait]
 pub trait AgentStepPort: Send + Sync {
     /// #563 seam. Unknown names must return `Ok(None)` and fail preflight.
-    async fn resolve(&self, name: &str) -> Result<Option<NamedAgentSpec>, String>;
+    async fn resolve(&self, name: &str, session_id: &str)
+        -> Result<Option<NamedAgentSpec>, String>;
     async fn execute(
         &self,
         spec: &NamedAgentSpec,
@@ -57,7 +68,20 @@ pub trait AgentStepPort: Send + Sync {
         effort: Option<&str>,
         capabilities: &BTreeSet<String>,
         session_id: &str,
+        root_run_id: &str,
+        cancellation: CancellationToken,
     ) -> Result<AgentStepResult, String>;
+    /// Consume a retained result while the caller owns the usage ledger lock.
+    fn acknowledge_result(&self, _attempt_id: &str) -> bool {
+        true
+    }
+    /// Stop and drain cancelled executions owned by this root run.
+    async fn drain_cancelled(
+        &self,
+        _root_run_id: &str,
+    ) -> (Vec<Result<AgentStepResult, String>>, Option<String>) {
+        (Vec::new(), None)
+    }
 }
 
 #[async_trait]
@@ -135,6 +159,8 @@ pub enum WorkflowRunError {
     InvalidInput(String),
     #[error("workflow preflight failed: {0}")]
     Preflight(String),
+    #[error("named agents without monetary measurement do not support a finite monetary budget")]
+    UnsupportedMonetaryBudget,
     #[error("workflow storage failed: {0}")]
     Storage(String),
     #[error("workflow run not found")]
@@ -159,6 +185,11 @@ pub struct WorkflowRunEngine {
 struct ActiveRun {
     cancellation: CancellationToken,
     snapshot: Arc<Mutex<WorkflowRunSnapshot>>,
+    root_run_id: String,
+    ledger: Arc<Mutex<WorkflowBudgetUsage>>,
+    drain_lock: Arc<Mutex<()>>,
+    cleanup_pending: AtomicBool,
+    has_agents: bool,
 }
 
 struct RuntimeRegistration {
@@ -169,8 +200,14 @@ struct RuntimeRegistration {
 impl Drop for RuntimeRegistration {
     fn drop(&mut self) {
         if let Some(engine) = self.engine.upgrade() {
-            engine.active.remove(&self.run_id);
-            engine.events.remove(&self.run_id);
+            let pending = engine
+                .active
+                .get(&self.run_id)
+                .is_some_and(|run| run.cleanup_pending.load(Ordering::Acquire));
+            if !pending {
+                engine.active.remove(&self.run_id);
+                engine.events.remove(&self.run_id);
+            }
         }
     }
 }
@@ -191,6 +228,8 @@ struct RunContext {
     depth: u32,
     ledger: Arc<Mutex<WorkflowBudgetUsage>>,
     root_limits: WorkflowBudgets,
+    root_run_id: String,
+    drain_lock: Arc<Mutex<()>>,
 }
 
 impl Clone for RunContext {
@@ -211,6 +250,8 @@ impl Clone for RunContext {
             depth: self.depth,
             ledger: self.ledger.clone(),
             root_limits: self.root_limits.clone(),
+            root_run_id: self.root_run_id.clone(),
+            drain_lock: self.drain_lock.clone(),
         }
     }
 }
@@ -290,6 +331,7 @@ impl WorkflowRunEngine {
             limits,
             semaphore,
             None,
+            None,
         )
         .await
     }
@@ -341,6 +383,7 @@ impl WorkflowRunEngine {
                     limits,
                     semaphore,
                     Some(signal.clone()),
+                    None,
                 )
                 .await;
             if let Err(error) = result {
@@ -419,6 +462,7 @@ impl WorkflowRunEngine {
         root_limits: WorkflowBudgets,
         semaphore: Arc<Semaphore>,
         started: Option<StartSignal>,
+        root_run_id: Option<String>,
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
         if request.definition.steps.len() > self.ceilings.max_steps as usize {
             return Err(WorkflowRunError::Preflight(
@@ -444,6 +488,7 @@ impl WorkflowRunEngine {
         })?;
 
         let run_id = Uuid::new_v4().to_string();
+        let root_run_id = root_run_id.unwrap_or_else(|| run_id.clone());
         let now = Utc::now();
         let snapshot = WorkflowRunSnapshot {
             run_id: run_id.clone(),
@@ -473,11 +518,17 @@ impl WorkflowRunEngine {
         self.events.insert(run_id.clone(), sender);
         self.publish(&queued);
         let snapshot = Arc::new(Mutex::new(snapshot));
+        let drain_lock = Arc::new(Mutex::new(()));
         self.active.insert(
             run_id.clone(),
             Arc::new(ActiveRun {
                 cancellation: cancellation.clone(),
                 snapshot: snapshot.clone(),
+                root_run_id: root_run_id.clone(),
+                ledger: ledger.clone(),
+                drain_lock: drain_lock.clone(),
+                cleanup_pending: AtomicBool::new(false),
+                has_agents: !pinned_agents.is_empty(),
             }),
         );
         let _registration = RuntimeRegistration {
@@ -522,13 +573,51 @@ impl WorkflowRunEngine {
             depth,
             ledger,
             root_limits,
+            root_run_id: root_run_id.clone(),
+            drain_lock,
         };
         let result = tokio::time::timeout(
             Duration::from_millis(compiled.definition.budgets.wall_time_ms),
             context.execute_node(&compiled.definition.plan, "root"),
         )
         .await;
+        if result.is_err() {
+            cancellation.cancel();
+        }
+        let _drain_guard = context.drain_lock.lock().await;
+        {
+            let snapshot = snapshot.lock().await;
+            if snapshot.status.is_terminal() {
+                return Ok(snapshot.clone());
+            }
+        }
+        if result.is_err() {
+            if let Some(durable) = self.repository.load(&run_id).await.map_err(storage)? {
+                *snapshot.lock().await = durable;
+            }
+        }
+        let (usage_unavailable, drain_error) = context.drain_agents().await;
+        // A node can be dropped after its ledger handoff but before checkpoint.
+        if context.ledger.lock().await.agents > 0 {
+            context
+                .checkpoint_agent_usage("AgentDrained")
+                .await
+                .map_err(|e| WorkflowRunError::Storage(e.message))?;
+        }
+        if drain_error.is_some() {
+            if let Some(active) = self.active.get(&run_id) {
+                active.cleanup_pending.store(true, Ordering::Release);
+            }
+            return Err(WorkflowRunError::Preflight(
+                "Workflow children have not confirmed stop; cancellation can be retried".into(),
+            ));
+        }
         let mut final_snapshot = snapshot.lock().await;
+        if usage_unavailable && !final_snapshot.status.is_terminal() {
+            self.finish_failed(&mut final_snapshot, failure(WorkflowFailureCode::ExecutionFailed,
+                "workflow Agent stopped but cumulative token observation unavailable; usage is not measured", false)).await?;
+            return Ok(final_snapshot.clone());
+        }
         if final_snapshot.status.is_terminal() {
             return Ok(final_snapshot.clone());
         }
@@ -620,6 +709,15 @@ impl WorkflowRunEngine {
         self.active.contains_key(run_id)
     }
 
+    #[cfg(test)]
+    pub(super) fn test_active_ledger(
+        &self,
+        run_id: &str,
+    ) -> (Arc<Mutex<WorkflowBudgetUsage>>, CancellationToken) {
+        let active = self.active.get(run_id).unwrap();
+        (active.ledger.clone(), active.cancellation.clone())
+    }
+
     pub async fn cancel(&self, run_id: &str) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
         let mut snapshot = self
             .repository
@@ -635,11 +733,80 @@ impl WorkflowRunEngine {
         }
         if let Some(active) = self.active.get(run_id).map(|active| active.clone()) {
             active.cancellation.cancel();
+            // Tool-only runs keep their existing cancellation/repository path.
+            if !active.has_agents {
+                let mut shared = active.snapshot.lock().await;
+                if !shared.status.is_terminal() {
+                    self.finish_cancelled(&mut shared).await?;
+                }
+                return Ok(shared.clone());
+            }
+            let _drain_guard = active.drain_lock.lock().await;
+            {
+                let snapshot = active.snapshot.lock().await;
+                if snapshot.status.is_terminal() {
+                    return Ok(snapshot.clone());
+                }
+            }
+            let mut usage_unavailable = false;
+            let mut ledger = active.ledger.lock().await;
+            let (drained, drain_error) = self.agents.drain_cancelled(&active.root_run_id).await;
+            let usage = {
+                let usage = &mut *ledger;
+                for result in drained {
+                    match result {
+                        Ok(result) => {
+                            usage.tokens = usage.tokens.saturating_add(result.tokens);
+                            usage.cost_micros = usage
+                                .cost_micros
+                                .zip(result.cost_micros)
+                                .map(|(a, b)| a.saturating_add(b));
+                        }
+                        Err(_) => {
+                            usage_unavailable = true;
+                            usage.cost_micros = None;
+                        }
+                    }
+                }
+                usage.clone()
+            };
+            drop(ledger);
+            {
+                let mut shared = active.snapshot.lock().await;
+                self.transition(
+                    &mut shared,
+                    None,
+                    WorkflowRunEventKind::Phase {
+                        name: "AgentDrained".into(),
+                    },
+                    |snapshot| {
+                        snapshot.usage.tokens = usage.tokens;
+                        snapshot.usage.cost_micros = usage.cost_micros;
+                    },
+                )
+                .await?;
+            }
+            if drain_error.is_some() {
+                active.cleanup_pending.store(true, Ordering::Release);
+                return Err(WorkflowRunError::Preflight(
+                    "Workflow children have not confirmed stop; cancellation can be retried".into(),
+                ));
+            }
             let mut shared = active.snapshot.lock().await;
             if !shared.status.is_terminal() {
-                self.finish_cancelled(&mut shared).await?;
+                if usage_unavailable {
+                    self.finish_failed(&mut shared, failure(WorkflowFailureCode::ExecutionFailed,
+                        "workflow Agent stopped but cumulative token observation unavailable; usage is not measured", false)).await?;
+                } else {
+                    self.finish_cancelled(&mut shared).await?;
+                }
             }
-            return Ok(shared.clone());
+            let result = shared.clone();
+            if active.cleanup_pending.swap(false, Ordering::AcqRel) {
+                self.active.remove(run_id);
+                self.events.remove(run_id);
+            }
+            return Ok(result);
         }
         self.finish_cancelled(&mut snapshot).await?;
         Ok(snapshot)
@@ -835,7 +1002,7 @@ impl WorkflowRunEngine {
                         } else {
                             let spec = self
                                 .agents
-                                .resolve(agent)
+                                .resolve(agent, session_id)
                                 .await
                                 .map_err(|_| {
                                     WorkflowRunError::Preflight(
@@ -855,6 +1022,12 @@ impl WorkflowRunEngine {
                             pinned_agents.insert(agent.clone(), spec.clone());
                             spec
                         };
+                        if (root_limits.max_cost_micros.is_some()
+                            || compiled.definition.budgets.max_cost_micros.is_some())
+                            && !spec.cost_supported
+                        {
+                            return Err(WorkflowRunError::UnsupportedMonetaryBudget);
+                        }
                         if !capabilities
                             .iter()
                             .all(|capability| spec.allowed_capabilities.contains(capability))
@@ -1217,6 +1390,22 @@ impl RunContext {
                                 // leaving it parked inside FuturesUnordered would
                                 // deadlock this reconciliation.
                                 drop(futures);
+                                if !self.pinned_agents.is_empty() {
+                                    let _drain_guard = self.drain_lock.lock().await;
+                                    let (usage_unavailable, drain_error) =
+                                        self.drain_agents().await;
+                                    self.checkpoint_agent_usage("AgentDrained").await?;
+                                    if usage_unavailable {
+                                        return Err(failure(WorkflowFailureCode::ExecutionFailed, "workflow Agent cumulative token observation unavailable; usage is not measured", false));
+                                    }
+                                    if drain_error.is_some() {
+                                        return Err(failure(
+                                            WorkflowFailureCode::ExecutionFailed,
+                                            "Workflow children have not confirmed stop",
+                                            false,
+                                        ));
+                                    }
+                                }
                                 self.cancel_active_parallel_steps(nodes).await?;
                                 error.message =
                                     format!("parallel branch[{index}] failed: {}", error.message);
@@ -1722,6 +1911,9 @@ impl RunContext {
                 for _ in 0..*structured_output_attempts {
                     self.ensure_agent_usage_budget_available().await?;
                     self.reserve_agent().await?;
+                    if !spec.cost_supported {
+                        self.ledger.lock().await.cost_micros = None;
+                    }
                     self.checkpoint_usage("agent_reserved").await?;
                     match self
                         .engine
@@ -1733,13 +1925,35 @@ impl RunContext {
                             effort.as_deref(),
                             &requested,
                             &session_id,
+                            &self.root_run_id,
+                            self.branch_cancellation.child_token(),
                         )
                         .await
                     {
                         Ok(result) => {
+                            let _drain_guard = self.drain_lock.lock().await;
+                            let mut usage = self.ledger.lock().await;
+                            if result
+                                .attempt_id
+                                .as_ref()
+                                .is_some_and(|id| !self.engine.agents.acknowledge_result(id))
+                            {
+                                self.check_cancelled()?;
+                                return Err(failure(
+                                    WorkflowFailureCode::Cancelled,
+                                    "workflow Agent result already drained",
+                                    false,
+                                ));
+                            }
+                            // No await between ownership transfer and accounting.
                             let exceeded =
-                                self.record_usage(result.tokens, result.cost_micros).await;
+                                self.record_usage(&mut usage, result.tokens, result.cost_micros);
+                            drop(usage);
                             self.checkpoint_usage("agent_usage_recorded").await?;
+                            self.check_cancelled()?;
+                            if let Some(error) = result.failure {
+                                return Err(error);
+                            }
                             if let Some(error) = exceeded {
                                 return Err(error);
                             }
@@ -1752,7 +1966,12 @@ impl RunContext {
                             return Ok(result.output);
                         }
                         Err(_error) => {
-                            last_error = Some("named agent execution failed".to_string())
+                            self.check_cancelled()?;
+                            return Err(failure(
+                                WorkflowFailureCode::ExecutionFailed,
+                                "named agent execution or usage observation unavailable",
+                                false,
+                            ));
                         }
                     }
                 }
@@ -1805,6 +2024,7 @@ impl RunContext {
                     self.root_limits.clone(),
                     self.semaphore.clone(),
                     None,
+                    Some(self.root_run_id.clone()),
                 ))
                 .await
                 .map_err(|_error| {
@@ -1914,10 +2134,17 @@ impl RunContext {
         Ok(())
     }
 
-    async fn record_usage(&self, tokens: u64, cost_micros: u64) -> Option<WorkflowFailure> {
-        let mut usage = self.ledger.lock().await;
+    fn record_usage(
+        &self,
+        usage: &mut WorkflowBudgetUsage,
+        tokens: u64,
+        cost_micros: Option<u64>,
+    ) -> Option<WorkflowFailure> {
         let next_tokens = usage.tokens.saturating_add(tokens);
-        let next_cost = usage.cost_micros.saturating_add(cost_micros);
+        let next_cost = usage
+            .cost_micros
+            .zip(cost_micros)
+            .map(|(a, b)| a.saturating_add(b));
         usage.tokens = next_tokens;
         usage.cost_micros = next_cost;
         if self
@@ -1927,7 +2154,7 @@ impl RunContext {
             || self
                 .root_limits
                 .max_cost_micros
-                .is_some_and(|limit| next_cost > limit)
+                .is_some_and(|limit| next_cost.is_none_or(|cost| cost > limit))
         {
             return Some(failure(
                 WorkflowFailureCode::BudgetExceeded,
@@ -1936,6 +2163,26 @@ impl RunContext {
             ));
         }
         None
+    }
+
+    async fn drain_agents(&self) -> (bool, Option<String>) {
+        // Acquire before the port transfers results; after it returns there is
+        // no await until all rows are accounted. Provider execution stays parallel.
+        let mut ledger = self.ledger.lock().await;
+        let (results, error) = self.engine.agents.drain_cancelled(&self.root_run_id).await;
+        let mut unavailable = false;
+        for result in results {
+            match result {
+                Ok(result) => {
+                    self.record_usage(&mut ledger, result.tokens, result.cost_micros);
+                }
+                Err(_) => {
+                    unavailable = true;
+                    ledger.cost_micros = None;
+                }
+            }
+        }
+        (unavailable, error)
     }
 
     async fn ensure_agent_usage_budget_available(&self) -> Result<(), WorkflowFailure> {
@@ -1947,7 +2194,7 @@ impl RunContext {
             || self
                 .root_limits
                 .max_cost_micros
-                .is_some_and(|limit| usage.cost_micros >= limit)
+                .is_some_and(|limit| usage.cost_micros.is_none_or(|cost| cost >= limit))
         {
             return Err(failure(
                 WorkflowFailureCode::BudgetExceeded,
@@ -1956,6 +2203,27 @@ impl RunContext {
             ));
         }
         Ok(())
+    }
+
+    async fn checkpoint_agent_usage(&self, name: &str) -> Result<(), WorkflowFailure> {
+        let usage = self.ledger.lock().await.clone();
+        let mut snapshot = self.snapshot.lock().await;
+        self.engine
+            .transition(
+                &mut snapshot,
+                None,
+                WorkflowRunEventKind::Phase {
+                    name: name.to_string(),
+                },
+                move |snapshot| {
+                    // Only completed Agent usage is reconciled here. Other counters
+                    // retain their existing durable reservation/checkpoint semantics.
+                    snapshot.usage.tokens = usage.tokens;
+                    snapshot.usage.cost_micros = usage.cost_micros;
+                },
+            )
+            .await
+            .map_err(|e| failure(WorkflowFailureCode::Storage, e.to_string(), false))
     }
 
     async fn checkpoint_usage(&self, name: &str) -> Result<(), WorkflowFailure> {

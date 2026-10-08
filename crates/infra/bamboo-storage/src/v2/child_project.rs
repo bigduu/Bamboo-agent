@@ -139,12 +139,37 @@ impl SessionStoreV2 {
             || current.kind != SessionKind::Child
             || current.root_session_id != incoming.root_session_id
             || current.parent_session_id != incoming.parent_session_id
+            || current.parent_created_at != incoming.parent_created_at
             || current.spawn_depth != incoming.spawn_depth
             || current.created_at != incoming.created_at
         {
             return Err(conflict(
                 "writer does not match durable Child creation identity",
             ));
+        }
+        if main {
+            // A mixed-version runtime writer must not erase the creation
+            // proof and then let a full writer make that loss authoritative.
+            #[derive(serde::Deserialize)]
+            struct MainBirth {
+                id: String,
+                created_at: DateTime<Utc>,
+                #[serde(default)]
+                parent_created_at: Option<DateTime<Utc>>,
+            }
+            let bytes = fs::read(directory.join("session.json"))
+                .await
+                .map_err(|error| conflict(error.to_string()))?;
+            compact_main::validate_full_main(&bytes)
+                .map_err(|error| conflict(error.to_string()))?;
+            let birth: MainBirth =
+                serde_json::from_slice(&bytes).map_err(|error| conflict(error.to_string()))?;
+            if birth.id != current.id
+                || birth.created_at != current.created_at
+                || birth.parent_created_at != current.parent_created_at
+            {
+                return Err(conflict("canonical Child Main/runtime birth proof differs"));
+            }
         }
         if current.project_id_meta() != incoming.project_id_meta() {
             return Err(conflict("Child Project is immutable after creation"));
