@@ -773,23 +773,14 @@ impl BambooRuntimeExecutor {
                 store.clone(),
                 persistence.clone(),
             );
-            let load_skill = Arc::new(bamboo_server::tools::LoadSkillTool::new(
-                skill_manager.clone(),
-                config.clone(),
-                session_repo.clone(),
-            ));
-            let read_skill = Arc::new(bamboo_server::tools::ReadSkillResourceTool::new(
+            bamboo_server::tools::assemble_legacy_skill_tools(
+                default_tools,
                 skill_manager.clone(),
                 config.clone(),
                 session_repo,
-            ));
-            let with_load = Arc::new(bamboo_server::tools::OverlayToolExecutor::new(
-                default_tools,
-                load_skill,
-            ));
-            Arc::new(bamboo_server::tools::OverlayToolExecutor::new(
-                with_load, read_skill,
-            ))
+                None,
+                None,
+            )
         };
 
         // Capture clones for the worker's OWN spawn stack (Phase 6: direct nested
@@ -4990,6 +4981,157 @@ mod tests {
             model: m.into(),
         });
         s
+    }
+
+    #[tokio::test]
+    async fn legacy_assembly_real_worker_synced_scope_and_strict_native_parity() {
+        for strict in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            // A localhost hold fixture satisfies provider construction without any model invocation.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut spec = spec_with(
+                "openai",
+                "unused-fixture-key",
+                Some(("openai", "test-model")),
+            );
+            spec.storage_dir = Some(home.path().join("worker").to_string_lossy().into_owned());
+            spec.fabric_dir = home.path().join("fabric").to_string_lossy().into_owned();
+            spec.workspace = Some(home.path().to_string_lossy().into_owned());
+            spec.secrets.provider_credentials[0].base_url = Some(format!("http://{address}/v1"));
+            let skills = home.path().join("synced-skills");
+            let skill = skills.join("assembly-worker");
+            std::fs::create_dir_all(skill.join("references")).unwrap();
+            std::fs::write(skill.join("SKILL.md"), "---\nname: assembly-worker\ndescription: Assembly worker\nmetadata:\n  dynamic_context:\n    - id: proof\n      tool: Read\n      input: {path: provider.txt}\n---\nWORKER_INSTRUCTIONS\n").unwrap();
+            std::fs::write(skill.join("references/proof.txt"), "SYNCED_RESOURCE\n").unwrap();
+            std::fs::write(
+                home.path().join("provider.txt"),
+                "MUST_NOT_DISPATCH_PROVIDER\n",
+            )
+            .unwrap();
+            if strict {
+                spec.identity.child_id = "assembly-strict".into();
+                spec.identity.parent_id = Some("assembly-root".into());
+                spec.identity.depth = 1;
+                spec.capabilities.required_child_context = true;
+                spec.capabilities.child_creation_identity = true;
+                spec.capabilities.enforce_permissions = true;
+                spec.capabilities.native_tool_ceiling_required = true;
+                spec.capabilities.native_tool_ceiling =
+                    Some(bamboo_subagent::proto::NativeToolCeiling {
+                        version: 1,
+                        child_session_id: spec.identity.child_id.clone(),
+                        parent_session_id: "assembly-root".into(),
+                        root_session_id: "assembly-root".into(),
+                        created_at: Utc::now(),
+                        spawn_depth: 1,
+                        project_id: None,
+                        tools: vec!["Read".into()],
+                    });
+            } else {
+                spec.capabilities.skills_dir = Some(skills.to_string_lossy().into_owned());
+            }
+            spec.validate().unwrap();
+            let runtime = BambooRuntimeExecutor::build(&spec).await.unwrap();
+            let tools = runtime.agent.default_tools();
+            let names: Vec<_> = tools
+                .list_tools()
+                .into_iter()
+                .map(|schema| schema.function.name)
+                .collect();
+            assert!(!names
+                .iter()
+                .any(|name| name == "skills_read" || name == "skills_list"));
+            let mut session = Session::new("assembly-worker-session", "test-model");
+            session.set_workspace_path_meta(home.path().to_string_lossy().into_owned());
+            session.metadata.insert(
+                bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.into(),
+                "[\"assembly-worker\"]".into(),
+            );
+            runtime
+                .agent
+                .storage()
+                .save_session(&session)
+                .await
+                .unwrap();
+            let call = ToolCall {
+                id: "assembly-worker-load".into(),
+                tool_type: "function".into(),
+                function: bamboo_agent_core::tools::FunctionCall {
+                    name: "load_skill".into(),
+                    arguments: serde_json::json!({"skill_id": "assembly-worker"}).to_string(),
+                },
+            };
+            let mut ctx = bamboo_agent_core::ToolExecutionContext::none(&call.id);
+            ctx.session_id = Some(&session.id);
+            if strict {
+                assert_eq!(names, ["Read"]);
+                assert!(tools.execute_with_context(&call, ctx).await.is_err());
+                let saved = runtime
+                    .agent
+                    .storage()
+                    .load_session(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!saved
+                    .metadata
+                    .contains_key(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY));
+                continue;
+            }
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|name| name.as_str() == "load_skill")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|name| name.as_str() == "read_skill_resource")
+                    .count(),
+                1
+            );
+            let result = tools.execute_with_context(&call, ctx).await.unwrap();
+            assert!(result.success);
+            let receipt: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+            assert_eq!(receipt["activation_status"], "active");
+            let saved = runtime
+                .agent
+                .storage()
+                .load_session(&session.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let active: bamboo_skills::ActiveWorkflow =
+                serde_json::from_str(&saved.metadata[bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY])
+                    .unwrap();
+            assert_eq!(
+                active.dynamic_context[0].status,
+                bamboo_skills::WorkflowActivationStatus::Degraded
+            );
+            assert_eq!(
+                active.dynamic_context[0].provenance,
+                "typed_authority_unavailable"
+            );
+            assert!(active.dynamic_context[0].content.is_empty());
+            let read = ToolCall {
+                id: "assembly-worker-read".into(), tool_type: "function".into(),
+                function: bamboo_agent_core::tools::FunctionCall {
+                    name: "read_skill_resource".into(), arguments: serde_json::json!({"skill_id": "assembly-worker", "resource_path": "references/proof.txt"}).to_string(),
+                },
+            };
+            let mut ctx = bamboo_agent_core::ToolExecutionContext::none(&read.id);
+            ctx.session_id = Some(&session.id);
+            let result = tools.execute_with_context(&read, ctx).await.unwrap();
+            assert!(result.success && result.result.contains("SYNCED_RESOURCE"));
+            assert!(tools.execute(&read).await.is_err());
+            assert!(
+                listener.into_std().unwrap().accept().is_err(),
+                "no model request occurred"
+            );
+        }
     }
 
     #[tokio::test]
