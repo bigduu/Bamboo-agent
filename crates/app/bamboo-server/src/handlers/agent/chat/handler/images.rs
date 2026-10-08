@@ -71,6 +71,36 @@ pub(super) async fn construct_user_message(
     }
 }
 
+/// Preserve C's real post-hook identity, timestamp and every attachment.
+pub(super) async fn construct_native_envelope(
+    state: &web::Data<AppState>,
+    session: &Session,
+    request: &super::ChatRequest,
+    message: &str,
+) -> ResponseResult<bamboo_domain::SessionMessageEnvelope> {
+    let data = super::ingress::skill_request(request)?;
+    let user = construct_user_message(state, session, message, request.images.as_deref()).await?;
+    let mut envelope =
+        bamboo_domain::SessionMessageEnvelope::user_input(&session.id, &user.content);
+    envelope.id = bamboo_domain::SessionMessageId::parse(user.id).map_err(|e| {
+        crate::error::json_error(
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            e.to_string(),
+        )
+    })?;
+    envelope.created_at = user.created_at;
+    envelope.body =
+        bamboo_domain::SessionMessageBody::Content(bamboo_domain::SessionMessageContent {
+            text: user.content,
+            parts: user.content_parts.unwrap_or_default(),
+            skill_request: data,
+        });
+    envelope.validate().map_err(|e| {
+        crate::error::json_error(actix_web::http::StatusCode::BAD_REQUEST, e.to_string())
+    })?;
+    Ok(envelope)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

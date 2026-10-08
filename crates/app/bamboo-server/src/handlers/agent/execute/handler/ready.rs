@@ -37,6 +37,7 @@ pub(super) struct ReadyExecution<'a> {
     /// Durable message id owned by the pending execute handoff, if any.
     pub startup_turn_id: Option<String>,
     pub untrusted_inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
+    pub generate_title: bool,
     pub effective_model: String,
     pub effective_reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
     pub model_source: &'static str,
@@ -199,6 +200,9 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         );
     }
 
+    if ready.generate_title && !session.title_generated {
+        crate::title_gen::spawn_title_generation(state.clone().into_inner(), session_id.to_owned());
+    }
     let disabled_tools: BTreeSet<String> = disabled_tools.into_iter().collect();
     let disabled_skill_ids: BTreeSet<String> = disabled_skill_ids.into_iter().collect();
     let resolved_provider_name = session_effective_model_ref(&session)

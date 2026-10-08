@@ -75,11 +75,11 @@ pub async fn handle_execute(
     // Bind rejection rollback to the exact turn observed by this request. A
     // delayed failure from turn A must never poison a newer turn B.
     drop(startup_lock);
-    let untrusted_inputs =
-        match crate::handlers::agent::chat::admit_for_execute(&state, &session_id).await {
-            Ok(inputs) => inputs,
-            Err(response) => return *response,
-        };
+    let admission = match state.admit_chat_for_execute(&session_id).await {
+        Ok(admission) => admission,
+        Err(response) => return *response,
+    };
+    let untrusted_inputs = admission.inputs;
     let startup_turn_id = state
         .storage
         .load_session(&session_id)
@@ -270,6 +270,7 @@ pub async fn handle_execute(
                     startup_guard: &mut startup_guard,
                     startup_turn_id: startup_turn_id.clone(),
                     untrusted_inputs,
+                    generate_title: admission.generate_title,
                     effective_model,
                     effective_reasoning_effort,
                     model_source,
