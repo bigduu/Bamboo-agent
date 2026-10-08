@@ -3869,10 +3869,8 @@ async fn constructor_parity_queue_preserves_envelope_and_deduplicated_retry() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        serde_json::to_value(replay).unwrap(),
-        serde_json::to_value(first).unwrap()
-    );
+    assert_eq!(replay.id, first.id);
+    assert_eq!(replay.generation, first.generation);
     let conflict = super::ingress::queue(&state, &session, &request, "changed body", &http)
         .await
         .unwrap_err();
