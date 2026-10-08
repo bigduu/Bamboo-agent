@@ -282,8 +282,20 @@ mod tests {
         let mut session = bamboo_agent_core::Session::new("ql-startup", "model");
         session.add_message(bamboo_agent_core::Message::system("system"));
         storage.save_session(&session).await.unwrap();
-        let envelope =
+        let mut envelope =
             bamboo_domain::SessionMessageEnvelope::user_input(&session.id, "new queued input");
+        let request = bamboo_domain::SessionSkillRequest {
+            mode: Some("original-mode".into()),
+            selections: vec![bamboo_domain::SessionSkillSelection {
+                id: "request-outside-host-ceiling".into(),
+                source: "plugin".into(),
+                revision: 7,
+                args: serde_json::json!({"original":[1.125,null,"原样"]}),
+            }],
+        };
+        if let bamboo_domain::SessionMessageBody::Content(content) = &mut envelope.body {
+            content.skill_request = Some(request.clone());
+        }
         let receipt = inbox.deliver(&envelope).await.unwrap();
         inbox
             .mark_activation_eligible(
@@ -306,6 +318,7 @@ mod tests {
         assert_eq!(carrier.observations()[0].input_id(), envelope.id.as_str());
         let config = AgentLoopConfig {
             initial_untrusted_inputs: Some(carrier),
+            selected_skill_ids: Some(Vec::new()),
             skip_initial_user_message: true,
             storage: Some(storage),
             persistence: Some(persistence),
@@ -327,6 +340,16 @@ mod tests {
         assert_eq!(first.execution_id.len(), 32);
         assert_eq!(batch.session_id(), first.session_id);
         assert_eq!(batch.records()[0].input_id, envelope.id.as_str());
+        assert_eq!(batch.records()[0].request.as_ref(), Some(&request));
+        assert_eq!(
+            config.initial_untrusted_inputs().unwrap().observations()[0].request(),
+            Some(&request)
+        );
+        assert_eq!(
+            config.selected_skill_ids,
+            Some(Vec::new()),
+            "request data never widens host ceiling"
+        );
         assert_eq!(
             config.initial_untrusted_inputs().unwrap().observations()[0].input_id(),
             envelope.id.as_str()

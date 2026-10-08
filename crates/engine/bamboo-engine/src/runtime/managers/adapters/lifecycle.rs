@@ -337,10 +337,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(
-                prepared.round_id,
-                crate::runtime::runner::round_prelude::build_round_id(id, &execution, 0)
-            );
+            assert_eq!(prepared.round_id, format!("{id}-run-{execution}-round-1"));
             let mut current = None;
             prepared
                 .observation

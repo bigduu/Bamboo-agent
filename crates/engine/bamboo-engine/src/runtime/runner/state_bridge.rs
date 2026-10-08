@@ -1421,6 +1421,125 @@ async fn refresh_turn_boundary_inner(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn ql_overflow_old_wrapper_and_rich_prelude_preserve_actual_outputs_and_ack() {
+        let mut snapshots = Vec::new();
+        for rich in [false, true] {
+            let (_home, store, locked, inbox, mut session) =
+                durable_inbox_fixture("ql-overflow-parity").await;
+            let mut system = Message::system("fixed provider system");
+            system.id = "fixed-system-id".into();
+            system.created_at = chrono::DateTime::from_timestamp(1700000000, 0).unwrap();
+            session.add_message(system);
+            store.save_session(&session).await.unwrap();
+            let storage: Arc<dyn Storage> = store;
+            let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> = locked;
+            for ordinal in 0..40 {
+                deliver_interrupt_eligible(&inbox, &ql_envelope(&session.id, ordinal, Some(7000)))
+                    .await;
+            }
+            let config = crate::runtime::config::AgentLoopConfig {
+                storage: Some(storage.clone()),
+                persistence: Some(persistence),
+                session_inbox: Some(inbox.clone()),
+                prompt_memory_flags: crate::runtime::config::PromptMemoryFlags {
+                    project_prompt_injection: false,
+                    relevant_recall: false,
+                    relevant_recall_rerank: false,
+                    project_first_dream: false,
+                    ledger_agenda: false,
+                },
+                ..Default::default()
+            };
+            let mut runtime = AgentRuntimeState::new("actual-parity-run");
+            let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let memory = if rich {
+                let (memory, observation) =
+                    crate::runtime::runner::round_prelude::refresh_round_boundary_with_observation(
+                        &mut session,
+                        &mut runtime,
+                        &config,
+                        Some(&tx),
+                        &cancel,
+                        None,
+                        None,
+                        "actual-parity-run",
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    observation.is_unavailable(),
+                    "whole overflow changes only optional data"
+                );
+                memory
+            } else {
+                crate::runtime::runner::round_prelude::refresh_round_boundary_and_prompt_context(
+                    &mut session,
+                    &mut runtime,
+                    &config,
+                    Some(&tx),
+                    &cancel,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+            };
+            let provider = AckBoundaryProvider(AtomicUsize::new(0));
+            let stream = bamboo_llm::LLMProvider::chat_stream(
+                &provider,
+                &session.messages,
+                &[],
+                None,
+                "model",
+            )
+            .await
+            .unwrap();
+            drop(stream);
+            assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                events.push(serde_json::to_value(event).unwrap());
+            }
+            assert_eq!(
+                events.len(),
+                40,
+                "all original committed prefix events remain visible"
+            );
+            for ordinal in 0..40 {
+                assert!(inbox
+                    .was_admitted(
+                        &session.id,
+                        &SessionMessageId::parse(format!("ql-{ordinal}")).unwrap()
+                    )
+                    .await
+                    .unwrap());
+            }
+            let cold = storage.load_session(&session.id).await.unwrap().unwrap();
+            assert_eq!(
+                cold.messages
+                    .iter()
+                    .filter(|m| m.id.starts_with("ql-"))
+                    .count(),
+                40
+            );
+            let backlog = inbox.inspect(&session.id).await.unwrap();
+            assert_eq!(backlog.pending + backlog.claimed, 0);
+            snapshots.push((
+                memory,
+                serde_json::to_value(&session.messages).unwrap(),
+                events,
+                runtime.effective_permission_mode(),
+                session.metadata.clone(),
+            ));
+        }
+        assert_eq!(
+            snapshots[0], snapshots[1],
+            "provider input, memory refresh, events and posture remain identical"
+        );
+    }
+
     fn ql_envelope(id: &str, ordinal: usize, bytes: Option<usize>) -> SessionMessageEnvelope {
         let mut envelope = SessionMessageEnvelope::user_input(id, "unchanged provider text");
         envelope.id = SessionMessageId::parse(format!("ql-{ordinal}")).unwrap();
@@ -1456,6 +1575,7 @@ mod tests {
                     SessionMessageBody::RuntimeInstruction(body) => {
                         body.content.as_ref().unwrap().skill_request.as_ref()
                     }
+                    SessionMessageBody::ChildOutcome(_) => None,
                 };
                 let records = [BorrowedInputRequestRecord {
                     input_id: envelope.id.as_str(),
@@ -1646,13 +1766,14 @@ mod tests {
             .any(|m| m.id == envelope.id.as_str()));
         assert!(!inbox.was_admitted(&session.id, &envelope.id).await.unwrap());
         faulted.fail_checkpoint.store(false, Ordering::SeqCst);
+        session = storage.load_session(&session.id).await.unwrap().unwrap();
         let (refresh, observation) = refresh_turn_boundary_with_observation(
             &mut session,
             Some(&storage),
             Some(&persistence),
             Some(&inbox),
             None,
-            "e",
+            "actual-cold-retry",
         )
         .await;
         assert_eq!(refresh.merged, 1);
@@ -1666,7 +1787,7 @@ mod tests {
             Some(&persistence),
             Some(&inbox),
             None,
-            "e",
+            "actual-cold-retry",
         )
         .await;
         assert!(observation.is_successful_no_new_input());
@@ -1763,7 +1884,11 @@ mod tests {
             assert!(refresh.admission_error.is_none());
             assert_eq!(refresh.merged, usize::from(!recovered));
             assert_eq!(observation.is_successful_no_new_input(), recovered);
-            if let Some(batch) = observation.new_inputs() {
+            if !recovered {
+                let batch = observation
+                    .new_inputs()
+                    .expect("actual owned Root New must project");
+                assert_eq!(batch.records().len(), 1);
                 let record = &batch.records()[0];
                 assert_eq!(record.input_id, envelope.id.as_str());
                 assert_eq!(

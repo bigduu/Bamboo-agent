@@ -2,6 +2,95 @@ use super::request::{optional_non_empty, resolve_model, resolve_session_id};
 use super::sync_runtime_workspace;
 use bamboo_agent_core::Session;
 
+#[actix_web::test]
+async fn ql_http_existing_queue_fit_or_overflow_keeps_prefix_events_and_pending_handoff() {
+    use actix_web::{test, web};
+    for overflow in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let state = web::Data::new(crate::AppState::new(home.path().into()).await.unwrap());
+        let id = "ql-http-queued";
+        let session = Session::new(id, "test-model");
+        state.storage.save_session(&session).await.unwrap();
+        let http = test::TestRequest::post()
+            .peer_addr("127.0.0.1:5700".parse().unwrap())
+            .to_http_request();
+        let count = if overflow { 40 } else { 2 };
+        for ordinal in 0..count {
+            let request = serde_json::from_value::<super::ChatRequest>(serde_json::json!({
+                "session_id":id,"message":"actual queued text","message_id":format!("ql-http-{ordinal}"),
+                "workflow_selection":{"id":"exact-request","source":"user","revision":7,
+                    "args":{"payload":"x".repeat(if overflow { 7000 } else { 9 })}}
+            })).unwrap();
+            super::ingress::queue(&state, &session, &request, "actual queued text", &http)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let mut latest = state.storage.load_session(id).await.unwrap().unwrap();
+        latest.metadata.insert(
+            "chat.queued_ingress.v1".into(),
+            format!("ql-http-{}", count - 1),
+        );
+        state.storage.save_session(&latest).await.unwrap();
+        let mut feed = state.account_sink.subscribe();
+        let carrier = super::ingress::admit_for_execute(&state, id).await.unwrap();
+        assert_eq!(
+            carrier.is_none(),
+            overflow,
+            "optional overflow never becomes an admission error"
+        );
+        if let Some(carrier) = carrier {
+            assert_eq!(carrier.observations().len(), 2);
+            assert_eq!(carrier.observations()[0].input_id(), "ql-http-0");
+            assert_eq!(carrier.observations()[1].input_id(), "ql-http-1");
+            assert_eq!(
+                carrier.observations()[0].request().unwrap().selections[0].revision,
+                7
+            );
+        }
+        let mut ids = Vec::new();
+        while let Ok(change) = feed.try_recv() {
+            if let bamboo_agent_core::AgentEvent::MessageAppended { message_id, .. } = change.event
+            {
+                ids.push(message_id);
+            }
+        }
+        assert_eq!(
+            ids,
+            (0..count)
+                .map(|i| format!("ql-http-{i}"))
+                .collect::<Vec<_>>()
+        );
+        let cold = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(!cold.metadata.contains_key("chat.queued_ingress.v1"));
+        assert_eq!(
+            cold.messages
+                .iter()
+                .filter(|m| m.id.starts_with("ql-http-"))
+                .count(),
+            count
+        );
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 0);
+        for ordinal in 0..count {
+            assert!(state
+                .session_inbox
+                .was_admitted(
+                    id,
+                    &bamboo_domain::SessionMessageId::parse(format!("ql-http-{ordinal}")).unwrap()
+                )
+                .await
+                .unwrap());
+        }
+        assert!(
+            super::ingress::admit_for_execute(&state, id)
+                .await
+                .unwrap()
+                .is_none(),
+            "recovery/history cannot remint current data"
+        );
+    }
+}
+
 use bamboo_engine::session_app::chat::{
     clear_skill_runtime_state, resolve_base_prompt, resolve_enhance_prompt,
     resolve_selected_skill_ids, resolve_workspace_path,
