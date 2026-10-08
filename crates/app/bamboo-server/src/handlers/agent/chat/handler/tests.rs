@@ -4808,6 +4808,9 @@ async fn native_http_rejects_semantic_empty_and_complete_utf8_oversize_without_u
         let home = tempfile::tempdir().unwrap();
         let state = web::Data::new(crate::AppState::new(home.path().into()).await.unwrap());
         let mut original = Session::new(id, "test-model");
+        original.add_message(bamboo_agent_core::Message::user(
+            "older canonical User bytes",
+        ));
         original.set_last_run_status("error");
         original.set_last_run_error("older failure");
         state.storage.save_session(&original).await.unwrap();
@@ -4833,8 +4836,15 @@ async fn native_http_rejects_semantic_empty_and_complete_utf8_oversize_without_u
         assert!(body.get("message_id").is_none());
         let cold = state.storage.load_session(id).await.unwrap().unwrap();
         assert_eq!(
-            serde_json::to_value(&cold.messages).unwrap(),
-            serde_json::to_value(&original.messages).unwrap()
+            serde_json::to_value(
+                cold.messages
+                    .iter()
+                    .filter(|m| m.role != bamboo_agent_core::Role::System)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap(),
+            serde_json::to_value(&original.messages).unwrap(),
+            "real config may save System, but failed Native adds no User or rewrites history"
         );
         assert_eq!(cold.last_run_status(), original.last_run_status());
         assert_eq!(cold.last_run_error(), original.last_run_error());
@@ -4844,6 +4854,9 @@ async fn native_http_rejects_semantic_empty_and_complete_utf8_oversize_without_u
         let backlog = state.session_inbox.inspect(id).await.unwrap();
         assert_eq!(backlog.pending + backlog.claimed, 0);
         assert!(!backlog.activation_pending());
+        let no_new = state.admit_chat_for_execute(id).await.unwrap();
+        assert!(no_new.inputs.is_none());
+        assert!(!no_new.generate_title);
         assert!(feed.try_recv().is_err());
     }
 }

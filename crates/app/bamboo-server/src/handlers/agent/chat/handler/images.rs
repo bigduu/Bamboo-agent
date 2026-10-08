@@ -158,6 +158,78 @@ mod tests {
             original,
             "partial attachment failure adds no canonical input"
         );
+        invalid.images.as_mut().unwrap()[8].base64 = png.into();
+        invalid.session_id = Some(session.id.clone());
+        invalid.model = Some("test-model".into());
+        let response = super::super::handler(
+            state.clone(),
+            actix_web::test::TestRequest::post().to_http_request(),
+            web::Json(invalid),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::CREATED);
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let input = receipt["message_id"].as_str().unwrap();
+        assert!(!state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.id == input));
+        let claims = state.session_inbox.claim(&session.id, 128).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].envelope.id.as_str(), input);
+        let delivered = claims[0].envelope.to_provider_message().unwrap();
+        let parts = delivered.content_parts.as_ref().unwrap();
+        assert_eq!(parts.len(), 18);
+        assert_eq!(
+            parts
+                .iter()
+                .filter_map(|p| match p {
+                    bamboo_domain::MessagePart::ImageUrl { image_url } => Some(&image_url.url),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            17
+        );
+        let consumed = state.admit_chat_for_execute(&session.id).await.unwrap();
+        assert_eq!(consumed.inputs.unwrap().observations()[0].input_id(), input);
+        let cold = state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cold.messages.iter().filter(|m| m.id == input).count(), 1);
+        let canonical = cold.messages.iter().find(|m| m.id == input).unwrap();
+        assert!(bamboo_domain::is_matching_session_message(
+            canonical,
+            &claims[0].envelope
+        ));
+        assert_eq!(canonical.content_parts.as_ref().unwrap().len(), 18);
+        assert!(state
+            .session_inbox
+            .was_admitted(&session.id, &claims[0].envelope.id)
+            .await
+            .unwrap());
+        assert_eq!(
+            state
+                .session_inbox
+                .inspect(&session.id)
+                .await
+                .unwrap()
+                .pending,
+            0
+        );
     }
 
     #[actix_web::test]

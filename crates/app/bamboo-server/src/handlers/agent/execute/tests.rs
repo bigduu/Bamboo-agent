@@ -654,30 +654,108 @@ mod execution_input_http {
     }
     #[actix_web::test]
     async fn execution_input_http_startup_rejection_drops_current_data_and_successor_is_separate() {
-        let (_home, state, _fault) = state(None).await;
-        let id = "execution-input-http-reject";
-        bootstrap(&state, id).await;
-        chat(&state, id, Some("rejected-current-a")).await;
-        input_taps().lock().unwrap().insert(id.into(), Vec::new());
-        let (status, _body) = execute(&state, id, Some("unavailable-explicit-provider")).await;
-        assert!(status.is_client_error() || status.is_server_error());
-        assert!(
-            input_taps().lock().unwrap().remove(id).unwrap().is_empty(),
-            "failed startup has no execution handoff"
-        );
-        assert!(crate::handlers::agent::chat::admit_for_execute(&state, id)
-            .await
-            .unwrap()
-            .is_none());
-        chat(&state, id, Some("rejection-successor-b")).await;
-        only_id(
-            &crate::handlers::agent::chat::admit_for_execute(&state, id)
+        for (native, reason) in [
+            (false, "provider"),
+            (true, "provider"),
+            (true, "model"),
+            (true, "image"),
+            (true, "sync"),
+        ] {
+            let (_home, state, _fault) = state(None).await;
+            let id = format!("execution-input-http-reject-{native}-{reason}");
+            if !native {
+                bootstrap(&state, &id).await;
+            }
+            let receipt = chat(
+                &state,
+                &id,
+                if native {
+                    None
+                } else {
+                    Some("rejected-current-a")
+                },
+            )
+            .await;
+            let rejected = receipt["message_id"].as_str().unwrap().to_owned();
+            if reason == "image" {
+                let mut config = state.config.write().await;
+                config.hooks.image_fallback.enabled = true;
+                config.hooks.image_fallback.mode = "invalid-existing-mode".into();
+            } else if reason == "model" {
+                state
+                    .config
+                    .write()
+                    .await
+                    .providers_mut()
+                    .openai
+                    .as_mut()
+                    .unwrap()
+                    .model = None;
+                let mut canonical = state.storage.load_session(&id).await.unwrap().unwrap();
+                canonical.model.clear();
+                state.save_and_cache_session(&mut canonical).await;
+            }
+            input_taps().lock().unwrap().insert(id.clone(), Vec::new());
+            let request = serde_json::from_value::<ExecuteRequest>(serde_json::json!({
+                "provider": (reason == "provider").then_some("unavailable-explicit-provider"),
+                "client_sync": (reason == "sync").then(|| serde_json::json!({"client_message_count":0,"client_has_pending_question":false}))
+            })).unwrap();
+            let response = super::super::handler::handler(
+                state.clone(),
+                test::TestRequest::post().to_http_request(),
+                web::Path::from(id.clone()),
+                web::Json(request),
+            )
+            .await;
+            let status = response.status();
+            let body: serde_json::Value = serde_json::from_slice(
+                &actix_web::body::to_bytes(response.into_body())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            if reason == "sync" {
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["sync"]["need_sync"], true);
+            } else {
+                assert!(
+                    status.is_client_error() || status.is_server_error(),
+                    "{reason}: {body}"
+                );
+            }
+            assert!(
+                input_taps().lock().unwrap().remove(&id).unwrap().is_empty(),
+                "failed startup has no execution handoff"
+            );
+            assert!(!state.agent_runners.read().await.contains_key(&id));
+            assert!(state
+                .session_inbox
+                .was_admitted(&id, &SessionMessageId::parse(rejected).unwrap())
                 .await
-                .unwrap()
-                .unwrap(),
-            "rejection-successor-b",
-        );
+                .unwrap());
+            let no_new = state.admit_chat_for_execute(&id).await.unwrap();
+            assert!(no_new.inputs.is_none());
+            assert!(!no_new.generate_title);
+            let successor = chat(
+                &state,
+                &id,
+                if native {
+                    None
+                } else {
+                    Some("rejection-successor-b")
+                },
+            )
+            .await;
+            only_id(
+                &crate::handlers::agent::chat::admit_for_execute(&state, &id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                successor["message_id"].as_str().unwrap(),
+            );
+        }
     }
+
     struct RunningProvider {
         calls: std::sync::atomic::AtomicUsize,
         started: tokio::sync::Semaphore,
@@ -853,5 +931,96 @@ mod execution_input_http {
         let no_new = state.admit_chat_for_execute(id).await.unwrap();
         assert!(no_new.inputs.is_none());
         assert!(!no_new.generate_title);
+    }
+
+    #[actix_web::test]
+    async fn native_pending_reservation_keeps_input_for_original_owner_release() {
+        use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
+        let (_home, state, _fault) = state(None).await;
+        let id = "native-pending-reservation";
+        state
+            .storage
+            .save_session(&bamboo_agent_core::Session::new(id, "test-model"))
+            .await
+            .unwrap();
+        let sender = state.get_session_event_sender(id).await;
+        let reservation = match reserve_session_execution(
+            &state.agent,
+            &state.agent_runners,
+            &state.session_event_senders,
+            id,
+            &sender,
+        )
+        .await
+        {
+            SessionExecutionReserveOutcome::Reserved(r) => r,
+            _ => panic!("original idle reservation"),
+        };
+        let run = reservation.run_id().to_owned();
+        let request = serde_json::from_value::<crate::handlers::agent::chat::ChatRequest>(serde_json::json!({"session_id":id,"message":"Native during actual Pending","model":"test-model"})).unwrap();
+        let response = crate::handlers::agent::chat::handler(
+            state.clone(),
+            test::TestRequest::post().to_http_request(),
+            web::Json(request),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let input = receipt["message_id"].as_str().unwrap();
+        assert!(state
+            .agent_runners
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|r| r.run_id == run && matches!(r.status, AgentStatus::Pending)));
+        let blocked = state.admit_chat_for_execute(id).await.unwrap();
+        assert!(blocked.inputs.is_none());
+        assert!(!blocked.generate_title);
+        let (status, body) = execute(&state, id, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "already_running");
+        assert!(state
+            .agent_runners
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|r| r.run_id == run));
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+        assert!(!state
+            .storage
+            .load_session(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.id == input));
+        reservation.abandon().await;
+        let admitted = state.admit_chat_for_execute(id).await.unwrap();
+        assert_eq!(admitted.inputs.unwrap().observations()[0].input_id(), input);
+        assert!(state
+            .session_inbox
+            .was_admitted(id, &SessionMessageId::parse(input).unwrap())
+            .await
+            .unwrap());
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 0);
+        assert_eq!(
+            state
+                .storage
+                .load_session(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .messages
+                .iter()
+                .filter(|m| m.id == input)
+                .count(),
+            1
+        );
     }
 }
