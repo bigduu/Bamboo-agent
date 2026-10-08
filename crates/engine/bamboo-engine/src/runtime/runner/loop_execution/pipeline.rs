@@ -4150,6 +4150,7 @@ mod tests {
                 persistence: Some(persistence),
                 session_inbox: Some(inbox.clone()),
                 skip_initial_user_message: true,
+                model_name: Some("model".into()),
                 run_budget: bamboo_config::RunBudgetConfig {
                     max_rounds: Some(2),
                     ..Default::default()
