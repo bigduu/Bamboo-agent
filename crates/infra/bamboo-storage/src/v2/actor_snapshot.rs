@@ -195,6 +195,8 @@ mod supported {
         #[serde(default)]
         parent_session_id: Option<String>,
         #[serde(default)]
+        parent_created_at: Option<DateTime<Utc>>,
+        #[serde(default)]
         root_session_id: String,
         #[serde(default)]
         spawn_depth: u32,
@@ -224,6 +226,7 @@ mod supported {
             session.metadata_version = self.metadata_version;
             session.kind = self.kind;
             session.parent_session_id = self.parent_session_id;
+            session.parent_created_at = self.parent_created_at;
             session.root_session_id = self.root_session_id;
             session.spawn_depth = self.spawn_depth;
             session.authority_identity = self.authority_identity;
@@ -299,6 +302,7 @@ mod supported {
                 || side.created_at != main.created_at
                 || side.kind != main.kind
                 || side.parent_session_id != main.parent_session_id
+                || side.parent_created_at != main.parent_created_at
                 || side.root_session_id != main.root_session_id
                 || side.spawn_depth != main.spawn_depth
                 || side.metadata_version < main.metadata_version
@@ -384,6 +388,13 @@ mod supported {
                 || parent.session.project_id_meta() != current.session.project_id_meta()
             {
                 return Err(Error::InconsistentAuthority);
+            }
+            if current
+                .session
+                .parent_created_at
+                .is_some_and(|birth| birth != parent.session.created_at)
+            {
+                return Err(Error::StaleAuthority);
             }
             chain.push(parent);
             current = parent;

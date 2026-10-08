@@ -1460,6 +1460,7 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     copy.id = new_id.to_string();
     copy.kind = SessionKind::Root;
     copy.parent_session_id = None;
+    copy.parent_created_at = None;
     copy.root_session_id = new_id.to_string();
     copy.spawn_depth = 0;
     copy.title = format!("{} (copy)", source.title.trim_end());
@@ -2086,6 +2087,7 @@ impl SessionStoreV2 {
                     || sidecar.kind != main.kind
                     || sidecar.root_session_id != main.root_session_id
                     || sidecar.parent_session_id != main.parent_session_id
+                    || sidecar.parent_created_at != main.parent_created_at
                     || sidecar.spawn_depth != main.spawn_depth
                     || sidecar.created_at != main.created_at
                 {
@@ -3354,7 +3356,9 @@ impl SessionStoreV2 {
                 ),
             ));
         };
-        if main.parent_session_id != current.parent_session_id {
+        if main.parent_session_id != current.parent_session_id
+            || main.parent_created_at != current.parent_created_at
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -3390,7 +3394,9 @@ impl SessionStoreV2 {
                 main.kind,
                 &main.root_session_id,
             )?;
-            if sidecar.parent_session_id != main.parent_session_id {
+            if sidecar.parent_session_id != main.parent_session_id
+                || sidecar.parent_created_at != main.parent_created_at
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("runtime Task recovery parent identity mismatch for {session_id}"),
@@ -7001,7 +7007,7 @@ mod tests {
         root.set_task_list_version_meta("1");
         storage.save_session(&root).await?;
 
-        let mut child = Session::new_child(child_id, root_id, "model", "child");
+        let mut child = Session::new_child_of(child_id, &root, "model", "child");
         child.add_message(Message::user("child transcript secret"));
         child.metadata.insert(
             "unrelated.child".to_string(),
