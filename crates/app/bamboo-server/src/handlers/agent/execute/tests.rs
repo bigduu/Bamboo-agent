@@ -371,7 +371,7 @@ mod execution_input_http {
         chat(&state, id, Some("ready-current-user")).await;
         input_taps().lock().unwrap().insert(id.into(), Vec::new());
         let (status, body) = execute(&state, id, None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
         assert_eq!(body["status"], "started", "{body}");
         let observed = input_taps().lock().unwrap().remove(id).unwrap();
         assert_eq!(observed.len(), 1, "one actual Ready/spawn handoff");
