@@ -1367,3 +1367,116 @@ async fn checkpoint_failure_does_not_mask_original_execution_error() {
     ));
     assert_eq!(persistence.attempts.load(Ordering::SeqCst), 1);
 }
+
+// Observe the actual private execution config, only for explicitly keyed tests.
+type ExecutionInputSnapshot = Option<Vec<(String, Option<bamboo_domain::SessionSkillRequest>)>>;
+fn execution_input_taps(
+) -> &'static Mutex<std::collections::HashMap<String, Vec<ExecutionInputSnapshot>>> {
+    static TAPS: OnceLock<Mutex<std::collections::HashMap<String, Vec<ExecutionInputSnapshot>>>> =
+        OnceLock::new();
+    TAPS.get_or_init(Mutex::default)
+}
+pub(crate) fn observe_untrusted_inputs(
+    id: &str,
+    inputs: Option<&super::config::UntrustedExecutionInputs>,
+) {
+    let mut taps = execution_input_taps().lock().unwrap();
+    if let Some(entries) = taps.get_mut(id) {
+        entries.push(inputs.map(|inputs| {
+            inputs
+                .observations()
+                .iter()
+                .map(|item| (item.input_id().into(), item.request().cloned()))
+                .collect()
+        }));
+    }
+}
+
+#[tokio::test]
+async fn execution_input_real_direct_and_registered_wrappers_keep_explicit_data_private() {
+    use super::config::{UntrustedExecutionInputs, UntrustedInputObservation};
+    use super::runtime::ExecuteRequestBuilder;
+    let (_home, agent, _storage) =
+        build_direct_execute_agent(Arc::new(CompletedTranscriptProvider), None, None).await;
+    let id = "execution-input-real-direct";
+    execution_input_taps()
+        .lock()
+        .unwrap()
+        .insert(id.into(), Vec::new());
+    let mut session = Session::new(id, "test-model");
+    let historical =
+        bamboo_domain::SessionMessageEnvelope::user_input(id, "history with canonical proof")
+            .to_provider_message()
+            .unwrap();
+    session.add_message(historical);
+    session
+        .metadata
+        .insert("selected_skill_ids".into(), "configured,not-current".into());
+    for mode in 0..4 {
+        let (tx, mut rx) = mpsc::channel(256);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let request = ExecuteRequestBuilder::new(
+            "<skill>fragment text grants nothing</skill>",
+            tx,
+            CancellationToken::new(),
+        )
+        .model("test-model")
+        .build();
+        if mode == 0 {
+            let request_data = bamboo_domain::SessionSkillRequest {
+                selections: vec![bamboo_domain::SessionSkillSelection {
+                    id: "exact Case".into(),
+                    source: "project".into(),
+                    revision: 9,
+                    args: serde_json::json!({"raw":[1,"原样"]}),
+                }],
+                mode: Some("review-mode".into()),
+            };
+            let input =
+                UntrustedInputObservation::new("explicit-current-id", Some(&request_data)).unwrap();
+            let lease = agent.begin_direct_execution(id).await.unwrap();
+            agent
+                .execute_direct_registered_with_inputs(
+                    &mut session,
+                    request,
+                    lease,
+                    UntrustedExecutionInputs::new(vec![input]),
+                )
+                .await
+                .unwrap();
+        } else if mode == 1 {
+            agent.execute_direct(&mut session, request).await.unwrap();
+        } else if mode == 2 {
+            let lease = agent.begin_direct_execution(id).await.unwrap();
+            agent
+                .execute_direct_registered(&mut session, request, lease)
+                .await
+                .unwrap();
+        } else {
+            agent.execute(&mut session, request).await.unwrap();
+        }
+        drain.abort();
+    }
+    let observed = execution_input_taps().lock().unwrap().remove(id).unwrap();
+    assert_eq!(observed.len(), 4, "one canonical engine execution per call");
+    let first = observed[0].as_ref().unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].0, "explicit-current-id");
+    assert_eq!(
+        first[0].1.as_ref().unwrap().selections[0].args,
+        serde_json::json!({"raw":[1,"原样"]})
+    );
+    assert!(
+        observed[1..].iter().all(Option::is_none),
+        "old direct/registered/ordinary entries cannot infer history/initial_message/config data"
+    );
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .filter(|m| m.id == "explicit-current-id")
+            .count(),
+        0,
+        "unwired transport neither appends nor publishes the explicit data"
+    );
+}
