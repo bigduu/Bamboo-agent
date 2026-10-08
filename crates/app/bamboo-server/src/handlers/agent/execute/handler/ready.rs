@@ -19,8 +19,7 @@ use super::response::{
 };
 use crate::app_state::AppState;
 use crate::handlers::agent::execute::runtime::{
-    reserve_runner, spawn_agent_execution, spawn_event_forwarder_with_root_actor,
-    RunnerReservation, SpawnAgentExecution,
+    reserve_runner, spawn_event_forwarder_with_root_actor, RunnerReservation, SpawnAgentExecution,
 };
 use bamboo_engine::model_areas::resolve_global_area_models;
 use bamboo_engine::model_config_helper::{
@@ -37,6 +36,7 @@ pub(super) struct ReadyExecution<'a> {
     pub startup_guard: &'a mut crate::handlers::agent::events::ExecuteStartupGuard,
     /// Durable message id owned by the pending execute handoff, if any.
     pub startup_turn_id: Option<String>,
+    pub untrusted_inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
     pub effective_model: String,
     pub effective_reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
     pub model_source: &'static str,
@@ -259,7 +259,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         resolved_provider_type,
         areas,
     );
-    spawn_agent_execution(SpawnAgentExecution {
+    SpawnAgentExecution {
         state: state.clone(),
         session_id: session_id.to_string(),
         session,
@@ -278,7 +278,8 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         gold_config,
         app_data_dir: Some(state.app_data_dir.clone()),
         run_budget: ready.run_budget,
-    });
+    }
+    .spawn_with_inputs(ready.untrusted_inputs);
 
     started_response(session_id, sync_info, run_id)
 }

@@ -17,7 +17,7 @@ const {
 
 const ROOT = path.resolve(__dirname, "..");
 const LOTUS_NEXT_PACKAGE_NAME = "@bigduu/lotus-next";
-const LOTUS_NEXT_VERSION = "2026.9.22";
+const LOTUS_NEXT_VERSION = "2026.10.8";
 
 test("defaults releases and tag events to the exact locked Lotus Next artifact", () => {
   assert.deepEqual(resolveReleaseFrontend(), {
@@ -181,4 +181,37 @@ test("crate and Docker publishers share the fail-closed resolver contract", () =
     ci.match(/scripts\/release-frontend-policy\.test\.cjs/g)?.length,
     2,
   );
+});
+
+test("crate publication rejects a moved, mismatched or dirty source before package work", (t) => {
+  const workflow = fs.readFileSync(path.join(ROOT, ".github/workflows/publish-crate.yml"), "utf8");
+  const guardName = "- name: Require the exact accepted publication source";
+  assert.ok(workflow.indexOf(guardName) < workflow.indexOf("- name: Setup Node.js"));
+  const match = workflow.match(/- name: Require the exact accepted publication source\n[\s\S]*?        run: \|\n([\s\S]*?)(?=\n      - name: Setup Node.js)/);
+  assert.ok(match, "The first publication guard must be executable before dependency or package work");
+  const guard = match[1].split("\n").map((line) => line.replace(/^          /, "")).join("\n");
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-publication-source-guard-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const git = (args) => {
+    const result = spawnSync("git", args, { cwd: directory, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  git(["init", "--quiet"]);
+  fs.writeFileSync(path.join(directory, "source.txt"), "accepted test fixture\n");
+  git(["add", "source.txt"]);
+  git(["-c", "user.name=release-guard-test", "-c", "user.email=release-guard-test@example.invalid", "commit", "--quiet", "-m", "source guard fixture"]);
+  const head = git(["rev-parse", "HEAD"]);
+  const check = (expected, workflowSha) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", guard], {
+    cwd: directory, encoding: "utf8", env: { ...process.env, EXPECTED_SOURCE_SHA: expected, GITHUB_SHA: workflowSha },
+  });
+  assert.equal(check(head, head).status, 0, "Exact clean source is admitted");
+  for (const [expected, workflowSha] of [["0".repeat(40), head], [head, "1".repeat(40)], ["HEAD", head], [head + "\npoison=true", head]]) {
+    assert.notEqual(check(expected, workflowSha).status, 0, "Unaccepted source or input must fail closed");
+  }
+  fs.writeFileSync(path.join(directory, "source.txt"), "changed source\n");
+  assert.notEqual(check(head, head).status, 0, "Tracked source changes must fail");
+  git(["checkout", "--", "source.txt"]);
+  fs.writeFileSync(path.join(directory, "extra.txt"), "untracked source\n");
+  assert.notEqual(check(head, head).status, 0, "Untracked source changes must fail");
 });

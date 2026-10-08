@@ -333,6 +333,22 @@ request shape and size; they do not guarantee admission under the existing
 whole-envelope Inbox limit. Guidance, peer messages and child/runtime
 presentation cannot turn this data into a fresh User request.
 
+Execution wrappers can carry a separately owned `UntrustedExecutionInputs`
+parameter into the execution-private config. HTTP checked queue admission
+supplies only this call's newly committed User IDs after ACK succeeds; SDK
+`run`, `run_with_cancel`, `run_stream` and `run_stream_cancellable` supply the
+exact User each just appended, with no request derived from its text.
+Old session/resume/custom execute/spawn entrypoints default to `None`.
+The public `SessionExecutionArgs`, `ExecuteRequest` and Server spawn argument
+layouts remain unchanged. At most 128 ID/request records are retained, each
+request bounded by the existing I-W rules; this transport is separate from the
+later aggregate projection cap and does not classify inputs as current.
+Admission/startup failure drops the local data; transcript recovery cannot
+mint it again. No message/images, Skill bodies or Source authority objects
+are retained. This remains unwired caller data, without preparation, Reader
+registration, resource reads, grants or a live Skill cutover. Native nonqueued
+Chat still requires its own accepted fresh handoff; history cannot supply it.
+
 A separate unwired Engine helper can project borrowed request records into one
 bounded, untrusted batch. It checks all original I-W request data, then charges
 one private compact view including exact session/execution/input IDs, canonical

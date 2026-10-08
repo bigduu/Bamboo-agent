@@ -1,0 +1,127 @@
+name: Frontend consumer acceptance
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [dev]
+    paths:
+      - ".github/workflows/frontend-acceptance.yml"
+      - "scripts/frontend-package-lock.json"
+      - "scripts/release-frontend-policy.test.cjs"
+      - "crates/app/bamboo-server/frontend_package/**"
+      - "crates/app/bamboo-server/src/services/frontend_package.rs"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Original release Clippy and frontend policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Require the exact clean candidate source
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+
+      - name: Verify exact committed frontend and release policies
+        run: |
+          node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
+          node scripts/frontend-package.cjs verify
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-lint-${{ runner.os }}
+          save-if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'dev') }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: |
+          cargo clippy --all-features -- \
+            -D warnings \
+            -A deprecated \
+            -A clippy::module_inception \
+            -A clippy::incompatible_msrv \
+            -A clippy::needless_borrows_for_generic_args \
+            -A clippy::too-many-arguments \
+            -A clippy::while-let-loop \
+            -A clippy::type_complexity \
+            -A dead-code
+
+      - name: Require source files to remain unchanged
+        run: git diff --exit-code
+
+  test:
+    name: Original release Test on frozen consumer source
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Require the exact clean candidate source
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+
+      - name: Test original CI policy
+        run: node --test scripts/ci-policy.test.cjs
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-test-${{ runner.os }}
+          save-if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'dev') }}
+
+      - name: Build locked Rust workspace
+        run: cargo build --locked
+
+      - name: Compile locked Rust test targets
+        timeout-minutes: 15
+        run: cargo test --locked --no-run
+        env:
+          RUST_MIN_STACK: "8388608"
+
+      - name: Test locked Rust workspace
+        timeout-minutes: 30
+        run: cargo test --locked
+        env:
+          RUST_MIN_STACK: "8388608"
+
+      - name: Require source files to remain unchanged
+        run: git diff --exit-code
