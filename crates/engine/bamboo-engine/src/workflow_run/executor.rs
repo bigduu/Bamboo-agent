@@ -1226,6 +1226,28 @@ impl RunContext {
                     }
                     Ok(Value::Array(output))
                 }
+                WorkflowPlan::Choice {
+                    condition,
+                    then_branch,
+                    else_branch,
+                } => {
+                    let condition = self.resolve_ref(condition).await?;
+                    let selected = condition.as_bool().ok_or_else(|| {
+                        failure(
+                            WorkflowFailureCode::InvalidInput,
+                            "choice condition must be a boolean",
+                            false,
+                        )
+                    })?;
+                    let (chosen, unchosen, branch) = if selected {
+                        (then_branch, else_branch, "then")
+                    } else {
+                        (else_branch, then_branch, "else")
+                    };
+                    self.skip_plan(unchosen, "conditional branch not selected")
+                        .await?;
+                    self.execute_node(chosen, &format!("{path}.{branch}")).await
+                }
                 WorkflowPlan::Map { source, item, body } => {
                     let source = self.resolve_ref(source).await?;
                     let values = source.as_array().ok_or_else(|| {
@@ -2089,42 +2111,63 @@ impl RunContext {
                     } else {
                         format!("{step}@{}", self.scope)
                     };
-                    let reason_owned = reason.to_string();
-                    let state_id = instance_id.clone();
-                    self.step_transition(
-                        &instance_id,
-                        WorkflowRunEventKind::StepSkipped {
-                            reason: reason.to_string(),
-                        },
-                        move |snapshot| {
-                            let state = snapshot.steps.entry(state_id.clone()).or_insert(
-                                WorkflowStepSnapshot {
-                                    id: state_id,
-                                    status: WorkflowStepStatus::Skipped,
-                                    input_hash: String::new(),
-                                    output: None,
-                                    failure: Some(failure(
-                                        WorkflowFailureCode::DependencySkipped,
-                                        reason_owned.clone(),
-                                        false,
-                                    )),
-                                    attempts: 0,
-                                },
-                            );
-                            state.status = WorkflowStepStatus::Skipped;
-                            state.failure = Some(failure(
-                                WorkflowFailureCode::DependencySkipped,
-                                reason_owned,
-                                false,
-                            ));
-                        },
-                    )
-                    .await?;
+                    // A previous Retry attempt may have materialized Map items
+                    // in this branch. Close only instances in the current scope.
+                    let mut instances = {
+                        let snapshot = self.snapshot.lock().await;
+                        snapshot
+                            .steps
+                            .keys()
+                            .filter(|id| instance_is_in_scope(id, step, &self.scope))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    };
+                    if instances.is_empty() {
+                        instances.push(instance_id);
+                    }
+                    for instance_id in instances {
+                        let reason_owned = reason.to_string();
+                        let state_id = instance_id.clone();
+                        self.step_transition(
+                            &instance_id,
+                            WorkflowRunEventKind::StepSkipped {
+                                reason: reason.to_string(),
+                            },
+                            move |snapshot| {
+                                let state = snapshot.steps.entry(state_id.clone()).or_insert(
+                                    WorkflowStepSnapshot {
+                                        id: state_id,
+                                        status: WorkflowStepStatus::Skipped,
+                                        input_hash: String::new(),
+                                        output: None,
+                                        failure: None,
+                                        attempts: 0,
+                                    },
+                                );
+                                state.status = WorkflowStepStatus::Skipped;
+                                state.output = None;
+                                state.failure = Some(failure(
+                                    WorkflowFailureCode::DependencySkipped,
+                                    reason_owned,
+                                    false,
+                                ));
+                            },
+                        )
+                        .await?;
+                    }
                 }
                 WorkflowPlan::Sequence { nodes } | WorkflowPlan::Parallel { nodes } => {
                     for node in nodes {
                         self.skip_plan(node, reason).await?;
                     }
+                }
+                WorkflowPlan::Choice {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    self.skip_plan(then_branch, reason).await?;
+                    self.skip_plan(else_branch, reason).await?;
                 }
                 WorkflowPlan::Map { body, .. } | WorkflowPlan::Retry { node: body, .. } => {
                     self.skip_plan(body, reason).await?;
@@ -2431,6 +2474,11 @@ fn plan_leaf_count(plan: &WorkflowPlan) -> usize {
                 total.saturating_add(plan_leaf_count(node))
             })
         }
+        WorkflowPlan::Choice {
+            then_branch,
+            else_branch,
+            ..
+        } => plan_leaf_count(then_branch).max(plan_leaf_count(else_branch)),
         WorkflowPlan::Map { body, .. } | WorkflowPlan::Retry { node: body, .. } => {
             plan_leaf_count(body)
         }
@@ -2442,6 +2490,15 @@ fn plan_step_ids(plan: &WorkflowPlan) -> Vec<String> {
         WorkflowPlan::Step { step } => vec![step.clone()],
         WorkflowPlan::Sequence { nodes } | WorkflowPlan::Parallel { nodes } => {
             nodes.iter().flat_map(plan_step_ids).collect()
+        }
+        WorkflowPlan::Choice {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let mut result = plan_step_ids(then_branch);
+            result.extend(plan_step_ids(else_branch));
+            result
         }
         WorkflowPlan::Map { body, .. } | WorkflowPlan::Retry { node: body, .. } => {
             plan_step_ids(body)
@@ -2469,6 +2526,15 @@ fn plan_frontier(plan: &WorkflowPlan) -> Vec<String> {
         WorkflowPlan::Step { step } => vec![step.clone()],
         WorkflowPlan::Sequence { nodes } => nodes.first().map_or_else(Vec::new, plan_frontier),
         WorkflowPlan::Parallel { nodes } => nodes.iter().flat_map(plan_frontier).collect(),
+        WorkflowPlan::Choice {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let mut result = plan_frontier(then_branch);
+            result.extend(plan_frontier(else_branch));
+            result
+        }
         WorkflowPlan::Map { body, .. } | WorkflowPlan::Retry { node: body, .. } => {
             plan_frontier(body)
         }
