@@ -1342,7 +1342,7 @@ impl CopilotAuthHandler {
             Err(_) => {
                 let body_str = String::from_utf8_lossy(&body);
                 let error_msg = format!("Failed to get copilot config: {body_str}");
-                error!("{error_msg}");
+                error!(response_bytes = body.len(), response_hash = %crate::providers::common::log_identity(&body_str), "Failed to get copilot config");
                 Err(anyhow!(error_msg))
             }
         }
@@ -1861,5 +1861,53 @@ mod retry_tests {
 
         assert_eq!(loaded.token, config.token);
         assert_eq!(loaded.expires_at, config.expires_at);
+    }
+}
+
+#[cfg(test)]
+mod operational_log_privacy_tests {
+    use super::{AccessTokenResponse, CopilotAuthHandler};
+    use crate::providers::common::log_privacy_tests::EventCapture;
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_operational_logs_copilot_config_decode_keep_body_private() {
+        let server = MockServer::start().await;
+        let body = r#"{"token":"credential-999-sentinel","private":"/private/workspace-999-sentinel","incomplete":true}"#;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        let client = Arc::new(
+            reqwest_middleware::ClientBuilder::new(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            )
+            .build(),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let handler = CopilotAuthHandler::new(client, directory.path().into(), true)
+            .with_github_api_base_url(server.uri());
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        tracing::callsite::rebuild_interest_cache();
+        let token = AccessTokenResponse {
+            access_token: Some("test-oauth-token".into()),
+            token_type: None,
+            scope: None,
+            error: None,
+            error_description: None,
+        };
+        let error = handler.get_copilot_token(token).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("Failed to get copilot config: {body}")
+        );
+        capture.assert_private(
+            "Failed to get copilot config",
+            &["credential-999-sentinel", "/private/workspace-999-sentinel"],
+        );
     }
 }

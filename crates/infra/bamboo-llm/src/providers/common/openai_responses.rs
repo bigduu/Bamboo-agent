@@ -4,6 +4,7 @@
 //! OpenAI Responses API instead of Chat Completions. We normalize Responses SSE
 //! events into [`LLMChunk`] so the rest of Bamboo can stay provider-agnostic.
 
+use super::log_identity;
 use super::tool_schema::sanitize_openai_function_parameters_schema;
 use crate::cache::PromptCachePlan;
 use crate::provider::{LLMError, ResponsesRequestOptions, Result};
@@ -1917,9 +1918,9 @@ impl ResponsesSseParser {
             });
 
         tracing::info!(
-            "{} responses reasoning summary: model='{}' requested_effort={} request_reasoning_enabled={} observed_reasoning_signal={} reasoning_event_count={} reasoning_text_chars={} reasoning_tokens={}",
+            "{} responses reasoning summary: model_hash={} requested_effort={} request_reasoning_enabled={} observed_reasoning_signal={} reasoning_event_count={} reasoning_text_chars={} reasoning_tokens={}",
             self.provider_label,
-            if self.model.is_empty() { "<unknown>" } else { self.model.as_str() },
+            log_identity(&self.model),
             self.requested_reasoning_effort
                 .map(ReasoningEffort::as_str)
                 .unwrap_or("none"),
