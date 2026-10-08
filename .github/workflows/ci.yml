@@ -15,13 +15,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 962b059f55fc408bff9ae8e604b4072188dddb02
+          ref: fd19bea7f34ac2069e2e1ed7eb8c150207c8f351
           path: .codex/recorder
 
       - name: Verify immutable Recorder source
         shell: bash
         run: |
-          test "$(git -C .codex/recorder rev-parse HEAD)" = 962b059f55fc408bff9ae8e604b4072188dddb02
+          test "$(git -C .codex/recorder rev-parse HEAD)" = fd19bea7f34ac2069e2e1ed7eb8c150207c8f351
           git -C .codex/recorder diff --exit-code
           git -C .codex/recorder show -s --format='%H %T %P'
 
