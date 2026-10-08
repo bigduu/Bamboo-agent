@@ -1176,6 +1176,9 @@ impl AppState {
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
             recovered_launches: Arc::new(dashmap::DashMap::new()),
         });
+        workflow_runs
+            .bind_child_adapter(child_adapter.clone())
+            .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
         let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();
         tickets.bind_adapter(child_adapter.clone());
         tickets.bind_messenger(session_messenger.clone());
