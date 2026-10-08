@@ -59,25 +59,28 @@ impl LifecycleManager for DefaultLifecycleManager {
         tools: &dyn ToolExecutor,
         _llm: &dyn LLMProvider,
     ) -> Result<String, AgentError> {
-        self.prepare_round_with_observation(
+        let execution_id = runtime_state.run_id.clone();
+        crate::runtime::runner::round_prelude::prepare_round(
             session,
             task_context,
             runtime_state,
-            round,
-            max_rounds,
             config,
-            cancel_token,
-            metrics_collector,
-            session_id,
-            model_name,
+            self.llm.clone(),
             tools,
-            _llm,
+            &crate::runtime::runner::round_prelude::RoundPreludeFrame {
+                execution_id: &execution_id,
+                round,
+                max_rounds,
+                debug_enabled: false, // debug logging handled at runner level, not via adapter
+                cancel_token,
+                metrics_collector,
+                session_id,
+                model_name,
+            },
         )
         .await
-        .map(|prepared| prepared.round_id)
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn prepare_round_with_observation(
         &self,
         session: &mut Session,

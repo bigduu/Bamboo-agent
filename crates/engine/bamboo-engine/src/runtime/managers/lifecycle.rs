@@ -36,7 +36,6 @@ pub trait LifecycleManager: Send + Sync {
     ) -> Result<String, AgentError>;
 
     /// Optional data-only companion. Older implementations execute exactly once.
-    #[allow(clippy::too_many_arguments)]
     async fn prepare_round_with_observation(
         &self,
         session: &mut Session,
