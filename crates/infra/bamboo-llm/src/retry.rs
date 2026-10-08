@@ -24,6 +24,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::providers::common::http_error_kind;
 use reqwest::{RequestBuilder, Response, StatusCode};
 
 /// Secret-free evidence from the most recent retryable HTTP response while
@@ -274,10 +275,10 @@ where
 
                 let delay = backoff_delay(config, attempt);
                 tracing::warn!(
-                    "[{provider}] transient transport error on attempt {}/{} ({}); retrying in {}ms",
+                    "[{provider}] transient transport error on attempt {}/{} (error_kind={}); retrying in {}ms",
                     attempt + 1,
                     max_attempts,
-                    err,
+                    http_error_kind(&err),
                     delay.as_millis()
                 );
                 tokio::time::sleep(delay).await;
