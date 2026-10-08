@@ -3803,3 +3803,148 @@ mod optional_model_e2e {
         }
     }
 }
+
+#[actix_web::test]
+async fn constructor_parity_queue_preserves_envelope_and_deduplicated_retry() {
+    use actix_web::{test, web};
+    use bamboo_domain::{SessionMessageBody, SessionMessageKind, SessionMessageSource};
+    let root = tempfile::tempdir().unwrap();
+    let state = web::Data::new(crate::AppState::new(root.path().into()).await.unwrap());
+    let session = Session::new("constructor-queue", "test-model");
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jF0cAAAAASUVORK5CYII=";
+    let request = serde_json::from_value::<super::ChatRequest>(serde_json::json!({
+        "message":"raw user text", "message_id":"constructor-queue-stable",
+        "thread_id":"thread", "in_reply_to":"parent", "correlation_id":"trace",
+        "images":[{"base64":png,"type":"image/png"},{"base64":png,"type":"image/png"}]
+    }))
+    .unwrap();
+    let http = test::TestRequest::post()
+        .peer_addr("127.0.0.1:5700".parse().unwrap())
+        .to_http_request();
+    let before = std::time::SystemTime::now();
+    let first = super::ingress::queue(&state, &session, &request, "effective 原样\ntext", &http)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        session.messages.is_empty(),
+        "queue has no HTTP-owned User append"
+    );
+    let claims = state.session_inbox.claim(&session.id, 10).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    let envelope = &claims[0].envelope;
+    assert_eq!(envelope.id.as_str(), "constructor-queue-stable");
+    assert_eq!(envelope.target_session_id, session.id);
+    assert_eq!(envelope.source, SessionMessageSource::User);
+    assert_eq!(envelope.kind, SessionMessageKind::UserInput);
+    assert_eq!(envelope.thread_id.as_deref(), Some("thread"));
+    assert_eq!(
+        envelope.in_reply_to.as_ref().map(|id| id.as_str()),
+        Some("parent")
+    );
+    assert_eq!(envelope.correlation_id.as_deref(), Some("trace"));
+    let minted: std::time::SystemTime = envelope.created_at.into();
+    assert!(minted >= before && minted <= std::time::SystemTime::now());
+    let SessionMessageBody::Content(body) = &envelope.body else {
+        panic!("canonical User content")
+    };
+    assert_eq!(body.text, "effective 原样\ntext");
+    assert_eq!(body.parts.len(), 3);
+    assert!(
+        matches!(&body.parts[0], bamboo_domain::MessagePart::Text {text} if text == &body.text)
+    );
+    let urls = body.parts[1..]
+        .iter()
+        .map(|p| match p {
+            bamboo_domain::MessagePart::ImageUrl { image_url } => image_url.url.clone(),
+            _ => panic!("actual queued attachment"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(urls[0], urls[1], "queued attachments remain deduplicated");
+    let original = serde_json::to_value(envelope).unwrap();
+    let restored: bamboo_domain::SessionMessageEnvelope =
+        serde_json::from_value(original.clone()).unwrap();
+    assert_eq!(serde_json::to_value(restored).unwrap(), original);
+    let replay = super::ingress::queue(&state, &session, &request, "effective 原样\ntext", &http)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(replay).unwrap(),
+        serde_json::to_value(first).unwrap()
+    );
+    let conflict = super::ingress::queue(&state, &session, &request, "changed body", &http)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        conflict.status(),
+        actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let persisted = state
+        .storage
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(persisted.messages.is_empty());
+    state
+        .session_inbox
+        .ack(&session.id, &claims[0])
+        .await
+        .unwrap();
+    assert!(state
+        .session_inbox
+        .claim(&session.id, 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[actix_web::test]
+async fn constructor_parity_queue_rejects_before_canonical_creation_or_delivery() {
+    use actix_web::{test, web};
+    let root = tempfile::tempdir().unwrap();
+    let state = web::Data::new(crate::AppState::new(root.path().into()).await.unwrap());
+    let http = test::TestRequest::post()
+        .peer_addr("127.0.0.1:5700".parse().unwrap())
+        .to_http_request();
+    for (label, extra) in [
+        (
+            "image",
+            serde_json::json!({"images":[{"base64":"invalid%%%","type":"image/png"}]}),
+        ),
+        (
+            "refs",
+            serde_json::json!({"correlation_id":"child_completion-fake"}),
+        ),
+        (
+            "bound",
+            serde_json::json!({"images":vec![serde_json::json!({"base64":"invalid%%%"});17]}),
+        ),
+    ] {
+        let session = Session::new(format!("constructor-queue-rejected-{label}"), "test-model");
+        let mut body =
+            serde_json::json!({"message":"raw", "message_id":format!("rejected-{label}")});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let request = serde_json::from_value::<super::ChatRequest>(body).unwrap();
+        let error = super::ingress::queue(&state, &session, &request, "must not admit", &http)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert!(state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .session_inbox
+            .claim(&session.id, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(session.messages.is_empty());
+    }
+}
