@@ -934,7 +934,7 @@ mod execution_input_http {
     }
 
     #[actix_web::test]
-    async fn native_pending_reservation_keeps_input_for_original_owner_release() {
+    async fn native_reserved_owner_and_pending_slot_keep_input_until_original_release() {
         use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
         let (_home, state, _fault) = state(None).await;
         let id = "native-pending-reservation";
@@ -977,7 +977,7 @@ mod execution_input_http {
             .read()
             .await
             .get(id)
-            .is_some_and(|r| r.run_id == run && matches!(r.status, AgentStatus::Pending)));
+            .is_some_and(|r| r.run_id == run && matches!(r.status, AgentStatus::Running)));
         let blocked = state.admit_chat_for_execute(id).await.unwrap();
         assert!(blocked.inputs.is_none());
         assert!(!blocked.generate_title);
@@ -1001,6 +1001,25 @@ mod execution_input_http {
             .iter()
             .any(|m| m.id == input));
         reservation.abandon().await;
+        // Existing default Pending-slot control, as in the original Server fixtures.
+        // This is not a production Pending activation or a running Runtime proof.
+        state
+            .agent_runners
+            .write()
+            .await
+            .insert(id.into(), AgentRunner::new());
+        let pending = state.admit_chat_for_execute(id).await.unwrap();
+        assert!(pending.inputs.is_none());
+        assert!(!pending.generate_title);
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+        {
+            let mut runners = state.agent_runners.write().await;
+            let removed =
+                bamboo_engine::execution::runner_lifecycle::remove_runner_entry(&mut runners, id)
+                    .await
+                    .unwrap();
+            assert!(matches!(removed.status, AgentStatus::Pending));
+        }
         let admitted = state.admit_chat_for_execute(id).await.unwrap();
         assert_eq!(admitted.inputs.unwrap().observations()[0].input_id(), input);
         assert!(state

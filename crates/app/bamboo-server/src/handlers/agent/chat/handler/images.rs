@@ -112,6 +112,7 @@ mod tests {
         let mut session = Session::new("native-seventeen", "test-model");
         session.set_last_run_status("error");
         session.set_last_run_error("old owned error");
+        state.storage.save_session(&session).await.unwrap();
         let original = serde_json::to_value(&session).unwrap();
         let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jF0cAAAAASUVORK5CYII=";
         let request: super::super::ChatRequest = serde_json::from_value(serde_json::json!({
@@ -167,13 +168,14 @@ mod tests {
             web::Json(invalid),
         )
         .await;
-        assert_eq!(response.status(), actix_web::http::StatusCode::CREATED);
+        let status = response.status();
         let receipt: serde_json::Value = serde_json::from_slice(
             &actix_web::body::to_bytes(response.into_body())
                 .await
                 .unwrap(),
         )
         .unwrap();
+        assert_eq!(status, actix_web::http::StatusCode::CREATED, "{receipt}");
         let input = receipt["message_id"].as_str().unwrap();
         assert!(!state
             .storage
