@@ -14,6 +14,7 @@ use bamboo_agent_core::tools::ToolError;
 use bamboo_agent_core::Session;
 use bamboo_domain::ProjectId;
 
+mod assembly;
 mod catalog;
 mod load_skill;
 mod output_budget;
@@ -22,6 +23,7 @@ mod read_resource;
 #[cfg(test)]
 mod tests;
 
+pub use assembly::{assemble_legacy_skill_tools, LegacySkillContextRegistry};
 pub use catalog::{SelectedSkillSource, SkillsListTool, SkillsReadTool, MAX_SKILLS_LIST_BYTES};
 pub use load_skill::LoadSkillTool;
 pub use output_budget::skill_response_byte_budget;
