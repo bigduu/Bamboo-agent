@@ -252,6 +252,53 @@ pub enum InputRequestProjection {
 
 #[cfg(test)]
 mod input_request_batch_tests {
+    fn ql_observation(session: &str, execution: &str, id: Option<&str>) -> InputObservation {
+        let source = bamboo_domain::SessionMessageSource::User;
+        let records = id.map(|id| BorrowedInputRequestRecord {
+            input_id: id,
+            source: &source,
+            kind: bamboo_domain::SessionMessageKind::UserInput,
+            wrapper: None,
+            created_at: chrono::DateTime::from_timestamp(1, 0).unwrap(),
+            request: None,
+        });
+        InputObservation::projected(project_input_request_batch(
+            session,
+            execution,
+            records.as_slice(),
+        ))
+    }
+
+    #[test]
+    fn ql_finite_owner_retains_nonew_only_for_exact_session_and_execution() {
+        let mut current = None;
+        ql_observation("s", "e", Some("N")).update_current(&mut current, "s", "e");
+        let pointer = current.as_ref().unwrap().records().as_ptr();
+        ql_observation("s", "e", None).update_current(&mut current, "s", "e");
+        assert_eq!(current.as_ref().unwrap().records().as_ptr(), pointer);
+        ql_observation("s", "old-execution", None).update_current(&mut current, "s", "e");
+        assert!(
+            current.is_none(),
+            "foreign NoNew cannot preserve this owner's data"
+        );
+        ql_observation("foreign-session", "e", Some("wrong")).update_current(
+            &mut current,
+            "s",
+            "e",
+        );
+        assert!(current.is_none());
+        ql_observation("s", "e", Some("N")).update_current(&mut current, "s", "e");
+        ql_observation("s", "e", None).update_current(&mut current, "successor", "e");
+        assert!(current.is_none());
+        ql_observation("s", "e", Some("N")).update_current(&mut current, "s", "e");
+        InputObservation::default().update_current(&mut current, "s", "e");
+        ql_observation("s", "e", None).update_current(&mut current, "s", "e");
+        assert!(
+            current.is_none(),
+            "NoNew after Unavailable never resurrects N"
+        );
+    }
+
     use super::*;
     use crate::runtime::runner::state_bridge::{
         project_input_request_batch, BorrowedInputRequestRecord,

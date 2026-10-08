@@ -1421,6 +1421,422 @@ async fn refresh_turn_boundary_inner(
 
 #[cfg(test)]
 mod tests {
+    fn ql_envelope(id: &str, ordinal: usize, bytes: Option<usize>) -> SessionMessageEnvelope {
+        let mut envelope = SessionMessageEnvelope::user_input(id, "unchanged provider text");
+        envelope.id = SessionMessageId::parse(format!("ql-{ordinal}")).unwrap();
+        envelope.created_at =
+            chrono::DateTime::from_timestamp(1700000000 + ordinal as i64, 0).unwrap();
+        if let (Some(bytes), SessionMessageBody::Content(content)) = (bytes, &mut envelope.body) {
+            content.skill_request = Some(bamboo_domain::SessionSkillRequest {
+                mode: Some("exact-mode".into()),
+                selections: vec![bamboo_domain::SessionSkillSelection {
+                    id: format!("selection-{ordinal}"),
+                    source: "user".into(),
+                    revision: u64::MAX,
+                    args: serde_json::json!({"payload":"x".repeat(bytes), "float": 1.125, "null":null}),
+                }],
+            });
+        }
+        envelope
+    }
+
+    #[test]
+    fn ql_raw_projection_matches_accepted_qb_cost_and_exact_numeric_data() {
+        use crate::runtime::managers::lifecycle::InputRequestProjection;
+        for root in [false, true] {
+            for request in [None, Some(0), Some(7000)] {
+                let envelope = ql_envelope("ql-raw", 1, request);
+                let envelope = if root {
+                    envelope.with_root_chat_prompt("system".into()).unwrap()
+                } else {
+                    envelope
+                };
+                let skill_request = match &envelope.body {
+                    SessionMessageBody::Content(content) => content.skill_request.as_ref(),
+                    SessionMessageBody::RuntimeInstruction(body) => {
+                        body.content.as_ref().unwrap().skill_request.as_ref()
+                    }
+                };
+                let records = [BorrowedInputRequestRecord {
+                    input_id: envelope.id.as_str(),
+                    source: &envelope.source,
+                    kind: envelope.kind,
+                    wrapper: root.then_some("root_chat_turn_v1"),
+                    created_at: envelope.created_at,
+                    request: skill_request,
+                }];
+                let expected = project_input_request_batch("ql-raw", "actual-execution", &records);
+                let actual = project_new_committed_inputs(
+                    "ql-raw",
+                    "actual-execution",
+                    &[envelope.to_provider_message().unwrap()],
+                );
+                assert_eq!(actual, expected);
+                let InputRequestProjection::Available(batch) = actual else {
+                    panic!("valid fit")
+                };
+                assert_eq!(batch.records()[0].request.as_ref(), skill_request);
+            }
+        }
+    }
+
+    #[test]
+    fn ql_raw_projection_normalizes_null_mode_and_missing_args_without_dropping_data() {
+        let envelope = ql_envelope("ql-null", 0, Some(0));
+        let mut message = envelope.to_provider_message().unwrap();
+        let proof = &mut message.metadata.as_mut().unwrap()["session_message"];
+        let request = &mut proof["body"]["skill_request"];
+        request["mode"] = serde_json::Value::Null;
+        request["selections"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("args");
+        let expected = bamboo_domain::SessionSkillRequest {
+            mode: None,
+            selections: vec![bamboo_domain::SessionSkillSelection {
+                id: "selection-0".into(),
+                source: "user".into(),
+                revision: u64::MAX,
+                args: serde_json::Value::Null,
+            }],
+        };
+        let records = [BorrowedInputRequestRecord {
+            input_id: envelope.id.as_str(),
+            source: &envelope.source,
+            kind: envelope.kind,
+            wrapper: None,
+            created_at: envelope.created_at,
+            request: Some(&expected),
+        }];
+        assert_eq!(
+            project_new_committed_inputs("ql-null", "e", &[message]),
+            project_input_request_batch("ql-null", "e", &records)
+        );
+    }
+
+    #[test]
+    fn ql_raw_projection_rejects_unknown_small_deep_and_wide_programmatic_data() {
+        use crate::runtime::managers::lifecycle::InputRequestProjection::Unavailable;
+        let message = ql_envelope("ql-shape", 0, Some(0))
+            .to_provider_message()
+            .unwrap();
+        let mut deep = serde_json::Value::Null;
+        for _ in 0..65 {
+            deep = serde_json::json!([deep]);
+        }
+        for args in [
+            deep,
+            serde_json::json!((0..8192).map(|_| 0).collect::<Vec<_>>()),
+        ] {
+            let mut invalid = message.clone();
+            invalid.metadata.as_mut().unwrap()["session_message"]["body"]["skill_request"]
+                ["selections"][0]["args"] = args;
+            assert!(matches!(
+                project_new_committed_inputs("ql-shape", "e", &[invalid]),
+                Unavailable(_)
+            ));
+        }
+        let mut invalid = message.clone();
+        invalid.metadata.as_mut().unwrap()["session_message"]["body"]["skill_request"]["extra"] =
+            1.into();
+        assert!(matches!(
+            project_new_committed_inputs("ql-shape", "e", &[invalid]),
+            Unavailable(_)
+        ));
+        let mut invalid = message;
+        invalid.metadata.as_mut().unwrap()["session_message"]["id"] = "wrong-id".into();
+        assert!(matches!(
+            project_new_committed_inputs("ql-shape", "e", &[invalid]),
+            Unavailable(_)
+        ));
+        assert!(matches!(
+            project_new_committed_inputs("ql-shape", "e", &[Message::user("old native")]),
+            Unavailable(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ql_real_new_order_none_overflow_nonew_and_fitting_restore() {
+        let (_home, store, locked, inbox, mut session) = durable_inbox_fixture("ql-sequence").await;
+        let storage: Arc<dyn Storage> = store;
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> = locked;
+        let mut current = None;
+        for (start, count, request, fitting) in [
+            (0, 2, Some(7), true),
+            (2, 1, None, true),
+            (3, 40, Some(7000), false),
+            (43, 0, None, false),
+            (43, 1, Some(9), true),
+        ] {
+            for ordinal in start..start + count {
+                deliver_interrupt_eligible(&inbox, &ql_envelope(&session.id, ordinal, request))
+                    .await;
+            }
+            let (refresh, observation) = refresh_turn_boundary_with_observation(
+                &mut session,
+                Some(&storage),
+                Some(&persistence),
+                Some(&inbox),
+                None,
+                "actual-sequence-run",
+            )
+            .await;
+            assert_eq!(refresh.merged, count);
+            assert_eq!(refresh.committed_messages.len(), count);
+            assert!(refresh.admission_error.is_none());
+            if count == 0 {
+                assert!(observation.is_successful_no_new_input());
+            }
+            if count == 40 {
+                assert!(observation.is_unavailable());
+            }
+            let session_id = session.id.clone();
+            observation.update_current(&mut current, &session_id, "actual-sequence-run");
+            assert_eq!(current.is_some(), fitting);
+            if let Some(batch) = &current {
+                assert_eq!(
+                    batch
+                        .records()
+                        .iter()
+                        .map(|r| r.input_id.as_str())
+                        .collect::<Vec<_>>(),
+                    (start..start + count)
+                        .map(|i| format!("ql-{i}"))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(batch.records()[0].request.is_some(), request.is_some());
+                assert_eq!(batch.execution_id(), "actual-sequence-run");
+            }
+            let backlog = inbox.inspect(&session_id).await.unwrap();
+            assert_eq!(backlog.pending + backlog.claimed, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn ql_original_checkpoint_failure_is_unavailable_and_cold_retry_is_new_once() {
+        let (_home, store, locked, inbox, mut session) =
+            durable_inbox_fixture("ql-checkpoint-failure").await;
+        let storage: Arc<dyn Storage> = store;
+        let faulted = Arc::new(FaultingPersistence {
+            inner: locked,
+            fail_checkpoint: std::sync::atomic::AtomicBool::new(true),
+        });
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> = faulted.clone();
+        let envelope = ql_envelope(&session.id, 0, Some(9));
+        deliver_interrupt_eligible(&inbox, &envelope).await;
+        let (refresh, observation) = refresh_turn_boundary_with_observation(
+            &mut session,
+            Some(&storage),
+            Some(&persistence),
+            Some(&inbox),
+            None,
+            "e",
+        )
+        .await;
+        assert!(
+            refresh.admission_error.is_none(),
+            "preserve original non-error checkpoint branch"
+        );
+        assert_eq!(refresh.merged, 0);
+        assert!(refresh.committed_messages.is_empty());
+        assert!(observation.is_unavailable());
+        assert!(!session
+            .messages
+            .iter()
+            .any(|m| m.id == envelope.id.as_str()));
+        assert!(!inbox.was_admitted(&session.id, &envelope.id).await.unwrap());
+        faulted.fail_checkpoint.store(false, Ordering::SeqCst);
+        let (refresh, observation) = refresh_turn_boundary_with_observation(
+            &mut session,
+            Some(&storage),
+            Some(&persistence),
+            Some(&inbox),
+            None,
+            "e",
+        )
+        .await;
+        assert_eq!(refresh.merged, 1);
+        assert_eq!(
+            observation.new_inputs().unwrap().records()[0].input_id,
+            envelope.id.as_str()
+        );
+        let (_, observation) = refresh_turn_boundary_with_observation(
+            &mut session,
+            Some(&storage),
+            Some(&persistence),
+            Some(&inbox),
+            None,
+            "e",
+        )
+        .await;
+        assert!(observation.is_successful_no_new_input());
+    }
+
+    #[tokio::test]
+    async fn ql_unresolved_ack_preserves_prefix_events_but_never_new_and_recovery_is_nonew() {
+        for permanent in [false, true] {
+            let (_home, store, locked, real, mut session) =
+                durable_inbox_fixture("ql-ack-failure").await;
+            let storage: Arc<dyn Storage> = store;
+            let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> = locked;
+            let inbox: Arc<dyn SessionInboxPort> = Arc::new(AckAfterPersistErrorInbox {
+                inner: real.clone(),
+                fail_before_once: std::sync::atomic::AtomicBool::new(!permanent),
+                fail_after_once: std::sync::atomic::AtomicBool::new(permanent),
+            });
+            let envelope = ql_envelope(&session.id, 0, Some(9));
+            deliver_interrupt_eligible(&inbox, &envelope).await;
+            let (refresh, observation) = refresh_turn_boundary_with_observation(
+                &mut session,
+                Some(&storage),
+                Some(&persistence),
+                Some(&inbox),
+                None,
+                "e",
+            )
+            .await;
+            assert_eq!(
+                refresh.admission_error.as_deref(),
+                Some(INBOX_ACK_UNRESOLVED)
+            );
+            assert_eq!(
+                refresh.committed_messages.len(),
+                1,
+                "retain original pre-ACK durable prefix"
+            );
+            assert!(observation.is_unavailable());
+            let mut cold = storage.load_session(&session.id).await.unwrap().unwrap();
+            let (refresh, observation) = refresh_turn_boundary_with_observation(
+                &mut cold,
+                Some(&storage),
+                Some(&persistence),
+                Some(&inbox),
+                None,
+                "cold-new-run",
+            )
+            .await;
+            assert_eq!(refresh.merged, 0);
+            assert!(refresh.committed_messages.is_empty());
+            assert!(observation.is_successful_no_new_input());
+            assert_eq!(
+                cold.messages
+                    .iter()
+                    .filter(|m| m.id == envelope.id.as_str())
+                    .count(),
+                1
+            );
+            assert_eq!(real.inspect(&session.id).await.unwrap().claimed, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn ql_owned_root_new_and_recovered_are_distinguished_after_exact_ack() {
+        use bamboo_domain::RuntimeSessionPersistence;
+        for recovered in [false, true] {
+            let (_home, store, locked, inbox, mut root) =
+                durable_inbox_fixture("ql-owned-root").await;
+            let envelope = ql_envelope(&root.id, 0, Some(17))
+                .with_root_chat_prompt("Root system".into())
+                .unwrap();
+            if recovered {
+                root.add_message(envelope.to_provider_message().unwrap());
+                store.save_session(&root).await.unwrap();
+            }
+            let repo = crate::SessionRepository::new(Arc::default(), store.clone(), locked)
+                .with_root_actor_directory(store.clone());
+            let binding = repo
+                .bind_root_actor_execution(&root, "actual-owned-root-run")
+                .await
+                .unwrap()
+                .unwrap();
+            let storage: Arc<dyn Storage> = store;
+            deliver_interrupt_eligible(&inbox, &envelope).await;
+            let (refresh, observation) = refresh_turn_boundary_with_observation(
+                &mut root,
+                Some(&storage),
+                Some(&binding.persistence),
+                Some(&inbox),
+                None,
+                "actual-owned-root-run",
+            )
+            .await;
+            assert!(refresh.admission_error.is_none());
+            assert_eq!(refresh.merged, usize::from(!recovered));
+            assert_eq!(observation.is_successful_no_new_input(), recovered);
+            if let Some(batch) = observation.new_inputs() {
+                let record = &batch.records()[0];
+                assert_eq!(record.input_id, envelope.id.as_str());
+                assert_eq!(
+                    record.source,
+                    SessionMessageSource::Runtime {
+                        subsystem: "chat".into()
+                    }
+                );
+                assert_eq!(record.kind, SessionMessageKind::RuntimeInstruction);
+                assert_eq!(record.wrapper.as_deref(), Some("root_chat_turn_v1"));
+                assert_eq!(record.created_at, envelope.created_at);
+                assert_eq!(
+                    record.request.as_ref().unwrap().selections[0].revision,
+                    u64::MAX
+                );
+            }
+            assert!(inbox.was_admitted(&root.id, &envelope.id).await.unwrap());
+            assert_eq!(inbox.inspect(&root.id).await.unwrap().pending, 0);
+            assert_eq!(
+                root.messages
+                    .iter()
+                    .filter(|m| m.id == envelope.id.as_str())
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ql_new_peer_user_presentation_is_unavailable_without_stale_fallback() {
+        let (_home, store, locked, inbox, mut session) = durable_inbox_fixture("ql-peer").await;
+        let storage: Arc<dyn Storage> = store;
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> = locked;
+        let user = ql_envelope(&session.id, 0, Some(8));
+        deliver_interrupt_eligible(&inbox, &user).await;
+        let (_, observation) = refresh_turn_boundary_with_observation(
+            &mut session,
+            Some(&storage),
+            Some(&persistence),
+            Some(&inbox),
+            None,
+            "e",
+        )
+        .await;
+        let mut current = None;
+        observation.update_current(&mut current, &session.id, "e");
+        assert!(current.is_some());
+        let mut peer = ql_envelope(&session.id, 1, None);
+        peer.source = SessionMessageSource::Session {
+            session_id: "real-peer".into(),
+        };
+        peer.kind = SessionMessageKind::PeerMessage;
+        assert_eq!(
+            peer.to_provider_message().unwrap().role,
+            bamboo_domain::Role::User
+        );
+        deliver_interrupt_eligible(&inbox, &peer).await;
+        let (refresh, observation) = refresh_turn_boundary_with_observation(
+            &mut session,
+            Some(&storage),
+            Some(&persistence),
+            Some(&inbox),
+            None,
+            "e",
+        )
+        .await;
+        assert_eq!(refresh.merged, 1);
+        assert!(observation.is_unavailable());
+        observation.update_current(&mut current, &session.id, "e");
+        assert!(current.is_none());
+        assert!(inbox.was_admitted(&session.id, &peer.id).await.unwrap());
+    }
+
     use super::*;
     use bamboo_agent_core::storage::Storage;
     use bamboo_domain::{

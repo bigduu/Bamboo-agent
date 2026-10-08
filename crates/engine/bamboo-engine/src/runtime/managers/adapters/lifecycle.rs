@@ -178,6 +178,207 @@ impl LifecycleManager for DefaultLifecycleManager {
 
 #[cfg(test)]
 mod tests {
+    struct QlOldCustom {
+        calls: std::sync::atomic::AtomicUsize,
+        fail: bool,
+        builtin: DefaultLifecycleManager,
+    }
+
+    #[async_trait]
+    impl LifecycleManager for QlOldCustom {
+        fn initialize_run(&self, s: &Session, c: &AgentLoopConfig) -> AgentRuntimeState {
+            self.builtin.initialize_run(s, c)
+        }
+        async fn prepare_round(
+            &self,
+            s: &mut Session,
+            _: &mut Option<TaskLoopContext>,
+            _: &mut AgentRuntimeState,
+            _: usize,
+            _: Option<usize>,
+            _: &AgentLoopConfig,
+            _: &CancellationToken,
+            _: Option<&MetricsCollector>,
+            _: &str,
+            _: &str,
+            _: &dyn ToolExecutor,
+            _: &dyn LLMProvider,
+        ) -> Result<String, AgentError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            s.metadata
+                .insert("old-custom-effect".into(), "exact".into());
+            if self.fail {
+                Err(AgentError::Tool("old-custom-error".into()))
+            } else {
+                Ok("old-custom-round".into())
+            }
+        }
+        async fn handle_round_outcome(
+            &self,
+            s: &mut Session,
+            r: &mut AgentRuntimeState,
+            t: &mut Option<TaskLoopContext>,
+            n: usize,
+            b: bool,
+        ) -> Result<bool, AgentError> {
+            self.builtin.handle_round_outcome(s, r, t, n, b).await
+        }
+        async fn finalize_run(
+            &self,
+            s: &mut Session,
+            r: &mut AgentRuntimeState,
+            e: &mpsc::Sender<AgentEvent>,
+            id: &str,
+            c: &AgentLoopConfig,
+            m: Option<&MetricsCollector>,
+            t: Option<TaskLoopContext>,
+        ) {
+            self.builtin.finalize_run(s, r, e, id, c, m, t).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ql_old_custom_default_companion_calls_once_and_preserves_return_error_effect() {
+        for fail in [false, true] {
+            let manager = QlOldCustom {
+                calls: Default::default(),
+                fail,
+                builtin: DefaultLifecycleManager::new(Arc::new(UnusedProvider)),
+            };
+            let mut session = Session::new("old-custom", "model");
+            let config = AgentLoopConfig::default();
+            let mut runtime = manager.initialize_run(&session, &config);
+            let result = manager
+                .prepare_round_with_observation(
+                    &mut session,
+                    &mut None,
+                    &mut runtime,
+                    0,
+                    None,
+                    &config,
+                    &CancellationToken::new(),
+                    None,
+                    "old-custom",
+                    "model",
+                    &EmptyTools,
+                    &UnusedProvider,
+                )
+                .await;
+            assert_eq!(manager.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(session.metadata["old-custom-effect"], "exact");
+            match result {
+                Ok(prepared) => {
+                    assert!(!fail);
+                    assert_eq!(prepared.round_id, "old-custom-round");
+                    assert!(prepared.observation.is_unavailable());
+                }
+                Err(AgentError::Tool(error)) => {
+                    assert!(fail);
+                    assert_eq!(error, "old-custom-error");
+                }
+                other => panic!("changed old result: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ql_same_builtin_manager_returns_separate_data_to_real_run_owners() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().into())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = store.clone();
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+        let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store,
+            SessionInboxLimits::default(),
+        ));
+        let config = AgentLoopConfig {
+            storage: Some(storage.clone()),
+            persistence: Some(persistence),
+            session_inbox: Some(inbox.clone()),
+            ..Default::default()
+        };
+        let manager = DefaultLifecycleManager::new(Arc::new(UnusedProvider));
+        let mut owners = Vec::new();
+        for id in ["ql-manager-a", "ql-manager-b"] {
+            let mut session = Session::new(id, "model");
+            session.add_message(Message::system("system"));
+            storage.save_session(&session).await.unwrap();
+            let envelope = SessionMessageEnvelope::user_input(id, format!("input {id}"));
+            let receipt = inbox.deliver(&envelope).await.unwrap();
+            inbox
+                .mark_activation_eligible(
+                    id,
+                    receipt.generation,
+                    SessionActivationPolicy::InterruptSpecificWait,
+                )
+                .await
+                .unwrap();
+            let mut runtime = manager.initialize_run(&session, &config);
+            let execution = runtime.run_id.clone();
+            let prepared = manager
+                .prepare_round_with_observation(
+                    &mut session,
+                    &mut None,
+                    &mut runtime,
+                    0,
+                    None,
+                    &config,
+                    &CancellationToken::new(),
+                    None,
+                    id,
+                    "model",
+                    &EmptyTools,
+                    &UnusedProvider,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                prepared.round_id,
+                crate::runtime::runner::round_prelude::build_round_id(id, &execution, 0)
+            );
+            let mut current = None;
+            prepared
+                .observation
+                .update_current(&mut current, id, &execution);
+            let batch = current.as_ref().unwrap();
+            assert_eq!(batch.records()[0].input_id, envelope.id.as_str());
+            assert_eq!(batch.session_id(), id);
+            let prepared = manager
+                .prepare_round_with_observation(
+                    &mut session,
+                    &mut None,
+                    &mut runtime,
+                    1,
+                    None,
+                    &config,
+                    &CancellationToken::new(),
+                    None,
+                    id,
+                    "model",
+                    &EmptyTools,
+                    &UnusedProvider,
+                )
+                .await
+                .unwrap();
+            assert!(prepared.observation.is_successful_no_new_input());
+            prepared
+                .observation
+                .update_current(&mut current, id, &execution);
+            owners.push(current.unwrap());
+        }
+        assert_ne!(owners[0].execution_id(), owners[1].execution_id());
+        assert_ne!(owners[0].records().as_ptr(), owners[1].records().as_ptr());
+        assert_ne!(
+            owners[0].records()[0].input_id,
+            owners[1].records()[0].input_id
+        );
+    }
+
     use super::*;
     use bamboo_agent_core::storage::Storage;
     use bamboo_agent_core::tools::{ToolCall, ToolError, ToolResult, ToolSchema};
