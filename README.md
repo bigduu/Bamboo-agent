@@ -332,3 +332,13 @@ public field intentionally changes Rust struct-literal construction: existing
 request shape and size; they do not guarantee admission under the existing
 whole-envelope Inbox limit. Guidance, peer messages and child/runtime
 presentation cannot turn this data into a fresh User request.
+
+A separate unwired Engine helper can project borrowed request records into one
+bounded, untrusted batch. It checks all original I-W request data, then charges
+one private compact view including exact session/execution/input IDs, canonical
+source/kind/wrapper provenance, original timestamps and explicit absent requests.
+The whole batch is limited to 128 records and 256 KiB of compact UTF-8 bytes;
+record/selection slots are bounded separately. Owned data copies only validated
+lengths, without retaining Message/image/Source objects or source capacities.
+The helper establishes no New/current-input evidence, publication or permission;
+queued observation, execution transport and live Skill cutover remain separate.
