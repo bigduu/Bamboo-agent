@@ -14,6 +14,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::provider::{LLMError, LLMProvider};
 use crate::provider_factory::{create_provider_by_name, create_provider_from_instance};
+use crate::providers::common::{llm_error_kind, log_identity};
 use bamboo_config::Config;
 use bamboo_config::ProviderInstanceConfig;
 use bamboo_domain::poison::PoisonRecover;
@@ -255,7 +256,11 @@ impl ProviderRegistry {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(provider = name, error = %e, "Provider failed to initialize, skipping");
+                    tracing::warn!(
+                        provider = name,
+                        error_kind = llm_error_kind(&e),
+                        "Provider failed to initialize, skipping"
+                    );
                 }
             }
         }
@@ -283,15 +288,15 @@ impl ProviderRegistry {
 
         for (instance_id, instance) in &config.provider_instances {
             if !instance.enabled {
-                tracing::info!(instance_id, "Provider instance disabled, skipping");
+                tracing::info!(instance_hash = %log_identity(instance_id), "Provider instance disabled, skipping");
                 continue;
             }
 
             match Self::create_instance_provider(config, instance, app_data_dir.clone()).await {
                 Ok(provider) => {
                     tracing::info!(
-                        instance_id,
-                        provider_type = &instance.provider_type,
+                        instance_hash = %log_identity(instance_id),
+                        provider_type_hash = %log_identity(&instance.provider_type),
                         "Provider instance initialized"
                     );
                     providers.insert(instance_id.clone(), provider);
@@ -312,9 +317,9 @@ impl ProviderRegistry {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        instance_id,
-                        provider_type = &instance.provider_type,
-                        error = %e,
+                        instance_hash = %log_identity(instance_id),
+                        provider_type_hash = %log_identity(&instance.provider_type),
+                        error_kind = llm_error_kind(&e),
                         "Provider instance failed to initialize, skipping"
                     );
                 }
@@ -342,8 +347,8 @@ impl ProviderRegistry {
                 {
                     Ok(provider) => {
                         tracing::info!(
-                            instance_id = legacy_default_id,
-                            provider_type = &instance_cfg.provider_type,
+                            instance_hash = %log_identity(legacy_default_id),
+                            provider_type_hash = %log_identity(&instance_cfg.provider_type),
                             "Legacy default alias synthesized for hybrid compatibility"
                         );
                         providers.insert(legacy_default_id.to_string(), provider);
@@ -364,8 +369,8 @@ impl ProviderRegistry {
                     }
                     Err(e) => {
                         tracing::warn!(
-                            instance_id = legacy_default_id,
-                            error = %e,
+                            instance_hash = %log_identity(legacy_default_id),
+                            error_kind = llm_error_kind(&e),
                             "Hybrid legacy default alias failed to initialize"
                         );
                     }
