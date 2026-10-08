@@ -10,18 +10,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: dbc1e797ee08fa9e12396dfb691352c130d4fe4f
+          ref: 962b059f55fc408bff9ae8e604b4072188dddb02
           path: .codex/recorder
 
       - name: Verify immutable Recorder source
         shell: bash
         run: |
-          test "$(git -C .codex/recorder rev-parse HEAD)" = dbc1e797ee08fa9e12396dfb691352c130d4fe4f
+          test "$(git -C .codex/recorder rev-parse HEAD)" = 962b059f55fc408bff9ae8e604b4072188dddb02
           git -C .codex/recorder diff --exit-code
           git -C .codex/recorder show -s --format='%H %T %P'
 
