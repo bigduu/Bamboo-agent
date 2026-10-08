@@ -2556,7 +2556,7 @@ mod constructor_parity_tests {
         }
     }
 
-    async fn agent(root: &std::path::Path, provider: Arc<RecordingProvider>) -> Agent {
+    async fn agent(root: &std::path::Path, provider: Arc<dyn LLMProvider>) -> Agent {
         std::fs::write(root.join("config.json"), r#"{"provider":"anthropic","providers":{"anthropic":{"api_key":"fixture","model":"claude-test"}}}"#).unwrap();
         Agent::builder()
             .provider(provider)
@@ -2652,11 +2652,22 @@ mod constructor_parity_tests {
             assert!(!requests.is_empty(), "actual provider consumer executed");
             let sent = requests[0]
                 .iter()
-                .filter(|m| m.role == Role::User)
+                .filter(|m| m.role == Role::User && m.id == users[1].id)
                 .collect::<Vec<_>>();
-            assert_eq!(sent.len(), 2);
             assert_eq!(
-                serde_json::to_value(sent[1]).unwrap(),
+                sent.len(),
+                1,
+                "actual fresh User identity reaches provider once"
+            );
+            assert_eq!(
+                requests[0]
+                    .iter()
+                    .filter(|m| m.role == Role::User && m.id == historical_id)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                serde_json::to_value(sent[0]).unwrap(),
                 serde_json::to_value(users[1]).unwrap(),
                 "minted identity/time/body reach provider and checkpoint unchanged"
             );
@@ -2785,10 +2796,99 @@ mod constructor_parity_tests {
             assert!(!requests.is_empty());
             let sent = requests[0]
                 .iter()
-                .filter(|m| m.role == Role::User)
+                .filter(|m| m.role == Role::User && m.id == users[0].id)
                 .collect::<Vec<_>>();
-            assert_eq!(sent.len(), 1);
+            assert_eq!(
+                sent.len(),
+                1,
+                "supplied historical User reaches provider once"
+            );
             assert_eq!(serde_json::to_value(sent[0]).unwrap(), expected);
+        }
+    }
+
+    #[derive(Default)]
+    struct PendingProvider {
+        requests: Mutex<Vec<Vec<Message>>>,
+        started: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl LLMProvider for PendingProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            self.started.notify_one();
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+
+    #[tokio::test]
+    async fn constructor_parity_sdk_cancellation_keeps_the_consumed_fresh_user() {
+        for streaming in [false, true] {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let root = tempfile::tempdir().unwrap();
+                let provider = Arc::new(PendingProvider::default());
+                let agent = agent(root.path(), provider.clone()).await;
+                let id = format!("constructor-sdk-cancel-{streaming}");
+                let mut session = Session::new(&id, "claude-test");
+                let converted = Arc::new(AtomicUsize::new(0));
+                let input = ObservedInput(converted.clone());
+                if streaming {
+                    let (mut rx, cancel) = agent.run_stream_cancellable(session, input);
+                    assert_eq!(converted.load(Ordering::SeqCst), 1);
+                    provider.started.notified().await;
+                    cancel.cancel();
+                    let (mut errors, mut complete, mut cancelled) = (0, 0, 0);
+                    while let Some(event) = rx.recv().await {
+                        errors += usize::from(matches!(event, AgentEvent::Error { .. }));
+                        complete += usize::from(matches!(event, AgentEvent::Complete { .. }));
+                        cancelled += usize::from(matches!(event, AgentEvent::Cancelled { .. }));
+                    }
+                    assert_eq!(
+                        (errors, complete, cancelled),
+                        (0, 0, 0),
+                        "original SDK cancellation closes the stream without a terminal event"
+                    );
+                } else {
+                    let cancel = CancellationToken::new();
+                    let stop = cancel.clone();
+                    let execution = agent.clone();
+                    let task = tokio::spawn(async move {
+                        execution.run_with_cancel(&mut session, input, cancel).await
+                    });
+                    provider.started.notified().await;
+                    stop.cancel();
+                    assert!(matches!(task.await.unwrap(), Err(AgentError::Cancelled)));
+                }
+                assert_eq!(converted.load(Ordering::SeqCst), 1);
+                let persisted = agent.storage().load_session(&id).await.unwrap().unwrap();
+                let users = persisted
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == Role::User)
+                    .collect::<Vec<_>>();
+                assert_eq!(users.len(), 1);
+                assert_eq!(users[0].content, "fresh 原样\n\"input\"");
+                let requests = provider.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                let sent = requests[0]
+                    .iter()
+                    .filter(|m| m.role == Role::User && m.id == users[0].id)
+                    .collect::<Vec<_>>();
+                assert_eq!(sent.len(), 1);
+                assert_eq!(
+                    serde_json::to_value(users[0]).unwrap(),
+                    serde_json::to_value(sent[0]).unwrap()
+                );
+            })
+            .await
+            .expect("actual provider cancellation must terminate");
         }
     }
 }
