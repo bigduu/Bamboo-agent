@@ -236,13 +236,26 @@ pub enum WorkflowStepStatus {
     Skipped,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowBudgetUsage {
     pub steps: u32,
     pub retries: u32,
     pub agents: u32,
     pub tokens: u64,
-    pub cost_micros: u64,
+    /// None means the execution has no monetary measurement.
+    pub cost_micros: Option<u64>,
+}
+
+impl Default for WorkflowBudgetUsage {
+    fn default() -> Self {
+        Self {
+            steps: 0,
+            retries: 0,
+            agents: 0,
+            tokens: 0,
+            cost_micros: Some(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -380,4 +393,28 @@ fn default_empty_object() -> Value {
 pub struct WorkflowProgress {
     pub snapshot: WorkflowRunSnapshot,
     pub events: Vec<WorkflowRunEvent>,
+}
+
+#[cfg(test)]
+mod usage_compatibility_tests {
+    use super::*;
+    #[test]
+    fn workflow_agent_unknown_cost_is_null_and_old_numeric_usage_still_loads() {
+        let mut usage = WorkflowBudgetUsage::default();
+        assert_eq!(serde_json::to_value(&usage).unwrap()["cost_micros"], 0);
+        usage.cost_micros = None;
+        let unknown = serde_json::to_value(&usage).unwrap();
+        assert!(unknown["cost_micros"].is_null());
+        assert_eq!(
+            serde_json::from_value::<WorkflowBudgetUsage>(unknown).unwrap(),
+            usage
+        );
+        let old = serde_json::json!({"steps":1,"retries":0,"agents":1,"tokens":12,"cost_micros":2});
+        assert_eq!(
+            serde_json::from_value::<WorkflowBudgetUsage>(old)
+                .unwrap()
+                .cost_micros,
+            Some(2)
+        );
+    }
 }

@@ -664,10 +664,16 @@ struct MockAgents;
 
 #[async_trait]
 impl AgentStepPort for MockAgents {
-    async fn resolve(&self, name: &str) -> Result<Option<NamedAgentSpec>, String> {
+    async fn resolve(
+        &self,
+        name: &str,
+        _session_id: &str,
+    ) -> Result<Option<NamedAgentSpec>, String> {
         Ok((name == "reviewer").then(|| NamedAgentSpec {
             name: name.to_string(),
             allowed_capabilities: BTreeSet::from(["read".to_string()]),
+            profile: None,
+            cost_supported: true,
         }))
     }
 
@@ -679,11 +685,15 @@ impl AgentStepPort for MockAgents {
         _effort: Option<&str>,
         _capabilities: &BTreeSet<String>,
         _session_id: &str,
+        _root_run_id: &str,
+        _cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<AgentStepResult, String> {
         Ok(AgentStepResult {
             output: json!({"reviewed": prompt}),
             tokens: 10,
-            cost_micros: 2,
+            cost_micros: Some(2),
+            attempt_id: None,
+            failure: None,
         })
     }
 }
@@ -692,11 +702,17 @@ struct CountingAgents(AtomicUsize);
 
 #[async_trait]
 impl AgentStepPort for CountingAgents {
-    async fn resolve(&self, name: &str) -> Result<Option<NamedAgentSpec>, String> {
+    async fn resolve(
+        &self,
+        name: &str,
+        _session_id: &str,
+    ) -> Result<Option<NamedAgentSpec>, String> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(Some(NamedAgentSpec {
             name: name.to_string(),
             allowed_capabilities: BTreeSet::from(["read".to_string()]),
+            profile: None,
+            cost_supported: true,
         }))
     }
 
@@ -708,11 +724,15 @@ impl AgentStepPort for CountingAgents {
         _effort: Option<&str>,
         _capabilities: &BTreeSet<String>,
         _session_id: &str,
+        _root_run_id: &str,
+        _cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<AgentStepResult, String> {
         Ok(AgentStepResult {
             output: prompt,
             tokens: 1,
-            cost_micros: 1,
+            cost_micros: Some(1),
+            attempt_id: None,
+            failure: None,
         })
     }
 }
@@ -2721,7 +2741,7 @@ async fn agent_and_actual_usage_limits_are_persisted_before_failure() {
         WorkflowFailureCode::BudgetExceeded
     );
     assert_eq!(failed.usage.tokens, 10);
-    assert_eq!(failed.usage.cost_micros, 2);
+    assert_eq!(failed.usage.cost_micros, Some(2));
     let persisted = engine.progress(&failed.run_id, 0).await.unwrap().snapshot;
     assert_eq!(persisted.usage, failed.usage);
 }
@@ -2732,10 +2752,16 @@ async fn zero_token_or_cost_budget_fails_before_agent_dispatch() {
 
     #[async_trait]
     impl AgentStepPort for ExecutionCountingAgents {
-        async fn resolve(&self, name: &str) -> Result<Option<NamedAgentSpec>, String> {
+        async fn resolve(
+            &self,
+            name: &str,
+            _session_id: &str,
+        ) -> Result<Option<NamedAgentSpec>, String> {
             Ok(Some(NamedAgentSpec {
                 name: name.to_string(),
                 allowed_capabilities: BTreeSet::from(["read".to_string()]),
+                profile: None,
+                cost_supported: true,
             }))
         }
 
@@ -2747,12 +2773,16 @@ async fn zero_token_or_cost_budget_fails_before_agent_dispatch() {
             _effort: Option<&str>,
             _capabilities: &BTreeSet<String>,
             _session_id: &str,
+            _root_run_id: &str,
+            _cancellation: tokio_util::sync::CancellationToken,
         ) -> Result<AgentStepResult, String> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(AgentStepResult {
                 output: json!({"unexpected": true}),
                 tokens: 1,
-                cost_micros: 1,
+                cost_micros: Some(1),
+                attempt_id: None,
+                failure: None,
             })
         }
     }
@@ -2798,7 +2828,7 @@ async fn zero_token_or_cost_budget_fails_before_agent_dispatch() {
             WorkflowFailureCode::BudgetExceeded
         );
         assert_eq!(failed.usage.tokens, 0);
-        assert_eq!(failed.usage.cost_micros, 0);
+        assert_eq!(failed.usage.cost_micros, Some(0));
     }
     assert_eq!(
         executions.load(Ordering::SeqCst),
@@ -2956,7 +2986,10 @@ async fn omitted_definition_usage_limits_inherit_server_ceilings() {
         failed.failure.as_ref().unwrap().code,
         WorkflowFailureCode::BudgetExceeded
     );
-    assert_eq!((failed.usage.tokens, failed.usage.cost_micros), (10, 2));
+    assert_eq!(
+        (failed.usage.tokens, failed.usage.cost_micros),
+        (10, Some(2))
+    );
 }
 
 #[tokio::test]
@@ -3147,4 +3180,495 @@ async fn unowned_running_tool_is_killed_before_workflow_suspends() {
             .await,
         Err(WorkflowRunError::Preflight(_))
     ));
+}
+
+struct UnpricedWorkflowAgents {
+    calls: AtomicUsize,
+    fail: bool,
+}
+
+#[async_trait]
+impl AgentStepPort for UnpricedWorkflowAgents {
+    async fn resolve(
+        &self,
+        name: &str,
+        _session_id: &str,
+    ) -> Result<Option<NamedAgentSpec>, String> {
+        Ok(Some(NamedAgentSpec {
+            name: name.into(),
+            allowed_capabilities: BTreeSet::from(["read".into()]),
+            profile: None,
+            cost_supported: false,
+        }))
+    }
+    async fn execute(
+        &self,
+        _spec: &NamedAgentSpec,
+        _prompt: Value,
+        _model: Option<&str>,
+        _effort: Option<&str>,
+        _capabilities: &BTreeSet<String>,
+        _session_id: &str,
+        _root_run_id: &str,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<AgentStepResult, String> {
+        let index = self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(AgentStepResult {
+            output: if index == 0 {
+                json!("invalid")
+            } else {
+                json!({"ok":true})
+            },
+            tokens: if index == 0 { 17 } else { 23 },
+            cost_micros: None,
+            attempt_id: None,
+            failure: self.fail.then(|| WorkflowFailure {
+                code: WorkflowFailureCode::ExecutionFailed,
+                message: "child failed after provider usage".into(),
+                retryable: false,
+            }),
+        })
+    }
+}
+
+fn workflow_agent_step() -> WorkflowStepDefinition {
+    WorkflowStepDefinition {
+        id: "review".into(),
+        kind: WorkflowStepKind::Agent {
+            agent: "reviewer".into(),
+            prompt: json!({"from":"args","pointer":""}),
+            model: None,
+            effort: None,
+            capabilities: vec!["read".into()],
+            structured_output_attempts: 2,
+        },
+        failure: FailurePolicy::FailFast,
+        output_schema: Some(
+            json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}),
+        ),
+    }
+}
+
+fn unpriced_workflow_engine(
+    directory: &std::path::Path,
+    agents: Arc<dyn AgentStepPort>,
+) -> Arc<WorkflowRunEngine> {
+    let mut limits = budgets();
+    limits.max_cost_micros = None;
+    WorkflowRunEngine::new(
+        Arc::new(FileWorkflowRunRepository::new(directory.to_path_buf()).unwrap()),
+        Arc::new(MockTools),
+        agents,
+        Arc::new(MockDefinitions::default()),
+        Arc::new(MockPolicy),
+        Arc::new(MockSecrets),
+        limits,
+    )
+}
+
+#[tokio::test]
+async fn workflow_agent_unpriced_finite_money_is_rejected_before_dispatch() {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(UnpricedWorkflowAgents {
+        calls: AtomicUsize::new(0),
+        fail: false,
+    });
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    assert!(matches!(
+        engine.run(request(workflow, json!({}))).await,
+        Err(WorkflowRunError::UnsupportedMonetaryBudget)
+    ));
+    assert_eq!(agents.calls.load(Ordering::SeqCst), 0);
+    assert!(engine.list_run_ids().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn workflow_agent_unpriced_structured_retries_accumulate_usage_with_null_cost() {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(UnpricedWorkflowAgents {
+        calls: AtomicUsize::new(0),
+        fail: false,
+    });
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let mut workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    workflow.budgets.max_cost_micros = None;
+    let result = engine.run(request(workflow, json!({}))).await.unwrap();
+    assert_eq!(result.status, WorkflowRunStatus::Succeeded);
+    assert_eq!(result.usage.tokens, 40);
+    assert_eq!(result.usage.agents, 2);
+    assert_eq!(result.usage.cost_micros, None);
+    assert!(serde_json::to_value(&result.usage).unwrap()["cost_micros"].is_null());
+    assert_eq!(
+        engine
+            .progress(&result.run_id, 0)
+            .await
+            .unwrap()
+            .snapshot
+            .usage,
+        result.usage
+    );
+}
+
+#[tokio::test]
+async fn workflow_agent_unpriced_failed_attempt_retains_observed_usage() {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(UnpricedWorkflowAgents {
+        calls: AtomicUsize::new(0),
+        fail: true,
+    });
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let mut workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    workflow.budgets.max_cost_micros = None;
+    let result = engine.run(request(workflow, json!({}))).await.unwrap();
+    assert_eq!(result.status, WorkflowRunStatus::Failed);
+    assert_eq!(result.usage.tokens, 17);
+    assert_eq!(result.usage.cost_micros, None);
+    assert_eq!(agents.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn workflow_agent_unpriced_token_limit_is_accounted_after_provider_and_prevents_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(UnpricedWorkflowAgents {
+        calls: AtomicUsize::new(0),
+        fail: false,
+    });
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let mut workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    workflow.budgets.max_cost_micros = None;
+    workflow.budgets.max_tokens = Some(10);
+    let result = engine.run(request(workflow, json!({}))).await.unwrap();
+    assert_eq!(result.status, WorkflowRunStatus::Failed);
+    assert_eq!(
+        result.failure.unwrap().code,
+        WorkflowFailureCode::BudgetExceeded
+    );
+    assert_eq!(
+        result.usage.tokens, 17,
+        "provider completion can exceed cap; no next attempt is admitted"
+    );
+    assert_eq!(agents.calls.load(Ordering::SeqCst), 1);
+}
+
+struct DrainingWorkflowAgents {
+    started: tokio::sync::Semaphore,
+    stopped: tokio::sync::Semaphore,
+    cancellation: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    consumed: AtomicBool,
+    missing_usage: bool,
+}
+
+impl DrainingWorkflowAgents {
+    fn new(missing_usage: bool) -> Self {
+        Self {
+            started: tokio::sync::Semaphore::new(0),
+            stopped: tokio::sync::Semaphore::new(0),
+            cancellation: std::sync::Mutex::new(None),
+            consumed: AtomicBool::new(false),
+            missing_usage,
+        }
+    }
+}
+
+#[async_trait]
+impl AgentStepPort for DrainingWorkflowAgents {
+    async fn resolve(
+        &self,
+        name: &str,
+        _session_id: &str,
+    ) -> Result<Option<NamedAgentSpec>, String> {
+        Ok(Some(NamedAgentSpec {
+            name: name.into(),
+            allowed_capabilities: BTreeSet::from(["read".into()]),
+            profile: None,
+            cost_supported: false,
+        }))
+    }
+    async fn execute(
+        &self,
+        _spec: &NamedAgentSpec,
+        _prompt: Value,
+        _model: Option<&str>,
+        _effort: Option<&str>,
+        _capabilities: &BTreeSet<String>,
+        _session_id: &str,
+        _root_run_id: &str,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<AgentStepResult, String> {
+        *self.cancellation.lock().unwrap() = Some(cancellation.clone());
+        let _on_drop = cancellation.clone().drop_guard();
+        self.started.add_permits(1);
+        cancellation.cancelled().await;
+        let permit = self.stopped.acquire().await.unwrap();
+        permit.forget();
+        Err("cancelled attempt usage is consumed by drain".into())
+    }
+    async fn drain_cancelled(
+        &self,
+        _root_run_id: &str,
+    ) -> (Vec<Result<AgentStepResult, String>>, Option<String>) {
+        let token = self.cancellation.lock().unwrap().clone();
+        if !token.is_some_and(|token| token.is_cancelled()) {
+            return (vec![], None);
+        }
+        let permit = self.stopped.acquire().await.unwrap();
+        permit.forget();
+        if self.consumed.swap(true, Ordering::SeqCst) {
+            return (vec![], None);
+        }
+        (
+            vec![if self.missing_usage {
+                Err("cumulative token observation unavailable".into())
+            } else {
+                Ok(AgentStepResult {
+                    output: Value::Null,
+                    tokens: 17,
+                    cost_micros: None,
+                    attempt_id: None,
+                    failure: None,
+                })
+            }],
+            None,
+        )
+    }
+}
+
+#[tokio::test]
+async fn workflow_agent_cancel_waits_for_stop_and_retains_cancelled_usage() {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(DrainingWorkflowAgents::new(false));
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let mut workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    workflow.budgets.max_cost_micros = None;
+    let running = engine.start(request(workflow, json!({}))).await.unwrap();
+    agents.started.acquire().await.unwrap().forget();
+    let cancelling = {
+        let engine = engine.clone();
+        let id = running.run_id.clone();
+        tokio::spawn(async move { engine.cancel(&id).await })
+    };
+    tokio::task::yield_now().await;
+    assert_eq!(
+        engine
+            .progress(&running.run_id, 0)
+            .await
+            .unwrap()
+            .snapshot
+            .status,
+        WorkflowRunStatus::Running
+    );
+    assert!(!cancelling.is_finished());
+    agents.stopped.add_permits(8);
+    let cancelled = cancelling.await.unwrap().unwrap();
+    assert_eq!(cancelled.status, WorkflowRunStatus::Cancelled);
+    assert_eq!(cancelled.usage.tokens, 17);
+    assert_eq!(cancelled.usage.cost_micros, None);
+}
+
+#[tokio::test]
+async fn workflow_agent_wall_time_waits_for_child_stop_and_accounts_usage() {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(DrainingWorkflowAgents::new(false));
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let mut workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    workflow.budgets.max_cost_micros = None;
+    workflow.budgets.wall_time_ms = 10_000;
+    let running = engine.start(request(workflow, json!({}))).await.unwrap();
+    agents.started.acquire().await.unwrap().forget();
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_millis(10_000)).await;
+    let token = agents.cancellation.lock().unwrap().clone().unwrap();
+    token.cancelled().await;
+    assert_eq!(
+        engine
+            .progress(&running.run_id, 0)
+            .await
+            .unwrap()
+            .snapshot
+            .status,
+        WorkflowRunStatus::Running
+    );
+    agents.stopped.add_permits(8);
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let snapshot = engine.progress(&running.run_id, 0).await.unwrap().snapshot;
+            if snapshot.status.is_terminal() {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal.failure.unwrap().code,
+        WorkflowFailureCode::BudgetExceeded
+    );
+    assert_eq!(terminal.usage.tokens, 17);
+}
+
+#[tokio::test]
+async fn workflow_agent_stopped_missing_usage_fails_without_permanent_cleanup_pending() {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(DrainingWorkflowAgents::new(true));
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let mut workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    workflow.budgets.max_cost_micros = None;
+    let running = engine.start(request(workflow, json!({}))).await.unwrap();
+    agents.started.acquire().await.unwrap().forget();
+    let cancelling = {
+        let engine = engine.clone();
+        let id = running.run_id.clone();
+        tokio::spawn(async move { engine.cancel(&id).await })
+    };
+    tokio::task::yield_now().await;
+    agents.stopped.add_permits(8);
+    let failed = cancelling.await.unwrap().unwrap();
+    assert_eq!(failed.status, WorkflowRunStatus::Failed);
+    assert_eq!(
+        failed.failure.unwrap().code,
+        WorkflowFailureCode::ExecutionFailed
+    );
+    assert_eq!(failed.usage.cost_micros, None);
+}
+
+struct RetainedWorkflowAgents {
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    returned: tokio::sync::Semaphore,
+    retained: AtomicBool,
+}
+
+impl RetainedWorkflowAgents {
+    fn result() -> AgentStepResult {
+        AgentStepResult {
+            output: json!({"ok": true}),
+            tokens: 17,
+            cost_micros: None,
+            failure: None,
+            attempt_id: Some("retained-attempt".into()),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentStepPort for RetainedWorkflowAgents {
+    async fn resolve(
+        &self,
+        name: &str,
+        _session_id: &str,
+    ) -> Result<Option<NamedAgentSpec>, String> {
+        Ok(Some(NamedAgentSpec {
+            name: name.into(),
+            allowed_capabilities: BTreeSet::from(["read".into()]),
+            profile: None,
+            cost_supported: false,
+        }))
+    }
+    async fn execute(
+        &self,
+        _spec: &NamedAgentSpec,
+        _prompt: Value,
+        _model: Option<&str>,
+        _effort: Option<&str>,
+        _capabilities: &BTreeSet<String>,
+        _session_id: &str,
+        _root_run_id: &str,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<AgentStepResult, String> {
+        self.started.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        self.retained.store(true, Ordering::SeqCst);
+        self.returned.add_permits(1);
+        Ok(Self::result())
+    }
+    fn acknowledge_result(&self, _id: &str) -> bool {
+        self.retained.swap(false, Ordering::SeqCst)
+    }
+    async fn drain_cancelled(
+        &self,
+        _run: &str,
+    ) -> (Vec<Result<AgentStepResult, String>>, Option<String>) {
+        (
+            if self.retained.swap(false, Ordering::SeqCst) {
+                vec![Ok(Self::result())]
+            } else {
+                vec![]
+            },
+            None,
+        )
+    }
+}
+
+async fn workflow_agent_handoff_control(wall_timeout: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(RetainedWorkflowAgents {
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        returned: tokio::sync::Semaphore::new(0),
+        retained: AtomicBool::new(false),
+    });
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let mut workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    workflow.budgets.max_cost_micros = None;
+    let running = engine.start(request(workflow, json!({}))).await.unwrap();
+    agents.started.acquire().await.unwrap().forget();
+    let (active_ledger, cancellation) = engine.test_active_ledger(&running.run_id);
+    let ledger = active_ledger.lock().await;
+    agents.release.add_permits(1);
+    agents.returned.acquire().await.unwrap().forget();
+    // The result exists, but its handoff cannot commit while this ledger is held.
+    tokio::task::yield_now().await;
+    let cancel = if wall_timeout {
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        cancellation.cancelled().await;
+        None
+    } else {
+        let engine = engine.clone();
+        let id = running.run_id.clone();
+        let task = tokio::spawn(async move { engine.cancel(&id).await });
+        cancellation.cancelled().await;
+        Some(task)
+    };
+    drop(ledger);
+    if let Some(cancel) = cancel {
+        cancel.await.unwrap().unwrap();
+    }
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = engine.progress(&running.run_id, 0).await.unwrap().snapshot;
+            if snapshot.status.is_terminal() && !engine.is_run_active(&running.run_id) {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal.usage.tokens, 17,
+        "exactly one result handoff survives cancellation/drop"
+    );
+    assert_eq!(terminal.usage.cost_micros, None);
+    assert_eq!(
+        terminal.status,
+        if wall_timeout {
+            WorkflowRunStatus::Failed
+        } else {
+            WorkflowRunStatus::Cancelled
+        }
+    );
+    assert!(!agents.retained.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn workflow_agent_result_handoff_cancel_counts_once() {
+    workflow_agent_handoff_control(false).await;
+}
+
+#[tokio::test]
+async fn workflow_agent_result_handoff_timeout_retains_usage() {
+    workflow_agent_handoff_control(true).await;
 }

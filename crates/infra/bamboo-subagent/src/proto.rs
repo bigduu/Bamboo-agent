@@ -76,6 +76,48 @@ pub struct RunSpec {
     pub secrets: RunSecrets,
 }
 
+/// Host-selected Workflow usage observation on the existing activation event lane.
+/// Counts use canonical runtime accounting (provider-first, estimate fallback),
+/// not monetary billing. This observation grants no execution authority.
+pub const WORKFLOW_USAGE_REQUESTED_KEY: &str = "workflow.agent_usage_requested.v1";
+pub const WORKFLOW_USAGE_OBSERVATION_KEY: &str = "workflow.agent_usage_observation.v1";
+/// Host-only proof that the selected current activation delivered an accepted terminal.
+pub const WORKFLOW_TERMINAL_OBSERVATION_KEY: &str = "workflow.agent_terminal_observation.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAgentUsage {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub activation_run_id: String,
+    pub child_session_id: String,
+    pub child_created_at: chrono::DateTime<chrono::Utc>,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+impl WorkflowAgentUsage {
+    pub const TYPE: &'static str = "workflow_agent_usage";
+
+    pub fn matches(&self, child: &bamboo_domain::Session, activation: &str) -> bool {
+        self.kind == Self::TYPE
+            && !activation.is_empty()
+            && self.activation_run_id == activation
+            && self.child_session_id == child.id
+            && self.child_created_at == child.created_at
+    }
+
+    pub fn from_session(child: &bamboo_domain::Session, activation: &str) -> Option<Self> {
+        let usage: Self =
+            serde_json::from_str(child.metadata.get(WORKFLOW_USAGE_OBSERVATION_KEY)?).ok()?;
+        usage.matches(child, activation).then_some(usage)
+    }
+
+    pub fn total_tokens(&self) -> u64 {
+        self.prompt_tokens.saturating_add(self.completion_tokens)
+    }
+}
+
 /// Actual worker message suffix, carried in the existing sequenced event lane.
 /// This cache observation grants nothing; the Host separately validates its
 /// current callable ceiling, event trace and fenced canonical append.
@@ -977,6 +1019,33 @@ impl ChildFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_agent_usage_is_bound_to_current_activation_and_birth() {
+        let mut child = bamboo_domain::Session::new("child", "model");
+        child.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new(""));
+        let usage = WorkflowAgentUsage {
+            kind: WorkflowAgentUsage::TYPE.into(),
+            activation_run_id: "activation".into(),
+            child_session_id: child.id.clone(),
+            child_created_at: child.created_at,
+            prompt_tokens: 24,
+            completion_tokens: 12,
+        };
+        child.metadata.insert(
+            WORKFLOW_USAGE_OBSERVATION_KEY.into(),
+            serde_json::to_string(&usage).unwrap(),
+        );
+        assert_eq!(
+            WorkflowAgentUsage::from_session(&child, "activation")
+                .unwrap()
+                .total_tokens(),
+            36
+        );
+        assert!(WorkflowAgentUsage::from_session(&child, "next-activation").is_none());
+        child.created_at += chrono::Duration::seconds(1);
+        assert!(WorkflowAgentUsage::from_session(&child, "activation").is_none());
+    }
 
     #[test]
     fn local_tool_messages_are_closed_bounded_and_durable() {
