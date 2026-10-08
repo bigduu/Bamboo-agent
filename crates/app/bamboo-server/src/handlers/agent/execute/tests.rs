@@ -281,7 +281,11 @@ mod execution_input_http {
         }
         (home, web::Data::new(state))
     }
-    async fn chat(state: &web::Data<crate::AppState>, id: &str, input: Option<&str>) {
+    async fn chat(
+        state: &web::Data<crate::AppState>,
+        id: &str,
+        input: Option<&str>,
+    ) -> serde_json::Value {
         let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
         let entry = catalog
             .entries
@@ -316,6 +320,7 @@ mod execution_input_http {
             "actual Chat producer: {}",
             String::from_utf8_lossy(&body)
         );
+        serde_json::from_slice(&body).unwrap()
     }
     async fn execute(
         state: &web::Data<crate::AppState>,
@@ -346,6 +351,54 @@ mod execution_input_http {
         assert_eq!(request.selections[0].args, serde_json::json!({}));
         assert!(request.selections[0].revision > 0);
     }
+    #[actix_web::test]
+    async fn native_inbox_real_chat_receipt_checkpoint_ack_and_current_input_once() {
+        let (_home, state) = state(None).await;
+        let id = "native-inbox-real-consumer";
+        let response = chat(&state, id, None).await;
+        let input = response["message_id"]
+            .as_str()
+            .expect("Native Chat returns its actual Inbox receipt");
+        assert!(response["ingress_seq"].as_u64().unwrap() > 0);
+        let before = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(!before
+            .messages
+            .iter()
+            .any(|m| m.role == bamboo_agent_core::Role::User));
+        assert!(!before.metadata.contains_key("chat.queued_ingress.v1"));
+        assert!(!before.title_generated);
+        assert!(state
+            .session_inbox
+            .inspect(id)
+            .await
+            .unwrap()
+            .activation_pending());
+        let inputs = crate::handlers::agent::chat::admit_for_execute(&state, id)
+            .await
+            .unwrap()
+            .expect("real checked New admission supplies current data");
+        only_id(&inputs, input);
+        let admitted = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            admitted.messages.iter().filter(|m| m.id == input).count(),
+            1
+        );
+        assert!(state
+            .session_inbox
+            .was_admitted(id, &SessionMessageId::parse(input).unwrap())
+            .await
+            .unwrap());
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 0);
+        drop(inputs);
+        assert!(
+            crate::handlers::agent::chat::admit_for_execute(&state, id)
+                .await
+                .unwrap()
+                .is_none(),
+            "NoNew retry cannot mint current data from canonical history"
+        );
+    }
+
     #[actix_web::test]
     async fn execution_input_http_actual_queue_admission_returns_only_this_calls_new_user() {
         let (_home, state) = state(None).await;
