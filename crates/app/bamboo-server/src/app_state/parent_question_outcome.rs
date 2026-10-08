@@ -13,7 +13,7 @@ use bamboo_domain::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum State {
     Pending,
-    Terminal(ParentQuestionResolution),
+    Terminal(Box<ParentQuestionResolution>),
 }
 
 pub(super) fn state(
@@ -23,7 +23,7 @@ pub(super) fn state(
 ) -> Result<State, ()> {
     if let Some(resolution) = ParentQuestionResolution::from_child(parent, child, &question.id) {
         if resolution.request == *question {
-            return Ok(State::Terminal(resolution));
+            return Ok(State::Terminal(Box::new(resolution)));
         }
         return Err(());
     }
