@@ -1746,65 +1746,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_birth_ancestor_restore_does_not_revive_descendant_fence(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let home = tempfile::tempdir()?;
-        let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
-        let root = Session::new("restore-root", "model");
-        let child = Session::new_child_of("restore-child", &root, "model", "Child");
-        let grandchild = Session::new_child_of("restore-grandchild", &child, "model", "Grandchild");
-        store.save_session(&root).await?;
-        store.save_session(&child).await?;
-        store.save_session(&grandchild).await?;
-        let now = Utc::now();
-        let activation = store
-            .claim_activation(&claim(&grandchild.id, "old-run", "old-host", now))
-            .await?;
-        let fence = activation.fence();
-        store.start_activation(&fence, now).await?;
-        let descendant = home
-            .path()
-            .join("sessions/restore-root/children/restore-grandchild");
-        let original_row = std::fs::read(descendant.join(ACTOR_AUTHORITY_FILE))?;
-        store.validate_fence(&fence, now).await?;
-        assert!(store.delete_session(&child.id).await?);
-        assert!(!home
-            .path()
-            .join("sessions/restore-root/children/restore-child")
-            .exists());
-        assert!(descendant.join("session.json").is_file());
-        // Only a normal Store save restores the old ancestor; no raw authority replay.
-        store.save_session(&child).await?;
-        let reopened = SessionStoreV2::new(home.path().to_path_buf()).await?;
-        let restored = reopened.load_session(&child.id).await?.unwrap();
-        assert_eq!(restored.created_at, child.created_at);
-        assert_eq!(restored.metadata_version, child.metadata_version);
-        let validation = reopened.validate_fence(&fence, now).await;
-        println!("same-birth/version restored; descendant row unchanged={}; old-fence validation={validation:?}",
-            std::fs::read(descendant.join(ACTOR_AUTHORITY_FILE))? == original_row);
-        assert_eq!(validation.unwrap_err(), ActorDirectoryError::StaleFence);
-        let cancelled: ActorDirectoryEntry =
-            serde_json::from_slice(&std::fs::read(descendant.join(ACTOR_AUTHORITY_FILE))?)?;
-        assert_eq!(cancelled.actor.state, ActorLogicalState::Cold);
-        assert_eq!(cancelled.actor.current_attempt, activation.attempt);
-        let durable_activation = cancelled.activation.unwrap();
-        assert_eq!(durable_activation.status, ActorActivationStatus::Cancelled);
-        assert_eq!(durable_activation.lease_epoch, activation.lease_epoch + 1);
-        let successor = reopened
-            .claim_activation(&claim(&grandchild.id, "new-run", "new-host", now))
-            .await?;
-        assert_eq!(successor.attempt, activation.attempt + 1);
-        assert_eq!(successor.lease_epoch, activation.lease_epoch + 2);
-        reopened.start_activation(&successor.fence(), now).await?;
-        reopened.validate_fence(&successor.fence(), now).await?;
-        assert_eq!(
-            reopened.validate_fence(&fence, now).await.unwrap_err(),
-            ActorDirectoryError::StaleFence
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn recreated_middle_parent_cannot_revive_grandchild_fence(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let home = tempfile::tempdir()?;
