@@ -196,7 +196,6 @@ mod input_request_batch_tests {
                 + 4096 * std::mem::size_of::<bamboo_domain::SessionSkillSelection>()
                 + std::mem::size_of::<BoundedInputRequestBatch>()
         );
-        assert!(INPUT_REQUEST_FIXED_SLOT_BYTES > 0);
         println!(
             "compiled fixed slots={} Record={} Selection={} Batch={}",
             INPUT_REQUEST_FIXED_SLOT_BYTES,
