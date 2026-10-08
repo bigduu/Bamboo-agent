@@ -15,8 +15,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: never
       BAMBOO_FRONTEND_BUILD_MODE: api-only
-      CARGO_TARGET_DIR: ${{ runner.temp }}/bamboo1630-target
-      CARGO_BUILD_BUILD_DIR: ${{ runner.temp }}/bamboo1630-build
       BEFORE_SHA: ba3e2dfe37c52f4ca9d0b33955501d8c61c412c8
       AFTER_SHA: 723e2430c7dbfdf529e18fdac7a75428abba54c2
     steps:
@@ -28,6 +26,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.99.0
+      - name: Set proof build directories
+        shell: bash
+        run: |
+          printf 'CARGO_TARGET_DIR=%s/bamboo1630-target\nCARGO_BUILD_BUILD_DIR=%s/bamboo1630-build\n' "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Cache proof artifacts
         uses: swatinem/rust-cache@v2
         with:
