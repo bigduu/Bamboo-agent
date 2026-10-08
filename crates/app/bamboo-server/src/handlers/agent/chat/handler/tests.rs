@@ -50,9 +50,9 @@ async fn ql_http_existing_queue_fit_or_overflow_keeps_prefix_events_and_pending_
         }
         let mut ids = Vec::new();
         while let Ok(change) = feed.try_recv() {
-            if let bamboo_agent_core::AgentEvent::MessageAppended { message_id, .. } = change.event
+            if let bamboo_agent_core::AgentEvent::MessageAppended { message_id, .. } = &change.event
             {
-                ids.push(message_id);
+                ids.push(message_id.clone());
             }
         }
         assert_eq!(
