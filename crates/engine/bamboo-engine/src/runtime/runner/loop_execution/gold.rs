@@ -1150,6 +1150,7 @@ mod tests {
         let mut state = crate::runtime::runner::loop_execution::startup::LoopRunState {
             session_id: "session-gold-eval".to_string(),
             execution_id: "gold-eval-execution".to_string(),
+            current_inputs: None,
             model_name: "model".to_string(),
             metrics_collector: None,
             debug_logger: crate::runtime::runner::logging::DebugLogger::new(false),

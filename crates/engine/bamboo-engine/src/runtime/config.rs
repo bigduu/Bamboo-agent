@@ -376,6 +376,13 @@ impl UntrustedInputObservation {
 #[derive(Debug)]
 pub struct UntrustedExecutionInputs {
     observations: Box<[UntrustedInputObservation]>,
+    startup: std::sync::Mutex<Option<StartupInputObservation>>,
+}
+
+#[derive(Debug)]
+struct StartupInputObservation {
+    execution_id: String,
+    observation: crate::runtime::managers::lifecycle::InputObservation,
 }
 
 impl UntrustedExecutionInputs {
@@ -389,11 +396,78 @@ impl UntrustedExecutionInputs {
         }
         Some(Self {
             observations: observations.into_boxed_slice(),
+            startup: std::sync::Mutex::new(None),
         })
     }
 
     pub fn observations(&self) -> &[UntrustedInputObservation] {
         &self.observations
+    }
+
+    /// Additive checked boundary companion. Original public refresh layout stays
+    /// unchanged; the caller still performs its original error/persist checks.
+    /// An unavailable projection changes only this optional data handoff.
+    pub async fn admit_with_startup_observation(
+        session: &mut bamboo_agent_core::Session,
+        storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
+        persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+        inbox: Option<&Arc<dyn bamboo_domain::SessionInboxPort>>,
+    ) -> (crate::runtime::runner::TurnBoundaryRefresh, Option<Self>) {
+        let execution_id = crate::runtime::runner::round_prelude::new_execution_id();
+        let (refresh, observation) =
+            crate::runtime::runner::state_bridge::refresh_turn_boundary_with_observation(
+                session,
+                storage,
+                persistence,
+                inbox,
+                None,
+                &execution_id,
+            )
+            .await;
+        // Compatibility slice is created only after complete aggregate fit.
+        // It retains one extra initial IE view: bounded slots and args AST,
+        // whose compact payload fits the same cap (not a heap/RSS bound).
+        let carrier = observation
+            .new_inputs()
+            .and_then(|batch| {
+                Self::new(
+                    batch
+                        .records()
+                        .iter()
+                        .map(|record| {
+                            Some(UntrustedInputObservation {
+                                input_id: bamboo_domain::SessionMessageId::parse(
+                                    record.input_id.clone(),
+                                )
+                                .ok()?,
+                                request: record.request.clone(),
+                            })
+                        })
+                        .collect::<Option<Vec<_>>>()?,
+                )
+            })
+            .map(|mut carrier| {
+                carrier.startup = std::sync::Mutex::new(Some(StartupInputObservation {
+                    execution_id,
+                    observation,
+                }));
+                carrier
+            });
+        (refresh, carrier)
+    }
+
+    pub(crate) fn take_startup_observation(
+        &self,
+        session_id: &str,
+    ) -> Option<(
+        String,
+        crate::runtime::managers::lifecycle::InputObservation,
+    )> {
+        let startup = self.startup.lock().ok()?.take()?;
+        startup
+            .observation
+            .matches_session(session_id)
+            .then_some((startup.execution_id, startup.observation))
     }
 
     /// Caller supplies ONLY this call's newly checkpointed messages, after its

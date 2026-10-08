@@ -273,13 +273,14 @@ pub(crate) async fn admit_for_execute(
     };
     let persistence: std::sync::Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
         state.persistence.clone();
-    let refreshed = bamboo_engine::runner::refresh_turn_boundary_with_inbox(
-        &mut session,
-        Some(&state.storage),
-        Some(&persistence),
-        Some(&state.session_inbox),
-    )
-    .await;
+    let (refreshed, inputs) =
+        bamboo_engine::config::UntrustedExecutionInputs::admit_with_startup_observation(
+            &mut session,
+            Some(&state.storage),
+            Some(&persistence),
+            Some(&state.session_inbox),
+        )
+        .await;
     // SDK admission may durably commit and ACK one bounded batch while the
     // newest queued input is still pending. Emit every committed message even
     // when this call must return a retryable admission error or tail response.
@@ -316,11 +317,7 @@ pub(crate) async fn admit_for_execute(
     }
     // Return data only after the entire checked admission/startup handoff
     // succeeds. A retry/recovered transcript is not a new observation.
-    Ok(
-        bamboo_engine::config::UntrustedExecutionInputs::from_committed_messages(
-            &refreshed.committed_messages,
-        ),
-    )
+    Ok(inputs)
 }
 
 #[cfg(test)]
