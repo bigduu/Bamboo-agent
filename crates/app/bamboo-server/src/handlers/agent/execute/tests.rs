@@ -277,7 +277,9 @@ mod execution_input_http {
         })).unwrap();
         let response = crate::handlers::agent::chat::handler(
             state.clone(),
-            test::TestRequest::post().to_http_request(),
+            test::TestRequest::post()
+                .peer_addr("127.0.0.1:5700".parse().unwrap())
+                .to_http_request(),
             web::Json(request),
         )
         .await;

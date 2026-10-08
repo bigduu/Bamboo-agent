@@ -2613,7 +2613,8 @@ mod reexecute_and_child_approval_tests {
             .iter()
             .find(|m| m.tool_call_id.as_deref() == Some("answer-replay-call"))
             .unwrap();
-        assert!(tool_result.content.contains("REAL OUTPUT"));
+        assert_eq!(tool_result.content, "REAL TOOL OUTPUT #0");
+        assert_eq!(tool_result.tool_success, Some(true));
     }
 }
 
