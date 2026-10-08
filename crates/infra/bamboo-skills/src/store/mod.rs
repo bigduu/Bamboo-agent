@@ -142,6 +142,23 @@ impl CurrentSkillInputPublication<'_> {
     }
 }
 impl PreparedSkillInputStore {
+    /// Check the existing mode store's immutable scope, without exposing a
+    /// handle or changing legacy alias caching used by pinned activations.
+    pub fn validate_scope(
+        &self,
+        project_home: Option<&Path>,
+        workspace: Option<&Path>,
+    ) -> SkillResult<()> {
+        if self.store.project_home_dir.as_deref() != project_home
+            || self.store.workspace_overlay_dir.as_deref() != workspace
+        {
+            return Err(SkillError::Validation(
+                "Skill current-input store does not match the host scope".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The host acquires its existing Session owner before entering this seam.
     /// Its callback may await one final direct storage read, then must validate
     /// Source and render synchronously. A final Source check precedes success.

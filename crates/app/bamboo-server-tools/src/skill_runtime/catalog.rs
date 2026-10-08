@@ -177,10 +177,20 @@ impl SkillInputFactory {
                 .collect(),
             deny_all: session.root_orchestration_only_enabled(),
         };
-        let store = self.access.skill_store_for_session(&session).await?;
+        // Resolve aliases before choosing a store: legacy alias caching exists
+        // for pinned activations and cannot authorize a new current input.
+        let scope = canonical_input_scope(&self.access, &session)?;
+        let expected_scope = (scope.workspace.clone(), scope.project.clone());
+        let store = self.access.store_for_scope(scope).await?;
         let prepared = store
             .prepare_current_input_store(caller.mode.as_deref())
             .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        prepared
+            .validate_scope(
+                expected_scope.1.as_ref().map(|(_, home)| home.as_path()),
+                expected_scope.0.as_deref(),
+            )
             .map_err(|error| ToolError::Execution(error.to_string()))?;
         let fresh = self.resolver.resolve(ctx).await?;
         let config = self.access.config.read().await;
@@ -228,12 +238,19 @@ impl SkillInputFactory {
                             "Skill Session changed during preparation".into(),
                         ));
                     }
-                    host_access
-                        .skill_scope_for_session(&session)
-                        .map_err(|error| {
+                    // Synchronous final scope resolution after the last await.
+                    // An unchanged Session path may now resolve elsewhere.
+                    let current_scope =
+                        canonical_input_scope(&host_access, &session).map_err(|error| {
                             bamboo_skills::SkillError::Validation(error.to_string())
                         })?;
+                    if (current_scope.workspace, current_scope.project) != expected_scope {
+                        return Err(bamboo_skills::SkillError::Validation(
+                            "Skill Project/workspace scope changed during preparation".into(),
+                        ));
+                    }
                     publication.validate_current()?;
+                    let caller_intent = caller.invocation.is_some();
                     let caller = SkillInputRestrictions {
                         input_id: &caller.input_id,
                         ceiling: restrictions.ceiling.as_ref(),
@@ -244,8 +261,7 @@ impl SkillInputFactory {
                     prepare_current_skill_input(
                         &user,
                         Ok(&caller),
-                        (!publication.inputs().is_empty())
-                            .then_some((user.id.as_str(), publication.inputs())),
+                        caller_intent.then_some((user.id.as_str(), publication.inputs())),
                     )
                     .map_err(bamboo_skills::SkillError::Validation)
                 })
@@ -253,6 +269,25 @@ impl SkillInputFactory {
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))
     }
+}
+
+// No await or store/cache mutation: compare the actual canonical scope at the
+// acceptance boundary while the Session owner and publication remain held.
+fn canonical_input_scope(
+    access: &SkillToolAccess,
+    session: &bamboo_agent_core::Session,
+) -> Result<super::SessionSkillScope, ToolError> {
+    let mut scope = access.skill_scope_for_session(session)?;
+    let resolve = |path: &std::path::Path| {
+        std::fs::canonicalize(path).map_err(|error| {
+            ToolError::Execution(format!("Skill input scope is unavailable: {error}"))
+        })
+    };
+    scope.workspace = scope.workspace.as_deref().map(resolve).transpose()?;
+    if let Some((_, home)) = &mut scope.project {
+        *home = resolve(home)?;
+    }
+    Ok(scope)
 }
 
 struct SelectedCatalogContext {

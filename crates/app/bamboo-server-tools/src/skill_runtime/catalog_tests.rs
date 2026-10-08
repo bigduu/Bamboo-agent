@@ -2136,6 +2136,16 @@ async fn skill_factory_selection_is_atomic_and_schema_arguments_are_bounded() {
             .is_err(),
         "a nonempty explicit invocation cannot lose all typed selections"
     );
+    let empty = Fixture::new(1).await;
+    let (user, selections) = empty.fresh_input(&[]).await;
+    assert!(
+        empty
+            .input_factory()
+            .prepare_input(&empty.ctx, &user, SkillInputSession::Existing, &selections)
+            .await
+            .is_err(),
+        "an empty explicit invocation is not ordinary input"
+    );
     for change in [
         "duplicate",
         "missing",
@@ -2655,5 +2665,222 @@ async fn skill_factory_new_and_existing_scopes_use_actual_project_mode_and_works
                 "missing Project resolver cannot fall back to global"
             );
         }
+    }
+}
+
+#[cfg(unix)]
+struct FactoryWorkspaceAliasResolver {
+    caller: SkillCatalogCaller,
+    calls: std::sync::atomic::AtomicUsize,
+    alias: std::path::PathBuf,
+    replacement: std::path::PathBuf,
+}
+#[cfg(unix)]
+#[async_trait]
+impl SkillCatalogCallerResolver for FactoryWorkspaceAliasResolver {
+    async fn resolve(&self, _: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            std::fs::remove_file(&self.alias).unwrap();
+            std::os::unix::fs::symlink(&self.replacement, &self.alias).unwrap();
+        }
+        Ok(self.caller.clone())
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn skill_factory_workspace_alias_retarget_cannot_accept_the_cached_old_store() {
+    for (new, project) in [(false, false), (true, false), (false, true), (true, true)] {
+        let fixture = Fixture::new(1).await;
+        let (user, _) = fixture.fresh_input(&["catalog-0"]).await;
+        let workspace_a = fixture._directory.path().join("workspace-a");
+        let workspace_b = fixture._directory.path().join("workspace-b");
+        let alias = fixture._directory.path().join("workspace-alias");
+        for (workspace, body) in [
+            (&workspace_a, "WORKSPACE A BODY"),
+            (&workspace_b, "WORKSPACE B BODY"),
+        ] {
+            let root = workspace.join(".bamboo/skills/catalog-0");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("SKILL.md"),
+                format!("---\nname: catalog-0\ndescription: scoped summary\n---\n{body}"),
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink(&workspace_a, &alias).unwrap();
+        let projects =
+            Arc::new(bamboo_projects::ProjectStore::open(fixture._directory.path()).unwrap());
+        let assigned = projects.create("Alias scoped input", None).unwrap();
+        let mut session = if new {
+            Session::new("new-workspace-alias-host", "model")
+        } else {
+            fixture.repo.load("catalog-session").await.unwrap()
+        };
+        session.set_workspace_path_meta(alias.to_string_lossy());
+        if project {
+            session.set_project_id_meta(assigned.id.to_string());
+        }
+        session.metadata_version += 1;
+        if !new {
+            fixture.repo.save(&mut session).await.unwrap();
+        }
+        let mut ctx = fixture.ctx.clone();
+        ctx.session_id = Some(session.id.clone().into());
+        let mut caller = fixture.resolver.0.read().await.clone().unwrap();
+        caller.session_id = session.id.clone();
+        let access = SkillToolAccess::new(
+            fixture.manager.clone(),
+            fixture.config.clone(),
+            fixture.repo.clone(),
+        )
+        .with_project_store(projects.clone());
+        // Prime the real alias cache with A before the factory's first resolve.
+        let store = access.skill_store_for_session(&session).await.unwrap();
+        let catalog = store.skill_catalog_snapshot().await;
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "catalog-0")
+            .unwrap();
+        assert_eq!(entry.source, bamboo_skills::WorkflowSource::Workspace);
+        let selections = [bamboo_skills::WorkflowSelection {
+            id: entry.id.clone(),
+            source: entry.source,
+            revision: entry.revision,
+            args: json!({}),
+        }];
+        let resolver = Arc::new(FactoryWorkspaceAliasResolver {
+            caller,
+            calls: Default::default(),
+            alias: alias.clone(),
+            replacement: workspace_b.clone(),
+        });
+        let factory = SkillInputFactory::new(
+            fixture.manager.clone(),
+            fixture.config.clone(),
+            fixture.repo.clone(),
+            resolver.clone(),
+        )
+        .with_project_store(projects);
+        let host = if new {
+            SkillInputSession::New(&session)
+        } else {
+            SkillInputSession::Existing
+        };
+        let result = factory.prepare_input(&ctx, &user, host, &selections).await;
+        assert!(
+            result.is_err(),
+            "retargeted alias must deny: new={new}, project={project}; {result:?}"
+        );
+        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::canonicalize(&alias).unwrap(),
+            std::fs::canonicalize(&workspace_b).unwrap()
+        );
+        if !project {
+            let cached = access.skill_store_for_session(&session).await.unwrap();
+            assert!(
+                Arc::ptr_eq(&store, &cached),
+                "legacy alias caching must remain unchanged"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn skill_factory_canonical_path_cannot_reuse_a_historical_alias_store() {
+    for new in [false, true] {
+        let fixture = Fixture::new(1).await;
+        let (user, _) = fixture.fresh_input(&["catalog-0"]).await;
+        let canonical_parent = std::fs::canonicalize(fixture._directory.path()).unwrap();
+        let workspace = canonical_parent.join("recreated-workspace");
+        let foreign = canonical_parent.join("foreign-workspace");
+        let root = foreign.join(".bamboo/skills/catalog-0");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            "---\nname: catalog-0\ndescription: scoped summary\n---\nFOREIGN BODY",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&foreign, &workspace).unwrap();
+        let mut session = if new {
+            Session::new("new-historical-alias-host", "model")
+        } else {
+            fixture.repo.load("catalog-session").await.unwrap()
+        };
+        session.set_workspace_path_meta(workspace.to_string_lossy());
+        session.metadata_version += 1;
+        if !new {
+            fixture.repo.save(&mut session).await.unwrap();
+        }
+        let access = SkillToolAccess::new(
+            fixture.manager.clone(),
+            fixture.config.clone(),
+            fixture.repo.clone(),
+        );
+        let old = access.skill_store_for_session(&session).await.unwrap();
+        let catalog = old.skill_catalog_snapshot().await;
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "catalog-0")
+            .unwrap();
+        let selections = [bamboo_skills::WorkflowSelection {
+            id: entry.id.clone(),
+            source: entry.source,
+            revision: entry.revision,
+            args: json!({}),
+        }];
+        std::fs::remove_file(&workspace).unwrap();
+        let root = workspace.join(".bamboo/skills/catalog-0");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            "---\nname: catalog-0\ndescription: scoped summary\n---\nACTUAL BODY",
+        )
+        .unwrap();
+        assert!(!std::fs::symlink_metadata(&workspace)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::canonicalize(&workspace).unwrap(),
+            std::fs::canonicalize(fixture._directory.path())
+                .unwrap()
+                .join("recreated-workspace")
+        );
+        let cached = access.skill_store_for_session(&session).await.unwrap();
+        assert!(Arc::ptr_eq(&old, &cached));
+        fixture
+            .resolver
+            .0
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .session_id = session.id.clone();
+        let mut ctx = fixture.ctx.clone();
+        ctx.session_id = Some(session.id.clone().into());
+        let host = if new {
+            SkillInputSession::New(&session)
+        } else {
+            SkillInputSession::Existing
+        };
+        let result = fixture
+            .input_factory()
+            .prepare_input(&ctx, &user, host, &selections)
+            .await;
+        if let Ok(prepared) = &result {
+            assert!(
+                prepared.message.content.contains("FOREIGN BODY"),
+                "the regression must actually reach the historical foreign store"
+            );
+        }
+        assert!(
+            result.is_err(),
+            "a canonical key with a historical alias store must deny: new={new}; {result:?}"
+        );
     }
 }
