@@ -934,7 +934,7 @@ mod execution_input_http {
     }
 
     #[actix_web::test]
-    async fn native_reserved_owner_and_pending_slot_keep_input_until_original_release() {
+    async fn native_pending_slot_and_reserved_owner_keep_input_until_original_release() {
         use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
         let (_home, state, _fault) = state(None).await;
         let id = "native-pending-reservation";
@@ -943,21 +943,7 @@ mod execution_input_http {
             .save_session(&bamboo_agent_core::Session::new(id, "test-model"))
             .await
             .unwrap();
-        let sender = state.get_session_event_sender(id).await;
-        let reservation = match reserve_session_execution(
-            &state.agent,
-            &state.agent_runners,
-            &state.session_event_senders,
-            id,
-            &sender,
-        )
-        .await
-        {
-            SessionExecutionReserveOutcome::Reserved(r) => r,
-            _ => panic!("original idle reservation"),
-        };
-        let run = reservation.run_id().to_owned();
-        let request = serde_json::from_value::<crate::handlers::agent::chat::ChatRequest>(serde_json::json!({"session_id":id,"message":"Native before reserved task starts","model":"test-model"})).unwrap();
+        let request = serde_json::from_value::<crate::handlers::agent::chat::ChatRequest>(serde_json::json!({"session_id":id,"message":"Native before the original owner releases","model":"test-model"})).unwrap();
         let response = crate::handlers::agent::chat::handler(
             state.clone(),
             test::TestRequest::post().to_http_request(),
@@ -972,6 +958,39 @@ mod execution_input_http {
         )
         .unwrap();
         let input = receipt["message_id"].as_str().unwrap();
+        // Existing default Pending-slot control, as in the original Server fixtures.
+        // This is not a production Pending activation or a running Runtime proof.
+        state
+            .agent_runners
+            .write()
+            .await
+            .insert(id.into(), AgentRunner::new());
+        let pending = state.admit_chat_for_execute(id).await.unwrap();
+        assert!(pending.inputs.is_none());
+        assert!(!pending.generate_title);
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+        {
+            let mut runners = state.agent_runners.write().await;
+            let removed =
+                bamboo_engine::execution::runner_lifecycle::remove_runner_entry(&mut runners, id)
+                    .await
+                    .unwrap();
+            assert!(matches!(removed.status, AgentStatus::Pending));
+        }
+        let sender = state.get_session_event_sender(id).await;
+        let reservation = match reserve_session_execution(
+            &state.agent,
+            &state.agent_runners,
+            &state.session_event_senders,
+            id,
+            &sender,
+        )
+        .await
+        {
+            SessionExecutionReserveOutcome::Reserved(r) => r,
+            _ => panic!("original idle reservation"),
+        };
+        let run = reservation.run_id().to_owned();
         assert!(state
             .agent_runners
             .read()
@@ -1003,27 +1022,21 @@ mod execution_input_http {
             .iter()
             .any(|m| m.id == input));
         reservation.abandon().await;
-        // Existing default Pending-slot control, as in the original Server fixtures.
-        // This is not a production Pending activation or a running Runtime proof.
-        state
-            .agent_runners
-            .write()
-            .await
-            .insert(id.into(), AgentRunner::new());
-        let pending = state.admit_chat_for_execute(id).await.unwrap();
-        assert!(pending.inputs.is_none());
-        assert!(!pending.generate_title);
-        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
-        {
-            let mut runners = state.agent_runners.write().await;
-            let removed =
-                bamboo_engine::execution::runner_lifecycle::remove_runner_entry(&mut runners, id)
-                    .await
-                    .unwrap();
-            assert!(matches!(removed.status, AgentStatus::Pending));
-        }
-        let admitted = state.admit_chat_for_execute(id).await.unwrap();
-        assert_eq!(admitted.inputs.unwrap().observations()[0].input_id(), input);
+        // Original abandonment may launch a legitimate successor before HTTP execute.
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while !state
+                .session_inbox
+                .was_admitted(id, &SessionMessageId::parse(input).unwrap())
+                .await
+                .unwrap()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("original successor checkpoints and ACKs Native once");
+        let no_new = state.admit_chat_for_execute(id).await.unwrap();
+        assert!(no_new.inputs.is_none());
         assert!(state
             .session_inbox
             .was_admitted(id, &SessionMessageId::parse(input).unwrap())
