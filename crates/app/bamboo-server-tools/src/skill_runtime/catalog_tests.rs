@@ -2300,9 +2300,31 @@ fn gated_factory(
 
 #[tokio::test]
 async fn skill_factory_first_and_final_storage_errors_cannot_become_new_or_success() {
-    for (new, fail_at) in [(false, 1), (false, 2), (true, 1), (true, 2)] {
+    for (new, fail_at, ordinary) in [
+        (false, 1, false),
+        (false, 2, false),
+        (true, 1, false),
+        (true, 2, false),
+        (false, 1, true),
+        (false, 2, true),
+        (true, 1, true),
+        (true, 2, true),
+    ] {
         let fixture = Fixture::new(1).await;
         let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
+        let selections = if ordinary {
+            fixture
+                .resolver
+                .0
+                .write()
+                .await
+                .as_mut()
+                .unwrap()
+                .invocation = None;
+            vec![]
+        } else {
+            selections
+        };
         let session = Session::new("new-error-session", "model");
         let mut ctx = fixture.ctx.clone();
         if new {
@@ -2330,7 +2352,7 @@ async fn skill_factory_first_and_final_storage_errors_cannot_become_new_or_succe
             error
                 .to_string()
                 .contains("original injected factory storage read failure"),
-            "{new}/{fail_at}: {error}"
+            "{new}/{fail_at}/{ordinary}: {error}"
         );
         assert_eq!(
             gate.loads.load(std::sync::atomic::Ordering::SeqCst),
@@ -2530,64 +2552,79 @@ impl SkillCatalogCallerResolver for FactoryMutationResolver {
 
 #[tokio::test]
 async fn skill_factory_final_resolver_cannot_hide_config_caller_or_session_aba() {
-    for change in [
-        "caller",
-        "error",
-        "config",
-        "root-aba",
-        "workspace-aba",
-        "new-row",
-    ] {
-        let fixture = Fixture::new(1).await;
-        let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
-        let mut session = fixture.repo.load("catalog-session").await.unwrap();
-        // Official Root mode transitions reject selected legacy Skill metadata.
-        session.clear_selected_skill_ids();
-        if change == "workspace-aba" {
-            session.set_workspace_path_meta(fixture._directory.path().to_string_lossy());
-        }
-        session.metadata_version += 1;
-        fixture.repo.save(&mut session).await.unwrap();
-        let mut ctx = fixture.ctx.clone();
-        let new = Session::new("appearing-host-session", "model");
-        let mut caller = fixture.resolver.0.read().await.clone().unwrap();
-        if change == "new-row" {
-            ctx.session_id = Some(new.id.clone().into());
-            caller.session_id = new.id.clone();
-        }
-        let resolver = Arc::new(FactoryMutationResolver {
-            caller,
-            calls: Default::default(),
-            repo: fixture.repo.clone(),
-            config: fixture.config.clone(),
-            change,
-        });
-        let factory = SkillInputFactory::new(
-            fixture.manager.clone(),
-            fixture.config.clone(),
-            fixture.repo.clone(),
-            resolver.clone(),
-        );
-        let host = if change == "new-row" {
-            SkillInputSession::New(&new)
-        } else {
-            SkillInputSession::Existing
-        };
-        assert!(
-            factory
-                .prepare_input(&ctx, &user, host, &selections)
-                .await
-                .is_err(),
-            "{change}"
-        );
-        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-        if change == "root-aba" {
-            let current = fixture.repo.load("catalog-session").await.unwrap();
-            assert!(!current.root_orchestration_only_enabled());
-            assert_eq!(
-                current.root_tool_authority_revision,
-                session.root_tool_authority_revision + 2
+    for ordinary in [false, true] {
+        for change in [
+            "caller",
+            "error",
+            "config",
+            "root-aba",
+            "workspace-aba",
+            "new-row",
+        ] {
+            let fixture = Fixture::new(1).await;
+            let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
+            let selections = if ordinary {
+                fixture
+                    .resolver
+                    .0
+                    .write()
+                    .await
+                    .as_mut()
+                    .unwrap()
+                    .invocation = None;
+                vec![]
+            } else {
+                selections
+            };
+            let mut session = fixture.repo.load("catalog-session").await.unwrap();
+            // Official Root mode transitions reject selected legacy Skill metadata.
+            session.clear_selected_skill_ids();
+            if change == "workspace-aba" {
+                session.set_workspace_path_meta(fixture._directory.path().to_string_lossy());
+            }
+            session.metadata_version += 1;
+            fixture.repo.save(&mut session).await.unwrap();
+            let mut ctx = fixture.ctx.clone();
+            let new = Session::new("appearing-host-session", "model");
+            let mut caller = fixture.resolver.0.read().await.clone().unwrap();
+            if change == "new-row" {
+                ctx.session_id = Some(new.id.clone().into());
+                caller.session_id = new.id.clone();
+            }
+            let resolver = Arc::new(FactoryMutationResolver {
+                caller,
+                calls: Default::default(),
+                repo: fixture.repo.clone(),
+                config: fixture.config.clone(),
+                change,
+            });
+            let factory = SkillInputFactory::new(
+                fixture.manager.clone(),
+                fixture.config.clone(),
+                fixture.repo.clone(),
+                resolver.clone(),
             );
+            let host = if change == "new-row" {
+                SkillInputSession::New(&new)
+            } else {
+                SkillInputSession::Existing
+            };
+            assert!(
+                factory
+                    .prepare_input(&ctx, &user, host, &selections)
+                    .await
+                    .is_err(),
+                "{ordinary}/{change}"
+            );
+            assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            if change == "root-aba" {
+                let current = fixture.repo.load("catalog-session").await.unwrap();
+                assert!(!current.root_orchestration_only_enabled());
+                assert_eq!(
+                    current.root_tool_authority_revision,
+                    session.root_tool_authority_revision + 2
+                );
+            }
         }
     }
 }
@@ -3119,6 +3156,146 @@ async fn skill_factory_legacy_resolver_defaults_to_deny_without_changing_list_re
             .await
             .unwrap();
         assert!(page.to_string().contains("PRIVATE BODY catalog-0"));
+        assert_eq!(
+            serde_json::to_value(fixture.repo.load("catalog-session").await.unwrap()).unwrap(),
+            before
+        );
+    }
+}
+
+#[tokio::test]
+async fn skill_factory_ordinary_input_does_not_require_unrelated_skill_source() {
+    for new in [false, true] {
+        let fixture = Fixture::new(1).await;
+        let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
+        let workspace = fixture._directory.path().join("deleted-workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let mut session = if new {
+            Session::new("ordinary-deleted-workspace-host", "model")
+        } else {
+            fixture.repo.load("catalog-session").await.unwrap()
+        };
+        session.set_workspace_path_meta(workspace.to_string_lossy());
+        session.metadata_version += 1;
+        if !new {
+            fixture.repo.save(&mut session).await.unwrap();
+        }
+        let before = serde_json::to_value(&session).unwrap();
+        let mut ctx = fixture.ctx.clone();
+        ctx.session_id = Some(session.id.clone().into());
+        fixture
+            .resolver
+            .0
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .session_id = session.id.clone();
+        std::fs::remove_dir(&workspace).unwrap();
+        let factory = fixture.input_factory();
+        let host = || {
+            if new {
+                SkillInputSession::New(&session)
+            } else {
+                SkillInputSession::Existing
+            }
+        };
+        assert!(
+            factory
+                .prepare_input(&ctx, &user, host(), &selections)
+                .await
+                .is_err(),
+            "explicit Skill input still requires an available real scope"
+        );
+        fixture
+            .resolver
+            .0
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .invocation = None;
+        let prepared = factory
+            .prepare_input(&ctx, &user, host(), &[])
+            .await
+            .expect("ordinary input must not require an unrelated Skill workspace");
+        assert_eq!(
+            serde_json::to_value(prepared.message).unwrap(),
+            serde_json::to_value(&user).unwrap()
+        );
+        assert!(prepared.warnings.is_empty());
+        if new {
+            assert!(fixture
+                .repo
+                .storage()
+                .load_session(&session.id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(fixture.repo.cache().get(&session.id).is_none());
+            assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        } else {
+            assert_eq!(
+                serde_json::to_value(fixture.repo.load(&session.id).await.unwrap()).unwrap(),
+                before
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn skill_factory_ordinary_input_still_checks_late_caller_authority() {
+    for change in ["invocation", "unknown", "busy"] {
+        let fixture = Fixture::new(1).await;
+        let (user, _) = fixture.fresh_input(&["catalog-0"]).await;
+        fixture
+            .resolver
+            .0
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .invocation = None;
+        let before =
+            serde_json::to_value(fixture.repo.load("catalog-session").await.unwrap()).unwrap();
+        let (factory, gate) = gated_factory(&fixture, 2, 0);
+        let pending = factory.prepare_input(&fixture.ctx, &user, SkillInputSession::Existing, &[]);
+        tokio::pin!(pending);
+        tokio::select! {
+            _ = gate.entered.notified() => {},
+            result = &mut pending => panic!("ordinary final storage barrier not reached: {result:?}"),
+        }
+        assert!(fixture.config.try_write().is_err());
+        let owner = fixture.repo.persistence().acquire_lock("catalog-session");
+        tokio::pin!(owner);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut owner)
+                .await
+                .is_err()
+        );
+        let held = if change == "busy" {
+            Some(fixture.resolver.0.write().await)
+        } else {
+            let mut caller = fixture.resolver.0.write().await;
+            if change == "unknown" {
+                *caller = None;
+            } else {
+                caller.as_mut().unwrap().invocation = Some(SkillCatalogInvocation {
+                    input_id: user.id.clone(),
+                    skills: BTreeSet::from(["catalog-0".into()]),
+                });
+            }
+            None
+        };
+        gate.release.notify_one();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut pending)
+                .await
+                .unwrap()
+                .is_err(),
+            "{change}"
+        );
+        drop(held);
         assert_eq!(
             serde_json::to_value(fixture.repo.load("catalog-session").await.unwrap()).unwrap(),
             before

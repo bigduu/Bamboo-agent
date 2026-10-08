@@ -177,21 +177,28 @@ impl SkillInputFactory {
                 .collect(),
             deny_all: session.root_orchestration_only_enabled(),
         };
-        // Resolve aliases before choosing a store: legacy alias caching exists
-        // for pinned activations and cannot authorize a new current input.
-        let scope = canonical_input_scope(&self.access, &session)?;
-        let expected_scope = (scope.workspace.clone(), scope.project.clone());
-        let store = self.access.store_for_scope(scope).await?;
-        let prepared = store
-            .prepare_current_input_store(caller.mode.as_deref())
-            .await
-            .map_err(|error| ToolError::Execution(error.to_string()))?;
-        prepared
-            .validate_scope(
-                expected_scope.1.as_ref().map(|(_, home)| home.as_path()),
-                expected_scope.0.as_deref(),
-            )
-            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        // No Skill intent needs no publication, but still uses the same final
+        // caller, Config and durable Session acceptance below.
+        let prepared = if caller.invocation.is_none() && selections.is_empty() {
+            None
+        } else {
+            // Resolve aliases before choosing a store: legacy alias caching exists
+            // for pinned activations and cannot authorize a new current input.
+            let scope = canonical_input_scope(&self.access, &session)?;
+            let expected_scope = (scope.workspace.clone(), scope.project.clone());
+            let store = self.access.store_for_scope(scope).await?;
+            let prepared = store
+                .prepare_current_input_store(caller.mode.as_deref())
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            prepared
+                .validate_scope(
+                    expected_scope.1.as_ref().map(|(_, home)| home.as_path()),
+                    expected_scope.0.as_deref(),
+                )
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            Some((prepared, expected_scope))
+        };
         let fresh = self.resolver.resolve(ctx).await?;
         let config = self.access.config.read().await;
         if fingerprint(&caller)? != fingerprint(&fresh)?
@@ -214,64 +221,101 @@ impl SkillInputFactory {
         let user = user.clone();
         let restrictions = access.clone();
         let host_access = self.access.clone();
-        let result = prepared
-            .with_current_inputs(&access, selections, move |publication| {
-                Box::pin(async move {
-                    // Last await: do not call try_load while the owner/publication are
-                    // held. That reentry deadlocks on a legitimate cache miss.
-                    let current = sessions
-                        .storage()
-                        .load_session(&caller.session_id)
-                        .await
-                        .map_err(|error| {
-                            bamboo_skills::SkillError::Validation(error.to_string())
-                        })?;
-                    let matches = if is_new {
-                        current.is_none() && sessions.cache().get(&caller.session_id).is_none()
-                    } else {
-                        current.as_ref().is_some_and(|current| {
-                            serde_json::to_value(current).is_ok_and(|actual| actual == expected)
-                        })
-                    };
-                    if !matches {
-                        return Err(bamboo_skills::SkillError::Validation(
-                            "Skill Session changed during preparation".into(),
-                        ));
-                    }
-                    // Synchronous final scope resolution after the last await.
-                    // An unchanged Session path may now resolve elsewhere.
-                    let current_scope =
-                        canonical_input_scope(&host_access, &session).map_err(|error| {
-                            bamboo_skills::SkillError::Validation(error.to_string())
-                        })?;
-                    if (current_scope.workspace, current_scope.project) != expected_scope {
-                        return Err(bamboo_skills::SkillError::Validation(
-                            "Skill Project/workspace scope changed during preparation".into(),
-                        ));
-                    }
-                    publication.validate_current()?;
-                    let caller_intent = caller.invocation.is_some();
-                    let caller = SkillInputRestrictions {
-                        input_id: &caller.input_id,
-                        ceiling: restrictions.ceiling.as_ref(),
-                        disabled: &restrictions.disabled,
-                        root_ultra: restrictions.deny_all,
-                        mode: caller.mode.as_deref(),
-                    };
-                    prepare_current_skill_input(
-                        &user,
-                        Ok(&caller),
-                        caller_intent.then_some((user.id.as_str(), publication.inputs())),
-                    )
-                    .map_err(bamboo_skills::SkillError::Validation)
+        let result = if let Some((prepared, expected_scope)) = prepared {
+            prepared
+                .with_current_inputs(&access, selections, move |publication| {
+                    Box::pin(async move {
+                        // Last await: do not call try_load while the owner/publication are
+                        // held. That reentry deadlocks on a legitimate cache miss.
+                        let current = sessions
+                            .storage()
+                            .load_session(&caller.session_id)
+                            .await
+                            .map_err(|error| {
+                                bamboo_skills::SkillError::Validation(error.to_string())
+                            })?;
+                        if !current_input_session_matches(
+                            &sessions,
+                            &caller.session_id,
+                            current.as_ref(),
+                            &expected,
+                            is_new,
+                        ) {
+                            return Err(bamboo_skills::SkillError::Validation(
+                                "Skill Session changed during preparation".into(),
+                            ));
+                        }
+                        // Synchronous final scope resolution after the last await.
+                        // An unchanged Session path may now resolve elsewhere.
+                        let current_scope =
+                            canonical_input_scope(&host_access, &session).map_err(|error| {
+                                bamboo_skills::SkillError::Validation(error.to_string())
+                            })?;
+                        if (current_scope.workspace, current_scope.project) != expected_scope {
+                            return Err(bamboo_skills::SkillError::Validation(
+                                "Skill Project/workspace scope changed during preparation".into(),
+                            ));
+                        }
+                        publication.validate_current()?;
+                        let caller_intent = caller.invocation.is_some();
+                        let caller = SkillInputRestrictions {
+                            input_id: &caller.input_id,
+                            ceiling: restrictions.ceiling.as_ref(),
+                            disabled: &restrictions.disabled,
+                            root_ultra: restrictions.deny_all,
+                            mode: caller.mode.as_deref(),
+                        };
+                        prepare_current_skill_input(
+                            &user,
+                            Ok(&caller),
+                            caller_intent.then_some((user.id.as_str(), publication.inputs())),
+                        )
+                        .map_err(bamboo_skills::SkillError::Validation)
+                    })
                 })
-            })
-            .await
-            .map_err(|error| ToolError::Execution(error.to_string()))?;
-        // Final Source validation has completed and publication has released.
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?
+        } else {
+            let current = sessions
+                .storage()
+                .load_session(&caller.session_id)
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            if !current_input_session_matches(
+                &sessions,
+                &caller.session_id,
+                current.as_ref(),
+                &expected,
+                is_new,
+            ) {
+                return Err(ToolError::Execution(
+                    "Skill Session changed during preparation".into(),
+                ));
+            }
+            prepare_current_skill_input(&user, Err("ordinary input has no Skill invocation"), None)
+                .map_err(ToolError::Execution)?
+        };
+        // Explicit Source validation has completed and publication has released.
+        // Ordinary input has no Source; both branches accept the same authority.
         // Config/Session owners remain held; no await follows this acceptance.
         self.resolver.validate_current(ctx, &fresh)?;
         Ok(result)
+    }
+}
+
+fn current_input_session_matches(
+    sessions: &bamboo_engine::SessionRepository,
+    session_id: &str,
+    current: Option<&bamboo_agent_core::Session>,
+    expected: &Value,
+    is_new: bool,
+) -> bool {
+    if is_new {
+        current.is_none() && sessions.cache().get(session_id).is_none()
+    } else {
+        current.is_some_and(|current| {
+            serde_json::to_value(current).is_ok_and(|actual| &actual == expected)
+        })
     }
 }
 
