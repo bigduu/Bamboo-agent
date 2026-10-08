@@ -317,7 +317,7 @@ fn project_new_committed_inputs(
                             body.get("content")?,
                         )
                     }
-                    _ => continue,
+                    _ => return None,
                 };
             let id = message.id.as_str();
             if proof.get("id")?.as_str()? != id
