@@ -15,8 +15,8 @@ jobs:
     env:
       CARGO_TERM_COLOR: never
       BAMBOO_FRONTEND_BUILD_MODE: api-only
-      BEFORE_SHA: ba3e2dfe37c52f4ca9d0b33955501d8c61c412c8
-      AFTER_SHA: 723e2430c7dbfdf529e18fdac7a75428abba54c2
+      BEFORE_SHA: 45842bb3a43bb985f8da17e772a76fe96e2d9ca9
+      AFTER_SHA: 389f0dc1b82618f928a14d0817516efd6071644a
     steps:
       - uses: actions/checkout@v7
         with:
@@ -101,6 +101,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: bamboo-1630-default-stack-723e2430
+          name: bamboo-1630-default-stack-389f0dc1
           path: ${{ runner.temp }}/bamboo1630-proof
           if-no-files-found: error
