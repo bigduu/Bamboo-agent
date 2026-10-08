@@ -379,20 +379,37 @@ mod execution_input_http {
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].0, "ready-current-user");
         assert_eq!(inputs[0].1.as_ref().unwrap().selections[0].id, "review");
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
-                let terminal =
-                    state.agent_runners.read().await.get(id).is_some_and(|r| {
-                        matches!(r.status, crate::app_state::AgentStatus::Completed)
-                    });
+                let terminal = state.agent_runners.read().await.get(id).is_some_and(|r| {
+                    matches!(
+                        r.status,
+                        crate::app_state::AgentStatus::Completed
+                            | crate::app_state::AgentStatus::Error(_)
+                            | crate::app_state::AgentStatus::Cancelled
+                    )
+                });
                 if terminal {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
-        .await
-        .expect("actual execution must finish");
+        .await;
+        let runner_status = state
+            .agent_runners
+            .read()
+            .await
+            .get(id)
+            .map(|runner| runner.status.clone());
+        assert!(
+            completion.is_ok()
+                && matches!(
+                    runner_status.as_ref(),
+                    Some(crate::app_state::AgentStatus::Completed)
+                ),
+            "actual execution must finish successfully: {runner_status:?}"
+        );
         let stored = state.storage.load_session(id).await.unwrap().unwrap();
         assert_eq!(
             stored
