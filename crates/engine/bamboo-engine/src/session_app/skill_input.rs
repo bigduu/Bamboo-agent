@@ -68,6 +68,9 @@ pub fn prepare_skill_input(
     let Some(intent) = intent else {
         return prepare_current_skill_input(user, caller, None);
     };
+    if intent.chosen.len() > MAX_EXPLICIT_SKILLS {
+        return Err("Skill invocation is empty, excessive or denied by Root Ultra".into());
+    }
     let chosen = intent
         .chosen
         .iter()
@@ -261,6 +264,45 @@ pub(crate) mod tests {
             disabled,
             root_ultra: false,
             mode: Some("code"),
+        }
+    }
+
+    #[test]
+    fn skill_input_rejects_oversized_intent_before_snapshot_lookup() {
+        let user = Message::user("original");
+        let original = serde_json::to_value(&user).unwrap();
+        let disabled = BTreeSet::new();
+        let caller = restrictions(&user, &disabled);
+        let mut snapshot = snapshot();
+        snapshot.skills.clear();
+        let selection = selection();
+        for (count, expected) in [
+            (
+                MAX_EXPLICIT_SKILLS,
+                "chosen Skill is missing from its correlated snapshot",
+            ),
+            (
+                MAX_EXPLICIT_SKILLS + 1,
+                "Skill invocation is empty, excessive or denied by Root Ultra",
+            ),
+        ] {
+            let chosen = (0..count)
+                .map(|_| ChosenSkillInput {
+                    selection: &selection,
+                    snapshot: &snapshot,
+                    main_resource: "review/SKILL.md",
+                })
+                .collect::<Vec<_>>();
+            let intent = SkillInputIntent {
+                input_id: &user.id,
+                chosen: &chosen,
+            };
+            assert_eq!(
+                prepare_skill_input(&user, Ok(&caller), Some(&intent)).unwrap_err(),
+                expected,
+                "count {count}"
+            );
+            assert_eq!(serde_json::to_value(&user).unwrap(), original);
         }
     }
 
