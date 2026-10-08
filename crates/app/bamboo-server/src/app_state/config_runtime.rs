@@ -4012,12 +4012,12 @@ fn retain_mcp_credentials(
                 }
             }
         }
-        match (&current_server.transport, &mut candidate_server.transport) {
-            (
-                TransportConfig::StreamableHttp(current),
-                TransportConfig::StreamableHttp(candidate),
-            ) => retain_mcp_header_credentials(&current.headers, &mut candidate.headers),
-            _ => {}
+        if let (
+            TransportConfig::StreamableHttp(current),
+            TransportConfig::StreamableHttp(candidate),
+        ) = (&current_server.transport, &mut candidate_server.transport)
+        {
+            retain_mcp_header_credentials(&current.headers, &mut candidate.headers);
         }
     }
 }

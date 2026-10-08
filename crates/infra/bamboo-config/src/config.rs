@@ -993,7 +993,7 @@ impl RemoteBrokerPeer {
             && self
                 .parent_role
                 .as_deref()
-                .map_or(true, |s| identifier(s, false))
+                .is_none_or(|s| identifier(s, false))
             && self
                 .worker_role
                 .as_deref()
