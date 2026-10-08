@@ -3811,6 +3811,7 @@ async fn constructor_parity_queue_preserves_envelope_and_deduplicated_retry() {
     let root = tempfile::tempdir().unwrap();
     let state = web::Data::new(crate::AppState::new(root.path().into()).await.unwrap());
     let session = Session::new("constructor-queue", "test-model");
+    state.storage.save_session(&session).await.unwrap();
     let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jF0cAAAAASUVORK5CYII=";
     let request = serde_json::from_value::<super::ChatRequest>(serde_json::json!({
         "message":"raw user text", "message_id":"constructor-queue-stable",
@@ -3896,6 +3897,45 @@ async fn constructor_parity_queue_preserves_envelope_and_deduplicated_retry() {
         .await
         .unwrap()
         .is_empty());
+
+    let fresh = Session::new("constructor-queue-default", "test-model");
+    let request = serde_json::from_value::<super::ChatRequest>(serde_json::json!({
+        "message":"plain raw", "thread_id":"thread"
+    }))
+    .unwrap();
+    assert!(state
+        .storage
+        .load_session(&fresh.id)
+        .await
+        .unwrap()
+        .is_none());
+    let receipt = super::ingress::queue(&state, &fresh, &request, "plain raw", &http)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !receipt.id.as_str().is_empty(),
+        "default envelope ID is minted once"
+    );
+    let claims = state.session_inbox.claim(&fresh.id, 10).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].envelope.id, receipt.id);
+    let user = claims[0].envelope.to_provider_message().unwrap();
+    assert_eq!(user.role, bamboo_agent_core::Role::User);
+    assert_eq!(user.content, "plain raw");
+    assert!(state
+        .storage
+        .load_session(&fresh.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .messages
+        .is_empty());
+    state
+        .session_inbox
+        .ack(&fresh.id, &claims[0])
+        .await
+        .unwrap();
 }
 
 #[actix_web::test]
@@ -3937,12 +3977,8 @@ async fn constructor_parity_queue_rejects_before_canonical_creation_or_delivery(
             .await
             .unwrap()
             .is_none());
-        assert!(state
-            .session_inbox
-            .claim(&session.id, 10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(matches!(state.session_inbox.claim(&session.id, 10).await,
+            Err(bamboo_domain::SessionInboxError::TargetNotFound(id)) if id == session.id));
         assert!(session.messages.is_empty());
     }
 }
