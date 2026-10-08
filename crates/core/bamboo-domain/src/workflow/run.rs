@@ -123,6 +123,11 @@ pub enum WorkflowPlan {
         item: String,
         body: Box<WorkflowPlan>,
     },
+    Choice {
+        condition: ValueRef,
+        then_branch: Box<WorkflowPlan>,
+        else_branch: Box<WorkflowPlan>,
+    },
     Retry {
         node: Box<WorkflowPlan>,
         max_attempts: u32,
