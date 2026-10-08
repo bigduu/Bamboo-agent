@@ -162,11 +162,34 @@ mod execution_input_http {
     impl LLMProvider for LocalProvider {
         async fn chat_stream(
             &self,
-            _messages: &[bamboo_agent_core::Message],
-            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            messages: &[bamboo_agent_core::Message],
+            tools: &[bamboo_agent_core::tools::ToolSchema],
             _max: Option<u32>,
             _model: &str,
         ) -> Result<LLMStream, LLMError> {
+            // The actual Chat selection keeps its existing legacy activation
+            // contract: load the selected workflow before producing an answer.
+            // I-E neither bypasses that gate nor creates a new consumer.
+            if let Some(schema) = tools.iter().find(|tool| {
+                tool.function.name == "load_skill" || tool.function.name.ends_with("::load_skill")
+            }) {
+                if !messages.iter().any(|message| {
+                    message.tool_call_id.as_deref() == Some("execution-input-existing-load")
+                }) {
+                    let call = bamboo_agent_core::tools::ToolCall {
+                        id: "execution-input-existing-load".into(),
+                        tool_type: "function".into(),
+                        function: bamboo_agent_core::tools::FunctionCall {
+                            name: schema.function.name.clone(),
+                            arguments: serde_json::json!({"skill_id":"review"}).to_string(),
+                        },
+                    };
+                    return Ok(Box::pin(futures::stream::iter(vec![
+                        Ok(LLMChunk::ToolCalls(vec![call])),
+                        Ok(LLMChunk::Done),
+                    ])));
+                }
+            }
             Ok(Box::pin(futures::stream::iter(vec![
                 Ok(LLMChunk::Token("finished".into())),
                 Ok(LLMChunk::Done),
@@ -411,6 +434,15 @@ mod execution_input_http {
             "actual execution must finish successfully: {runner_status:?}"
         );
         let stored = state.storage.load_session(id).await.unwrap().unwrap();
+        let loads = stored
+            .messages
+            .iter()
+            .filter(|message| {
+                message.tool_call_id.as_deref() == Some("execution-input-existing-load")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(loads.len(), 1, "one real existing workflow prerequisite");
+        assert_eq!(loads[0].tool_success, Some(true));
         assert_eq!(
             stored
                 .messages
