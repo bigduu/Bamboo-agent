@@ -11121,6 +11121,8 @@ mod tests {
             "zero_valid",
             "error_tail",
             "cancelled_tail",
+            "cancelled_valid",
+            "cancelled_zero_valid",
             "error_valid",
             "error_zero_valid",
             "ordinary_lossy",
@@ -11244,7 +11246,7 @@ mod tests {
                         },
                     ]
                 }
-                "zero_missing" | "zero_valid" | "error_zero_valid" => {
+                "zero_missing" | "zero_valid" | "error_zero_valid" | "cancelled_zero_valid" => {
                     frames.clear();
                     marker.final_seq = 0;
                 }
@@ -11257,7 +11259,9 @@ mod tests {
             }
             let status = match case {
                 "error_tail" | "error_valid" | "error_zero_valid" => TerminalStatus::Error,
-                "cancelled_tail" => TerminalStatus::Cancelled,
+                "cancelled_tail" | "cancelled_valid" | "cancelled_zero_valid" => {
+                    TerminalStatus::Cancelled
+                }
                 _ => TerminalStatus::Completed,
             };
             frames.push(ChildFrame::Terminal {
@@ -11330,7 +11334,11 @@ mod tests {
             if matches!(case, "success" | "ordinary_lossy") {
                 assert_eq!(outcome.unwrap().as_deref(), Some("complete"), "{case}");
             } else {
-                let error = outcome.unwrap_err().to_string();
+                let error = outcome.unwrap_err();
+                if matches!(case, "cancelled_valid" | "cancelled_zero_valid") {
+                    assert!(matches!(&error, AgentError::Cancelled), "{case}: {error}");
+                }
+                let error = error.to_string();
                 if !matches!(
                     case,
                     "duplicate"
@@ -11341,6 +11349,8 @@ mod tests {
                         | "zero_valid"
                         | "error_valid"
                         | "error_zero_valid"
+                        | "cancelled_valid"
+                        | "cancelled_zero_valid"
                 ) {
                     assert!(
                         error.contains("actor_history_tail_incomplete"),

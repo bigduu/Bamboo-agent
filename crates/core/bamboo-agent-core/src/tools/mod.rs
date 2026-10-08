@@ -96,6 +96,7 @@ pub mod bash_completion;
 pub mod context;
 pub mod executor;
 pub mod input_guard;
+mod output_cap_observation;
 pub mod registry;
 pub mod result_handler;
 pub mod smart_code_review;
@@ -115,6 +116,7 @@ pub use context::{
     ExecutingSupervisorObservation, ToolExecutionContext, ToolExecutionSessionFlags,
 };
 pub use executor::{execute_tool_call, execute_tool_call_with_context, ToolError, ToolExecutor};
+pub use output_cap_observation::{observed_tool_output_cap, scope_tool_output_cap};
 pub use registry::{
     global_registry, normalize_tool_name, RegistryError, SharedTool, Tool, ToolRegistry,
 };

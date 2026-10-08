@@ -1,6 +1,8 @@
 //! Stateless adapter for the existing typed Instruction selection and commit.
 //! It owns no caller grant, writer, or alternate activation protocol.
 
+use crate::error::ResponseResult;
+
 use super::{
     persist_and_cache_session_locked, project_context_error_response, publish_committed_chat,
 };
@@ -71,7 +73,7 @@ pub(super) async fn pin_explicit_workflow_candidate(
     session: &mut bamboo_agent_core::Session,
     selection: &bamboo_skills::WorkflowSelection,
     disabled_skill_ids: &std::collections::BTreeSet<String>,
-) -> Result<String, HttpResponse> {
+) -> ResponseResult<String> {
     let selected_ids = [selection.id.clone()];
     // Resolve into an isolated staging activation. A stale/invalid request must
     // never replace or release the activation currently serving this session.
@@ -165,7 +167,7 @@ pub(super) async fn pin_explicit_workflow_candidate(
                 .skill_manager
                 .release_activation_for_workspace(&staging_activation_id, workspace.as_deref())
                 .await;
-            return Err(workflow_catalog_unavailable_response(&error));
+            return Err(workflow_catalog_unavailable_response(&error).into());
         }
     };
     let snapshot = match store
@@ -184,7 +186,8 @@ pub(super) async fn pin_explicit_workflow_candidate(
                     message: "selected workflow snapshot could not be retained".to_string(),
                     recoverable: true,
                 },
-            ));
+            )
+            .into());
         }
     };
     if let Err(diagnostic) = bamboo_skills::persist_explicit_workflow_candidate(
@@ -197,7 +200,7 @@ pub(super) async fn pin_explicit_workflow_candidate(
             .skill_manager
             .release_activation_for_workspace(&staging_activation_id, workspace.as_deref())
             .await;
-        return Err(workflow_selection_error_response(diagnostic));
+        return Err(workflow_selection_error_response(diagnostic).into());
     }
     Ok(staging_activation_id)
 }
@@ -440,7 +443,7 @@ pub(super) async fn stage_selection(
     selected_skill_ids: Option<&[String]>,
     message: &str,
     config_snapshot: &bamboo_config::Config,
-) -> Result<Option<StagedWorkflowActivation>, HttpResponse> {
+) -> ResponseResult<Option<StagedWorkflowActivation>> {
     Ok(if let Some(selection) = selection {
         let mut candidate = session.clone();
         if let Err(error) = bamboo_engine::session_app::chat::resolve_workflow_selection(
@@ -449,9 +452,11 @@ pub(super) async fn stage_selection(
             selected_skill_ids,
             message,
         ) {
-            return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                "error": crate::error::error_value(error.to_string())
-            })));
+            return Err(HttpResponse::BadRequest()
+                .json(serde_json::json!({
+                    "error": crate::error::error_value(error.to_string())
+                }))
+                .into());
         }
         let disabled_skill_ids = config_snapshot.disabled_skill_ids();
         let staging_id = match pin_explicit_workflow_candidate(
@@ -490,7 +495,7 @@ pub(super) async fn commit_selected_input(
             std::collections::HashMap<String, crate::app_state::AgentRunner>,
         >,
     >,
-) -> Result<(), HttpResponse> {
+) -> ResponseResult<()> {
     let commit_state = state;
     let commit_session_id = session_id;
     let commit = tokio::spawn(async move {
@@ -569,18 +574,21 @@ pub(super) async fn commit_selected_input(
     match commit.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            return Err(HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": crate::error::error_value(format!(
-                    "Failed to persist chat session: {error}"
-                ))
-            })));
+            return Err(HttpResponse::InternalServerError()
+                .json(serde_json::json!({
+                    "error": crate::error::error_value(format!(
+                        "Failed to persist chat session: {error}"
+                    ))
+                }))
+                .into());
         }
         Err(error) => {
             tracing::error!(%error, "Workflow authority chat commit task failed");
             return Err(crate::error::json_error(
                 actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to commit Workflow authority chat",
-            ));
+            )
+            .into());
         }
     }
     Ok(())

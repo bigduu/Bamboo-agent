@@ -1,4 +1,6 @@
 //! Authenticated transport admission; client references never select a role.
+use crate::error::ResponseResult;
+
 use super::ChatRequest;
 use crate::{app_state::AppState, handlers::agent::tickets};
 use actix_web::{http::StatusCode, HttpRequest, HttpResponse, ResponseError};
@@ -17,7 +19,7 @@ pub(super) async fn queue(
     request: &ChatRequest,
     effective_message: &str,
     http: &HttpRequest,
-) -> Result<Option<SessionInboxReceipt>, HttpResponse> {
+) -> ResponseResult<Option<SessionInboxReceipt>> {
     let ticket = state.config.read().await.features.ticket_mutation
         && state.tickets.service().ok().is_some_and(|s| {
             s.published()
@@ -54,13 +56,15 @@ pub(super) async fn queue(
         return Err(error(
             StatusCode::BAD_REQUEST,
             "Invalid message references; tracing cannot select Runtime activation policy",
-        ));
+        )
+        .into());
     }
     if ticket && (request.message.is_empty() || request.message.len() > 32768) {
         return Err(error(
             StatusCode::BAD_REQUEST,
             "Ticket Human input requires 1..32768 UTF-8 bytes",
-        ));
+        )
+        .into());
     }
     let mut envelope = SessionMessageEnvelope::user_input(&session.id, effective_message);
     if let Some(id) = &request.message_id {
@@ -80,7 +84,8 @@ pub(super) async fn queue(
             return Err(error(
                 StatusCode::BAD_REQUEST,
                 "A message supports up to 16 images",
-            ));
+            )
+            .into());
         }
         let mut parts = vec![bamboo_domain::MessagePart::Text {
             text: effective_message.into(),
@@ -192,7 +197,7 @@ pub(super) async fn queue(
 /// Fresh HTTP execute needs a User turn before its legacy preparation gate.
 /// Reuse the SDK's exact checkpoint/receipt/ACK boundary, and never compete
 /// with a live runner's inbox consumer. This adapter owns no second protocol.
-pub(crate) async fn admit_for_execute(state: &AppState, id: &str) -> Result<(), HttpResponse> {
+pub(crate) async fn admit_for_execute(state: &AppState, id: &str) -> ResponseResult<()> {
     let runners = state.agent_runners.read().await;
     if runners.get(id).is_some_and(|r| {
         matches!(
@@ -232,13 +237,14 @@ pub(crate) async fn admit_for_execute(state: &AppState, id: &str) -> Result<(), 
         );
     }
     if let Some(reason) = refreshed.admission_error {
-        return Err(error(StatusCode::SERVICE_UNAVAILABLE, reason));
+        return Err(error(StatusCode::SERVICE_UNAVAILABLE, reason).into());
     }
     if !session.messages.iter().any(|m| m.id == queued_id) {
         return Err(error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Queued User admission is still pending; retry execute",
-        ));
+        )
+        .into());
     }
     let _guard = state.persistence.acquire_lock(id).await;
     let mut latest = state

@@ -1,3 +1,4 @@
+use crate::error::ResponseResult;
 use actix_web::{web, HttpResponse};
 
 use crate::app_state::AppState;
@@ -11,7 +12,7 @@ pub(super) async fn append_user_message(
     session: &mut Session,
     message: &str,
     images: Option<&[ChatImage]>,
-) -> Result<(), HttpResponse> {
+) -> ResponseResult<()> {
     // Preserve multimodal parts so that preflight hooks (OCR/fallback) and/or multimodal
     // upstream models can use the images.
     if let Some(images) = images.filter(|items| !items.is_empty()) {
@@ -29,11 +30,13 @@ pub(super) async fn append_user_message(
             {
                 Ok(result) => result,
                 Err(error) => {
-                    return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                        "error": crate::error::error_value(format!(
-                            "Failed to store image attachment: {error}"
-                        ))
-                    })));
+                    return Err(HttpResponse::BadRequest()
+                        .json(serde_json::json!({
+                            "error": crate::error::error_value(format!(
+                                "Failed to store image attachment: {error}"
+                            ))
+                        }))
+                        .into());
                 }
             };
             parts.push(ContentPart::ImageUrl {
