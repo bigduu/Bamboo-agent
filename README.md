@@ -223,6 +223,15 @@ Ordinary requests keep their existing input and idempotent replay behavior.
 This adapter adds no caller grant, Session field, reader registration or
 additional writer. The pure prepared-input helpers remain unwired.
 
+Native chat and queued HTTP input use private constructors for the same User
+Message and inbox envelope. Native chat retains its attachment storage, append
+and pending marker; queued input retains authenticated admission and its durable
+retry identity. The four fresh-input SDK wrappers share one synchronous append
+helper at their original call positions, including synchronous stream creation.
+Session-only execution and resume retain their supplied history. These helpers
+preserve the existing public and serialized layouts and introduce no Skill
+factory or live reader registration.
+
 ## License
 
 Project-owned code is licensed under the [MIT License](./LICENSE).
