@@ -49,7 +49,11 @@ async fn ql_http_existing_queue_fit_or_overflow_keeps_prefix_events_and_pending_
             );
         }
         let mut ids = Vec::new();
-        while let Ok(change) = feed.try_recv() {
+        for _ in 0..count {
+            let change = tokio::time::timeout(std::time::Duration::from_secs(10), feed.recv())
+                .await
+                .expect("every committed prefix event")
+                .unwrap();
             if let bamboo_agent_core::AgentEvent::MessageAppended { message_id, .. } = &change.event
             {
                 ids.push(message_id.clone());
