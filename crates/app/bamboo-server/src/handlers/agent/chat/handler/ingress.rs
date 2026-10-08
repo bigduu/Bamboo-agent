@@ -491,7 +491,7 @@ pub(super) async fn commit_native_input(
         }
         drop(workflow_guard);
         drop(host_guard);
-        result.map(|admission| admission.receipt)
+        result.map(|admission| admission.delivery)
     });
     commit
         .await
