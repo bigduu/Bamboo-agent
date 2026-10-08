@@ -8052,7 +8052,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                     ActorEventRoute::Publish(envelope) => {
                                         let public_event = actor_event_observer
                                             .filter(|_| envelope.class != ActorEventClass::Ephemeral)
-                                            .map(|_| PublicActorEvent::from(&envelope));
+                                            .map(|_| PublicActorEvent::from(envelope.as_ref()));
                                         tracing::trace!(
                                             actor_id = %envelope.actor_id,
                                             event_id = %envelope.event_id,
