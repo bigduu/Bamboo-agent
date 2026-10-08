@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Loopback fixture using the existing native serve/subagent-worker route; no runtime overrides."""
+"""Loopback fixture using the default native Host/Worker; cold reads disable background auto-Dream."""
 import argparse, base64, hashlib, http.server, json, os, pathlib, socket, subprocess, threading, time, traceback, urllib.request, urllib.error
 
 P = argparse.ArgumentParser(); P.add_argument('--binary', required=True); P.add_argument('--output', required=True); P.add_argument('--source-head', required=True)
@@ -187,6 +187,11 @@ finally:
     except subprocess.TimeoutExpired: host.kill(); host.wait()
     log.close()
     if result['status']=='pass':
+        # Keep the four Child requests distinct from unrelated startup memory work.
+        # The active Host/Worker above uses defaults; only this cold-read Host opts out.
+        config['memory']={'auto_dream_enabled':False}
+        (data/'config.json').write_text(json.dumps(config))
+        result['cold_read_fixture_config']={'memory.auto_dream_enabled':False}
         cold_log=open(out/'cold-host.log','wb')
         s=socket.socket(); s.bind(('127.0.0.1',0)); port=s.getsockname()[1]; s.close(); base=f'http://127.0.0.1:{port}/api/v1'
         host=subprocess.Popen([A.binary,'serve','--bind','127.0.0.1','--port',str(port),'--data-dir',str(data)],cwd=data,env=env,stdout=cold_log,stderr=cold_log)
