@@ -17,6 +17,34 @@ impl SkillCatalogCallerResolver for Resolver {
             .clone()
             .ok_or_else(|| ToolError::Execution("unknown actual caller".into()))
     }
+    fn validate_current(
+        &self,
+        ctx: &ToolCtx,
+        expected: &SkillCatalogCaller,
+    ) -> Result<(), ToolError> {
+        let current = self
+            .0
+            .try_read()
+            .map_err(|_| ToolError::Execution("current actual caller is busy".into()))?;
+        validate_fixture_caller(ctx, current.as_ref(), expected)
+    }
+}
+
+fn validate_fixture_caller(
+    ctx: &ToolCtx,
+    current: Option<&SkillCatalogCaller>,
+    expected: &SkillCatalogCaller,
+) -> Result<(), ToolError> {
+    let current = current.ok_or_else(|| ToolError::Execution("unknown actual caller".into()))?;
+    let snapshot = |caller: &SkillCatalogCaller| {
+        serde_json::to_value(caller).map_err(|error| ToolError::Execution(error.to_string()))
+    };
+    if ctx.session_id() != Some(current.session_id.as_str())
+        || snapshot(current)? != snapshot(expected)?
+    {
+        return Err(ToolError::Execution("current actual caller changed".into()));
+    }
+    Ok(())
 }
 
 struct Fixture {
@@ -1888,5 +1916,1389 @@ async fn skill_output_budget_composition_preserves_fresh_warm_and_cold_authority
                 "cold fresh source {change}"
             );
         }
+    }
+}
+
+impl Fixture {
+    fn input_factory(&self) -> SkillInputFactory {
+        SkillInputFactory::new(
+            self.manager.clone(),
+            self.config.clone(),
+            self.repo.clone(),
+            self.resolver.clone(),
+        )
+    }
+    async fn fresh_input(&self, ids: &[&str]) -> (Message, Vec<bamboo_skills::WorkflowSelection>) {
+        let user = Message::user("### Explicit Skill client-fragment\nReview this input");
+        let mut resolver = self.resolver.0.write().await;
+        let caller = resolver.as_mut().unwrap();
+        caller.input_id = user.id.clone();
+        caller.invocation = Some(SkillCatalogInvocation {
+            input_id: user.id.clone(),
+            skills: ids.iter().map(|id| (*id).into()).collect(),
+        });
+        drop(resolver);
+        let catalog = self.manager.store().skill_catalog_snapshot().await;
+        let selections = ids
+            .iter()
+            .map(|id| {
+                let entry = catalog
+                    .entries
+                    .iter()
+                    .find(|entry| &entry.id == id)
+                    .unwrap();
+                bamboo_skills::WorkflowSelection {
+                    id: (*id).into(),
+                    source: entry.source,
+                    revision: entry.revision,
+                    args: json!({}),
+                }
+            })
+            .collect();
+        (user, selections)
+    }
+}
+
+#[tokio::test]
+async fn skill_factory_unappended_user_preserves_message_and_existing_reader_predicate() {
+    use bamboo_domain::{ImageUrlRef, MessagePart};
+    let fixture = Fixture::new(2).await;
+    let (mut user, selections) = fixture.fresh_input(&["catalog-0", "catalog-1"]).await;
+    user.content_parts = Some(vec![
+        MessagePart::Text {
+            text: user.content.clone(),
+        },
+        MessagePart::ImageUrl {
+            image_url: ImageUrlRef {
+                url: "https://example.invalid/image.png".into(),
+                detail: Some("high".into()),
+            },
+        },
+        MessagePart::Text {
+            text: "additional text".into(),
+        },
+    ]);
+    let before = serde_json::to_value(fixture.repo.load("catalog-session").await.unwrap()).unwrap();
+    let original = serde_json::to_value(&user).unwrap();
+    assert!(
+        fixture.tool.render_catalog(&fixture.ctx).await.is_err(),
+        "old API requires the actually persisted User"
+    );
+    let prepared = fixture
+        .input_factory()
+        .prepare_input(
+            &fixture.ctx,
+            &user,
+            SkillInputSession::Existing,
+            &selections,
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared.message.id, user.id);
+    assert_eq!(prepared.message.role, user.role);
+    assert_eq!(prepared.message.created_at, user.created_at);
+    assert!(prepared.message.content.starts_with(&user.content));
+    assert!(prepared.message.content.contains("PRIVATE BODY catalog-0"));
+    assert!(prepared.message.content.contains("PRIVATE BODY catalog-1"));
+    assert!(!prepared.message.content.contains("aux"));
+    let parts = prepared.message.content_parts.as_ref().unwrap();
+    assert!(matches!(&parts[0], MessagePart::Text { text } if text == &prepared.message.content));
+    assert_eq!(&parts[1..], &user.content_parts.as_ref().unwrap()[1..]);
+    assert_eq!(serde_json::to_value(&user).unwrap(), original);
+    assert_eq!(
+        serde_json::to_value(fixture.repo.load("catalog-session").await.unwrap()).unwrap(),
+        before
+    );
+    assert!(fixture
+        .manager
+        .store()
+        .activation_descriptor("catalog-session")
+        .await
+        .is_none());
+    assert!(fixture
+        .tool
+        .selected_source(&fixture.ctx, "catalog-0", "SKILL.md")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn skill_factory_new_session_is_host_owned_and_ordinary_input_is_a_noop() {
+    let fixture = Fixture::new(1).await;
+    let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
+    let session = Session::new("new-host-session", "model");
+    let mut ctx = fixture.ctx.clone();
+    ctx.session_id = Some(session.id.clone().into());
+    fixture
+        .resolver
+        .0
+        .write()
+        .await
+        .as_mut()
+        .unwrap()
+        .session_id = session.id.clone();
+    let factory = fixture.input_factory();
+    let before = serde_json::to_value(&session).unwrap();
+    assert!(factory
+        .prepare_input(&ctx, &user, SkillInputSession::Existing, &selections)
+        .await
+        .is_err());
+    let prepared = factory
+        .prepare_input(&ctx, &user, SkillInputSession::New(&session), &selections)
+        .await
+        .unwrap();
+    assert!(prepared.message.content.contains("PRIVATE BODY"));
+    assert_eq!(serde_json::to_value(&session).unwrap(), before);
+    assert!(fixture
+        .repo
+        .storage()
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(fixture.repo.cache().get(&session.id).is_none());
+    fixture
+        .resolver
+        .0
+        .write()
+        .await
+        .as_mut()
+        .unwrap()
+        .invocation = None;
+    let ordinary = factory
+        .prepare_input(&ctx, &user, SkillInputSession::New(&session), &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(ordinary.message).unwrap(),
+        serde_json::to_value(&user).unwrap()
+    );
+    assert!(ordinary.warnings.is_empty());
+    *fixture.resolver.0.write().await = None;
+    assert!(factory
+        .prepare_input(&ctx, &user, SkillInputSession::New(&session), &[])
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn skill_factory_enforces_fresh_ceiling_manual_disabled_ultra_and_input_bindings() {
+    for change in [
+        "none",
+        "empty",
+        "other",
+        "disabled",
+        "ultra",
+        "unknown",
+        "intent",
+        "input",
+        "mode",
+        "collision",
+        "new-collision",
+    ] {
+        let fixture = Fixture::new(2).await;
+        let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
+        let mut session = fixture.repo.load("catalog-session").await.unwrap();
+        match change {
+            "none" => fixture.resolver.0.write().await.as_mut().unwrap().ceiling = None,
+            "empty" => {
+                fixture.resolver.0.write().await.as_mut().unwrap().ceiling = Some(BTreeSet::new())
+            }
+            "other" => {
+                fixture.resolver.0.write().await.as_mut().unwrap().ceiling =
+                    Some(BTreeSet::from(["catalog-1".into()]))
+            }
+            "disabled" => fixture.config.write().await.skills.disabled = vec!["catalog-0".into()],
+            "ultra" => {
+                session.root_orchestration_only = true;
+                session.root_tool_authority_revision += 1;
+                fixture.repo.save(&mut session).await.unwrap();
+            }
+            "unknown" => *fixture.resolver.0.write().await = None,
+            "intent" => {
+                fixture
+                    .resolver
+                    .0
+                    .write()
+                    .await
+                    .as_mut()
+                    .unwrap()
+                    .invocation = None
+            }
+            "input" => {
+                fixture.resolver.0.write().await.as_mut().unwrap().input_id =
+                    "historical-input".into()
+            }
+            "mode" => {
+                fixture.resolver.0.write().await.as_mut().unwrap().mode = Some("../escape".into())
+            }
+            "collision" => {
+                session.messages.push(user.clone());
+                fixture.repo.save(&mut session).await.unwrap();
+            }
+            "new-collision" => {}
+            _ => unreachable!(),
+        }
+        let host = if change == "new-collision" {
+            SkillInputSession::New(&session)
+        } else {
+            SkillInputSession::Existing
+        };
+        let result = fixture
+            .input_factory()
+            .prepare_input(&fixture.ctx, &user, host, &selections)
+            .await;
+        assert_eq!(result.is_ok(), change == "none", "{change}");
+    }
+}
+
+#[tokio::test]
+async fn skill_factory_selection_is_atomic_and_schema_arguments_are_bounded() {
+    let missing = Fixture::new(1).await;
+    let (user, _) = missing.fresh_input(&["catalog-0"]).await;
+    assert!(
+        missing
+            .input_factory()
+            .prepare_input(&missing.ctx, &user, SkillInputSession::Existing, &[])
+            .await
+            .is_err(),
+        "a nonempty explicit invocation cannot lose all typed selections"
+    );
+    let empty = Fixture::new(1).await;
+    let (user, selections) = empty.fresh_input(&[]).await;
+    assert!(
+        empty
+            .input_factory()
+            .prepare_input(&empty.ctx, &user, SkillInputSession::Existing, &selections)
+            .await
+            .is_err(),
+        "an empty explicit invocation is not ordinary input"
+    );
+    for change in [
+        "duplicate",
+        "missing",
+        "source",
+        "revision",
+        "args",
+        "schema",
+        "policy",
+    ] {
+        let fixture = Fixture::new(2).await;
+        let (user, mut selections) = fixture.fresh_input(&["catalog-0", "catalog-1"]).await;
+        match change {
+            "duplicate" => selections[1] = selections[0].clone(),
+            "missing" => {
+                selections[1].id = "missing-skill".into();
+                fixture
+                    .resolver
+                    .0
+                    .write()
+                    .await
+                    .as_mut()
+                    .unwrap()
+                    .invocation
+                    .as_mut()
+                    .unwrap()
+                    .skills = BTreeSet::from(["catalog-0".into(), "missing-skill".into()]);
+            }
+            "source" => selections[1].source = bamboo_skills::WorkflowSource::Workspace,
+            "revision" => selections[1].revision += 1,
+            "args" => selections[1].args = json!({"target":"界".repeat(8192)}),
+            "schema" => selections[1].args = json!(true),
+            "policy" => {
+                std::fs::create_dir_all(fixture._directory.path().join("skills/catalog-1/agents"))
+                    .unwrap();
+                std::fs::write(
+                    fixture
+                        ._directory
+                        .path()
+                        .join("skills/catalog-1/agents/bamboo.yaml"),
+                    "invocation_policy:\n  explicit: false\n  automatic: true\n",
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let original = serde_json::to_value(&user).unwrap();
+        assert!(
+            fixture
+                .input_factory()
+                .prepare_input(
+                    &fixture.ctx,
+                    &user,
+                    SkillInputSession::Existing,
+                    &selections
+                )
+                .await
+                .is_err(),
+            "{change}"
+        );
+        assert_eq!(serde_json::to_value(&user).unwrap(), original);
+    }
+}
+
+// Read interception retains the real durable Storage and existing persistence
+// coordinator; it creates no fake caller permission or publication snapshot.
+struct FactoryStorageGate {
+    inner: Arc<dyn bamboo_domain::Storage>,
+    loads: std::sync::atomic::AtomicUsize,
+    pause_at: usize,
+    fail_at: usize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[async_trait]
+impl bamboo_domain::Storage for FactoryStorageGate {
+    async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+        self.inner.save_session(session).await
+    }
+    async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+        let call = self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if call == self.pause_at {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        if call == self.fail_at {
+            return Err(std::io::Error::other(
+                "original injected factory storage read failure",
+            ));
+        }
+        self.inner.load_session(id).await
+    }
+    async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+        self.inner.delete_session(id).await
+    }
+}
+fn gated_factory(
+    fixture: &Fixture,
+    pause_at: usize,
+    fail_at: usize,
+) -> (SkillInputFactory, Arc<FactoryStorageGate>) {
+    let gate = Arc::new(FactoryStorageGate {
+        inner: fixture.repo.storage().clone(),
+        loads: Default::default(),
+        pause_at,
+        fail_at,
+        entered: Default::default(),
+        release: Default::default(),
+    });
+    let repo = bamboo_engine::SessionRepository::new(
+        fixture.repo.cache().clone(),
+        gate.clone(),
+        fixture.repo.persistence().clone(),
+    );
+    (
+        SkillInputFactory::new(
+            fixture.manager.clone(),
+            fixture.config.clone(),
+            repo,
+            fixture.resolver.clone(),
+        ),
+        gate,
+    )
+}
+
+#[tokio::test]
+async fn skill_factory_first_and_final_storage_errors_cannot_become_new_or_success() {
+    for (new, fail_at, ordinary) in [
+        (false, 1, false),
+        (false, 2, false),
+        (true, 1, false),
+        (true, 2, false),
+        (false, 1, true),
+        (false, 2, true),
+        (true, 1, true),
+        (true, 2, true),
+    ] {
+        let fixture = Fixture::new(1).await;
+        let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
+        let selections = if ordinary {
+            fixture
+                .resolver
+                .0
+                .write()
+                .await
+                .as_mut()
+                .unwrap()
+                .invocation = None;
+            vec![]
+        } else {
+            selections
+        };
+        let session = Session::new("new-error-session", "model");
+        let mut ctx = fixture.ctx.clone();
+        if new {
+            ctx.session_id = Some(session.id.clone().into());
+            fixture
+                .resolver
+                .0
+                .write()
+                .await
+                .as_mut()
+                .unwrap()
+                .session_id = session.id.clone();
+        }
+        let (factory, gate) = gated_factory(&fixture, 0, fail_at);
+        let host = if new {
+            SkillInputSession::New(&session)
+        } else {
+            SkillInputSession::Existing
+        };
+        let error = factory
+            .prepare_input(&ctx, &user, host, &selections)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("original injected factory storage read failure"),
+            "{new}/{fail_at}/{ordinary}: {error}"
+        );
+        assert_eq!(
+            gate.loads.load(std::sync::atomic::Ordering::SeqCst),
+            fail_at
+        );
+        assert!(fixture
+            .repo
+            .storage()
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn skill_factory_final_storage_holds_config_owner_and_current_source_guards() {
+    for changed in ["main", "auxiliary", "policy", "physical"] {
+        let fixture = Fixture::new(1).await;
+        let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
+        let (factory, gate) = gated_factory(&fixture, 2, 0);
+        let pending = factory.prepare_input(
+            &fixture.ctx,
+            &user,
+            SkillInputSession::Existing,
+            &selections,
+        );
+        tokio::pin!(pending);
+        tokio::select! { _ = gate.entered.notified() => {}, result = &mut pending => panic!("final storage barrier not reached: {result:?}") }
+        assert!(
+            fixture.config.try_write().is_err(),
+            "configuration remains guarded across final storage await"
+        );
+        let owner_wait = fixture.repo.persistence().acquire_lock("catalog-session");
+        tokio::pin!(owner_wait);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut owner_wait)
+                .await
+                .is_err()
+        );
+        let root = fixture._directory.path().join("skills/catalog-0");
+        match changed {
+            "main" => {
+                let path = root.join("SKILL.md");
+                let text = std::fs::read_to_string(&path).unwrap();
+                std::fs::write(path, format!("{text}\n ")).unwrap();
+            }
+            "auxiliary" => {
+                std::fs::write(root.join("references/raw.txt"), "changed auxiliary").unwrap()
+            }
+            "policy" => std::fs::write(
+                root.join("agents/bamboo.yaml"),
+                "invocation_policy:\n  explicit: false\n  automatic: false\n",
+            )
+            .unwrap(),
+            "physical" => {
+                let path = root.join("SKILL.md");
+                let text = std::fs::read_to_string(&path).unwrap();
+                std::fs::rename(&path, root.join("old-main.txt")).unwrap();
+                std::fs::write(path, text).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let manager = fixture.manager.clone();
+        let writer = tokio::spawn(async move { manager.store().reload().await });
+        gate.release.notify_one();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut pending)
+                .await
+                .unwrap()
+                .is_err(),
+            "{changed}"
+        );
+        drop(pending);
+        drop(owner_wait);
+        tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(fixture.config.try_write().is_ok());
+    }
+}
+
+#[tokio::test]
+async fn skill_factory_cache_miss_and_changed_reload_do_not_form_an_owner_cycle() {
+    let fixture = Fixture::new(1).await;
+    let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
+    fixture.repo.cache().remove("catalog-session");
+    let owner = fixture
+        .repo
+        .persistence()
+        .acquire_lock("catalog-session")
+        .await;
+    let factory = fixture.input_factory();
+    let pending = factory.prepare_input(
+        &fixture.ctx,
+        &user,
+        SkillInputSession::Existing,
+        &selections,
+    );
+    tokio::pin!(pending);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), &mut pending)
+            .await
+            .is_err()
+    );
+    let path = fixture._directory.path().join("skills/catalog-0/SKILL.md");
+    std::fs::write(
+        path,
+        "---\nname: catalog-0\ndescription: changed\n---\nNEW BODY",
+    )
+    .unwrap();
+    // A real changed reload must complete while the cache-miss reader waits for
+    // the existing chat owner. The reader has acquired no publication guard.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.manager.store().reload(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(owner);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut pending)
+            .await
+            .unwrap()
+            .is_err(),
+        "stale typed revision must deny after owner release"
+    );
+}
+
+struct FactoryMutationResolver {
+    caller: SkillCatalogCaller,
+    calls: std::sync::atomic::AtomicUsize,
+    repo: bamboo_engine::SessionRepository,
+    config: Arc<RwLock<Config>>,
+    change: &'static str,
+}
+#[async_trait]
+impl SkillCatalogCallerResolver for FactoryMutationResolver {
+    async fn resolve(&self, _: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
+        let mut caller = self.caller.clone();
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            match self.change {
+                "caller" => caller.ceiling = Some(BTreeSet::new()),
+                "error" => {
+                    return Err(ToolError::Execution(
+                        "original final resolver failure".into(),
+                    ))
+                }
+                "config" => self.config.write().await.skills.disabled = vec!["catalog-0".into()],
+                "new-row" => {
+                    let mut row = Session::new(&caller.session_id, "model");
+                    self.repo.save(&mut row).await.unwrap();
+                }
+                "root-aba" => {
+                    let mut session = self
+                        .repo
+                        .try_load(&caller.session_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    session.set_root_orchestration_only(true).unwrap();
+                    self.repo.save(&mut session).await.unwrap();
+                    session.set_root_orchestration_only(false).unwrap();
+                    self.repo.save(&mut session).await.unwrap();
+                }
+                "workspace-aba" => {
+                    let mut session = self
+                        .repo
+                        .try_load(&caller.session_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let original = session.workspace_path_meta().unwrap();
+                    session.set_workspace_path_meta("/temporary-foreign-workspace");
+                    session.metadata_version += 1;
+                    self.repo.save(&mut session).await.unwrap();
+                    session.set_workspace_path_meta(original);
+                    session.metadata_version += 1;
+                    self.repo.save(&mut session).await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(caller)
+    }
+    fn validate_current(
+        &self,
+        ctx: &ToolCtx,
+        expected: &SkillCatalogCaller,
+    ) -> Result<(), ToolError> {
+        validate_fixture_caller(ctx, Some(&self.caller), expected)
+    }
+}
+
+#[tokio::test]
+async fn skill_factory_final_resolver_cannot_hide_config_caller_or_session_aba() {
+    for ordinary in [false, true] {
+        for change in [
+            "caller",
+            "error",
+            "config",
+            "root-aba",
+            "workspace-aba",
+            "new-row",
+        ] {
+            let fixture = Fixture::new(1).await;
+            let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
+            let selections = if ordinary {
+                fixture
+                    .resolver
+                    .0
+                    .write()
+                    .await
+                    .as_mut()
+                    .unwrap()
+                    .invocation = None;
+                vec![]
+            } else {
+                selections
+            };
+            let mut session = fixture.repo.load("catalog-session").await.unwrap();
+            // Official Root mode transitions reject selected legacy Skill metadata.
+            session.clear_selected_skill_ids();
+            if change == "workspace-aba" {
+                session.set_workspace_path_meta(fixture._directory.path().to_string_lossy());
+            }
+            session.metadata_version += 1;
+            fixture.repo.save(&mut session).await.unwrap();
+            let mut ctx = fixture.ctx.clone();
+            let new = Session::new("appearing-host-session", "model");
+            let mut caller = fixture.resolver.0.read().await.clone().unwrap();
+            if change == "new-row" {
+                ctx.session_id = Some(new.id.clone().into());
+                caller.session_id = new.id.clone();
+            }
+            let resolver = Arc::new(FactoryMutationResolver {
+                caller,
+                calls: Default::default(),
+                repo: fixture.repo.clone(),
+                config: fixture.config.clone(),
+                change,
+            });
+            let factory = SkillInputFactory::new(
+                fixture.manager.clone(),
+                fixture.config.clone(),
+                fixture.repo.clone(),
+                resolver.clone(),
+            );
+            let host = if change == "new-row" {
+                SkillInputSession::New(&new)
+            } else {
+                SkillInputSession::Existing
+            };
+            assert!(
+                factory
+                    .prepare_input(&ctx, &user, host, &selections)
+                    .await
+                    .is_err(),
+                "{ordinary}/{change}"
+            );
+            assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            if change == "root-aba" {
+                let current = fixture.repo.load("catalog-session").await.unwrap();
+                assert!(!current.root_orchestration_only_enabled());
+                assert_eq!(
+                    current.root_tool_authority_revision,
+                    session.root_tool_authority_revision + 2
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn skill_factory_new_and_existing_scopes_use_actual_project_mode_and_workspace() {
+    let fixture = Fixture::new(1).await;
+    let projects =
+        Arc::new(bamboo_projects::ProjectStore::open(fixture._directory.path()).unwrap());
+    let project = projects.create("Factory scoped inputs", None).unwrap();
+    let workspace = fixture._directory.path().join("workspace");
+    let project_root = projects
+        .paths()
+        .project_home(&project.id)
+        .join("skills/catalog-0");
+    let mode_root = workspace.join(".bamboo/skills-review/catalog-0");
+    for (root, body) in [
+        (&project_root, "PROJECT BODY"),
+        (&mode_root, "MODE WORKSPACE BODY"),
+    ] {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            format!("---\nname: catalog-0\ndescription: scoped summary\n---\n{body}"),
+        )
+        .unwrap();
+    }
+    let mut existing = fixture.repo.load("catalog-session").await.unwrap();
+    existing.set_project_id_meta(project.id.to_string());
+    existing.set_workspace_path_meta(workspace.to_string_lossy());
+    existing.metadata_version += 1;
+    fixture.repo.save(&mut existing).await.unwrap();
+    for new in [false, true] {
+        let session = if new {
+            let mut session = Session::new("new-scoped-host", "model");
+            session.set_project_id_meta(project.id.to_string());
+            session.set_workspace_path_meta(workspace.to_string_lossy());
+            session
+        } else {
+            existing.clone()
+        };
+        for mode in [None, Some("review")] {
+            let (user, _) = fixture.fresh_input(&["catalog-0"]).await;
+            let mut ctx = fixture.ctx.clone();
+            ctx.session_id = Some(session.id.clone().into());
+            {
+                let mut caller = fixture.resolver.0.write().await;
+                let caller = caller.as_mut().unwrap();
+                caller.session_id = session.id.clone();
+                caller.mode = mode.map(str::to_owned);
+            }
+            let factory = fixture.input_factory().with_project_store(projects.clone());
+            let access = SkillToolAccess::new(
+                fixture.manager.clone(),
+                fixture.config.clone(),
+                fixture.repo.clone(),
+            )
+            .with_project_store(projects.clone());
+            let store = access.skill_store_for_session(&session).await.unwrap();
+            let projection = store
+                .progressive_catalog_for_mode(
+                    mode,
+                    &bamboo_skills::progressive::SkillCatalogEligibility {
+                        ceiling: None,
+                        explicit: BTreeSet::from(["catalog-0".into()]),
+                        disabled: BTreeSet::new(),
+                        deny_all: false,
+                    },
+                )
+                .await
+                .unwrap();
+            let entry = projection
+                .entries
+                .iter()
+                .find(|entry| entry.package == "catalog-0")
+                .unwrap();
+            let selections = [bamboo_skills::WorkflowSelection {
+                id: entry.package.clone(),
+                source: entry.source,
+                revision: entry.revision,
+                args: json!({"escaped":"界\"\\\n"}),
+            }];
+            let host = if new {
+                SkillInputSession::New(&session)
+            } else {
+                SkillInputSession::Existing
+            };
+            let prepared = factory
+                .prepare_input(&ctx, &user, host, &selections)
+                .await
+                .unwrap();
+            assert!(prepared.message.content.contains(if mode.is_some() {
+                "MODE WORKSPACE BODY"
+            } else {
+                "PROJECT BODY"
+            }));
+            assert!(!prepared.message.content.contains("PRIVATE BODY catalog-0"));
+            assert!(prepared.message.content.contains("界\\\"\\\\\\n"));
+            let host = if new {
+                SkillInputSession::New(&session)
+            } else {
+                SkillInputSession::Existing
+            };
+            assert!(
+                fixture
+                    .input_factory()
+                    .prepare_input(&ctx, &user, host, &selections)
+                    .await
+                    .is_err(),
+                "missing Project resolver cannot fall back to global"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+struct FactoryWorkspaceAliasResolver {
+    caller: SkillCatalogCaller,
+    calls: std::sync::atomic::AtomicUsize,
+    alias: std::path::PathBuf,
+    replacement: std::path::PathBuf,
+}
+#[cfg(unix)]
+#[async_trait]
+impl SkillCatalogCallerResolver for FactoryWorkspaceAliasResolver {
+    async fn resolve(&self, _: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            std::fs::remove_file(&self.alias).unwrap();
+            std::os::unix::fs::symlink(&self.replacement, &self.alias).unwrap();
+        }
+        Ok(self.caller.clone())
+    }
+    fn validate_current(
+        &self,
+        ctx: &ToolCtx,
+        expected: &SkillCatalogCaller,
+    ) -> Result<(), ToolError> {
+        validate_fixture_caller(ctx, Some(&self.caller), expected)
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn skill_factory_workspace_alias_retarget_cannot_accept_the_cached_old_store() {
+    for (new, project) in [(false, false), (true, false), (false, true), (true, true)] {
+        let fixture = Fixture::new(1).await;
+        let (user, _) = fixture.fresh_input(&["catalog-0"]).await;
+        let workspace_a = fixture._directory.path().join("workspace-a");
+        let workspace_b = fixture._directory.path().join("workspace-b");
+        let alias = fixture._directory.path().join("workspace-alias");
+        for (workspace, body) in [
+            (&workspace_a, "WORKSPACE A BODY"),
+            (&workspace_b, "WORKSPACE B BODY"),
+        ] {
+            let root = workspace.join(".bamboo/skills/catalog-0");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("SKILL.md"),
+                format!("---\nname: catalog-0\ndescription: scoped summary\n---\n{body}"),
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink(&workspace_a, &alias).unwrap();
+        let projects =
+            Arc::new(bamboo_projects::ProjectStore::open(fixture._directory.path()).unwrap());
+        let assigned = projects.create("Alias scoped input", None).unwrap();
+        let mut session = if new {
+            Session::new("new-workspace-alias-host", "model")
+        } else {
+            fixture.repo.load("catalog-session").await.unwrap()
+        };
+        session.set_workspace_path_meta(alias.to_string_lossy());
+        if project {
+            session.set_project_id_meta(assigned.id.to_string());
+        }
+        session.metadata_version += 1;
+        if !new {
+            fixture.repo.save(&mut session).await.unwrap();
+        }
+        let mut ctx = fixture.ctx.clone();
+        ctx.session_id = Some(session.id.clone().into());
+        let mut caller = fixture.resolver.0.read().await.clone().unwrap();
+        caller.session_id = session.id.clone();
+        let access = SkillToolAccess::new(
+            fixture.manager.clone(),
+            fixture.config.clone(),
+            fixture.repo.clone(),
+        )
+        .with_project_store(projects.clone());
+        // Prime the real alias cache with A before the factory's first resolve.
+        let store = access.skill_store_for_session(&session).await.unwrap();
+        let catalog = store.skill_catalog_snapshot().await;
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "catalog-0")
+            .unwrap();
+        assert_eq!(entry.source, bamboo_skills::WorkflowSource::Workspace);
+        let selections = [bamboo_skills::WorkflowSelection {
+            id: entry.id.clone(),
+            source: entry.source,
+            revision: entry.revision,
+            args: json!({}),
+        }];
+        let resolver = Arc::new(FactoryWorkspaceAliasResolver {
+            caller,
+            calls: Default::default(),
+            alias: alias.clone(),
+            replacement: workspace_b.clone(),
+        });
+        let factory = SkillInputFactory::new(
+            fixture.manager.clone(),
+            fixture.config.clone(),
+            fixture.repo.clone(),
+            resolver.clone(),
+        )
+        .with_project_store(projects);
+        let host = if new {
+            SkillInputSession::New(&session)
+        } else {
+            SkillInputSession::Existing
+        };
+        let result = factory.prepare_input(&ctx, &user, host, &selections).await;
+        assert!(
+            result.is_err(),
+            "retargeted alias must deny: new={new}, project={project}; {result:?}"
+        );
+        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::canonicalize(&alias).unwrap(),
+            std::fs::canonicalize(&workspace_b).unwrap()
+        );
+        if !project {
+            let cached = access.skill_store_for_session(&session).await.unwrap();
+            assert!(
+                Arc::ptr_eq(&store, &cached),
+                "legacy alias caching must remain unchanged"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn skill_factory_canonical_path_cannot_reuse_a_historical_alias_store() {
+    for new in [false, true] {
+        let fixture = Fixture::new(1).await;
+        let (user, _) = fixture.fresh_input(&["catalog-0"]).await;
+        let canonical_parent = std::fs::canonicalize(fixture._directory.path()).unwrap();
+        let workspace = canonical_parent.join("recreated-workspace");
+        let foreign = canonical_parent.join("foreign-workspace");
+        let root = foreign.join(".bamboo/skills/catalog-0");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            "---\nname: catalog-0\ndescription: scoped summary\n---\nFOREIGN BODY",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&foreign, &workspace).unwrap();
+        let mut session = if new {
+            Session::new("new-historical-alias-host", "model")
+        } else {
+            fixture.repo.load("catalog-session").await.unwrap()
+        };
+        session.set_workspace_path_meta(workspace.to_string_lossy());
+        session.metadata_version += 1;
+        if !new {
+            fixture.repo.save(&mut session).await.unwrap();
+        }
+        let access = SkillToolAccess::new(
+            fixture.manager.clone(),
+            fixture.config.clone(),
+            fixture.repo.clone(),
+        );
+        let old = access.skill_store_for_session(&session).await.unwrap();
+        let catalog = old.skill_catalog_snapshot().await;
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "catalog-0")
+            .unwrap();
+        let selections = [bamboo_skills::WorkflowSelection {
+            id: entry.id.clone(),
+            source: entry.source,
+            revision: entry.revision,
+            args: json!({}),
+        }];
+        std::fs::remove_file(&workspace).unwrap();
+        let root = workspace.join(".bamboo/skills/catalog-0");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            "---\nname: catalog-0\ndescription: scoped summary\n---\nACTUAL BODY",
+        )
+        .unwrap();
+        assert!(!std::fs::symlink_metadata(&workspace)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::canonicalize(&workspace).unwrap(),
+            std::fs::canonicalize(fixture._directory.path())
+                .unwrap()
+                .join("recreated-workspace")
+        );
+        let cached = access.skill_store_for_session(&session).await.unwrap();
+        assert!(Arc::ptr_eq(&old, &cached));
+        fixture
+            .resolver
+            .0
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .session_id = session.id.clone();
+        let mut ctx = fixture.ctx.clone();
+        ctx.session_id = Some(session.id.clone().into());
+        let host = if new {
+            SkillInputSession::New(&session)
+        } else {
+            SkillInputSession::Existing
+        };
+        let result = fixture
+            .input_factory()
+            .prepare_input(&ctx, &user, host, &selections)
+            .await;
+        if let Ok(prepared) = &result {
+            assert!(
+                prepared.message.content.contains("FOREIGN BODY"),
+                "the regression must actually reach the historical foreign store"
+            );
+        }
+        assert!(
+            result.is_err(),
+            "a canonical key with a historical alias store must deny: new={new}; {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn skill_factory_caller_revocation_during_final_storage_is_denied() {
+    let fixture = Fixture::new(1).await;
+    let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
+    let before = serde_json::to_value(
+        fixture
+            .repo
+            .storage()
+            .load_session("catalog-session")
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let (factory, gate) = gated_factory(&fixture, 2, 0);
+    let pending = factory.prepare_input(
+        &fixture.ctx,
+        &user,
+        SkillInputSession::Existing,
+        &selections,
+    );
+    tokio::pin!(pending);
+    tokio::select! {
+        _ = gate.entered.notified() => {},
+        result = &mut pending => panic!("final storage barrier not reached: {result:?}"),
+    }
+    assert!(fixture.config.try_write().is_err());
+    // Actual authority source is independent of Config and Session owners.
+    fixture.resolver.0.write().await.as_mut().unwrap().ceiling = Some(BTreeSet::new());
+    gate.release.notify_one();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut pending)
+        .await
+        .unwrap();
+    let after = serde_json::to_value(
+        fixture
+            .repo
+            .storage()
+            .load_session("catalog-session")
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(before, after, "authority revocation did not alter Session");
+    assert!(
+        result.is_err(),
+        "revoked caller must not receive Skill instructions: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn skill_factory_final_caller_snapshot_denies_changes_unknown_and_busy() {
+    for change in [
+        "unchanged",
+        "identity",
+        "session",
+        "input",
+        "invocation-input",
+        "invocation-skills",
+        "invocation-none",
+        "mode",
+        "context-window",
+        "metadata-tokens",
+        "response-bytes",
+        "unknown",
+        "busy",
+    ] {
+        let fixture = Fixture::new(1).await;
+        let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
+        let before =
+            serde_json::to_value(fixture.repo.load("catalog-session").await.unwrap()).unwrap();
+        let (factory, gate) = gated_factory(&fixture, 2, 0);
+        let pending = factory.prepare_input(
+            &fixture.ctx,
+            &user,
+            SkillInputSession::Existing,
+            &selections,
+        );
+        tokio::pin!(pending);
+        tokio::select! {
+            _ = gate.entered.notified() => {},
+            result = &mut pending => panic!("final storage barrier not reached: {result:?}"),
+        }
+        assert!(fixture.config.try_write().is_err());
+        let mut authority = fixture.resolver.0.write().await;
+        if change == "unknown" {
+            *authority = None;
+        } else {
+            let caller = authority.as_mut().unwrap();
+            match change {
+                "unchanged" | "busy" => {}
+                "identity" => caller.caller_id = "another-host".into(),
+                "session" => caller.session_id = "another-session".into(),
+                "input" => caller.input_id = "another-input".into(),
+                "invocation-input" => {
+                    caller.invocation.as_mut().unwrap().input_id = "another-input".into()
+                }
+                "invocation-skills" => caller.invocation.as_mut().unwrap().skills.clear(),
+                "invocation-none" => caller.invocation = None,
+                "mode" => caller.mode = Some("review".into()),
+                "context-window" => caller.context_window = Some(200_000),
+                "metadata-tokens" => caller.metadata_tokens = std::num::NonZeroUsize::new(1),
+                "response-bytes" => caller.response_bytes += 1,
+                _ => unreachable!(),
+            }
+        }
+        let _busy = if change == "busy" {
+            Some(authority)
+        } else {
+            drop(authority);
+            None
+        };
+        gate.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut pending)
+            .await
+            .unwrap();
+        if change == "unchanged" {
+            assert!(result
+                .unwrap()
+                .message
+                .content
+                .contains("PRIVATE BODY catalog-0"));
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(!error.contains("PRIVATE BODY"), "{change}: {error}");
+            assert!(
+                error.contains(if change == "unknown" {
+                    "unknown actual caller"
+                } else if change == "busy" {
+                    "current actual caller is busy"
+                } else {
+                    "current actual caller changed"
+                }),
+                "{change}: {error}"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(fixture.repo.load("catalog-session").await.unwrap()).unwrap(),
+            before,
+            "{change}"
+        );
+        assert!(fixture.config.try_write().is_ok());
+    }
+}
+
+#[tokio::test]
+async fn skill_factory_legacy_resolver_defaults_to_deny_without_changing_list_read() {
+    let fixture = Fixture::new(1).await;
+    let original = fixture.resolver.0.read().await.clone();
+    // Existing BudgetResolver implements only resolve; no synchronous override.
+    let (read, resolver) = budget_reader(&fixture, Some(8_000));
+    let list = SkillsListTool::new(
+        fixture.manager.clone(),
+        fixture.config.clone(),
+        fixture.repo.clone(),
+        resolver.clone(),
+    );
+    let before = serde_json::to_value(fixture.repo.load("catalog-session").await.unwrap()).unwrap();
+    for after_factory in [false, true] {
+        if after_factory {
+            let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
+            let factory = SkillInputFactory::new(
+                fixture.manager.clone(),
+                fixture.config.clone(),
+                fixture.repo.clone(),
+                resolver.clone(),
+            );
+            let error = factory
+                .prepare_input(
+                    &fixture.ctx,
+                    &user,
+                    SkillInputSession::Existing,
+                    &selections,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("Current Skill caller authority validation is unavailable"));
+            assert!(!error.contains("PRIVATE BODY"));
+            *fixture.resolver.0.write().await = original.clone();
+        }
+        let page = list
+            .invoke(json!({}), fixture.ctx.clone())
+            .await
+            .unwrap()
+            .into_tool_result();
+        assert!(page.result.contains("catalog-0"));
+        assert!(!page.result.contains("PRIVATE BODY"));
+        let (_, page) = read_page(&read, &fixture.ctx, "catalog-0", "SKILL.md", None)
+            .await
+            .unwrap();
+        assert!(page.to_string().contains("PRIVATE BODY catalog-0"));
+        assert_eq!(
+            serde_json::to_value(fixture.repo.load("catalog-session").await.unwrap()).unwrap(),
+            before
+        );
+    }
+}
+
+#[tokio::test]
+async fn skill_factory_ordinary_input_does_not_require_unrelated_skill_source() {
+    for new in [false, true] {
+        let fixture = Fixture::new(1).await;
+        let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
+        let workspace = fixture._directory.path().join("deleted-workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let mut session = if new {
+            Session::new("ordinary-deleted-workspace-host", "model")
+        } else {
+            fixture.repo.load("catalog-session").await.unwrap()
+        };
+        session.set_workspace_path_meta(workspace.to_string_lossy());
+        session.metadata_version += 1;
+        if !new {
+            fixture.repo.save(&mut session).await.unwrap();
+        }
+        let before = serde_json::to_value(&session).unwrap();
+        let mut ctx = fixture.ctx.clone();
+        ctx.session_id = Some(session.id.clone().into());
+        fixture
+            .resolver
+            .0
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .session_id = session.id.clone();
+        std::fs::remove_dir(&workspace).unwrap();
+        let factory = fixture.input_factory();
+        let host = || {
+            if new {
+                SkillInputSession::New(&session)
+            } else {
+                SkillInputSession::Existing
+            }
+        };
+        assert!(
+            factory
+                .prepare_input(&ctx, &user, host(), &selections)
+                .await
+                .is_err(),
+            "explicit Skill input still requires an available real scope"
+        );
+        fixture
+            .resolver
+            .0
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .invocation = None;
+        let prepared = factory
+            .prepare_input(&ctx, &user, host(), &[])
+            .await
+            .expect("ordinary input must not require an unrelated Skill workspace");
+        assert_eq!(
+            serde_json::to_value(prepared.message).unwrap(),
+            serde_json::to_value(&user).unwrap()
+        );
+        assert!(prepared.warnings.is_empty());
+        if new {
+            assert!(fixture
+                .repo
+                .storage()
+                .load_session(&session.id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(fixture.repo.cache().get(&session.id).is_none());
+            assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        } else {
+            assert_eq!(
+                serde_json::to_value(fixture.repo.load(&session.id).await.unwrap()).unwrap(),
+                before
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn skill_factory_ordinary_input_still_checks_late_caller_authority() {
+    for change in ["invocation", "unknown", "busy"] {
+        let fixture = Fixture::new(1).await;
+        let (user, _) = fixture.fresh_input(&["catalog-0"]).await;
+        fixture
+            .resolver
+            .0
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .invocation = None;
+        let before =
+            serde_json::to_value(fixture.repo.load("catalog-session").await.unwrap()).unwrap();
+        let (factory, gate) = gated_factory(&fixture, 2, 0);
+        let pending = factory.prepare_input(&fixture.ctx, &user, SkillInputSession::Existing, &[]);
+        tokio::pin!(pending);
+        tokio::select! {
+            _ = gate.entered.notified() => {},
+            result = &mut pending => panic!("ordinary final storage barrier not reached: {result:?}"),
+        }
+        assert!(fixture.config.try_write().is_err());
+        let owner = fixture.repo.persistence().acquire_lock("catalog-session");
+        tokio::pin!(owner);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut owner)
+                .await
+                .is_err()
+        );
+        let held = if change == "busy" {
+            Some(fixture.resolver.0.write().await)
+        } else {
+            let mut caller = fixture.resolver.0.write().await;
+            if change == "unknown" {
+                *caller = None;
+            } else {
+                caller.as_mut().unwrap().invocation = Some(SkillCatalogInvocation {
+                    input_id: user.id.clone(),
+                    skills: BTreeSet::from(["catalog-0".into()]),
+                });
+            }
+            None
+        };
+        gate.release.notify_one();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut pending)
+                .await
+                .unwrap()
+                .is_err(),
+            "{change}"
+        );
+        drop(held);
+        assert_eq!(
+            serde_json::to_value(fixture.repo.load("catalog-session").await.unwrap()).unwrap(),
+            before
+        );
     }
 }

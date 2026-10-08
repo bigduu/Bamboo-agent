@@ -48,7 +48,8 @@ pub use session_inspector::SessionInspectorTool;
 pub use skill_runtime::{
     assemble_legacy_skill_tools, skill_response_byte_budget, LegacySkillContextRegistry,
     LoadSkillTool, ReadSkillResourceTool, SelectedSkillSource, SkillCatalogCaller,
-    SkillCatalogCallerResolver, SkillCatalogInvocation, SkillsListTool, SkillsReadTool,
+    SkillCatalogCallerResolver, SkillCatalogInvocation, SkillInputFactory, SkillInputSession,
+    SkillsListTool, SkillsReadTool,
 };
 pub use sub_agent::{SubAgentTool, DEFAULT_MAX_SPAWN_DEPTH};
 pub use surface::{ToolSurface, ToolSurfaceFactory};
