@@ -2126,6 +2126,16 @@ async fn skill_factory_enforces_fresh_ceiling_manual_disabled_ultra_and_input_bi
 
 #[tokio::test]
 async fn skill_factory_selection_is_atomic_and_schema_arguments_are_bounded() {
+    let missing = Fixture::new(1).await;
+    let (user, _) = missing.fresh_input(&["catalog-0"]).await;
+    assert!(
+        missing
+            .input_factory()
+            .prepare_input(&missing.ctx, &user, SkillInputSession::Existing, &[])
+            .await
+            .is_err(),
+        "a nonempty explicit invocation cannot lose all typed selections"
+    );
     for change in [
         "duplicate",
         "missing",

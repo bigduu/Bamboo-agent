@@ -117,11 +117,11 @@ impl SkillInputFactory {
             .iter()
             .map(|selection| selection.id.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        if !selections.is_empty()
-            && caller
-                .invocation
-                .as_ref()
-                .is_none_or(|intent| intent.skills != requested)
+        if caller
+            .invocation
+            .as_ref()
+            .is_some_and(|intent| intent.skills != requested)
+            || (!requested.is_empty() && caller.invocation.is_none())
         {
             return Err(invalid());
         }
