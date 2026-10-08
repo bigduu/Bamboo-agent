@@ -171,6 +171,178 @@ impl ChildSessionAdapter {
         })
     }
 
+    /// Workflow owns this fresh activation in process. Do not create a generic
+    /// boot auto-run intent: Workflow recovery requires an explicit new run.
+    pub(crate) async fn admit_workflow_child(
+        &self,
+        parent: &Session,
+        child: &Session,
+        gate: &bamboo_domain::AdmissionGate,
+    ) -> Result<bamboo_domain::AdmissionCommit<()>, ChildSessionError> {
+        self.validate_child_model(child).await?;
+        self.scheduler
+            .enqueue_announced_for_generation(
+                Self::child_spawn_job(parent, child)?,
+                Some(child.title.clone()),
+                Some(gate),
+                Some(child.child_launch_generation()),
+            )
+            .await
+            .map_err(ChildSessionError::Execution)
+    }
+
+    pub(crate) async fn workflow_child_stop_confirmed(&self, child: &Session) -> bool {
+        let runner_id = self
+            .agent_runners
+            .read()
+            .await
+            .get(&child.id)
+            .map(|r| r.run_id.clone());
+        let activation = runner_id.or_else(|| {
+            bamboo_engine::session_app::child_session::named_profile::committed_child_activation(
+                child,
+            )
+        });
+        activation.filter(|id| !id.is_empty()).is_some_and(|id| {
+            child
+                .metadata
+                .get(bamboo_subagent::proto::WORKFLOW_TERMINAL_OBSERVATION_KEY)
+                == Some(&id)
+        })
+    }
+
+    async fn confirm_workflow_child_stop(
+        &self,
+        id: &str,
+        admission: Option<&bamboo_domain::AdmissionGate>,
+    ) -> Result<(), ChildSessionError> {
+        let child = self
+            .storage
+            .load_session(id)
+            .await
+            .map_err(|_| {
+                ChildSessionError::Execution("Workflow child stop readback unavailable".into())
+            })?
+            .ok_or_else(|| ChildSessionError::NotFound(id.into()))?;
+        if child
+            .metadata
+            .get(bamboo_subagent::proto::WORKFLOW_USAGE_REQUESTED_KEY)
+            .is_some_and(|v| v == "true")
+            && !admission.is_some_and(|gate| gate.is_cancelled())
+            && !self.workflow_child_stop_confirmed(&child).await
+        {
+            return Err(ChildSessionError::Execution(
+                "Workflow child terminal stop unconfirmed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn cancel_workflow_child_and_wait(
+        &self,
+        id: &str,
+        admission: &bamboo_domain::AdmissionGate,
+    ) -> Result<(), ChildSessionError> {
+        admission.cancel_if_pending();
+        self.cancel_child_run_and_wait_inner(id, Some(admission))
+            .await
+    }
+
+    async fn cancel_child_run_and_wait_inner(
+        &self,
+        child_session_id: &str,
+        admission: Option<&bamboo_domain::AdmissionGate>,
+    ) -> Result<(), ChildSessionError> {
+        let launch_guard = self.scheduler.lock_child_launch(child_session_id).await;
+        let running_token = {
+            let runners = self.agent_runners.read().await;
+            runners
+                .get(child_session_id)
+                .filter(|runner| matches!(runner.status, AgentStatus::Running))
+                .map(|runner| runner.cancel_token.clone())
+        };
+        let mut already_terminal = false;
+        let mut queued_parent = None;
+        let saved = self
+            .persistence
+            .update_runtime_config_and_publish(
+                child_session_id,
+                |child| {
+                    if child
+                        .last_run_status()
+                        .as_deref()
+                        .is_some_and(is_terminal_child_status)
+                    {
+                        already_terminal = true;
+                        return;
+                    }
+                    child.cancel_child_launch_generation();
+                    if running_token.is_none() {
+                        child.set_last_run_status("cancelled");
+                        child.set_last_run_error("Cancelled by parent before activation");
+                        queued_parent = child.parent_session_id.clone();
+                    }
+                },
+                |child| {
+                    self.sessions_cache.insert(
+                        child.id.clone(),
+                        Arc::new(bamboo_engine::SessionSnapshot::new(child.clone())),
+                    );
+                },
+            )
+            .await
+            .map_err(|error| ChildSessionError::Execution(error.to_string()))?;
+        if saved.is_none() {
+            return Err(ChildSessionError::Execution(
+                "child session disappeared during cancellation".into(),
+            ));
+        }
+        if already_terminal && running_token.is_none() {
+            return self
+                .confirm_workflow_child_stop(child_session_id, admission)
+                .await;
+        }
+        if let Some(token) = running_token.as_ref() {
+            token.cancel();
+        }
+        drop(launch_guard);
+        if let Some(parent_id) = queued_parent {
+            self.scheduler
+                .publish_queued_child_cancellation(&parent_id, child_session_id)
+                .await;
+            return self
+                .confirm_workflow_child_stop(child_session_id, admission)
+                .await;
+        }
+
+        if running_token.is_none() {
+            return self
+                .confirm_workflow_child_stop(child_session_id, admission)
+                .await;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let still_running = {
+                let runners = self.agent_runners.read().await;
+                runners
+                    .get(child_session_id)
+                    .is_some_and(|runner| matches!(runner.status, AgentStatus::Running))
+            };
+            if !still_running {
+                return self
+                    .confirm_workflow_child_stop(child_session_id, admission)
+                    .await;
+            }
+            if Instant::now() >= deadline {
+                return Err(ChildSessionError::Execution(format!(
+                    "timed out waiting for child session {child_session_id} to stop after cancellation"
+                )));
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Shared tail of the two child-save methods: map the persist error and
     /// refresh the in-memory cache. The two public methods differ ONLY in which
     /// persistence call they make (adopting vs authoritative); everything after
@@ -1675,86 +1847,8 @@ impl ChildSessionPort for ChildSessionAdapter {
         &self,
         child_session_id: &str,
     ) -> Result<(), ChildSessionError> {
-        let launch_guard = self.scheduler.lock_child_launch(child_session_id).await;
-        let running_token = {
-            let runners = self.agent_runners.read().await;
-            runners
-                .get(child_session_id)
-                .filter(|runner| matches!(runner.status, AgentStatus::Running))
-                .map(|runner| runner.cancel_token.clone())
-        };
-        let mut already_terminal = false;
-        let mut queued_parent = None;
-        let saved = self
-            .persistence
-            .update_runtime_config_and_publish(
-                child_session_id,
-                |child| {
-                    if child
-                        .last_run_status()
-                        .as_deref()
-                        .is_some_and(is_terminal_child_status)
-                    {
-                        already_terminal = true;
-                        return;
-                    }
-                    child.cancel_child_launch_generation();
-                    if running_token.is_none() {
-                        child.set_last_run_status("cancelled");
-                        child.set_last_run_error("Cancelled by parent before activation");
-                        queued_parent = child.parent_session_id.clone();
-                    }
-                },
-                |child| {
-                    self.sessions_cache.insert(
-                        child.id.clone(),
-                        Arc::new(bamboo_engine::SessionSnapshot::new(child.clone())),
-                    );
-                },
-            )
+        self.cancel_child_run_and_wait_inner(child_session_id, None)
             .await
-            .map_err(|error| ChildSessionError::Execution(error.to_string()))?;
-        if saved.is_none() {
-            return Err(ChildSessionError::Execution(
-                "child session disappeared during cancellation".into(),
-            ));
-        }
-        if already_terminal {
-            return Ok(());
-        }
-        if let Some(token) = running_token.as_ref() {
-            token.cancel();
-        }
-        drop(launch_guard);
-        if let Some(parent_id) = queued_parent {
-            self.scheduler
-                .publish_queued_child_cancellation(&parent_id, child_session_id)
-                .await;
-            return Ok(());
-        }
-
-        if running_token.is_none() {
-            return Ok(());
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let still_running = {
-                let runners = self.agent_runners.read().await;
-                runners
-                    .get(child_session_id)
-                    .is_some_and(|runner| matches!(runner.status, AgentStatus::Running))
-            };
-            if !still_running {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(ChildSessionError::Execution(format!(
-                    "timed out waiting for child session {child_session_id} to stop after cancellation"
-                )));
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
     }
 
     async fn delete_child_session(

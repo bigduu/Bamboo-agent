@@ -725,6 +725,15 @@ impl AgentRuntime {
         session: &mut Session,
         req: ExecuteRequest,
     ) -> crate::runtime::runner::Result<()> {
+        self.execute_with_inputs(session, req, None).await
+    }
+
+    pub(crate) async fn execute_with_inputs(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+    ) -> crate::runtime::runner::Result<()> {
         let existing = self.persistence.inherited_child_wait();
         if let Some(inherited) = existing.as_ref() {
             inherited
@@ -739,15 +748,16 @@ impl AgentRuntime {
                     .map_err(|error| bamboo_agent_core::AgentError::LLM(error.to_string()))?;
             }
             runtime.inherited_child_wait_captured = true;
-            return runtime.execute_bound(session, req).await;
+            return runtime.execute_bound(session, req, inputs).await;
         }
-        self.execute_bound(session, req).await
+        self.execute_bound(session, req, inputs).await
     }
 
     async fn execute_bound(
         &self,
         session: &mut Session,
         req: ExecuteRequest,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     ) -> crate::runtime::runner::Result<()> {
         if self.persistence.root_actor_execution_required(session) {
             return Err(bamboo_agent_core::AgentError::Tool(
@@ -833,6 +843,7 @@ impl AgentRuntime {
             disabled_skill_ids: disabled_skill_ids.unwrap_or_else(|| config.disabled_skill_ids()),
             selected_skill_ids,
             selected_skill_mode,
+            initial_untrusted_inputs: inputs,
             skill_manager: Some(self.skill_manager.clone()),
             project_context_resolver: self.project_context_resolver.clone(),
             skip_initial_user_message: true,
@@ -929,6 +940,11 @@ impl AgentRuntime {
         };
 
         drop(config);
+        #[cfg(test)]
+        crate::runtime::tests::observe_untrusted_inputs(
+            &session.id,
+            loop_config.initial_untrusted_inputs(),
+        );
 
         if let Some(plan) = &ticket_worker_plan {
             session

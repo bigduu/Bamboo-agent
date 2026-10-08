@@ -7815,6 +7815,18 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         .map(|activation| activation.store.as_ref())
         .or(actor_directory_store);
     let remote_claim_fence = actor_directory_store.zip(canonical_activation);
+    let workflow_usage_requested = logical_session
+        .metadata
+        .get(bamboo_subagent::proto::WORKFLOW_USAGE_REQUESTED_KEY)
+        .is_some_and(|v| v == "true");
+    if workflow_usage_requested {
+        logical_session
+            .metadata
+            .remove(bamboo_subagent::proto::WORKFLOW_USAGE_OBSERVATION_KEY);
+        logical_session
+            .metadata
+            .remove(bamboo_subagent::proto::WORKFLOW_TERMINAL_OBSERVATION_KEY);
+    }
     let mut remote_cancel_deadline: Option<tokio::time::Instant> = None;
     let mut display = ActorEventDisplay::default();
     let mut readonly = readonly_output
@@ -7824,7 +7836,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     loop {
         tokio::select! {
             _ = cancel_token.cancelled(), if remote_cancel_deadline.is_none() => {
-                if remote_claim_fence.is_some() {
+                if remote_claim_fence.is_some() || workflow_usage_requested {
                     // A remote Worker may finish after its subscriber cancels.
                     // Keep the same correlated frame pump alive briefly so an
                     // exact Cancelled Outcome can terminalize the Actor fence.
@@ -8014,7 +8026,18 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                         for (offset, event) in batch.events.into_iter().enumerate().skip(skip) {
                             let seq = batch.first_seq + offset as u64;
                             let mut publish = true;
-                            if let Some(collector) = local_history.as_mut() {
+                            if event["type"] == bamboo_subagent::proto::WorkflowAgentUsage::TYPE {
+                                if workflow_usage_requested {
+                                    if permission_handshake.is_awaiting() { return Err(plain_actor_unsupported()); }
+                                    let usage: bamboo_subagent::proto::WorkflowAgentUsage = serde_json::from_value(event.clone()).map_err(|_| plain_actor_unsupported())?;
+                                    let activation = activation_run_id.ok_or_else(plain_actor_unsupported)?;
+                                    if !usage.matches(logical_session, activation) { return Err(plain_actor_unsupported()); }
+                                    if logical_session.metadata.contains_key(bamboo_subagent::proto::WORKFLOW_USAGE_OBSERVATION_KEY) { return Err(plain_actor_unsupported()); }
+                                    logical_session.metadata.insert(bamboo_subagent::proto::WORKFLOW_USAGE_OBSERVATION_KEY.into(), serde_json::to_string(&usage).map_err(|_| plain_actor_unsupported())?);
+                                }
+                                publish = false;
+                            }
+                            if publish { if let Some(collector) = local_history.as_mut() {
                                 if permission_handshake.is_awaiting() && event["type"] != "permission_posture_activated" {
                                     return Err(local_tool_history_unsupported());
                                 }
@@ -8025,7 +8048,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             } else if event["type"] == bamboo_subagent::proto::LocalToolMessages::TYPE {
                                 // Completion DATA is private and grants nothing on an unselected route.
                                 publish = false;
-                            }
+                            }}
                             if publish { publish = if let Some(collector) = readonly.as_mut() {
                                 if permission_handshake.is_awaiting()
                                     && event["type"] != "permission_posture_activated" {
@@ -8527,6 +8550,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             // unacked for retry; only the placement fence can
                             // now be released after SDK saves Cancelled.
                             client.accept_durable_terminal(status);
+                            if workflow_usage_requested {
+                                logical_session.metadata.insert(bamboo_subagent::proto::WORKFLOW_TERMINAL_OBSERVATION_KEY.into(), activation_run_id.ok_or_else(plain_actor_unsupported)?.into());
+                            }
                             return Err(AgentError::Cancelled);
                         }
                         if parent_question_checkpoint_id.is_some()
@@ -8546,6 +8572,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                     // the Host records the failure. Other early terminals
                                     // remain unproven and keep their placement fence.
                                     client.accept_durable_terminal(status);
+                            if workflow_usage_requested {
+                                logical_session.metadata.insert(bamboo_subagent::proto::WORKFLOW_TERMINAL_OBSERVATION_KEY.into(), activation_run_id.ok_or_else(plain_actor_unsupported)?.into());
+                            }
                                     return Err(AgentError::LLM(code.to_owned()));
                                 }
                             }
@@ -8728,6 +8757,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                         // an error status. Genuine Worker Error/Cancelled frames
                         // are accepted terminals even though drive returns Err.
                         client.accept_durable_terminal(status);
+                            if workflow_usage_requested {
+                                logical_session.metadata.insert(bamboo_subagent::proto::WORKFLOW_TERMINAL_OBSERVATION_KEY.into(), activation_run_id.ok_or_else(plain_actor_unsupported)?.into());
+                            }
                         if status == TerminalStatus::Completed {
                             if let Some(activation) = plain_input {
                                 // Only the final epoch reaches here: continued Runs
