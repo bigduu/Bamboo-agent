@@ -1,6 +1,28 @@
 use super::request::{optional_non_empty, resolve_model, resolve_session_id};
 use super::sync_runtime_workspace;
 use bamboo_agent_core::Session;
+// Bootstrap old Root-policy fixtures through the same real Native consumer.
+// Its actual checked carrier belongs to the initial turn, never the target turn.
+async fn consume_native_bootstrap(state: &actix_web::web::Data<crate::AppState>, id: &str) {
+    let claims = state.session_inbox.claim(id, 128).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(
+        claims[0].activation_policy,
+        bamboo_domain::SessionActivationPolicy::RespectSpecificWait
+    );
+    let input_id = claims[0].envelope.id.as_str();
+    let admitted = state.admit_chat_for_execute(id).await.unwrap();
+    let inputs = admitted.inputs.unwrap();
+    assert_eq!(inputs.observations().len(), 1);
+    assert_eq!(inputs.observations()[0].input_id(), input_id);
+    assert!(state
+        .session_inbox
+        .was_admitted(id, &claims[0].envelope.id)
+        .await
+        .unwrap());
+    assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 0);
+    drop(inputs);
+}
 
 #[actix_web::test]
 async fn ql_http_existing_queue_fit_or_overflow_keeps_prefix_events_and_pending_handoff() {
@@ -266,6 +288,7 @@ async fn ticket_review_queued_ingress_does_not_requeue_activated_root_history() 
     )
     .await;
     assert_eq!(first.status(), actix_web::http::StatusCode::CREATED);
+    consume_native_bootstrap(&state, "queued-owned-root").await;
     let session = state
         .storage
         .load_session("queued-owned-root")
@@ -397,6 +420,7 @@ async fn activated_root_chat_preserves_handoff_and_commits_multimodal_input_once
     )
     .await;
     assert_eq!(first.status(), actix_web::http::StatusCode::CREATED);
+    consume_native_bootstrap(&state, "owned-chat-image").await;
     let mut session = state
         .storage
         .load_session("owned-chat-image")
@@ -1946,6 +1970,13 @@ mod optional_model_e2e {
         )
         .await;
         let session_id = "chat-title-before-execute";
+        let mut parent = Session::new("native-title-parent", "chat-model");
+        state.save_and_cache_session(&mut parent).await;
+        let mut child =
+            Session::new_child_of(session_id, &parent, "chat-model", "Unfinished title");
+        // Explicit unfinished-title fixture; ordinary children default to true.
+        child.title_generated = false;
+        state.save_and_cache_session(&mut child).await;
         let sender = state.get_session_event_sender(session_id).await;
         let mut title_events = sender.subscribe();
 
@@ -1986,7 +2017,10 @@ mod optional_model_e2e {
                 .to_request(),
         )
         .await;
-        assert_eq!(execution.status(), StatusCode::ACCEPTED);
+        let execution_status = execution.status();
+        let execution_body: Value = test::read_body_json(execution).await;
+        assert_eq!(execution_status, StatusCode::ACCEPTED, "{execution_body}");
+        let first_run = execution_body["run_id"].as_str().unwrap().to_owned();
         let _started = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             provider.started.acquire(),
@@ -2012,8 +2046,14 @@ mod optional_model_e2e {
                     .await
                     .get(session_id)
                     .is_some_and(|runner| {
-                        matches!(runner.status, crate::app_state::AgentStatus::Completed)
+                        runner.run_id == first_run
+                            && matches!(runner.status, crate::app_state::AgentStatus::Completed)
                     })
+                    && state
+                        .session_activation_router
+                        .current_run_id(session_id)
+                        .await
+                        .is_none()
                 {
                     break;
                 }
@@ -2021,7 +2061,7 @@ mod optional_model_e2e {
             }
         })
         .await
-        .expect("first actual Runtime completes while its title provider remains blocked");
+        .expect("first exact Runtime completes and releases its original activation owner");
         let second = test::call_service(
             &app,
             test::TestRequest::post()
@@ -2043,7 +2083,9 @@ mod optional_model_e2e {
                 .to_request(),
         )
         .await;
-        assert_eq!(second_execution.status(), StatusCode::ACCEPTED);
+        let second_status = second_execution.status();
+        let second_body: Value = test::read_body_json(second_execution).await;
+        assert_eq!(second_status, StatusCode::ACCEPTED, "{second_body}");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
 
@@ -4115,6 +4157,7 @@ mod optional_model_e2e {
             )
             .await;
             assert_eq!(initial.status(), StatusCode::CREATED);
+            super::consume_native_bootstrap(&state, session_id).await;
             let original = state
                 .storage
                 .load_session(session_id)

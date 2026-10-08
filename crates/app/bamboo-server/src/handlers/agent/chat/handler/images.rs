@@ -214,9 +214,9 @@ mod tests {
             assert!(!user.id.is_empty());
             let minted: std::time::SystemTime = user.created_at.into();
             assert!(minted >= before && minted <= std::time::SystemTime::now());
-            if count == Some(2) {
+            if let Some(count) = count.filter(|count| *count > 0) {
                 let parts = user.content_parts.as_ref().unwrap();
-                assert_eq!(parts.len(), 3);
+                assert_eq!(parts.len(), count + 1);
                 assert!(
                     matches!(&parts[0], bamboo_domain::MessagePart::Text {text} if text == &user.content)
                 );
@@ -230,6 +230,10 @@ mod tests {
                 assert_ne!(
                     urls[0], urls[1],
                     "native attachment storage remains nondeduplicated"
+                );
+                assert_eq!(
+                    urls.iter().collect::<std::collections::BTreeSet<_>>().len(),
+                    count
                 );
             } else {
                 assert!(user.content_parts.is_none());
