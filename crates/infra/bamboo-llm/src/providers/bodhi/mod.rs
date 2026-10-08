@@ -4,6 +4,7 @@
 //! API key before forwarding to the actual provider.  This keeps raw provider
 //! credentials off the client.
 
+use crate::providers::common::{llm_error_kind, log_identity};
 use async_trait::async_trait;
 use reqwest::{
     header::{HeaderMap, HeaderValue, AUTHORIZATION},
@@ -167,11 +168,11 @@ impl LLMProvider for BodhiProvider {
             .unwrap_or("unknown-session");
 
         tracing::info!(
-            "[{}] Bodhi proxy request target={} model='{}' [{}]",
-            session_log_id,
-            self.target_provider,
-            model,
-            request_purpose
+            "[session_hash={}] Bodhi proxy request target_hash={} model_hash={} purpose_hash={}",
+            log_identity(session_log_id),
+            log_identity(&self.target_provider),
+            log_identity(model),
+            log_identity(request_purpose)
         );
 
         match self.target_provider.as_str() {
@@ -229,7 +230,10 @@ impl LLMProvider for BodhiProvider {
         match model_fetcher::fetch_model_list(&self.client, &url, headers, "Bodhi").await {
             Ok(models) => Ok(models),
             Err(e) => {
-                tracing::debug!("Bodhi proxy models endpoint not available: {}", e);
+                tracing::debug!(
+                    error_kind = llm_error_kind(&e),
+                    "Bodhi proxy models endpoint not available"
+                );
                 Ok(vec![])
             }
         }
@@ -347,8 +351,8 @@ impl BodhiProvider {
                 && looks_like_thinking_forced_tool_choice_error(status, &text)
             {
                 tracing::warn!(
-                    "Bodhi/Anthropic model '{}' rejected forced named tool_choice in thinking mode; retrying activation with tool_choice=auto and parallel tool use disabled",
-                    model
+                    "Bodhi/Anthropic model_hash {} rejected forced named tool_choice in thinking mode; retrying activation with tool_choice=auto and parallel tool use disabled",
+                    log_identity(model)
                 );
                 let mut fallback_body = build_anthropic_request(
                     messages,

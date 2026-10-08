@@ -4,6 +4,7 @@ mod stream;
 
 pub use stream::{parse_gemini_sse_event, GeminiStreamState};
 
+use crate::providers::common::log_identity;
 use async_trait::async_trait;
 use reqwest::{
     header::{HeaderMap, HeaderValue, CONTENT_TYPE},
@@ -215,7 +216,7 @@ impl LLMProvider for GeminiProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
-        tracing::debug!("Gemini provider using model: {}", model);
+        tracing::debug!("Gemini provider using model_hash={}", log_identity(model));
         let reasoning_effort = options
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
@@ -273,9 +274,9 @@ impl LLMProvider for GeminiProvider {
         // Last-moment scan: mask every text value in the fully-assembled body.
         crate::masking::mask_outbound_body(&mut request_json, &self.masking_config);
         tracing::info!(
-            "[{}] Gemini request protocol=streamGenerateContent model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_budget={} max_output_tokens={} [{}]",
-            session_log_id,
-            model,
+            "[session_hash={}] Gemini request protocol=streamGenerateContent model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_budget={} max_output_tokens={} purpose_hash={}",
+            log_identity(session_log_id),
+            log_identity(model),
             reasoning_effort
                 .map(ReasoningEffort::as_str)
                 .unwrap_or("none"),
@@ -287,11 +288,12 @@ impl LLMProvider for GeminiProvider {
             max_output_tokens
                 .map(|tokens| tokens.to_string())
                 .unwrap_or_else(|| "none".to_string()),
-            request_purpose
+            log_identity(request_purpose)
         );
         tracing::debug!(
-            "Gemini request: {}",
-            serde_json::to_string_pretty(&request_json).unwrap_or_default()
+            message_count = messages.len(),
+            tool_count = tools.len(),
+            "Gemini request prepared"
         );
 
         let headers = self.build_headers(
@@ -317,8 +319,8 @@ impl LLMProvider for GeminiProvider {
                 && Self::looks_like_reasoning_unsupported_error(status, &text)
             {
                 tracing::warn!(
-                    "Gemini streamGenerateContent rejected reasoning for model '{}'; retrying without reasoning_effort",
-                    model
+                    "Gemini streamGenerateContent rejected reasoning for model_hash {}; retrying without reasoning_effort",
+                    log_identity(model)
                 );
 
                 let fallback_request = build_request(None)?;
@@ -338,13 +340,13 @@ impl LLMProvider for GeminiProvider {
                 applied_reasoning_effort = None;
                 applied_thinking_budget = None;
                 tracing::info!(
-                    "Gemini request retry protocol=streamGenerateContent model='{}' reasoning_effort=none reasoning_source={} request_reasoning_enabled=false thinking_budget=none max_output_tokens={} purpose={}",
-                    model,
+                    "Gemini request retry protocol=streamGenerateContent model_hash={} reasoning_effort=none reasoning_source={} request_reasoning_enabled=false thinking_budget=none max_output_tokens={} purpose_hash={}",
+                    log_identity(model),
                     reasoning_source,
                     max_output_tokens
                         .map(|tokens| tokens.to_string())
                         .unwrap_or_else(|| "none".to_string()),
-                    request_purpose
+                    log_identity(request_purpose)
                 );
                 let fallback_headers = self.build_headers(
                     request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
@@ -415,8 +417,8 @@ impl LLMProvider for GeminiProvider {
                     && chunks.iter().any(|c| matches!(c, LLMChunk::Done))
                 {
                     tracing::info!(
-                        "Gemini reasoning summary: model='{}' requested_effort={} request_thinking_budget={} observed_thinking_signal={} thinking_parts_count={} thinking_text_chars={}",
-                        model_for_log,
+                        "Gemini reasoning summary: model_hash={} requested_effort={} request_thinking_budget={} observed_thinking_signal={} thinking_parts_count={} thinking_text_chars={}",
+                        log_identity(&model_for_log),
                         requested_reasoning_for_log
                             .map(ReasoningEffort::as_str)
                             .unwrap_or("none"),
