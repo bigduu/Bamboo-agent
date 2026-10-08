@@ -124,6 +124,31 @@ async fn partial_queued_ingress_emits_every_committed_message_before_retry() {
     )
     .await;
     assert_eq!(initial.status(), actix_web::http::StatusCode::CREATED);
+    let first: serde_json::Value = serde_json::from_slice(
+        &actix_web::body::to_bytes(initial.into_body())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let bootstrap = super::ingress::admit_for_execute(&state, "partial-batch-root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bootstrap.observations().len(), 1);
+    assert_eq!(
+        bootstrap.observations()[0].input_id(),
+        first["message_id"].as_str().unwrap()
+    );
+    drop(bootstrap);
+    assert_eq!(
+        state
+            .session_inbox
+            .inspect("partial-batch-root")
+            .await
+            .unwrap()
+            .pending,
+        0
+    );
     for index in 0..129 {
         let response = super::handler(
             state.clone(),
@@ -1800,9 +1825,15 @@ mod optional_model_e2e {
             _messages: &[bamboo_agent_core::Message],
             _tools: &[bamboo_agent_core::ToolSchema],
             _max_output_tokens: Option<u32>,
-            _model: &str,
+            model: &str,
             options: Option<&LLMRequestOptions>,
         ) -> Result<LLMStream, LLMError> {
+            if model != "title-model" {
+                return Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(LLMChunk::Token("Answered by local Runtime fixture".into())),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
             assert_eq!(
                 options.and_then(|value| value.request_purpose.as_deref()),
                 Some("title_generation")
@@ -1873,6 +1904,12 @@ mod optional_model_e2e {
         assert_eq!(response.status(), StatusCode::CREATED);
         let persisted = state.storage.load_session(id).await.unwrap().unwrap();
         assert!(persisted.authority_identity.is_ordinary());
+        assert!(!persisted
+            .messages
+            .iter()
+            .any(|m| m.role == bamboo_agent_core::Role::User));
+        drop(state.admit_chat_for_execute(id).await.unwrap());
+        let persisted = state.storage.load_session(id).await.unwrap().unwrap();
         assert!(persisted
             .messages
             .iter()
@@ -1896,11 +1933,10 @@ mod optional_model_e2e {
             .is_ordinary());
     }
 
-    /// #793: a durable user message is the trigger. No `/execute` request is
-    /// made, and a second message while the provider is blocked must not start
-    /// duplicate title work.
+    /// Native Chat delays title work until real checked admission and Ready.
+    /// Preserve #793's single in-flight provider call and one metadata event.
     #[actix_web::test]
-    async fn chat_starts_title_generation_before_execute_and_deduplicates_inflight_work() {
+    async fn native_title_waits_for_checked_ready_and_deduplicates_inflight_work() {
         let provider = BlockingTitleProvider::new();
         let state = title_test_state(provider.clone()).await;
         let app = test::init_service(
@@ -1927,12 +1963,36 @@ mod optional_model_e2e {
         .await;
         assert_eq!(response.status(), StatusCode::CREATED);
 
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "Chat without execute starts no title work"
+        );
+        let before = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!before
+            .messages
+            .iter()
+            .any(|m| m.role == bamboo_agent_core::Role::User));
+        let execution = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{session_id}"))
+                .set_json(serde_json::json!({"model":"chat-model"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(execution.status(), StatusCode::ACCEPTED);
         let _started = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             provider.started.acquire(),
         )
         .await
-        .expect("title provider started without /execute")
+        .expect("checked Ready starts the title provider")
         .expect("started semaphore stays open");
 
         let pending = state
@@ -1944,6 +2004,24 @@ mod optional_model_e2e {
         assert!(!pending.title_generated);
         assert_eq!(pending.title_version, 0);
 
+        tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
+            loop {
+                if state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(session_id)
+                    .is_some_and(|runner| {
+                        matches!(runner.status, crate::app_state::AgentStatus::Completed)
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first actual Runtime completes while its title provider remains blocked");
         let second = test::call_service(
             &app,
             test::TestRequest::post()
@@ -1957,6 +2035,15 @@ mod optional_model_e2e {
         )
         .await;
         assert_eq!(second.status(), StatusCode::CREATED);
+        let second_execution = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{session_id}"))
+                .set_json(serde_json::json!({"model":"chat-model"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(second_execution.status(), StatusCode::ACCEPTED);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
 
@@ -1982,11 +2069,19 @@ mod optional_model_e2e {
         assert_eq!(finalized.title_version, 1);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
 
-        let event =
-            tokio::time::timeout(std::time::Duration::from_millis(500), title_events.recv())
-                .await
-                .expect("one title event arrives")
-                .expect("title event channel remains open");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = title_events
+                    .recv()
+                    .await
+                    .expect("title event channel remains open");
+                if matches!(event, AgentEvent::SessionTitleUpdated { .. }) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("one title event arrives alongside real Runtime events");
         assert!(matches!(
             event,
             AgentEvent::SessionTitleUpdated {
@@ -1995,9 +2090,16 @@ mod optional_model_e2e {
             }
         ));
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), title_events.recv())
-                .await
-                .is_err(),
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                loop {
+                    let event = title_events.recv().await.unwrap();
+                    if matches!(event, AgentEvent::SessionTitleUpdated { .. }) {
+                        break event;
+                    }
+                }
+            })
+            .await
+            .is_err(),
             "deduplicated title work must not emit a second metadata event"
         );
     }
@@ -2131,6 +2233,23 @@ mod optional_model_e2e {
 
         let response: Value = serde_json::from_slice(&first_body).expect("chat response JSON");
         let session_id = response["session_id"].as_str().expect("session_id");
+        let before = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!before.messages.iter().any(|m| m.role == Role::User));
+        assert_eq!(
+            state
+                .session_inbox
+                .inspect(session_id)
+                .await
+                .unwrap()
+                .pending,
+            1
+        );
+        drop(state.admit_chat_for_execute(session_id).await.unwrap());
         let session = state
             .storage
             .load_session(session_id)
@@ -3270,7 +3389,7 @@ mod optional_model_e2e {
             .iter()
             .find(|entry| entry.id == "review" && entry.winner)
             .expect("builtin review Workflow");
-        let barrier = super::super::install_workflow_post_save_test_barrier(session_id);
+        let barrier = super::super::ingress::install_native_post_save(session_id);
         let mut feed = state.account_sink.subscribe();
         let app = test::init_service(
             App::new()
@@ -3354,6 +3473,16 @@ mod optional_model_e2e {
                     .filter(|message| message.role == bamboo_agent_core::Role::User
                         && message.content == "commit despite response cancellation")
                     .count(),
+                0,
+                "Native has durable admission but no canonical User before its consumer"
+            );
+            assert_eq!(
+                state
+                    .session_inbox
+                    .inspect(session_id)
+                    .await
+                    .unwrap()
+                    .pending,
                 1
             );
             // Dropping the Actix response future simulates a disconnected
@@ -3361,6 +3490,34 @@ mod optional_model_e2e {
             // finish cache/feed/pin publication.
         }
         barrier.resume.add_permits(1);
+        let guard = tokio::time::timeout(
+            CONCURRENCY_ASSERT_TIMEOUT,
+            state.persistence.acquire_lock(session_id),
+        )
+        .await
+        .expect("detached Native pin transaction releases original Host lock");
+        drop(guard);
+        assert!(state
+            .skill_manager
+            .pinned_activation_for_workspace(session_id, None)
+            .await
+            .unwrap()
+            .is_none());
+        let before_consumer = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!before_consumer
+            .messages
+            .iter()
+            .any(|m| m.content == "commit despite response cancellation"));
+        assert!(!bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap().iter().any(|change|
+            matches!(&change.event, bamboo_agent_core::AgentEvent::MessageAppended { session_id: id, .. } if id == session_id)));
+        let current = state.admit_chat_for_execute(session_id).await.unwrap();
+        assert!(current.inputs.is_some());
+        drop(current);
 
         let event = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
             loop {
@@ -3535,7 +3692,18 @@ mod optional_model_e2e {
                 .cloned()
                 .collect()
         };
-        let original = users(&first_session);
+        assert!(
+            users(&first_session).is_empty(),
+            "Chat does not publish canonical Native input"
+        );
+        let claims = state.session_inbox.claim(session_id, 1).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        let receipt: Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(
+            claims[0].envelope.id.as_str(),
+            receipt["message_id"].as_str().unwrap()
+        );
+        let original = vec![claims[0].envelope.to_provider_message().unwrap()];
         assert_eq!(original.len(), 1);
         assert_eq!(original[0].content, "ordinary 原样输入");
         assert!(!original[0].id.is_empty());
@@ -3543,6 +3711,14 @@ mod optional_model_e2e {
         let retry = test::call_service(&app, request()).await;
         assert_eq!(retry.status(), StatusCode::CREATED);
         assert_eq!(test::read_body(retry).await, first_body);
+        let before_consumer = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(users(&before_consumer).is_empty());
+        drop(state.admit_chat_for_execute(session_id).await.unwrap());
         let replayed = state
             .storage
             .load_session(session_id)

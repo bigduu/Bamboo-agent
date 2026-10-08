@@ -14,8 +14,8 @@ mod images;
 mod legacy_selection;
 #[cfg(test)]
 use legacy_selection::{
-    install_workflow_commit_test_barrier, install_workflow_post_save_test_barrier,
-    pin_explicit_workflow_candidate, wait_at_workflow_commit_test_barrier,
+    install_workflow_commit_test_barrier, pin_explicit_workflow_candidate,
+    wait_at_workflow_commit_test_barrier,
 };
 use legacy_selection::{
     workflow_activation_running_conflict_response, workflow_runner_is_active,

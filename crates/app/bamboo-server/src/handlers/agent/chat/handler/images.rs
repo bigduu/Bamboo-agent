@@ -106,6 +106,61 @@ mod tests {
     use super::*;
 
     #[actix_web::test]
+    async fn native_envelope_keeps_seventeen_nondeduplicated_images_and_original_handoff() {
+        let home = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(home.path().into()).await.unwrap());
+        let mut session = Session::new("native-seventeen", "test-model");
+        session.set_last_run_status("error");
+        session.set_last_run_error("old owned error");
+        let original = serde_json::to_value(&session).unwrap();
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jF0cAAAAASUVORK5CYII=";
+        let request: super::super::ChatRequest = serde_json::from_value(serde_json::json!({
+            "message":"before hook", "images":(0..17).map(|_|serde_json::json!({"base64":png,"type":"image/png"})).collect::<Vec<_>>()
+        })).unwrap();
+        let envelope = construct_native_envelope(&state, &session, &request, "after hook 原样")
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&session).unwrap(),
+            original,
+            "construction appends no User or handoff metadata"
+        );
+        let delivered = envelope.to_provider_message().unwrap();
+        assert_eq!(delivered.id, envelope.id.as_str());
+        assert_eq!(delivered.created_at, envelope.created_at);
+        assert_eq!(delivered.content, "after hook 原样");
+        let parts = delivered.content_parts.as_ref().unwrap();
+        assert_eq!(parts.len(), 18);
+        let urls = parts
+            .iter()
+            .filter_map(|part| match part {
+                bamboo_domain::MessagePart::ImageUrl { image_url } => Some(&image_url.url),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            urls.len(),
+            17,
+            "identical images retain all original distinct attachments"
+        );
+        assert!(urls
+            .iter()
+            .all(|url| url.starts_with("bamboo-attachment://")));
+        let mut invalid = request;
+        invalid.images.as_mut().unwrap()[8].base64 = "not base64!".into();
+        assert!(
+            construct_native_envelope(&state, &session, &invalid, "after hook")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(&session).unwrap(),
+            original,
+            "partial attachment failure adds no canonical input"
+        );
+    }
+
+    #[actix_web::test]
     async fn new_user_turn_replaces_stale_terminal_metadata_with_pending() {
         let dir = tempfile::tempdir().expect("temporary app data");
         let state = web::Data::new(
@@ -129,7 +184,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(root.path().into()).await.unwrap());
         let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jF0cAAAAASUVORK5CYII=";
-        for count in [None, Some(0), Some(2)] {
+        for count in [None, Some(0), Some(2), Some(17)] {
             let mut session = Session::new(format!("constructor-native-{count:?}"), "test-model");
             session.set_last_run_status("error");
             session.set_last_run_error("original failure");

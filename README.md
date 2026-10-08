@@ -94,7 +94,7 @@ No key yet? `bamboo -p "ping" --echo` is a **transport smoke test only**: it use
 
 ### Call it from your application
 
-With a configured provider and running server, the legacy HTTP/SSE sequence is **chat → subscribe → execute**. `chat` persists the message; `execute` starts the agent loop. The example requires `curl` and `jq`; replace the model with one your account supports. In terminal A, create the session and open its live event stream:
+With a configured provider and running server, the legacy HTTP/SSE sequence is **chat → subscribe → execute**. Native `chat` saves session configuration and admits a typed Inbox message with its own RespectSpecificWait intent. Canonical history and `MessageAppended` appear when an existing same-session consumer checkpoints and ACKs it; `execute` starts the agent loop. The example requires `curl` and `jq`; replace the model with one your account supports. In terminal A, create the session and open its live event stream:
 
 ```bash
 SID=$(curl -fsS http://127.0.0.1:9562/api/v1/chat \
@@ -111,6 +111,17 @@ SID="<session-id printed in terminal A>"
 curl -fsS -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
   -H 'Content-Type: application/json' -d '{}'
 ```
+
+Native Chat returns the actual `message_id` and `ingress_seq` receipt fields.
+Its serialized envelope is limited to 256 KiB and must contain semantic content;
+attachments are kept whole, including duplicate images and more than 16 images.
+There is no truncation to fit the limit. Chat without a consumer leaves the input
+in the Inbox and does not append history, emit `MessageAppended`, or start a title.
+Automatic title work moves to checked Native admission followed by successful
+HTTP Ready startup. A running owner or another legitimate same-session activation
+may consume the message before the client's execute request. The specific intent
+does not release staged child/Bash outcomes; their coordinator retains that order.
+Referenced/ticket and Root ingress keep their existing scheduling rules.
 
 Watch terminal A for live events; subscribing after execution can miss response tokens. The browser uses the shared `/v2/stream` WebSocket; legacy SSE routes remain available.
 

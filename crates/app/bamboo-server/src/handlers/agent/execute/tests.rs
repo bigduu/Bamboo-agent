@@ -198,7 +198,7 @@ mod execution_input_http {
     }
     struct FailOnceAck {
         inner: Arc<dyn SessionInboxPort>,
-        fail: AtomicBool,
+        fail: Arc<AtomicBool>,
         after_receipt: bool,
     }
     #[async_trait]
@@ -254,7 +254,13 @@ mod execution_input_http {
             self.inner.inspect(id).await
         }
     }
-    async fn state(ack_failure: Option<bool>) -> (tempfile::TempDir, web::Data<crate::AppState>) {
+    async fn state(
+        ack_failure: Option<bool>,
+    ) -> (
+        tempfile::TempDir,
+        web::Data<crate::AppState>,
+        Arc<AtomicBool>,
+    ) {
         let home = tempfile::tempdir().unwrap();
         let mut config = bamboo_llm::Config::from_data_dir(Some(home.path().into()));
         config.provider = "openai".into();
@@ -272,14 +278,15 @@ mod execution_input_http {
             "openai".into(),
         ));
         state.provider_router = Arc::new(ProviderModelRouter::new(state.provider_registry.clone()));
+        let fault = Arc::new(AtomicBool::new(ack_failure.is_some()));
         if let Some(after_receipt) = ack_failure {
             state.session_inbox = Arc::new(FailOnceAck {
                 inner: state.session_inbox.clone(),
-                fail: AtomicBool::new(true),
+                fail: fault.clone(),
                 after_receipt,
             });
         }
-        (home, web::Data::new(state))
+        (home, web::Data::new(state), fault)
     }
     async fn chat(
         state: &web::Data<crate::AppState>,
@@ -322,6 +329,23 @@ mod execution_input_http {
         );
         serde_json::from_slice(&body).unwrap()
     }
+    async fn bootstrap(state: &web::Data<crate::AppState>, id: &str) {
+        let response = chat(state, id, None).await;
+        let input = response["message_id"].as_str().unwrap();
+        let inputs = crate::handlers::agent::chat::admit_for_execute(state, id)
+            .await
+            .unwrap()
+            .unwrap();
+        only_id(&inputs, input);
+        drop(inputs);
+        assert!(state
+            .session_inbox
+            .was_admitted(id, &SessionMessageId::parse(input).unwrap())
+            .await
+            .unwrap());
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 0);
+    }
+
     async fn execute(
         state: &web::Data<crate::AppState>,
         id: &str,
@@ -353,7 +377,7 @@ mod execution_input_http {
     }
     #[actix_web::test]
     async fn native_inbox_real_chat_receipt_checkpoint_ack_and_current_input_once() {
-        let (_home, state) = state(None).await;
+        let (_home, state, _fault) = state(None).await;
         let id = "native-inbox-real-consumer";
         let response = chat(&state, id, None).await;
         let input = response["message_id"]
@@ -400,10 +424,63 @@ mod execution_input_http {
     }
 
     #[actix_web::test]
+    async fn native_ack_failure_recovers_only_scheduling_owner_without_data_or_title() {
+        for after_receipt in [false, true] {
+            let (_home, state, _fault) = state(Some(after_receipt)).await;
+            let id = format!("native-ack-no-new-{after_receipt}");
+            let mut original = bamboo_agent_core::Session::new(&id, "test-model");
+            original.set_last_run_status("error");
+            original.set_last_run_error("old failure");
+            state.storage.save_session(&original).await.unwrap();
+            let response = chat(&state, &id, None).await;
+            let input = response["message_id"].as_str().unwrap();
+            let mut feed = state.account_sink.subscribe();
+            let failure = state.admit_chat_for_execute(&id).await.err().unwrap();
+            assert_eq!(failure.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let failed = state.storage.load_session(&id).await.unwrap().unwrap();
+            assert_eq!(failed.messages.iter().filter(|m| m.id == input).count(), 1);
+            assert_eq!(failed.last_run_status().as_deref(), Some("error"));
+            assert!(crate::handlers::agent::events::startup_work_id(&failed).is_none());
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), feed.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(&event.event, bamboo_agent_core::AgentEvent::MessageAppended { message_id, .. } if message_id == input)
+            );
+            let retry = state.admit_chat_for_execute(&id).await.unwrap();
+            assert!(
+                retry.inputs.is_none(),
+                "ACK recovery/history cannot reconstruct the previous request or startup seal"
+            );
+            assert!(!retry.generate_title, "NoNew cannot invent a title effect");
+            let recovered = state.storage.load_session(&id).await.unwrap().unwrap();
+            assert_eq!(
+                crate::handlers::agent::events::startup_work_id(&recovered).as_deref(),
+                Some(input)
+            );
+            assert_eq!(
+                recovered.messages.iter().filter(|m| m.id == input).count(),
+                1
+            );
+            assert!(state
+                .session_inbox
+                .was_admitted(&id, &SessionMessageId::parse(input).unwrap())
+                .await
+                .unwrap());
+            assert_eq!(state.session_inbox.inspect(&id).await.unwrap().pending, 0);
+            assert!(
+                feed.try_recv().is_err(),
+                "recovery publishes no duplicate canonical event"
+            );
+        }
+    }
+
+    #[actix_web::test]
     async fn execution_input_http_actual_queue_admission_returns_only_this_calls_new_user() {
-        let (_home, state) = state(None).await;
+        let (_home, state, _fault) = state(None).await;
         let id = "execution-input-http-admit";
-        chat(&state, id, None).await;
+        bootstrap(&state, id).await;
         chat(&state, id, Some("current-queued-a")).await;
         let inputs = crate::handlers::agent::chat::admit_for_execute(&state, id)
             .await
@@ -441,81 +518,86 @@ mod execution_input_http {
     }
     #[actix_web::test]
     async fn execution_input_http_checked_queue_reaches_exact_ready_spawn_once() {
-        let (_home, state) = state(None).await;
-        let id = "execution-input-http-ready";
-        chat(&state, id, None).await;
-        chat(&state, id, Some("ready-current-user")).await;
-        input_taps().lock().unwrap().insert(id.into(), Vec::new());
-        let (status, body) = execute(&state, id, None).await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        assert_eq!(body["status"], "started", "{body}");
-        let observed = input_taps().lock().unwrap().remove(id).unwrap();
-        assert_eq!(observed.len(), 1, "one actual Ready/spawn handoff");
-        let inputs = observed[0].as_ref().unwrap();
-        assert_eq!(inputs.len(), 1);
-        assert_eq!(inputs[0].0, "ready-current-user");
-        assert_eq!(inputs[0].1.as_ref().unwrap().selections[0].id, "review");
-        let completion = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let terminal = state.agent_runners.read().await.get(id).is_some_and(|r| {
-                    matches!(
-                        r.status,
-                        crate::app_state::AgentStatus::Completed
-                            | crate::app_state::AgentStatus::Error(_)
-                            | crate::app_state::AgentStatus::Cancelled
-                    )
-                });
-                if terminal {
-                    break;
+        for native in [false, true] {
+            let (_home, state, _fault) = state(None).await;
+            let id = "execution-input-http-ready";
+            let input = if native {
+                chat(&state, id, None).await["message_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            } else {
+                bootstrap(&state, id).await;
+                chat(&state, id, Some("ready-current-user")).await;
+                "ready-current-user".to_owned()
+            };
+            input_taps().lock().unwrap().insert(id.into(), Vec::new());
+            let (status, body) = execute(&state, id, None).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            assert_eq!(body["status"], "started", "{body}");
+            let observed = input_taps().lock().unwrap().remove(id).unwrap();
+            assert_eq!(observed.len(), 1, "one actual Ready/spawn handoff");
+            let inputs = observed[0].as_ref().unwrap();
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(inputs[0].0, input);
+            assert_eq!(inputs[0].1.as_ref().unwrap().selections[0].id, "review");
+            let completion = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    let terminal = state.agent_runners.read().await.get(id).is_some_and(|r| {
+                        matches!(
+                            r.status,
+                            crate::app_state::AgentStatus::Completed
+                                | crate::app_state::AgentStatus::Error(_)
+                                | crate::app_state::AgentStatus::Cancelled
+                        )
+                    });
+                    if terminal {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await;
-        let runner_status = state
-            .agent_runners
-            .read()
-            .await
-            .get(id)
-            .map(|runner| runner.status.clone());
-        assert!(
-            completion.is_ok()
-                && matches!(
-                    runner_status.as_ref(),
-                    Some(crate::app_state::AgentStatus::Completed)
-                ),
-            "actual execution must finish successfully: {runner_status:?}"
-        );
-        let stored = state.storage.load_session(id).await.unwrap().unwrap();
-        let loads = stored
-            .messages
-            .iter()
-            .filter(|message| {
-                message.tool_call_id.as_deref() == Some("execution-input-existing-load")
             })
-            .collect::<Vec<_>>();
-        assert_eq!(loads.len(), 1, "one real existing workflow prerequisite");
-        assert_eq!(loads[0].tool_success, Some(true));
-        assert_eq!(
-            stored
+            .await;
+            let runner_status = state
+                .agent_runners
+                .read()
+                .await
+                .get(id)
+                .map(|runner| runner.status.clone());
+            assert!(
+                completion.is_ok()
+                    && matches!(
+                        runner_status.as_ref(),
+                        Some(crate::app_state::AgentStatus::Completed)
+                    ),
+                "actual execution must finish successfully: {runner_status:?}"
+            );
+            let stored = state.storage.load_session(id).await.unwrap().unwrap();
+            let loads = stored
                 .messages
                 .iter()
-                .filter(|m| m.id == "ready-current-user")
-                .count(),
-            1
-        );
-        assert!(crate::handlers::agent::chat::admit_for_execute(&state, id)
-            .await
-            .unwrap()
-            .is_none());
+                .filter(|message| {
+                    message.tool_call_id.as_deref() == Some("execution-input-existing-load")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(loads.len(), 1, "one real existing workflow prerequisite");
+            assert_eq!(loads[0].tool_success, Some(true));
+            assert_eq!(stored.messages.iter().filter(|m| m.id == input).count(), 1);
+            assert!(crate::handlers::agent::chat::admit_for_execute(&state, id)
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
     #[actix_web::test]
     async fn execution_input_http_ack_failure_preserves_prefix_events_but_recovery_cannot_regrant_data(
     ) {
         for after_receipt in [false, true] {
-            let (_home, state) = state(Some(after_receipt)).await;
+            let (_home, state, fault) = state(Some(after_receipt)).await;
+            fault.store(false, Ordering::SeqCst);
             let id = format!("execution-input-http-ack-{after_receipt}");
-            chat(&state, &id, None).await;
+            bootstrap(&state, &id).await;
+            fault.store(true, Ordering::SeqCst);
             chat(&state, &id, Some("ack-current-a")).await;
             let mut feed = state.account_sink.subscribe();
             let error = crate::handlers::agent::chat::admit_for_execute(&state, &id)
@@ -563,9 +645,9 @@ mod execution_input_http {
     }
     #[actix_web::test]
     async fn execution_input_http_startup_rejection_drops_current_data_and_successor_is_separate() {
-        let (_home, state) = state(None).await;
+        let (_home, state, _fault) = state(None).await;
         let id = "execution-input-http-reject";
-        chat(&state, id, None).await;
+        bootstrap(&state, id).await;
         chat(&state, id, Some("rejected-current-a")).await;
         input_taps().lock().unwrap().insert(id.into(), Vec::new());
         let (status, _body) = execute(&state, id, Some("unavailable-explicit-provider")).await;
