@@ -282,7 +282,7 @@ mod execution_input_http {
             crate::AppState::new_with_provider(home.path().into(), config, provider.clone())
                 .await
                 .unwrap();
-        state.provider_registry = Arc::new(ProviderRegistry::new(
+        state.provider_registry.replace_with(ProviderRegistry::new(
             std::collections::HashMap::from([("openai".into(), provider)]),
             "openai".into(),
         ));
