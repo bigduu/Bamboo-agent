@@ -32,10 +32,10 @@ pub struct BorrowedInputRequestRecord<'a> {
 
 // Private deterministic measurement, never a wire/persistence format or decoder.
 #[derive(serde::Serialize)]
-struct InputRequestMeasurement<'a> {
+struct InputRequestMeasurement<'a, T> {
     session_id: &'a str,
     execution_id: &'a str,
-    records: InputRequestRecordsMeasurement<'a>,
+    records: T,
 }
 struct InputRequestRecordsMeasurement<'a>(&'a [BorrowedInputRequestRecord<'a>]);
 impl serde::Serialize for InputRequestRecordsMeasurement<'_> {
@@ -90,29 +90,13 @@ pub fn project_input_request_batch(
             return Unavailable(InputRequestUnavailable::InvalidData);
         }
     }
-    struct CountingWrite(usize);
-    impl std::io::Write for CountingWrite {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self
-                .0
-                .checked_add(bytes.len())
-                .filter(|n| *n <= LIMIT)
-                .ok_or_else(|| std::io::Error::other("compact input byte limit"))?;
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut count = CountingWrite(0);
-    let measurement = InputRequestMeasurement {
+    let Some(compact_bytes) = measure_input_request_view(
         session_id,
         execution_id,
-        records: InputRequestRecordsMeasurement(records),
-    };
-    if serde_json::to_writer(&mut count, &measurement).is_err() {
+        InputRequestRecordsMeasurement(records),
+    ) else {
         return Unavailable(InputRequestUnavailable::CompactLimit { limit: LIMIT });
-    }
+    };
     let records = records
         .iter()
         .map(|record| ProjectedInputRequest {
@@ -153,7 +137,267 @@ pub fn project_input_request_batch(
         session_id: session_id.into(),
         execution_id: execution_id.into(),
         records,
-        compact_bytes: count.0,
+        compact_bytes,
+    })
+}
+
+fn measure_input_request_view(
+    session_id: &str,
+    execution_id: &str,
+    records: impl serde::Serialize,
+) -> Option<usize> {
+    struct CountingWrite(usize);
+    impl std::io::Write for CountingWrite {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .filter(|n| *n <= 262144)
+                .ok_or_else(|| std::io::Error::other("compact input byte limit"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = CountingWrite(0);
+    serde_json::to_writer(
+        &mut count,
+        &InputRequestMeasurement {
+            session_id,
+            execution_id,
+            records,
+        },
+    )
+    .ok()?;
+    Some(count.0)
+}
+
+// Borrow the canonical request representation, including absent/default fields.
+// Serde counts the same keys/scalars as Q-B without copying any args tree.
+#[derive(serde::Serialize)]
+struct RawRequest<'a> {
+    selections: RawSelections<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<&'a str>,
+}
+struct RawSelections<'a>(&'a [serde_json::Value]);
+#[derive(serde::Serialize)]
+struct RawSelection<'a> {
+    id: &'a str,
+    source: &'a str,
+    revision: u64,
+    args: &'a serde_json::Value,
+}
+fn raw_selection(value: &serde_json::Value) -> Option<RawSelection<'_>> {
+    let fields = value.as_object()?;
+    if fields
+        .keys()
+        .any(|k| !matches!(k.as_str(), "id" | "source" | "revision" | "args"))
+    {
+        return None;
+    }
+    Some(RawSelection {
+        id: value.get("id")?.as_str()?,
+        source: value.get("source")?.as_str()?,
+        revision: value.get("revision")?.as_u64()?,
+        args: value.get("args").unwrap_or(&serde_json::Value::Null),
+    })
+}
+impl serde::Serialize for RawSelections<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for value in self.0 {
+            sequence.serialize_element(
+                &raw_selection(value)
+                    .ok_or_else(|| serde::ser::Error::custom("invalid checked selection"))?,
+            )?;
+        }
+        sequence.end()
+    }
+}
+fn raw_request(value: &serde_json::Value) -> Option<RawRequest<'_>> {
+    let fields = value.as_object()?;
+    if fields
+        .keys()
+        .any(|k| !matches!(k.as_str(), "selections" | "mode"))
+    {
+        return None;
+    }
+    let selections = value.get("selections")?.as_array()?;
+    if selections.is_empty() || selections.len() > 32 {
+        return None;
+    }
+    let mode = match value.get("mode") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(value.as_str()?),
+    };
+    if mode.is_some_and(|mode| {
+        mode.is_empty()
+            || mode.len() > 64
+            || !mode
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    }) {
+        return None;
+    }
+    for (index, value) in selections.iter().enumerate() {
+        let selection = raw_selection(value)?;
+        bamboo_domain::SessionSkillSelection::validate_borrowed(
+            selection.id,
+            selection.source,
+            selection.revision,
+            selection.args,
+        )
+        .ok()?;
+        if selections[..index]
+            .iter()
+            .any(|prior| prior.get("id").and_then(|v| v.as_str()) == Some(selection.id))
+        {
+            return None;
+        }
+    }
+    Some(RawRequest {
+        selections: RawSelections(selections),
+        mode,
+    })
+}
+#[derive(serde::Serialize)]
+struct RawInputRecord<'a>(
+    &'a str,
+    &'a serde_json::Value,
+    SessionMessageKind,
+    Option<&'static str>,
+    chrono::DateTime<chrono::Utc>,
+    Option<RawRequest<'a>>,
+);
+
+// Private caller precondition: ONLY this completed boundary's New/ACKed prefix.
+// Never call on transcript history or use this projection as a provenance test.
+fn project_new_committed_inputs(
+    session_id: &str,
+    execution_id: &str,
+    messages: &[Message],
+) -> crate::runtime::managers::lifecycle::InputRequestProjection {
+    use crate::runtime::managers::lifecycle::{
+        BoundedInputRequestBatch,
+        InputRequestProjection::{Available, Unavailable},
+        InputRequestUnavailable, ProjectedInputRequest,
+    };
+    if messages.len() > 128 {
+        return Unavailable(InputRequestUnavailable::RecordLimit {
+            count: messages.len(),
+            limit: 128,
+        });
+    }
+    let parse = || -> Option<Vec<RawInputRecord<'_>>> {
+        let mut records = Vec::with_capacity(messages.len());
+        for message in messages {
+            let proof = message.metadata.as_ref()?.get("session_message")?;
+            let source = proof.get("source")?;
+            let body = proof.get("body")?;
+            let (kind, wrapper, content) =
+                match (source.get("type")?.as_str()?, proof.get("kind")?.as_str()?) {
+                    ("user", "user_input")
+                        if source.as_object()?.len() == 1
+                            && body.get("type")?.as_str()? == "content" =>
+                    {
+                        (SessionMessageKind::UserInput, None, body)
+                    }
+                    ("runtime", "runtime_instruction")
+                        if source.as_object()?.len() == 2
+                            && source.get("subsystem")?.as_str()? == "chat"
+                            && body.get("type")?.as_str()? == "runtime_instruction"
+                            && body.get("instruction")?.as_str()? == "root_chat_turn_v1" =>
+                    {
+                        (
+                            SessionMessageKind::RuntimeInstruction,
+                            Some("root_chat_turn_v1"),
+                            body.get("content")?,
+                        )
+                    }
+                    _ => continue,
+                };
+            let id = message.id.as_str();
+            if proof.get("id")?.as_str()? != id
+                || proof.get("target_session_id")?.as_str()? != session_id
+                || id.is_empty()
+                || id.len() > 256
+                || id.trim() != id
+                || id.contains('/')
+                || id.contains('\\')
+                || id.contains("..")
+            {
+                return None;
+            }
+            let time = proof
+                .get("created_at")?
+                .as_str()?
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .ok()?;
+            if time != message.created_at {
+                return None;
+            }
+            let request = match content.get("skill_request").filter(|v| !v.is_null()) {
+                Some(value) => Some(raw_request(value)?),
+                None => None,
+            };
+            records.push(RawInputRecord(id, source, kind, wrapper, time, request));
+        }
+        Some(records)
+    };
+    let Some(records) = parse() else {
+        return Unavailable(InputRequestUnavailable::InvalidData);
+    };
+    let Some(compact_bytes) = measure_input_request_view(session_id, execution_id, &records) else {
+        return Unavailable(InputRequestUnavailable::CompactLimit { limit: 262144 });
+    };
+    let records = records
+        .iter()
+        .map(|record| ProjectedInputRequest {
+            input_id: record.0.into(),
+            source: if record.2 == SessionMessageKind::UserInput {
+                SessionMessageSource::User
+            } else {
+                SessionMessageSource::Runtime {
+                    subsystem: "chat".into(),
+                }
+            },
+            kind: record.2,
+            wrapper: record.3.map(String::from),
+            created_at: record.4,
+            request: record
+                .5
+                .as_ref()
+                .map(|request| bamboo_domain::SessionSkillRequest {
+                    mode: request.mode.map(String::from),
+                    selections: request
+                        .selections
+                        .0
+                        .iter()
+                        .map(|value| {
+                            let selection =
+                                raw_selection(value).expect("validated borrowed selection");
+                            bamboo_domain::SessionSkillSelection {
+                                id: selection.id.into(),
+                                source: selection.source.into(),
+                                revision: selection.revision,
+                                args: copy_input_request_value(selection.args),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice()
+                        .into_vec(),
+                }),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    Available(BoundedInputRequestBatch {
+        session_id: session_id.into(),
+        execution_id: execution_id.into(),
+        records,
+        compact_bytes,
     })
 }
 
@@ -652,6 +896,7 @@ pub async fn migrate_legacy_pending_only(
 
 #[derive(Debug, Default)]
 struct InboxAdmission {
+    observation_complete: bool,
     merged: usize,
     committed_messages: Vec<Message>,
     admission_error: Option<String>,
@@ -682,6 +927,7 @@ async fn admit_session_inbox(
                 tracing::warn!(session_id = %session.id, %error, "owned Root Inbox admission stopped");
             }
             return InboxAdmission {
+                observation_complete: admission.admission_error.is_none(),
                 merged: admission.merged,
                 committed_messages: admission.committed_messages,
                 admission_error: admission
@@ -709,8 +955,12 @@ async fn admit_session_inbox(
         }
     };
 
-    let mut admission = InboxAdmission::default();
-    for claim in claims {
+    let count = claims.len();
+    let mut admission = InboxAdmission {
+        observation_complete: count == 0,
+        ..Default::default()
+    };
+    for (index, claim) in claims.into_iter().enumerate() {
         let permanently_admitted = match inbox.was_admitted(&session.id, &claim.envelope.id).await {
             Ok(value) => value,
             Err(error) => {
@@ -782,6 +1032,7 @@ async fn admit_session_inbox(
                 admission.admission_error = Some(INBOX_ACK_UNRESOLVED.to_string());
                 break;
             }
+            admission.observation_complete = index + 1 == count;
             continue;
         }
 
@@ -891,6 +1142,7 @@ async fn admit_session_inbox(
         if !transcript_has_id {
             admission.merged += 1;
         }
+        admission.observation_complete = index + 1 == count;
     }
     admission
 }
@@ -932,6 +1184,45 @@ pub(crate) async fn refresh_turn_boundary_with_inbox_for_run(
     inbox: Option<&Arc<dyn SessionInboxPort>>,
     active_run_id: Option<&str>,
 ) -> TurnBoundaryRefresh {
+    refresh_turn_boundary_inner(session, storage, persistence, inbox, active_run_id, None).await
+}
+
+pub(crate) async fn refresh_turn_boundary_with_observation(
+    session: &mut Session,
+    storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
+    persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+    inbox: Option<&Arc<dyn SessionInboxPort>>,
+    active_run_id: Option<&str>,
+    execution_id: &str,
+) -> (
+    TurnBoundaryRefresh,
+    crate::runtime::managers::lifecycle::InputObservation,
+) {
+    let mut observation = crate::runtime::managers::lifecycle::InputObservation::default();
+    let refresh = refresh_turn_boundary_inner(
+        session,
+        storage,
+        persistence,
+        inbox,
+        active_run_id,
+        Some((execution_id, &mut observation)),
+    )
+    .await;
+    (refresh, observation)
+}
+
+async fn refresh_turn_boundary_inner(
+    session: &mut Session,
+    storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
+    persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+    inbox: Option<&Arc<dyn SessionInboxPort>>,
+    active_run_id: Option<&str>,
+    capture: Option<(
+        &str,
+        &mut crate::runtime::managers::lifecycle::InputObservation,
+    )>,
+) -> TurnBoundaryRefresh {
+    let mut read_complete = true;
     let latest = match storage {
         Some(storage) => match storage.load_session(&session.id).await {
             Ok(latest) => latest,
@@ -941,6 +1232,7 @@ pub(crate) async fn refresh_turn_boundary_with_inbox_for_run(
                     %error,
                     "turn-boundary session refresh failed"
                 );
+                read_complete = false;
                 None
             }
         },
@@ -1020,6 +1312,20 @@ pub(crate) async fn refresh_turn_boundary_with_inbox_for_run(
 
     if let Some(inbox) = inbox {
         let admission = admit_session_inbox(session, inbox, persistence, active_run_id).await;
+        if let Some((execution_id, observation)) = capture {
+            if read_complete
+                && admission.observation_complete
+                && admission.admission_error.is_none()
+            {
+                *observation = crate::runtime::managers::lifecycle::InputObservation::projected(
+                    project_new_committed_inputs(
+                        &session.id,
+                        execution_id,
+                        &admission.committed_messages,
+                    ),
+                );
+            }
+        }
         return TurnBoundaryRefresh {
             merged: admission.merged,
             committed_messages: admission.committed_messages,

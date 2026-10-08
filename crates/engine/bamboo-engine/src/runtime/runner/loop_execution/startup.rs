@@ -80,6 +80,8 @@ pub(super) struct LoopRunState {
     /// pipeline execution. Round counters restart on resume/re-execution, so
     /// they are only unique within this private run scope.
     pub(super) execution_id: String,
+    pub(super) current_inputs:
+        Option<crate::runtime::managers::lifecycle::BoundedInputRequestBatch>,
     pub(super) model_name: String,
     pub(super) metrics_collector: Option<MetricsCollector>,
     pub(super) debug_logger: DebugLogger,
@@ -118,6 +120,17 @@ pub(super) async fn initialize_loop_state(
 ) -> super::super::Result<LoopRunState> {
     let debug_logger = DebugLogger::new(tracing::enabled!(tracing::Level::DEBUG));
     let session_id = session.id.clone();
+    // Take before fallible startup work: failed initialization drops the value.
+    let (execution_id, observation) = config
+        .initial_untrusted_inputs
+        .as_ref()
+        .and_then(|inputs| inputs.take_startup_observation(&session_id))
+        .unwrap_or_else(|| {
+            (
+                crate::runtime::runner::round_prelude::new_execution_id(),
+                Default::default(),
+            )
+        });
     let metrics_collector = config.metrics_collector.clone();
     let model_name = config
         .model_name
@@ -229,9 +242,12 @@ pub(super) async fn initialize_loop_state(
     )
     .await?;
 
+    let mut current_inputs = None;
+    observation.update_current(&mut current_inputs, &session_id, &execution_id);
     Ok(LoopRunState {
         session_id,
-        execution_id: crate::runtime::runner::round_prelude::new_execution_id(),
+        execution_id,
+        current_inputs,
         model_name,
         metrics_collector,
         debug_logger,
