@@ -536,6 +536,9 @@ async fn handle_chat(
         return project_context_error_response(error);
     }
     let workspace_was_explicit = req.workspace_path.is_some();
+    if let Err(response) = ingress::validate_skill_request(&req) {
+        return *response;
+    }
     let requested_workflow_selection = req.workflow_selection.clone();
     // An explicit request value wins; otherwise stamp the durable
     // permission-policy seed for a NEW session. The engine applies this only
@@ -1007,6 +1010,10 @@ async fn handle_chat(
     }
 
     let mut queued_input = if queue_root_input && !queued {
+        let skill_request = match ingress::skill_request(&req) {
+            Ok(data) => data,
+            Err(response) => return *response,
+        };
         let message = session
             .messages
             .pop()
@@ -1037,6 +1044,7 @@ async fn handle_chat(
                     _ => unreachable!(),
                 },
                 parts: message.content_parts.unwrap_or_default(),
+                skill_request,
             });
         Some(envelope)
     } else {

@@ -313,3 +313,22 @@ defaults retain their existing tool registration. The old classes remain
 exported. This refactor preserves legacy invocation, resource and metadata
 behavior; it does not register progressive catalog/read Tools or wire the
 prepared ordinary-input helpers. The atomic live cutover remains separate.
+
+Canonical User envelopes can retain bounded, untrusted Skill request data in
+`SessionMessageContent::skill_request`. A current HTTP `workflow_selection`
+supplies one exact id/source/revision/args selection with no mode. Existing
+queued and Root envelopes preserve this data and include it in retry identity;
+the existing native Message path and queue admission conditions are unchanged.
+This carrier does not prepare or invoke a Skill, authorize a source/body read,
+or identify a historical message as current input. Fresh caller, current User,
+Source, schema, configuration and policy checks remain mandatory at eventual
+use. The existing Workflow/Instruction activation path remains live.
+
+Absent request data keeps legacy JSON, `.text()` construction, provider
+text/parts and canonical proof/idempotency bytes compatible. The new optional
+public field intentionally changes Rust struct-literal construction: existing
+`SessionMessageContent { text, parts }` callers must write
+`SessionMessageContent { text, parts, skill_request: None }`. Data bounds limit
+request shape and size; they do not guarantee admission under the existing
+whole-envelope Inbox limit. Guidance, peer messages and child/runtime
+presentation cannot turn this data into a fresh User request.
