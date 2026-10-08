@@ -80,6 +80,17 @@ impl Agent {
         self.runtime.execute(session, req).await
     }
 
+    /// Explicit bounded caller-data handoff; no currentness or Skill authority.
+    /// Ordinary execute/direct/spawn entrypoints continue to supply None.
+    pub async fn execute_with_inputs(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+    ) -> crate::runtime::runner::Result<()> {
+        self.runtime.execute_with_inputs(session, req, inputs).await
+    }
+
     /// Execute a caller-owned session under a complete logical-session
     /// activation lifecycle.
     ///
@@ -174,6 +185,18 @@ impl Agent {
         req: ExecuteRequest,
         lease: DirectExecutionLease,
     ) -> crate::runtime::runner::Result<()> {
+        self.execute_direct_registered_with_inputs(session, req, lease, None)
+            .await
+    }
+
+    /// Existing direct lifecycle with a separately owned, untrusted input handoff.
+    pub async fn execute_direct_registered_with_inputs(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        lease: DirectExecutionLease,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+    ) -> crate::runtime::runner::Result<()> {
         let inherited = self.persistence().inherited_child_wait().or_else(|| {
             (!self.runtime.inherited_child_wait_captured)
                 .then(|| bamboo_domain::InheritedChildWait::capture(session))
@@ -196,7 +219,7 @@ impl Agent {
             self.with_execution_persistence(self.persistence().clone())
         };
         agent
-            .execute_direct_registered_bound(session, req, lease)
+            .execute_direct_registered_bound(session, req, lease, inputs)
             .await
     }
 
@@ -205,6 +228,7 @@ impl Agent {
         session: &mut Session,
         req: ExecuteRequest,
         mut lease: DirectExecutionLease,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     ) -> crate::runtime::runner::Result<()> {
         if lease.target_session_id != session.id {
             return Err(bamboo_agent_core::AgentError::LLM(format!(
@@ -213,14 +237,14 @@ impl Agent {
             )));
         }
         let Some(router) = lease.router.take() else {
-            return self.execute(session, req).await;
+            return self.execute_with_inputs(session, req, inputs).await;
         };
         let mut registration = lease.registration.take().ok_or_else(|| {
             bamboo_agent_core::AgentError::LLM(
                 "direct execution lease is missing its router registration".to_string(),
             )
         })?;
-        let result = self.execute(session, req).await;
+        let result = self.execute_with_inputs(session, req, inputs).await;
 
         // Freeze what this provider execution actually consumed. Compatibility
         // migration and concurrent deliveries below must remain newer work.

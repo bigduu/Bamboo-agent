@@ -333,6 +333,181 @@ impl From<&MemoryConfig> for PromptMemoryFlags {
     }
 }
 
+/// One bounded, explicitly supplied input observation. This carries caller data,
+/// never proof of currentness, a Source grant, or permission to invoke a Skill.
+#[derive(Debug, PartialEq)]
+pub struct UntrustedInputObservation {
+    input_id: bamboo_domain::SessionMessageId,
+    request: Option<bamboo_domain::SessionSkillRequest>,
+}
+
+impl UntrustedInputObservation {
+    pub fn new(
+        input_id: &str,
+        request: Option<&bamboo_domain::SessionSkillRequest>,
+    ) -> Option<Self> {
+        // Bound before the owned ID/request copy. Use the existing canonical ID
+        // contract, including its path rules, without trimming or normalizing.
+        if input_id.is_empty() || input_id.len() > 256 {
+            return None;
+        }
+        let input_id = bamboo_domain::SessionMessageId::parse(input_id.to_owned()).ok()?;
+        if let Some(request) = request {
+            request.validate().ok()?;
+        }
+        Some(Self {
+            input_id,
+            request: request.cloned(),
+        })
+    }
+
+    pub fn input_id(&self) -> &str {
+        self.input_id.as_str()
+    }
+    pub fn request(&self) -> Option<&bamboo_domain::SessionSkillRequest> {
+        self.request.as_ref()
+    }
+}
+
+/// Execution-owned transport, with at most one existing Inbox admission batch
+/// (128 records), each retaining only an ID and an I-W-bounded request. There
+/// is no whole-batch Clone/Arc or body/config/Source snapshot. This is not Q-B's
+/// aggregate compact projection or its eventual current-input classification.
+#[derive(Debug)]
+pub struct UntrustedExecutionInputs {
+    observations: Box<[UntrustedInputObservation]>,
+}
+
+impl UntrustedExecutionInputs {
+    pub fn new(observations: Vec<UntrustedInputObservation>) -> Option<Self> {
+        if observations.is_empty() || observations.len() > 128 {
+            return None;
+        }
+        let mut ids = std::collections::HashSet::with_capacity(observations.len());
+        if observations.iter().any(|item| !ids.insert(item.input_id())) {
+            return None;
+        }
+        Some(Self {
+            observations: observations.into_boxed_slice(),
+        })
+    }
+
+    pub fn observations(&self) -> &[UntrustedInputObservation] {
+        &self.observations
+    }
+
+    /// Caller supplies ONLY this call's newly checkpointed messages, after its
+    /// ACK/rejection checks. Never call this on stored Session history. The
+    /// existing admission producer already checked their envelope proof.
+    pub fn from_committed_messages(messages: &[bamboo_agent_core::Message]) -> Option<Self> {
+        if messages.len() > 128 {
+            return None;
+        }
+        let mut observations = Vec::with_capacity(messages.len());
+        for message in messages {
+            let Some(proof) = message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("session_message"))
+            else {
+                continue;
+            };
+            if proof.get("id")?.as_str()? != message.id {
+                return None;
+            }
+            let body = proof.get("body")?;
+            let request = if proof.get("source")?.get("type")?.as_str()? == "user"
+                && proof.get("kind")?.as_str()? == "user_input"
+                && body.get("type")?.as_str()? == "content"
+            {
+                body.get("skill_request")
+            } else if proof.get("source")?.get("type")?.as_str()? == "runtime"
+                && proof.get("source")?.get("subsystem")?.as_str()? == "chat"
+                && proof.get("kind")?.as_str()? == "runtime_instruction"
+                && body.get("instruction")?.as_str()? == "root_chat_turn_v1"
+            {
+                body.get("content")?.get("skill_request")
+            } else {
+                continue;
+            };
+            let request = request
+                .filter(|value| !value.is_null())
+                .map(copy_checked_request)
+                .transpose()
+                .ok()?;
+            if message.id.is_empty() || message.id.len() > 256 {
+                return None;
+            }
+            let input_id = bamboo_domain::SessionMessageId::parse(message.id.clone()).ok()?;
+            observations.push(UntrustedInputObservation { input_id, request });
+        }
+        Self::new(observations)
+    }
+}
+
+// Read only the exact bounded request, never deserialize/copy the Message,
+// images, body, proof, or publication metadata merely to transport caller data.
+fn copy_checked_request(
+    value: &serde_json::Value,
+) -> Result<bamboo_domain::SessionSkillRequest, ()> {
+    let selections = value
+        .get("selections")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(())?;
+    if selections.is_empty() || selections.len() > 32 {
+        return Err(());
+    }
+    let mode = match value.get("mode") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let mode = value.as_str().ok_or(())?;
+            if mode.is_empty()
+                || mode.len() > 64
+                || !mode
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            {
+                return Err(());
+            }
+            Some(mode)
+        }
+    };
+    // Bound every original args tree before copying any selection. Existing
+    // I-W validation supplies nonrecursive depth/node/compact-byte checks.
+    for selection in selections {
+        bamboo_domain::SessionSkillSelection::validate_borrowed(
+            selection
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?,
+            selection
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?,
+            selection
+                .get("revision")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(())?,
+            selection.get("args").unwrap_or(&serde_json::Value::Null),
+        )
+        .map_err(|_| ())?;
+    }
+    let request = bamboo_domain::SessionSkillRequest {
+        selections: selections
+            .iter()
+            .map(|selection| bamboo_domain::SessionSkillSelection {
+                id: selection["id"].as_str().unwrap().to_owned(),
+                source: selection["source"].as_str().unwrap().to_owned(),
+                revision: selection["revision"].as_u64().unwrap(),
+                args: selection.get("args").cloned().unwrap_or_default(),
+            })
+            .collect(),
+        mode: mode.map(str::to_owned),
+    };
+    request.validate().map_err(|_| ())?;
+    Ok(request)
+}
+
 /// Configuration for the agent loop.
 ///
 /// # One-config-per-run invariant (#44)
@@ -369,6 +544,8 @@ pub struct AgentLoopConfig {
     /// When set, skill discovery prefers `skills-<mode>` directories over generic
     /// directories for the same skill id.
     pub(crate) selected_skill_mode: Option<String>,
+    /// Unwired untrusted inputs supplied by this startup call, never inferred.
+    pub(crate) initial_untrusted_inputs: Option<UntrustedExecutionInputs>,
     pub(crate) additional_tool_schemas: Vec<ToolSchema>,
     pub(crate) tool_registry: Arc<ToolRegistry>,
     pub(crate) skill_manager: Option<Arc<SkillManager>>,
@@ -563,6 +740,13 @@ pub struct AgentLoopConfig {
     pub(crate) run_budget: bamboo_config::RunBudgetConfig,
 }
 
+impl AgentLoopConfig {
+    /// Data-only execution transport. This accessor does not classify or grant.
+    pub fn initial_untrusted_inputs(&self) -> Option<&UntrustedExecutionInputs> {
+        self.initial_untrusted_inputs.as_ref()
+    }
+}
+
 impl Default for AgentLoopConfig {
     fn default() -> Self {
         Self {
@@ -572,6 +756,7 @@ impl Default for AgentLoopConfig {
             disabled_skill_ids: BTreeSet::new(),
             selected_skill_ids: None,
             selected_skill_mode: None,
+            initial_untrusted_inputs: None,
             additional_tool_schemas: Vec::new(),
             tool_registry: Arc::new(ToolRegistry::new()),
             skill_manager: None,
@@ -716,3 +901,91 @@ impl AgentLoopConfig {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod execution_input_tests {
+    use super::*;
+    fn request() -> bamboo_domain::SessionSkillRequest {
+        bamboo_domain::SessionSkillRequest {
+            selections: vec![bamboo_domain::SessionSkillSelection {
+                id: "exact Case".into(),
+                source: "builtin".into(),
+                revision: 1,
+                args: serde_json::json!({"raw":"保持原样"}),
+            }],
+            mode: None,
+        }
+    }
+    #[test]
+    fn execution_input_owned_bounds_and_old_config_default() {
+        assert!(AgentLoopConfig::default()
+            .initial_untrusted_inputs()
+            .is_none());
+        let request = request();
+        let input = UntrustedInputObservation::new("exact-input", Some(&request)).unwrap();
+        assert_eq!(input.input_id(), "exact-input");
+        assert_eq!(input.request(), Some(&request));
+        for id in [
+            "",
+            " leading",
+            "trailing ",
+            "unsafe/id",
+            "unsafe\\id",
+            "unsafe..id",
+        ] {
+            assert!(UntrustedInputObservation::new(id, None).is_none());
+        }
+        assert!(UntrustedInputObservation::new(&"a".repeat(257), None).is_none());
+        assert!(UntrustedExecutionInputs::new(Vec::new()).is_none());
+        let batch = UntrustedExecutionInputs::new(
+            (0..128)
+                .map(|i| {
+                    UntrustedInputObservation::new(&format!("input-{i}"), Some(&request)).unwrap()
+                })
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(batch.observations().len(), 128);
+        assert_eq!(batch.observations()[127].input_id(), "input-127");
+        assert!(UntrustedExecutionInputs::new(
+            (0..129)
+                .map(|i| UntrustedInputObservation::new(&format!("input-{i}"), None).unwrap())
+                .collect()
+        )
+        .is_none());
+        assert!(UntrustedExecutionInputs::new(vec![
+            UntrustedInputObservation::new("same", None).unwrap(),
+            UntrustedInputObservation::new("same", None).unwrap()
+        ])
+        .is_none());
+        let mut malformed = request;
+        malformed.selections[0].args = (0..65).fold(serde_json::Value::Null, |v, _| {
+            serde_json::Value::Array(vec![v])
+        });
+        assert!(UntrustedInputObservation::new("deep", Some(&malformed)).is_none());
+    }
+    #[test]
+    fn execution_input_only_explicit_checked_commit_slice_copies_request_fields() {
+        let request = request();
+        let mut user = bamboo_domain::SessionMessageEnvelope::user_input("target", "ordinary");
+        if let bamboo_domain::SessionMessageBody::Content(content) = &mut user.body {
+            content.skill_request = Some(request.clone());
+        }
+        let id = user.id.to_string();
+        let plain = user.to_provider_message().unwrap();
+        let root = user
+            .with_root_chat_prompt("system prompt is not retained".into())
+            .unwrap()
+            .to_provider_message()
+            .unwrap();
+        for message in [plain, root] {
+            let batch = UntrustedExecutionInputs::from_committed_messages(&[message]).unwrap();
+            assert_eq!(batch.observations().len(), 1);
+            assert_eq!(batch.observations()[0].input_id(), id);
+            assert_eq!(batch.observations()[0].request(), Some(&request));
+        }
+        let text = bamboo_agent_core::Message::user("{\"skill_request\":\"fragment\"}");
+        assert!(UntrustedExecutionInputs::from_committed_messages(&[text]).is_none());
+        assert!(UntrustedExecutionInputs::from_committed_messages(&[]).is_none());
+    }
+}

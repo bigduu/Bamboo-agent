@@ -150,8 +150,17 @@ pub struct Agent {
 }
 
 impl Agent {
-    fn append_user_input(session: &mut Session, input: impl Into<String>) {
-        session.add_message(Message::user(input.into()));
+    fn append_user_input(
+        session: &mut Session,
+        input: impl Into<String>,
+    ) -> Option<bamboo_engine::config::UntrustedExecutionInputs> {
+        let message = Message::user(input.into());
+        // The observation belongs to this exact constructor, not a last-User
+        // lookup or a decoder of caller text/config/historical proof.
+        let inputs = bamboo_engine::config::UntrustedInputObservation::new(&message.id, None)
+            .and_then(|input| bamboo_engine::config::UntrustedExecutionInputs::new(vec![input]));
+        session.add_message(message);
+        inputs
     }
 
     /// Return a new ergonomic builder.
@@ -213,8 +222,9 @@ impl Agent {
         session: &mut Session,
         input: impl Into<String>,
     ) -> Result<(), AgentError> {
-        Self::append_user_input(session, input);
-        self.run_session(session).await
+        let inputs = Self::append_user_input(session, input);
+        self.run_session_with_cancel_and_inputs(session, CancellationToken::new(), inputs)
+            .await
     }
 
     /// Like [`run`](Self::run) but driven by a caller-owned
@@ -226,8 +236,9 @@ impl Agent {
         input: impl Into<String>,
         cancel_token: CancellationToken,
     ) -> Result<(), AgentError> {
-        Self::append_user_input(session, input);
-        self.run_session_with_cancel(session, cancel_token).await
+        let inputs = Self::append_user_input(session, input);
+        self.run_session_with_cancel_and_inputs(session, cancel_token, inputs)
+            .await
     }
 
     /// Run the agent loop on `session` exactly as it stands — i.e. on a
@@ -261,12 +272,24 @@ impl Agent {
         session: &mut Session,
         cancel_token: CancellationToken,
     ) -> Result<(), AgentError> {
+        self.run_session_with_cancel_and_inputs(session, cancel_token, None)
+            .await
+    }
+
+    async fn run_session_with_cancel_and_inputs(
+        &self,
+        session: &mut Session,
+        cancel_token: CancellationToken,
+        inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
+    ) -> Result<(), AgentError> {
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(EVENT_CHANNEL_CAPACITY);
 
         // Drain events so the bounded channel never blocks the loop.
         let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
 
-        let result = self.execute_internal(session, event_tx, cancel_token).await;
+        let result = self
+            .execute_internal(session, event_tx, cancel_token, inputs)
+            .await;
 
         // Stop draining once execution returns. Detached engine tasks (e.g.
         // background evaluations) may still hold a cloned sender, so awaiting
@@ -283,8 +306,8 @@ impl Agent {
         mut session: Session,
         input: impl Into<String>,
     ) -> mpsc::Receiver<AgentEvent> {
-        Self::append_user_input(&mut session, input);
-        self.run_stream_session(session)
+        let inputs = Self::append_user_input(&mut session, input);
+        self.run_stream_session_with_cancel_and_inputs(session, CancellationToken::new(), inputs)
     }
 
     /// Like [`run_stream`](Self::run_stream), but also returns a
@@ -296,8 +319,11 @@ impl Agent {
         mut session: Session,
         input: impl Into<String>,
     ) -> (mpsc::Receiver<AgentEvent>, CancellationToken) {
-        Self::append_user_input(&mut session, input);
-        self.run_stream_session_cancellable(session)
+        let inputs = Self::append_user_input(&mut session, input);
+        let cancel_token = CancellationToken::new();
+        let rx =
+            self.run_stream_session_with_cancel_and_inputs(session, cancel_token.clone(), inputs);
+        (rx, cancel_token)
     }
 
     /// Stream the run's [`AgentEvent`]s for a caller-provided message list,
@@ -322,8 +348,17 @@ impl Agent {
     /// helpers funnel into.
     pub fn run_stream_session_with_cancel(
         &self,
+        session: Session,
+        cancel_token: CancellationToken,
+    ) -> mpsc::Receiver<AgentEvent> {
+        self.run_stream_session_with_cancel_and_inputs(session, cancel_token, None)
+    }
+
+    fn run_stream_session_with_cancel_and_inputs(
+        &self,
         mut session: Session,
         cancel_token: CancellationToken,
+        inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
     ) -> mpsc::Receiver<AgentEvent> {
         let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(EVENT_CHANNEL_CAPACITY);
         let agent = self.clone();
@@ -336,7 +371,7 @@ impl Agent {
             // its successor.
             let execution_tx = event_tx.clone();
             if let Err(error) = agent
-                .execute_internal(&mut session, execution_tx, cancel_token)
+                .execute_internal(&mut session, execution_tx, cancel_token, inputs)
                 .await
             {
                 tracing::warn!("Agent::run_stream execution failed: {error}");
@@ -372,6 +407,8 @@ impl Agent {
         session: &mut Session,
         request: ExecuteRequest,
     ) -> Result<(), AgentError> {
+        #[cfg(test)]
+        constructor_parity_tests::observe_inputs(&session.id, None);
         self.inner.execute_direct(session, request).await
     }
 
@@ -383,6 +420,7 @@ impl Agent {
         session: &'a mut Session,
         event_tx: mpsc::Sender<AgentEvent>,
         cancel_token: CancellationToken,
+        inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentError>> + Send + 'a>>
     {
         // Keep the shared execution body off nested public run/resume futures.
@@ -562,9 +600,16 @@ impl Agent {
                 builder = builder.model(model);
             }
 
+            #[cfg(test)]
+            constructor_parity_tests::observe_inputs(&session.id, inputs.as_ref());
             execution
                 .inner
-                .execute_direct_registered(session, builder.build(), direct_lease)
+                .execute_direct_registered_with_inputs(
+                    session,
+                    builder.build(),
+                    direct_lease,
+                    inputs,
+                )
                 .await
         })
     }
@@ -1888,7 +1933,7 @@ mod reexecute_and_child_approval_tests {
         winner.set_project_id_meta("competing-project");
         winner.metadata_version += 1;
         let (tx, mut rx) = mpsc::channel(16);
-        let run = agent.execute_internal(&mut session, tx, CancellationToken::new());
+        let run = agent.execute_internal(&mut session, tx, CancellationToken::new(), None);
         let compete = async {
             tokio::time::timeout(std::time::Duration::from_secs(5), hook.reached.notified())
                 .await
@@ -1988,7 +2033,7 @@ mod reexecute_and_child_approval_tests {
         let before = serde_json::to_vec(&session).unwrap();
         let (tx, mut rx) = mpsc::channel(16);
         let error = agent
-            .execute_internal(&mut session, tx, CancellationToken::new())
+            .execute_internal(&mut session, tx, CancellationToken::new(), None)
             .await
             .unwrap_err();
         assert!(
@@ -2195,7 +2240,7 @@ mod reexecute_and_child_approval_tests {
         let (event_tx, mut event_rx) = mpsc::channel(16);
 
         let error = agent
-            .execute_internal(&mut session, event_tx, CancellationToken::new())
+            .execute_internal(&mut session, event_tx, CancellationToken::new(), None)
             .await
             .expect_err("assigned SDK session must fail without Project resolver");
 
@@ -2541,6 +2586,35 @@ mod constructor_parity_tests {
     #[derive(Default)]
     struct RecordingProvider(Mutex<Vec<Vec<Message>>>);
 
+    type InputSnapshot = Option<Vec<(String, Option<bamboo_domain::SessionSkillRequest>)>>;
+    fn input_taps() -> &'static Mutex<std::collections::HashMap<String, Vec<InputSnapshot>>> {
+        static TAPS: std::sync::OnceLock<
+            Mutex<std::collections::HashMap<String, Vec<InputSnapshot>>>,
+        > = std::sync::OnceLock::new();
+        TAPS.get_or_init(Mutex::default)
+    }
+    fn watch_inputs(id: &str) {
+        input_taps().lock().unwrap().insert(id.into(), Vec::new());
+    }
+    fn take_inputs(id: &str) -> Vec<InputSnapshot> {
+        input_taps().lock().unwrap().remove(id).unwrap()
+    }
+    pub(super) fn observe_inputs(
+        id: &str,
+        inputs: Option<&bamboo_engine::config::UntrustedExecutionInputs>,
+    ) {
+        let mut taps = input_taps().lock().unwrap();
+        if let Some(entries) = taps.get_mut(id) {
+            entries.push(inputs.map(|inputs| {
+                inputs
+                    .observations()
+                    .iter()
+                    .map(|item| (item.input_id().into(), item.request().cloned()))
+                    .collect()
+            }));
+        }
+    }
+
     #[async_trait]
     impl LLMProvider for RecordingProvider {
         async fn chat_stream(
@@ -2599,6 +2673,7 @@ mod constructor_parity_tests {
         for mode in 0..4 {
             provider.0.lock().unwrap().clear();
             let mut session = Session::new(format!("constructor-sdk-fresh-{mode}"), "claude-test");
+            watch_inputs(&session.id);
             let historical = Message::user("historical input");
             let historical_id = historical.id.clone();
             session.add_message(historical);
@@ -2646,6 +2721,11 @@ mod constructor_parity_tests {
             assert_eq!(users[0].id, historical_id);
             assert_eq!(users[1].content, "fresh 原样\n\"input\"");
             assert_ne!(users[1].id, historical_id);
+            assert_eq!(
+                take_inputs(&persisted.id),
+                vec![Some(vec![(users[1].id.clone(), None)])],
+                "exact newly generated User, no history/text/config request reconstruction"
+            );
             assert!(users[1].content_parts.is_none());
             let minted: std::time::SystemTime = users[1].created_at.into();
             assert!(
@@ -2685,6 +2765,7 @@ mod constructor_parity_tests {
         let agent = agent(root.path(), provider.clone()).await;
         for mode in 0..4 {
             let id = format!("constructor-sdk-prelease-{mode}");
+            watch_inputs(&id);
             let mut session = Session::new(&id, "claude-test");
             let lease = agent.inner.begin_direct_execution(&id).await.unwrap();
             let converted = Arc::new(AtomicUsize::new(0));
@@ -2734,6 +2815,10 @@ mod constructor_parity_tests {
             }
             assert_eq!(converted.load(Ordering::SeqCst), 1);
             assert!(provider.0.lock().unwrap().is_empty());
+            assert!(
+                take_inputs(&id).is_empty(),
+                "startup lease rejection drops the local observation before execution"
+            );
             lease.abandon().await;
         }
     }
@@ -2746,6 +2831,7 @@ mod constructor_parity_tests {
         for mode in 0..10 {
             provider.0.lock().unwrap().clear();
             let id = format!("constructor-sdk-session-only-{mode}");
+            watch_inputs(&id);
             let mut session = Session::new(&id, "claude-test");
             let historical = Message::user("original history, never new input");
             let expected = serde_json::to_value(&historical).unwrap();
@@ -2796,6 +2882,11 @@ mod constructor_parity_tests {
                 .collect::<Vec<_>>();
             assert_eq!(users.len(), 1);
             assert_eq!(serde_json::to_value(users[0]).unwrap(), expected);
+            assert_eq!(
+                take_inputs(&id),
+                vec![None],
+                "all ten session/resume/custom execute paths default to absence"
+            );
             let requests = provider.0.lock().unwrap();
             assert!(!requests.is_empty());
             let sent = requests[0]
@@ -2840,6 +2931,7 @@ mod constructor_parity_tests {
                 let provider = Arc::new(PendingProvider::default());
                 let agent = agent(root.path(), provider.clone()).await;
                 let id = format!("constructor-sdk-cancel-{streaming}");
+                watch_inputs(&id);
                 let mut session = Session::new(&id, "claude-test");
                 let converted = Arc::new(AtomicUsize::new(0));
                 let input = ObservedInput(converted.clone());
@@ -2879,6 +2971,10 @@ mod constructor_parity_tests {
                     .collect::<Vec<_>>();
                 assert_eq!(users.len(), 1);
                 assert_eq!(users[0].content, "fresh 原样\n\"input\"");
+                assert_eq!(
+                    take_inputs(&id),
+                    vec![Some(vec![(users[0].id.clone(), None)])]
+                );
                 let requests = provider.requests.lock().unwrap();
                 assert_eq!(requests.len(), 1);
                 let sent = requests[0]

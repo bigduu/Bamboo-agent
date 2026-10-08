@@ -155,7 +155,25 @@ pub(crate) fn make_disabled_filter_resolver(
     })
 }
 
-pub(crate) fn spawn_agent_execution(mut args: SpawnAgentExecution) {
+pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
+    args.spawn_with_inputs(None);
+}
+
+impl SpawnAgentExecution {
+    /// Separate untrusted transport parameter; the existing argument layout and
+    /// ordinary spawner remain compatible and default to absence.
+    pub(crate) fn spawn_with_inputs(
+        self,
+        inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
+    ) {
+        spawn_agent_execution_with_inputs(self, inputs);
+    }
+}
+
+fn spawn_agent_execution_with_inputs(
+    mut args: SpawnAgentExecution,
+    inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
+) {
     let session_model_ref = session_effective_model_ref(&args.session);
     let provider_override = match (session_model_ref.as_ref(), args.provider_override.take()) {
         (Some(_), Some(provider)) => Some(provider),
@@ -195,48 +213,51 @@ pub(crate) fn spawn_agent_execution(mut args: SpawnAgentExecution) {
     let mut model_roster = args.model_roster;
     model_roster.provider_name = Some(args.provider_name);
 
-    bamboo_engine::execution::spawn_session_execution(SessionExecutionArgs {
-        agent: args.state.agent.clone(),
-        session_id: args.session_id,
-        session: args.session,
-        execution_reservation: args.execution_reservation,
-        tools_override,
-        provider_override,
-        model_roster,
-        reasoning_effort: args.reasoning_effort,
-        reasoning_effort_source: args.reasoning_effort_source,
-        auxiliary_model_resolver: Some(auxiliary_model_resolver),
-        // Live per-round disabled-set resolver (#136): a tool disabled/re-enabled
-        // mid-run takes effect on the next round of this (long-running) agent loop.
-        disabled_filter_resolver: Some(make_disabled_filter_resolver(&args.state)),
-        disabled_tools: Some(args.disabled_tools),
-        disabled_skill_ids: Some(args.disabled_skill_ids),
-        selected_skill_ids,
-        selected_skill_mode,
-        mpsc_tx: args.mpsc_tx,
-        history_commit_barrier: args.history_commit_barrier,
-        image_fallback: args.image_fallback,
-        gold_config: args.gold_config,
-        // The guardian reviewer spawner is always available; the terminal gate
-        // stays inert until `guardian_config` is enabled. (TODO: surface a
-        // guardian config on the request, mirroring `gold_config`.)
-        guardian_config: None,
-        guardian_spawner: Some(args.state.guardian_spawner.clone()),
-        bash_resume_hook: Some(args.state.bash_resume_hook.clone()),
-        // The completion coordinator also implements `BashCompletionSink`: a
-        // finished background shell pushes its result into this loop (injected at
-        // the next round boundary, issue #84 Phase 2b follow-up).
-        bash_completion_sink: Some(args.state.child_completion_coordinator.clone()),
-        app_data_dir: args.app_data_dir,
-        run_budget: args.run_budget,
-        runners: args.state.agent_runners.clone(),
-        sessions_cache: args.state.sessions.clone(),
-        on_complete: None,
-        // Resumed/child sessions finishing on this path wake their waiting
-        // parent through the completion coordinator (issue #546); the
-        // publish is gated on kind=Child inside `spawn_session_execution`.
-        child_completion_handler: Some(args.state.child_completion_coordinator.clone()),
-    });
+    bamboo_engine::execution::agent_spawn::spawn_session_execution_with_inputs(
+        SessionExecutionArgs {
+            agent: args.state.agent.clone(),
+            session_id: args.session_id,
+            session: args.session,
+            execution_reservation: args.execution_reservation,
+            tools_override,
+            provider_override,
+            model_roster,
+            reasoning_effort: args.reasoning_effort,
+            reasoning_effort_source: args.reasoning_effort_source,
+            auxiliary_model_resolver: Some(auxiliary_model_resolver),
+            // Live per-round disabled-set resolver (#136): a tool disabled/re-enabled
+            // mid-run takes effect on the next round of this (long-running) agent loop.
+            disabled_filter_resolver: Some(make_disabled_filter_resolver(&args.state)),
+            disabled_tools: Some(args.disabled_tools),
+            disabled_skill_ids: Some(args.disabled_skill_ids),
+            selected_skill_ids,
+            selected_skill_mode,
+            mpsc_tx: args.mpsc_tx,
+            history_commit_barrier: args.history_commit_barrier,
+            image_fallback: args.image_fallback,
+            gold_config: args.gold_config,
+            // The guardian reviewer spawner is always available; the terminal gate
+            // stays inert until `guardian_config` is enabled. (TODO: surface a
+            // guardian config on the request, mirroring `gold_config`.)
+            guardian_config: None,
+            guardian_spawner: Some(args.state.guardian_spawner.clone()),
+            bash_resume_hook: Some(args.state.bash_resume_hook.clone()),
+            // The completion coordinator also implements `BashCompletionSink`: a
+            // finished background shell pushes its result into this loop (injected at
+            // the next round boundary, issue #84 Phase 2b follow-up).
+            bash_completion_sink: Some(args.state.child_completion_coordinator.clone()),
+            app_data_dir: args.app_data_dir,
+            run_budget: args.run_budget,
+            runners: args.state.agent_runners.clone(),
+            sessions_cache: args.state.sessions.clone(),
+            on_complete: None,
+            // Resumed/child sessions finishing on this path wake their waiting
+            // parent through the completion coordinator (issue #546); the
+            // publish is gated on kind=Child inside `spawn_session_execution`.
+            child_completion_handler: Some(args.state.child_completion_coordinator.clone()),
+        },
+        inputs,
+    );
 }
 
 #[cfg(test)]
