@@ -2814,7 +2814,7 @@ pub(super) async fn run_pipeline(
     state: &mut LoopRunState,
 ) -> super::super::Result<bool> {
     let result =
-        run_pipeline_inner(session, event_tx, llm, tools, cancel_token, config, state).await;
+        boxed_pipeline_inner(session, event_tx, llm, tools, cancel_token, config, state).await;
 
     // This outer lifecycle fence deliberately catches every return from the
     // implementation below, including `?` from prompt refresh and hook paths.
@@ -2831,6 +2831,26 @@ pub(super) async fn run_pipeline(
     };
     abort_in_flight_evaluations(state, event_tx, reason).await;
     result
+}
+
+fn boxed_pipeline_inner<'a>(
+    session: &'a mut Session,
+    event_tx: &'a mpsc::Sender<AgentEvent>,
+    llm: Arc<dyn LLMProvider>,
+    tools: Arc<dyn ToolExecutor>,
+    cancel_token: &'a CancellationToken,
+    config: &'a AgentLoopConfig,
+    state: &'a mut LoopRunState,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = super::super::Result<bool>> + 'a>> {
+    Box::pin(run_pipeline_inner(
+        session,
+        event_tx,
+        llm,
+        tools,
+        cancel_token,
+        config,
+        state,
+    ))
 }
 
 async fn run_pipeline_inner(

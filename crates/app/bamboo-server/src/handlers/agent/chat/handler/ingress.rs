@@ -13,6 +13,102 @@ fn error(status: StatusCode, reason: impl ToString) -> HttpResponse {
     crate::error::json_error(status, reason.to_string())
 }
 
+pub(super) fn validate_skill_request(request: &ChatRequest) -> ResponseResult<()> {
+    if let Some(selection) = &request.workflow_selection {
+        bamboo_domain::SessionSkillSelection::validate_borrowed(
+            &selection.id, selection.source.as_str(), selection.revision, &selection.args,
+        ).map_err(|_| error(StatusCode::BAD_REQUEST,
+            "Invalid Skill request: canonical id (1..256 bytes), known source, nonzero revision; args limit 64 container levels, 8192 nodes and 8192 JSON bytes"))?;
+    }
+    Ok(())
+}
+
+pub(super) fn skill_request(
+    request: &ChatRequest,
+) -> ResponseResult<Option<bamboo_domain::SessionSkillRequest>> {
+    validate_skill_request(request)?;
+    let Some(selection) = &request.workflow_selection else {
+        return Ok(None);
+    };
+    let data = bamboo_domain::SessionSkillRequest {
+        selections: vec![bamboo_domain::SessionSkillSelection {
+            id: selection.id.clone(),
+            source: selection.source.as_str().to_owned(),
+            revision: selection.revision,
+            args: selection.args.clone(),
+        }],
+        mode: None,
+    };
+    data.validate().map_err(|_| {
+        error(
+            StatusCode::BAD_REQUEST,
+            "Invalid bounded Skill request data",
+        )
+    })?;
+    Ok(Some(data))
+}
+
+pub(super) async fn construct_user_envelope(
+    state: &AppState,
+    session: &Session,
+    request: &ChatRequest,
+    effective_message: &str,
+) -> ResponseResult<SessionMessageEnvelope> {
+    let skill_request = skill_request(request)?;
+    let mut envelope = SessionMessageEnvelope::user_input(&session.id, effective_message);
+    if let Some(id) = &request.message_id {
+        envelope.id =
+            SessionMessageId::parse(id.clone()).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    }
+    envelope.thread_id = request.thread_id.clone();
+    envelope.in_reply_to = request
+        .in_reply_to
+        .as_ref()
+        .map(|id| SessionMessageId::parse(id.clone()))
+        .transpose()
+        .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    envelope.correlation_id = request.correlation_id.clone();
+    if let Some(images) = request.images.as_ref().filter(|v| !v.is_empty()) {
+        if images.len() > 16 {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "A message supports up to 16 images",
+            )
+            .into());
+        }
+        let mut parts = vec![bamboo_domain::MessagePart::Text {
+            text: effective_message.into(),
+        }];
+        for image in images {
+            let (_, url) = state
+                .session_store
+                .write_image_attachment_deduplicated(
+                    session,
+                    &image.base64,
+                    image.mime_type.as_deref(),
+                )
+                .await
+                .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+            parts.push(bamboo_domain::MessagePart::ImageUrl {
+                image_url: bamboo_domain::ImageUrlRef { url, detail: None },
+            });
+        }
+        envelope.body =
+            bamboo_domain::SessionMessageBody::Content(bamboo_domain::SessionMessageContent {
+                text: effective_message.into(),
+                parts,
+                skill_request: None,
+            });
+    }
+    if let bamboo_domain::SessionMessageBody::Content(content) = &mut envelope.body {
+        content.skill_request = skill_request;
+    }
+    envelope
+        .validate()
+        .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    Ok(envelope)
+}
+
 pub(super) async fn queue(
     state: &AppState,
     session: &Session,
@@ -66,53 +162,7 @@ pub(super) async fn queue(
         )
         .into());
     }
-    let mut envelope = SessionMessageEnvelope::user_input(&session.id, effective_message);
-    if let Some(id) = &request.message_id {
-        envelope.id =
-            SessionMessageId::parse(id.clone()).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
-    }
-    envelope.thread_id = request.thread_id.clone();
-    envelope.in_reply_to = request
-        .in_reply_to
-        .as_ref()
-        .map(|id| SessionMessageId::parse(id.clone()))
-        .transpose()
-        .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
-    envelope.correlation_id = request.correlation_id.clone();
-    if let Some(images) = request.images.as_ref().filter(|v| !v.is_empty()) {
-        if images.len() > 16 {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "A message supports up to 16 images",
-            )
-            .into());
-        }
-        let mut parts = vec![bamboo_domain::MessagePart::Text {
-            text: effective_message.into(),
-        }];
-        for image in images {
-            let (_, url) = state
-                .session_store
-                .write_image_attachment_deduplicated(
-                    session,
-                    &image.base64,
-                    image.mime_type.as_deref(),
-                )
-                .await
-                .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
-            parts.push(bamboo_domain::MessagePart::ImageUrl {
-                image_url: bamboo_domain::ImageUrlRef { url, detail: None },
-            });
-        }
-        envelope.body =
-            bamboo_domain::SessionMessageBody::Content(bamboo_domain::SessionMessageContent {
-                text: effective_message.into(),
-                parts,
-            });
-    }
-    envelope
-        .validate()
-        .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    let envelope = construct_user_envelope(state, session, request, effective_message).await?;
     // A new ordinary session needs a canonical address before delivery. This
     // contains no User turn or live workflow pin; the final chat checkpoint
     // remains responsible for those. A failed delivery can retry the same ID.
@@ -262,4 +312,84 @@ pub(crate) async fn admit_for_execute(state: &AppState, id: &str) -> ResponseRes
             .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod skill_request_tests {
+    use super::*;
+
+    #[test]
+    fn skill_request_maps_each_source_and_preserves_original_scalar_args() {
+        for source in ["builtin", "project", "workspace", "user", "plugin"] {
+            for args in [
+                serde_json::Value::Null,
+                serde_json::json!([1, "原样"]),
+                serde_json::json!({"key":"value"}),
+            ] {
+                let request: ChatRequest = serde_json::from_value(serde_json::json!({
+                    "message":"ordinary", "workflow_selection":{"id":"exact Case", "source":source, "revision":7, "args":args}
+                })).unwrap();
+                let data = skill_request(&request).unwrap().unwrap();
+                assert_eq!(data.mode, None);
+                assert_eq!(data.selections.len(), 1);
+                assert_eq!(data.selections[0].id, "exact Case");
+                assert_eq!(data.selections[0].source, source);
+                assert_eq!(data.selections[0].revision, 7);
+                assert_eq!(data.selections[0].args, args);
+                data.validate().unwrap();
+                assert_eq!(request.workflow_selection.as_ref().unwrap().args, args);
+            }
+        }
+        let request: ChatRequest = serde_json::from_value(serde_json::json!({
+            "message":"ordinary", "selected_skill_ids":["historical"], "selected_skill_mode":"plan"
+        }))
+        .unwrap();
+        assert!(
+            skill_request(&request).unwrap().is_none(),
+            "no historical/config/selected-ID producer"
+        );
+    }
+
+    #[actix_web::test]
+    async fn skill_request_programmatic_depth_rejects_before_attachment_or_session_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = AppState::new(root.path().into()).await.unwrap();
+        let session = Session::new("preclone-deep-skill", "test-model");
+        let mut request: ChatRequest = serde_json::from_value(serde_json::json!({
+            "message":"ordinary", "message_id":"preclone-id", "workflow_selection":{"id":"review", "source":"builtin", "revision":1},
+            "images":[{"base64":"invalid%%%","type":"image/png"}]
+        })).unwrap();
+        for depth in [65, 180] {
+            let args = (0..depth).fold(serde_json::Value::Null, |value, _| {
+                serde_json::Value::Array(vec![value])
+            });
+            assert!(serde_json::to_vec(&args).unwrap().len() < 8192);
+            request.workflow_selection.as_mut().unwrap().args = args;
+            let response = construct_user_envelope(&state, &session, &request, "ordinary")
+                .await
+                .unwrap_err();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(
+                body.contains("64 container levels"),
+                "shape failed before invalid image: {body}"
+            );
+            assert!(body.len() < 512, "bounded reason does not echo args");
+            assert!(state
+                .storage
+                .load_session(&session.id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(!root
+                .path()
+                .join("sessions")
+                .join(&session.id)
+                .join("attachments")
+                .exists());
+        }
+    }
 }

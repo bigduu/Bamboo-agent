@@ -16,6 +16,18 @@ pub use render::{
 };
 pub(crate) mod source;
 
+/// Correlated borrowed data from one current publication. It is not a grant,
+/// activation snapshot or retained resource owner.
+pub struct CurrentSkillInput<'a> {
+    pub selection: &'a crate::WorkflowSelection,
+    pub definition: &'a crate::SkillDefinition,
+    pub catalog_entry: &'a crate::WorkflowCatalogEntry,
+    pub revision: u64,
+    pub catalog_revision: u64,
+    pub mode: Option<&'a str>,
+    pub main_resource: &'a str,
+}
+
 /// Owned metadata only; contains no source handles, instruction or policy bytes.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SkillCatalogMetadata {

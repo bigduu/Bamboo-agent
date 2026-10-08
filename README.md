@@ -199,6 +199,18 @@ data and a unique successful active receipt, retains originals and uses the
 existing 512 KiB bound. Unsupported history stays intact. Neither helper is
 called by chat, runner setup, providers or persistence; live cutover is separate.
 
+`bamboo_server_tools::SkillInputFactory` is an unwired host preparation entry
+point for an actual User that has not been appended. It requires a freshly
+resolved caller and typed current selections; host ceilings, disabled/manual
+policy, Root Ultra and Project/workspace scope remain separate restrictions.
+New Sessions require explicit host provenance and first/final absent storage
+rows. Existing Sessions reuse their persistence owner before publication guards
+and a final direct fallible storage read. Definition, schema, mode and Source
+are borrowed from one current publication, with charged raw/physical validation
+before rendering and before success. Only ordinary Message data and warnings
+return; no Session, pin or reader permission is written. No production caller
+uses this factory. Its fixtures establish preparation, not live runtime cutover.
+
 The runner's existing Instruction activation path is factored into a private,
 stateless `legacy_instruction` adapter. It still publishes the selected pin,
 requires one model-issued `load_skill` call, suppresses first-round answer text,
@@ -222,6 +234,15 @@ from response cancellation; those guards are released before activation.
 Ordinary requests keep their existing input and idempotent replay behavior.
 This adapter adds no caller grant, Session field, reader registration or
 additional writer. The pure prepared-input helpers remain unwired.
+
+Native chat and queued HTTP input use private constructors for the same User
+Message and inbox envelope. Native chat retains its attachment storage, append
+and pending marker; queued input retains authenticated admission and its durable
+retry identity. The four fresh-input SDK wrappers share one synchronous append
+helper at their original call positions, including synchronous stream creation.
+Session-only execution and resume retain their supplied history. These helpers
+preserve the existing public and serialized layouts and introduce no Skill
+factory or live reader registration.
 
 ## License
 
@@ -282,3 +303,32 @@ exit, cancellation and unwind restore the caller's previous scope.
 Production Reader registration, current-input intent transport, default trusted
 caller resolution and output-helper composition remain disconnected until the
 separate atomic cutover. Existing legacy execution remains the only live path.
+
+Server and deployed workers construct the existing `load_skill` and
+`read_skill_resource` overlays through `assemble_legacy_skill_tools` in
+`skill_runtime/assembly.rs`. Server retains its Project store and the actual
+permission-checked pre-Skill context registry; workers retain their absent
+optional adapters. Strict-native workers bypass this construction, and SDK
+defaults retain their existing tool registration. The old classes remain
+exported. This refactor preserves legacy invocation, resource and metadata
+behavior; it does not register progressive catalog/read Tools or wire the
+prepared ordinary-input helpers. The atomic live cutover remains separate.
+
+Canonical User envelopes can retain bounded, untrusted Skill request data in
+`SessionMessageContent::skill_request`. A current HTTP `workflow_selection`
+supplies one exact id/source/revision/args selection with no mode. Existing
+queued and Root envelopes preserve this data and include it in retry identity;
+the existing native Message path and queue admission conditions are unchanged.
+This carrier does not prepare or invoke a Skill, authorize a source/body read,
+or identify a historical message as current input. Fresh caller, current User,
+Source, schema, configuration and policy checks remain mandatory at eventual
+use. The existing Workflow/Instruction activation path remains live.
+
+Absent request data keeps legacy JSON, `.text()` construction, provider
+text/parts and canonical proof/idempotency bytes compatible. The new optional
+public field intentionally changes Rust struct-literal construction: existing
+`SessionMessageContent { text, parts }` callers must write
+`SessionMessageContent { text, parts, skill_request: None }`. Data bounds limit
+request shape and size; they do not guarantee admission under the existing
+whole-envelope Inbox limit. Guidance, peer messages and child/runtime
+presentation cannot turn this data into a fresh User request.

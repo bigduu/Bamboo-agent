@@ -3802,4 +3802,678 @@ mod optional_model_e2e {
             }
         }
     }
+
+    #[actix_web::test]
+    async fn skill_request_actual_root_and_queued_handlers_preserve_current_caller_data() {
+        for queued in [false, true] {
+            let state = new_state().await;
+            let session_id = if queued {
+                "skill-request-handler-queue"
+            } else {
+                "skill-request-handler-root"
+            };
+            let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
+            let entry = catalog
+                .entries
+                .iter()
+                .find(|entry| entry.id == "review" && entry.winner)
+                .unwrap();
+            let selection = bamboo_skills::WorkflowSelection {
+                id: entry.id.clone(),
+                source: entry.source,
+                revision: entry.revision,
+                args: serde_json::json!({}),
+            };
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            // Prepare the real initial Main before its first Actor activation.
+            let mut initial_body = serde_json::json!({"session_id":session_id,"message":"prior turn","model":"test-model","workflow_selection":selection});
+            if queued {
+                // Referenced queue ingress retains the already published prompt;
+                // the separate Root constructor below carries a changed prompt.
+                initial_body["system_prompt"] = "REQUEST_ROOT_SYSTEM".into();
+            }
+            let initial = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/chat")
+                    .set_json(initial_body)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(initial.status(), StatusCode::CREATED);
+            let original = state
+                .storage
+                .load_session(session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let sender = state.get_session_event_sender(session_id).await;
+            let mut reservation = match bamboo_engine::execution::reserve_session_execution(
+                &state.agent,
+                &state.agent_runners,
+                &state.session_event_senders,
+                session_id,
+                &sender,
+            )
+            .await
+            {
+                bamboo_engine::execution::SessionExecutionReserveOutcome::Reserved(reservation) => {
+                    reservation
+                }
+                _ => panic!("idle Root reservation"),
+            };
+            reservation
+                .bind_root_actor(&state.agent, &original)
+                .await
+                .unwrap();
+            // Exercise a truly activated Root after its exact startup owner is
+            // cancelled and released; a plain Session is an unfenced fixture.
+            reservation.abandon().await;
+            assert!(state
+                .session_store
+                .root_actor_input_required(&original)
+                .await
+                .unwrap());
+            #[cfg(unix)]
+            {
+                state.config.write().await.lifecycle_hooks = bamboo_config::LifecycleHooksConfig {
+                    enabled: true,
+                    user_prompt_submit: vec![bamboo_config::LifecycleHookGroup {
+                        enabled: true,
+                        matcher: None,
+                        hooks: vec![bamboo_config::LifecycleHookHandler::command(
+                            "printf '%s' '{\"additional_context\":\"REQUEST_HOOK_CONTEXT\"}'",
+                            bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                        )],
+                    }],
+                    ..Default::default()
+                };
+            }
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let mut body = serde_json::json!({"session_id":session_id,"message":"current caller 原样","model":"test-model",
+                "system_prompt":"REQUEST_ROOT_SYSTEM", "workflow_selection":selection,
+                "images":[{"base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jF0cAAAAASUVORK5CYII=","type":"image/png"}]
+            });
+            if queued {
+                body["message_id"] = "current-request-stable-id".into();
+            }
+            let before = chrono::Utc::now();
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/chat")
+                    .peer_addr("127.0.0.1:5700".parse().unwrap())
+                    .set_json(&body)
+                    .to_request(),
+            )
+            .await;
+            let status = response.status();
+            let response: Value = test::read_body_json(response).await;
+            assert_eq!(status, StatusCode::CREATED, "{response}");
+            let claims = state.session_inbox.claim(session_id, 10).await.unwrap();
+            assert_eq!(claims.len(), 1);
+            let envelope = &claims[0].envelope;
+            assert!(envelope.created_at >= before && envelope.created_at <= chrono::Utc::now());
+            if queued {
+                assert_eq!(envelope.id.as_str(), "current-request-stable-id");
+            } else {
+                assert_eq!(
+                    envelope
+                        .root_chat_prompt()
+                        .unwrap()
+                        .map(|s| s.contains("REQUEST_ROOT_SYSTEM")),
+                    Some(true)
+                );
+            }
+            let content = match &envelope.body {
+                bamboo_domain::SessionMessageBody::Content(content) => content,
+                bamboo_domain::SessionMessageBody::RuntimeInstruction(instruction) => {
+                    let canonical = instruction.content.as_ref().unwrap();
+                    assert_eq!(
+                        canonical.skill_request,
+                        instruction
+                            .provider_message
+                            .as_ref()
+                            .unwrap()
+                            .content
+                            .skill_request
+                    );
+                    canonical
+                }
+                _ => panic!("current ordinary Root input"),
+            };
+            let data = content.skill_request.as_ref().unwrap();
+            assert_eq!(data.mode, None);
+            assert_eq!(data.selections.len(), 1);
+            assert_eq!(data.selections[0].id, selection.id);
+            assert_eq!(data.selections[0].source, selection.source.as_str());
+            assert_eq!(data.selections[0].revision, selection.revision);
+            assert_eq!(data.selections[0].args, selection.args);
+            assert!(content.text.starts_with("current caller 原样"));
+            #[cfg(unix)]
+            assert!(content.text.contains("REQUEST_HOOK_CONTEXT"));
+            assert_eq!(content.parts.len(), 2);
+            assert!(
+                matches!(&content.parts[0],bamboo_domain::MessagePart::Text{text} if text==&content.text)
+            );
+            let presentation = envelope.to_provider_message().unwrap();
+            assert_eq!(presentation.id, envelope.id.to_string());
+            assert_eq!(presentation.created_at, envelope.created_at);
+            assert_eq!(presentation.content, content.text);
+            assert_eq!(presentation.content_parts.as_ref().unwrap(), &content.parts);
+            let persisted = state
+                .storage
+                .load_session(session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value((
+                    &persisted.messages,
+                    &persisted.provider_transcript,
+                    persisted.session_inbox_admission()
+                ))
+                .unwrap(),
+                serde_json::to_value((
+                    &original.messages,
+                    &original.provider_transcript,
+                    original.session_inbox_admission()
+                ))
+                .unwrap(),
+                "pending turn retains original Main before owned admission"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn skill_request_rejected_hook_or_attachment_has_no_canonical_delivery() {
+        for reject_hook in [false, true] {
+            if reject_hook && !cfg!(unix) {
+                continue;
+            }
+            let state = new_state().await;
+            let session_id = if reject_hook {
+                "skill-request-rejected-hook"
+            } else {
+                "skill-request-rejected-image"
+            };
+            let selection = seed_active_instruction_workflow(&state, session_id, "review").await;
+            let before = state
+                .storage
+                .load_session(session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if reject_hook {
+                state.config.write().await.lifecycle_hooks = bamboo_config::LifecycleHooksConfig {
+                    enabled: true,
+                    user_prompt_submit: vec![bamboo_config::LifecycleHookGroup {
+                        enabled: true,
+                        matcher: None,
+                        hooks: vec![bamboo_config::LifecycleHookHandler::command(
+                            "printf 'request rejected' >&2; exit 2",
+                            bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                        )],
+                    }],
+                    ..Default::default()
+                };
+            }
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let mut body = serde_json::json!({"session_id":session_id,"message_id":"rejected-request-id","message":"not admitted",
+                "model":"test-model","workflow_selection":selection});
+            if !reject_hook {
+                body["images"] = serde_json::json!([{"base64":"invalid%%%","type":"image/png"}]);
+            }
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/chat")
+                    .peer_addr("127.0.0.1:5700".parse().unwrap())
+                    .set_json(body)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(state
+                .session_inbox
+                .claim(session_id, 10)
+                .await
+                .unwrap()
+                .is_empty());
+            let after = state
+                .storage
+                .load_session(session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let users = |session: &Session| {
+                session
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == bamboo_agent_core::Role::User)
+                    .map(|message| serde_json::to_value(message).unwrap())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                users(&after),
+                users(&before),
+                "failed hook/attachment appended no User; existing System preparation may persist"
+            );
+            assert_eq!(
+                workflow_runtime_metadata(&after),
+                workflow_runtime_metadata(&before)
+            );
+        }
+    }
+}
+
+#[actix_web::test]
+async fn constructor_parity_queue_preserves_envelope_and_deduplicated_retry() {
+    use actix_web::{test, web};
+    use bamboo_domain::{SessionMessageBody, SessionMessageKind, SessionMessageSource};
+    let root = tempfile::tempdir().unwrap();
+    let state = web::Data::new(crate::AppState::new(root.path().into()).await.unwrap());
+    let session = Session::new("constructor-queue", "test-model");
+    state.storage.save_session(&session).await.unwrap();
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jF0cAAAAASUVORK5CYII=";
+    let request = serde_json::from_value::<super::ChatRequest>(serde_json::json!({
+        "message":"raw user text", "message_id":"constructor-queue-stable",
+        "thread_id":"thread", "in_reply_to":"parent", "correlation_id":"trace",
+        "images":[{"base64":png,"type":"image/png"},{"base64":png,"type":"image/png"}]
+    }))
+    .unwrap();
+    let http = test::TestRequest::post()
+        .peer_addr("127.0.0.1:5700".parse().unwrap())
+        .to_http_request();
+    let before = std::time::SystemTime::now();
+    let first = super::ingress::queue(&state, &session, &request, "effective 原样\ntext", &http)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        session.messages.is_empty(),
+        "queue has no HTTP-owned User append"
+    );
+    let claims = state.session_inbox.claim(&session.id, 10).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    let envelope = &claims[0].envelope;
+    assert_eq!(envelope.id.as_str(), "constructor-queue-stable");
+    assert_eq!(envelope.target_session_id, session.id);
+    assert_eq!(envelope.source, SessionMessageSource::User);
+    assert_eq!(envelope.kind, SessionMessageKind::UserInput);
+    assert_eq!(envelope.thread_id.as_deref(), Some("thread"));
+    assert_eq!(
+        envelope.in_reply_to.as_ref().map(|id| id.as_str()),
+        Some("parent")
+    );
+    assert_eq!(envelope.correlation_id.as_deref(), Some("trace"));
+    let minted: std::time::SystemTime = envelope.created_at.into();
+    assert!(minted >= before && minted <= std::time::SystemTime::now());
+    let SessionMessageBody::Content(body) = &envelope.body else {
+        panic!("canonical User content")
+    };
+    assert_eq!(body.text, "effective 原样\ntext");
+    assert_eq!(body.parts.len(), 3);
+    assert!(
+        matches!(&body.parts[0], bamboo_domain::MessagePart::Text {text} if text == &body.text)
+    );
+    let urls = body.parts[1..]
+        .iter()
+        .map(|p| match p {
+            bamboo_domain::MessagePart::ImageUrl { image_url } => image_url.url.clone(),
+            _ => panic!("actual queued attachment"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(urls[0], urls[1], "queued attachments remain deduplicated");
+    let original = serde_json::to_value(envelope).unwrap();
+    let restored: bamboo_domain::SessionMessageEnvelope =
+        serde_json::from_value(original.clone()).unwrap();
+    assert_eq!(serde_json::to_value(restored).unwrap(), original);
+    let replay = super::ingress::queue(&state, &session, &request, "effective 原样\ntext", &http)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.id, first.id);
+    assert_eq!(replay.generation, first.generation);
+    let conflict = super::ingress::queue(&state, &session, &request, "changed body", &http)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        conflict.status(),
+        actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let persisted = state
+        .storage
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(persisted.messages.is_empty());
+    state
+        .session_inbox
+        .ack(&session.id, &claims[0])
+        .await
+        .unwrap();
+    assert!(state
+        .session_inbox
+        .claim(&session.id, 10)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let fresh = Session::new("constructor-queue-default", "test-model");
+    let request = serde_json::from_value::<super::ChatRequest>(serde_json::json!({
+        "message":"plain raw", "thread_id":"thread"
+    }))
+    .unwrap();
+    assert!(state
+        .storage
+        .load_session(&fresh.id)
+        .await
+        .unwrap()
+        .is_none());
+    let receipt = super::ingress::queue(&state, &fresh, &request, "plain raw", &http)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !receipt.id.as_str().is_empty(),
+        "default envelope ID is minted once"
+    );
+    let claims = state.session_inbox.claim(&fresh.id, 10).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].envelope.id, receipt.id);
+    let user = claims[0].envelope.to_provider_message().unwrap();
+    assert_eq!(user.role, bamboo_agent_core::Role::User);
+    assert_eq!(user.content, "plain raw");
+    assert!(state
+        .storage
+        .load_session(&fresh.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .messages
+        .is_empty());
+    state
+        .session_inbox
+        .ack(&fresh.id, &claims[0])
+        .await
+        .unwrap();
+}
+
+#[actix_web::test]
+async fn constructor_parity_queue_rejects_before_canonical_creation_or_delivery() {
+    use actix_web::{test, web};
+    let root = tempfile::tempdir().unwrap();
+    let state = web::Data::new(crate::AppState::new(root.path().into()).await.unwrap());
+    let http = test::TestRequest::post()
+        .peer_addr("127.0.0.1:5700".parse().unwrap())
+        .to_http_request();
+    for (label, extra) in [
+        (
+            "image",
+            serde_json::json!({"images":[{"base64":"invalid%%%","type":"image/png"}]}),
+        ),
+        (
+            "refs",
+            serde_json::json!({"correlation_id":"child_completion-fake"}),
+        ),
+        (
+            "bound",
+            serde_json::json!({"images":vec![serde_json::json!({"base64":"invalid%%%"});17]}),
+        ),
+    ] {
+        let session = Session::new(format!("constructor-queue-rejected-{label}"), "test-model");
+        let mut body =
+            serde_json::json!({"message":"raw", "message_id":format!("rejected-{label}")});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let request = serde_json::from_value::<super::ChatRequest>(body).unwrap();
+        let error = super::ingress::queue(&state, &session, &request, "must not admit", &http)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert!(state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(state.session_inbox.claim(&session.id, 10).await,
+            Err(bamboo_domain::SessionInboxError::TargetNotFound(id)) if id == session.id));
+        assert!(session.messages.is_empty());
+    }
+}
+
+#[actix_web::test]
+async fn skill_request_existing_queue_retains_original_data_and_images() {
+    use actix_web::{test, web};
+    let root = tempfile::tempdir().unwrap();
+    let state = web::Data::new(crate::AppState::new(root.path().into()).await.unwrap());
+    let session = Session::new("skill-request-queue", "test-model");
+    state.storage.save_session(&session).await.unwrap();
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jF0cAAAAASUVORK5CYII=";
+    let request = serde_json::from_value::<super::ChatRequest>(serde_json::json!({
+        "message":"original text", "message_id":"skill-request-queue-id",
+        "thread_id":"thread", "in_reply_to":"prior", "correlation_id":"trace",
+        "workflow_selection":{"id":"caller-data", "source":"plugin", "revision":7, "args":{"query":"原样"}},
+        "images":[{"base64":png,"type":"image/png"}]
+    })).unwrap();
+    let http = test::TestRequest::post()
+        .peer_addr("127.0.0.1:5700".parse().unwrap())
+        .to_http_request();
+    let before = chrono::Utc::now();
+    let receipt = super::ingress::queue(&state, &session, &request, "effective text", &http)
+        .await
+        .unwrap()
+        .unwrap();
+    let claims = state.session_inbox.claim(&session.id, 10).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    let envelope = &claims[0].envelope;
+    assert_eq!(envelope.id, receipt.id);
+    assert_eq!(envelope.id.as_str(), "skill-request-queue-id");
+    assert!(envelope.created_at >= before && envelope.created_at <= chrono::Utc::now());
+    assert_eq!(envelope.thread_id.as_deref(), Some("thread"));
+    assert_eq!(envelope.in_reply_to.as_ref().unwrap().as_str(), "prior");
+    assert_eq!(envelope.correlation_id.as_deref(), Some("trace"));
+    let serialized = serde_json::to_value(envelope).unwrap();
+    assert_eq!(serialized["body"]["text"], "effective text");
+    assert_eq!(serialized["body"]["parts"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        serialized["body"]["skill_request"],
+        serde_json::json!({
+            "selections":[{"id":"caller-data","source":"plugin","revision":7,"args":{"query":"原样"}}]
+        })
+    );
+    let provider = envelope.to_provider_message().unwrap();
+    assert_eq!(provider.id, envelope.id.to_string());
+    assert_eq!(provider.created_at, envelope.created_at);
+    assert_eq!(provider.content, "effective text");
+    assert_eq!(provider.content_parts.as_ref().unwrap().len(), 2);
+    assert_eq!(
+        provider.metadata.unwrap()["session_message"]["body"],
+        serialized["body"]
+    );
+}
+
+#[actix_web::test]
+async fn skill_request_real_inbox_rejection_preserves_queue_proof_and_retry_identity() {
+    use bamboo_domain::{
+        SessionMessageBody, SessionMessageEnvelope, SessionMessageId, SessionSkillRequest,
+        SessionSkillSelection,
+    };
+    let policy = bamboo_domain::SessionActivationPolicy::InterruptSpecificWait;
+    let root = tempfile::tempdir().unwrap();
+    let state = crate::AppState::new(root.path().into()).await.unwrap();
+    let mut session = Session::new("skill-request-inbox", "test-model");
+    state.storage.save_session(&session).await.unwrap();
+    let mut valid = SessionMessageEnvelope::user_input(&session.id, "ordinary text");
+    valid.id = SessionMessageId::parse("retry-after-invalid-request").unwrap();
+    if let SessionMessageBody::Content(content) = &mut valid.body {
+        content.skill_request = Some(SessionSkillRequest {
+            mode: None,
+            selections: vec![SessionSkillSelection {
+                id: "review".into(),
+                source: "builtin".into(),
+                revision: 7,
+                args: serde_json::json!({"a":1,"b":2}),
+            }],
+        });
+    }
+    let queue_before = state.session_inbox.inspect(&session.id).await.unwrap();
+    let transcript_before = serde_json::to_vec(
+        &state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    for depth in [65, 180] {
+        let mut invalid = valid.clone();
+        if let SessionMessageBody::Content(content) = &mut invalid.body {
+            content.skill_request.as_mut().unwrap().selections[0].args = (0..depth)
+                .fold(serde_json::Value::Null, |value, _| {
+                    serde_json::Value::Array(vec![value])
+                });
+        }
+        assert!(state
+            .session_inbox
+            .deliver_with_activation_intent(&invalid, policy, None)
+            .await
+            .is_err());
+        assert_eq!(
+            state.session_inbox.inspect(&session.id).await.unwrap(),
+            queue_before
+        );
+        assert!(!state
+            .session_inbox
+            .was_admitted(&session.id, &valid.id)
+            .await
+            .unwrap());
+        assert_eq!(
+            serde_json::to_vec(
+                &state
+                    .storage
+                    .load_session(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            transcript_before
+        );
+    }
+    let first = state
+        .session_inbox
+        .deliver_with_activation_intent(&valid, policy, None)
+        .await
+        .unwrap();
+    let mut reordered = valid.clone();
+    if let SessionMessageBody::Content(content) = &mut reordered.body {
+        let mut args = serde_json::Map::new();
+        args.insert("b".into(), serde_json::json!(2));
+        args.insert("a".into(), serde_json::json!(1));
+        content.skill_request.as_mut().unwrap().selections[0].args =
+            serde_json::Value::Object(args);
+    }
+    reordered.created_at = chrono::Utc::now();
+    reordered.attempt = Some(2);
+    let duplicate = state
+        .session_inbox
+        .deliver_with_activation_intent(&reordered, policy, None)
+        .await
+        .unwrap();
+    assert_eq!(duplicate.generation, first.generation);
+    let claims = state.session_inbox.claim(&session.id, 10).await.unwrap();
+    assert_eq!(
+        claims.len(),
+        1,
+        "invalid request did not reserve ID; retry queued once"
+    );
+    let provider = claims[0].envelope.to_provider_message().unwrap();
+    let proof = provider.metadata.as_ref().unwrap()["session_message"].clone();
+    session.messages.push(provider);
+    state.storage.save_session(&session).await.unwrap();
+    state
+        .session_inbox
+        .ack(&session.id, &claims[0])
+        .await
+        .unwrap();
+    assert!(state
+        .session_inbox
+        .was_admitted(&session.id, &valid.id)
+        .await
+        .unwrap());
+    let admitted_queue = state.session_inbox.inspect(&session.id).await.unwrap();
+    for changed in 0..5 {
+        let mut conflicting = valid.clone();
+        let SessionMessageBody::Content(content) = &mut conflicting.body else {
+            unreachable!()
+        };
+        let request = content.skill_request.as_mut().unwrap();
+        match changed {
+            0 => request.selections[0].id = "other".into(),
+            1 => request.selections[0].source = "project".into(),
+            2 => request.selections[0].revision += 1,
+            3 => request.selections[0].args = serde_json::json!({"a":3}),
+            _ => request.mode = Some("plan".into()),
+        }
+        let error = state
+            .session_inbox
+            .deliver_with_activation_intent(&conflicting, policy, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, bamboo_domain::SessionInboxError::InvalidClaim(ref reason) if reason.contains("different delivery semantics")),
+            "changed field {changed} conflicts after ACK: {error}"
+        );
+        assert_eq!(
+            state.session_inbox.inspect(&session.id).await.unwrap(),
+            admitted_queue
+        );
+        let history = state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.messages.len(), 1);
+        assert_eq!(
+            history.messages[0].metadata.as_ref().unwrap()["session_message"],
+            proof
+        );
+    }
+    assert_eq!(
+        state
+            .session_inbox
+            .deliver_with_activation_intent(&valid, policy, None)
+            .await
+            .unwrap()
+            .generation,
+        first.generation
+    );
+    assert!(state
+        .session_inbox
+        .claim(&session.id, 10)
+        .await
+        .unwrap()
+        .is_empty());
 }

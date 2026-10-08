@@ -186,6 +186,15 @@ fn validate_plan_inner(
                 validate_plan_inner(node, steps, seen)?;
             }
         }
+        WorkflowPlan::Choice {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            validate_ref(condition, steps)?;
+            validate_plan_inner(then_branch, steps, seen)?;
+            validate_plan_inner(else_branch, steps, seen)?;
+        }
         WorkflowPlan::Map { source, item, body } => {
             if item.trim().is_empty() {
                 return Err(WorkflowCompileError::InvalidStep {
@@ -349,6 +358,28 @@ fn validate_execution_bindings(
                 }
                 Ok(result)
             }
+            WorkflowPlan::Choice {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let schema =
+                    reference_schema("<choice>", condition, definition, steps, available, items)?;
+                if schema.get("type").and_then(serde_json::Value::as_str) != Some("boolean") {
+                    return Err(WorkflowCompileError::InvalidStep {
+                        step: "<choice>".to_string(),
+                        message: "choice condition schema must declare type boolean".to_string(),
+                    });
+                }
+                // Both paths receive the same incoming bindings; expose only
+                // values available on both paths after the choice.
+                let then_available = walk_plan(then_branch, definition, steps, available, items)?;
+                let else_available = walk_plan(else_branch, definition, steps, available, items)?;
+                Ok(then_available
+                    .intersection(&else_available)
+                    .cloned()
+                    .collect())
+            }
             WorkflowPlan::Map { source, item, body } => {
                 let item_schema =
                     reference_schema("<map>", source, definition, steps, available, items)?
@@ -489,6 +520,19 @@ fn collect_plan_edges(
             }
             tails
         }
+        WorkflowPlan::Choice {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            let mut incoming = previous;
+            if let ValueRef::Step { step, .. } = condition {
+                incoming.insert(step.clone());
+            }
+            let mut tails = collect_plan_edges(then_branch, incoming.clone(), edges);
+            tails.extend(collect_plan_edges(else_branch, incoming, edges));
+            tails
+        }
         WorkflowPlan::Map { body, .. } | WorkflowPlan::Retry { node: body, .. } => {
             collect_plan_edges(body, previous, edges)
         }
@@ -521,4 +565,206 @@ fn collect_value_step_refs(step: &WorkflowStepDefinition, mut found: impl FnMut(
         }
     }
     walk(value, &mut found);
+}
+
+#[cfg(test)]
+mod choice_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn step(id: &str, args: Value) -> WorkflowStepDefinition {
+        WorkflowStepDefinition {
+            id: id.to_string(),
+            kind: WorkflowStepKind::Tool {
+                tool: "echo".to_string(),
+                args,
+                capabilities: Vec::new(),
+            },
+            failure: Default::default(),
+            output_schema: Some(json!({"type":"boolean"})),
+        }
+    }
+
+    fn choice(condition: Value, then_branch: Value, else_branch: Value) -> Value {
+        json!({"type":"choice","condition":condition,"then_branch":then_branch,"else_branch":else_branch})
+    }
+
+    fn leaf(id: &str) -> Value {
+        json!({"type":"step","step":id})
+    }
+
+    fn definition(plan: Value, steps: Vec<WorkflowStepDefinition>) -> WorkflowRunDefinition {
+        WorkflowRunDefinition {
+            workflow_schema: 1,
+            id: "conditional".to_string(),
+            revision: 1,
+            input_schema: json!({"type":"object","properties":{"approved":{"type":"boolean"},"rows":{"type":"array","items":{"type":"boolean"}}},"additionalProperties":false}),
+            output_schema: None,
+            steps,
+            plan: serde_json::from_value(plan).expect("Choice plan loads"),
+            budgets: Default::default(),
+        }
+    }
+
+    #[test]
+    fn workflow_choice_loads_json_yaml_and_requires_both_branches() {
+        let plan = choice(
+            json!({"from":"literal","value":true}),
+            leaf("yes"),
+            leaf("no"),
+        );
+        let json_plan: WorkflowPlan = serde_json::from_value(plan.clone()).unwrap();
+        let yaml_plan: WorkflowPlan = serde_yaml::from_str(
+            "type: choice\ncondition: {from: literal, value: true}\nthen_branch: {type: step, step: yes}\nelse_branch: {type: step, step: no}\n",
+        ).unwrap();
+        assert_eq!(json_plan, yaml_plan);
+        for missing in ["then_branch", "else_branch", "condition"] {
+            let mut incomplete = plan.clone();
+            incomplete.as_object_mut().unwrap().remove(missing);
+            assert!(serde_json::from_value::<WorkflowPlan>(incomplete).is_err());
+        }
+    }
+
+    #[test]
+    fn workflow_choice_accepts_boolean_args_step_item_and_literal() {
+        for condition in [
+            json!({"from":"args","pointer":"/approved"}),
+            json!({"from":"literal","value":false}),
+        ] {
+            CompiledWorkflow::compile(definition(
+                choice(condition, leaf("yes"), leaf("no")),
+                vec![step("yes", json!(true)), step("no", json!(false))],
+            ))
+            .unwrap();
+        }
+        let from_step = definition(
+            json!({"type":"sequence","nodes":[leaf("before"), choice(json!({"from":"step","step":"before"}), leaf("yes"), leaf("no"))]}),
+            vec![
+                step("before", json!(true)),
+                step("yes", json!(true)),
+                step("no", json!(false)),
+            ],
+        );
+        CompiledWorkflow::compile(from_step).unwrap();
+        let from_item = definition(
+            json!({"type":"map","source":{"from":"args","pointer":"/rows"},"item":"row","body":choice(json!({"from":"item","name":"row"}), leaf("yes"), leaf("no"))}),
+            vec![step("yes", json!(true)), step("no", json!(false))],
+        );
+        CompiledWorkflow::compile(from_item).unwrap();
+    }
+
+    #[test]
+    fn workflow_choice_rejects_missing_and_non_boolean_reference_schemas() {
+        for condition in [
+            json!({"from":"literal","value":"false"}),
+            json!({"from":"literal","value":0}),
+            json!({"from":"literal","value":null}),
+            json!({"from":"args","pointer":"/missing"}),
+            json!({"from":"item","name":"outside"}),
+            json!({"from":"step","step":"unknown"}),
+        ] {
+            assert!(CompiledWorkflow::compile(definition(
+                choice(condition, leaf("yes"), leaf("no")),
+                vec![step("yes", json!(true)), step("no", json!(false))],
+            ))
+            .is_err());
+        }
+        for schema in [
+            json!({}),
+            json!({"type":"string"}),
+            json!({"type":"integer"}),
+        ] {
+            let mut flow = definition(
+                choice(
+                    json!({"from":"args","pointer":"/approved"}),
+                    leaf("yes"),
+                    leaf("no"),
+                ),
+                vec![step("yes", json!(true)), step("no", json!(false))],
+            );
+            flow.input_schema["properties"]["approved"] = schema;
+            assert!(CompiledWorkflow::compile(flow).is_err());
+        }
+        let mut flow = definition(
+            json!({"type":"sequence","nodes":[leaf("before"), choice(json!({"from":"step","step":"before"}), leaf("yes"), leaf("no"))]}),
+            vec![
+                step("before", json!(true)),
+                step("yes", json!(true)),
+                step("no", json!(false)),
+            ],
+        );
+        flow.steps[0].output_schema = None;
+        assert!(CompiledWorkflow::compile(flow).is_err());
+    }
+
+    #[test]
+    fn workflow_choice_rejects_forward_sibling_and_join_output_references() {
+        let condition = json!({"from":"literal","value":true});
+        let branch = choice(condition.clone(), leaf("yes"), leaf("no"));
+        for flow in [
+            definition(
+                json!({"type":"sequence","nodes":[choice(json!({"from":"step","step":"later"}),leaf("yes"),leaf("no")),leaf("later")]}),
+                vec![
+                    step("yes", json!(true)),
+                    step("no", json!(false)),
+                    step("later", json!(true)),
+                ],
+            ),
+            definition(
+                branch.clone(),
+                vec![
+                    step("yes", json!(true)),
+                    step("no", json!({"from":"step","step":"yes"})),
+                ],
+            ),
+            definition(
+                json!({"type":"sequence","nodes":[branch,leaf("after")]}),
+                vec![
+                    step("yes", json!(true)),
+                    step("no", json!(false)),
+                    step("after", json!({"from":"step","step":"yes"})),
+                ],
+            ),
+        ] {
+            assert!(CompiledWorkflow::compile(flow).is_err());
+        }
+    }
+
+    #[test]
+    fn workflow_choice_preserves_incoming_and_branch_local_bindings() {
+        let from_before = json!({"from":"step","step":"before"});
+        let flow = definition(
+            json!({"type":"sequence","nodes":[leaf("before"),choice(from_before.clone(),json!({"type":"sequence","nodes":[leaf("yes"),leaf("yes-after")]}),leaf("no")),leaf("after")]}),
+            vec![
+                step("before", json!(true)),
+                step("yes", from_before.clone()),
+                step("yes-after", json!({"from":"step","step":"yes"})),
+                step("no", from_before.clone()),
+                step("after", from_before),
+            ],
+        );
+        CompiledWorkflow::compile(flow).unwrap();
+    }
+
+    #[test]
+    fn workflow_choice_rejects_duplicate_steps_and_invalid_unselected_plan() {
+        let duplicate = definition(
+            choice(
+                json!({"from":"literal","value":true}),
+                leaf("same"),
+                leaf("same"),
+            ),
+            vec![step("same", json!(true))],
+        );
+        assert!(CompiledWorkflow::compile(duplicate).is_err());
+        let empty_branch = definition(
+            choice(
+                json!({"from":"literal","value":true}),
+                leaf("yes"),
+                json!({"type":"sequence","nodes":[]}),
+            ),
+            vec![step("yes", json!(true))],
+        );
+        assert!(CompiledWorkflow::compile(empty_branch).is_err());
+    }
 }

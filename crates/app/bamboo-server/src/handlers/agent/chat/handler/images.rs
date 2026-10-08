@@ -13,6 +13,24 @@ pub(super) async fn append_user_message(
     message: &str,
     images: Option<&[ChatImage]>,
 ) -> ResponseResult<()> {
+    let user = construct_user_message(state, session, message, images).await?;
+    session.add_message(user);
+
+    // Persist a durable handoff marker with the new turn. A reconnect may occur
+    // before POST /execute reserves a Pending runner; without this marker, the
+    // previous run's Cancelled/Failed runtime snapshot can be mistaken for the
+    // terminal state of this new request.
+    crate::handlers::agent::events::mark_pending_turn(session);
+
+    Ok(())
+}
+
+pub(super) async fn construct_user_message(
+    state: &web::Data<AppState>,
+    session: &Session,
+    message: &str,
+    images: Option<&[ChatImage]>,
+) -> ResponseResult<bamboo_agent_core::Message> {
     // Preserve multimodal parts so that preflight hooks (OCR/fallback) and/or multimodal
     // upstream models can use the images.
     if let Some(images) = images.filter(|items| !items.is_empty()) {
@@ -44,21 +62,13 @@ pub(super) async fn append_user_message(
             });
         }
 
-        session.add_message(bamboo_agent_core::Message::user_with_parts(
+        Ok(bamboo_agent_core::Message::user_with_parts(
             message.to_string(),
             parts.into_iter().map(Into::into).collect(),
-        ));
+        ))
     } else {
-        session.add_message(bamboo_agent_core::Message::user(message.to_string()));
+        Ok(bamboo_agent_core::Message::user(message.to_string()))
     }
-
-    // Persist a durable handoff marker with the new turn. A reconnect may occur
-    // before POST /execute reserves a Pending runner; without this marker, the
-    // previous run's Cancelled/Failed runtime snapshot can be mistaken for the
-    // terminal state of this new request.
-    crate::handlers::agent::events::mark_pending_turn(session);
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -82,5 +92,87 @@ mod tests {
             .is_ok());
         assert_eq!(session.last_run_status().as_deref(), Some("pending"));
         assert!(session.last_run_error().is_none());
+    }
+
+    #[actix_web::test]
+    async fn constructor_parity_native_preserves_user_parts_and_pending_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(root.path().into()).await.unwrap());
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jF0cAAAAASUVORK5CYII=";
+        for count in [None, Some(0), Some(2)] {
+            let mut session = Session::new(format!("constructor-native-{count:?}"), "test-model");
+            session.set_last_run_status("error");
+            session.set_last_run_error("original failure");
+            let images = count.map(|n| {
+                (0..n)
+                    .map(|_| ChatImage {
+                        base64: png.into(),
+                        name: None,
+                        size: None,
+                        mime_type: Some("image/png".into()),
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let before = std::time::SystemTime::now();
+            append_user_message(
+                &state,
+                &mut session,
+                "原样 \"text\"\nnext",
+                images.as_deref(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(session.messages.len(), 1);
+            let user = &session.messages[0];
+            assert_eq!(user.role, bamboo_agent_core::Role::User);
+            assert_eq!(user.content, "原样 \"text\"\nnext");
+            assert!(!user.id.is_empty());
+            let minted: std::time::SystemTime = user.created_at.into();
+            assert!(minted >= before && minted <= std::time::SystemTime::now());
+            if count == Some(2) {
+                let parts = user.content_parts.as_ref().unwrap();
+                assert_eq!(parts.len(), 3);
+                assert!(
+                    matches!(&parts[0], bamboo_domain::MessagePart::Text {text} if text == &user.content)
+                );
+                let urls = parts[1..]
+                    .iter()
+                    .map(|p| match p {
+                        bamboo_domain::MessagePart::ImageUrl { image_url } => image_url.url.clone(),
+                        _ => panic!("actual attachment"),
+                    })
+                    .collect::<Vec<_>>();
+                assert_ne!(
+                    urls[0], urls[1],
+                    "native attachment storage remains nondeduplicated"
+                );
+            } else {
+                assert!(user.content_parts.is_none());
+            }
+            assert_eq!(session.last_run_status().as_deref(), Some("pending"));
+            assert!(session.last_run_error().is_none());
+        }
+    }
+
+    #[actix_web::test]
+    async fn constructor_parity_native_storage_error_keeps_original_session() {
+        let root = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(root.path().into()).await.unwrap());
+        let mut session = Session::new("constructor-native-rejected", "test-model");
+        session.add_message(bamboo_agent_core::Message::user("existing User"));
+        session.set_last_run_status("error");
+        session.set_last_run_error("original failure");
+        let original = serde_json::to_value(&session).unwrap();
+        let images = [ChatImage {
+            base64: "invalid%%%".into(),
+            name: None,
+            size: None,
+            mime_type: Some("image/png".into()),
+        }];
+        let error = append_user_message(&state, &mut session, "must not append", Some(&images))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert_eq!(serde_json::to_value(&session).unwrap(), original);
     }
 }
