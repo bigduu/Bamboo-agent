@@ -358,6 +358,7 @@ fn session_provider_message(message: &Message) -> SessionProviderMessage {
         content: SessionMessageContent {
             text: message.content.clone(),
             parts: message.content_parts.clone().unwrap_or_default(),
+            skill_request: None,
         },
         metadata: message
             .metadata
@@ -3523,6 +3524,51 @@ impl ChildCompletionCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_request_child_provider_constructor_keeps_data_absent_and_rejects_injection() {
+        let provider = Message::user("rendered child outcome");
+        let presentation = session_provider_message(&provider);
+        assert_eq!(presentation.content.skill_request, None);
+        assert_eq!(presentation.content.text, provider.content);
+        let mut envelope = SessionMessageEnvelope::user_input("parent", "unused");
+        envelope.source = SessionMessageSource::Runtime {
+            subsystem: "child_completion_coordinator".into(),
+        };
+        envelope.kind = SessionMessageKind::ChildOutcome;
+        envelope.body = SessionMessageBody::ChildOutcome(SessionChildOutcome {
+            child_session_id: "child".into(),
+            status: "completed".into(),
+            result: Some("typed result".into()),
+            error: None,
+            provider_message: Some(presentation),
+        });
+        envelope.validate().unwrap();
+        assert_eq!(
+            envelope.to_provider_message().unwrap().content,
+            "rendered child outcome"
+        );
+        if let SessionMessageBody::ChildOutcome(outcome) = &mut envelope.body {
+            outcome
+                .provider_message
+                .as_mut()
+                .unwrap()
+                .content
+                .skill_request = Some(bamboo_domain::SessionSkillRequest {
+                mode: None,
+                selections: vec![bamboo_domain::SessionSkillSelection {
+                    id: "review".into(),
+                    source: "builtin".into(),
+                    revision: 7,
+                    args: serde_json::Value::Null,
+                }],
+            });
+        }
+        assert_eq!(
+            envelope.validate(),
+            Err(bamboo_domain::SessionMessageValidationError::KindSourceBodyMismatch)
+        );
+    }
 
     #[tokio::test]
     async fn cancelled_resume_waiters_do_not_retain_historical_parent_ids() {

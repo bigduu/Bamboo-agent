@@ -53,7 +53,7 @@ fn normalize_ws(s: &str) -> String {
 mod tests {
     use super::*;
 
-    fn coord(x: f32, y: f32, width: f32, height: f32, text: &str) -> rust_ocr::Coordinates {
+    fn coord(x: f64, y: f64, width: f64, height: f64, text: &str) -> rust_ocr::Coordinates {
         rust_ocr::Coordinates {
             x,
             y,
