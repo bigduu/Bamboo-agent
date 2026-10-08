@@ -3,6 +3,7 @@
 //! Creates LLM providers based on configuration.
 
 use crate::provider::{LLMError, LLMProvider};
+use crate::providers::common::llm_error_kind;
 use crate::providers::{
     AnthropicProvider, BodhiProvider, CopilotProvider, GeminiProvider, OpenAIProvider,
 };
@@ -141,7 +142,7 @@ pub async fn create_provider_from_instance(
                     // This allows the user to see the authentication error and know what to do
                 }
                 Err(e) => {
-                    tracing::warn!("Copilot silent authentication failed: {}. Use POST /v1/bamboo/copilot/auth/start to authenticate.", e);
+                    tracing::warn!(error_kind = llm_error_kind(&e), "Copilot silent authentication failed. Use POST /v1/bamboo/copilot/auth/start to authenticate.");
                 }
             }
             Ok(Arc::new(provider.with_masking(masking_config.clone())))

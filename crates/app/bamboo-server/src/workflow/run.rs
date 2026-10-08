@@ -732,6 +732,10 @@ pub(crate) enum PublicWorkflowPlan {
     Map {
         body: Box<PublicWorkflowPlan>,
     },
+    Choice {
+        then_branch: Box<PublicWorkflowPlan>,
+        else_branch: Box<PublicWorkflowPlan>,
+    },
     Retry {
         node: Box<PublicWorkflowPlan>,
         max_attempts: u32,
@@ -794,6 +798,14 @@ fn public_workflow_plan(plan: &WorkflowPlan) -> PublicWorkflowPlan {
         },
         WorkflowPlan::Parallel { nodes } => PublicWorkflowPlan::Parallel {
             nodes: nodes.iter().map(public_workflow_plan).collect(),
+        },
+        WorkflowPlan::Choice {
+            then_branch,
+            else_branch,
+            ..
+        } => PublicWorkflowPlan::Choice {
+            then_branch: Box::new(public_workflow_plan(then_branch)),
+            else_branch: Box::new(public_workflow_plan(else_branch)),
         },
         WorkflowPlan::Map { body, .. } => PublicWorkflowPlan::Map {
             body: Box::new(public_workflow_plan(body)),
@@ -1634,6 +1646,55 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn workflow_choice_public_snapshot_exposes_only_branch_topology() {
+        for condition in [
+            json!({"from":"args","pointer":"/PRIVATE-CONDITION-POINTER"}),
+            json!({"from":"literal","value":"PRIVATE-CONDITION-VALUE"}),
+            json!({"from":"step","step":"PRIVATE-CONDITION-STEP","pointer":"/PRIVATE-CONDITION-POINTER"}),
+            json!({"from":"item","name":"PRIVATE-CONDITION-ITEM","pointer":"/PRIVATE-CONDITION-POINTER"}),
+        ] {
+            let mut snapshot = private_workflow_snapshot(WorkflowRunStatus::Succeeded);
+            snapshot.definition.plan = serde_json::from_value(json!({
+                "type":"choice","condition":condition,
+                "then_branch":{"type":"step","step":"inspect"},
+                "else_branch":{"type":"sequence","nodes":[{"type":"step","step":"explain"}]}
+            }))
+            .expect("Choice plan loads");
+            let public = serde_json::to_value(public_workflow_snapshot(snapshot)).unwrap();
+            assert_eq!(
+                public["plan"],
+                json!({
+                    "type":"choice",
+                    "then_branch":{"type":"step","step":"inspect"},
+                    "else_branch":{"type":"sequence","nodes":[{"type":"step","step":"explain"}]}
+                })
+            );
+            let text = public.to_string();
+            assert!(!text.contains("PRIVATE-"));
+            assert!(!text.contains("condition") && !text.contains("pointer"));
+        }
+    }
+
+    #[test]
+    fn workflow_choice_skipped_event_keeps_sequence_without_private_reason() {
+        let event = public_workflow_event(WorkflowRunEvent {
+            run_id: "choice-run".to_string(),
+            sequence: 5,
+            at: chrono::Utc::now(),
+            step_id: Some("unchosen".to_string()),
+            kind: WorkflowRunEventKind::StepSkipped {
+                reason: "PRIVATE-CONDITION-VALUE".to_string(),
+            },
+        });
+        let public = serde_json::to_value(event).unwrap();
+        assert_eq!(public["type"], "step_skipped");
+        assert_eq!(public["sequence"], 5);
+        assert_eq!(public["step_id"], "unchosen");
+        assert!(public.get("reason").is_none());
+        assert!(!public.to_string().contains("PRIVATE-"));
     }
 
     #[test]
