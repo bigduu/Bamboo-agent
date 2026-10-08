@@ -534,6 +534,140 @@ impl SessionStoreV2 {
         Ok(value)
     }
 
+    /// The caller owns lifecycle/Task exclusivity and this Root's tree guard.
+    /// Cancel only already-published live descendants; never initialize an Actor.
+    /// A cancelled attempt remains recorded so same-birth ancestor restoration
+    /// can permit a fresh claim without ever making the old fence live again.
+    pub(super) async fn cancel_descendant_activations_before_child_delete(
+        &self,
+        root_id: &str,
+        child_id: &str,
+        guards: &Arc<super::SessionDeletionGuards>,
+        tree: &Arc<ActorTreeWriteGuard>,
+    ) -> io::Result<()> {
+        let directory = self.sessions_dir.join(root_id).join("children");
+        let root_id = root_id.to_owned();
+        let child_id = child_id.to_owned();
+        let guards = Arc::clone(guards);
+        let tree = Arc::clone(tree);
+        #[cfg(test)]
+        let hook = self.actor_write_hook.lock().unwrap().clone();
+        tokio::task::spawn_blocking(move || {
+            // The original acquired guards cover the actual scan and every
+            // durable row replacement, including caller/runtime cancellation.
+            let _guards = guards;
+            let _tree = tree;
+            let invalid = || {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid descendant Actor authority during Child deletion",
+                )
+            };
+            match std::fs::symlink_metadata(&directory) {
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => return Err(invalid()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            }
+            let entries = std::fs::read_dir(&directory)?;
+            let read = |path: &Path| -> io::Result<Option<Vec<u8>>> {
+                match std::fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.file_type().is_file() => std::fs::read(path).map(Some),
+                    Ok(_) => Err(invalid()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error),
+                }
+            };
+            let now = Utc::now();
+            let mut replacements = Vec::new();
+            // Preflight the complete same-Root census before changing any row.
+            // The persisted ancestor list covers indirect descendants too.
+            for item in entries {
+                let item = item?;
+                if !item.file_type()?.is_dir() || item.file_name() == child_id.as_str() {
+                    continue;
+                }
+                let path = item.path().join(ACTOR_AUTHORITY_FILE);
+                let marker = read(&item.path().join(ACTOR_INITIALIZED_FILE))?;
+                let row = read(&path)?;
+                let Some(row) = row else {
+                    // Two absent witnesses are ordinary historical Sessions.
+                    if marker.is_some() {
+                        return Err(invalid());
+                    }
+                    continue;
+                };
+                let mut entry: ActorDirectoryEntry =
+                    serde_json::from_slice(&row).map_err(|_| invalid())?;
+                entry.validate().map_err(|_| invalid())?;
+                if item.file_name() != entry.actor.actor_id.as_str()
+                    || entry.actor.root_actor_id != root_id
+                    || entry.actor.parent_actor_id.is_none()
+                {
+                    return Err(invalid());
+                }
+                let Some(marker) = marker else {
+                    // Reuse the first-publication crash rule: an inert Cold
+                    // row has never issued a fence and needs no cancellation.
+                    if entry.actor.current_attempt == 0
+                        && entry.actor.state == ActorLogicalState::Cold
+                        && entry.activation.is_none()
+                    {
+                        continue;
+                    }
+                    return Err(invalid());
+                };
+                let marker: ActorInitializedMarker =
+                    serde_json::from_slice(&marker).map_err(|_| invalid())?;
+                if marker.schema_version != bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION
+                    || marker.actor_id != entry.actor.actor_id
+                    || marker.session_created_at != entry.actor.session_created_at
+                {
+                    return Err(invalid());
+                }
+                if !entry
+                    .actor
+                    .ancestor_observations
+                    .iter()
+                    .any(|ancestor| ancestor.actor_id == child_id)
+                {
+                    continue;
+                }
+                let Some(activation) = entry
+                    .activation
+                    .as_mut()
+                    .filter(|activation| activation.status.is_live())
+                else {
+                    continue;
+                };
+                activation.lease_epoch =
+                    checked_next(activation.lease_epoch).map_err(|_| invalid())?;
+                activation.status = ActorActivationStatus::Cancelled;
+                activation.finished_at = Some(now);
+                activation.lease_expires_at = now;
+                entry.actor.state = ActorLogicalState::Cold;
+                entry.revision = checked_next(entry.revision).map_err(|_| invalid())?;
+                entry.validate().map_err(|_| invalid())?;
+                let bytes = serde_json::to_vec_pretty(&entry).map_err(|_| invalid())?;
+                replacements.push((path, bytes));
+            }
+            replacements.sort_by(|left, right| left.0.cmp(&right.0));
+            for (path, bytes) in replacements {
+                durable_atomic_write_blocking(&path, &bytes, |phase| {
+                    #[cfg(test)]
+                    if let Some(hook) = &hook {
+                        return hook.visit(&path, phase);
+                    }
+                    let _ = phase;
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("join descendant Actor cancellation: {error}")))?
+    }
+
     /// Retire a resident only while its exact physical activation is still
     /// the Directory owner. A delayed launcher/renewal cleanup may run after
     /// expiry and replacement; it must not retire that successor by ActorId.
