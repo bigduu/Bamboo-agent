@@ -358,3 +358,20 @@ record/selection slots are bounded separately. Owned data copies only validated
 lengths, without retaining Message/image/Source objects or source capacities.
 The helper establishes no New/current-input evidence, publication or permission;
 queued observation, execution transport and live Skill cutover remain separate.
+
+Checked queued admission can now supply execution-local current input data after
+the existing transcript checkpoint and exact ACK succeed. Unknown, failed or
+oversized observations clear prior data; a successful boundary with no new input
+retains data only within the same live session and execution. A new ordered batch
+replaces the old IDs and selections, including when its request is absent.
+Overflow preserves the original admission, events, memory and provider behavior.
+
+The main loop owns this finite value and drops it at every terminal return. The
+optional Lifecycle companion returns data to its caller; old implementations
+run once and return unavailable data. The initial checked HTTP handoff is sealed
+and consumed once under the same measured execution UUID. Its existing I-E
+compatibility slice adds bounded slots and args AST storage; the 256 KiB compact
+cap is not a heap/RSS bound. Old SDK/native/history constructors do not create
+current-input evidence. Host selection remains a ceiling, and every eventual
+Skill use still requires fresh caller, Source, schema, configuration and policy
+checks. This adds no Reader, preparation, registration or live Skill cutover.

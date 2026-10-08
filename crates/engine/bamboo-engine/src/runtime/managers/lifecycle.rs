@@ -35,6 +35,44 @@ pub trait LifecycleManager: Send + Sync {
         llm: &dyn LLMProvider,
     ) -> Result<String, AgentError>;
 
+    /// Optional data-only companion. Older implementations execute exactly once.
+    async fn prepare_round_with_observation(
+        &self,
+        session: &mut Session,
+        task_context: &mut Option<TaskLoopContext>,
+        runtime_state: &mut AgentRuntimeState,
+        round: usize,
+        max_rounds: Option<usize>,
+        config: &AgentLoopConfig,
+        cancel_token: &CancellationToken,
+        metrics_collector: Option<&bamboo_metrics::MetricsCollector>,
+        session_id: &str,
+        model_name: &str,
+        tools: &dyn ToolExecutor,
+        llm: &dyn LLMProvider,
+    ) -> Result<ObservedRoundPreparation, AgentError> {
+        let round_id = self
+            .prepare_round(
+                session,
+                task_context,
+                runtime_state,
+                round,
+                max_rounds,
+                config,
+                cancel_token,
+                metrics_collector,
+                session_id,
+                model_name,
+                tools,
+                llm,
+            )
+            .await?;
+        Ok(ObservedRoundPreparation {
+            round_id,
+            observation: InputObservation::default(),
+        })
+    }
+
     /// Handle post-round processing and determine next action.
     /// Returns `true` if the agent run should break out of the round loop.
     async fn handle_round_outcome(
@@ -63,6 +101,81 @@ pub trait LifecycleManager: Send + Sync {
 pub use crate::runtime::runner::state_bridge::{
     project_input_request_batch, BorrowedInputRequestRecord,
 };
+
+/// Original round result plus opaque, untrusted execution-local input data.
+#[derive(Debug)]
+pub struct ObservedRoundPreparation {
+    pub round_id: String,
+    pub observation: InputObservation,
+}
+
+/// Only checked admission creates positive data; this is never a Skill grant.
+/// The caller owns finite current data and supplies its existing run identity.
+#[derive(Debug, Default)]
+pub struct InputObservation(ObservationState);
+
+#[derive(Debug, Default)]
+enum ObservationState {
+    #[default]
+    Unavailable,
+    SuccessfulNoNewInput(BoundedInputRequestBatch),
+    New(BoundedInputRequestBatch),
+}
+
+impl InputObservation {
+    pub(crate) fn projected(projection: InputRequestProjection) -> Self {
+        Self(match projection {
+            InputRequestProjection::Available(batch) if batch.records.is_empty() => {
+                ObservationState::SuccessfulNoNewInput(batch)
+            }
+            InputRequestProjection::Available(batch) => ObservationState::New(batch),
+            InputRequestProjection::Unavailable(_) => ObservationState::Unavailable,
+        })
+    }
+
+    pub fn new_inputs(&self) -> Option<&BoundedInputRequestBatch> {
+        match &self.0 {
+            ObservationState::New(batch) => Some(batch),
+            _ => None,
+        }
+    }
+
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self.0, ObservationState::Unavailable)
+    }
+
+    pub fn is_successful_no_new_input(&self) -> bool {
+        matches!(self.0, ObservationState::SuccessfulNoNewInput(_))
+    }
+
+    pub(crate) fn matches_session(&self, session_id: &str) -> bool {
+        match &self.0 {
+            ObservationState::New(batch) | ObservationState::SuccessfulNoNewInput(batch) => {
+                batch.session_id == session_id
+            }
+            ObservationState::Unavailable => false,
+        }
+    }
+
+    /// Move a whole new batch, retain only same-run NoNew, or clear on unknown.
+    /// A new input with no request replaces the old IDs and selections too.
+    pub fn update_current(
+        self,
+        current: &mut Option<BoundedInputRequestBatch>,
+        session_id: &str,
+        execution_id: &str,
+    ) {
+        let matches = |batch: &BoundedInputRequestBatch| {
+            batch.session_id == session_id && batch.execution_id == execution_id
+        };
+        match self.0 {
+            ObservationState::New(batch) if matches(&batch) => *current = Some(batch),
+            ObservationState::SuccessfulNoNewInput(batch)
+                if matches(&batch) && current.as_ref().is_none_or(matches) => {}
+            _ => *current = None,
+        }
+    }
+}
 
 /// Untrusted request data only; neither current-input evidence nor permission.
 #[derive(Debug, PartialEq)]
@@ -139,6 +252,53 @@ pub enum InputRequestProjection {
 
 #[cfg(test)]
 mod input_request_batch_tests {
+    fn ql_observation(session: &str, execution: &str, id: Option<&str>) -> InputObservation {
+        let source = bamboo_domain::SessionMessageSource::User;
+        let records = id.map(|id| BorrowedInputRequestRecord {
+            input_id: id,
+            source: &source,
+            kind: bamboo_domain::SessionMessageKind::UserInput,
+            wrapper: None,
+            created_at: chrono::DateTime::from_timestamp(1, 0).unwrap(),
+            request: None,
+        });
+        InputObservation::projected(project_input_request_batch(
+            session,
+            execution,
+            records.as_slice(),
+        ))
+    }
+
+    #[test]
+    fn ql_finite_owner_retains_nonew_only_for_exact_session_and_execution() {
+        let mut current = None;
+        ql_observation("s", "e", Some("N")).update_current(&mut current, "s", "e");
+        let pointer = current.as_ref().unwrap().records().as_ptr();
+        ql_observation("s", "e", None).update_current(&mut current, "s", "e");
+        assert_eq!(current.as_ref().unwrap().records().as_ptr(), pointer);
+        ql_observation("s", "old-execution", None).update_current(&mut current, "s", "e");
+        assert!(
+            current.is_none(),
+            "foreign NoNew cannot preserve this owner's data"
+        );
+        ql_observation("foreign-session", "e", Some("wrong")).update_current(
+            &mut current,
+            "s",
+            "e",
+        );
+        assert!(current.is_none());
+        ql_observation("s", "e", Some("N")).update_current(&mut current, "s", "e");
+        ql_observation("s", "e", None).update_current(&mut current, "successor", "e");
+        assert!(current.is_none());
+        ql_observation("s", "e", Some("N")).update_current(&mut current, "s", "e");
+        InputObservation::default().update_current(&mut current, "s", "e");
+        ql_observation("s", "e", None).update_current(&mut current, "s", "e");
+        assert!(
+            current.is_none(),
+            "NoNew after Unavailable never resurrects N"
+        );
+    }
+
     use super::*;
     use crate::runtime::runner::state_bridge::{
         project_input_request_batch, BorrowedInputRequestRecord,

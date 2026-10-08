@@ -106,6 +106,65 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
     metrics_collector: Option<&MetricsCollector>,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
 ) -> Result<PromptMemoryExposureProvenance, AgentError> {
+    refresh_round_boundary_inner(
+        session,
+        runtime_state,
+        config,
+        event_tx,
+        cancel_token,
+        metrics_collector,
+        runtime_context,
+        None,
+    )
+    .await
+    .map(|(memory, _)| memory)
+}
+
+pub(crate) async fn refresh_round_boundary_with_observation(
+    session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
+    config: &AgentLoopConfig,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
+    cancel_token: &CancellationToken,
+    metrics_collector: Option<&MetricsCollector>,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
+    execution_id: &str,
+) -> Result<
+    (
+        PromptMemoryExposureProvenance,
+        crate::runtime::managers::lifecycle::InputObservation,
+    ),
+    AgentError,
+> {
+    refresh_round_boundary_inner(
+        session,
+        runtime_state,
+        config,
+        event_tx,
+        cancel_token,
+        metrics_collector,
+        runtime_context,
+        Some(execution_id),
+    )
+    .await
+}
+
+async fn refresh_round_boundary_inner(
+    session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
+    config: &AgentLoopConfig,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
+    cancel_token: &CancellationToken,
+    metrics_collector: Option<&MetricsCollector>,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
+    execution_id: Option<&str>,
+) -> Result<
+    (
+        PromptMemoryExposureProvenance,
+        crate::runtime::managers::lifecycle::InputObservation,
+    ),
+    AgentError,
+> {
     if let Some(notifications) = config.session_activation_notifications.as_ref() {
         let mut receiver = notifications.lock();
         if receiver.has_changed().unwrap_or(false) {
@@ -118,14 +177,29 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
         }
     }
 
-    let turn_refresh = super::state_bridge::refresh_turn_boundary_with_inbox_for_run(
-        session,
-        config.storage.as_ref(),
-        config.persistence.as_ref(),
-        config.session_inbox.as_ref(),
-        config.guidance_active_run_id.as_deref(),
-    )
-    .await;
+    let (turn_refresh, observation) = if let Some(execution_id) = execution_id {
+        super::state_bridge::refresh_turn_boundary_with_observation(
+            session,
+            config.storage.as_ref(),
+            config.persistence.as_ref(),
+            config.session_inbox.as_ref(),
+            config.guidance_active_run_id.as_deref(),
+            execution_id,
+        )
+        .await
+    } else {
+        (
+            super::state_bridge::refresh_turn_boundary_with_inbox_for_run(
+                session,
+                config.storage.as_ref(),
+                config.persistence.as_ref(),
+                config.session_inbox.as_ref(),
+                config.guidance_active_run_id.as_deref(),
+            )
+            .await,
+            Default::default(),
+        )
+    };
     if turn_refresh.merged > 0 {
         tracing::debug!(
             session_id = %session.id,
@@ -190,7 +264,7 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
         &session.id,
         session.messages.len(),
     )?;
-    Ok(prompt_memory_exposure)
+    Ok((prompt_memory_exposure, observation))
 }
 
 // ---- round_state functions ----
@@ -395,6 +469,52 @@ pub(crate) async fn prepare_round(
     _tools: &dyn ToolExecutor,
     frame: &RoundPreludeFrame<'_>,
 ) -> Result<String, AgentError> {
+    prepare_round_inner(
+        session,
+        task_context,
+        runtime_state,
+        config,
+        llm,
+        _tools,
+        frame,
+        false,
+    )
+    .await
+    .map(|prepared| prepared.round_id)
+}
+
+pub(crate) async fn prepare_round_with_observation(
+    session: &mut Session,
+    task_context: &mut Option<TaskLoopContext>,
+    runtime_state: &mut AgentRuntimeState,
+    config: &AgentLoopConfig,
+    llm: Arc<dyn LLMProvider>,
+    _tools: &dyn ToolExecutor,
+    frame: &RoundPreludeFrame<'_>,
+) -> Result<crate::runtime::managers::lifecycle::ObservedRoundPreparation, AgentError> {
+    prepare_round_inner(
+        session,
+        task_context,
+        runtime_state,
+        config,
+        llm,
+        _tools,
+        frame,
+        true,
+    )
+    .await
+}
+
+async fn prepare_round_inner(
+    session: &mut Session,
+    task_context: &mut Option<TaskLoopContext>,
+    runtime_state: &mut AgentRuntimeState,
+    config: &AgentLoopConfig,
+    llm: Arc<dyn LLMProvider>,
+    _tools: &dyn ToolExecutor,
+    frame: &RoundPreludeFrame<'_>,
+    capture: bool,
+) -> Result<crate::runtime::managers::lifecycle::ObservedRoundPreparation, AgentError> {
     // Bind frame fields as locals so the rest of the function body stays unchanged.
     let round = frame.round;
     let max_rounds = frame.max_rounds;
@@ -408,7 +528,7 @@ pub(crate) async fn prepare_round(
         llm: config.background_model_provider.clone().unwrap_or(llm),
         background_model_name: config.background_model_name.clone(),
     };
-    refresh_round_boundary_and_prompt_context(
+    let (_, observation) = refresh_round_boundary_inner(
         session,
         runtime_state,
         config,
@@ -416,6 +536,7 @@ pub(crate) async fn prepare_round(
         cancel_token,
         metrics_collector,
         Some(&runtime_context),
+        capture.then_some(frame.execution_id),
     )
     .await?;
     update_task_round_state(task_context, round, max_rounds);
@@ -436,7 +557,12 @@ pub(crate) async fn prepare_round(
         model_name,
     );
 
-    Ok(round_id)
+    Ok(
+        crate::runtime::managers::lifecycle::ObservedRoundPreparation {
+            round_id,
+            observation,
+        },
+    )
 }
 
 #[cfg(test)]

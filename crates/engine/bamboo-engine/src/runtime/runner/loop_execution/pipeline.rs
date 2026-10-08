@@ -2830,6 +2830,7 @@ pub(super) async fn run_pipeline(
         "run_completed"
     };
     abort_in_flight_evaluations(state, event_tx, reason).await;
+    state.current_inputs = None;
     result
 }
 
@@ -2994,8 +2995,8 @@ async fn run_pipeline_inner(
                 .unwrap_or_else(|| llm.clone()),
             background_model_name: state.auxiliary_models.background_model_name.clone(),
         };
-        let prompt_memory_exposure =
-            crate::runtime::runner::round_prelude::refresh_round_boundary_and_prompt_context(
+        let (prompt_memory_exposure, observation) =
+            crate::runtime::runner::round_prelude::refresh_round_boundary_with_observation(
                 session,
                 &mut state.runtime_state,
                 config,
@@ -3003,8 +3004,14 @@ async fn run_pipeline_inner(
                 cancel_token,
                 state.metrics_collector.as_ref(),
                 Some(&runtime_context),
+                &state.execution_id,
             )
             .await?;
+        observation.update_current(
+            &mut state.current_inputs,
+            &state.session_id,
+            &state.execution_id,
+        );
 
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {
@@ -4102,6 +4109,116 @@ fn heuristic_complexity(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn ql_main_pipeline_observes_real_new_then_terminal_or_cancel_drops_owner() {
+        for cancelled in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(home.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let storage: Arc<dyn Storage> = store.clone();
+            let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+                Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+            let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+                store,
+                SessionInboxLimits::default(),
+            ));
+            let mut session = Session::new_child("ql-main", "parent", "model", "Child");
+            session.add_message(Message::system("base system"));
+            storage.save_session(&session).await.unwrap();
+            let mut expected = Vec::new();
+            for text in [
+                "first current input",
+                "second current input without selection",
+            ] {
+                let envelope = SessionMessageEnvelope::user_input(&session.id, text);
+                expected.push(envelope.id.to_string());
+                let receipt = inbox.deliver(&envelope).await.unwrap();
+                inbox
+                    .mark_activation_eligible(
+                        &session.id,
+                        receipt.generation,
+                        SessionActivationPolicy::InterruptSpecificWait,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let config = AgentLoopConfig {
+                storage: Some(storage),
+                persistence: Some(persistence),
+                session_inbox: Some(inbox.clone()),
+                skip_initial_user_message: true,
+                model_name: Some("model".into()),
+                run_budget: bamboo_config::RunBudgetConfig {
+                    max_rounds: Some(2),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let provider = Arc::new(ContextProbeProvider::default());
+            let tools = Arc::new(bamboo_tools::BuiltinToolExecutorBuilder::new().build());
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut state = e2e_loop_state(&session.id);
+            let (tx, _rx) = tokio::sync::mpsc::channel(256);
+            // Inspect the actual inner consumer before the outer terminal fence.
+            assert!(super::run_pipeline_inner(
+                &mut session,
+                &tx,
+                provider.clone(),
+                tools.clone(),
+                &cancel,
+                &config,
+                &mut state
+            )
+            .await
+            .unwrap());
+            let batch = state
+                .current_inputs
+                .as_ref()
+                .expect("production shared prelude moved real New");
+            assert_eq!(
+                batch
+                    .records()
+                    .iter()
+                    .map(|r| r.input_id.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(batch.records().iter().all(|r| r.request.is_none()));
+            assert_eq!(batch.execution_id(), state.execution_id);
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            if cancelled {
+                cancel.cancel();
+            }
+            let result = super::run_pipeline(
+                &mut session,
+                &tx,
+                provider.clone(),
+                tools,
+                &cancel,
+                &config,
+                &mut state,
+            )
+            .await;
+            assert!(
+                state.current_inputs.is_none(),
+                "outer terminal fence drops prior N for every return"
+            );
+            if cancelled {
+                assert!(matches!(result, Err(AgentError::Cancelled)));
+            } else {
+                assert!(result.unwrap());
+            }
+            assert_eq!(
+                provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+                if cancelled { 1 } else { 2 }
+            );
+            assert_eq!(inbox.inspect(&session.id).await.unwrap().claimed, 0);
+        }
+    }
+
     use super::super::startup::{InFlightTaskEvaluation, OverflowRecoveryState};
     use super::{
         apply_successful_explicit_activation, assistant_with_visible_identity,
@@ -7108,6 +7225,7 @@ mod tests {
         LoopRunState {
             session_id: session_id.to_string(),
             execution_id: "test-execution".to_string(),
+            current_inputs: None,
             model_name: "model".to_string(),
             metrics_collector: None,
             debug_logger: crate::runtime::runner::logging::DebugLogger::new(false),
@@ -9970,6 +10088,7 @@ mod tests {
         let mut state = super::super::startup::LoopRunState {
             session_id: "session-task-eval".to_string(),
             execution_id: "task-eval-execution".to_string(),
+            current_inputs: None,
             model_name: "model".to_string(),
             metrics_collector: None,
             debug_logger: crate::runtime::runner::logging::DebugLogger::new(false),

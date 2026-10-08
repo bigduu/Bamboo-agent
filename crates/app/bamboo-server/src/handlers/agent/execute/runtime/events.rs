@@ -1286,6 +1286,7 @@ mod tests {
             .expect("app state should initialize");
         let state = actix_web::web::Data::new(state);
 
+        let mut account_rx = state.account_sink.subscribe();
         let session_id = "test-account-feed";
         {
             use bamboo_engine::runtime::execution::runner_state::AgentRunner;
@@ -1352,7 +1353,16 @@ mod tests {
             .unwrap();
         drop(mpsc_tx);
 
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        timeout(Duration::from_secs(10), async {
+            for _ in 0..5 {
+                account_rx
+                    .recv()
+                    .await
+                    .expect("durable account event should be published");
+            }
+        })
+        .await
+        .expect("all five durable events should reach the account feed");
 
         let journaled =
             bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
