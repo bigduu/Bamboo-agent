@@ -801,6 +801,15 @@ fn build_execute_request(
 /// 4. Persists the session via merge-save (preserves concurrent UI title/pin edits)
 /// 5. Updates the in-memory session cache
 pub fn spawn_session_execution(args: SessionExecutionArgs) {
+    spawn_session_execution_with_inputs(args, None);
+}
+
+/// Forward only explicitly supplied caller data through the existing spawned
+/// body. The reservation and public argument layout remain unchanged.
+pub fn spawn_session_execution_with_inputs(
+    args: SessionExecutionArgs,
+    inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+) {
     let span_session_id = args.session_id.clone();
     let session_span = tracing::info_span!("agent_execution", session_id = %span_session_id);
 
@@ -971,9 +980,13 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // waiting parent. Map a panic to a terminal error instead.
             let result = {
                 use futures::FutureExt;
-                match std::panic::AssertUnwindSafe(agent.execute(&mut session, execute_request))
-                    .catch_unwind()
-                    .await
+                match std::panic::AssertUnwindSafe(agent.execute_with_inputs(
+                    &mut session,
+                    execute_request,
+                    inputs,
+                ))
+                .catch_unwind()
+                .await
                 {
                     Ok(result) => result,
                     Err(panic) => {

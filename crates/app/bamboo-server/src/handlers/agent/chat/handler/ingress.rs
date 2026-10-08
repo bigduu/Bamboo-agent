@@ -247,7 +247,10 @@ pub(super) async fn queue(
 /// Fresh HTTP execute needs a User turn before its legacy preparation gate.
 /// Reuse the SDK's exact checkpoint/receipt/ACK boundary, and never compete
 /// with a live runner's inbox consumer. This adapter owns no second protocol.
-pub(crate) async fn admit_for_execute(state: &AppState, id: &str) -> ResponseResult<()> {
+pub(crate) async fn admit_for_execute(
+    state: &AppState,
+    id: &str,
+) -> ResponseResult<Option<bamboo_engine::config::UntrustedExecutionInputs>> {
     let runners = state.agent_runners.read().await;
     if runners.get(id).is_some_and(|r| {
         matches!(
@@ -255,7 +258,7 @@ pub(crate) async fn admit_for_execute(state: &AppState, id: &str) -> ResponseRes
             crate::app_state::AgentStatus::Pending | crate::app_state::AgentStatus::Running
         )
     }) {
-        return Ok(());
+        return Ok(None);
     }
     let Some(mut session) = state
         .storage
@@ -263,10 +266,10 @@ pub(crate) async fn admit_for_execute(state: &AppState, id: &str) -> ResponseRes
         .await
         .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?
     else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(queued_id) = session.metadata.get("chat.queued_ingress.v1").cloned() else {
-        return Ok(());
+        return Ok(None);
     };
     let persistence: std::sync::Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
         state.persistence.clone();
@@ -280,10 +283,10 @@ pub(crate) async fn admit_for_execute(state: &AppState, id: &str) -> ResponseRes
     // SDK admission may durably commit and ACK one bounded batch while the
     // newest queued input is still pending. Emit every committed message even
     // when this call must return a retryable admission error or tail response.
-    for message in refreshed.committed_messages {
+    for message in &refreshed.committed_messages {
         state.account_sink.record(
             Some(id),
-            &bamboo_agent_core::AgentEvent::message_appended(id, &message),
+            &bamboo_agent_core::AgentEvent::message_appended(id, message),
         );
     }
     if let Some(reason) = refreshed.admission_error {
@@ -311,7 +314,13 @@ pub(crate) async fn admit_for_execute(state: &AppState, id: &str) -> ResponseRes
             .await
             .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
-    Ok(())
+    // Return data only after the entire checked admission/startup handoff
+    // succeeds. A retry/recovered transcript is not a new observation.
+    Ok(
+        bamboo_engine::config::UntrustedExecutionInputs::from_committed_messages(
+            &refreshed.committed_messages,
+        ),
+    )
 }
 
 #[cfg(test)]

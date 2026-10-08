@@ -19,6 +19,168 @@ const INBOX_ACK_UNRESOLVED: &str =
     "SessionInbox ACK unresolved; durable input is preserved; retry this activation";
 const INBOX_CLAIM_UNRESOLVED: &str =
     "SessionInbox claim unresolved; durable input is preserved; retry with its current owner";
+/// Original scalar data borrowed without Message, image or Source retention.
+#[derive(Clone, Copy)]
+pub struct BorrowedInputRequestRecord<'a> {
+    pub input_id: &'a str,
+    pub source: &'a SessionMessageSource,
+    pub kind: SessionMessageKind,
+    pub wrapper: Option<&'a str>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub request: Option<&'a bamboo_domain::SessionSkillRequest>,
+}
+
+// Private deterministic measurement, never a wire/persistence format or decoder.
+#[derive(serde::Serialize)]
+struct InputRequestMeasurement<'a> {
+    session_id: &'a str,
+    execution_id: &'a str,
+    records: InputRequestRecordsMeasurement<'a>,
+}
+struct InputRequestRecordsMeasurement<'a>(&'a [BorrowedInputRequestRecord<'a>]);
+impl serde::Serialize for InputRequestRecordsMeasurement<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for record in self.0 {
+            sequence.serialize_element(&(
+                record.input_id,
+                record.source,
+                record.kind,
+                record.wrapper,
+                record.created_at,
+                record.request,
+            ))?;
+        }
+        sequence.end()
+    }
+}
+
+/// Validate all borrowed data and charge the whole batch before any owned copy.
+/// Success does not classify input as New, authorize it or publish anything.
+pub fn project_input_request_batch(
+    session_id: &str,
+    execution_id: &str,
+    records: &[BorrowedInputRequestRecord<'_>],
+) -> crate::runtime::managers::lifecycle::InputRequestProjection {
+    use crate::runtime::managers::lifecycle::{
+        BoundedInputRequestBatch,
+        InputRequestProjection::{Available, Unavailable},
+        InputRequestUnavailable, ProjectedInputRequest,
+    };
+    const LIMIT: usize = 262144;
+    if records.len() > 128 {
+        return Unavailable(InputRequestUnavailable::RecordLimit {
+            count: records.len(),
+            limit: 128,
+        });
+    }
+    for record in records {
+        let id = record.input_id;
+        if id.trim().is_empty()
+            || id.trim() != id
+            || id.len() > 256
+            || id.contains('/')
+            || id.contains('\\')
+            || id.contains("..")
+            || record
+                .request
+                .is_some_and(|request| request.validate().is_err())
+        {
+            return Unavailable(InputRequestUnavailable::InvalidData);
+        }
+    }
+    struct CountingWrite(usize);
+    impl std::io::Write for CountingWrite {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .filter(|n| *n <= LIMIT)
+                .ok_or_else(|| std::io::Error::other("compact input byte limit"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = CountingWrite(0);
+    let measurement = InputRequestMeasurement {
+        session_id,
+        execution_id,
+        records: InputRequestRecordsMeasurement(records),
+    };
+    if serde_json::to_writer(&mut count, &measurement).is_err() {
+        return Unavailable(InputRequestUnavailable::CompactLimit { limit: LIMIT });
+    }
+    let records = records
+        .iter()
+        .map(|record| ProjectedInputRequest {
+            input_id: record.input_id.into(),
+            source: match record.source {
+                SessionMessageSource::User => SessionMessageSource::User,
+                SessionMessageSource::Session { session_id } => SessionMessageSource::Session {
+                    session_id: session_id.as_str().into(),
+                },
+                SessionMessageSource::Runtime { subsystem } => SessionMessageSource::Runtime {
+                    subsystem: subsystem.as_str().into(),
+                },
+            },
+            kind: record.kind,
+            wrapper: record.wrapper.map(String::from),
+            created_at: record.created_at,
+            request: record
+                .request
+                .map(|request| bamboo_domain::SessionSkillRequest {
+                    mode: request.mode.as_deref().map(String::from),
+                    selections: request
+                        .selections
+                        .iter()
+                        .map(|selection| bamboo_domain::SessionSkillSelection {
+                            id: selection.id.as_str().into(),
+                            source: selection.source.as_str().into(),
+                            revision: selection.revision,
+                            args: copy_input_request_value(&selection.args),
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice()
+                        .into_vec(),
+                }),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    Available(BoundedInputRequestBatch {
+        session_id: session_id.into(),
+        execution_id: execution_id.into(),
+        records,
+        compact_bytes: count.0,
+    })
+}
+
+// Called only after accepted I-W depth64/node8192/byte validation and full fit.
+// Copy lengths, including nested strings/keys/arrays, never source capacities.
+fn copy_input_request_value(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(value) => Value::String(value.as_str().into()),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(copy_input_request_value)
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+                .into_vec(),
+        ),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.as_str().into(), copy_input_request_value(value)))
+                .collect(),
+        ),
+        scalar => scalar.clone(),
+    }
+}
+
 #[cfg(test)]
 const PENDING_INJECTED_MESSAGES_KEY: &str = "pending_injected_messages";
 
@@ -2937,5 +3099,422 @@ mod tests {
         );
         let backlog = inbox.inspect(&first_run.id).await.unwrap();
         assert_eq!(backlog.pending + backlog.claimed, 0);
+    }
+}
+
+#[cfg(test)]
+mod input_request_projection_tests {
+    use super::*;
+    use crate::runtime::managers::lifecycle::{
+        BoundedInputRequestBatch,
+        InputRequestProjection::{Available, Unavailable},
+        InputRequestUnavailable,
+    };
+    use bamboo_domain::{SessionSkillRequest, SessionSkillSelection};
+
+    fn request() -> SessionSkillRequest {
+        SessionSkillRequest {
+            selections: vec![SessionSkillSelection {
+                id: "skill".into(),
+                source: "user".into(),
+                revision: u64::MAX,
+                args: serde_json::json!({"n": u64::MAX, "a": [1, 1.25, null]}),
+            }],
+            mode: None,
+        }
+    }
+    fn record(request: Option<&SessionSkillRequest>) -> BorrowedInputRequestRecord<'_> {
+        BorrowedInputRequestRecord {
+            input_id: "u",
+            source: &SessionMessageSource::User,
+            kind: SessionMessageKind::UserInput,
+            wrapper: None,
+            created_at: chrono::DateTime::from_timestamp(1, 0).unwrap(),
+            request,
+        }
+    }
+    fn available(
+        session: &str,
+        execution: &str,
+        records: &[BorrowedInputRequestRecord<'_>],
+    ) -> BoundedInputRequestBatch {
+        match project_input_request_batch(session, execution, records) {
+            Available(batch) => batch,
+            Unavailable(error) => panic!("unexpected bounded diagnostic {error:?}"),
+        }
+    }
+
+    #[test]
+    fn input_request_projection_charges_exact_private_framing_escaping_and_null() {
+        let mut row = record(None);
+        row.input_id = "u\"\t界";
+        let rows = [row];
+        let expected = r#"{"session_id":"s\n界","execution_id":"e\"","records":[["u\"\t界",{"type":"user"},"user_input",null,"1970-01-01T00:00:01Z",null]]}"#;
+        let encoded = serde_json::to_vec(&InputRequestMeasurement {
+            session_id: "s\n界",
+            execution_id: "e\"",
+            records: InputRequestRecordsMeasurement(&rows),
+        })
+        .unwrap();
+        assert_eq!(encoded, expected.as_bytes());
+        let batch = available("s\n界", "e\"", &rows);
+        assert_eq!(batch.compact_bytes(), expected.len());
+        assert_eq!(batch.session_id(), "s\n界");
+        assert_eq!(batch.execution_id(), "e\"");
+        assert_eq!(batch.records()[0].input_id, row.input_id);
+        assert_eq!(batch.records()[0].request, None);
+        let mut data = request();
+        let without_mode = available("s", "e", &[record(Some(&data))]).compact_bytes();
+        data.mode = Some("review".into());
+        assert_eq!(
+            available("s", "e", &[record(Some(&data))]).compact_bytes(),
+            without_mode + r#","mode":"review""#.len()
+        );
+    }
+
+    #[test]
+    fn input_request_projection_accepts_exact_whole_limit_then_rejects_one_byte() {
+        let mut data = SessionSkillRequest {
+            selections: (0..32)
+                .map(|i| SessionSkillSelection {
+                    id: format!("{i:x}"),
+                    source: "user".into(),
+                    revision: 1,
+                    args: serde_json::Value::String(String::new()),
+                })
+                .collect(),
+            mode: None,
+        };
+        let baseline = serde_json::to_vec(&InputRequestMeasurement {
+            session_id: "s",
+            execution_id: "e",
+            records: InputRequestRecordsMeasurement(&[record(Some(&data))]),
+        })
+        .unwrap()
+        .len();
+        let padding = 262144 - baseline;
+        for (i, selection) in data.selections.iter_mut().enumerate() {
+            selection.args =
+                serde_json::Value::String("x".repeat(padding / 32 + usize::from(i < padding % 32)));
+        }
+        data.validate().unwrap();
+        let batch = available("s", "e", &[record(Some(&data))]);
+        assert_eq!(batch.compact_bytes(), 262144);
+        assert_eq!(batch.records()[0].request.as_ref().unwrap(), &data);
+        if let serde_json::Value::String(value) = &mut data.selections[0].args {
+            value.push('x');
+        }
+        data.validate().unwrap(); // Individually valid; only whole-batch overhead overflows.
+        assert_eq!(
+            project_input_request_batch("s", "e", &[record(Some(&data))]),
+            Unavailable(InputRequestUnavailable::CompactLimit { limit: 262144 })
+        );
+        let rows = [record(Some(&data)), record(Some(&data))];
+        assert!(matches!(
+            project_input_request_batch("s", "e", &rows),
+            Unavailable(InputRequestUnavailable::CompactLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn input_request_projection_preserves_order_and_charges_every_none_record() {
+        let ids: Vec<_> = (0..129).map(|i| format!("u-{i}")).collect();
+        let rows: Vec<_> = ids
+            .iter()
+            .map(|id| BorrowedInputRequestRecord {
+                input_id: id,
+                ..record(None)
+            })
+            .collect();
+        let batch = available("s", "e", &rows[..128]);
+        assert_eq!(batch.records().len(), 128);
+        assert_eq!(
+            batch
+                .records()
+                .iter()
+                .map(|r| &r.input_id)
+                .collect::<Vec<_>>(),
+            ids[..128].iter().collect::<Vec<_>>()
+        );
+        assert!(batch.records().iter().all(|row| row.request.is_none()));
+        let one = available("s", "e", &rows[..1]);
+        assert!(batch.compact_bytes() > one.compact_bytes() * 50);
+        assert_eq!(
+            project_input_request_batch("s", "e", &rows),
+            Unavailable(InputRequestUnavailable::RecordLimit {
+                count: 129,
+                limit: 128
+            })
+        );
+        let empty = available("s", "e", &[]);
+        assert!(empty.records().is_empty());
+        assert_eq!(
+            empty.compact_bytes(),
+            r#"{"session_id":"s","execution_id":"e","records":[]}"#.len()
+        );
+    }
+
+    #[test]
+    fn input_request_projection_rejects_original_invalid_data_without_partial_output() {
+        for id in ["", " ", " u", "u ", "a/b", "a\\b", "a..b", &"界".repeat(86)] {
+            let rows = [
+                record(None),
+                BorrowedInputRequestRecord {
+                    input_id: id,
+                    ..record(None)
+                },
+            ];
+            assert_eq!(
+                project_input_request_batch("s", "e", &rows),
+                Unavailable(InputRequestUnavailable::InvalidData)
+            );
+        }
+        let canonical = format!("{}\t界", "x".repeat(252));
+        assert_eq!(canonical.len(), 256);
+        assert_eq!(
+            available(
+                "s",
+                "e",
+                &[BorrowedInputRequestRecord {
+                    input_id: &canonical,
+                    ..record(None)
+                }]
+            )
+            .records()[0]
+                .input_id,
+            canonical
+        );
+        let mut data = request();
+        for depth in [64, 65, 256] {
+            data.selections[0].args = (0..depth).fold(serde_json::Value::Null, |value, _| {
+                serde_json::Value::Array(vec![value])
+            });
+            let result =
+                project_input_request_batch("s", "e", &[record(None), record(Some(&data))]);
+            assert_eq!(matches!(result, Available(_)), depth == 64);
+            if depth != 64 {
+                assert_eq!(result, Unavailable(InputRequestUnavailable::InvalidData));
+            }
+        }
+        data.selections[0].args = serde_json::Value::Array(vec![serde_json::Value::Null; 8192]);
+        assert_eq!(
+            project_input_request_batch("s", "e", &[record(Some(&data))]),
+            Unavailable(InputRequestUnavailable::InvalidData)
+        );
+        data.selections[0].args = serde_json::Value::Null;
+        for mode in ["", "UPPER", "a_b", &"x".repeat(65)] {
+            data.mode = Some(mode.into());
+            assert_eq!(
+                project_input_request_batch("s", "e", &[record(Some(&data))]),
+                Unavailable(InputRequestUnavailable::InvalidData)
+            );
+        }
+        data.mode = Some("x".repeat(64));
+        available("s", "e", &[record(Some(&data))]);
+        data.selections.clear();
+        assert_eq!(
+            project_input_request_batch("s", "e", &[record(Some(&data))]),
+            Unavailable(InputRequestUnavailable::InvalidData)
+        );
+    }
+
+    #[test]
+    fn input_request_projection_normalizes_nested_capacities_and_outlives_original_data() {
+        fn excess(value: &str) -> String {
+            let mut s = String::with_capacity(100000);
+            s.push_str(value);
+            s
+        }
+        fn nodes(value: &serde_json::Value) -> usize {
+            1 + match value {
+                serde_json::Value::Array(v) => v.iter().map(nodes).sum(),
+                serde_json::Value::Object(v) => v.values().map(nodes).sum(),
+                _ => 0,
+            }
+        }
+        let mut data = request();
+        data.mode = Some(excess("review"));
+        let mut array = Vec::with_capacity(100000);
+        array.push(serde_json::Value::String(excess("界\"\n")));
+        let mut object = serde_json::Map::new();
+        object.insert(excess("key"), serde_json::Value::String(excess("value")));
+        array.push(serde_json::Value::Object(object));
+        data.selections[0].args = serde_json::Value::Array(array);
+        data.selections[0].id = excess("skill");
+        data.selections[0].source = excess("user");
+        data.selections.reserve(100000);
+        let source = SessionMessageSource::Runtime {
+            subsystem: excess("chat"),
+        };
+        let input_id = excess("u");
+        let wrapper = excess("root_chat_turn_v1");
+        let session = excess("s");
+        let execution = excess("e");
+        let batch = available(
+            &session,
+            &execution,
+            &[BorrowedInputRequestRecord {
+                input_id: &input_id,
+                source: &source,
+                kind: SessionMessageKind::RuntimeInstruction,
+                wrapper: Some(&wrapper),
+                ..record(Some(&data))
+            }],
+        );
+        let row = &batch.records()[0];
+        assert_eq!(row.request.as_ref().unwrap(), &data);
+        assert_eq!(
+            row.created_at,
+            chrono::DateTime::from_timestamp(1, 0).unwrap()
+        );
+        assert_eq!(row.kind, SessionMessageKind::RuntimeInstruction);
+        assert_eq!(row.wrapper.as_deref(), Some("root_chat_turn_v1"));
+        assert_eq!(batch.session_id.capacity(), batch.session_id.len());
+        assert_eq!(batch.execution_id.capacity(), batch.execution_id.len());
+        assert_eq!(row.input_id.capacity(), row.input_id.len());
+        assert_eq!(row.wrapper.as_ref().unwrap().capacity(), wrapper.len());
+        let SessionMessageSource::Runtime { subsystem } = &row.source else {
+            panic!()
+        };
+        assert_eq!(subsystem.capacity(), subsystem.len());
+        let copied = row.request.as_ref().unwrap();
+        assert_eq!(copied.selections.capacity(), copied.selections.len());
+        assert_eq!(copied.mode.as_ref().unwrap().capacity(), 6);
+        let selection = &copied.selections[0];
+        assert_eq!(selection.id.capacity(), selection.id.len());
+        assert_eq!(selection.source.capacity(), selection.source.len());
+        let values = selection.args.as_array().unwrap();
+        assert_eq!(values.capacity(), values.len());
+        let serde_json::Value::String(s) = &values[0] else {
+            panic!()
+        };
+        assert_eq!(s.capacity(), s.len());
+        let (key, value) = values[1].as_object().unwrap().iter().next().unwrap();
+        assert_eq!(key.capacity(), key.len());
+        let serde_json::Value::String(s) = value else {
+            panic!()
+        };
+        assert_eq!(s.capacity(), s.len());
+        assert!(nodes(&selection.args) <= batch.compact_bytes());
+        drop((data, source, input_id, wrapper, session, execution));
+        assert_eq!(
+            batch.records()[0].request.as_ref().unwrap().selections[0].revision,
+            u64::MAX
+        );
+        let scalar = request();
+        assert_eq!(
+            available("s", "e", &[record(Some(&scalar))]).records()[0]
+                .request
+                .as_ref(),
+            Some(&scalar)
+        );
+    }
+    #[test]
+    fn input_request_projection_request_golden_charges_keys_numbers_mode_and_provenance() {
+        let data = SessionSkillRequest {
+            mode: Some("review".into()),
+            selections: vec![SessionSkillSelection {
+                id: "skill".into(),
+                source: "plugin".into(),
+                revision: u64::MAX,
+                args: serde_json::json!({"n": u64::MAX, "q": "界\"\n"}),
+            }],
+        };
+        let source = SessionMessageSource::Runtime {
+            subsystem: "chat".into(),
+        };
+        let rows = [BorrowedInputRequestRecord {
+            source: &source,
+            kind: SessionMessageKind::RuntimeInstruction,
+            wrapper: Some("root_chat_turn_v1"),
+            created_at: chrono::DateTime::from_timestamp(1, 123456789).unwrap(),
+            ..record(Some(&data))
+        }];
+        let expected = r#"{"session_id":"s","execution_id":"e","records":[["u",{"type":"runtime","subsystem":"chat"},"runtime_instruction","root_chat_turn_v1","1970-01-01T00:00:01.123456789Z",{"selections":[{"id":"skill","source":"plugin","revision":18446744073709551615,"args":{"n":18446744073709551615,"q":"界\"\n"}}],"mode":"review"}]]}"#;
+        assert_eq!(
+            serde_json::to_vec(&InputRequestMeasurement {
+                session_id: "s",
+                execution_id: "e",
+                records: InputRequestRecordsMeasurement(&rows)
+            })
+            .unwrap(),
+            expected.as_bytes()
+        );
+        let batch = available("s", "e", &rows);
+        assert_eq!(batch.compact_bytes(), expected.len());
+        assert_eq!(batch.records()[0].request.as_ref(), Some(&data));
+        assert_eq!(batch.records()[0].created_at, rows[0].created_at);
+    }
+
+    #[test]
+    fn input_request_projection_reuses_all_original_selection_validation() {
+        let mut invalid = Vec::new();
+        for id in ["", " skill", "skill ", "bad\n", &"x".repeat(257)] {
+            let mut value = request();
+            value.selections[0].id = id.into();
+            invalid.push(value);
+        }
+        for source in ["", "USER", "user ", "unknown"] {
+            let mut value = request();
+            value.selections[0].source = source.into();
+            invalid.push(value);
+        }
+        let mut zero = request();
+        zero.selections[0].revision = 0;
+        invalid.push(zero);
+        let mut duplicate = request();
+        duplicate.selections.push(duplicate.selections[0].clone());
+        duplicate.selections[1].source = "builtin".into();
+        invalid.push(duplicate);
+        let mut excessive = request();
+        excessive.selections = (0..33)
+            .map(|i| SessionSkillSelection {
+                id: format!("s{i}"),
+                ..request().selections.remove(0)
+            })
+            .collect();
+        invalid.push(excessive);
+        for value in invalid {
+            assert_eq!(
+                project_input_request_batch("s", "e", &[record(None), record(Some(&value))]),
+                Unavailable(InputRequestUnavailable::InvalidData)
+            );
+        }
+    }
+
+    #[test]
+    fn input_request_projection_retains_every_untrusted_source_and_kind_exactly() {
+        let mut identity = String::with_capacity(100000);
+        identity.push_str(" peer/\n界");
+        let sources = [
+            SessionMessageSource::User,
+            SessionMessageSource::Session {
+                session_id: identity,
+            },
+            SessionMessageSource::Runtime {
+                subsystem: "arbitrary".into(),
+            },
+        ];
+        for source in &sources {
+            for kind in [
+                SessionMessageKind::UserInput,
+                SessionMessageKind::PeerMessage,
+                SessionMessageKind::ChildOutcome,
+                SessionMessageKind::RuntimeInstruction,
+            ] {
+                let row = BorrowedInputRequestRecord {
+                    source,
+                    kind,
+                    ..record(None)
+                };
+                let batch = available("s", "e", &[row]);
+                assert_eq!(&batch.records()[0].source, source);
+                assert_eq!(batch.records()[0].kind, kind); // Data, never eligibility/currentness.
+                if let SessionMessageSource::Session { session_id } = &batch.records()[0].source {
+                    assert_eq!(session_id.capacity(), session_id.len());
+                    assert_eq!(session_id, " peer/\n界");
+                }
+            }
+        }
     }
 }
