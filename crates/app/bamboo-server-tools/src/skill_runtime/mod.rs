@@ -60,6 +60,24 @@ pub trait SkillCatalogCallerResolver: Send + Sync {
         &self,
         ctx: &bamboo_agent_core::tools::ToolCtx,
     ) -> Result<SkillCatalogCaller, ToolError>;
+
+    /// Synchronous acceptance check for the unwired preappend factory only.
+    /// Read the same actual authority source nonblockingly and compare its full
+    /// current caller/input binding, ceiling, invocation, mode and limits with
+    /// `expected`. Unknown, changed, busy or unavailable authority must deny.
+    /// Do not trust `expected` alone, block, await or reenter Config/Session
+    /// owners: those owners remain held, but Source publication has released.
+    /// This is an acceptance instant, not a lease for subsequent consumption.
+    /// Existing list/read paths continue to use `resolve` exclusively.
+    fn validate_current(
+        &self,
+        _ctx: &bamboo_agent_core::tools::ToolCtx,
+        _expected: &SkillCatalogCaller,
+    ) -> Result<(), ToolError> {
+        Err(ToolError::Execution(
+            "Current Skill caller authority validation is unavailable".into(),
+        ))
+    }
 }
 
 pub(super) const MAX_RESOURCE_CONTENT_CHARS: usize = 50_000;

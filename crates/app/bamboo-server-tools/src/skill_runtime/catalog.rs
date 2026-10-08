@@ -214,7 +214,7 @@ impl SkillInputFactory {
         let user = user.clone();
         let restrictions = access.clone();
         let host_access = self.access.clone();
-        prepared
+        let result = prepared
             .with_current_inputs(&access, selections, move |publication| {
                 Box::pin(async move {
                     // Last await: do not call try_load while the owner/publication are
@@ -267,7 +267,11 @@ impl SkillInputFactory {
                 })
             })
             .await
-            .map_err(|error| ToolError::Execution(error.to_string()))
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        // Final Source validation has completed and publication has released.
+        // Config/Session owners remain held; no await follows this acceptance.
+        self.resolver.validate_current(ctx, &fresh)?;
+        Ok(result)
     }
 }
 
