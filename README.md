@@ -199,6 +199,18 @@ data and a unique successful active receipt, retains originals and uses the
 existing 512 KiB bound. Unsupported history stays intact. Neither helper is
 called by chat, runner setup, providers or persistence; live cutover is separate.
 
+`bamboo_server_tools::SkillInputFactory` is an unwired host preparation entry
+point for an actual User that has not been appended. It requires a freshly
+resolved caller and typed current selections; host ceilings, disabled/manual
+policy, Root Ultra and Project/workspace scope remain separate restrictions.
+New Sessions require explicit host provenance and first/final absent storage
+rows. Existing Sessions reuse their persistence owner before publication guards
+and a final direct fallible storage read. Definition, schema, mode and Source
+are borrowed from one current publication, with charged raw/physical validation
+before rendering and before success. Only ordinary Message data and warnings
+return; no Session, pin or reader permission is written. No production caller
+uses this factory. Its fixtures establish preparation, not live runtime cutover.
+
 The runner's existing Instruction activation path is factored into a private,
 stateless `legacy_instruction` adapter. It still publishes the selected pin,
 requires one model-issued `load_skill` call, suppresses first-round answer text,

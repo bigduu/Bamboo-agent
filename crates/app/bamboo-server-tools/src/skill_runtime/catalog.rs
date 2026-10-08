@@ -49,6 +49,212 @@ pub struct SelectedSkillSource {
     pub identity: String,
 }
 
+/// Explicit host provenance for a real unappended User's Session. New requires
+/// the host's actual unsaved Session; storage absence alone cannot create one.
+pub enum SkillInputSession<'a> {
+    New(&'a bamboo_agent_core::Session),
+    Existing,
+}
+
+/// Unwired preappend factory. Returns ordinary data, never a reader/activation
+/// grant. Call before acquiring a chat persistence owner; this factory acquires
+/// that same existing owner itself, ahead of every publication guard.
+pub struct SkillInputFactory {
+    access: SkillToolAccess,
+    resolver: Arc<dyn SkillCatalogCallerResolver>,
+}
+impl SkillInputFactory {
+    pub fn new(
+        manager: Arc<SkillManager>,
+        config: Arc<RwLock<Config>>,
+        sessions: bamboo_engine::SessionRepository,
+        resolver: Arc<dyn SkillCatalogCallerResolver>,
+    ) -> Self {
+        Self {
+            access: SkillToolAccess::new(manager, config, sessions),
+            resolver,
+        }
+    }
+    pub fn with_project_store(mut self, projects: Arc<bamboo_projects::ProjectStore>) -> Self {
+        self.access = self.access.with_project_store(projects);
+        self
+    }
+    pub async fn prepare_input(
+        &self,
+        ctx: &ToolCtx,
+        user: &bamboo_agent_core::Message,
+        host: SkillInputSession<'_>,
+        selections: &[bamboo_skills::WorkflowSelection],
+    ) -> Result<bamboo_engine::session_app::skill_input::PreparedSkillInput, ToolError> {
+        use bamboo_engine::session_app::skill_input::{
+            prepare_current_skill_input, SkillInputRestrictions, MAX_EXPLICIT_SKILLS,
+        };
+        let caller = self.resolver.resolve(ctx).await?;
+        let invalid =
+            || ToolError::Execution("Skill preappend caller/input is stale or invalid".into());
+        if ctx.session_id() != Some(caller.session_id.as_str())
+            || user.role != bamboo_agent_core::Role::User
+            || user.id != caller.input_id
+            || [&caller.caller_id, &caller.input_id, &caller.session_id]
+                .iter()
+                .any(|id| id.is_empty() || id.len() > MAX_HANDLE_BYTES)
+            || caller.mode.as_ref().is_some_and(|mode| {
+                mode.is_empty()
+                    || mode.len() > 256
+                    || !mode
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+            })
+            || caller
+                .invocation
+                .as_ref()
+                .is_some_and(|intent| intent.input_id != user.id)
+            || selections.len() > MAX_EXPLICIT_SKILLS
+        {
+            return Err(invalid());
+        }
+        let requested = selections
+            .iter()
+            .map(|selection| selection.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if !selections.is_empty()
+            && caller
+                .invocation
+                .as_ref()
+                .is_none_or(|intent| intent.skills != requested)
+        {
+            return Err(invalid());
+        }
+        // A fallible direct storage read cannot turn a failed existing lookup
+        // into New. Classification is independent of the cache's fast path.
+        let first = self
+            .access
+            .session_repo
+            .storage()
+            .load_session(&caller.session_id)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let (session, is_new) = match (host, first) {
+            (SkillInputSession::New(session), None)
+                if session.id == caller.session_id
+                    && self.access.session_repo.cache().get(&session.id).is_none() =>
+            {
+                (session.clone(), true)
+            }
+            (SkillInputSession::Existing, Some(session)) if session.id == caller.session_id => {
+                let session = self
+                    .access
+                    .session_repo
+                    .try_load(&session.id)
+                    .await
+                    .map_err(|error| ToolError::Execution(error.to_string()))?
+                    .ok_or_else(|| {
+                        ToolError::Execution("Skill existing Session is unavailable".into())
+                    })?;
+                (session, false)
+            }
+            _ => {
+                return Err(ToolError::Execution(
+                    "Skill host New/existing Session provenance does not match storage".into(),
+                ))
+            }
+        };
+        if session.messages.iter().any(|message| message.id == user.id) {
+            return Err(ToolError::Execution(
+                "Skill input is already appended or its ID collides".into(),
+            ));
+        }
+        let access = SkillCatalogEligibility {
+            ceiling: caller.ceiling.clone(),
+            explicit: requested,
+            disabled: self
+                .access
+                .config
+                .read()
+                .await
+                .disabled_skill_ids()
+                .into_iter()
+                .collect(),
+            deny_all: session.root_orchestration_only_enabled(),
+        };
+        let store = self.access.skill_store_for_session(&session).await?;
+        let prepared = store
+            .prepare_current_input_store(caller.mode.as_deref())
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let fresh = self.resolver.resolve(ctx).await?;
+        let config = self.access.config.read().await;
+        if fingerprint(&caller)? != fingerprint(&fresh)?
+            || access.disabled != config.disabled_skill_ids().into_iter().collect()
+        {
+            return Err(ToolError::Execution(
+                "Skill host caller/config changed during preparation".into(),
+            ));
+        }
+        let _owner = self
+            .access
+            .session_repo
+            .persistence()
+            .acquire_lock(&session.id)
+            .await;
+        let sessions = self.access.session_repo.clone();
+        // Compare JSON structure: Session contains HashMaps whose iteration
+        // order legitimately changes across independent durable decodes.
+        let expected = serde_json::to_value(&session).map_err(json_error)?;
+        let user = user.clone();
+        let restrictions = access.clone();
+        let host_access = self.access.clone();
+        prepared
+            .with_current_inputs(&access, selections, move |publication| {
+                Box::pin(async move {
+                    // Last await: do not call try_load while the owner/publication are
+                    // held. That reentry deadlocks on a legitimate cache miss.
+                    let current = sessions
+                        .storage()
+                        .load_session(&caller.session_id)
+                        .await
+                        .map_err(|error| {
+                            bamboo_skills::SkillError::Validation(error.to_string())
+                        })?;
+                    let matches = if is_new {
+                        current.is_none() && sessions.cache().get(&caller.session_id).is_none()
+                    } else {
+                        current.as_ref().is_some_and(|current| {
+                            serde_json::to_value(current).is_ok_and(|actual| actual == expected)
+                        })
+                    };
+                    if !matches {
+                        return Err(bamboo_skills::SkillError::Validation(
+                            "Skill Session changed during preparation".into(),
+                        ));
+                    }
+                    host_access
+                        .skill_scope_for_session(&session)
+                        .map_err(|error| {
+                            bamboo_skills::SkillError::Validation(error.to_string())
+                        })?;
+                    publication.validate_current()?;
+                    let caller = SkillInputRestrictions {
+                        input_id: &caller.input_id,
+                        ceiling: restrictions.ceiling.as_ref(),
+                        disabled: &restrictions.disabled,
+                        root_ultra: restrictions.deny_all,
+                        mode: caller.mode.as_deref(),
+                    };
+                    prepare_current_skill_input(
+                        &user,
+                        Ok(&caller),
+                        (!publication.inputs().is_empty())
+                            .then_some((user.id.as_str(), publication.inputs())),
+                    )
+                    .map_err(bamboo_skills::SkillError::Validation)
+                })
+            })
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))
+    }
+}
+
 struct SelectedCatalogContext {
     caller: SkillCatalogCaller,
     snapshot: SkillCatalogSnapshot,

@@ -22,7 +22,10 @@ mod read_resource;
 #[cfg(test)]
 mod tests;
 
-pub use catalog::{SelectedSkillSource, SkillsListTool, SkillsReadTool, MAX_SKILLS_LIST_BYTES};
+pub use catalog::{
+    SelectedSkillSource, SkillInputFactory, SkillInputSession, SkillsListTool, SkillsReadTool,
+    MAX_SKILLS_LIST_BYTES,
+};
 pub use load_skill::LoadSkillTool;
 pub use output_budget::skill_response_byte_budget;
 pub use read_resource::ReadSkillResourceTool;
