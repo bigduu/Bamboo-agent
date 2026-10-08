@@ -13,6 +13,24 @@ pub(super) async fn append_user_message(
     message: &str,
     images: Option<&[ChatImage]>,
 ) -> ResponseResult<()> {
+    let user = construct_user_message(state, session, message, images).await?;
+    session.add_message(user);
+
+    // Persist a durable handoff marker with the new turn. A reconnect may occur
+    // before POST /execute reserves a Pending runner; without this marker, the
+    // previous run's Cancelled/Failed runtime snapshot can be mistaken for the
+    // terminal state of this new request.
+    crate::handlers::agent::events::mark_pending_turn(session);
+
+    Ok(())
+}
+
+pub(super) async fn construct_user_message(
+    state: &web::Data<AppState>,
+    session: &Session,
+    message: &str,
+    images: Option<&[ChatImage]>,
+) -> ResponseResult<bamboo_agent_core::Message> {
     // Preserve multimodal parts so that preflight hooks (OCR/fallback) and/or multimodal
     // upstream models can use the images.
     if let Some(images) = images.filter(|items| !items.is_empty()) {
@@ -44,21 +62,13 @@ pub(super) async fn append_user_message(
             });
         }
 
-        session.add_message(bamboo_agent_core::Message::user_with_parts(
+        Ok(bamboo_agent_core::Message::user_with_parts(
             message.to_string(),
             parts.into_iter().map(Into::into).collect(),
-        ));
+        ))
     } else {
-        session.add_message(bamboo_agent_core::Message::user(message.to_string()));
+        Ok(bamboo_agent_core::Message::user(message.to_string()))
     }
-
-    // Persist a durable handoff marker with the new turn. A reconnect may occur
-    // before POST /execute reserves a Pending runner; without this marker, the
-    // previous run's Cancelled/Failed runtime snapshot can be mistaken for the
-    // terminal state of this new request.
-    crate::handlers::agent::events::mark_pending_turn(session);
-
-    Ok(())
 }
 
 #[cfg(test)]

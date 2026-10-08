@@ -150,6 +150,10 @@ pub struct Agent {
 }
 
 impl Agent {
+    fn append_user_input(session: &mut Session, input: impl Into<String>) {
+        session.add_message(Message::user(input.into()));
+    }
+
     /// Return a new ergonomic builder.
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
@@ -209,7 +213,7 @@ impl Agent {
         session: &mut Session,
         input: impl Into<String>,
     ) -> Result<(), AgentError> {
-        session.add_message(Message::user(input.into()));
+        Self::append_user_input(session, input);
         self.run_session(session).await
     }
 
@@ -222,7 +226,7 @@ impl Agent {
         input: impl Into<String>,
         cancel_token: CancellationToken,
     ) -> Result<(), AgentError> {
-        session.add_message(Message::user(input.into()));
+        Self::append_user_input(session, input);
         self.run_session_with_cancel(session, cancel_token).await
     }
 
@@ -279,7 +283,7 @@ impl Agent {
         mut session: Session,
         input: impl Into<String>,
     ) -> mpsc::Receiver<AgentEvent> {
-        session.add_message(Message::user(input.into()));
+        Self::append_user_input(&mut session, input);
         self.run_stream_session(session)
     }
 
@@ -292,7 +296,7 @@ impl Agent {
         mut session: Session,
         input: impl Into<String>,
     ) -> (mpsc::Receiver<AgentEvent>, CancellationToken) {
-        session.add_message(Message::user(input.into()));
+        Self::append_user_input(&mut session, input);
         self.run_stream_session_cancellable(session)
     }
 

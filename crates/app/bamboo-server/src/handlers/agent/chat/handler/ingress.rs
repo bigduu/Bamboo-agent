@@ -13,6 +13,62 @@ fn error(status: StatusCode, reason: impl ToString) -> HttpResponse {
     crate::error::json_error(status, reason.to_string())
 }
 
+pub(super) async fn construct_user_envelope(
+    state: &AppState,
+    session: &Session,
+    request: &ChatRequest,
+    effective_message: &str,
+) -> ResponseResult<SessionMessageEnvelope> {
+    let mut envelope = SessionMessageEnvelope::user_input(&session.id, effective_message);
+    if let Some(id) = &request.message_id {
+        envelope.id =
+            SessionMessageId::parse(id.clone()).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    }
+    envelope.thread_id = request.thread_id.clone();
+    envelope.in_reply_to = request
+        .in_reply_to
+        .as_ref()
+        .map(|id| SessionMessageId::parse(id.clone()))
+        .transpose()
+        .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    envelope.correlation_id = request.correlation_id.clone();
+    if let Some(images) = request.images.as_ref().filter(|v| !v.is_empty()) {
+        if images.len() > 16 {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "A message supports up to 16 images",
+            )
+            .into());
+        }
+        let mut parts = vec![bamboo_domain::MessagePart::Text {
+            text: effective_message.into(),
+        }];
+        for image in images {
+            let (_, url) = state
+                .session_store
+                .write_image_attachment_deduplicated(
+                    session,
+                    &image.base64,
+                    image.mime_type.as_deref(),
+                )
+                .await
+                .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+            parts.push(bamboo_domain::MessagePart::ImageUrl {
+                image_url: bamboo_domain::ImageUrlRef { url, detail: None },
+            });
+        }
+        envelope.body =
+            bamboo_domain::SessionMessageBody::Content(bamboo_domain::SessionMessageContent {
+                text: effective_message.into(),
+                parts,
+            });
+    }
+    envelope
+        .validate()
+        .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    Ok(envelope)
+}
+
 pub(super) async fn queue(
     state: &AppState,
     session: &Session,
@@ -66,53 +122,7 @@ pub(super) async fn queue(
         )
         .into());
     }
-    let mut envelope = SessionMessageEnvelope::user_input(&session.id, effective_message);
-    if let Some(id) = &request.message_id {
-        envelope.id =
-            SessionMessageId::parse(id.clone()).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
-    }
-    envelope.thread_id = request.thread_id.clone();
-    envelope.in_reply_to = request
-        .in_reply_to
-        .as_ref()
-        .map(|id| SessionMessageId::parse(id.clone()))
-        .transpose()
-        .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
-    envelope.correlation_id = request.correlation_id.clone();
-    if let Some(images) = request.images.as_ref().filter(|v| !v.is_empty()) {
-        if images.len() > 16 {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "A message supports up to 16 images",
-            )
-            .into());
-        }
-        let mut parts = vec![bamboo_domain::MessagePart::Text {
-            text: effective_message.into(),
-        }];
-        for image in images {
-            let (_, url) = state
-                .session_store
-                .write_image_attachment_deduplicated(
-                    session,
-                    &image.base64,
-                    image.mime_type.as_deref(),
-                )
-                .await
-                .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
-            parts.push(bamboo_domain::MessagePart::ImageUrl {
-                image_url: bamboo_domain::ImageUrlRef { url, detail: None },
-            });
-        }
-        envelope.body =
-            bamboo_domain::SessionMessageBody::Content(bamboo_domain::SessionMessageContent {
-                text: effective_message.into(),
-                parts,
-            });
-    }
-    envelope
-        .validate()
-        .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    let envelope = construct_user_envelope(state, session, request, effective_message).await?;
     // A new ordinary session needs a canonical address before delivery. This
     // contains no User turn or live workflow pin; the final chat checkpoint
     // remains responsible for those. A failed delivery can retry the same ID.
