@@ -957,7 +957,7 @@ mod execution_input_http {
             _ => panic!("original idle reservation"),
         };
         let run = reservation.run_id().to_owned();
-        let request = serde_json::from_value::<crate::handlers::agent::chat::ChatRequest>(serde_json::json!({"session_id":id,"message":"Native during actual Pending","model":"test-model"})).unwrap();
+        let request = serde_json::from_value::<crate::handlers::agent::chat::ChatRequest>(serde_json::json!({"session_id":id,"message":"Native before reserved task starts","model":"test-model"})).unwrap();
         let response = crate::handlers::agent::chat::handler(
             state.clone(),
             test::TestRequest::post().to_http_request(),
@@ -983,13 +983,15 @@ mod execution_input_http {
         assert!(!blocked.generate_title);
         let (status, body) = execute(&state, id, None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["status"], "already_running");
+        // Original execute checks canonical pending work before reservation.
+        // The input stays in Inbox, so this response does not finish the owner.
+        assert_eq!(body["status"], "completed");
         assert!(state
             .agent_runners
             .read()
             .await
             .get(id)
-            .is_some_and(|r| r.run_id == run));
+            .is_some_and(|r| r.run_id == run && matches!(r.status, AgentStatus::Running)));
         assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
         assert!(!state
             .storage
