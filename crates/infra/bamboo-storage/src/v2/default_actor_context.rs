@@ -309,6 +309,7 @@ impl SessionStoreV2 {
             || side.kind != main.kind
             || side.root_session_id != main.root_session_id
             || side.parent_session_id != main.parent_session_id
+            || side.parent_created_at != main.parent_created_at
             || side.spawn_depth != main.spawn_depth
             || side.authority_identity != main.authority_identity
             || runtime_context(incoming)? != runtime_context(&side)?
