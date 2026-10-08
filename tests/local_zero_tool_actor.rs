@@ -1080,7 +1080,11 @@ async fn fixture_with_followups(
     recovery: bool,
     two: Option<TwoFollowups>,
 ) {
-    let temp = tempfile::tempdir_in(std::env::var_os("BAMBOO_ACTOR_FIXTURE_DIAGNOSTIC_DIR").expect("diagnostic-only CI directory")).unwrap();
+    let temp = tempfile::tempdir_in(
+        std::env::var_os("BAMBOO_ACTOR_FIXTURE_DIAGNOSTIC_DIR")
+            .expect("diagnostic-only CI directory"),
+    )
+    .unwrap();
     let temp_root = temp.path().canonicalize().unwrap();
     let _kept = temp.keep();
     eprintln!("recovery diagnostic root={}", temp_root.display());
@@ -1153,7 +1157,10 @@ async fn fixture_with_followups(
         .unwrap()
         .port();
     let mut host = start(&data, port);
-    host.record_cleanup("recovery_initial_host", Some(temp_root.join("cleanup.jsonl")));
+    host.record_cleanup(
+        "recovery_initial_host",
+        Some(temp_root.join("cleanup.jsonl")),
+    );
     eprintln!("recovery initial Host pid={} port={port}", host.0.id());
     let base = format!("http://127.0.0.1:{port}/api/v1");
     let client = fixture_http_client();
@@ -1353,7 +1360,10 @@ async fn fixture_with_followups(
         tokio::time::sleep(delay + Duration::from_millis(10)).await;
         host = start(&data, port);
         host.record_cleanup("recovery_cold_host", Some(temp_root.join("cleanup.jsonl")));
-        eprintln!("recovery cold Host pid={} port={port} expired_deadline={deadline}", host.0.id());
+        eprintln!(
+            "recovery cold Host pid={} port={port} expired_deadline={deadline}",
+            host.0.id()
+        );
         tokio::time::timeout(Duration::from_secs(30), async {
             while !client
                 .get(format!("{base}/health"))
@@ -1362,7 +1372,11 @@ async fn fixture_with_followups(
                 .is_ok_and(|r| r.status().is_success())
             {
                 let status = host.0.try_wait().unwrap();
-                assert!(status.is_none(), "cold recovery Host exited: status={status:?}; port={port}; raw log={}", std::fs::read_to_string(data.join("host.log")).unwrap_or_default());
+                assert!(
+                    status.is_none(),
+                    "cold recovery Host exited: status={status:?}; port={port}; raw log={}",
+                    std::fs::read_to_string(data.join("host.log")).unwrap_or_default()
+                );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
