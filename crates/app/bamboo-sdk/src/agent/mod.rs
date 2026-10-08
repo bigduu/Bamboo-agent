@@ -150,6 +150,10 @@ pub struct Agent {
 }
 
 impl Agent {
+    fn append_user_input(session: &mut Session, input: impl Into<String>) {
+        session.add_message(Message::user(input.into()));
+    }
+
     /// Return a new ergonomic builder.
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
@@ -209,7 +213,7 @@ impl Agent {
         session: &mut Session,
         input: impl Into<String>,
     ) -> Result<(), AgentError> {
-        session.add_message(Message::user(input.into()));
+        Self::append_user_input(session, input);
         self.run_session(session).await
     }
 
@@ -222,7 +226,7 @@ impl Agent {
         input: impl Into<String>,
         cancel_token: CancellationToken,
     ) -> Result<(), AgentError> {
-        session.add_message(Message::user(input.into()));
+        Self::append_user_input(session, input);
         self.run_session_with_cancel(session, cancel_token).await
     }
 
@@ -279,7 +283,7 @@ impl Agent {
         mut session: Session,
         input: impl Into<String>,
     ) -> mpsc::Receiver<AgentEvent> {
-        session.add_message(Message::user(input.into()));
+        Self::append_user_input(&mut session, input);
         self.run_stream_session(session)
     }
 
@@ -292,7 +296,7 @@ impl Agent {
         mut session: Session,
         input: impl Into<String>,
     ) -> (mpsc::Receiver<AgentEvent>, CancellationToken) {
-        session.add_message(Message::user(input.into()));
+        Self::append_user_input(&mut session, input);
         self.run_stream_session_cancellable(session)
     }
 
@@ -2523,5 +2527,372 @@ mod reexecute_and_child_approval_tests {
 
         // One-shot: a replay of the same request_id is rejected.
         assert!(!agent.answer_child_approval("child-x", "req-1", true));
+    }
+}
+
+#[cfg(test)]
+mod constructor_parity_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    #[derive(Default)]
+    struct RecordingProvider(Mutex<Vec<Vec<Message>>>);
+
+    #[async_trait]
+    impl LLMProvider for RecordingProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            self.0.lock().unwrap().push(messages.to_vec());
+            Ok(Box::pin(futures::stream::iter([
+                Ok(bamboo_llm::LLMChunk::Token(
+                    "constructor parity done".into(),
+                )),
+                Ok(bamboo_llm::LLMChunk::Done),
+            ])))
+        }
+    }
+
+    async fn agent(root: &std::path::Path, provider: Arc<dyn LLMProvider>) -> Agent {
+        std::fs::write(root.join("config.json"), r#"{"provider":"anthropic","providers":{"anthropic":{"api_key":"fixture","model":"claude-test"}}}"#).unwrap();
+        Agent::builder()
+            .provider(provider)
+            .session_delivery(bamboo_engine::SessionActivationRouter::new())
+            .model("claude-test")
+            .instruction("constructor fixture")
+            .with_defaults_for_data_dir(root.into())
+            .await
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    struct ObservedInput(Arc<AtomicUsize>);
+    impl From<ObservedInput> for String {
+        fn from(input: ObservedInput) -> Self {
+            input.0.fetch_add(1, Ordering::SeqCst);
+            "fresh 原样\n\"input\"".into()
+        }
+    }
+
+    async fn drain(mut rx: mpsc::Receiver<AgentEvent>) {
+        let mut complete = 0;
+        while let Some(event) = rx.recv().await {
+            assert!(!matches!(event, AgentEvent::Error { .. }), "{event:?}");
+            complete += usize::from(matches!(event, AgentEvent::Complete { .. }));
+        }
+        assert_eq!(complete, 1);
+    }
+
+    #[tokio::test]
+    async fn constructor_parity_four_sdk_fresh_wrappers_append_once_at_original_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let agent = agent(root.path(), provider.clone()).await;
+        for mode in 0..4 {
+            provider.0.lock().unwrap().clear();
+            let mut session = Session::new(format!("constructor-sdk-fresh-{mode}"), "claude-test");
+            let historical = Message::user("historical input");
+            let historical_id = historical.id.clone();
+            session.add_message(historical);
+            let converted = Arc::new(AtomicUsize::new(0));
+            let input = ObservedInput(converted.clone());
+            let before = std::time::SystemTime::now();
+            let mut sync_returned = None;
+            match mode {
+                0 => agent.run(&mut session, input).await.unwrap(),
+                1 => agent
+                    .run_with_cancel(&mut session, input, CancellationToken::new())
+                    .await
+                    .unwrap(),
+                2 => {
+                    let rx = agent.run_stream(session, input);
+                    assert_eq!(
+                        converted.load(Ordering::SeqCst),
+                        1,
+                        "stream constructor stays synchronous"
+                    );
+                    sync_returned = Some(std::time::SystemTime::now());
+                    drain(rx).await;
+                }
+                _ => {
+                    let (rx, cancel) = agent.run_stream_cancellable(session, input);
+                    assert_eq!(converted.load(Ordering::SeqCst), 1);
+                    assert!(!cancel.is_cancelled());
+                    sync_returned = Some(std::time::SystemTime::now());
+                    drain(rx).await;
+                }
+            }
+            assert_eq!(converted.load(Ordering::SeqCst), 1);
+            let persisted = agent
+                .storage()
+                .load_session(&format!("constructor-sdk-fresh-{mode}"))
+                .await
+                .unwrap()
+                .unwrap();
+            let users = persisted
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .collect::<Vec<_>>();
+            assert_eq!(users.len(), 2);
+            assert_eq!(users[0].id, historical_id);
+            assert_eq!(users[1].content, "fresh 原样\n\"input\"");
+            assert_ne!(users[1].id, historical_id);
+            assert!(users[1].content_parts.is_none());
+            let minted: std::time::SystemTime = users[1].created_at.into();
+            assert!(
+                minted >= before
+                    && minted <= sync_returned.unwrap_or_else(std::time::SystemTime::now)
+            );
+            let requests = provider.0.lock().unwrap();
+            assert!(!requests.is_empty(), "actual provider consumer executed");
+            let sent = requests[0]
+                .iter()
+                .filter(|m| m.role == Role::User && m.id == users[1].id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                sent.len(),
+                1,
+                "actual fresh User identity reaches provider once"
+            );
+            assert_eq!(
+                requests[0]
+                    .iter()
+                    .filter(|m| m.role == Role::User && m.id == historical_id)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                serde_json::to_value(sent[0]).unwrap(),
+                serde_json::to_value(users[1]).unwrap(),
+                "minted identity/time/body reach provider and checkpoint unchanged"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn constructor_parity_fresh_append_remains_before_existing_execution_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let agent = agent(root.path(), provider.clone()).await;
+        for mode in 0..4 {
+            let id = format!("constructor-sdk-prelease-{mode}");
+            let mut session = Session::new(&id, "claude-test");
+            let lease = agent.inner.begin_direct_execution(&id).await.unwrap();
+            let converted = Arc::new(AtomicUsize::new(0));
+            let input = ObservedInput(converted.clone());
+            match mode {
+                0 | 1 => {
+                    let result = if mode == 0 {
+                        agent.run(&mut session, input).await
+                    } else {
+                        agent
+                            .run_with_cancel(&mut session, input, CancellationToken::new())
+                            .await
+                    };
+                    assert!(
+                        result.is_err(),
+                        "occupied direct lease must still reject execution"
+                    );
+                    let users = session
+                        .messages
+                        .iter()
+                        .filter(|m| m.role == Role::User)
+                        .collect::<Vec<_>>();
+                    assert_eq!(users.len(), 1, "existing fresh append precedes rejection");
+                    assert_eq!(users[0].content, "fresh 原样\n\"input\"");
+                }
+                _ => {
+                    let mut rx = if mode == 2 {
+                        agent.run_stream(session, input)
+                    } else {
+                        agent.run_stream_cancellable(session, input).0
+                    };
+                    assert_eq!(
+                        converted.load(Ordering::SeqCst),
+                        1,
+                        "synchronous conversion cannot move behind spawn/lease"
+                    );
+                    let mut errors = 0;
+                    while let Some(event) = rx.recv().await {
+                        errors += usize::from(matches!(event, AgentEvent::Error { .. }));
+                        assert!(!matches!(event, AgentEvent::Complete { .. }));
+                    }
+                    assert_eq!(
+                        errors, 0,
+                        "original prelease failure closes the stream without an Error event"
+                    );
+                }
+            }
+            assert_eq!(converted.load(Ordering::SeqCst), 1);
+            assert!(provider.0.lock().unwrap().is_empty());
+            lease.abandon().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn constructor_parity_session_resume_and_execute_do_not_append_fresh_users() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let agent = agent(root.path(), provider.clone()).await;
+        for mode in 0..10 {
+            provider.0.lock().unwrap().clear();
+            let id = format!("constructor-sdk-session-only-{mode}");
+            let mut session = Session::new(&id, "claude-test");
+            let historical = Message::user("original history, never new input");
+            let expected = serde_json::to_value(&historical).unwrap();
+            session.add_message(historical);
+            match mode {
+                0 => agent.run_session(&mut session).await.unwrap(),
+                1 => agent
+                    .run_session_with_cancel(&mut session, CancellationToken::new())
+                    .await
+                    .unwrap(),
+                2 => drain(agent.run_stream_session(session)).await,
+                3 => drain(agent.run_stream_session_cancellable(session).0).await,
+                4 => {
+                    drain(agent.run_stream_session_with_cancel(session, CancellationToken::new()))
+                        .await
+                }
+                5 => agent.resume(&mut session).await.unwrap(),
+                6 => agent
+                    .resume_with_cancel(&mut session, CancellationToken::new())
+                    .await
+                    .unwrap(),
+                7 => drain(agent.resume_stream(session)).await,
+                8 => drain(agent.resume_stream_cancellable(session).0).await,
+                _ => {
+                    let (tx, mut rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+                    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+                    agent
+                        .execute(
+                            &mut session,
+                            ExecuteRequestBuilder::new(
+                                "request text cannot append User",
+                                tx,
+                                CancellationToken::new(),
+                            )
+                            .model("claude-test")
+                            .build(),
+                        )
+                        .await
+                        .unwrap();
+                    drain.abort();
+                }
+            }
+            let persisted = agent.storage().load_session(&id).await.unwrap().unwrap();
+            let users = persisted
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .collect::<Vec<_>>();
+            assert_eq!(users.len(), 1);
+            assert_eq!(serde_json::to_value(users[0]).unwrap(), expected);
+            let requests = provider.0.lock().unwrap();
+            assert!(!requests.is_empty());
+            let sent = requests[0]
+                .iter()
+                .filter(|m| m.role == Role::User && m.id == users[0].id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                sent.len(),
+                1,
+                "supplied historical User reaches provider once"
+            );
+            assert_eq!(serde_json::to_value(sent[0]).unwrap(), expected);
+        }
+    }
+
+    #[derive(Default)]
+    struct PendingProvider {
+        requests: Mutex<Vec<Vec<Message>>>,
+        started: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl LLMProvider for PendingProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            self.started.notify_one();
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+
+    #[tokio::test]
+    async fn constructor_parity_sdk_cancellation_keeps_the_consumed_fresh_user() {
+        for streaming in [false, true] {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let root = tempfile::tempdir().unwrap();
+                let provider = Arc::new(PendingProvider::default());
+                let agent = agent(root.path(), provider.clone()).await;
+                let id = format!("constructor-sdk-cancel-{streaming}");
+                let mut session = Session::new(&id, "claude-test");
+                let converted = Arc::new(AtomicUsize::new(0));
+                let input = ObservedInput(converted.clone());
+                if streaming {
+                    let (mut rx, cancel) = agent.run_stream_cancellable(session, input);
+                    assert_eq!(converted.load(Ordering::SeqCst), 1);
+                    provider.started.notified().await;
+                    cancel.cancel();
+                    let (mut errors, mut complete, mut cancelled) = (0, 0, 0);
+                    while let Some(event) = rx.recv().await {
+                        errors += usize::from(matches!(event, AgentEvent::Error { .. }));
+                        complete += usize::from(matches!(event, AgentEvent::Complete { .. }));
+                        cancelled += usize::from(matches!(event, AgentEvent::Cancelled { .. }));
+                    }
+                    assert_eq!(
+                        (errors, complete, cancelled),
+                        (0, 0, 0),
+                        "original SDK cancellation closes the stream without a terminal event"
+                    );
+                } else {
+                    let cancel = CancellationToken::new();
+                    let stop = cancel.clone();
+                    let execution = agent.clone();
+                    let task = tokio::spawn(async move {
+                        execution.run_with_cancel(&mut session, input, cancel).await
+                    });
+                    provider.started.notified().await;
+                    stop.cancel();
+                    assert!(matches!(task.await.unwrap(), Err(AgentError::Cancelled)));
+                }
+                assert_eq!(converted.load(Ordering::SeqCst), 1);
+                let persisted = agent.storage().load_session(&id).await.unwrap().unwrap();
+                let users = persisted
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == Role::User)
+                    .collect::<Vec<_>>();
+                assert_eq!(users.len(), 1);
+                assert_eq!(users[0].content, "fresh 原样\n\"input\"");
+                let requests = provider.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                let sent = requests[0]
+                    .iter()
+                    .filter(|m| m.role == Role::User && m.id == users[0].id)
+                    .collect::<Vec<_>>();
+                assert_eq!(sent.len(), 1);
+                assert_eq!(
+                    serde_json::to_value(users[0]).unwrap(),
+                    serde_json::to_value(sent[0]).unwrap()
+                );
+            })
+            .await
+            .expect("actual provider cancellation must terminate");
+        }
     }
 }
