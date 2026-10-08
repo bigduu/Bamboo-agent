@@ -2371,7 +2371,31 @@ impl ChildExecutor for BambooRuntimeExecutor {
                     .unwrap_or_default();
                 ChildOutcome::completed(text)
             }
-            Err(AgentError::Cancelled) => ChildOutcome::cancelled(),
+            Err(AgentError::Cancelled) => {
+                // Execution has stopped. Supply the existing bounded DATA only
+                // on a selected strict Read/Glob route; the Host independently
+                // validates and checkpoints it before proving this cancellation.
+                if self.local_tool_history
+                    && self.read_only_child
+                    && self.native_tool_ceiling.as_ref().is_some_and(|ceiling| {
+                        !ceiling.tools.is_empty()
+                            && ceiling
+                                .tools
+                                .iter()
+                                .all(|name| matches!(name.as_str(), "Read" | "Glob"))
+                    })
+                {
+                    if let Ok(observation) = local_tool_completion(&session) {
+                        tail_events
+                            .emit(
+                                serde_json::to_value(observation)
+                                    .expect("validated local cancellation DATA"),
+                            )
+                            .await;
+                    }
+                }
+                ChildOutcome::cancelled()
+            }
             Err(e) => ChildOutcome::error(e.to_string()),
         }
     }
