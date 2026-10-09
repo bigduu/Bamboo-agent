@@ -403,8 +403,8 @@ impl Fixture {
             .post(format!("{}/chat", a.base))
             .json(&json!({
                 "session_id":root,"message":INPUT,"model":"writer-root","provider":"openai",
-                "model_ref":{"provider":"openai","model":"writer-root"},"thinking_mode":"standard",
-                "permission_mode":"default","root_orchestration_only":false,"workspace_path":workspace
+                "model_ref":{"provider":"openai","model":"writer-root"},
+                "permission_mode":"default","workspace_path":workspace
             }))
             .send()
             .await
