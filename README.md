@@ -94,7 +94,7 @@ No key yet? `bamboo -p "ping" --echo` is a **transport smoke test only**: it use
 
 ### Call it from your application
 
-With a configured provider and running server, the legacy HTTP/SSE sequence is **chat → subscribe → execute**. `chat` persists the message; `execute` starts the agent loop. The example requires `curl` and `jq`; replace the model with one your account supports. In terminal A, create the session and open its live event stream:
+With a configured provider and running server, the legacy HTTP/SSE sequence is **chat → subscribe → execute**. Native `chat` saves session configuration and admits a typed Inbox message with its own RespectSpecificWait intent. Canonical history and `MessageAppended` appear when an existing same-session consumer checkpoints and ACKs it; `execute` starts the agent loop. The example requires `curl` and `jq`; replace the model with one your account supports. In terminal A, create the session and open its live event stream:
 
 ```bash
 SID=$(curl -fsS http://127.0.0.1:9562/api/v1/chat \
@@ -111,6 +111,17 @@ SID="<session-id printed in terminal A>"
 curl -fsS -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
   -H 'Content-Type: application/json' -d '{}'
 ```
+
+Native Chat returns the actual `message_id` and `ingress_seq` receipt fields.
+Its serialized envelope is limited to 256 KiB and must contain semantic content;
+attachments are kept whole, including duplicate images and more than 16 images.
+There is no truncation to fit the limit. Chat without a consumer leaves the input
+in the Inbox and does not append history, emit `MessageAppended`, or start a title.
+Automatic title work moves to checked Native admission followed by successful
+HTTP Ready startup. A running owner or another legitimate same-session activation
+may consume the message before the client's execute request. The specific intent
+does not release staged child/Bash outcomes; their coordinator retains that order.
+Referenced/ticket and Root ingress keep their existing scheduling rules.
 
 Watch terminal A for live events; subscribing after execution can miss response tokens. The browser uses the shared `/v2/stream` WebSocket; legacy SSE routes remain available.
 
@@ -211,6 +222,20 @@ before rendering and before success. Only ordinary Message data and warnings
 return; no Session, pin or reader permission is written. No production caller
 uses this factory. Its fixtures establish preparation, not live runtime cutover.
 
+Its `prepare_input_with_owner` entry borrows the host's active persistence guard
+and checks the same Session and coordinator map before reading. It compares the
+complete durable checkpoint separately from the request-local candidate; only
+hook observations and the prompt precheck may differ. Runtime permission fields,
+identity, transcript and host authority must remain equal. The borrowed entry
+uses a synchronous resolver that denies by default and does not reenter the
+Session or Config owner. Store refresh may run under the borrowed Session owner;
+it takes no host Config lock or Session callback and retains no publication guard.
+Both entries acquire retained Config after Session and before publication, then
+validate current caller revocation after the final await. The SDK's
+private User construction and append helpers retain one exact message ID/time
+and all four wrappers' original synchronous append, lease and error order.
+These preparations do not connect HTTP, runtime, Reader or production authority.
+
 The runner's existing Instruction activation path is factored into a private,
 stateless `legacy_instruction` adapter. It still publishes the selected pin,
 requires one model-issued `load_skill` call, suppresses first-round answer text,
@@ -236,9 +261,9 @@ This adapter adds no caller grant, Session field, reader registration or
 additional writer. The pure prepared-input helpers remain unwired.
 
 Native chat and queued HTTP input use private constructors for the same User
-Message and inbox envelope. Native chat retains its attachment storage, append
-and pending marker; queued input retains authenticated admission and its durable
-retry identity. The four fresh-input SDK wrappers share one synchronous append
+Message and inbox envelope. Native chat retains its real ID, timestamp and nondeduplicated attachments;
+the existing consumer checkpoints its User and pending handoff. Queued input
+retains authenticated admission and its durable retry identity. The four fresh-input SDK wrappers share one synchronous append
 helper at their original call positions, including synchronous stream creation.
 Session-only execution and resume retain their supplied history. These helpers
 preserve the existing public and serialized layouts and introduce no Skill
@@ -334,8 +359,8 @@ whole-envelope Inbox limit. Guidance, peer messages and child/runtime
 presentation cannot turn this data into a fresh User request.
 
 Execution wrappers can carry a separately owned `UntrustedExecutionInputs`
-parameter into the execution-private config. HTTP checked queue admission
-supplies only this call's newly committed User IDs after ACK succeeds; SDK
+parameter into the execution-private config. HTTP checked Native and queue admission
+supply only this call's newly committed User IDs after ACK succeeds; SDK
 `run`, `run_with_cancel`, `run_stream` and `run_stream_cancellable` supply the
 exact User each just appended, with no request derived from its text.
 Old session/resume/custom execute/spawn entrypoints default to `None`.
@@ -347,7 +372,7 @@ Admission/startup failure drops the local data; transcript recovery cannot
 mint it again. No message/images, Skill bodies or Source authority objects
 are retained. This remains unwired caller data, without preparation, Reader
 registration, resource reads, grants or a live Skill cutover. Native nonqueued
-Chat still requires its own accepted fresh handoff; history cannot supply it.
+Chat uses the same checked Inbox handoff; NoNew and history cannot reconstruct it.
 
 A separate unwired Engine helper can project borrowed request records into one
 bounded, untrusted batch. It checks all original I-W request data, then charges

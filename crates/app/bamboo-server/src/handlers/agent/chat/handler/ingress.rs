@@ -244,80 +244,290 @@ pub(super) async fn queue(
     Ok(Some(receipt))
 }
 
-/// Fresh HTTP execute needs a User turn before its legacy preparation gate.
-/// Reuse the SDK's exact checkpoint/receipt/ACK boundary, and never compete
-/// with a live runner's inbox consumer. This adapter owns no second protocol.
+/// Only this invocation's checked admission supplies input data and title work.
+#[derive(Default)]
+pub(crate) struct ExecuteAdmission {
+    pub inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
+    pub generate_title: bool,
+}
+
 pub(crate) async fn admit_for_execute(
     state: &AppState,
     id: &str,
 ) -> ResponseResult<Option<bamboo_engine::config::UntrustedExecutionInputs>> {
-    let runners = state.agent_runners.read().await;
-    if runners.get(id).is_some_and(|r| {
-        matches!(
-            r.status,
-            crate::app_state::AgentStatus::Pending | crate::app_state::AgentStatus::Running
-        )
-    }) {
-        return Ok(None);
-    }
-    let Some(mut session) = state
-        .storage
-        .load_session(id)
+    state
+        .admit_chat_for_execute_inner(id)
         .await
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map(|admission| admission.inputs)
+}
+
+impl AppState {
+    /// Keep the existing runner/startup owner and SDK checkpoint/ACK boundary.
+    pub(crate) async fn admit_chat_for_execute(
+        &self,
+        id: &str,
+    ) -> ResponseResult<ExecuteAdmission> {
+        let legacy_queue = self
+            .storage
+            .load_session(id)
+            .await
+            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .is_some_and(|session| session.metadata.contains_key("chat.queued_ingress.v1"));
+        if legacy_queue {
+            // Preserve the existing data-only adapter for referenced transport.
+            // Its own checked owner/admission re-read remains authoritative.
+            return crate::handlers::agent::chat::admit_for_execute(self, id)
+                .await
+                .map(|inputs| ExecuteAdmission {
+                    inputs,
+                    generate_title: false,
+                });
+        }
+        self.admit_chat_for_execute_inner(id).await
+    }
+
+    async fn admit_chat_for_execute_inner(&self, id: &str) -> ResponseResult<ExecuteAdmission> {
+        let runners = self.agent_runners.read().await;
+        if runners.get(id).is_some_and(|r| {
+            matches!(
+                r.status,
+                crate::app_state::AgentStatus::Pending | crate::app_state::AgentStatus::Running
+            )
+        }) {
+            return Ok(ExecuteAdmission::default());
+        }
+        let Some(mut session) = self
+            .storage
+            .load_session(id)
+            .await
+            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        else {
+            return Ok(ExecuteAdmission::default());
+        };
+        let queued_id = session.metadata.get("chat.queued_ingress.v1").cloned();
+        // Inspection selects an attempt; it neither grants a sibling nor proves Fresh.
+        if queued_id.is_none()
+            && !self
+                .session_inbox
+                .inspect(id)
+                .await
+                .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?
+                .activation_pending()
+        {
+            recover_user_handoff(self, &session).await?;
+            return Ok(ExecuteAdmission::default());
+        }
+        let persistence: std::sync::Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            self.persistence.clone();
+        let (refreshed, inputs) =
+            bamboo_engine::config::UntrustedExecutionInputs::admit_with_startup_observation(
+                &mut session,
+                Some(&self.storage),
+                Some(&persistence),
+                Some(&self.session_inbox),
+            )
+            .await;
+        // Preserve committed prefix events even when a later ACK/tail rejects startup.
+        for message in &refreshed.committed_messages {
+            self.account_sink.record(
+                Some(id),
+                &bamboo_agent_core::AgentEvent::message_appended(id, message),
+            );
+        }
+        if let Some(reason) = refreshed.admission_error {
+            return Err(error(StatusCode::SERVICE_UNAVAILABLE, reason).into());
+        }
+        let generate_title = queued_id.is_none()
+            && refreshed
+                .committed_messages
+                .iter()
+                .any(|message| checked_user(&session.id, message));
+        if let Some(queued_id) = queued_id {
+            if !session.messages.iter().any(|m| m.id == queued_id) {
+                return Err(error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Queued User admission is still pending; retry execute",
+                )
+                .into());
+            }
+            let _guard = self.persistence.acquire_lock(id).await;
+            let mut latest = self
+                .persistence
+                .storage()
+                .load_session(id)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+                .ok_or_else(|| error(StatusCode::NOT_FOUND, "Session missing"))?;
+            if latest.metadata.get("chat.queued_ingress.v1") == Some(&queued_id) {
+                latest.metadata.remove("chat.queued_ingress.v1");
+                crate::handlers::agent::events::mark_pending_turn(&mut latest);
+                super::persist_and_cache_session_locked(self, &latest)
+                    .await
+                    .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            }
+        } else if !recover_user_handoff(self, &session).await? {
+            return Err(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "User handoff changed during admission; retry execute",
+            )
+            .into());
+        }
+        Ok(ExecuteAdmission {
+            inputs,
+            generate_title,
+        })
+    }
+}
+
+// Typed identity is used for scheduling effects only. History never creates IE/Q.
+fn checked_user(id: &str, message: &bamboo_agent_core::Message) -> bool {
+    let Some(proof) = message
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("session_message"))
     else {
-        return Ok(None);
+        return false;
     };
-    let Some(queued_id) = session.metadata.get("chat.queued_ingress.v1").cloned() else {
-        return Ok(None);
+    if proof
+        .get("source")
+        .and_then(|s| s.get("type"))
+        .and_then(|s| s.as_str())
+        != Some("user")
+        || proof.get("kind").and_then(|s| s.as_str()) != Some("user_input")
+        || proof.get("target_session_id").and_then(|s| s.as_str()) != Some(id)
+    {
+        return false;
+    }
+    let Ok(envelope) = <SessionMessageEnvelope as serde::Deserialize>::deserialize(proof) else {
+        return false;
     };
-    let persistence: std::sync::Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
-        state.persistence.clone();
-    let (refreshed, inputs) =
-        bamboo_engine::config::UntrustedExecutionInputs::admit_with_startup_observation(
-            &mut session,
-            Some(&state.storage),
-            Some(&persistence),
-            Some(&state.session_inbox),
-        )
-        .await;
-    // SDK admission may durably commit and ACK one bounded batch while the
-    // newest queued input is still pending. Emit every committed message even
-    // when this call must return a retryable admission error or tail response.
-    for message in &refreshed.committed_messages {
-        state.account_sink.record(
-            Some(id),
-            &bamboo_agent_core::AgentEvent::message_appended(id, message),
-        );
-    }
-    if let Some(reason) = refreshed.admission_error {
-        return Err(error(StatusCode::SERVICE_UNAVAILABLE, reason).into());
-    }
-    if !session.messages.iter().any(|m| m.id == queued_id) {
-        return Err(error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Queued User admission is still pending; retry execute",
-        )
-        .into());
-    }
-    let _guard = state.persistence.acquire_lock(id).await;
+    bamboo_domain::is_matching_session_message(message, &envelope)
+}
+
+async fn recover_user_handoff(state: &AppState, observed: &Session) -> ResponseResult<bool> {
+    let Some(user) = observed
+        .messages
+        .last()
+        .filter(|m| checked_user(&observed.id, m))
+    else {
+        return Ok(true);
+    };
+    let _guard = state.persistence.acquire_lock(&observed.id).await;
     let mut latest = state
         .persistence
         .storage()
-        .load_session(id)
+        .load_session(&observed.id)
         .await
         .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Session missing"))?;
-    if latest.metadata.get("chat.queued_ingress.v1") == Some(&queued_id) {
-        latest.metadata.remove("chat.queued_ingress.v1");
+    if !latest
+        .messages
+        .last()
+        .is_some_and(|m| m.id == user.id && checked_user(&latest.id, m))
+    {
+        return Ok(false);
+    }
+    if crate::handlers::agent::events::startup_work_id(&latest).is_none()
+        && bamboo_engine::session_app::execute::has_pending_user_message(&latest)
+        && latest.last_run_status().as_deref() != Some("running")
+    {
+        // Preserve a running turn while repairing an ACKed handoff token.
+        // Repair only its old scheduling token; no New seal, data or title is minted.
         crate::handlers::agent::events::mark_pending_turn(&mut latest);
         super::persist_and_cache_session_locked(state, &latest)
             .await
             .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
-    // Return data only after the entire checked admission/startup handoff
-    // succeeds. A retry/recovered transcript is not a new observation.
-    Ok(inputs)
+    Ok(true)
+}
+
+pub(super) async fn commit_native_input(
+    state: actix_web::web::Data<AppState>,
+    mut session: Session,
+    mut staging: Option<super::legacy_selection::StagedWorkflowActivation>,
+    workflow_changed: bool,
+    envelope: SessionMessageEnvelope,
+    persistence_guard: bamboo_storage::session_merge::SessionLockGuard,
+    workflow_guard: Option<
+        tokio::sync::OwnedRwLockReadGuard<
+            std::collections::HashMap<String, crate::app_state::AgentRunner>,
+        >,
+    >,
+) -> ResponseResult<SessionInboxReceipt> {
+    let commit = tokio::spawn(async move {
+        let host_guard = persistence_guard;
+        if let Some(staging) = staging.as_ref() {
+            staging.apply(&mut session.metadata);
+        }
+        let result = async {
+            super::persist_and_cache_session_locked(&state, &session)
+                .await
+                .map_err(|e| e.to_string())?;
+            state
+                .session_messenger
+                .admit_with_activation_intent(
+                    envelope,
+                    bamboo_domain::SessionActivationPolicy::RespectSpecificWait,
+                    None,
+                )
+                .await
+                .map_err(|e| e.to_string())
+        }
+        .await;
+        if result.is_ok() {
+            #[cfg(test)]
+            wait_native_post_save(&session.id).await;
+            if workflow_changed {
+                if let Err(error) = state
+                    .skill_manager
+                    .release_activation_for_workspace(&session.id, None)
+                    .await
+                {
+                    tracing::error!(session_id = %session.id, %error, "failed to release prior Workflow activation after Native commit");
+                }
+            }
+        }
+        if let Some(staging) = staging.as_mut() {
+            staging.release().await;
+        }
+        drop(workflow_guard);
+        drop(host_guard);
+        result.map(|admission| admission.delivery)
+    });
+    commit
+        .await
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e).into())
+}
+
+#[cfg(test)]
+static NATIVE_POST_SAVE: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<super::legacy_selection::WorkflowCommitTestBarrier>,
+        >,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+pub(super) fn install_native_post_save(
+    id: &str,
+) -> std::sync::Arc<super::legacy_selection::WorkflowCommitTestBarrier> {
+    let barrier =
+        std::sync::Arc::new(super::legacy_selection::WorkflowCommitTestBarrier::default());
+    NATIVE_POST_SAVE
+        .lock()
+        .unwrap()
+        .insert(id.into(), barrier.clone());
+    barrier
+}
+#[cfg(test)]
+async fn wait_native_post_save(id: &str) {
+    let barrier = NATIVE_POST_SAVE.lock().unwrap().remove(id);
+    if let Some(barrier) = barrier {
+        barrier.reached.add_permits(1);
+        barrier.resume.acquire().await.unwrap().forget();
+    }
 }
 
 #[cfg(test)]

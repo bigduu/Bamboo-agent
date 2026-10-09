@@ -150,17 +150,36 @@ pub struct Agent {
 }
 
 impl Agent {
+    fn construct_user_input(
+        input: impl Into<String>,
+    ) -> (
+        Message,
+        Option<bamboo_engine::config::UntrustedExecutionInputs>,
+    ) {
+        let message = Message::user(input.into());
+        // Observe this exact constructor; never decode text/config/history.
+        let inputs = bamboo_engine::config::UntrustedInputObservation::new(&message.id, None)
+            .and_then(|input| bamboo_engine::config::UntrustedExecutionInputs::new(vec![input]));
+        (message, inputs)
+    }
+
+    fn append_constructed_user_input(
+        session: &mut Session,
+        (message, inputs): (
+            Message,
+            Option<bamboo_engine::config::UntrustedExecutionInputs>,
+        ),
+    ) -> Option<bamboo_engine::config::UntrustedExecutionInputs> {
+        session.add_message(message);
+        inputs
+    }
+
     fn append_user_input(
         session: &mut Session,
         input: impl Into<String>,
     ) -> Option<bamboo_engine::config::UntrustedExecutionInputs> {
-        let message = Message::user(input.into());
-        // The observation belongs to this exact constructor, not a last-User
-        // lookup or a decoder of caller text/config/historical proof.
-        let inputs = bamboo_engine::config::UntrustedInputObservation::new(&message.id, None)
-            .and_then(|input| bamboo_engine::config::UntrustedExecutionInputs::new(vec![input]));
-        session.add_message(message);
-        inputs
+        // The four wrappers retain consecutive synchronous construct -> append.
+        Self::append_constructed_user_input(session, Self::construct_user_input(input))
     }
 
     /// Return a new ergonomic builder.
@@ -2706,6 +2725,54 @@ mod constructor_parity_tests {
             complete += usize::from(matches!(event, AgentEvent::Complete { .. }));
         }
         assert_eq!(complete, 1);
+    }
+
+    #[test]
+    fn constructor_parity_owned_user_can_be_prepared_before_append_without_reminting() {
+        let mut session = Session::new("constructor-staged", "model");
+        session.add_message(Message::user("history"));
+        let before = serde_json::to_value(&session).unwrap();
+        let converted = Arc::new(AtomicUsize::new(0));
+        let (user, inputs) = Agent::construct_user_input(ObservedInput(converted.clone()));
+        let original = serde_json::to_value(&user).unwrap();
+        assert_eq!(converted.load(Ordering::SeqCst), 1);
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        assert_eq!(
+            inputs.as_ref().unwrap().observations()[0].input_id(),
+            user.id
+        );
+        assert!(inputs.as_ref().unwrap().observations()[0]
+            .request()
+            .is_none());
+        let prepared = bamboo_engine::session_app::skill_input::prepare_current_skill_input(
+            &user,
+            Err("no authority or explicit request"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(&prepared.message).unwrap(), original);
+        let mut invalid = user.clone();
+        invalid.role = Role::Assistant;
+        assert!(
+            bamboo_engine::session_app::skill_input::prepare_current_skill_input(
+                &invalid,
+                Err("unavailable"),
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        let inputs = Agent::append_constructed_user_input(&mut session, (prepared.message, inputs));
+        assert_eq!(
+            serde_json::to_value(session.messages.last().unwrap()).unwrap(),
+            original
+        );
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(
+            inputs.as_ref().unwrap().observations()[0].input_id(),
+            user.id
+        );
+        assert_eq!(converted.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

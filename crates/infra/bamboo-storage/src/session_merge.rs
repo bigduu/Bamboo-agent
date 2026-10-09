@@ -725,6 +725,22 @@ impl LockedSessionStore {
         guard
     }
 
+    /// Check a borrowed process-serialization owner without acquiring another lock.
+    /// Bound writer views share this lock map; independent stores do not. This
+    /// proves no durable writer fence, current caller or Skill/Source authority.
+    pub fn validate_lock(&self, owner: &SessionLockGuard, session_id: &str) -> std::io::Result<()> {
+        if owner.guard.is_none()
+            || owner.session_id != session_id
+            || !Arc::ptr_eq(&owner.locks, &self.locks)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Session persistence owner does not match this coordinator and session",
+            ));
+        }
+        Ok(())
+    }
+
     /// Save a full snapshot while preserving Task generations advanced by an
     /// independent store instance. V2 rejects such a stale write before any
     /// mutation; reloading and adopting only Task-owned fields makes the retry,
@@ -8163,6 +8179,52 @@ mod tests {
     }
 
     // ── Self-cleaning per-session lock (issue #346) ─────────────────
+
+    #[tokio::test]
+    async fn validate_lock_requires_active_same_session_same_map_and_accepts_bound_view() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let independent = LockedSessionStore::new(storage);
+        let owner = store.acquire_lock("owned").await;
+        assert!(store.validate_lock(&owner, "owned").is_ok());
+        assert!(store.validate_lock(&owner, "other").is_err());
+        assert!(independent.validate_lock(&owner, "owned").is_err());
+        let mut session = fresh("owned");
+        let mut runtime = bamboo_domain::AgentRuntimeState::new("owned");
+        runtime.waiting_for_children = Some(bamboo_domain::WaitingForChildrenState::for_children(
+            vec!["child".into()],
+            Default::default(),
+            chrono::Utc::now(),
+        ));
+        session.agent_runtime_state = Some(runtime);
+        let bound = store.bind_inherited_child_wait(
+            bamboo_domain::InheritedChildWait::capture(&session).unwrap(),
+        );
+        assert!(bound.validate_lock(&owner, "owned").is_ok());
+        let inactive = SessionLockGuard {
+            guard: None,
+            locks: store.locks.clone(),
+            session_id: "owned".into(),
+        };
+        assert!(store.validate_lock(&inactive, "owned").is_err());
+        drop(inactive);
+        let mut waiter = Box::pin(bound.acquire_lock("owned"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiter)
+                .await
+                .is_err()
+        );
+        drop(waiter);
+        drop(owner);
+        assert_eq!(store.locks.len(), 0);
+        let successor = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            bound.acquire_lock("owned"),
+        )
+        .await
+        .unwrap();
+        assert!(store.validate_lock(&successor, "owned").is_ok());
+    }
 
     #[tokio::test]
     async fn acquire_lock_self_evicts_when_no_other_holder() {

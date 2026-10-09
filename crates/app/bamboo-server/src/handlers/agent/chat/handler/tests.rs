@@ -1,6 +1,28 @@
 use super::request::{optional_non_empty, resolve_model, resolve_session_id};
 use super::sync_runtime_workspace;
 use bamboo_agent_core::Session;
+// Bootstrap old Root-policy fixtures through the same real Native consumer.
+// Its actual checked carrier belongs to the initial turn, never the target turn.
+async fn consume_native_bootstrap(state: &actix_web::web::Data<crate::AppState>, id: &str) {
+    let claims = state.session_inbox.claim(id, 128).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(
+        claims[0].activation_policy,
+        bamboo_domain::SessionActivationPolicy::RespectSpecificWait
+    );
+    let input_id = claims[0].envelope.id.as_str();
+    let admitted = state.admit_chat_for_execute(id).await.unwrap();
+    let inputs = admitted.inputs.unwrap();
+    assert_eq!(inputs.observations().len(), 1);
+    assert_eq!(inputs.observations()[0].input_id(), input_id);
+    assert!(state
+        .session_inbox
+        .was_admitted(id, &claims[0].envelope.id)
+        .await
+        .unwrap());
+    assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 0);
+    drop(inputs);
+}
 
 #[actix_web::test]
 async fn ql_http_existing_queue_fit_or_overflow_keeps_prefix_events_and_pending_handoff() {
@@ -124,6 +146,31 @@ async fn partial_queued_ingress_emits_every_committed_message_before_retry() {
     )
     .await;
     assert_eq!(initial.status(), actix_web::http::StatusCode::CREATED);
+    let first: serde_json::Value = serde_json::from_slice(
+        &actix_web::body::to_bytes(initial.into_body())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let bootstrap = super::ingress::admit_for_execute(&state, "partial-batch-root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bootstrap.observations().len(), 1);
+    assert_eq!(
+        bootstrap.observations()[0].input_id(),
+        first["message_id"].as_str().unwrap()
+    );
+    drop(bootstrap);
+    assert_eq!(
+        state
+            .session_inbox
+            .inspect("partial-batch-root")
+            .await
+            .unwrap()
+            .pending,
+        0
+    );
     for index in 0..129 {
         let response = super::handler(
             state.clone(),
@@ -241,6 +288,7 @@ async fn ticket_review_queued_ingress_does_not_requeue_activated_root_history() 
     )
     .await;
     assert_eq!(first.status(), actix_web::http::StatusCode::CREATED);
+    consume_native_bootstrap(&state, "queued-owned-root").await;
     let session = state
         .storage
         .load_session("queued-owned-root")
@@ -372,6 +420,7 @@ async fn activated_root_chat_preserves_handoff_and_commits_multimodal_input_once
     )
     .await;
     assert_eq!(first.status(), actix_web::http::StatusCode::CREATED);
+    consume_native_bootstrap(&state, "owned-chat-image").await;
     let mut session = state
         .storage
         .load_session("owned-chat-image")
@@ -1800,9 +1849,15 @@ mod optional_model_e2e {
             _messages: &[bamboo_agent_core::Message],
             _tools: &[bamboo_agent_core::ToolSchema],
             _max_output_tokens: Option<u32>,
-            _model: &str,
+            model: &str,
             options: Option<&LLMRequestOptions>,
         ) -> Result<LLMStream, LLMError> {
+            if model != "title-model" {
+                return Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(LLMChunk::Token("Answered by local Runtime fixture".into())),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
             assert_eq!(
                 options.and_then(|value| value.request_purpose.as_deref()),
                 Some("title_generation")
@@ -1873,6 +1928,12 @@ mod optional_model_e2e {
         assert_eq!(response.status(), StatusCode::CREATED);
         let persisted = state.storage.load_session(id).await.unwrap().unwrap();
         assert!(persisted.authority_identity.is_ordinary());
+        assert!(!persisted
+            .messages
+            .iter()
+            .any(|m| m.role == bamboo_agent_core::Role::User));
+        drop(state.admit_chat_for_execute(id).await.unwrap());
+        let persisted = state.storage.load_session(id).await.unwrap().unwrap();
         assert!(persisted
             .messages
             .iter()
@@ -1896,11 +1957,10 @@ mod optional_model_e2e {
             .is_ordinary());
     }
 
-    /// #793: a durable user message is the trigger. No `/execute` request is
-    /// made, and a second message while the provider is blocked must not start
-    /// duplicate title work.
+    /// Native Chat delays title work until real checked admission and Ready.
+    /// Preserve #793's single in-flight provider call and one metadata event.
     #[actix_web::test]
-    async fn chat_starts_title_generation_before_execute_and_deduplicates_inflight_work() {
+    async fn native_title_waits_for_checked_ready_and_deduplicates_inflight_work() {
         let provider = BlockingTitleProvider::new();
         let state = title_test_state(provider.clone()).await;
         let app = test::init_service(
@@ -1910,6 +1970,13 @@ mod optional_model_e2e {
         )
         .await;
         let session_id = "chat-title-before-execute";
+        let mut parent = Session::new("native-title-parent", "chat-model");
+        state.save_and_cache_session(&mut parent).await;
+        let mut child =
+            Session::new_child_of(session_id, &parent, "chat-model", "Unfinished title");
+        // Explicit unfinished-title fixture; ordinary children default to true.
+        child.title_generated = false;
+        state.save_and_cache_session(&mut child).await;
         let sender = state.get_session_event_sender(session_id).await;
         let mut title_events = sender.subscribe();
 
@@ -1927,12 +1994,39 @@ mod optional_model_e2e {
         .await;
         assert_eq!(response.status(), StatusCode::CREATED);
 
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "Chat without execute starts no title work"
+        );
+        let before = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!before
+            .messages
+            .iter()
+            .any(|m| m.role == bamboo_agent_core::Role::User));
+        let execution = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{session_id}"))
+                .set_json(serde_json::json!({"model":"chat-model"}))
+                .to_request(),
+        )
+        .await;
+        let execution_status = execution.status();
+        let execution_body: Value = test::read_body_json(execution).await;
+        assert_eq!(execution_status, StatusCode::ACCEPTED, "{execution_body}");
+        let first_run = execution_body["run_id"].as_str().unwrap().to_owned();
         let _started = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             provider.started.acquire(),
         )
         .await
-        .expect("title provider started without /execute")
+        .expect("checked Ready starts the title provider")
         .expect("started semaphore stays open");
 
         let pending = state
@@ -1944,6 +2038,30 @@ mod optional_model_e2e {
         assert!(!pending.title_generated);
         assert_eq!(pending.title_version, 0);
 
+        tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
+            loop {
+                if state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(session_id)
+                    .is_some_and(|runner| {
+                        runner.run_id == first_run
+                            && matches!(runner.status, crate::app_state::AgentStatus::Completed)
+                    })
+                    && state
+                        .session_activation_router
+                        .current_run_id(session_id)
+                        .await
+                        .is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first exact Runtime completes and releases its original activation owner");
         let second = test::call_service(
             &app,
             test::TestRequest::post()
@@ -1957,6 +2075,17 @@ mod optional_model_e2e {
         )
         .await;
         assert_eq!(second.status(), StatusCode::CREATED);
+        let second_execution = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{session_id}"))
+                .set_json(serde_json::json!({"model":"chat-model"}))
+                .to_request(),
+        )
+        .await;
+        let second_status = second_execution.status();
+        let second_body: Value = test::read_body_json(second_execution).await;
+        assert_eq!(second_status, StatusCode::ACCEPTED, "{second_body}");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
 
@@ -1982,11 +2111,19 @@ mod optional_model_e2e {
         assert_eq!(finalized.title_version, 1);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
 
-        let event =
-            tokio::time::timeout(std::time::Duration::from_millis(500), title_events.recv())
-                .await
-                .expect("one title event arrives")
-                .expect("title event channel remains open");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = title_events
+                    .recv()
+                    .await
+                    .expect("title event channel remains open");
+                if matches!(event, AgentEvent::SessionTitleUpdated { .. }) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("one title event arrives alongside real Runtime events");
         assert!(matches!(
             event,
             AgentEvent::SessionTitleUpdated {
@@ -1995,9 +2132,16 @@ mod optional_model_e2e {
             }
         ));
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), title_events.recv())
-                .await
-                .is_err(),
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                loop {
+                    let event = title_events.recv().await.unwrap();
+                    if matches!(event, AgentEvent::SessionTitleUpdated { .. }) {
+                        break event;
+                    }
+                }
+            })
+            .await
+            .is_err(),
             "deduplicated title work must not emit a second metadata event"
         );
     }
@@ -2131,6 +2275,23 @@ mod optional_model_e2e {
 
         let response: Value = serde_json::from_slice(&first_body).expect("chat response JSON");
         let session_id = response["session_id"].as_str().expect("session_id");
+        let before = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!before.messages.iter().any(|m| m.role == Role::User));
+        assert_eq!(
+            state
+                .session_inbox
+                .inspect(session_id)
+                .await
+                .unwrap()
+                .pending,
+            1
+        );
+        drop(state.admit_chat_for_execute(session_id).await.unwrap());
         let session = state
             .storage
             .load_session(session_id)
@@ -3270,7 +3431,7 @@ mod optional_model_e2e {
             .iter()
             .find(|entry| entry.id == "review" && entry.winner)
             .expect("builtin review Workflow");
-        let barrier = super::super::install_workflow_post_save_test_barrier(session_id);
+        let barrier = super::super::ingress::install_native_post_save(session_id);
         let mut feed = state.account_sink.subscribe();
         let app = test::init_service(
             App::new()
@@ -3354,6 +3515,16 @@ mod optional_model_e2e {
                     .filter(|message| message.role == bamboo_agent_core::Role::User
                         && message.content == "commit despite response cancellation")
                     .count(),
+                0,
+                "Native has durable admission but no canonical User before its consumer"
+            );
+            assert_eq!(
+                state
+                    .session_inbox
+                    .inspect(session_id)
+                    .await
+                    .unwrap()
+                    .pending,
                 1
             );
             // Dropping the Actix response future simulates a disconnected
@@ -3361,6 +3532,34 @@ mod optional_model_e2e {
             // finish cache/feed/pin publication.
         }
         barrier.resume.add_permits(1);
+        let guard = tokio::time::timeout(
+            CONCURRENCY_ASSERT_TIMEOUT,
+            state.persistence.acquire_lock(session_id),
+        )
+        .await
+        .expect("detached Native pin transaction releases original Host lock");
+        drop(guard);
+        assert!(state
+            .skill_manager
+            .pinned_activation_for_workspace(session_id, None)
+            .await
+            .unwrap()
+            .is_none());
+        let before_consumer = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!before_consumer
+            .messages
+            .iter()
+            .any(|m| m.content == "commit despite response cancellation"));
+        assert!(!bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap().iter().any(|change|
+            matches!(&change.event, bamboo_agent_core::AgentEvent::MessageAppended { session_id: id, .. } if id == session_id)));
+        let current = state.admit_chat_for_execute(session_id).await.unwrap();
+        assert!(current.inputs.is_some());
+        drop(current);
 
         let event = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
             loop {
@@ -3535,7 +3734,18 @@ mod optional_model_e2e {
                 .cloned()
                 .collect()
         };
-        let original = users(&first_session);
+        assert!(
+            users(&first_session).is_empty(),
+            "Chat does not publish canonical Native input"
+        );
+        let claims = state.session_inbox.claim(session_id, 1).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        let receipt: Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(
+            claims[0].envelope.id.as_str(),
+            receipt["message_id"].as_str().unwrap()
+        );
+        let original = vec![claims[0].envelope.to_provider_message().unwrap()];
         assert_eq!(original.len(), 1);
         assert_eq!(original[0].content, "ordinary 原样输入");
         assert!(!original[0].id.is_empty());
@@ -3543,6 +3753,14 @@ mod optional_model_e2e {
         let retry = test::call_service(&app, request()).await;
         assert_eq!(retry.status(), StatusCode::CREATED);
         assert_eq!(test::read_body(retry).await, first_body);
+        let before_consumer = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(users(&before_consumer).is_empty());
+        drop(state.admit_chat_for_execute(session_id).await.unwrap());
         let replayed = state
             .storage
             .load_session(session_id)
@@ -3939,6 +4157,7 @@ mod optional_model_e2e {
             )
             .await;
             assert_eq!(initial.status(), StatusCode::CREATED);
+            super::consume_native_bootstrap(&state, session_id).await;
             let original = state
                 .storage
                 .load_session(session_id)
@@ -4569,4 +4788,726 @@ async fn skill_request_real_inbox_rejection_preserves_queue_proof_and_retry_iden
         .await
         .unwrap()
         .is_empty());
+}
+
+#[actix_web::test]
+async fn native_http_rejects_semantic_empty_and_complete_utf8_oversize_without_user_or_receipt() {
+    use actix_web::{test, web};
+    for (id, text, expected) in [
+        (
+            "native-empty",
+            " \n\t".to_owned(),
+            actix_web::http::StatusCode::BAD_REQUEST,
+        ),
+        (
+            "native-too-large",
+            "界".repeat(256 * 1024 / 3 + 1),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let state = web::Data::new(crate::AppState::new(home.path().into()).await.unwrap());
+        let mut original = Session::new(id, "test-model");
+        original.add_message(bamboo_agent_core::Message::user(
+            "older canonical User bytes",
+        ));
+        original.set_last_run_status("error");
+        original.set_last_run_error("older failure");
+        state.storage.save_session(&original).await.unwrap();
+        let request = serde_json::from_value::<super::ChatRequest>(serde_json::json!({
+            "session_id":id,"message":text,"model":"test-model"
+        }))
+        .unwrap();
+        let mut feed = state.account_sink.subscribe();
+        let response = super::handler(
+            state.clone(),
+            test::TestRequest::post().to_http_request(),
+            web::Json(request),
+        )
+        .await;
+        let status = response.status();
+        let body: serde_json::Value = serde_json::from_slice(
+            &actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status, expected, "{body}");
+        assert!(body.get("message_id").is_none());
+        let cold = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                cold.messages
+                    .iter()
+                    .filter(|m| m.role != bamboo_agent_core::Role::System)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap(),
+            serde_json::to_value(&original.messages).unwrap(),
+            "real config may save System, but failed Native adds no User or rewrites history"
+        );
+        assert_eq!(cold.last_run_status(), original.last_run_status());
+        assert_eq!(cold.last_run_error(), original.last_run_error());
+        assert!(!cold
+            .metadata
+            .contains_key("execute.pending_turn_message_id"));
+        let backlog = state.session_inbox.inspect(id).await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 0);
+        assert!(!backlog.activation_pending());
+        let no_new = state.admit_chat_for_execute(id).await.unwrap();
+        assert!(no_new.inputs.is_none());
+        assert!(!no_new.generate_title);
+        assert!(feed.try_recv().is_err());
+    }
+}
+
+mod native_inbox_wait_boundaries {
+    use actix_web::{body::to_bytes, http::StatusCode, test, web};
+    use bamboo_agent_core::{Message, Session};
+    use bamboo_domain::session::runtime_state::{
+        AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState,
+        WaitingForChildrenState,
+    };
+    use bamboo_domain::{
+        SessionActivationPolicy, SessionMessageBody, SessionMessageContent, SessionMessageEnvelope,
+        SessionMessageId, SessionMessageKind, SessionMessageSource, SessionRuntimeInstruction,
+    };
+    use bamboo_engine::execution::{ChildCompletion, ChildCompletionHandler};
+    use bamboo_engine::session_activation::{
+        SessionActivationLaunch, SessionActivationReserveOutcome, SessionActivationSpawner,
+    };
+    use chrono::Utc;
+    use std::collections::BTreeSet;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    // Same public test seam used by Engine coordinator fixtures; this port
+    // counts launch, intentionally creates no real runtime/competing consumer.
+    #[derive(Default)]
+    struct CountingSpawner {
+        reservations: AtomicUsize,
+        launches: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl SessionActivationSpawner for CountingSpawner {
+        async fn reserve_activation(
+            &self,
+            target: &str,
+            generation: u64,
+        ) -> Result<SessionActivationReserveOutcome, bamboo_domain::SessionActivationError>
+        {
+            self.reservations.fetch_add(1, Ordering::SeqCst);
+            let launches = self.launches.clone();
+            Ok(SessionActivationReserveOutcome::Reserved(
+                SessionActivationLaunch::new(format!("{target}-{generation}"), move || {
+                    launches.fetch_add(1, Ordering::SeqCst);
+                }),
+            ))
+        }
+    }
+
+    async fn cold(state: &web::Data<crate::AppState>, id: &str) -> Session {
+        state.storage.load_session(id).await.unwrap().unwrap()
+    }
+    async fn pending(state: &web::Data<crate::AppState>, id: &str, n: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if state.session_inbox.inspect(id).await.unwrap().pending == n {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual durable Inbox pending count");
+    }
+    fn complete(parent: &str, child: &str) -> ChildCompletion {
+        ChildCompletion {
+            parent_session_id: parent.into(),
+            child_session_id: child.into(),
+            status: "completed".into(),
+            error: None,
+            completed_at: Utc::now(),
+            source: None, // Existing neutral/synthetic path; no transcript/source grant.
+        }
+    }
+    fn bare_bash(id: &str) -> SessionMessageEnvelope {
+        let mut e = SessionMessageEnvelope::user_input(id, "bare Bash control");
+        e.source = SessionMessageSource::Runtime {
+            subsystem: "bash".into(),
+        };
+        e.kind = SessionMessageKind::RuntimeInstruction;
+        e.body = SessionMessageBody::RuntimeInstruction(SessionRuntimeInstruction {
+            instruction: "bash_completion".into(),
+            content: Some(SessionMessageContent::text("bare Bash control")),
+            data: None,
+            provider_message: None,
+        });
+        e.validate().unwrap();
+        e
+    }
+
+    type Feed = tokio::sync::broadcast::Receiver<Arc<bamboo_engine::events::ChangeEvent>>;
+
+    // Account broadcast follows journal.append_synced; do not fence with try_recv.
+    async fn next_target_append(feed: &mut Feed, id: &str) -> String {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let change = feed
+                    .recv()
+                    .await
+                    .expect("account feed stays live and unlagged");
+                match &change.event {
+                    bamboo_agent_core::AgentEvent::MessageAppended {
+                        session_id,
+                        message_id,
+                        ..
+                    } if session_id == id => return message_id.clone(),
+                    bamboo_agent_core::AgentEvent::SessionTitleUpdated { session_id, .. }
+                        if session_id == id =>
+                    {
+                        panic!("checked control admission creates no title")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("actual durable target append within 10s")
+    }
+
+    fn target_journal(state: &web::Data<crate::AppState>, id: &str) -> Vec<String> {
+        bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|change| match change.event {
+                bamboo_agent_core::AgentEvent::MessageAppended {
+                    session_id,
+                    message_id,
+                    ..
+                } if session_id == id => Some(message_id),
+                bamboo_agent_core::AgentEvent::SessionTitleUpdated { session_id, .. }
+                    if session_id == id =>
+                {
+                    panic!("no Ready/title side effect")
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    // Reuses the actual SDK-backed canonical checkpoint, receipt and ACK;
+    // retaining a raw claim above is an inspection, never a manual ACK.
+    async fn consume_released(
+        state: &web::Data<crate::AppState>,
+        id: &str,
+        released: &[bamboo_domain::SessionInboxClaim],
+        feed: &mut Feed,
+    ) -> serde_json::Value {
+        let before = cold(state, id).await;
+        let mut expected: Vec<_> = before.messages.iter().map(|m| m.id.clone()).collect();
+        for claim in released {
+            assert!(!state
+                .session_inbox
+                .was_admitted(id, &claim.envelope.id)
+                .await
+                .unwrap());
+            expected.push(claim.envelope.id.as_str().to_owned());
+        }
+        let admission = state.admit_chat_for_execute(id).await.unwrap();
+        assert!(
+            admission.inputs.is_none(),
+            "control siblings are not fresh User data"
+        );
+        assert!(
+            !admission.generate_title,
+            "control siblings create no title effect"
+        );
+        let saved = cold(state, id).await;
+        assert_eq!(
+            saved
+                .messages
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            serde_json::to_value(&saved.messages[..before.messages.len()]).unwrap(),
+            serde_json::to_value(&before.messages).unwrap(),
+            "preserve complete canonical prefix"
+        );
+        for claim in released {
+            let rows: Vec<_> = saved
+                .messages
+                .iter()
+                .filter(|message| message.id == claim.envelope.id.as_str())
+                .collect();
+            assert_eq!(rows.len(), 1);
+            assert!(bamboo_domain::is_matching_session_message(
+                rows[0],
+                &claim.envelope
+            ));
+            assert!(state
+                .session_inbox
+                .was_admitted(id, &claim.envelope.id)
+                .await
+                .unwrap());
+            assert_eq!(
+                next_target_append(feed, id).await,
+                claim.envelope.id.as_str()
+            );
+        }
+        let backlog = state.session_inbox.inspect(id).await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 0);
+        assert!(!backlog.activation_pending());
+        serde_json::to_value(&saved.messages).unwrap()
+    }
+
+    async fn no_new_after_controls(
+        state: &web::Data<crate::AppState>,
+        id: &str,
+        saved: &serde_json::Value,
+        released: &[bamboo_domain::SessionInboxClaim],
+        native: &str,
+        feed: &mut Feed,
+    ) {
+        let retry = state.admit_chat_for_execute(id).await.unwrap();
+        assert!(retry.inputs.is_none());
+        assert!(!retry.generate_title);
+        assert_eq!(
+            &serde_json::to_value(&cold(state, id).await.messages).unwrap(),
+            saved
+        );
+        for claim in released {
+            assert!(state
+                .session_inbox
+                .was_admitted(id, &claim.envelope.id)
+                .await
+                .unwrap());
+        }
+        assert!(state
+            .session_inbox
+            .was_admitted(id, &SessionMessageId::parse(native).unwrap())
+            .await
+            .unwrap());
+        assert!(state.session_inbox.claim(id, 128).await.unwrap().is_empty());
+        let backlog = state.session_inbox.inspect(id).await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 0);
+        assert!(!backlog.activation_pending());
+        // Finite post-callback observation; journal identity is checked as well.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), next_target_append(feed, id))
+                .await
+                .is_err(),
+            "no duplicate target append"
+        );
+        let expected = std::iter::once(native.to_owned())
+            .chain(
+                released
+                    .iter()
+                    .map(|claim| claim.envelope.id.as_str().to_owned()),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(target_journal(state, id), expected);
+    }
+
+    // Real HTTP producer, actual single specific claim, then real checked
+    // canonical checkpoint+receipt+ACK. No direct ACK before canonical save.
+    async fn consume_native(state: &web::Data<crate::AppState>, id: &str) -> String {
+        let req = serde_json::from_value::<super::super::ChatRequest>(serde_json::json!({
+            "session_id":id, "message":"current Native only", "model":"test-model"
+        }))
+        .unwrap();
+        let http = test::TestRequest::post()
+            .peer_addr("127.0.0.1:5700".parse().unwrap())
+            .to_http_request();
+        let response = super::super::handler(state.clone(), http, web::Json(req)).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body()).await.unwrap()).unwrap();
+        let id_from_receipt = body["message_id"].as_str().unwrap().to_string();
+        assert!(body["ingress_seq"].as_u64().unwrap() > 0);
+        assert!(!cold(state, id)
+            .await
+            .messages
+            .iter()
+            .any(|m| m.id == id_from_receipt));
+        let before = state.session_inbox.inspect(id).await.unwrap();
+        assert!(before.activation_pending());
+        assert!(!before.interrupt_pending());
+        assert_eq!(before.coordinator_generation, 0);
+        let claims = state.session_inbox.claim(id, 128).await.unwrap();
+        assert_eq!(
+            claims.len(),
+            1,
+            "Respect Native must not promote either bare sibling"
+        );
+        assert_eq!(claims[0].envelope.id.as_str(), id_from_receipt);
+        assert_eq!(
+            claims[0].activation_policy,
+            SessionActivationPolicy::RespectSpecificWait
+        );
+        assert_eq!(claims[0].envelope.source, SessionMessageSource::User);
+        let inputs = super::super::ingress::admit_for_execute(state, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inputs.observations().len(), 1);
+        assert_eq!(inputs.observations()[0].input_id(), id_from_receipt);
+        assert!(inputs.observations()[0].request().is_none());
+        assert!(state
+            .session_inbox
+            .was_admitted(
+                id,
+                &SessionMessageId::parse(id_from_receipt.clone()).unwrap()
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            cold(state, id)
+                .await
+                .messages
+                .iter()
+                .filter(|m| m.id == id_from_receipt)
+                .count(),
+            1
+        );
+        drop(inputs);
+        assert!(super::super::ingress::admit_for_execute(state, id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!state
+            .session_inbox
+            .inspect(id)
+            .await
+            .unwrap()
+            .activation_pending());
+        id_from_receipt
+    }
+
+    #[actix_web::test]
+    async fn native_respect_only_self_leaves_bare_child_and_bash_until_child_wait_release() {
+        let home = tempfile::tempdir().unwrap();
+        let state = web::Data::new(crate::AppState::new(home.path().into()).await.unwrap());
+        let spawner = Arc::new(CountingSpawner::default());
+        state
+            .session_activation_router
+            .set_spawner(spawner.clone())
+            .await;
+        let id = "native-real-bare-siblings";
+        let children = ["native-real-first-child", "native-real-second-child"];
+        let wait = WaitingForChildrenState::for_children(
+            children.iter().map(|s| s.to_string()).collect(),
+            ChildWaitPolicy::All,
+            Utc::now(),
+        );
+        let mut parent = Session::new(id, "test-model");
+        let mut runtime = AgentRuntimeState::new("native-real-child-wait");
+        runtime.status = AgentStatusState::Suspended;
+        runtime.waiting_for_children = Some(wait.clone());
+        runtime.suspension = Some(SuspensionState {
+            reason: "waiting_for_children".into(),
+            suspended_at: Utc::now(),
+            resumable: true,
+            hook_point: Some("ChildCompletion".into()),
+        });
+        parent.agent_runtime_state = Some(runtime);
+        parent.metadata.insert(
+            "runtime.suspend_reason".into(),
+            "waiting_for_children".into(),
+        );
+        state.storage.save_session(&parent).await.unwrap();
+        for (ordinal, child_id) in children.iter().enumerate() {
+            let mut child = Session::new_child_of(*child_id, &parent, "test-model", "Child");
+            child.add_message(Message::assistant(
+                "UNSEALED answer must not be imported",
+                None,
+            ));
+            child.set_last_run_status(if ordinal == 0 { "completed" } else { "running" });
+            state.storage.save_session(&child).await.unwrap();
+        }
+        // This callback really stages the first neutral outcome; it cannot
+        // complete All while the second owned child is still running.
+        ChildCompletionHandler::on_child_completed(
+            state.child_completion_coordinator.as_ref(),
+            complete(id, children[0]),
+        )
+        .await;
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+        assert_eq!(
+            cold(&state, id)
+                .await
+                .agent_runtime_state
+                .unwrap()
+                .waiting_for_children,
+            Some(wait.clone())
+        );
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
+        // Manual bare Bash envelope is only eligibility control, not a claimed
+        // real Bash producer completion. Real-shell supplement is separate.
+        let bash = bare_bash(id);
+        let bash_id = bash.id.clone();
+        state.session_messenger.admit(bash).await.unwrap();
+        pending(&state, id, 2).await;
+        assert!(!state
+            .session_inbox
+            .inspect(id)
+            .await
+            .unwrap()
+            .activation_pending());
+        let mut feed = state.account_sink.subscribe();
+        let native_id = consume_native(&state, id).await;
+        assert_eq!(next_target_append(&mut feed, id).await, native_id);
+        let backlog = state.session_inbox.inspect(id).await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 2);
+        assert_eq!(backlog.coordinator_generation, 0);
+        assert_eq!(
+            cold(&state, id)
+                .await
+                .agent_runtime_state
+                .unwrap()
+                .waiting_for_children,
+            Some(wait)
+        );
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 0);
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
+        assert!(state.session_inbox.claim(id, 128).await.unwrap().is_empty());
+        let mut second = cold(&state, children[1]).await;
+        second.set_last_run_status("completed");
+        state.storage.save_session(&second).await.unwrap();
+        // Only original coordinator clears/saves the wait and grants its prefix.
+        ChildCompletionHandler::on_child_completed(
+            state.child_completion_coordinator.as_ref(),
+            complete(id, children[1]),
+        )
+        .await;
+        assert!(cold(&state, id)
+            .await
+            .agent_runtime_state
+            .unwrap()
+            .waiting_for_children
+            .is_none());
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
+        let released = state.session_inbox.claim(id, 128).await.unwrap();
+        assert_eq!(released.len(), 3);
+        let mut seen_children = BTreeSet::new();
+        let mut seen_bash = 0;
+        for claim in &released {
+            assert_ne!(claim.envelope.id.as_str(), native_id);
+            assert_eq!(
+                claim.activation_policy,
+                SessionActivationPolicy::RespectSpecificWait
+            );
+            match &claim.envelope.body {
+                SessionMessageBody::ChildOutcome(outcome) => {
+                    assert_eq!(outcome.status, "completed");
+                    assert!(
+                        outcome.result.is_none(),
+                        "source=None imports no assistant result"
+                    );
+                    assert!(seen_children.insert(outcome.child_session_id.clone()));
+                }
+                SessionMessageBody::RuntimeInstruction(_) => {
+                    assert_eq!(claim.envelope.id, bash_id);
+                    seen_bash += 1;
+                }
+                _ => panic!("coordinator release must expose only original sibling control"),
+            }
+        }
+        assert_eq!(
+            seen_children,
+            children
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(seen_bash, 1);
+        assert!(
+            !serde_json::to_string(&released.iter().map(|c| &c.envelope).collect::<Vec<_>>())
+                .unwrap()
+                .contains("UNSEALED answer must not be imported")
+        );
+        // Exact original generation order: first Child, staged Bash, final Child.
+        for (claim, expected) in released.iter().zip([children[0], "bare-bash", children[1]]) {
+            match &claim.envelope.body {
+                SessionMessageBody::ChildOutcome(outcome) => {
+                    assert_eq!(outcome.child_session_id, expected)
+                }
+                SessionMessageBody::RuntimeInstruction(_) => assert_eq!(expected, "bare-bash"),
+                _ => unreachable!(),
+            }
+        }
+        let saved = consume_released(&state, id, &released, &mut feed).await;
+        ChildCompletionHandler::on_child_completed(
+            state.child_completion_coordinator.as_ref(),
+            complete(id, children[1]),
+        )
+        .await;
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
+        no_new_after_controls(&state, id, &saved, &released, &native_id, &mut feed).await;
+    }
+    struct OwnedShellCleanup(Vec<Arc<bamboo_tools::tools::bash_runtime::ShellSession>>);
+    impl Drop for OwnedShellCleanup {
+        fn drop(&mut self) {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                for shell in self.0.drain(..) {
+                    rt.spawn(async move {
+                        shell.close_stdin().await;
+                        if shell.status() == "running" {
+                            let _ = shell.kill().await;
+                        }
+                    });
+                }
+            }
+        }
+    }
+    #[cfg(unix)]
+    #[actix_web::test]
+    async fn native_respect_does_not_release_bare_bash_before_real_last_shell_completion() {
+        use bamboo_tools::tools::bash_runtime::{remove_shell, spawn_background};
+        let home = tempfile::tempdir().unwrap();
+        let state = web::Data::new(crate::AppState::new(home.path().into()).await.unwrap());
+        let spawner = Arc::new(CountingSpawner::default());
+        state
+            .session_activation_router
+            .set_spawner(spawner.clone())
+            .await;
+        let id = format!("native-real-bash-{}", uuid::Uuid::new_v4().simple());
+        state
+            .storage
+            .save_session(&Session::new(&id, "test-model"))
+            .await
+            .unwrap();
+        let sink: Arc<dyn bamboo_agent_core::BashCompletionSink> =
+            state.child_completion_coordinator.clone();
+        let mut cleanup = OwnedShellCleanup(Vec::new());
+        let first = spawn_background(
+            "cat",
+            None,
+            None,
+            Some(id.clone()),
+            true,
+            Some(sink.clone()),
+        )
+        .await
+        .unwrap();
+        cleanup.0.push(first.clone());
+        let second = spawn_background("cat", None, None, Some(id.clone()), true, Some(sink))
+            .await
+            .unwrap();
+        cleanup.0.push(second.clone());
+        assert_eq!((first.status(), second.status()), ("running", "running"));
+        let wait = bamboo_domain::session::runtime_state::WaitingForBashState::for_bash(
+            vec![first.id.clone(), second.id.clone()],
+            Utc::now(),
+        );
+        let mut parent = cold(&state, &id).await;
+        let mut runtime = AgentRuntimeState::new("native-real-bash-wait");
+        runtime.status = AgentStatusState::Suspended;
+        runtime.waiting_for_bash = Some(wait.clone());
+        parent.agent_runtime_state = Some(runtime);
+        parent
+            .metadata
+            .insert("runtime.suspend_reason".into(), "waiting_for_bash".into());
+        state.storage.save_session(&parent).await.unwrap();
+        assert!(first.close_stdin().await);
+        pending(&state, &id, 1).await; // durable stage, not merely producer exit.
+        assert_eq!(first.exit_code().await, Some(0));
+        assert_eq!(second.status(), "running");
+        assert_eq!(
+            cold(&state, &id)
+                .await
+                .agent_runtime_state
+                .unwrap()
+                .waiting_for_bash,
+            Some(wait.clone())
+        );
+        assert!(!state
+            .session_inbox
+            .inspect(&id)
+            .await
+            .unwrap()
+            .activation_pending());
+        let mut feed = state.account_sink.subscribe();
+        let native = consume_native(&state, &id).await;
+        assert_eq!(next_target_append(&mut feed, &id).await, native);
+        assert_eq!(
+            cold(&state, &id)
+                .await
+                .agent_runtime_state
+                .unwrap()
+                .waiting_for_bash,
+            Some(wait)
+        );
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 0);
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
+        assert!(state
+            .session_inbox
+            .claim(&id, 128)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(second.close_stdin().await);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let saved = cold(&state, &id).await;
+                if saved
+                    .agent_runtime_state
+                    .unwrap()
+                    .waiting_for_bash
+                    .is_none()
+                    && spawner.launches.load(Ordering::SeqCst) == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("original coordinator persists wait-clear before activation");
+        assert_eq!(second.exit_code().await, Some(0));
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+        let released = state.session_inbox.claim(&id, 128).await.unwrap();
+        assert_eq!(released.len(), 2);
+        let mut shells = BTreeSet::new();
+        for claim in &released {
+            assert_ne!(claim.envelope.id.as_str(), native);
+            assert_eq!(
+                claim.activation_policy,
+                SessionActivationPolicy::RespectSpecificWait
+            );
+            let SessionMessageBody::RuntimeInstruction(instruction) = &claim.envelope.body else {
+                panic!("Bash only")
+            };
+            assert_eq!(instruction.instruction, "background_bash_completed");
+            assert!(shells.insert(
+                instruction.data.as_ref().unwrap()["bash_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            ));
+        }
+        assert_eq!(
+            shells,
+            [first.id.clone(), second.id.clone()]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            (first.status(), second.status()),
+            ("completed", "completed")
+        );
+        let saved = consume_released(&state, &id, &released, &mut feed).await;
+        no_new_after_controls(&state, &id, &saved, &released, &native, &mut feed).await;
+        remove_shell(&first.id);
+        remove_shell(&second.id);
+        cleanup.0.clear();
+    }
 }

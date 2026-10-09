@@ -14,8 +14,8 @@ mod images;
 mod legacy_selection;
 #[cfg(test)]
 use legacy_selection::{
-    install_workflow_commit_test_barrier, install_workflow_post_save_test_barrier,
-    pin_explicit_workflow_candidate, wait_at_workflow_commit_test_barrier,
+    install_workflow_commit_test_barrier, pin_explicit_workflow_candidate,
+    wait_at_workflow_commit_test_barrier,
 };
 use legacy_selection::{
     workflow_activation_running_conflict_response, workflow_runner_is_active,
@@ -963,7 +963,8 @@ async fn handle_chat(
     let metadata_before_input = session.metadata.clone();
     let runtime_metadata_before_input = session.runtime_metadata.clone();
     // Image handling stays in the handler layer (depends on AppState attachment reader).
-    let ingress_receipt =
+    let mut native_input = None;
+    let mut ingress_receipt =
         match ingress::queue(&state, &session, &req, &effective_message, http_request).await {
             Ok(receipt) => receipt,
             Err(response) => {
@@ -993,6 +994,16 @@ async fn handle_chat(
                     actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
                     error.to_string(),
                 )
+            }
+        }
+    } else if !queue_root_input {
+        match images::construct_native_envelope(&state, &session, &req, &effective_message).await {
+            Ok(envelope) => native_input = Some(envelope),
+            Err(response) => {
+                if let Some(staging) = staged_workflow_activation.as_mut() {
+                    staging.release().await;
+                }
+                return *response;
             }
         }
     } else if let Err(response) = images::append_user_message(
@@ -1068,7 +1079,23 @@ async fn handle_chat(
         bamboo_engine::runner::refresh_prompt_snapshot(&mut session);
     }
 
-    if staged_workflow_activation.is_some() || retire_workflow || queued_input.is_some() {
+    if let Some(envelope) = native_input {
+        let workflow_changed = staged_workflow_activation.is_some() || retire_workflow;
+        ingress_receipt = match ingress::commit_native_input(
+            state.clone(),
+            session,
+            staged_workflow_activation,
+            workflow_changed,
+            envelope,
+            persistence_guard,
+            workflow_commit_guard,
+        )
+        .await
+        {
+            Ok(receipt) => Some(receipt),
+            Err(response) => return *response,
+        };
+    } else if staged_workflow_activation.is_some() || retire_workflow || queued_input.is_some() {
         let workflow_changed = staged_workflow_activation.is_some() || retire_workflow;
         let mut staging = staged_workflow_activation;
         if let Some(staging) = staging.as_ref() {
