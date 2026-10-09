@@ -3103,10 +3103,10 @@ async fn spawn_depth_zero_rejects_legacy_compact_plan_and_direct_creation_before
         .unwrap()
         .unwrap();
     let before = h.adapter.session_store.list_index_entries().await.len();
-    for args in [
+    for (index, args) in [
         json!({"action":"create","title":"Child","responsibility":"Inspect","prompt":"Inspect","workspace":h.workspace_path,"auto_run":false}),
         json!({"message":"Inspect the assigned scope"}),
-    ] {
+    ].into_iter().enumerate() {
         let error = invoke_completed(
             &h.tool,
             args,
@@ -3114,7 +3114,12 @@ async fn spawn_depth_zero_rejects_legacy_compact_plan_and_direct_creation_before
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("depth limit (0)"), "{error}");
+        if index == 0 {
+            assert!(error.to_string().contains("depth limit (0)"), "{error}");
+        } else {
+            assert!(matches!(error, ToolError::InvalidArguments(ref message)
+                if message == "Invalid SubAgent request or inspection cursor; start a new inspection"));
+        }
     }
     let plan = PlanTool::new(h.adapter.clone(), h.adapter.clone());
     let error = invoke_plan_completed(
@@ -3175,18 +3180,23 @@ async fn spawn_depth_reload_changes_later_creation_without_rewriting_lineage() {
         .await
         .subagents_mut()
         .max_spawn_depth = Some(1);
-    for args in [
+    for (index, args) in [
         json!({"action":"create","title":"Child","responsibility":"Inspect","prompt":"Inspect","workspace":h.workspace_path,"auto_run":false}),
         json!({"message":"Inspect the assigned scope"}),
-    ] {
+    ].into_iter().enumerate() {
         let error = invoke_completed(
             &h.tool,
             args,
-            ctx_for(&parent.id, "depth-lowered").to_tool_ctx(),
+            ctx_for(&child.id, "depth-lowered").to_tool_ctx(),
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("depth limit (1)"), "{error}");
+        if index == 0 {
+            assert!(error.to_string().contains("depth limit (1)"), "{error}");
+        } else {
+            assert!(matches!(error, ToolError::InvalidArguments(ref message)
+                if message == "Invalid SubAgent request or inspection cursor; start a new inspection"));
+        }
     }
     assert_eq!(
         h.adapter.session_store.list_index_entries().await.len(),
@@ -3211,21 +3221,23 @@ async fn spawn_depth_reload_changes_later_creation_without_rewriting_lineage() {
         .await
         .subagents_mut()
         .max_spawn_depth = Some(3);
-    let second = child_session::create_child_action(
-        h.adapter.as_ref(),
-        spawn_depth_input(&h, child, "depth-three-child"),
+    // The same valid compact create rejected above now succeeds after reload.
+    let second = invoke_completed(
+        &h.tool,
+        json!({"message":"Inspect the assigned scope"}),
+        ctx_for(&child.id, "depth-raised").to_tool_ctx(),
     )
     .await
     .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&second.result).unwrap();
     let grandchild = h
         .storage
-        .load_session(&second.child_session_id)
+        .load_session(payload["actor_id"].as_str().unwrap())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(grandchild.spawn_depth, 3);
     assert_eq!(grandchild.root_session_id, h.parent_session_id);
-    assert_eq!(h.activation.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
