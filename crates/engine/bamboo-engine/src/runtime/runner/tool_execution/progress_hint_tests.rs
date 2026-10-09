@@ -662,3 +662,81 @@ async fn observation_progress_new_human_input_resets_streak_before_pause() {
         }
     }
 }
+
+#[tokio::test]
+async fn observation_progress_hidden_resume_keeps_question_with_zero_model_dispatch() {
+    let mut session = Session::new("progress-hidden-resume", "model");
+    run_observation_loop(&mut session, "Read", None).await;
+    let question_id = session
+        .pending_question
+        .as_ref()
+        .unwrap()
+        .tool_call_id
+        .clone();
+    let evidence = serde_json::to_value(&session.messages).unwrap();
+    let mut notification = Message::user("A background task completed");
+    notification.metadata = Some(
+        serde_json::json!({"hidden_from_ui": true, "runtime_kind": "child_completion_resume"}),
+    );
+    session.add_message(notification);
+    let provider = Arc::new(ObservationProvider {
+        calls: AtomicUsize::new(0),
+        rounds: 0,
+        tool_name: "Read",
+        call_namespace: 0,
+        hint_counts: Mutex::new(Vec::new()),
+        fail_on_hint_once: false,
+        hint_retry_failed: AtomicBool::new(false),
+        steering: None,
+    });
+    let executor = Arc::new(ObservationExecutor {
+        calls: AtomicUsize::new(0),
+        tool_name: "Read",
+        changed_round: None,
+    });
+    let (tx, _rx) = mpsc::channel(256);
+    crate::runtime::runner::run_agent_loop_with_config(
+        &mut session,
+        "A background task completed".into(),
+        tx,
+        provider.clone(),
+        executor.clone(),
+        CancellationToken::new(),
+        AgentLoopConfig {
+            skip_initial_user_message: true,
+            model_name: Some("model".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert!(provider.hint_counts.lock().unwrap().is_empty());
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        session.pending_question.as_ref().unwrap().tool_call_id,
+        question_id
+    );
+    assert_eq!(
+        session.agent_runtime_state.as_ref().unwrap().status,
+        bamboo_domain::AgentStatusState::Suspended
+    );
+    let original_count = evidence.as_array().unwrap().len();
+    // System prompt setup may refresh its own body; the original real tool
+    // pairs and runtime question remain byte-for-byte identical.
+    for original in evidence
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] != "system")
+    {
+        let id = original["id"].as_str().unwrap();
+        let actual = session
+            .messages
+            .iter()
+            .find(|message| message.id == id)
+            .unwrap();
+        assert_eq!(serde_json::to_value(actual).unwrap(), *original);
+    }
+    assert_eq!(session.messages.len(), original_count + 1);
+}

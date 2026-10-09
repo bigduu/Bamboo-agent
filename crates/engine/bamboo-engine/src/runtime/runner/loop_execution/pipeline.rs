@@ -2894,6 +2894,19 @@ async fn run_pipeline_inner(
     );
 
     loop {
+        // Startup has already admitted this run's input. A runtime-only wakeup
+        // cannot spend model calls while the Human progress question is pending,
+        // including auxiliary evaluations and prompt-memory work below.
+        if crate::session_app::no_progress::resume_after_user_message(
+            session,
+            &mut state.runtime_state,
+        ) {
+            tool_policy_guard.reset_observation_progress();
+        }
+        if crate::session_app::no_progress::retain_pending_pause(session, &mut state.runtime_state)
+        {
+            break;
+        }
         if let Some(message) = tool_policy_guard.delegation_failure_message() {
             // The preceding round has already persisted every tool response and
             // accounted for its usage. Stop before another model request rather

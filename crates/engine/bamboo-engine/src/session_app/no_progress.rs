@@ -41,6 +41,10 @@ pub(crate) fn create_question(session: &mut Session, runtime_state: &mut AgentRu
         true,
         PendingQuestionSource::AgenticClarification,
     );
+    mark_suspended(session, runtime_state);
+}
+
+fn mark_suspended(session: &mut Session, runtime_state: &mut AgentRuntimeState) {
     session.metadata.insert(
         "runtime.suspend_reason".into(),
         "awaiting_clarification".into(),
@@ -53,6 +57,22 @@ pub(crate) fn create_question(session: &mut Session, runtime_state: &mut AgentRu
         hook_point: Some("AfterToolExecution".into()),
     });
     crate::runtime::runner::state_bridge::write_runtime_state(session, runtime_state);
+}
+
+/// A hidden resume may activate the runner, but cannot answer this Human gate.
+pub(crate) fn retain_pending_pause(
+    session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
+) -> bool {
+    if !session
+        .pending_question
+        .as_ref()
+        .is_some_and(|pending| is_no_progress_question(session, pending))
+    {
+        return false;
+    }
+    mark_suspended(session, runtime_state);
+    true
 }
 
 /// A normal Human message can steer a paused run through the usual chat/Inbox
