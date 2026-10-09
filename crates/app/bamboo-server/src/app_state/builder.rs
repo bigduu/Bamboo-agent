@@ -914,6 +914,7 @@ impl AppState {
             notification_relay_deps.clone(),
             project_store.clone(),
             workspace_resolver.clone(),
+            workflow_runs.clone(),
         );
 
         bamboo_engine::auto_dream::spawn_auto_dream_task_with_project_resolver(
