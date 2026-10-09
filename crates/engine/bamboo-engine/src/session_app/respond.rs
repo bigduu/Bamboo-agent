@@ -480,6 +480,16 @@ fn apply_pending_response(
         }
     }
 
+    let no_progress_question = super::no_progress::is_no_progress_question(session, &pending);
+    if no_progress_question
+        && (response_source != ResponseSource::Human || permission_receipt.is_some())
+    {
+        session.pending_question = Some(pending);
+        return Err(RespondError::InvalidResponse(
+            "A progress pause requires a Human response".into(),
+        ));
+    }
+
     let tool_call_id = pending.tool_call_id.clone();
     tracing::debug!(
         "[{}] Looking for tool result message with tool_call_id: {}",
@@ -539,12 +549,23 @@ fn apply_pending_response(
     }
 
     // ---- Update or append tool result message ----
-    let found = update_or_append_tool_result_message(
-        session,
-        &tool_call_id,
-        &input.user_response,
-        response_source,
-    );
+    let found = if no_progress_question {
+        // Runtime questions have no ToolCall. Keep every real tool result and
+        // append the Human's direction as an ordinary User turn.
+        let mut direction = Message::user(input.user_response.clone());
+        if input.user_response == super::no_progress::CONTINUE_OPTION {
+            direction.metadata = Some(serde_json::json!({"runtime_kind": "no_progress_continue"}));
+        }
+        session.add_message(direction);
+        true
+    } else {
+        update_or_append_tool_result_message(
+            session,
+            &tool_call_id,
+            &input.user_response,
+            response_source,
+        )
+    };
     if let Some(receipt) = permission_receipt {
         if !persist_permission_decision_receipt(session, &tool_call_id, receipt) {
             return Err(RespondError::InvalidResponse(
@@ -573,6 +594,10 @@ fn apply_pending_response(
     session.clear_pending_question();
     record_consumed_clarification(session, &tool_call_id);
     session.metadata.remove("runtime.suspend_reason");
+    if no_progress_question && input.user_response == super::no_progress::STOP_OPTION {
+        super::no_progress::stop_after_response(session);
+        return Ok((input.user_response.clone(), None, Vec::new()));
+    }
     session.metadata.insert(
         CLARIFICATION_RESUME_PENDING_KEY.to_string(),
         "true".to_string(),
@@ -1668,6 +1693,9 @@ mod tests {
         assert!(legacy.pending_question.is_some());
     }
 }
+
+#[cfg(test)]
+mod no_progress_tests;
 
 #[cfg(test)]
 mod receipt_persistence_tests {

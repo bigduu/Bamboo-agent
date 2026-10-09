@@ -10,6 +10,7 @@ use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_domain::{AgentHookPoint, HookPayload, SessionStartSource};
 use bamboo_llm::LLMProvider;
 
+mod final_answer;
 mod gold;
 mod pipeline;
 mod startup;

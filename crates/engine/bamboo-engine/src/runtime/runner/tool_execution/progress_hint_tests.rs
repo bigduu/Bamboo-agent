@@ -50,6 +50,7 @@ struct ObservationProvider {
     hint_counts: Mutex<Vec<usize>>,
     fail_on_hint_once: bool,
     hint_retry_failed: AtomicBool,
+    steering: Option<(Arc<dyn bamboo_domain::SessionInboxPort>, String, bool)>,
 }
 
 #[async_trait]
@@ -129,6 +130,28 @@ impl LLMProvider for ObservationProvider {
             ));
         }
         let round = self.calls.fetch_add(1, Ordering::SeqCst);
+        if round == 4 {
+            if let Some((inbox, session_id, wrapped)) = self.steering.as_ref() {
+                let mut envelope = bamboo_domain::SessionMessageEnvelope::user_input(
+                    session_id,
+                    "Use a different approach, then finish",
+                );
+                if *wrapped {
+                    envelope = envelope
+                        .with_root_chat_prompt("Task instructions".into())
+                        .unwrap();
+                }
+                let receipt = inbox.deliver(&envelope).await.unwrap();
+                inbox
+                    .mark_activation_eligible(
+                        session_id,
+                        receipt.generation,
+                        bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
         let chunks = if round < self.rounds {
             vec![
                 Ok(LLMChunk::ToolCalls(
@@ -214,6 +237,7 @@ async fn run_observation_loop_with_retry(
         hint_counts: Mutex::new(Vec::new()),
         fail_on_hint_once,
         hint_retry_failed: AtomicBool::new(false),
+        steering: None,
     });
     let executor = Arc::new(ObservationExecutor {
         calls: AtomicUsize::new(0),
@@ -254,15 +278,63 @@ async fn run_observation_loop_with_retry(
         "the hint never skips a real call"
     );
     let mut completes = 0;
+    let mut questions = 0;
     while let Ok(event) = rx.try_recv() {
         if matches!(event, bamboo_agent_core::AgentEvent::Complete { .. }) {
             completes += 1;
         }
+        if matches!(
+            event,
+            bamboo_agent_core::AgentEvent::NeedClarification { .. }
+        ) {
+            questions += 1;
+        }
     }
     assert_eq!(
         completes, 1,
-        "the advisory leaves completion behavior unchanged"
+        "the existing terminal event is sent for completed and suspended runs"
     );
+    let should_pause = session.kind == bamboo_domain::SessionKind::Root
+        && tool_name == "Read"
+        && changed_round.is_none();
+    assert_eq!(questions, usize::from(should_pause));
+    if should_pause {
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            6,
+            "no seventh provider request after pause"
+        );
+        assert_eq!(
+            session.agent_runtime_state.as_ref().unwrap().status,
+            bamboo_domain::AgentStatusState::Suspended
+        );
+        let pending = session
+            .pending_question
+            .as_ref()
+            .expect("runtime progress question");
+        assert!(crate::session_app::no_progress::is_no_progress_question(
+            session, pending
+        ));
+        assert!(pending.allow_custom);
+        assert_eq!(pending.options, ["Continue", "Stop"]);
+        // A pause must neither replace real observations nor manufacture tool
+        // execution. Every original call keeps its own successful result.
+        for call in session
+            .messages
+            .iter()
+            .filter_map(|message| message.tool_calls.as_ref())
+            .flatten()
+        {
+            assert_eq!(call.function.name, "Read");
+            let result = session
+                .messages
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some(call.id.as_str()))
+                .unwrap();
+            assert_eq!(result.content, "same evidence");
+            assert_eq!(result.tool_success, Some(true));
+        }
+    }
     let hints = provider.hint_counts.lock().unwrap().clone();
     hints
 }
@@ -272,7 +344,7 @@ async fn observation_progress_request_retry_keeps_the_same_one_shot_hint() {
     let mut session = Session::new("observation-progress-retry", "model");
     assert_eq!(
         run_observation_loop_with_retry(&mut session, "Read", None, true).await,
-        [0, 0, 0, 1, 1, 0, 0, 0]
+        [0, 0, 0, 1, 1, 0, 0]
     );
     assert!(session
         .messages
@@ -282,12 +354,12 @@ async fn observation_progress_request_retry_keeps_the_same_one_shot_hint() {
 }
 
 #[tokio::test]
-async fn observation_progress_real_loop_hints_one_request_after_paired_results_and_resets_on_new_run(
+async fn observation_progress_real_loop_hints_then_pauses_after_paired_results_and_resets_on_user_message(
 ) {
     let mut session = Session::new("observation-progress", "model");
     assert_eq!(
         run_observation_loop(&mut session, "Read", None).await,
-        [0, 0, 0, 1, 0, 0, 0]
+        [0, 0, 0, 1, 0, 0]
     );
     assert_eq!(hint_count(&session.messages), 0);
     assert!(session
@@ -296,7 +368,7 @@ async fn observation_progress_real_loop_hints_one_request_after_paired_results_a
         .all(|message| !message.content.contains(HINT_TEXT)));
     assert_eq!(
         run_observation_loop(&mut session, "Read", None).await,
-        [0, 0, 0, 1, 0, 0, 0]
+        [0, 0, 0, 1, 0, 0]
     );
     assert_eq!(hint_count(&session.messages), 0);
     assert!(session
@@ -505,4 +577,166 @@ async fn observation_progress_real_loop_resets_when_output_changes_and_leaves_po
         run_observation_loop(&mut mutation, "Write", None).await,
         [0; 7]
     );
+}
+
+#[tokio::test]
+async fn observation_progress_new_human_input_resets_streak_before_pause() {
+    for wrapped in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().into())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn bamboo_agent_core::storage::Storage> = store.clone();
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+        let inbox: Arc<dyn bamboo_domain::SessionInboxPort> =
+            Arc::new(bamboo_storage::FileSessionInbox::new(
+                store,
+                bamboo_domain::SessionInboxLimits::default(),
+            ));
+        let mut session = Session::new("progress-fresh-input", "model");
+        storage.save_session(&session).await.unwrap();
+        let provider = Arc::new(ObservationProvider {
+            calls: AtomicUsize::new(0),
+            rounds: 6,
+            tool_name: "Read",
+            call_namespace: 0,
+            hint_counts: Mutex::new(Vec::new()),
+            fail_on_hint_once: false,
+            hint_retry_failed: AtomicBool::new(false),
+            steering: Some((inbox.clone(), session.id.clone(), wrapped)),
+        });
+        let executor = Arc::new(ObservationExecutor {
+            calls: AtomicUsize::new(0),
+            tool_name: "Read",
+            changed_round: None,
+        });
+        let config = AgentLoopConfig {
+            model_name: Some("model".into()),
+            system_prompt: Some("Complete bounded task".into()),
+            storage: Some(storage),
+            persistence: Some(persistence),
+            session_inbox: Some(inbox),
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            ..Default::default()
+        };
+        let (tx, mut rx) = mpsc::channel(256);
+        crate::runtime::runner::run_agent_loop_with_config(
+            &mut session,
+            "Inspect file".into(),
+            tx,
+            provider.clone(),
+            executor,
+            CancellationToken::new(),
+            config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            7,
+            "fresh Human direction breaks the old streak before round six"
+        );
+        assert!(session.pending_question.is_none());
+        assert_eq!(
+            session.agent_runtime_state.as_ref().unwrap().status,
+            bamboo_domain::AgentStatusState::Completed
+        );
+        assert!(session
+            .messages
+            .iter()
+            .any(|message| message.content == "Use a different approach, then finish"));
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(
+                event,
+                bamboo_agent_core::AgentEvent::NeedClarification { .. }
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn observation_progress_hidden_resume_keeps_question_with_zero_model_dispatch() {
+    let mut session = Session::new("progress-hidden-resume", "model");
+    run_observation_loop(&mut session, "Read", None).await;
+    let question_id = session
+        .pending_question
+        .as_ref()
+        .unwrap()
+        .tool_call_id
+        .clone();
+    let evidence = serde_json::to_value(&session.messages).unwrap();
+    let mut notification = Message::user("A background task completed");
+    notification.metadata = Some(
+        serde_json::json!({"hidden_from_ui": true, "runtime_kind": "child_completion_resume"}),
+    );
+    session.add_message(notification);
+    let provider = Arc::new(ObservationProvider {
+        calls: AtomicUsize::new(0),
+        rounds: 0,
+        tool_name: "Read",
+        call_namespace: 0,
+        hint_counts: Mutex::new(Vec::new()),
+        fail_on_hint_once: false,
+        hint_retry_failed: AtomicBool::new(false),
+        steering: None,
+    });
+    let executor = Arc::new(ObservationExecutor {
+        calls: AtomicUsize::new(0),
+        tool_name: "Read",
+        changed_round: None,
+    });
+    let (tx, _rx) = mpsc::channel(256);
+    crate::runtime::runner::run_agent_loop_with_config(
+        &mut session,
+        "A background task completed".into(),
+        tx,
+        provider.clone(),
+        executor.clone(),
+        CancellationToken::new(),
+        AgentLoopConfig {
+            skip_initial_user_message: true,
+            model_name: Some("model".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert!(provider.hint_counts.lock().unwrap().is_empty());
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        session.pending_question.as_ref().unwrap().tool_call_id,
+        question_id
+    );
+    assert_eq!(
+        session.agent_runtime_state.as_ref().unwrap().status,
+        bamboo_domain::AgentStatusState::Suspended
+    );
+    let original_count = evidence.as_array().unwrap().len();
+    // System prompt setup may refresh its own body; the original real tool
+    // pairs and runtime question remain byte-for-byte identical.
+    for original in evidence
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] != "system")
+    {
+        let id = original["id"].as_str().unwrap();
+        let actual = session
+            .messages
+            .iter()
+            .find(|message| message.id == id)
+            .unwrap();
+        assert_eq!(serde_json::to_value(actual).unwrap(), *original);
+    }
+    assert_eq!(session.messages.len(), original_count + 1);
 }

@@ -944,6 +944,7 @@ impl AgentRuntime {
                 .map(PromptMemoryFlags::from)
                 .unwrap_or_default(),
             features_dynamic_model_routing: config.features.dynamic_model_routing,
+            features_final_evidence_check: config.features.final_evidence_check,
             permission_mode: Some(if active_plan_gate {
                 PermissionMode::Plan
             } else {

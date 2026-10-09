@@ -844,7 +844,7 @@ async fn commit_openai_client_tool_search_round(
     session: &mut Session,
     config: &AgentLoopConfig,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
-) -> Result<(), AgentError> {
+) -> Result<Message, AgentError> {
     ensure_discovery_allowed(session, config).await?;
     let host_outputs = build_openai_client_tool_search_outputs(
         session,
@@ -865,7 +865,7 @@ async fn commit_openai_client_tool_search_round(
     );
     let anchor = message.id.clone();
     let mut provider_items = Some(stream_output.provider_transcript_items);
-    commit_assistant_message(session, message, &mut provider_items)?;
+    commit_assistant_message(session, message.clone(), &mut provider_items)?;
     for output in host_outputs {
         session
             .append_provider_transcript_group(&anchor, None, vec![output])
@@ -885,7 +885,7 @@ async fn commit_openai_client_tool_search_round(
                 ))
             })?;
     }
-    Ok(())
+    Ok(message)
 }
 
 // ---- Error classification (from rounds.rs) ----
@@ -2297,6 +2297,8 @@ async fn handle_no_tool_calls_with_native(
     iteration: u32,
     llm: Arc<dyn LLMProvider>,
     provider_transcript_items: Vec<ProviderTranscriptItem>,
+    evidence_llm: Arc<dyn LLMProvider>,
+    cancel_token: &CancellationToken,
 ) -> Result<TurnOutcome, AgentError> {
     // The Gold judge reads the recent transcript, so when the goal loop is active
     // the assistant's final turn must be in the session BEFORE the gate runs
@@ -2312,6 +2314,12 @@ async fn handle_no_tool_calls_with_native(
             .with_reasoning_signature(reasoning_signature),
         visible_message,
     ));
+    let buffered_candidate = config.features_final_evidence_check.then(|| {
+        deferred_assistant_message
+            .as_ref()
+            .expect("candidate exists")
+            .clone()
+    });
     let mut native_items = Some(provider_transcript_items);
     if add_message_before_gold {
         if let Some(message) = deferred_assistant_message.take() {
@@ -2340,6 +2348,9 @@ async fn handle_no_tool_calls_with_native(
     .await;
 
     if let GoldTerminalDecision::Continue { continuation_count } = decision {
+        if let Some(message) = buffered_candidate.as_ref() {
+            publish_buffered_message(event_tx, message).await;
+        }
         tracing::info!(
             "[{}] Goal terminal gate: continuing toward goal (continuation {})",
             session_id,
@@ -2385,6 +2396,9 @@ async fn handle_no_tool_calls_with_native(
     )
     .await
     {
+        if let Some(message) = buffered_candidate.as_ref() {
+            publish_buffered_message(event_tx, message).await;
+        }
         // Suspended on the guardian verdict. In the no-goal case the assistant
         // message was intentionally not appended yet (the resumed turn re-emits
         // it), so nothing to roll back here.
@@ -2420,6 +2434,9 @@ async fn handle_no_tool_calls_with_native(
                 if let Some(message) = deferred_assistant_message.take() {
                     commit_assistant_message(session, message, &mut native_items)?;
                 }
+                if let Some(message) = buffered_candidate.as_ref() {
+                    publish_buffered_message(event_tx, message).await;
+                }
                 let extra_context = outcome
                     .injected_contexts
                     .iter()
@@ -2432,13 +2449,17 @@ async fn handle_no_tool_calls_with_native(
                 } else {
                     format!("\n\nAdditional hook context:\n{extra_context}")
                 };
-                session.add_message(Message::user(format!(
+                let mut continuation = Message::user(format!(
                     "A Stop lifecycle hook requires another work round ({}/{}): {}{}\n\nContinue working and address this feedback before attempting to finish again.",
                     runtime_state.stop_hook_forced_continuations,
                     MAX_STOP_HOOK_CONTINUATIONS,
                     reason.trim(),
                     context_suffix,
-                )));
+                ));
+                continuation.metadata = Some(serde_json::json!({
+                    "runtime_kind": "stop_hook_continuation"
+                }));
+                session.add_message(continuation);
                 state_bridge::write_runtime_state(session, runtime_state);
                 record_no_tool_calls_round_completed(
                     metrics_collector,
@@ -2473,12 +2494,67 @@ async fn handle_no_tool_calls_with_native(
         }
     }
 
+    let mut complete_usage = MetricsTokenUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+    };
+    if let Some(mut answer) = buffered_candidate {
+        let check = super::final_answer::check(
+            session,
+            runtime_state,
+            &mut answer,
+            config,
+            evidence_llm,
+            eval_model,
+            cancel_token,
+            metrics_collector,
+            round_id,
+            round_usage,
+        )
+        .await;
+        let check = match check {
+            Ok(check) => check,
+            Err(error) => {
+                if add_message_before_gold {
+                    session.messages.retain(|message| message.id != answer.id);
+                    session.updated_at = Utc::now();
+                }
+                reset_final_answer_context(session);
+                return Err(error);
+            }
+        };
+        complete_usage.add_assign_durable(check.usage);
+        if check.revised {
+            if let Some(message) = deferred_assistant_message.as_mut() {
+                *message = answer.clone();
+            } else {
+                let stored = session
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.id == answer.id)
+                    .ok_or_else(|| {
+                        AgentError::LLM("final candidate is no longer present".to_string())
+                    })?;
+                *stored = answer.clone();
+                session.updated_at = Utc::now();
+            }
+            // Provider envelopes and previous_response_id still describe the
+            // original answer. Rebuild both context lanes from canonical text.
+            native_items = None;
+            reset_final_answer_context(session);
+        }
+        publish_buffered_message(event_tx, &answer).await;
+    }
     if let Some(message) = deferred_assistant_message.take() {
         commit_assistant_message(session, message, &mut native_items)?;
     }
     let _ = event_tx
         .send(AgentEvent::Complete {
-            usage: to_event_token_usage(prompt_tokens, completion_tokens),
+            usage: to_event_token_usage(
+                complete_usage.prompt_tokens,
+                complete_usage.completion_tokens,
+            ),
         })
         .await;
     record_no_tool_calls_round_completed(
@@ -2492,6 +2568,26 @@ async fn handle_no_tool_calls_with_native(
         should_break: true,
         sent_complete: true,
     })
+}
+
+fn reset_final_answer_context(session: &mut Session) {
+    session.metadata.remove("responses.previous_response_id");
+    session.reset_model_context_epoch(
+        bamboo_domain::session::model_context::ModelContextResetReason::ExplicitHistoryRewrite,
+    );
+}
+
+async fn publish_buffered_message(event_tx: &mpsc::Sender<AgentEvent>, message: &Message) {
+    crate::runtime::stream::handler::publish_buffered_response(
+        event_tx,
+        &VisibleMessageIdentity {
+            message_id: message.id.clone(),
+            created_at: message.created_at,
+        },
+        &message.content,
+        message.reasoning.as_deref(),
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -2533,8 +2629,10 @@ async fn handle_no_tool_calls(
         task_context,
         eval_model,
         iteration,
-        llm,
+        llm.clone(),
         Vec::new(),
+        llm,
+        &CancellationToken::new(),
     )
     .await
 }
@@ -2882,6 +2980,7 @@ async fn run_pipeline_inner(
     // summary round; the next hit stops unconditionally.
     let mut budget_summary_used = false;
     session.metadata.remove("runtime.completion_reason");
+    session.metadata.remove("runtime.final_evidence_check");
     // Same hygiene for the budget-trip detail key (issue #221): without this,
     // one tripped run would leave `budget_exceeded_kind` on the session
     // forever, misleading clients on every later run that stops for an
@@ -2894,6 +2993,19 @@ async fn run_pipeline_inner(
     );
 
     loop {
+        // Startup has already admitted this run's input. A runtime-only wakeup
+        // cannot spend model calls while the Human progress question is pending,
+        // including auxiliary evaluations and prompt-memory work below.
+        if crate::session_app::no_progress::resume_after_user_message(
+            session,
+            &mut state.runtime_state,
+        ) {
+            tool_policy_guard.reset_observation_progress();
+        }
+        if crate::session_app::no_progress::retain_pending_pause(session, &mut state.runtime_state)
+        {
+            break;
+        }
         if let Some(message) = tool_policy_guard.delegation_failure_message() {
             // The preceding round has already persisted every tool response and
             // accounted for its usage. Stop before another model request rather
@@ -3007,11 +3119,43 @@ async fn run_pipeline_inner(
                 &state.execution_id,
             )
             .await?;
+        // Use this boundary's newly admitted inputs, never replayed history or
+        // hook-authored User text, to reset the unchanged-observation streak.
+        let fresh_human_input = observation.new_inputs().is_some_and(|batch| {
+            batch.records().iter().any(|input| {
+                (input.source == bamboo_domain::SessionMessageSource::User
+                    && input.kind == bamboo_domain::SessionMessageKind::UserInput)
+                    || input.wrapper.as_deref() == Some("root_chat_turn_v1")
+            })
+        });
         observation.update_current(
             &mut state.current_inputs,
             &state.session_id,
             &state.execution_id,
         );
+
+        let resumed_progress_question = crate::session_app::no_progress::resume_after_user_message(
+            session,
+            &mut state.runtime_state,
+        );
+        if fresh_human_input || resumed_progress_question {
+            tool_policy_guard.reset_observation_progress();
+        }
+        // Consume once after input admission and before recording another model
+        // round. Retries reuse this request-only hint. A pause creates no
+        // phantom model round and leaves every completed tool pair intact.
+        let observation_progress_hint = tool_policy_guard.observation_progress_hint();
+        if tool_policy_guard.should_pause_for_observation_progress()
+            && crate::runtime::runner::tool_execution::pause_for_no_progress(
+                session,
+                &mut state.runtime_state,
+                event_tx,
+                config,
+            )
+            .await?
+        {
+            break;
+        }
 
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {
@@ -3097,9 +3241,6 @@ async fn run_pipeline_inner(
         } else {
             0
         };
-        // Consume the completed observation round once. Ordinary/overflow
-        // retries receive the same request-only advice, never a new User turn.
-        let observation_progress_hint = tool_policy_guard.observation_progress_hint();
         for attempt in 1..=MAX_LLM_TURN_ATTEMPTS + extra_attempts {
             if config.goal_loop_active() && extra_attempts > 0 {
                 if let Some(delay_ms) = crate::runtime::goal_recovery::pending_delay(
@@ -3389,7 +3530,10 @@ async fn run_pipeline_inner(
                     )
                     .await
                     {
-                        Ok(()) => {
+                        Ok(message) => {
+                            if config.features_final_evidence_check {
+                                publish_buffered_message(event_tx, &message).await;
+                            }
                             record_no_tool_calls_round_completed(
                                 state.metrics_collector.as_ref(),
                                 &round_id,
@@ -3470,6 +3614,12 @@ async fn run_pipeline_inner(
                     turn_counter + 1,
                     llm.clone(),
                     stream_output.provider_transcript_items,
+                    state
+                        .auxiliary_models
+                        .fast_model_provider
+                        .clone()
+                        .unwrap_or_else(|| llm.clone()),
+                    cancel_token,
                 )
                 .await
                 {
@@ -3956,12 +4106,14 @@ async fn run_pipeline_inner(
                     "runtime.budget_exceeded_kind".to_string(),
                     exceeded.kind.to_string(),
                 );
-                session.add_message(Message::user(format!(
+                let mut summary = Message::user(format!(
                     "The run's resource budget ({}, limit={}, reached={}) was exceeded; the \
                      task was stopped before completion. Stop working now and summarize your \
                      progress so far and what remains.",
                     exceeded.kind, exceeded.limit, exceeded.actual
-                )));
+                ));
+                summary.metadata = Some(serde_json::json!({"runtime_kind": "run_budget_summary"}));
+                session.add_message(summary);
                 let _ = event_tx
                     .send(AgentEvent::BudgetExceeded {
                         session_id: state.session_id.clone(),
@@ -4026,12 +4178,15 @@ async fn run_pipeline_inner(
                     // role alternation (Anthropic 400s on it), breaking the summary
                     // turn and the next resume. One user turn keeps alternation valid
                     // (a preceding Tool message is merged into it by the serializer).
-                    session.add_message(Message::user(format!(
+                    let mut summary = Message::user(format!(
                         "Reached the maximum of {0} rounds; the task was stopped before \
                          completion. Stop working now and summarize your progress so far \
                          and what remains.",
                         max_rounds
-                    )));
+                    ));
+                    summary.metadata =
+                        Some(serde_json::json!({"runtime_kind": "max_rounds_summary"}));
+                    session.add_message(summary);
                     max_rounds_summary_used = true;
                     continue;
                 }
@@ -12823,3 +12978,7 @@ mod tests {
         assert!(matches!(result, Err(AgentError::Cancelled)));
     }
 }
+
+#[cfg(test)]
+#[path = "pipeline_final_evidence_tests.rs"]
+mod final_evidence_tests;
