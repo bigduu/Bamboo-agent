@@ -744,6 +744,11 @@ fn guardian_resume_message(completion: &ChildCompletion, verdict: &GuardianVerdi
     message
 }
 
+/// Observe the existing registered Root surface without retaining its owner.
+pub type RootToolSurfaceObserver = Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, Option<Arc<dyn ToolExecutor>>> + Send + Sync,
+>;
+
 pub type ReservedRootExecutionAdapter = Arc<
     dyn Fn(
             Arc<Agent>,
@@ -828,6 +833,18 @@ impl ChildCompletionCoordinator {
             .reserved_root_adapter
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(adapter);
+    }
+
+    pub fn root_tool_surface_observer(&self) -> RootToolSurfaceObserver {
+        let source = Arc::downgrade(&self.root_tools);
+        Arc::new(move || {
+            let source = source.clone();
+            Box::pin(async move {
+                let source = source.upgrade()?;
+                let current = source.read().await.clone();
+                current
+            })
+        })
     }
 
     pub async fn set_root_tools(&self, tools: Arc<dyn ToolExecutor>) {

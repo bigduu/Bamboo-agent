@@ -3557,9 +3557,28 @@ mod optional_model_e2e {
             .any(|m| m.content == "commit despite response cancellation"));
         assert!(!bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap().iter().any(|change|
             matches!(&change.event, bamboo_agent_core::AgentEvent::MessageAppended { session_id: id, .. } if id == session_id)));
+        let claims = state.session_inbox.claim(session_id, 128).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        let prepared = claims[0].envelope.to_provider_message().unwrap();
         let current = state.admit_chat_for_execute(session_id).await.unwrap();
-        assert!(current.inputs.is_some());
+        let observed = current.inputs.as_ref().unwrap().observations();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].input_id(), prepared.id);
         drop(current);
+        assert!(state
+            .session_inbox
+            .was_admitted(session_id, &claims[0].envelope.id)
+            .await
+            .unwrap());
+        assert_eq!(
+            state
+                .session_inbox
+                .inspect(session_id)
+                .await
+                .unwrap()
+                .pending,
+            0
+        );
 
         let event = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
             loop {
@@ -3594,10 +3613,14 @@ mod optional_model_e2e {
         )
         .expect("selection JSON");
         assert_eq!(selection.id, "review");
-        assert!(persisted.messages.iter().any(|message| {
-            matches!(message.role, bamboo_agent_core::Role::User)
-                && message.content == "commit despite response cancellation"
-        }));
+        let users: Vec<_> = persisted
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, bamboo_agent_core::Role::User))
+            .collect();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].id, prepared.id);
+        assert_eq!(users[0].content.as_bytes(), prepared.content.as_bytes());
         assert!(state
             .skill_manager
             .pinned_activation_for_workspace(session_id, None)

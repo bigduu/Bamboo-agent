@@ -9,7 +9,7 @@ use bamboo_agent_core::tools::{
     observed_tool_output_cap, ToolCall, ToolCtx, ToolError, ToolExecutionContext, ToolExecutor,
     ToolOutcome, ToolResult, ToolSchema,
 };
-use bamboo_agent_core::{AgentError, Message, Session, ToolMutability};
+use bamboo_agent_core::{AgentError, Session, ToolMutability};
 use bamboo_domain::{
     SessionMessageBody, SessionMessageEnvelope, SessionMessageKind, SessionMessageSource,
     SessionPermissionMode,
@@ -108,6 +108,8 @@ pub(crate) struct ServerMainSkillProducer {
     storage: Arc<dyn bamboo_agent_core::Storage>,
     permission_checker: Arc<dyn bamboo_tools::permission::PermissionChecker>,
     tool_factory: crate::tools::ToolSurfaceFactory,
+    root_observer:
+        Option<bamboo_engine::session_app::child_completion_coordinator::RootToolSurfaceObserver>,
     runners:
         Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, crate::AgentRunner>>>>,
 }
@@ -129,6 +131,7 @@ impl ServerMainSkillProducer {
             storage,
             permission_checker,
             tool_factory,
+            root_observer: None,
             runners: None,
         }
     }
@@ -137,6 +140,13 @@ impl ServerMainSkillProducer {
         runners: Arc<tokio::sync::RwLock<std::collections::HashMap<String, crate::AgentRunner>>>,
     ) -> Self {
         self.runners = Some(runners);
+        self
+    }
+    pub(crate) fn with_root_observer(
+        mut self,
+        observer: bamboo_engine::session_app::child_completion_coordinator::RootToolSurfaceObserver,
+    ) -> Self {
+        self.root_observer = Some(observer);
         self
     }
     fn from_state(state: &AppState) -> Self {
@@ -161,7 +171,17 @@ impl ServerMainSkillProducer {
         reservation: &SessionExecutionReservation,
         base: Arc<dyn ToolExecutor>,
     ) -> Result<NativeExecutionBinding, ToolError> {
-        bind_registered_execution(Arc::new(self.clone()), agent, session, reservation, base)
+        let mut producer = self.clone();
+        if producer.root_observer.is_some() {
+            // Only the registered coordinator callback receives this actual
+            // reserved Root surface. HTTP keeps its current factory check.
+            producer.tool_factory = crate::tools::ToolSurfaceFactory::new(
+                self.tools_for(ToolSurface::Base),
+                self.tools_for(ToolSurface::WithTask),
+                base.clone(),
+            );
+        }
+        bind_registered_execution(Arc::new(producer), agent, session, reservation, base)
     }
 }
 
@@ -400,6 +420,18 @@ impl NativeRun {
     }
     async fn check_owner(&self) -> Result<u64, ToolError> {
         let epoch = self.check_live()?;
+        if let Some(observer) = self.policy.state.root_observer.as_ref() {
+            let current = tokio::select! { biased;
+                _ = self.cancel.cancelled() => return Err(denied("Native surface check was cancelled")),
+                current = observer() => current,
+            };
+            if current
+                .as_ref()
+                .is_none_or(|current| !Arc::ptr_eq(current, &self.policy.base))
+            {
+                return Err(denied("Native registered Root surface changed"));
+            }
+        }
         let registry = self
             .policy
             .state
@@ -626,7 +658,8 @@ impl SkillExecutionHost for NativeHost {
         }
         let mut ctx = ToolCtx::none(format!("native-metadata:{execution_id}"));
         ctx.session_id = Some(session.id.clone().into());
-        NATIVE_PHASE
+        let epoch = self.run.check_owner().await.map_err(engine_error)?;
+        let rendered = NATIVE_PHASE
             .scope(
                 Phase {
                     run: self.run.clone(),
@@ -647,10 +680,14 @@ impl SkillExecutionHost for NativeHost {
                         METADATA_TOKENS,
                     ))
                     .ok_or_else(|| engine_error(denied("Native Skill usage does not fit")))?;
-                    Ok(format!("{}\n\n{usage}", render.text))
+                    Ok::<_, AgentError>(format!("{}\n\n{usage}", render.text))
                 },
             )
-            .await
+            .await?;
+        if self.run.check_owner().await.map_err(engine_error)? != epoch {
+            return Err(engine_error(denied("Native metadata owner changed")));
+        }
+        Ok(rendered)
     }
     fn finish(&self, _: &str, _: &str) {
         self.run.revoke();

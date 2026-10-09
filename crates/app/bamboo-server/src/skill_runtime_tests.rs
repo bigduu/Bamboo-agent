@@ -2,7 +2,7 @@ use super::*;
 use crate::AgentStatus;
 use actix_web::{http::StatusCode, test, App};
 use bamboo_agent_core::tools::{FunctionCall, ToolSchema};
-use bamboo_agent_core::Role;
+use bamboo_agent_core::{Message, Role};
 use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
 use bamboo_llm::{ProviderModelRouter, ProviderRegistry};
 use serde_json::{json, Value};
