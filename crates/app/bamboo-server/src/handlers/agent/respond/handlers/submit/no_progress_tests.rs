@@ -284,8 +284,31 @@ async fn no_progress_registered_http_ordinary_chat_message_resumes_runtime_quest
             .configure(crate::routes::configure_routes),
     )
     .await;
-    let chat = test::call_service(&app, test::TestRequest::post().uri("/api/v1/chat").set_json(serde_json::json!({"session_id": paused.id, "message_id": "progress-new-human-message", "message": "Use the other file and finish", "model": "model", "workspace_path": dir.path()})).to_request()).await;
-    assert!(chat.status().is_success());
+    let chat = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/chat")
+            // Stable Human input IDs use the authenticated Inbox route.
+            .peer_addr("127.0.0.1:5700".parse().unwrap())
+            .set_json(serde_json::json!({
+                "session_id": paused.id,
+                "message_id": "progress-new-human-message",
+                "message": "Use the other file and finish",
+                "model": "model",
+                "model_ref": {"provider": "progress-test", "model": "model"},
+                "workspace_path": dir.path()
+            }))
+            .to_request(),
+    )
+    .await;
+    let chat_status = chat.status();
+    let chat_body = test::read_body(chat).await;
+    assert_eq!(
+        chat_status,
+        actix_web::http::StatusCode::CREATED,
+        "chat status={chat_status}, body={}",
+        String::from_utf8_lossy(&chat_body)
+    );
     let execute = test::call_service(
         &app,
         test::TestRequest::post()
@@ -294,7 +317,13 @@ async fn no_progress_registered_http_ordinary_chat_message_resumes_runtime_quest
             .to_request(),
     )
     .await;
-    assert!(execute.status().is_success());
+    let execute_status = execute.status();
+    let execute_body = test::read_body(execute).await;
+    assert!(
+        execute_status.is_success(),
+        "execute status={execute_status}, body={}",
+        String::from_utf8_lossy(&execute_body)
+    );
     let durable = wait_completed(&state, "http-progress-chat").await;
     assert!(durable.pending_question.is_none());
     assert!(!durable.metadata.contains_key("runtime.suspend_reason"));
