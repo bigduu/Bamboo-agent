@@ -10,6 +10,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+// Each real HTTP proof creates a complete AppState and pages a 15k-byte
+// Source through durable Root checkpoints. Bound this fixture family's own
+// I/O concurrency; the normal workspace test runner and Root leases stay intact.
+static HTTP_PROOF: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Default)]
 struct Trace {
     requests: Vec<Vec<Message>>,
@@ -329,6 +334,7 @@ fn provider(home: &Path, cap: u32, references: bool) -> Arc<SkillsProvider> {
 
 #[actix_web::test]
 async fn native_http_typed_main_reads_complete_pages_reference_then_actual_task() {
+    let _proof = HTTP_PROOF.lock().await;
     let home = tempfile::tempdir().unwrap();
     let expected = write_skill(home.path(), "native-proof", false);
     let provider = provider(home.path(), 4096, true);
@@ -425,8 +431,10 @@ async fn native_http_typed_main_reads_complete_pages_reference_then_actual_task(
 
 #[actix_web::test]
 async fn native_http_implicit_main_retains_current_user_across_nonew_pages() {
+    let _proof = HTTP_PROOF.lock().await;
     let home = tempfile::tempdir().unwrap();
     let expected = write_skill(home.path(), "native-proof", true);
+    write_skill(home.path(), "manual-only", false);
     let provider = provider(home.path(), 4096, false);
     let state = state(home.path(), provider.clone()).await;
     let id = "native-implicit-pages";
@@ -451,6 +459,10 @@ async fn native_http_implicit_main_retains_current_user_across_nonew_pages() {
         .unwrap();
     assert_eq!(user.role, Role::User);
     assert_eq!(user.content, "Inspect proof and perform its normal action");
+    assert!(!trace.packages.contains_key("manual-only"));
+    assert!(!trace.requests[0]
+        .iter()
+        .any(|m| m.content.contains("manual-only")));
 }
 
 fn bindings() -> &'static Mutex<BTreeMap<String, std::sync::Weak<NativeExecutor>>> {
@@ -489,6 +501,7 @@ impl LLMProvider for GatedProvider {
 }
 #[actix_web::test]
 async fn native_http_actual_stop_and_provider_unwind_revoke_retained_executor() {
+    let _proof = HTTP_PROOF.lock().await;
     for unwind in [false, true] {
         let home = tempfile::tempdir().unwrap();
         write_skill(home.path(), "native-proof", true);
@@ -640,6 +653,7 @@ impl LLMProvider for RevokingProvider {
 }
 #[actix_web::test]
 async fn native_http_warm_reader_checks_current_disabled_and_raw_source_before_task() {
+    let _proof = HTTP_PROOF.lock().await;
     for source_changed in [false, true] {
         let home = tempfile::tempdir().unwrap();
         write_skill(home.path(), "native-proof", true);
@@ -673,6 +687,7 @@ async fn native_http_warm_reader_checks_current_disabled_and_raw_source_before_t
 
 #[actix_web::test]
 async fn native_http_existing_root_second_typed_input_uses_canonical_f_with_hook_once() {
+    let _proof = HTTP_PROOF.lock().await;
     let home = tempfile::tempdir().unwrap();
     write_skill(home.path(), "native-proof", true);
     let provider = provider(home.path(), 4096, false);
@@ -728,8 +743,102 @@ async fn native_http_existing_root_second_typed_input_uses_canonical_f_with_hook
     );
 }
 
+struct ScopeChangingProvider {
+    inner: Arc<SkillsProvider>,
+    state: Mutex<Option<web::Data<AppState>>>,
+    session_id: String,
+    workspace: PathBuf,
+    policy: bool,
+    changed: AtomicBool,
+}
+#[async_trait]
+impl LLMProvider for ScopeChangingProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let warm = {
+            let trace = self.inner.trace.lock().unwrap();
+            trace.pending.as_ref().is_some_and(|(id, name)| {
+                name == "skills_read"
+                    && messages.iter().any(|m| {
+                        m.tool_call_id.as_deref() == Some(id)
+                            && m.tool_success == Some(true)
+                            && serde_json::from_str::<Value>(&m.content)
+                                .is_ok_and(|p| p["next_cursor"].is_string())
+                    })
+            })
+        };
+        if warm && !self.changed.swap(true, Ordering::AcqRel) {
+            let state = self.state.lock().unwrap().as_ref().unwrap().clone();
+            if self.policy {
+                let permission = state.permission_checker.permission_config().unwrap();
+                permission.set_policy_revision(permission.policy_revision() + 1);
+            } else {
+                let workspace = self.workspace.to_string_lossy().into_owned();
+                state
+                    .session_repo
+                    .update_runtime_session(&self.session_id, &["workspace_path"], |session| {
+                        session.set_workspace_path_meta(workspace)
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+        Ok(Box::pin(futures::stream::iter(
+            self.inner.next(messages, tools).into_iter().map(Ok),
+        )))
+    }
+}
+
+#[actix_web::test]
+async fn native_http_warm_reader_rejects_actual_canonical_scope_and_policy_change() {
+    let _proof = HTTP_PROOF.lock().await;
+    for policy in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        write_skill(home.path(), "native-proof", true);
+        let workspace = home.path().join("different-source-scope");
+        std::fs::create_dir(&workspace).unwrap();
+        let id = format!("native-current-policy-{policy}");
+        let provider = Arc::new(ScopeChangingProvider {
+            inner: provider(home.path(), 4096, false),
+            state: Mutex::default(),
+            session_id: id.clone(),
+            workspace,
+            policy,
+            changed: AtomicBool::new(false),
+        });
+        let state = state(home.path(), provider.clone()).await;
+        *provider.state.lock().unwrap() = Some(state.clone());
+        seed(&state, &id).await;
+        let (status, body) = http(
+            &state,
+            "/api/v1/chat",
+            json!({"session_id":id,"message":"Inspect proof", "workspace_path":home.path()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let terminal = done(&state, &id).await;
+        assert!(matches!(terminal, AgentStatus::Error(_)), "{terminal:?}");
+        assert!(provider.changed.load(Ordering::Acquire));
+        let trace = provider.inner.trace.lock().unwrap();
+        assert_eq!(trace.main_pages, 1);
+        assert!(trace.eof.is_empty() && !trace.task_started && !trace.task_completed);
+        drop(trace);
+        // Remove the test observer's back-reference to the actual AppState.
+        provider.state.lock().unwrap().take();
+    }
+}
+
 #[actix_web::test]
 async fn native_http_stale_and_oversized_selection_reject_before_inbox_or_user_append() {
+    let _proof = HTTP_PROOF.lock().await;
     let home = tempfile::tempdir().unwrap();
     write_skill(home.path(), "native-proof", true);
     let provider = provider(home.path(), 4096, false);
@@ -762,4 +871,50 @@ async fn native_http_stale_and_oversized_selection_reject_before_inbox_or_user_a
         assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 0);
         assert!(provider.trace.lock().unwrap().requests.is_empty());
     }
+}
+
+#[actix_web::test]
+async fn native_registered_producer_rejects_excluded_hosts_before_source_access() {
+    let _proof = HTTP_PROOF.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    write_skill(home.path(), "native-proof", true);
+    let provider = provider(home.path(), 4096, false);
+    let state = state(home.path(), provider.clone()).await;
+    let session = Session::new("native-host-exclusions", "test-model");
+    // Real Server state and reservation; these metadata shapes confer no host grant.
+    state.storage.save_session(&session).await.unwrap();
+    let sender = state.get_session_event_sender(&session.id).await;
+    let bamboo_engine::execution::SessionExecutionReserveOutcome::Reserved(reservation) =
+        bamboo_engine::execution::reserve_session_execution(
+            &state.agent,
+            &state.agent_runners,
+            &state.session_event_senders,
+            &session.id,
+            &sender,
+        )
+        .await
+    else {
+        panic!("fresh actual reservation")
+    };
+    for shape in 0..4 {
+        let mut excluded = session.clone();
+        match shape {
+            0 => excluded.kind = bamboo_domain::SessionKind::Child,
+            1 => {
+                excluded.set_root_orchestration_only(true).unwrap();
+            }
+            2 => excluded.root_session_id = "forged-root-owner".into(),
+            _ => excluded.spawn_depth = 1,
+        }
+        assert!(!ordinary_main(&excluded));
+        assert!(bind_execution(
+            state.clone(),
+            &excluded,
+            &reservation,
+            state.tools_for(ToolSurface::Root)
+        )
+        .is_err());
+    }
+    reservation.abandon().await;
+    assert!(provider.trace.lock().unwrap().requests.is_empty());
 }
