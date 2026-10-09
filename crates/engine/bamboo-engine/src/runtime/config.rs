@@ -333,10 +333,10 @@ impl From<&MemoryConfig> for PromptMemoryFlags {
     }
 }
 
-/// SDK-owned execution adapter. Input presence is data, never a Skill grant.
-/// Only the registered SDK host interprets its own finite caller policy.
+/// Execution-local adapter for a registered host. Input presence is data,
+/// never a Skill grant; each host owns and validates its actual caller policy.
 #[async_trait::async_trait]
-pub trait SdkSkillExecutionHost: Send + Sync {
+pub trait SkillExecutionHost: Send + Sync {
     fn observe_current_inputs(
         &self,
         session_id: &str,
@@ -352,6 +352,9 @@ pub trait SdkSkillExecutionHost: Send + Sync {
 
     fn finish(&self, session_id: &str, execution_id: &str);
 }
+
+/// Compatibility name for the default SDK host.
+pub use SkillExecutionHost as SdkSkillExecutionHost;
 
 /// One bounded, explicitly supplied input observation. This carries caller data,
 /// never proof of currentness, a Source grant, or permission to invoke a Skill.

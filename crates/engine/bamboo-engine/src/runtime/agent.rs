@@ -90,6 +90,15 @@ impl Agent {
         &self,
         host: Arc<dyn crate::runtime::config::SdkSkillExecutionHost>,
     ) -> Self {
+        self.with_skill_execution_host(host)
+    }
+
+    /// Attach an execution-local registered host; this creates no caller authority.
+    #[doc(hidden)]
+    pub fn with_skill_execution_host(
+        &self,
+        host: Arc<dyn crate::runtime::config::SkillExecutionHost>,
+    ) -> Self {
         let mut runtime = (*self.runtime).clone();
         runtime.sdk_skill_execution_host = Some(host);
         Self::from_runtime(Arc::new(runtime))

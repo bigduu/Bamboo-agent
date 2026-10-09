@@ -249,6 +249,8 @@ pub(super) async fn queue(
 pub(crate) struct ExecuteAdmission {
     pub inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
     pub generate_title: bool,
+    /// Native route data only; the genuine reservation supplies run authority.
+    pub native_main: bool,
 }
 
 pub(crate) async fn admit_for_execute(
@@ -281,6 +283,7 @@ impl AppState {
                 .map(|inputs| ExecuteAdmission {
                     inputs,
                     generate_title: false,
+                    native_main: false,
                 });
         }
         self.admit_chat_for_execute_inner(id).await
@@ -342,6 +345,7 @@ impl AppState {
                 .committed_messages
                 .iter()
                 .any(|message| checked_user(&session.id, message));
+        let native_main = queued_id.is_none() && inputs.is_some();
         if let Some(queued_id) = queued_id {
             if !session.messages.iter().any(|m| m.id == queued_id) {
                 return Err(error(
@@ -375,6 +379,7 @@ impl AppState {
         Ok(ExecuteAdmission {
             inputs,
             generate_title,
+            native_main,
         })
     }
 }

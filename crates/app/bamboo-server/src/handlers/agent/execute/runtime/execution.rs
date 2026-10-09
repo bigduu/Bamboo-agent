@@ -166,13 +166,28 @@ impl SpawnAgentExecution {
         self,
         inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
     ) {
-        spawn_agent_execution_with_inputs(self, inputs);
+        spawn_agent_execution_with_inputs(self, inputs, None);
+    }
+
+    pub(crate) fn spawn_with_native_inputs(
+        self,
+        inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
+        native_binding: Option<(
+            Arc<bamboo_engine::Agent>,
+            Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
+        )>,
+    ) {
+        spawn_agent_execution_with_inputs(self, inputs, native_binding);
     }
 }
 
 fn spawn_agent_execution_with_inputs(
     mut args: SpawnAgentExecution,
     inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
+    native_binding: Option<(
+        Arc<bamboo_engine::Agent>,
+        Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
+    )>,
 ) {
     let session_model_ref = session_effective_model_ref(&args.session);
     let provider_override = match (session_model_ref.as_ref(), args.provider_override.take()) {
@@ -198,10 +213,13 @@ fn spawn_agent_execution_with_inputs(
             return;
         }
     }
-    let tools_override = Some(tools_for_execution(
-        args.state.as_ref(),
-        args.is_child_session,
-    ));
+    let (agent, tools) = native_binding.unwrap_or_else(|| {
+        (
+            args.state.agent.clone(),
+            tools_for_execution(args.state.as_ref(), args.is_child_session),
+        )
+    });
+    let tools_override = Some(tools);
 
     let selected_skill_ids = session_state::selected_skill_ids_for_session(&args.session);
     let selected_skill_mode = session_state::selected_skill_mode_for_session(&args.session);
@@ -218,7 +236,7 @@ fn spawn_agent_execution_with_inputs(
 
     bamboo_engine::execution::agent_spawn::spawn_session_execution_with_inputs(
         SessionExecutionArgs {
-            agent: args.state.agent.clone(),
+            agent,
             session_id: args.session_id,
             session: args.session,
             execution_reservation: args.execution_reservation,
