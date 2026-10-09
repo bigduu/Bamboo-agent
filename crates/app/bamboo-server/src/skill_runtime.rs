@@ -240,6 +240,12 @@ impl Policy {
         if session.workspace_path_meta() != self.workspace
             || session.project_id_meta() != self.project
         {
+            #[cfg(test)]
+            eprintln!(
+                "Native canonical scope mismatch {}: captured workspace={:?} project={:?}; current workspace={:?} project={:?}",
+                self.session_id, self.workspace, self.project,
+                session.workspace_path_meta(), session.project_id_meta()
+            );
             return Err(denied("Native canonical Session Source scope changed"));
         }
         Ok(())

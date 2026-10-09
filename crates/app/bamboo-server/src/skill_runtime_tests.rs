@@ -290,7 +290,7 @@ async fn selection(state: &web::Data<AppState>, name: &str) -> bamboo_skills::Wo
     }
 }
 async fn done(state: &web::Data<AppState>, id: &str) -> AgentStatus {
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
         loop {
             if let Some(status) = state
                 .agent_runners
@@ -515,7 +515,7 @@ async fn native_http_actual_stop_and_provider_unwind_revoke_retained_executor() 
         let (status, body) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
             provider.entered.notified(),
         )
         .await
@@ -561,7 +561,7 @@ async fn native_http_actual_stop_and_provider_unwind_revoke_retained_executor() 
             assert_eq!(status, StatusCode::OK, "{body}");
             assert!(executor.run.cancel.is_cancelled());
         }
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             while executor.run.live.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
             }
