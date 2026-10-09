@@ -931,6 +931,10 @@ impl WaitOrderPort {
 
 #[async_trait::async_trait]
 impl ChildSessionPort for WaitOrderPort {
+    async fn max_spawn_depth(&self) -> u32 {
+        self.inner.max_spawn_depth().await
+    }
+
     async fn validate_child_model(&self, child: &Session) -> Result<(), ChildSessionError> {
         self.inner.validate_child_model(child).await
     }
@@ -3053,6 +3057,274 @@ async fn nested_parent_at_depth(harness: &TestHarness, depth: u32) -> Session {
         parent = child;
     }
     parent
+}
+
+fn spawn_depth_input(
+    harness: &TestHarness,
+    parent: Session,
+    child_id: &str,
+) -> child_session::CreateChildInput {
+    child_session::CreateChildInput {
+        parent_session: parent,
+        child_id: child_id.into(),
+        title: "Depth policy child".into(),
+        responsibility: "Inspect".into(),
+        assignment_prompt: "Inspect the assigned scope".into(),
+        subagent_type: "worker".into(),
+        workspace: harness.workspace_path.to_string_lossy().into_owned(),
+        workspace_source: bamboo_engine::project_context::WorkspaceSource::Explicit,
+        model_override: None,
+        model_ref_override: None,
+        runtime_metadata: HashMap::new(),
+        read_only: false,
+        auto_run: false,
+        reasoning_effort: None,
+        lifecycle: None,
+        resident_name: None,
+        resident_context: None,
+        disabled_tools: None,
+        context_fork: None,
+    }
+}
+
+#[tokio::test]
+async fn spawn_depth_zero_rejects_legacy_compact_plan_and_direct_creation_before_effects() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    h.adapter
+        .config
+        .write()
+        .await
+        .subagents_mut()
+        .max_spawn_depth = Some(0);
+    let parent = h
+        .storage
+        .load_session(&h.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let before = h.adapter.session_store.list_index_entries().await.len();
+    for (index, args) in [
+        json!({"action":"create","title":"Child","responsibility":"Inspect","prompt":"Inspect","workspace":h.workspace_path,"auto_run":false}),
+        json!({"message":"Inspect the assigned scope"}),
+    ].into_iter().enumerate() {
+        let error = invoke_completed(
+            &h.tool,
+            args,
+            ctx_for(&parent.id, "depth-zero").to_tool_ctx(),
+        )
+        .await
+        .unwrap_err();
+        if index == 0 {
+            assert!(error.to_string().contains("depth limit (0)"), "{error}");
+        } else {
+            assert!(matches!(error, ToolError::InvalidArguments(ref message)
+                if message == "Invalid SubAgent request or inspection cursor; start a new inspection"));
+        }
+    }
+    let plan = PlanTool::new(h.adapter.clone(), h.adapter.clone());
+    let error = invoke_plan_completed(
+        &plan,
+        json!({"task":"Plan the bounded task","workspace":h.workspace_path}),
+        ctx_for(&parent.id, "depth-zero-plan").to_tool_ctx(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("depth limit (0)"), "{error}");
+    let error = child_session::create_child_action(
+        h.adapter.as_ref(),
+        spawn_depth_input(&h, parent, "depth-zero-direct"),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("depth limit (0)"));
+    assert_eq!(
+        h.adapter.session_store.list_index_entries().await.len(),
+        before
+    );
+    assert_eq!(h.activation.calls.load(Ordering::SeqCst), 0);
+    assert!(h.agent_runners.read().await.is_empty());
+    assert!(bamboo_agent_core::workspace_state::get_workspace("depth-zero-direct").is_none());
+}
+
+#[tokio::test]
+async fn spawn_depth_reload_changes_later_creation_without_rewriting_lineage() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    let parent = nested_parent_at_depth(&h, 1).await;
+    h.adapter
+        .config
+        .write()
+        .await
+        .subagents_mut()
+        .max_spawn_depth = Some(2);
+    let first = child_session::create_child_action(
+        h.adapter.as_ref(),
+        spawn_depth_input(&h, parent.clone(), "depth-two-child"),
+    )
+    .await
+    .unwrap();
+    let child = h
+        .storage
+        .load_session(&first.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.spawn_depth, 2);
+    assert_eq!(child.parent_session_id.as_deref(), Some(parent.id.as_str()));
+    assert_eq!(child.root_session_id, h.parent_session_id);
+    let saved = serde_json::to_value(&child).unwrap();
+    let before = h.adapter.session_store.list_index_entries().await.len();
+
+    h.adapter
+        .config
+        .write()
+        .await
+        .subagents_mut()
+        .max_spawn_depth = Some(1);
+    for (index, args) in [
+        json!({"action":"create","title":"Child","responsibility":"Inspect","prompt":"Inspect","workspace":h.workspace_path,"auto_run":false}),
+        json!({"message":"Inspect the assigned scope"}),
+    ].into_iter().enumerate() {
+        let error = invoke_completed(
+            &h.tool,
+            args,
+            ctx_for(&child.id, "depth-lowered").to_tool_ctx(),
+        )
+        .await
+        .unwrap_err();
+        if index == 0 {
+            assert!(error.to_string().contains("depth limit (1)"), "{error}");
+        } else {
+            assert!(matches!(error, ToolError::InvalidArguments(ref message)
+                if message == "Invalid SubAgent request or inspection cursor; start a new inspection"));
+        }
+    }
+    assert_eq!(
+        h.adapter.session_store.list_index_entries().await.len(),
+        before
+    );
+    assert_eq!(
+        serde_json::to_value(h.storage.load_session(&child.id).await.unwrap().unwrap()).unwrap(),
+        saved
+    );
+    // A lower creation cap cannot invalidate the existing child's visibility.
+    child_session::owned_tree::inspect_owned_tree(
+        h.adapter.session_store.as_ref(),
+        &child.id,
+        None,
+    )
+    .await
+    .unwrap();
+
+    h.adapter
+        .config
+        .write()
+        .await
+        .subagents_mut()
+        .max_spawn_depth = Some(3);
+    // The same valid compact create rejected above now succeeds after reload.
+    let second = invoke_completed(
+        &h.tool,
+        json!({"message":"Inspect the assigned scope"}),
+        ctx_for(&child.id, "depth-raised").to_tool_ctx(),
+    )
+    .await
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&second.result).unwrap();
+    let grandchild = h
+        .storage
+        .load_session(payload["actor_id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(grandchild.spawn_depth, 3);
+    assert_eq!(grandchild.root_session_id, h.parent_session_id);
+}
+
+#[tokio::test]
+async fn spawn_depth_rejects_forged_observations_and_durable_parent_edges_before_persistence() {
+    // The legacy Storage adapter can contain malformed saved lineage too; it
+    // must reach the same creation policy as the strict V2-backed adapter.
+    let h = build_test_harness_with_storage(None, None, false).await;
+    h.adapter
+        .config
+        .write()
+        .await
+        .subagents_mut()
+        .max_spawn_depth = Some(8);
+    let parent = nested_parent_at_depth(&h, 2).await;
+    let before = h.adapter.session_store.list_index_entries().await.len();
+    for field in ["depth", "root", "parent", "birth"] {
+        let mut forged = parent.clone();
+        match field {
+            "depth" => forged.spawn_depth = 1,
+            "root" => forged.root_session_id = "another-root".into(),
+            "parent" => forged.parent_session_id = Some(h.parent_session_id.clone()),
+            "birth" => forged.created_at += chrono::Duration::seconds(1),
+            _ => unreachable!(),
+        }
+        let id = format!("forged-{field}");
+        let error = child_session::create_child_action(
+            h.adapter.as_ref(),
+            spawn_depth_input(&h, forged, &id),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("lineage"), "{field}: {error}");
+        assert!(h.storage.load_session(&id).await.unwrap().is_none());
+    }
+    // Both the caller and durable parent agree on this forged depth. Walking
+    // its actual parent proves that the claimed edge is still invalid.
+    let mut malformed = parent.clone();
+    malformed.spawn_depth = 3;
+    h.storage.save_session(&malformed).await.unwrap();
+    let error = child_session::create_child_action(
+        h.adapter.as_ref(),
+        spawn_depth_input(&h, malformed, "malformed-edge-child"),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("lineage"), "{error}");
+    assert!(h
+        .storage
+        .load_session("malformed-edge-child")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        h.adapter.session_store.list_index_entries().await.len(),
+        before
+    );
+    assert_eq!(h.activation.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn spawn_depth_above_default_preserves_child_tree_inspection() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    h.adapter
+        .config
+        .write()
+        .await
+        .subagents_mut()
+        .max_spawn_depth = Some(6);
+    let parent = nested_parent_at_depth(&h, 5).await;
+    let created = child_session::create_child_action(
+        h.adapter.as_ref(),
+        spawn_depth_input(&h, parent.clone(), "depth-six-child"),
+    )
+    .await
+    .unwrap();
+    let page = child_session::owned_tree::inspect_owned_tree(
+        h.adapter.session_store.as_ref(),
+        &parent.id,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(page["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|node| node["actor_id"] == created.child_session_id));
 }
 
 #[tokio::test]

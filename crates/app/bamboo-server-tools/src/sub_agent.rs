@@ -661,11 +661,9 @@ fn parse_model_spec(
     Ok(bamboo_domain::ProviderModelRef::new(provider, spec))
 }
 
-/// Default max nesting depth for sub-agent spawning (Phase 6: direct nested
-/// execution). An agent at `spawn_depth >= this` may not create more children,
-/// bounding worker→worker→… recursion. Root orchestrator = depth 0, so this
-/// allows 4 levels of sub-agents below the root.
-pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = 4;
+/// Compatibility export of the migration default. Creation reads the Host's
+/// current `subagents.max_spawn_depth` through the shared child-session policy.
+pub use bamboo_config::DEFAULT_MAX_SPAWN_DEPTH;
 
 /// The `SubAgent` tool description. Exposed standalone so a nested worker's
 /// SubAgent proxy can advertise the identical tool to its own LLM (no drift).
@@ -1186,17 +1184,11 @@ impl SubAgentTool {
                     }
                 }
                 let mut packet_counts = None;
-                // Phase 6: enforce the max nesting-depth cap. `parent` is this
-                // agent's run session; its `spawn_depth` is the current nesting
-                // level (workers stamp it from the actor spec, so it accumulates
-                // across the actor boundary). Refuse to spawn beyond the cap so
-                // worker→worker→… recursion is bounded.
-                if parent.spawn_depth >= DEFAULT_MAX_SPAWN_DEPTH {
-                    return Err(ToolError::InvalidArguments(format!(
-                        "spawn depth limit ({}) reached: this agent is at depth {} and cannot create more sub-agents. Finish the work here, or delegate to a sibling.",
-                        DEFAULT_MAX_SPAWN_DEPTH, parent.spawn_depth
-                    )));
-                }
+                // Resident reuse bypasses the creator, so it shares the same
+                // Host policy and canonical parent validation here.
+                let parent = child_session::validate_spawn_parent(self.sessions.as_ref(), &parent)
+                    .await
+                    .map_err(tool_error_from_child_session)?;
                 let title = normalize_title(title, description)?;
                 let responsibility = normalize_required_text(responsibility, "responsibility")?;
                 let prompt = if compact {

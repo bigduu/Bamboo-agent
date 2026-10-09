@@ -114,6 +114,8 @@ async fn create_child_action_inner(
     use crate::runner::refresh_prompt_snapshot;
     use bamboo_agent_core::Message;
 
+    input.parent_session = super::validate_spawn_parent(port, &input.parent_session).await?;
+
     let workflow_usage_requested = pinned_profile.is_some()
         && input
             .runtime_metadata

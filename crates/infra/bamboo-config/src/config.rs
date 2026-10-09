@@ -695,6 +695,9 @@ pub enum CodexApprovalPolicy {
     OnRequest,
 }
 
+/// Default number of child levels below a Root (whose depth is zero).
+pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = 4;
+
 /// Sub-agent execution settings.
 ///
 /// Sub-agents always run as independent **actor** processes — an isolated OS
@@ -707,6 +710,10 @@ pub enum CodexApprovalPolicy {
 /// custom worker.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SubagentsConfig {
+    /// Maximum child depth below Root=0. Zero disables new child creation.
+    /// Unset preserves the historical four-level limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_spawn_depth: Option<u32>,
     /// Maximum actor activations running at once; further spawns wait their
     /// turn. Default: 200. Warm-idle process retention has a separate, smaller
     /// bound.
@@ -848,6 +855,12 @@ pub struct SubagentsConfig {
     /// worker, not a malicious one that lies about its own role).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_role_allowlist: Vec<McpRoleAllowlistEntry>,
+}
+
+impl SubagentsConfig {
+    pub fn effective_max_spawn_depth(&self) -> u32 {
+        self.max_spawn_depth.unwrap_or(DEFAULT_MAX_SPAWN_DEPTH)
+    }
 }
 
 /// One role's MCP proxy tool allowlist entry (issue #54). See
@@ -6232,6 +6245,34 @@ mod tests {
         // nulls.
         let empty = serde_json::to_string(&RunBudgetConfig::default()).unwrap();
         assert_eq!(empty, "{}");
+    }
+
+    #[test]
+    fn subagents_spawn_depth_preserves_default_and_explicit_zero() {
+        let old: SubagentsConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.effective_max_spawn_depth(), DEFAULT_MAX_SPAWN_DEPTH);
+        assert!(!serde_json::to_string(&old)
+            .unwrap()
+            .contains("max_spawn_depth"));
+        for depth in [0, 1, 8] {
+            let config: SubagentsConfig =
+                serde_json::from_value(serde_json::json!({"max_spawn_depth": depth})).unwrap();
+            assert_eq!(config.effective_max_spawn_depth(), depth);
+            assert_eq!(
+                serde_json::to_value(config).unwrap()["max_spawn_depth"],
+                depth
+            );
+        }
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("4"),
+        ] {
+            assert!(serde_json::from_value::<SubagentsConfig>(
+                serde_json::json!({"max_spawn_depth": invalid}),
+            )
+            .is_err());
+        }
     }
 
     #[test]

@@ -433,7 +433,8 @@ fn build_external_child_runner_internal(
                     .subagents()
                     .max_concurrent
                     .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
-            );
+            )
+            .with_max_spawn_depth(config.subagents().effective_max_spawn_depth());
             if let Some(registry) = approval_registry.clone() {
                 runner = runner.with_approval_registry(registry);
             }
@@ -555,6 +556,7 @@ fn build_local_actor_runner(
         sub.max_concurrent
             .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
     )
+    .with_max_spawn_depth(sub.effective_max_spawn_depth())
     .with_builtin_required_context_route(sub.worker_bin.is_none() && sub.worker_args.is_none())
     .with_remote_placements(resolve_remote_placements(
         &sub.remote_placements,
