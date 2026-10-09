@@ -10,7 +10,7 @@ use bamboo_engine::session_app::child_session::{
     self, ChildSessionError, ChildSessionPort, CreateChildInput, SubagentResolutionPort,
 };
 
-use crate::sub_agent::{waiting_for_children_tool_result, DEFAULT_MAX_SPAWN_DEPTH};
+use crate::sub_agent::waiting_for_children_tool_result;
 
 const PLANNER_ROLE: &str = "planner";
 const MAX_CONTEXT_FORK_MESSAGES: usize = 12;
@@ -227,12 +227,6 @@ impl Tool for PlanTool {
             .load_root_session(parent_session_id)
             .await
             .map_err(child_error)?;
-        if parent.spawn_depth >= DEFAULT_MAX_SPAWN_DEPTH {
-            return Err(ToolError::InvalidArguments(format!(
-                "spawn depth limit ({DEFAULT_MAX_SPAWN_DEPTH}) reached: this agent is at depth {} and cannot create a planner child",
-                parent.spawn_depth
-            )));
-        }
         if parent.model.trim().is_empty() {
             return Err(ToolError::Execution(
                 "parent session model is empty".to_string(),
