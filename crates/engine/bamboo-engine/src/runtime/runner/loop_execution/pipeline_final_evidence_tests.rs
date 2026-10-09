@@ -493,6 +493,7 @@ async fn gold_committed_candidate_is_revised_in_place_without_a_duplicate_or_sta
             )
             .unwrap();
         let anchor = session.messages[1].id.clone();
+        let call = session.messages[1].tool_calls.as_ref().unwrap()[0].clone();
         session.append_provider_transcript_group(&anchor, None, vec![
             native_item(ProviderTranscriptAuthor::Model,
                 json!({"type":"tool_search_call", "id":"hosted-search", "call_id":"hosted-1",
@@ -500,6 +501,9 @@ async fn gold_committed_candidate_is_revised_in_place_without_a_duplicate_or_sta
             native_item(ProviderTranscriptAuthor::ToolResult,
                 json!({"type":"tool_search_output", "id":"hosted-output", "call_id":"hosted-1",
                     "execution":"server", "status":"completed", "tools":[]})),
+            native_item(ProviderTranscriptAuthor::Model,
+                json!({"type":"function_call", "call_id":call.id,
+                    "name":call.function.name, "arguments":call.function.arguments})),
         ]).unwrap();
         config.gold_config = Some(crate::runtime::config::GoldConfig {
             enabled: true,
