@@ -102,6 +102,9 @@ async fn submit_response_inner(
             "error": crate::error::error_value("No pending question waiting for response")
         })));
     };
+    let stop_progress_pause =
+        bamboo_engine::session_app::no_progress::is_no_progress_question(&preflight, pending)
+            && user_response == bamboo_engine::session_app::no_progress::STOP_OPTION;
     if let Some(expected) = req.expected_tool_call_id.as_deref() {
         if expected != pending.tool_call_id {
             return Ok(HttpResponse::Conflict().json(serde_json::json!({
@@ -248,6 +251,22 @@ async fn submit_response_inner(
         }
     };
 
+    if stop_progress_pause {
+        // The same guarded CAS consumed the runtime question and saved the
+        // stopped session. Release its unused successor without provider work.
+        if let Some(message) = session.messages.last() {
+            handoff.publish_event(AgentEvent::message_appended(&session_id, message));
+        }
+        handoff.abandon().await;
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": "Run stopped.",
+            "response": user_response,
+            "auto_resume_status": "completed",
+            "stopped": true,
+        })));
+    }
+
     // Record session grants for any permission prompt the user approved, so the
     // resumed run's re-attempt of the gated operation passes the checker without
     // prompting again. `state.permission_checker` shares the same PermissionConfig
@@ -340,6 +359,9 @@ async fn submit_response_inner(
         "run_id": auto_resume_outcome.run_id()
     })))
 }
+
+#[cfg(test)]
+mod no_progress_tests;
 
 #[cfg(test)]
 mod tests {
