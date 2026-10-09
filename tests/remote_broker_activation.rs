@@ -196,9 +196,9 @@ async fn wait_child(data: &Path, id: &str, status: &str) -> Session {
     wait_child_after(data, id, status, SystemTime::UNIX_EPOCH).await
 }
 async fn wait_child_after(data: &Path, id: &str, status: &str, since: SystemTime) -> Session {
-    let reader = SessionStoreV2::new(data.to_path_buf()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
+            let reader = SessionStoreV2::new(data.to_path_buf()).await.unwrap();
             let runtime = data
                 .join(reader.resolve_rel_path(id).await.unwrap())
                 .join("runtime.json");
@@ -260,10 +260,9 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
             .status()
             .is_success());
     }
-    let reader = SessionStoreV2::new(p.data.clone()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
-            let root = reader.load_session("remote-root").await.unwrap().unwrap();
+            let root = cold(&p.data, "remote-root").await;
             let call_id = format!("remote-op-{number}");
             let result = matches!(op, 0 | 1 | 2 | 4)
                 .then(|| {
@@ -288,6 +287,7 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
                 .flatten();
             if let Some(result) = result {
                 let actor = result["actor_id"].as_str().expect("actual logical ActorId");
+                {
                 let mut ids = p.ids.lock().unwrap();
                 if op == 0 {
                     if !ids.iter().any(|id| id == actor) {
@@ -335,12 +335,12 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
                 {
                     break;
                 }
-                drop(ids);
+                }
                 if op == 0
                     && existing_wait.is_some()
                     && result["observed_status"] == "running_in_background"
                 {
-                    let child = reader.load_session(actor).await.unwrap().unwrap();
+                    let child = cold(&p.data, actor).await;
                     if child.last_run_status().as_deref() == Some("running")
                         && root.last_run_status().as_deref() == Some("suspended")
                     {
@@ -639,10 +639,10 @@ async fn cancelled_slot_reuse(context: RemoteProofContext<'_>) {
         cert,
     } = context;
     let resident_pid = resident.0.id();
-    let (cancelled_activation, old_slot) = placement(&data, &child_id).await;
+    let (cancelled_activation, old_slot) = placement(data, child_id).await;
     let old_event = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let Some(message) = mailbox_messages(&data, "remote-parent")
+            if let Some(message) = mailbox_messages(data, "remote-parent")
                 .into_iter()
                 .map(|(_, message)| message)
                 .find(|message| {
@@ -660,21 +660,21 @@ async fn cancelled_slot_reuse(context: RemoteProofContext<'_>) {
     })
     .await
     .expect("capture actual held Run event route before cancellation");
-    turn(&client, &base, &p, 0, 0).await;
+    turn(client, base, p, 0, 0).await;
     let sibling = p.ids.lock().unwrap()[1].clone();
-    turn(&client, &base, &p, 2, 1).await;
-    wait_child(&data, &sibling, "cancelled").await;
+    turn(client, base, p, 2, 1).await;
+    wait_child(data, &sibling, "cancelled").await;
     assert_eq!(
         p.calls.load(Ordering::SeqCst),
         2,
         "cancelled subscription waiter must not dispatch Run"
     );
-    turn(&client, &base, &p, 2, 0).await;
-    let cancelled = wait_child(&data, &child_id, "cancelled").await;
+    turn(client, base, p, 2, 0).await;
+    let cancelled = wait_child(data, child_id, "cancelled").await;
     let registry = FileHostRegistry::new(data.clone()).await.unwrap();
     let authority = SessionStoreV2::new(data.clone()).await.unwrap();
     let finished = authority
-        .inspect_actor(&child_id)
+        .inspect_actor(child_id)
         .await
         .unwrap()
         .activation
@@ -682,7 +682,7 @@ async fn cancelled_slot_reuse(context: RemoteProofContext<'_>) {
     assert_eq!(finished.fence(), cancelled_activation.fence());
     assert_eq!(finished.status, ActorActivationStatus::Cancelled);
     let cancelled_receipt =
-        terminal_ack(&data, &cancelled, &cancelled_activation, "cancelled").await;
+        terminal_ack(data, &cancelled, &cancelled_activation, "cancelled").await;
     assert_eq!(
         old_event.correlation_id.as_ref().map(|id| id.0.as_str()),
         Some(cancelled_receipt.broker_correlation_id.as_str())
@@ -695,7 +695,7 @@ async fn cancelled_slot_reuse(context: RemoteProofContext<'_>) {
     .await
     .expect("cancel closes actual held provider stream before fixture release or successor");
     assert!(p.hold.load(Ordering::SeqCst));
-    wait_runs_settled(&data).await;
+    wait_runs_settled(data).await;
     assert!(registry
         .inspect_host(&old_slot.host_ref)
         .await
@@ -706,9 +706,9 @@ async fn cancelled_slot_reuse(context: RemoteProofContext<'_>) {
     assert!(resident.0.try_wait().unwrap().is_none());
 
     // Reuse the same live resident, before any operator replacement or lease expiry.
-    turn(&client, &base, &p, 1, 0).await;
-    wait_calls(&p, 3).await;
-    let (successor, successor_slot) = placement(&data, &child_id).await;
+    turn(client, base, p, 1, 0).await;
+    wait_calls(p, 3).await;
+    let (successor, successor_slot) = placement(data, child_id).await;
     assert_eq!(resident.0.id(), resident_pid);
     assert!(resident.0.try_wait().unwrap().is_none());
     assert_eq!(successor_slot.host_ref, old_slot.host_ref);
@@ -767,10 +767,10 @@ async fn cancelled_slot_reuse(context: RemoteProofContext<'_>) {
 
     // This authenticated publish-only connection does not replace the resident subscription.
     let mut publisher = BrokerClient::connect_with_tls(
-        &url,
+        url,
         old_event.from.clone(),
         WORKER,
-        Some(client_config_trusting_cert(&cert).unwrap()),
+        Some(client_config_trusting_cert(cert).unwrap()),
     )
     .await
     .unwrap();
@@ -795,7 +795,7 @@ async fn cancelled_slot_reuse(context: RemoteProofContext<'_>) {
     drop(publisher);
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if mailbox_messages(&data, "remote-parent")
+            if mailbox_messages(data, "remote-parent")
                 .iter()
                 .any(|(path, msg)| msg.id == stale_id && path.parent().unwrap().ends_with("cur"))
             {
@@ -808,7 +808,7 @@ async fn cancelled_slot_reuse(context: RemoteProofContext<'_>) {
     .expect("actual stale output delivered to current Host, retained for old Run recovery");
     assert_eq!(
         authority
-            .inspect_actor(&child_id)
+            .inspect_actor(child_id)
             .await
             .unwrap()
             .activation
@@ -820,19 +820,17 @@ async fn cancelled_slot_reuse(context: RemoteProofContext<'_>) {
         .validate_slot(&successor_slot, Utc::now())
         .await
         .unwrap();
-    assert!(
-        !serde_json::to_string(&cold(&data, &child_id).await.messages)
-            .unwrap()
-            .contains(STALE_OUTPUT)
-    );
+    assert!(!serde_json::to_string(&cold(data, child_id).await.messages)
+        .unwrap()
+        .contains(STALE_OUTPUT));
     p.hold.store(false, Ordering::SeqCst);
-    let reused = wait_child(&data, &child_id, "completed").await;
-    let reused_receipt = terminal_ack(&data, &reused, &successor, "completed").await;
+    let reused = wait_child(data, child_id, "completed").await;
+    let reused_receipt = terminal_ack(data, &reused, &successor, "completed").await;
     assert!(!reused_receipt.message_ids.contains(&stale_id.0));
     assert!(!serde_json::to_string(&reused.messages)
         .unwrap()
         .contains(STALE_OUTPUT));
-    assert!(mailbox_messages(&data, "remote-parent")
+    assert!(mailbox_messages(data, "remote-parent")
         .iter()
         .any(|(_, msg)| msg.id == stale_id));
     assert_eq!(p.calls.load(Ordering::SeqCst), 3);
@@ -845,7 +843,7 @@ async fn cancelled_slot_reuse(context: RemoteProofContext<'_>) {
         .is_empty());
     assert_eq!(
         authority
-            .inspect_actor(&child_id)
+            .inspect_actor(child_id)
             .await
             .unwrap()
             .activation
@@ -867,7 +865,7 @@ async fn cancelled_slot_reuse(context: RemoteProofContext<'_>) {
         "held_provider_closed":p.held_closed.load(Ordering::SeqCst),"stale_delivered_retained_id":stale_id,
         "provider_admissions":p.calls.load(Ordering::SeqCst)})
     );
-    wait_runs_settled(&data).await;
+    wait_runs_settled(data).await;
 }
 #[actix_web::test]
 async fn actual_host_pinned_remote_runs_cancels_and_explicitly_replaces_over_wss() {
@@ -1301,7 +1299,9 @@ async fn fixture() {
     .unwrap();
     drop(replacement_observer);
     let mismatched_requested_at = SystemTime::now();
-    turn(&client, &base, &p, 1, 0).await;
+    // Same-resident reuse has completed and ACKed this answer. A new durable
+    // turn exercises replacement admission; retry below still covers its failed Run.
+    turn(&client, &base, &p, 4, 0).await;
     let mismatched = wait_child_after(&data, &child_id, "error", mismatched_requested_at).await;
     assert!(mismatched
         .last_run_error()
