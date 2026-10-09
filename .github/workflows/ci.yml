@@ -9,11 +9,14 @@ on:
   pull_request:
     branches: [ dev, main ]
 
-# Keep only the newest run for a branch or pull request. A promotion build can
-# still fan out to all three platforms within that run.
+# Queue every main push for its own release gate; supersede iterative PR/manual
+# validation independently. Promotion builds still fan out to three platforms.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  # Every main merge needs a completed CI gate before its own publication.
+  # PRs/manual validation keep their existing superseding-run behavior.
+  queue: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'max' || 'single' }}
+  cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,7 +50,7 @@ jobs:
           node-version: lts/*
 
       - name: Test CI workflow policy
-        run: node --test scripts/ci-policy.test.cjs
+        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs
 
       - name: Test frontend artifact and release policies
         if: github.event_name != 'pull_request' || github.base_ref == 'main'
