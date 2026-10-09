@@ -195,6 +195,7 @@ fn build_manager(
     });
 
     let ctx = ScheduleContext {
+        workflow_runs: None,
         schedule_store,
         agent: agent.clone(),
         persistence: Arc::new(bamboo_storage::LockedSessionStore::new(store.clone())),
