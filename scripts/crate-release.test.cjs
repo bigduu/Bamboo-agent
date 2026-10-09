@@ -247,7 +247,7 @@ test('missing, malformed, wrong-key and modified receipt authentication cannot b
 })
 
 test('explicit manual unsigned or bad-MAC drafts cannot be re-signed into a privileged publication', async () => {
-  for (const version of ['2026.9999.9999', '2026.10.9999']) {
+  for (const version of ['2026.9.9999', '2026.10.9999']) {
     for (const unsigned of [true, false]) {
       const forged = makeReceipt({ version, automatic: false })
       if (unsigned) delete forged.authentication
@@ -473,6 +473,56 @@ test('dry run performs no registry/GitHub reads, draft reservation, tag or asset
     ensureTag: forbidden, ensureFrontend: forbidden, saveReceipt: forbidden, assertSigningKey: forbidden })
   assert.deepEqual(await plan(context), { version: '2026.10.8', dryRun: true })
   assert.deepEqual(calls, [])
+})
+
+test('future manual stable versions are rejected before history or reservation, including signed retries', async () => {
+  const forbidden = () => { throw new Error('Future manual version must not access external state') }
+  for (const version of ['9999.1.1', '2026.11.1', '2026.9999.1',
+    '18446744073709551615.1.1', '2026.18446744073709551615.1']) {
+    const receipt = makeReceipt({ version, automatic: false })
+    assert.equal(assertVersion(version), version, 'Pure Cargo SemVer validation remains unchanged')
+    assert.equal(validateReceipt(receipt, identity, crates).version, version)
+    assert.equal(readAuthenticatedReceipt(release(receipt), signingKey, { required: true }).version, version)
+    assert.throws(() => selectVersion({ automatic: false, requestedVersion: version, identity, crates,
+      releases: [release(receipt)], receipts: [receipt], versions: [version], now }), /current UTC year\/month/)
+    for (const requestedVersion of [version, '', 'latest']) {
+      for (const dryRun of [false, true]) {
+        const { context, calls } = fixture({ automatic: false, requestedVersion, sourceVersion: version, dryRun,
+          releases: forbidden, assertSigningKey: forbidden })
+        await assert.rejects(() => plan(context), /current UTC year\/month/)
+        assert.deepEqual(calls, [])
+      }
+    }
+  }
+})
+
+test('direct manual publication rejects a future signed partial or completed reservation without side effects', async () => {
+  for (const completed of [false, true]) {
+    const receipt = makeReceipt({ version: '9999.1.1', automatic: false, completed,
+      packageChecksums: Object.fromEntries((completed ? crates : crates.slice(0, 1)).map(crate => [crate, checksum])) })
+    const original = clone(receipt)
+    const { context, calls } = fixture({ automatic: false,
+      registry: async () => { throw new Error('Future manual version must not read the registry') } })
+    await assert.rejects(() => publish(context, release(receipt), receipt), /current UTC year\/month/)
+    assert.deepEqual(calls, [], 'No package, receipt, upload, tag or completion writes')
+    assert.deepEqual(receipt, original)
+  }
+})
+
+test('manual stable limits follow UTC month and year boundaries while preserving historical and prerelease versions', async () => {
+  for (const [clock, version, allowed] of [
+    ['2026-11-01T00:30:00+08:00', '2026.11.1', false],
+    ['2026-10-31T17:00:00-07:00', '2026.11.1', true],
+    ['2026-12-31T23:59:59.999Z', '2027.1.1', false],
+    ['2027-01-01T00:00:00Z', '2027.1.1', true],
+    ...['1.2.3', '1.18446744073709551615.1', '2026.10.18446744073709551615',
+      '9999.1.1-rc.0'].map(version => [now.toISOString(), version, true]),
+  ]) {
+    const { context, calls } = fixture({ automatic: false, requestedVersion: version, now: new Date(clock), dryRun: true })
+    if (allowed) assert.deepEqual(await plan(context), { version, dryRun: true })
+    else await assert.rejects(() => plan(context), /current UTC year\/month/)
+    assert.deepEqual(calls, [])
+  }
 })
 
 test('manual versions obey Cargo SemVer before external operations and retain the existing build-metadata exclusion', async (t) => {

@@ -83,6 +83,17 @@ function assertVersion(version) {
   return version
 }
 
+function assertManualVersion(version, now = new Date()) {
+  const stable = /^(\d+)\.(\d+)\.\d+$/.exec(assertVersion(version))
+  if (stable) {
+    const year = BigInt(now.getUTCFullYear())
+    assert.ok(BigInt(stable[1]) < year || (BigInt(stable[1]) === year &&
+      BigInt(stable[2]) <= BigInt(now.getUTCMonth() + 1)),
+    'Manual stable version must not be later than the current UTC year/month')
+  }
+  return version
+}
+
 function validateSource({ eventName, event, repository, sourceRevision, workflowRevision }) {
   assert.match(sourceRevision, SHA)
   if (eventName === 'workflow_dispatch') {
@@ -151,8 +162,8 @@ function selectVersion({ automatic, requestedVersion, sourceVersion, identity, c
     if (matches.length) return validateReceipt(matches[0], identity, crates).version
     return nextVersion(versions, now, occupiedVersions)
   }
-  const version = assertVersion(!requestedVersion || requestedVersion === 'latest'
-    ? sourceVersion : requestedVersion)
+  const version = assertManualVersion(!requestedVersion || requestedVersion === 'latest'
+    ? sourceVersion : requestedVersion, now)
   const release = releases.find((entry) => entry.tag_name === `v${version}`)
   if (release) {
     const receipt = receipts.find((entry) => entry.version === version)
@@ -166,12 +177,12 @@ function selectVersion({ automatic, requestedVersion, sourceVersion, identity, c
 
 async function plan(context) {
   const { automatic, identity, crates, requestedVersion, sourceVersion, dryRun } = context
+  const manualVersion = automatic ? null : assertManualVersion(
+    !requestedVersion || requestedVersion === 'latest' ? sourceVersion : requestedVersion, context.now)
   if (dryRun) {
     assert.ok(!automatic, 'Automatic publication cannot be a dry run')
-    return { version: assertVersion(!requestedVersion || requestedVersion === 'latest'
-      ? sourceVersion : requestedVersion), dryRun: true }
+    return { version: manualVersion, dryRun: true }
   }
-  if (!automatic) assertVersion(!requestedVersion || requestedVersion === 'latest' ? sourceVersion : requestedVersion)
   context.assertSigningKey()
   const releases = await context.releases()
   const receipts = []
@@ -211,6 +222,7 @@ async function publish(context, release, receipt) {
   context.assertSigningKey()
   context.verifyReceipt(receipt)
   validateReceipt(receipt, context.identity, context.crates)
+  if (!context.automatic) assertManualVersion(receipt.version, context.now)
   assert.equal(release.target_commitish, receipt.identity.sourceRevision)
   await assertAutomaticVersionOrder(context, release, receipt)
   for (const crate of receipt.crates) {
