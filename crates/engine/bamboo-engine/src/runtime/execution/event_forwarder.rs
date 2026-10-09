@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use tokio::sync::{broadcast, mpsc, watch, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::AgentEvent;
 
@@ -570,6 +571,45 @@ async fn publish_forwarded_event(
     }
 }
 
+const ROOT_AUTHORITY_LOST: &str =
+    "This run was interrupted because its execution ownership was lost. Reload the conversation before retrying.";
+
+/// Close only the obsolete run's live transport. This is not a runtime-state
+/// publication: it never enters the account journal, replay cache, or storage.
+/// The exact local runner guard keeps this fixed error ahead of any successor's
+/// Started frame on the shared session channel. A successor already installed
+/// in the registry must not receive the obsolete run's error or cancellation.
+async fn interrupt_root_on_authority_loss(
+    error: &std::io::Error,
+    session_id: &str,
+    run_id: &str,
+    runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    publication: &super::event_publication::EventPublication,
+    visible: &super::visible_messages::VisibleMessageStream,
+    cancel_token: &CancellationToken,
+) {
+    if !error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+    {
+        return;
+    }
+    // These capabilities were captured from the original runner. Never look
+    // up a replacement's cancellation token or publication fence.
+    cancel_token.cancel();
+    publication.retire().await;
+    visible.mark_terminal("error");
+    let guard = runners.read().await;
+    if let Some(runner) = guard
+        .get(session_id)
+        .filter(|runner| runner.run_id == run_id)
+    {
+        let _ = runner.event_sender.send(AgentEvent::Error {
+            message: ROOT_AUTHORITY_LOST.into(),
+        });
+    }
+}
+
 /// The Root adapter passes its immutable capability before any Started frame.
 /// Legacy Child/Supervisor/standalone callers keep the existing queue behavior.
 pub fn create_event_forwarder_with_root_actor(
@@ -605,7 +645,7 @@ pub fn create_event_forwarder_with_root_actor(
             session_id: session_id.clone(),
             started_at: Utc::now().to_rfc3339(),
         };
-        let (publication, visible_messages) = {
+        let (publication, visible_messages, cancel_token) = {
             let guard = runners.clone().read_owned().await;
             let Some(runner) = guard
                 .get(&session_id)
@@ -615,6 +655,7 @@ pub fn create_event_forwarder_with_root_actor(
             };
             let publication = runner.event_publication.clone();
             let visible_messages = runner.visible_messages.clone();
+            let cancel_token = runner.cancel_token.clone();
             let feed = legacy_feed.clone();
             let sid = session_id.clone();
             let tx = broadcast_tx.clone();
@@ -633,9 +674,19 @@ pub fn create_event_forwarder_with_root_actor(
             .await
             {
                 tracing::warn!(%session_id, %run_id, %error, "Root Started publication rejected");
+                interrupt_root_on_authority_loss(
+                    &error,
+                    &session_id,
+                    &run_id,
+                    &runners,
+                    &publication,
+                    &visible_messages,
+                    &cancel_token,
+                )
+                .await;
                 return;
             }
-            (publication, visible_messages)
+            (publication, visible_messages, cancel_token)
         };
         let mut tool_event_display = bamboo_agent_core::NativeToolEventDisplay::default();
         while let Some(event) = mpsc_rx.recv().await {
@@ -756,6 +807,16 @@ pub fn create_event_forwarder_with_root_actor(
             };
             if let Err(error) = result {
                 tracing::warn!(%session_id, %run_id, %error, "Root runtime publication rejected");
+                interrupt_root_on_authority_loss(
+                    &error,
+                    &session_id,
+                    &run_id,
+                    &runners,
+                    &publication,
+                    &visible_messages,
+                    &cancel_token,
+                )
+                .await;
                 return;
             }
             if is_history_commit {

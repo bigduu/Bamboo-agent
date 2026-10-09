@@ -86,6 +86,26 @@ impl RootActorEventPublication {
                 .and_then(Result::ok)
                 .unwrap_or(false)
             {
+                // The account writer reports a boolean receipt, so an owner
+                // conflict there otherwise loses its typed cause. Revalidate
+                // without publishing or writing runtime state before returning the
+                // generic receipt failure; a lost owner must still interrupt
+                // its exact live transport through the event forwarder.
+                if let Err(error) = self
+                    .storage
+                    .publish_root_actor_runtime_event(
+                        &self.owner,
+                        Box::new(|check_current| check_current()),
+                    )
+                    .await
+                {
+                    if error
+                        .get_ref()
+                        .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+                    {
+                        return Err(error);
+                    }
+                }
                 return Err(std::io::Error::other(
                     "Root account final publication was not confirmed",
                 ));
