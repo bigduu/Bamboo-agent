@@ -19,6 +19,16 @@ use bamboo_skills::runtime_metadata::{
     SKILL_RUNTIME_SELECTION_TRACE_KEY,
 };
 
+tokio::task_local! { static SDK_RUNTIME: (); }
+
+pub(crate) async fn scope_sdk_runtime<F: std::future::Future>(future: F) -> F::Output {
+    SDK_RUNTIME.scope((), future).await
+}
+
+pub(crate) fn sdk_runtime_active() -> bool {
+    SDK_RUNTIME.try_with(|_| ()).is_ok()
+}
+
 pub(crate) async fn prepare_context(
     session: &mut Session,
     initial_message: &str,
@@ -27,6 +37,9 @@ pub(crate) async fn prepare_context(
     debug_logger: &DebugLogger,
     must_resume_pinned_activation: bool,
 ) -> super::super::Result<String> {
+    if config.sdk_skill_execution_host.is_some() || sdk_runtime_active() {
+        return Ok(String::new());
+    }
     let skill_result = match skill_context::load_skill_context(
         config,
         session,
@@ -262,6 +275,10 @@ pub(super) fn reset_activation_state_for_new_selection(
 }
 
 pub(crate) fn explicit_activation_pending(session: &Session) -> bool {
+    if sdk_runtime_active() {
+        return false;
+    }
+
     let selected_skill_ids = session
         .metadata
         .get(SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY)
@@ -290,6 +307,10 @@ pub(crate) fn explicit_activation_pending(session: &Session) -> bool {
 /// This is a dedicated host context block, never a synthetic user message in
 /// session history and never a catalog/live-filesystem re-resolution.
 pub(crate) fn active_context_block(session: &Session) -> Option<ContextBlock> {
+    if sdk_runtime_active() {
+        return None;
+    }
+
     let durable = session
         .metadata
         .get(bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY)
@@ -359,6 +380,10 @@ pub(crate) fn validate_first_step(
     session: &Session,
     tool_calls: &[bamboo_agent_core::tools::ToolCall],
 ) -> Result<Option<ExplicitActivationAttempt>, AgentError> {
+    if sdk_runtime_active() {
+        return Ok(None);
+    }
+
     if !skill_context::explicit_activation_pending(session) {
         return Ok(None);
     }
@@ -410,6 +435,10 @@ pub(crate) fn apply_successful_attempt(
     session: &mut Session,
     attempt: &ExplicitActivationAttempt,
 ) -> Result<(), AgentError> {
+    if sdk_runtime_active() {
+        return Ok(());
+    }
+
     let tool_succeeded = session.messages.iter().rev().any(|message| {
         message.tool_call_id.as_deref() == Some(attempt.call_id.as_str())
             && message.tool_success == Some(true)
@@ -441,6 +470,9 @@ pub(crate) fn retain_terminal_activation_tools(
     session: &Session,
     tool_schemas: &mut Vec<ToolSchema>,
 ) {
+    if sdk_runtime_active() {
+        return;
+    }
     // Once a single explicitly selected workflow reaches a terminal activation
     // result, stop advertising load_skill so the model-issued attempt occurs
     // exactly once. A typed degraded result is terminal too: the main session
@@ -493,6 +525,9 @@ pub(crate) async fn refresh_load_side_effects(
     tool_name: &str,
     success: bool,
 ) {
+    if config.sdk_skill_execution_host.is_some() || sdk_runtime_active() {
+        return;
+    }
     // Keep the original raw-name branch distinct from normalized first-call validation.
     if !success || tool_name != "load_skill" {
         return;
@@ -693,5 +728,42 @@ mod tests {
             "loaded matching does not validate snapshot contents"
         );
         assert!(!explicit_activation_pending(&session));
+    }
+}
+
+#[cfg(test)]
+mod sdk_inert_tests {
+    use super::*;
+    #[tokio::test]
+    async fn sdk_mode_disables_old_pending_first_step_projection_and_terminal_suppression() {
+        let mut session = Session::new("sdk-inert", "model");
+        session.metadata.insert(
+            SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.into(),
+            r#"["old"]"#.into(),
+        );
+        session
+            .metadata
+            .insert(SKILL_RUNTIME_SELECTION_SOURCE_KEY.into(), "explicit".into());
+        assert!(explicit_activation_pending(&session));
+        let mut schemas = vec![ToolSchema {
+            schema_type: "function".into(),
+            function: bamboo_agent_core::tools::FunctionSchema {
+                name: "load_skill".into(),
+                description: "old".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        }];
+        scope_sdk_runtime(async {
+            assert!(!explicit_activation_pending(&session));
+            assert!(active_context_block(&session).is_none());
+            assert!(validate_first_step(&session, &[]).unwrap().is_none());
+            retain_terminal_activation_tools(&session, &mut schemas);
+            assert_eq!(schemas.len(), 1);
+        })
+        .await;
+        assert!(
+            explicit_activation_pending(&session),
+            "private mode cannot leak to generic execution"
+        );
     }
 }

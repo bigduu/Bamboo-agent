@@ -127,7 +127,19 @@ Watch terminal A for live events; subscribing after execution can miss response 
 
 ### Use it as a Rust SDK (in-process)
 
-For SDK embedding, `bamboo_sdk::agent::Agent` provides `run`, `run_stream`, and `execute` over the same engine. Defaults require a configured provider; they do not supply credentials. See [first-run CLI / HTTP / SDK examples](./docs/guides/GETTING_STARTED.md), [API reference](./docs/guides/API.md), and the [published crate's rustdoc](https://docs.rs/bamboo-agent).
+For SDK embedding, `bamboo_sdk::agent::Agent` provides `run`, `run_stream`, and
+`execute` over the same engine. Defaults require a configured provider; they do not
+supply credentials. A complete built-in defaults assembly also supports
+`run_with_skills(session, SdkSkillInput)` and its cancellation variant. These async
+entries validate current selections and the portable submission hook before appending
+the prepared User. They require a new empty Session or the exact durable Session; save
+and reload staged edits before submitting. The existing String entries keep their
+synchronous append and error order. Explicit tool policies, custom executors and
+`from_runtime` do not supply this finite Skills host and reject typed input before
+append. Low-level `execute` retains its custom-request contract. See [first-run CLI /
+HTTP / SDK examples](./docs/guides/GETTING_STARTED.md), [API
+reference](./docs/guides/API.md), and the [published crate's
+rustdoc](https://docs.rs/bamboo-agent).
 
 ## Your data and operating boundaries
 
@@ -197,10 +209,13 @@ outside this per-page budget.
 pinned Codex allocator: a 2% context budget, an 8,000-character fallback, or an
 independent configured token cap. Names, locators, root aliases and omission
 notices consume that budget; descriptions share remaining space round-robin.
-These exported APIs have no live registry or body-reader integration yet.
+The complete defaults-backed SDK ergonomic execution surface installs these Tools with a
+private current-run/current-User resolver. Server, deployed worker and other runtime
+assembly surfaces still require their separate atomic integration.
 
-Engine's `session_app::skill_input::prepare_skill_input` is a pure, unwired
-ordinary User-content converter. The host must supply current-input restrictions
+Engine's `session_app::skill_input::prepare_skill_input` is a pure
+ordinary User-content converter used by the SDK host factory. The host must supply
+current-input restrictions
 and correlated typed selections/snapshots; catalog, configured IDs and client
 fragment text establish no invocation. Explicit bodies use an 8,000 UTF-8-byte
 limit with visible warnings; bounded arguments are rejected rather than cut.
@@ -208,9 +223,11 @@ limit with visible warnings; bounded arguments are rejected rather than cut.
 history after the complete original tool batch. It validates typed historical
 data and a unique successful active receipt, retains originals and uses the
 existing 512 KiB bound. Unsupported history stays intact. Neither helper is
-called by chat, runner setup, providers or persistence; live cutover is separate.
+called by chat. The defaults SDK invokes input conversion through its host factory and
+converts supported loaded Instruction history during runner setup, checkpointing before
+the obsolete outbox can run.
 
-`bamboo_server_tools::SkillInputFactory` is an unwired host preparation entry
+`bamboo_server_tools::SkillInputFactory` is a host preparation entry
 point for an actual User that has not been appended. It requires a freshly
 resolved caller and typed current selections; host ceilings, disabled/manual
 policy, Root Ultra and Project/workspace scope remain separate restrictions.
@@ -219,8 +236,10 @@ rows. Existing Sessions reuse their persistence owner before publication guards
 and a final direct fallible storage read. Definition, schema, mode and Source
 are borrowed from one current publication, with charged raw/physical validation
 before rendering and before success. Only ordinary Message data and warnings
-return; no Session, pin or reader permission is written. No production caller
-uses this factory. Its fixtures establish preparation, not live runtime cutover.
+return; no Session, pin or reader permission is written. The SDK async typed entry
+borrows its actual repository owner and uses this factory before final append. The
+subsequent existing checkpoint verifies the exact final User before exposing bounded
+current-input data to metadata and Reader dispatch.
 
 Its `prepare_input_with_owner` entry borrows the host's active persistence guard
 and checks the same Session and coordinator map before reading. It compares the
@@ -234,19 +253,24 @@ Both entries acquire retained Config after Session and before publication, then
 validate current caller revocation after the final await. The SDK's
 private User construction and append helpers retain one exact message ID/time
 and all four wrappers' original synchronous append, lease and error order.
-These preparations do not connect HTTP, runtime, Reader or production authority.
+The SDK connects those preparations to its actual runtime and Reader; HTTP and other
+host surfaces retain their existing paths.
 
 The runner's existing Instruction activation path is factored into a private,
-stateless `legacy_instruction` adapter. It still publishes the selected pin,
+stateless `legacy_instruction` adapter. Outside the defaults SDK it still publishes the
+selected pin,
 requires one model-issued `load_skill` call, suppresses first-round answer text,
 and refreshes the existing repository activation metadata before continuation.
 Durable workflow context, resume behavior, terminal degraded results and
 WorkflowRun ordering retain their existing contracts. The adapter adds no
 caller grant, Session field, source reader or lifecycle writer.
 
-This extraction does not wire the pure input/history helpers or register the
-progressive catalog/read Tools. The legacy Instruction path remains the only
-live protocol; an atomic live cutover is a separate migration step.
+The defaults SDK disables this adapter for its whole execution, including prompt
+projection, required-first-call, answer suppression, silent-stream and retrieval gates.
+Supported loaded Instruction history converts one way through the existing checkpoint;
+unsupported history remains intact and inert. Deterministic WorkflowRun ordering remains
+unchanged. Server, child and deployed-worker cutover, official legacy Tool/export
+retirement and the complete #1595 integration remain outstanding.
 
 Chat's existing typed Instruction selection uses a private `legacy_selection`
 adapter. Candidate revisions and snapshots still come from the same Skills
@@ -258,7 +282,7 @@ guards through durable save, admission and pin handoff. It remains detached
 from response cancellation; those guards are released before activation.
 Ordinary requests keep their existing input and idempotent replay behavior.
 This adapter adds no caller grant, Session field, reader registration or
-additional writer. The pure prepared-input helpers remain unwired.
+additional writer. These HTTP paths do not use the SDK host preparation entry.
 
 Native chat and queued HTTP input use private constructors for the same User
 Message and inbox envelope. Native chat retains its real ID, timestamp and nondeduplicated attachments;
@@ -266,8 +290,9 @@ the existing consumer checkpoints its User and pending handoff. Queued input
 retains authenticated admission and its durable retry identity. The four fresh-input SDK wrappers share one synchronous append
 helper at their original call positions, including synchronous stream creation.
 Session-only execution and resume retain their supplied history. These helpers
-preserve the existing public and serialized layouts and introduce no Skill
-factory or live reader registration.
+preserve the existing public and serialized layouts. The defaults SDK now
+connects its actual append to checked current-input data and Reader execution;
+HTTP producer helpers alone provide no Skill authority.
 
 ## License
 
@@ -286,18 +311,21 @@ charged through the last real owner and carries no future execution permission.
 bounded charged scratch. These APIs do not register a `skills_read` Tool or provide
 paging/cache/runtime activation. Existing publication storage has separate bounds.
 
-The exported, unregistered `SkillsReadTool` reuses `SkillsListTool`'s mandatory
+The exported `SkillsReadTool`, installed on the defaults SDK ergonomic surface, reuses
+`SkillsListTool`'s mandatory
 trusted caller resolver. Reads use stable packages plus `SKILL.md` or a published
 relative resource. Follow `next_cursor` to complete EOF before applying instructions.
 A finite owned snapshot cache retains shared byte charges through active borrows;
 every continuation validates current caller/input, host policy and source identity.
 UTF-8 pages charge the largest real OpenAI Chat/Responses, Anthropic cache
 (including 1h), Gemini page-bearing block and complete ToolResult envelope.
-`render_skill_usage_instructions` exposes complete budgeted guidance only when a
-future runtime deliberately installs the read Tool. Live registration is deferred.
+`render_skill_usage_instructions` supplies budgeted guidance to the actual SDK prompt.
+The provider must follow main-resource pages to EOF before task actions; referenced
+resources remain on demand. The finite run owner revokes access on cancellation, drop
+and completion, even when Tool or host clones remain.
 
-`skill_response_byte_budget` is an unwired scalar preparation helper. A future
-trusted caller must supply its actual current tool-output token cap alongside the
+`skill_response_byte_budget` is a scalar budget helper. The SDK Reader resolver composes
+its actual current dispatch output cap with the
 existing response byte ceiling. Unknown caps and zero response bytes fail;
 a known zero token cap means no hard token cap while retaining a finite512KiB
 byte ceiling. Positive caps conservatively limit response bytes to that cap.
@@ -325,19 +353,19 @@ Unwrapped spawned/blocking tasks and detached completions do not inherit it.
 Moving a whole scoped future preserves its own per-poll observation, and scope
 exit, cancellation and unwind restore the caller's previous scope.
 
-Production Reader registration, current-input intent transport, default trusted
-caller resolution and output-helper composition remain disconnected until the
-separate atomic cutover. Existing legacy execution remains the only live path.
+Defaults SDK ergonomic execution now connects Reader registration, actual
+current-input transport, finite trusted caller resolution and output-cap
+composition. Server, child and deployed-worker integration remains pending.
 
 Server and deployed workers construct the existing `load_skill` and
 `read_skill_resource` overlays through `assemble_legacy_skill_tools` in
 `skill_runtime/assembly.rs`. Server retains its Project store and the actual
 permission-checked pre-Skill context registry; workers retain their absent
-optional adapters. Strict-native workers bypass this construction, and SDK
-defaults retain their existing tool registration. The old classes remain
-exported. This refactor preserves legacy invocation, resource and metadata
-behavior; it does not register progressive catalog/read Tools or wire the
-prepared ordinary-input helpers. The atomic live cutover remains separate.
+optional adapters. Strict-native workers bypass this construction. The defaults
+SDK installs progressive catalog/read Tools on its ergonomic execution surface;
+its legacy Instruction execution adapter is inert. The old classes remain
+exported for the other host surfaces, whose legacy behavior remains unchanged.
+Their integration and official export retirement remain part of #1595.
 
 Canonical User envelopes can retain bounded, untrusted Skill request data in
 `SessionMessageContent::skill_request`. A current HTTP `workflow_selection`
@@ -396,7 +424,13 @@ optional Lifecycle companion returns data to its caller; old implementations
 run once and return unavailable data. The initial checked HTTP handoff is sealed
 and consumed once under the same measured execution UUID. Its existing I-E
 compatibility slice adds bounded slots and args AST storage; the 256 KiB compact
-cap is not a heap/RSS bound. Old SDK/native/history constructors do not create
-current-input evidence. Host selection remains a ceiling, and every eventual
-Skill use still requires fresh caller, Source, schema, configuration and policy
-checks. This adds no Reader, preparation, registration or live Skill cutover.
+cap is not a heap/RSS bound. Generic SDK/history constructors do not create
+current-input evidence. The defaults SDK's actual append reserves a private execution
+identity and exposes input data only after the exact durable User is verified. Failed,
+absent or changed durable reads clear the SDK data; a successful checked NoNew boundary
+can retain it within that same execution. Resume and run_session cannot recover current
+invocation from history. The actual provider/retry/Tool future borrows the uniquely
+owned Q value, and normal completion returns that same owner before the next boundary.
+Host selection remains a ceiling, and every Skill use still requires fresh caller,
+Source, schema, configuration and policy checks. This SDK integration does not complete
+#1595 or the overall migration.

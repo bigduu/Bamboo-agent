@@ -98,6 +98,16 @@ pub(crate) async fn run_agent_loop_with_config(
                 message.content = initial_message.clone();
             }
         }
+        if let Some(inputs) = config.initial_untrusted_inputs.as_ref() {
+            // Observation failure denies the optional Skill caller while
+            // retaining the ordinary SDK append and execution semantics.
+            if let Err(error) = inputs
+                .seal_sdk_input(session, config.persistence.as_ref())
+                .await
+            {
+                tracing::warn!(session_id = %session.id, %error, "SDK input remains unsealed");
+            }
+        }
         super::state_bridge::ensure_initial_root_tool_authority(session, config.storage.as_ref())
             .await?;
         let mut state: LoopRunState = initialize_loop_state(

@@ -1,9 +1,11 @@
 # Owned input-request data scope
 
 The Engine lifecycle module exports `scope_input_request_data` and
-`with_scoped_input_request_data` as unwired preparation for #1595. Production
-runner, Chat, SDK and tool registrations do not call them. The existing
-Instruction activation path remains live.
+`with_scoped_input_request_data`. The main pipeline now scopes its one owned
+batch through metadata, provider retries and Tool execution, then recovers the
+same owner before the next boundary. The defaults SDK borrows this data through
+its private current-run/current-User resolver; Q itself supplies no authority.
+Server, child and deployed-worker Skills integration remains pending under #1595.
 
 The scope accepts an existing `Option<BoundedInputRequestBatch>` and a future.
 It moves the unique batch into Tokio's task-local scope and lends it during
@@ -30,10 +32,13 @@ independently at actual use. Holding a scoped batch is not a Source lease and
 does not delay revocation. There is no persistent index, grant cache, second
 writer, public Core layout change, broad snapshot copy or whole-batch Clone.
 
-Future integration must first apply the existing `InputObservation::update_current`
+The pipeline applies the existing `InputObservation::update_current`
 at each accepted round boundary. Same-execution successful NoNew retains the
 owner; New replaces it, including a new input without any request; unavailable
 or foreign observations clear it. Recover the scope before the next boundary.
 Do not poll another scoped future while a synchronous reader holds its borrow.
-The actual caller/F/SDK contracts and complete atomic live switch remain separate
-work under #1595; this preparation does not establish their acceptance.
+The defaults SDK connects the actual caller, preappend F, final User checkpoint
+and Reader while disabling its old Instruction gates. Its direct String append
+order is preserved; session-only execution and resume cannot reconstruct a new
+invocation from history. The remaining official host surfaces and complete
+atomic switch stay open under #1595.

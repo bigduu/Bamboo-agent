@@ -188,7 +188,7 @@ pub struct ProjectedInputRequest {
     pub request: Option<bamboo_domain::SessionSkillRequest>,
 }
 
-/// One execution-private data value. No live consumer is connected here.
+/// One execution-private data value, borrowed by the SDK provider/Tool round.
 /// Compact bytes bound the measurement, not total AST allocation or RSS.
 ///
 /// ```
