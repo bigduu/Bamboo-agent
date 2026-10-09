@@ -24,8 +24,8 @@ use crate::runtime::config::{
 use crate::runtime::execution::child_completion::ChildCompletion;
 use crate::runtime::execution::event_forwarder::HistoryCommitBarrier;
 use crate::runtime::execution::runner_lifecycle::{
-    finalize_rejected_runner_if_distinct, finalize_runner, finalize_runner_exact,
-    reserve_runner_core, ReserveOutcome, RunnerReservation,
+    finalize_rejected_runner_if_distinct, finalize_runner_exact, reserve_runner_core,
+    ReserveOutcome, RunnerReservation,
 };
 use crate::runtime::execution::runner_state::AgentRunner;
 use crate::runtime::model_roster::ModelRoster;
@@ -1180,7 +1180,7 @@ pub fn spawn_session_execution_with_inputs(
             // persisted above, so `is_running` and `last_run_status` become
             // visible together and the frontend settles immediately instead of
             // lingering in its optimistic-settle window.
-            finalize_runner(&runners, &session_id, &result).await;
+            finalize_runner_exact(&runners, &session_id, &activation_run_id, &result).await;
 
             if let Some(owner) = root_actor.take() {
                 let outcome = if result.as_ref().is_err_and(|error| error.is_cancelled()) {
