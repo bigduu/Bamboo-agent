@@ -3,7 +3,6 @@ use crate::AgentStatus;
 use actix_web::{http::StatusCode, test, App};
 use bamboo_agent_core::tools::{FunctionCall, ToolSchema};
 use bamboo_agent_core::Role;
-use bamboo_domain::TokenBudget;
 use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
 use bamboo_llm::{ProviderModelRouter, ProviderRegistry};
 use serde_json::{json, Value};
@@ -270,13 +269,10 @@ async fn http(state: &web::Data<AppState>, path: &str, body: Value) -> (StatusCo
     let status = response.status();
     (status, test::read_body_json(response).await)
 }
-async fn seed(state: &web::Data<AppState>, id: &str, cap: u32) {
+async fn seed(state: &web::Data<AppState>, id: &str) {
     let mut session = Session::new(id, "test-model");
     session.title_generated = true;
-    session.token_budget = Some(TokenBudget {
-        max_tool_output_tokens: cap,
-        ..Default::default()
-    });
+
     state.storage.save_session(&session).await.unwrap();
 }
 async fn selection(state: &web::Data<AppState>, name: &str) -> bamboo_skills::WorkflowSelection {
@@ -338,7 +334,7 @@ async fn native_http_typed_main_reads_complete_pages_reference_then_actual_task(
     let provider = provider(home.path(), 4096, true);
     let state = state(home.path(), provider.clone()).await;
     let id = "native-typed-pages";
-    seed(&state, id, 4096).await;
+    seed(&state, id).await;
     let selection = selection(&state, "native-proof").await;
     let image = "data:image/png;base64,aGVsbG8=";
     let (status, receipt) = http(
@@ -383,9 +379,24 @@ async fn native_http_typed_main_reads_complete_pages_reference_then_actual_task(
         "REFERENCE_EOF_native-proof\n"
     );
     let actual_user = trace.requests[0].iter().find(|m| m.id == input_id).unwrap();
-    assert_eq!(
-        serde_json::to_value(actual_user).unwrap(),
-        serde_json::to_value(user).unwrap()
+    // Existing Server attachment materialization replaces only stored URLs.
+    let mut expected_user = user.clone();
+    for part in expected_user.content_parts.as_mut().unwrap() {
+        if let bamboo_domain::MessagePart::ImageUrl { image_url } = part {
+            image_url.url = image.into();
+        }
+    }
+    let actual = serde_json::to_value(actual_user).unwrap();
+    let expected_user = serde_json::to_value(expected_user).unwrap();
+    let differences: Vec<_> = actual
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|key| actual[*key] != expected_user[*key])
+        .collect();
+    assert!(
+        differences.is_empty(),
+        "unexpected provider User changes: {differences:?}"
     );
     assert_eq!(
         actual_user
@@ -419,7 +430,7 @@ async fn native_http_implicit_main_retains_current_user_across_nonew_pages() {
     let provider = provider(home.path(), 4096, false);
     let state = state(home.path(), provider.clone()).await;
     let id = "native-implicit-pages";
-    seed(&state, id, 4096).await;
+    seed(&state, id).await;
     let (status, receipt) = http(&state, "/api/v1/chat", json!({
         "session_id":id,"message":"Inspect proof and perform its normal action", "workspace_path":home.path()
     })).await;
@@ -489,7 +500,7 @@ async fn native_http_actual_stop_and_provider_unwind_revoke_retained_executor() 
         });
         let state = state(home.path(), provider.clone()).await;
         let id = format!("native-revoke-{unwind}");
-        seed(&state, &id, 4096).await;
+        seed(&state, &id).await;
         bindings()
             .lock()
             .unwrap()
@@ -641,7 +652,7 @@ async fn native_http_warm_reader_checks_current_disabled_and_raw_source_before_t
         let state = state(home.path(), provider.clone()).await;
         *provider.config.lock().unwrap() = Some(state.config.clone());
         let id = format!("native-source-revoked-{source_changed}");
-        seed(&state, &id, 4096).await;
+        seed(&state, &id).await;
         let (status, body) = http(
             &state,
             "/api/v1/chat",
@@ -667,7 +678,7 @@ async fn native_http_existing_root_second_typed_input_uses_canonical_f_with_hook
     let provider = provider(home.path(), 4096, false);
     let state = state(home.path(), provider.clone()).await;
     let id = "native-existing-root";
-    seed(&state, id, 4096).await;
+    seed(&state, id).await;
     let (status, body) = http(
         &state,
         "/api/v1/chat",
@@ -724,7 +735,7 @@ async fn native_http_stale_and_oversized_selection_reject_before_inbox_or_user_a
     let provider = provider(home.path(), 4096, false);
     let state = state(home.path(), provider.clone()).await;
     let id = "native-invalid-selection";
-    seed(&state, id, 4096).await;
+    seed(&state, id).await;
     let selected = selection(&state, "native-proof").await;
     for oversized in [false, true] {
         let mut invalid = selected.clone();

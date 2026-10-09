@@ -36,6 +36,7 @@ use std::sync::{
 use tokio_util::sync::CancellationToken;
 
 const METADATA_TOKENS: usize = 2_000;
+// Producer page ceiling, further narrowed by the actual dispatch cap.
 const RESPONSE_BYTES: usize = 4 * 1024;
 
 fn denied(reason: &str) -> ToolError {
@@ -48,6 +49,8 @@ fn engine_error(error: ToolError) -> AgentError {
 pub(crate) fn ordinary_main(session: &Session) -> bool {
     session.kind == bamboo_domain::SessionKind::Root
         && session.parent_session_id.is_none()
+        && session.root_session_id == session.id
+        && session.spawn_depth == 0
         && session.authority_identity.is_ordinary()
         && !session.root_orchestration_only_enabled()
 }
@@ -210,7 +213,7 @@ impl Policy {
         }
         Ok(())
     }
-    fn check_session(&self, session: &Session) -> Result<(), ToolError> {
+    fn check_execution_session(&self, session: &Session) -> Result<(), ToolError> {
         self.check()?;
         if session.id != self.session_id || !ordinary_main(session) {
             return Err(denied("Native Main identity changed"));
@@ -227,13 +230,17 @@ impl Policy {
         {
             return Err(denied("Native Session permission policy changed"));
         }
+        if ceiling(session)? != self.ceiling || mode(session) != self.mode {
+            return Err(denied("Native Session Skill restriction changed"));
+        }
+        Ok(())
+    }
+    fn check_session(&self, session: &Session) -> Result<(), ToolError> {
+        self.check_execution_session(session)?;
         if session.workspace_path_meta() != self.workspace
             || session.project_id_meta() != self.project
         {
-            return Err(denied("Native Session Source scope changed"));
-        }
-        if ceiling(session)? != self.ceiling || mode(session) != self.mode {
-            return Err(denied("Native Session Skill restriction changed"));
+            return Err(denied("Native canonical Session Source scope changed"));
         }
         Ok(())
     }
@@ -584,7 +591,7 @@ impl SkillExecutionHost for NativeHost {
     ) -> Result<String, AgentError> {
         self.run
             .policy
-            .check_session(session)
+            .check_execution_session(session)
             .map_err(engine_error)?;
         let has_input = {
             let current = self
