@@ -844,7 +844,7 @@ async fn commit_openai_client_tool_search_round(
     session: &mut Session,
     config: &AgentLoopConfig,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
-) -> Result<(), AgentError> {
+) -> Result<Message, AgentError> {
     ensure_discovery_allowed(session, config).await?;
     let host_outputs = build_openai_client_tool_search_outputs(
         session,
@@ -865,7 +865,7 @@ async fn commit_openai_client_tool_search_round(
     );
     let anchor = message.id.clone();
     let mut provider_items = Some(stream_output.provider_transcript_items);
-    commit_assistant_message(session, message, &mut provider_items)?;
+    commit_assistant_message(session, message.clone(), &mut provider_items)?;
     for output in host_outputs {
         session
             .append_provider_transcript_group(&anchor, None, vec![output])
@@ -885,7 +885,7 @@ async fn commit_openai_client_tool_search_round(
                 ))
             })?;
     }
-    Ok(())
+    Ok(message)
 }
 
 // ---- Error classification (from rounds.rs) ----
@@ -3512,7 +3512,10 @@ async fn run_pipeline_inner(
                     )
                     .await
                     {
-                        Ok(()) => {
+                        Ok(message) => {
+                            if config.features_final_evidence_check {
+                                publish_buffered_message(event_tx, &message).await;
+                            }
                             record_no_tool_calls_round_completed(
                                 state.metrics_collector.as_ref(),
                                 &round_id,

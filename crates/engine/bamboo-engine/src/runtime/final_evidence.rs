@@ -144,7 +144,12 @@ fn collect_evidence(session: &Session) -> EvidencePacket {
                         .as_ref()
                         .and_then(|metadata| metadata.get("runtime_kind"))
                         .and_then(|kind| kind.as_str()),
-                    Some("stop_hook_continuation" | "run_budget_summary" | "max_rounds_summary")
+                    Some(
+                        "stop_hook_continuation"
+                            | "run_budget_summary"
+                            | "max_rounds_summary"
+                            | "no_progress_continue"
+                    )
                 )
         })
         .unwrap_or(0);

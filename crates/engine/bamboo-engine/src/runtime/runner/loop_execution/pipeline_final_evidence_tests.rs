@@ -9,12 +9,14 @@ use serde_json::json;
 
 const CANDIDATE: &str = "All checks passed and the task is complete.";
 const CORRECTED: &str = "The check failed; the task remains incomplete.";
+const DISCOVERY_PROGRESS: &str = "Looking up the available tools.";
 
 #[derive(Clone, Copy)]
 enum Verdict {
     Revise,
     InvalidReference,
     CancelAfterUsage,
+    NativeSearch(bool),
 }
 
 struct FinalProvider {
@@ -73,11 +75,33 @@ impl LLMProvider for FinalProvider {
         if options.and_then(|options| options.request_purpose.as_deref())
             != Some("final_evidence_check")
         {
-            self.main_calls.fetch_add(1, Ordering::SeqCst);
+            let round = self.main_calls.fetch_add(1, Ordering::SeqCst);
+            let search = matches!(self.verdict, Verdict::NativeSearch(_)) && round == 0;
+            let content = match (search, self.verdict) {
+                (true, Verdict::NativeSearch(true)) => "",
+                (true, _) => DISCOVERY_PROGRESS,
+                _ => CANDIDATE,
+            };
+            let payload = if search {
+                json!({"type":"tool_search_call", "id":"native-search", "call_id":"search-1",
+                    "execution":"client", "status":"completed", "arguments":{"query":"checks"}})
+            } else {
+                json!({"type":"message", "id":format!("native-message-{round}"), "role":"assistant", "status":"completed",
+                    "content":[{"type":"output_text", "text":content, "annotations":[]}]})
+            };
+            let native = ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                ProviderTranscriptOrigin::Provider,
+                ProviderTranscriptAuthor::Model,
+                payload,
+            )
+            .unwrap();
             return Ok(Box::pin(stream::iter(vec![
                 Ok(LLMChunk::ReasoningToken("original signed thought".into())),
                 Ok(LLMChunk::ReasoningSignature("original-signature".into())),
-                Ok(LLMChunk::Token(CANDIDATE.into())),
+                Ok(LLMChunk::Token(content.into())),
+                Ok(LLMChunk::ProviderTranscriptItem(native)),
                 Ok(provider_usage(100, 10)),
                 Ok(LLMChunk::Done),
             ])));
@@ -158,6 +182,7 @@ fn fixture(enabled: bool) -> (Session, AgentLoopConfig, LoopRunState) {
         features_final_evidence_check: enabled,
         model_name: Some("model".into()),
         fast_model_name: Some("fast-model".into()),
+        provider_type: Some("openai".into()),
         prompt_memory_flags: crate::runtime::config::PromptMemoryFlags {
             project_prompt_injection: false,
             relevant_recall: false,
@@ -184,6 +209,25 @@ fn fixture(enabled: bool) -> (Session, AgentLoopConfig, LoopRunState) {
     (session, config, state)
 }
 
+async fn run(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    state: &mut LoopRunState,
+    provider: Arc<FinalProvider>,
+    tx: &mpsc::Sender<AgentEvent>,
+) -> Result<bool, AgentError> {
+    run_pipeline(
+        session,
+        tx,
+        provider,
+        Arc::new(NoExecution),
+        &CancellationToken::new(),
+        config,
+        state,
+    )
+    .await
+}
+
 fn drain(rx: &mut mpsc::Receiver<AgentEvent>) -> (String, usize) {
     let mut content = String::new();
     let mut completes = 0;
@@ -202,17 +246,8 @@ async fn disabled_check_keeps_the_original_final_answer_without_an_auxiliary_cal
     let (mut session, config, mut state) = fixture(false);
     let provider = FinalProvider::new(Verdict::Revise);
     let (tx, mut rx) = mpsc::channel(128);
-    assert!(run_pipeline(
-        &mut session,
-        &tx,
-        provider.clone(),
-        Arc::new(NoExecution),
-        &CancellationToken::new(),
-        &config,
-        &mut state
-    )
-    .await
-    .unwrap());
+    let result = run(&mut session, &config, &mut state, provider.clone(), &tx).await;
+    assert!(result.unwrap());
     assert_eq!(drain(&mut rx), (CANDIDATE.to_string(), 1));
     assert_eq!(provider.main_calls.load(Ordering::SeqCst), 1);
     assert_eq!(provider.auxiliary_calls.load(Ordering::SeqCst), 0);
@@ -229,17 +264,8 @@ async fn enabled_check_emits_and_saves_only_the_correction_and_accounts_once() {
     let (mut session, config, mut state) = fixture(true);
     let provider = FinalProvider::new(Verdict::Revise);
     let (tx, mut rx) = mpsc::channel(128);
-    assert!(run_pipeline(
-        &mut session,
-        &tx,
-        provider.clone(),
-        Arc::new(NoExecution),
-        &CancellationToken::new(),
-        &config,
-        &mut state
-    )
-    .await
-    .unwrap());
+    let result = run(&mut session, &config, &mut state, provider.clone(), &tx).await;
+    assert!(result.unwrap());
     assert_eq!(drain(&mut rx), (CORRECTED.to_string(), 1));
     let answer = session.messages.last().unwrap();
     assert_eq!(answer.content, CORRECTED);
@@ -271,16 +297,7 @@ async fn invalid_verdict_does_not_publish_the_candidate_but_retains_billed_usage
     let (mut session, config, mut state) = fixture(true);
     let provider = FinalProvider::new(Verdict::InvalidReference);
     let (tx, mut rx) = mpsc::channel(128);
-    let result = run_pipeline(
-        &mut session,
-        &tx,
-        provider.clone(),
-        Arc::new(NoExecution),
-        &CancellationToken::new(),
-        &config,
-        &mut state,
-    )
-    .await;
+    let result = run(&mut session, &config, &mut state, provider.clone(), &tx).await;
     assert!(matches!(result, Err(AgentError::LLM(_))));
     assert_eq!(drain(&mut rx), (String::new(), 0));
     assert_eq!(provider.main_calls.load(Ordering::SeqCst), 1);
@@ -321,8 +338,19 @@ async fn cancelled_check_never_emits_complete_and_keeps_received_auxiliary_usage
 struct FinalGateProbe {
     deny_first: bool,
     calls: AtomicUsize,
-    committed_candidate_id: Mutex<Option<String>>,
+    candidate_id: Mutex<Option<String>>,
     transcript_epoch: AtomicUsize,
+}
+
+fn native_replay_count(session: &Session) -> usize {
+    let transcript = &session.provider_transcript;
+    transcript
+        .replayable_groups(
+            transcript.active_family().unwrap(),
+            transcript.active_protocol().unwrap(),
+            transcript.active_provider_boundary_sha256().unwrap(),
+        )
+        .len()
 }
 
 #[async_trait::async_trait]
@@ -337,7 +365,8 @@ impl bamboo_agent_core::AgentHook for FinalGateProbe {
             .last()
             .filter(|message| message.role == Role::Assistant && message.tool_calls.is_none())
         {
-            *self.committed_candidate_id.lock().unwrap() = Some(message.id.clone());
+            assert!(native_replay_count(session) > 0);
+            *self.candidate_id.lock().unwrap() = Some(message.id.clone());
             self.transcript_epoch.store(
                 session.provider_transcript.epoch() as usize,
                 Ordering::SeqCst,
@@ -357,7 +386,7 @@ fn install_probe(config: &mut AgentLoopConfig, deny_first: bool) -> Arc<FinalGat
     let probe = Arc::new(FinalGateProbe {
         deny_first,
         calls: AtomicUsize::new(0),
-        committed_candidate_id: Mutex::new(None),
+        candidate_id: Mutex::new(None),
         transcript_epoch: AtomicUsize::new(0),
     });
     let mut hooks = crate::runtime::hooks::HookRunner::new();
@@ -372,17 +401,8 @@ async fn stop_hook_continuation_keeps_original_evidence_and_checks_only_the_fina
     let probe = install_probe(&mut config, true);
     let provider = FinalProvider::new(Verdict::Revise);
     let (tx, mut rx) = mpsc::channel(128);
-    assert!(run_pipeline(
-        &mut session,
-        &tx,
-        provider.clone(),
-        Arc::new(NoExecution),
-        &CancellationToken::new(),
-        &config,
-        &mut state
-    )
-    .await
-    .unwrap());
+    let result = run(&mut session, &config, &mut state, provider.clone(), &tx).await;
+    assert!(result.unwrap());
     assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
     assert_eq!(provider.main_calls.load(Ordering::SeqCst), 2);
     assert_eq!(provider.auxiliary_calls.load(Ordering::SeqCst), 1);
@@ -393,6 +413,54 @@ async fn stop_hook_continuation_keeps_original_evidence_and_checks_only_the_fina
     assert_eq!(session.messages.last().unwrap().content, CORRECTED);
     assert_eq!(state.runtime_state.round.total_prompt_tokens, 207);
     assert_eq!(state.runtime_state.round.total_completion_tokens, 23);
+}
+
+#[tokio::test]
+async fn native_discovery_replays_progress_once_with_the_committed_identity_before_final_check() {
+    for (enabled, thought_only) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (mut session, config, mut state) = fixture(enabled);
+        let provider = FinalProvider::new(Verdict::NativeSearch(thought_only));
+        let (tx, mut rx) = mpsc::channel(128);
+        let result = run(&mut session, &config, &mut state, provider.clone(), &tx).await;
+        assert!(result.unwrap());
+        let mut current_id = None;
+        let mut texts = Vec::new();
+        let mut reasoning_count = 0;
+        let mut completes = 0;
+        while let Ok(event) = rx.try_recv() {
+            let stored = session
+                .messages
+                .iter()
+                .find(|message| Some(&message.id) == current_id.as_ref());
+            match event {
+                AgentEvent::VisibleMessageStart { message_id, .. } => current_id = Some(message_id),
+                AgentEvent::Token { content } => {
+                    assert_eq!(stored.unwrap().content, content);
+                    texts.push(content);
+                }
+                AgentEvent::ReasoningToken { content } => {
+                    assert_eq!(stored.unwrap().reasoning.as_deref(), Some(content.as_str()));
+                    reasoning_count += 1;
+                }
+                AgentEvent::Complete { .. } => completes += 1,
+                _ => {}
+            }
+        }
+        let mut expected = if thought_only {
+            vec![]
+        } else {
+            vec![DISCOVERY_PROGRESS]
+        };
+        expected.push(if enabled { CORRECTED } else { CANDIDATE });
+        assert_eq!(texts, expected);
+        assert_eq!(reasoning_count, if enabled { 1 } else { 2 });
+        assert_eq!(completes, 1);
+        assert_eq!(provider.main_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            provider.auxiliary_calls.load(Ordering::SeqCst),
+            usize::from(enabled)
+        );
+    }
 }
 
 #[tokio::test]
@@ -409,22 +477,8 @@ async fn gold_committed_candidate_is_revised_in_place_without_a_duplicate_or_sta
         let probe = install_probe(&mut config, false);
         let provider = FinalProvider::new(verdict);
         let (tx, mut rx) = mpsc::channel(128);
-        let result = run_pipeline(
-            &mut session,
-            &tx,
-            provider.clone(),
-            Arc::new(NoExecution),
-            &CancellationToken::new(),
-            &config,
-            &mut state,
-        )
-        .await;
-        let candidate_id = probe
-            .committed_candidate_id
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap();
+        let result = run(&mut session, &config, &mut state, provider.clone(), &tx).await;
+        let candidate_id = probe.candidate_id.lock().unwrap().clone().unwrap();
         let revised = matches!(verdict, Verdict::Revise);
         if revised {
             assert!(result.unwrap());
@@ -450,20 +504,12 @@ async fn gold_committed_candidate_is_revised_in_place_without_a_duplicate_or_sta
             session.provider_transcript.epoch() as usize
                 > probe.transcript_epoch.load(Ordering::SeqCst)
         );
+        assert_eq!(native_replay_count(&session), 0);
         assert!(!session
             .metadata
             .contains_key("responses.previous_response_id"));
-        assert_eq!(
-            drain(&mut rx),
-            (
-                if revised {
-                    CORRECTED.to_string()
-                } else {
-                    String::new()
-                },
-                usize::from(revised)
-            )
-        );
+        let expected = if revised { CORRECTED } else { "" };
+        assert_eq!(drain(&mut rx), (expected.into(), usize::from(revised)));
         assert_eq!(provider.main_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.auxiliary_calls.load(Ordering::SeqCst), 1);
     }

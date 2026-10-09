@@ -177,6 +177,7 @@ fn runtime_resume_keeps_evidence_but_a_new_external_request_starts_a_new_window(
         "stop_hook_continuation",
         "run_budget_summary",
         "max_rounds_summary",
+        "no_progress_continue",
     ] {
         let mut feedback = Message::user("Summarize the remaining work.");
         feedback.metadata = Some(json!({"runtime_kind": kind}));
