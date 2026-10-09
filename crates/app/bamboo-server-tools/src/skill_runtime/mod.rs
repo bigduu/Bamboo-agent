@@ -63,6 +63,21 @@ pub trait SkillCatalogCallerResolver: Send + Sync {
         ctx: &bamboo_agent_core::tools::ToolCtx,
     ) -> Result<SkillCatalogCaller, ToolError>;
 
+    /// Resolve the actual preappend caller while its existing Session owner is
+    /// borrowed. Implementations must read actual authority nonblockingly and
+    /// never acquire/reenter Session or Config owners. Unknown, stale, busy or
+    /// unavailable bindings deny. This is not an accepted-input or Source grant.
+    /// Only the unwired borrowed-owner factory uses this additive contract;
+    /// existing list/read and self-owned preparation retain async `resolve`.
+    fn resolve_preappend(
+        &self,
+        _ctx: &bamboo_agent_core::tools::ToolCtx,
+    ) -> Result<SkillCatalogCaller, ToolError> {
+        Err(ToolError::Execution(
+            "Current preappend caller resolution is unavailable".into(),
+        ))
+    }
+
     /// Synchronous acceptance check for the unwired preappend factory only.
     /// Read the same actual authority source nonblockingly and compare its full
     /// current caller/input binding, ceiling, invocation, mode and limits with
