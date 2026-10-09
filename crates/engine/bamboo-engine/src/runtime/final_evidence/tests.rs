@@ -342,6 +342,7 @@ async fn fixed_semantic_cases_preserve_honest_reports_and_return_scoped_correcti
     for (success, evidence, candidate, verdict, correction) in cases {
         let session = session_with_result(evidence, success);
         let provider = RecordingProvider::new(Response::Chunks(vec![
+            LLMChunk::ReasoningToken("Compare the recorded outcome with the final claim.".into()),
             LLMChunk::ToolCalls(vec![report(verdict, correction, &["check-1"])]),
             LLMChunk::Done,
         ]));
@@ -370,6 +371,13 @@ async fn fixed_semantic_cases_preserve_honest_reports_and_return_scoped_correcti
         assert!(
             result.usage.total_tokens > 0,
             "missing provider usage uses the existing tokenizer fallback"
+        );
+        assert!(
+            result.usage.completion_tokens
+                >= u64::from(
+                    TiktokenTokenCounter::default()
+                        .count_text("Compare the recorded outcome with the final claim.")
+                )
         );
     }
 }

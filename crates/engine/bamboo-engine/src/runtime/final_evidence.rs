@@ -396,8 +396,9 @@ pub(crate) async fn evaluate_final_evidence(
         Err(failure) => {
             let partial = failure.partial_output;
             let completion_surface = format!(
-                "{}\n{}",
+                "{}\n{}\n{}",
                 partial.content,
+                partial.reasoning_content,
                 partial
                     .partial_tool_calls
                     .iter()
@@ -419,8 +420,9 @@ pub(crate) async fn evaluate_final_evidence(
         }
     };
     let completion_surface = format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
         output.content,
+        output.reasoning_content,
         output
             .tool_calls
             .iter()
