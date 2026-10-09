@@ -1093,7 +1093,8 @@ impl AppState {
             storage.clone(),
             permission_checker.clone(),
             tool_factory.clone(),
-        );
+        )
+        .with_runners(agent_runners.clone());
         child_completion_coordinator.set_reserved_root_execution_adapter(Arc::new(
             move |agent, session, reservation, tools| {
                 if !crate::skill_runtime::ordinary_main(session) {

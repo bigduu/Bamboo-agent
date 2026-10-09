@@ -36,7 +36,7 @@ use std::sync::{
 use tokio_util::sync::CancellationToken;
 
 const METADATA_TOKENS: usize = 2_000;
-const RESPONSE_BYTES: usize = 256 * 1024;
+const RESPONSE_BYTES: usize = 4 * 1024;
 
 fn denied(reason: &str) -> ToolError {
     ToolError::Execution(reason.into())
@@ -89,6 +89,8 @@ pub(crate) struct ServerMainSkillProducer {
     storage: Arc<dyn bamboo_agent_core::Storage>,
     permission_checker: Arc<dyn bamboo_tools::permission::PermissionChecker>,
     tool_factory: crate::tools::ToolSurfaceFactory,
+    runners:
+        Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, crate::AgentRunner>>>>,
 }
 impl ServerMainSkillProducer {
     pub(crate) fn new(
@@ -108,7 +110,15 @@ impl ServerMainSkillProducer {
             storage,
             permission_checker,
             tool_factory,
+            runners: None,
         }
+    }
+    pub(crate) fn with_runners(
+        mut self,
+        runners: Arc<tokio::sync::RwLock<std::collections::HashMap<String, crate::AgentRunner>>>,
+    ) -> Self {
+        self.runners = Some(runners);
+        self
     }
     fn from_state(state: &AppState) -> Self {
         Self::new(
@@ -120,6 +130,7 @@ impl ServerMainSkillProducer {
             state.permission_checker.clone(),
             state.tool_factory.clone(),
         )
+        .with_runners(state.agent_runners.clone())
     }
     fn tools_for(&self, surface: ToolSurface) -> Arc<dyn ToolExecutor> {
         self.tool_factory.get(surface)
@@ -201,21 +212,28 @@ impl Policy {
     }
     fn check_session(&self, session: &Session) -> Result<(), ToolError> {
         self.check()?;
-        if session.id != self.session_id
-            || !ordinary_main(session)
-            || session.root_tool_authority_revision != self.root_revision
-            || permission_mode(session) != self.permission_mode
+        if session.id != self.session_id || !ordinary_main(session) {
+            return Err(denied("Native Main identity changed"));
+        }
+        if session.root_tool_authority_revision != self.root_revision {
+            return Err(denied("Native Root tool authority revision changed"));
+        }
+        if permission_mode(session) != self.permission_mode
             || session
                 .agent_runtime_state
                 .as_ref()
                 .is_some_and(|s| s.plan_mode.is_some())
                 != self.plan
-            || session.workspace_path_meta() != self.workspace
-            || session.project_id_meta() != self.project
-            || ceiling(session)? != self.ceiling
-            || mode(session) != self.mode
         {
-            return Err(denied("Native Skill Session policy changed"));
+            return Err(denied("Native Session permission policy changed"));
+        }
+        if session.workspace_path_meta() != self.workspace
+            || session.project_id_meta() != self.project
+        {
+            return Err(denied("Native Session Source scope changed"));
+        }
+        if ceiling(session)? != self.ceiling || mode(session) != self.mode {
+            return Err(denied("Native Session Skill restriction changed"));
         }
         Ok(())
     }
@@ -349,10 +367,36 @@ impl NativeRun {
         if !self.live.load(Ordering::Acquire) || self.cancel.is_cancelled() {
             return Err(denied("Native Skill run is no longer active"));
         }
-        // The actual reservation owns this token; existing replacement/removal
-        // cancels it before publishing a successor. Runtime finish revokes this
-        // execution-private host on return, cancellation, drop and unwind.
+        // Sync callbacks validate this exact token and host. Async metadata and
+        // dispatch also check the actual registry owner, without try-lock denial
+        // or synchronous reentry into a busy shared registry.
         Ok(self.epoch.load(Ordering::Acquire))
+    }
+    async fn check_owner(&self) -> Result<u64, ToolError> {
+        let epoch = self.check_live()?;
+        let registry = self
+            .policy
+            .state
+            .runners
+            .as_ref()
+            .ok_or_else(|| denied("Registered Main runner registry is unavailable"))?;
+        let runners = tokio::select! { biased;
+            _ = self.cancel.cancelled() => return Err(denied("Native runner check was cancelled")),
+            runners = registry.read() => runners,
+        };
+        if !runners.get(&self.policy.session_id).is_some_and(|runner| {
+            runner.run_id == self.reservation_id
+                && matches!(
+                    runner.status,
+                    crate::AgentStatus::Pending | crate::AgentStatus::Running
+                )
+        }) {
+            return Err(denied("Native runner identity changed"));
+        }
+        if self.check_live()? != epoch {
+            return Err(denied("Native owner changed during validation"));
+        }
+        Ok(epoch)
     }
     fn caller(&self, ctx: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
         let epoch = self.check_live()?;
@@ -470,6 +514,7 @@ struct NativeResolver {
 #[async_trait]
 impl SkillCatalogCallerResolver for NativeResolver {
     async fn resolve(&self, ctx: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
+        self.run.check_owner().await?;
         let caller = self.run.caller(ctx)?;
         // Direct durable read, never cache/owner reentry. The Reader also
         // validates current canonical Source scope and Config for each page.
@@ -483,6 +528,7 @@ impl SkillCatalogCallerResolver for NativeResolver {
             .map_err(|e| denied(&e.to_string()))?
             .ok_or_else(|| denied("Native Session disappeared"))?;
         self.run.policy.check_session(&session)?;
+        self.run.check_owner().await?;
         let current = self.run.caller(ctx)?;
         if current.caller_id != caller.caller_id || current.input_id != caller.input_id {
             return Err(denied("Native input changed during Session validation"));
@@ -613,6 +659,9 @@ fn bind_registered_execution(
     reservation: &SessionExecutionReservation,
     base: Arc<dyn ToolExecutor>,
 ) -> Result<NativeExecutionBinding, ToolError> {
+    if reservation.session_id() != session.id {
+        return Err(denied("Native reservation target mismatch"));
+    }
     let policy = Policy::new(state, session)?;
     if !Arc::ptr_eq(&base, &policy.base) {
         return Err(denied("Native execution surface changed"));
@@ -669,13 +718,13 @@ impl NativeExecutor {
         {
             return Err(denied("Native actual dispatch identity is unavailable"));
         }
-        let epoch = self.run.check_live()?;
+        let epoch = self.run.check_owner().await?;
         let result = tokio::select! { biased;
             _ = self.run.cancel.cancelled() => Err(denied("Native Skill dispatch was cancelled")),
             result = NATIVE_PHASE.scope(Phase { run: self.run.clone(), purpose: Purpose::Dispatch, call_id: call.id.clone().into() },
                 self.tools.execute_exact_with_context_outcome(call, name, ctx)) => result,
         };
-        if self.run.check_live()? != epoch {
+        if self.run.check_owner().await? != epoch {
             return Err(denied("Native Skill dispatch owner changed"));
         }
         result
