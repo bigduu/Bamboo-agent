@@ -54,6 +54,18 @@ impl SkillsProvider {
             },
         }])
     }
+    fn has_warm_page(&self, messages: &[Message]) -> bool {
+        let trace = self.trace.lock().unwrap();
+        trace.pending.as_ref().is_some_and(|(id, name)| {
+            name == "skills_read"
+                && messages.iter().any(|m| {
+                    m.tool_call_id.as_deref() == Some(id)
+                        && m.tool_success == Some(true)
+                        && serde_json::from_str::<Value>(&m.content)
+                            .is_ok_and(|p| p["next_cursor"].is_string())
+                })
+        })
+    }
     fn next(&self, messages: &[Message], tools: &[ToolSchema]) -> Vec<LLMChunk> {
         let mut trace = self.trace.lock().unwrap();
         trace.requests.push(messages.to_vec());
@@ -623,18 +635,7 @@ impl LLMProvider for RevokingProvider {
         _: Option<u32>,
         _: &str,
     ) -> Result<LLMStream, LLMError> {
-        let continuation = {
-            let trace = self.inner.trace.lock().unwrap();
-            trace.pending.as_ref().is_some_and(|(id, name)| {
-                name == "skills_read"
-                    && messages.iter().any(|m| {
-                        m.tool_call_id.as_deref() == Some(id)
-                            && m.tool_success == Some(true)
-                            && serde_json::from_str::<Value>(&m.content)
-                                .is_ok_and(|p| p["next_cursor"].is_string())
-                    })
-            })
-        };
+        let continuation = self.inner.has_warm_page(messages);
         if continuation && !self.revoked.swap(true, Ordering::AcqRel) {
             if let Some(source) = &self.source {
                 let mut body = std::fs::read_to_string(source).unwrap();
@@ -772,18 +773,7 @@ impl LLMProvider for ScopeChangingProvider {
         _: Option<u32>,
         _: &str,
     ) -> Result<LLMStream, LLMError> {
-        let warm = {
-            let trace = self.inner.trace.lock().unwrap();
-            trace.pending.as_ref().is_some_and(|(id, name)| {
-                name == "skills_read"
-                    && messages.iter().any(|m| {
-                        m.tool_call_id.as_deref() == Some(id)
-                            && m.tool_success == Some(true)
-                            && serde_json::from_str::<Value>(&m.content)
-                                .is_ok_and(|p| p["next_cursor"].is_string())
-                    })
-            })
-        };
+        let warm = self.inner.has_warm_page(messages);
         if warm && !self.changed.swap(true, Ordering::AcqRel) {
             let state = self.state.lock().unwrap().as_ref().unwrap().clone();
             if self.change != 0 {
