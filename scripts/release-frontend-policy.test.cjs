@@ -203,9 +203,10 @@ test("crate publication rejects a moved, mismatched or dirty source before packa
   git(["-c", "user.name=release-guard-test", "-c", "user.email=release-guard-test@example.invalid", "commit", "--quiet", "-m", "source guard fixture"]);
   const head = git(["rev-parse", "HEAD"]);
   const check = (expected, workflowSha) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", guard], {
-    cwd: directory, encoding: "utf8", env: { ...process.env, EXPECTED_SOURCE_SHA: expected, GITHUB_SHA: workflowSha },
+    cwd: directory, encoding: "utf8", env: { ...process.env, EXPECTED_SOURCE_SHA: expected, GITHUB_SHA: workflowSha,
+      GITHUB_REF: "refs/tags/frozen-source-fixture", GITHUB_REF_PROTECTED: "false" },
   });
-  assert.equal(check(head, head).status, 0, "Exact clean source is admitted");
+  assert.equal(check(head, head).status, 0, "Exact clean frozen-tag source is admitted without requiring a protected branch");
   for (const [expected, workflowSha] of [["0".repeat(40), head], [head, "1".repeat(40)], ["HEAD", head], [head + "\npoison=true", head]]) {
     assert.notEqual(check(expected, workflowSha).status, 0, "Unaccepted source or input must fail closed");
   }
