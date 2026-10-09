@@ -249,6 +249,21 @@ fn validate_hms(hour: u8, minute: u8, second: u8) -> ResponseResult<()> {
     Ok(())
 }
 
+pub(super) fn validate_workflow_target(
+    trigger: &ScheduleTrigger,
+    run_config: &ScheduleRunConfig,
+) -> ResponseResult<()> {
+    crate::schedule_app::manager::validate_workflow_schedule_target(trigger, run_config).map_err(
+        |message| {
+            HttpResponse::BadRequest()
+                .json(serde_json::json!({
+                    "error": crate::error::error_value(message)
+                }))
+                .into()
+        },
+    )
+}
+
 pub(super) async fn validate_auto_execute_run_config(
     state: &web::Data<AppState>,
     run_config: &ScheduleRunConfig,
@@ -360,7 +375,13 @@ pub(super) async fn validate_auto_execute_run_config(
                 .as_deref()
                 .map(bamboo_config::paths::path_to_display_string),
         );
-    if !run_config.auto_execute {
+    if run_config.workflow_target.is_some() {
+        if !run_config.auto_execute || run_config.task_message.is_some() {
+            return Err(HttpResponse::BadRequest().json(serde_json::json!({
+                "error": crate::error::error_value("workflow_target requires auto_execute: true and no task_message")
+            })).into());
+        }
+    } else if !run_config.auto_execute {
         return Ok(normalized);
     }
 
@@ -371,7 +392,7 @@ pub(super) async fn validate_auto_execute_run_config(
         .filter(|value| !value.is_empty())
         .is_some();
 
-    if !has_task {
+    if !has_task && run_config.workflow_target.is_none() {
         return Err(HttpResponse::BadRequest().json(serde_json::json!({
             "error": crate::error::error_value("run_config.task_message is required when auto_execute is true")
         })).into());
