@@ -748,7 +748,7 @@ struct ScopeChangingProvider {
     state: Mutex<Option<web::Data<AppState>>>,
     session_id: String,
     workspace: PathBuf,
-    policy: bool,
+    change: u8,
     changed: AtomicBool,
 }
 #[async_trait]
@@ -774,9 +774,13 @@ impl LLMProvider for ScopeChangingProvider {
         };
         if warm && !self.changed.swap(true, Ordering::AcqRel) {
             let state = self.state.lock().unwrap().as_ref().unwrap().clone();
-            if self.policy {
+            if self.change != 0 {
                 let permission = state.permission_checker.permission_config().unwrap();
-                permission.set_policy_revision(permission.policy_revision() + 1);
+                if self.change == 1 {
+                    permission.set_policy_revision(permission.policy_revision() + 1);
+                } else {
+                    permission.set_enabled(!permission.is_enabled());
+                }
             } else {
                 let workspace = self.workspace.to_string_lossy().into_owned();
                 state
@@ -798,18 +802,18 @@ impl LLMProvider for ScopeChangingProvider {
 #[actix_web::test]
 async fn native_http_warm_reader_rejects_actual_canonical_scope_and_policy_change() {
     let _proof = HTTP_PROOF.lock().await;
-    for policy in [false, true] {
+    for change in [0, 1, 2] {
         let home = tempfile::tempdir().unwrap();
         write_skill(home.path(), "native-proof", true);
         let workspace = home.path().join("different-source-scope");
         std::fs::create_dir(&workspace).unwrap();
-        let id = format!("native-current-policy-{policy}");
+        let id = format!("native-current-policy-{change}");
         let provider = Arc::new(ScopeChangingProvider {
             inner: provider(home.path(), 4096, false),
             state: Mutex::default(),
             session_id: id.clone(),
             workspace,
-            policy,
+            change,
             changed: AtomicBool::new(false),
         });
         let state = state(home.path(), provider.clone()).await;
@@ -825,14 +829,22 @@ async fn native_http_warm_reader_rejects_actual_canonical_scope_and_policy_chang
         let (status, body) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
         let terminal = done(&state, &id).await;
-        assert!(matches!(terminal, AgentStatus::Error(_)), "{terminal:?}");
+        provider.state.lock().unwrap().take();
         assert!(provider.changed.load(Ordering::Acquire));
         let trace = provider.inner.trace.lock().unwrap();
+        if change == 0 {
+            assert!(matches!(terminal, AgentStatus::Completed), "{terminal:?}");
+            assert_eq!(trace.failures.len(), 1);
+            assert!(trace.failures[0].contains("Native canonical Session Source scope changed"));
+        } else {
+            assert!(
+                matches!(terminal, AgentStatus::Error(ref reason) if reason.contains("Native Skill policy changed")),
+                "{terminal:?}"
+            );
+        }
         assert_eq!(trace.main_pages, 1);
         assert!(trace.eof.is_empty() && !trace.task_started && !trace.task_completed);
         drop(trace);
-        // Remove the test observer's back-reference to the actual AppState.
-        provider.state.lock().unwrap().take();
     }
 }
 

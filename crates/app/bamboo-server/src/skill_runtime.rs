@@ -170,6 +170,7 @@ struct Policy {
     base: Arc<dyn ToolExecutor>,
     permission: Arc<PermissionConfig>,
     revision: u64,
+    enabled: bool,
     configured_mode: bamboo_domain::PermissionMode,
     session_id: String,
     root_revision: u64,
@@ -197,6 +198,7 @@ impl Policy {
         // Server read-only and Plan/name policy stays on the actual base tools.
         Ok(Self {
             revision: permission.policy_revision(),
+            enabled: permission.is_enabled(),
             configured_mode: permission.mode(),
             permission,
             base,
@@ -222,6 +224,7 @@ impl Policy {
             .ok_or_else(|| denied("Server permission policy disappeared"))?;
         if !Arc::ptr_eq(&permission, &self.permission)
             || permission.policy_revision() != self.revision
+            || permission.is_enabled() != self.enabled
             || permission.mode() != self.configured_mode
             || !Arc::ptr_eq(&self.base, &self.state.tools_for(ToolSurface::Root))
         {
