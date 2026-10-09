@@ -193,99 +193,73 @@ bamboo/
 
 ## Release Process
 
-Feature pull requests target `dev`. A normal protected `dev → main` promotion
-starts comprehensive CI for its merge commit. After that exact `main` push CI
-succeeds, Publish Crate automatically publishes the workspace dependency closure
-to crates.io and creates a GitHub Release at the same commit. It selects an unused
-`YYYY.M.N` UTC sequence after existing crate versions and authenticated draft
-reservations, avoiding occupied tags. Source manifests keep their `0.0.0`
-placeholders; the temporary publishing checkout stamps the selected version and embeds the exact committed
-frontend package. The workflow and release policy must first reach `main` through
-a normal promotion; this change does not itself promote the existing dev backlog.
+Feature pull requests target `dev`. After a normal protected `dev → main`
+promotion, successful same-repository main push CI queues publication of its
+exact tested commit to crates.io and a GitHub Release. The workflow must first
+reach main through that normal promotion; do not promote unrelated development
+solely to activate it. Source manifests keep `0.0.0`; temporary publication
+stamps an unused `YYYY.M.N` UTC version and embeds the committed frontend lock.
 
-Automatic releases and manual/Zenith dispatches share one publication queue.
-A draft Release reserves the version and stores canonical source/frontend
-provenance atomically in its body before any crate upload. Its frontend assets
-preserve the initial staged bytes for retries; restored manifest semantics and
-ZIP payloads must still match the independently verified fixed npm package.
-Each expected crate checksum is recorded before publishing, and the downloaded
-crate must match that checksum,
-its `.cargo_vcs_info.json` source SHA, and (for bamboo-server) the preserved
-embedded frontend bytes. The GitHub Release becomes public only after every
-crate is verified. Rerun a failed Publish Crate run to continue the same source
-and version; a completed automatic CI rerun verifies existing artifacts without
-publishing again or changing the latest release.
-An older main CI recovery remains public without replacing a completed newer
-main source as GitHub's latest; source ancestry takes precedence over the date
-sequence allocated when each run first starts.
-Before any crate upload, an older or unproven main source at or above a newer
-source's reserved version is rejected, including partial publications. This
-preserves crates.io version order while the newer source is still recovering.
-The highest stable numeric registry version of each crate is also checked
-against its downloaded checksum and actual Git source SHA. This preserves
-source order and GitHub latest selection even if Release metadata is deleted.
-A newer main source also cannot recover below an older source's published
-registry version. Same-source and older-source lower-version recoveries remain
-available without displacing a higher version at the same source as latest.
+Automatic runs and manual/Zenith dispatches using this workflow share one
+`bamboo-crate-publication` queue without canceling queued uploads. Previously
+frozen tags retain their own workflow definitions; this change does not
+retroactively add the queue or new guards to those tags.
 
-Every reservation and update is authenticated with a domain-separated HMAC
-over the complete canonical receipt. Only authenticated, source-bound receipts
-and crates.io versions advance the automatic allocator. Unsigned release/tag
-names only occupy individual candidates; 100 consecutive collisions stop the
-run before any publication. Explicit manual reservations and authenticated
-receipts for the current source at their signed version's canonical tag fail on
-invalid recovery evidence without being re-signed. A public target SHA alone
-does not establish receipt authority.
-Unauthenticated names remain occupancy only. Unrelated shape or placement
-failures have no allocation or source-order authority; transport failures still
-stop the run.
-The automatic counter retains Cargo's full unsigned 64-bit range; exhausting
-that range stops before reserving a release until the next UTC month.
+### Automatic main publication
 
-The existing manual workflow inputs remain available, including `dev` dispatches
-from Zenith and the explicit fixed legacy frontend rollback. Pass an unused real
-Cargo-compatible SemVer `version`; invalid identifiers or overflowing core
-components fail before reserving anything. Build metadata remains unsupported
-by this workflow. An occupied version can resume only with matching source/frontend
-provenance. Historical releases without this provenance are rejected rather than
-blindly skipped. `dry_run=true` performs local validation without creating any
-draft, tag, or release asset. Manual releases do not replace the automatic main
-release as GitHub's latest release.
+Only the automatic job uses the `bamboo-release` Environment and new GitHub/HMAC
+authority. Its exact branch-type rules allow dev/main, with no tag rule. Before
+checkout, a fixed bootstrap verifies the successful same-repository main push CI
+source and that source/workflow SHAs belong to protected dev/main history. The
+checkout uses the tested CI SHA, which may differ from the workflow's SHA.
+Pre-policy main commits cannot acquire the new publication authority.
 
-Publication uses the `bamboo-release` GitHub Environment, whose custom branch
-rules must allow only the `dev` and `main` branch types, with no tag rule.
-An inline bootstrap runs before checkout or repository code and verifies that
-both the exact source SHA and workflow SHA belong to protected dev/main history.
-This keeps queued historical commits available while excluding arbitrary branch
-code from publication credentials. Zenith's existing dev/main dispatch contract
-and exact run/source SHA remain unchanged. Feature-branch dry runs use a separate
-job with read-only permissions, no Environment, and no publication credentials.
-Publication subprocesses receive only the credentials they need: `gh` retains
-GitHub authentication, and only `cargo publish` retains `CARGO_REGISTRY_TOKEN`.
-Cargo metadata/package/check and the other subprocesses receive neither those
-tokens nor the receipt signing key. Cargo publish build scripts still inherit
-its required registry token; this does not change the existing Cargo contract.
+An authenticated draft body reserves source, frontend and version before any
+crate upload. Original frontend assets and each package checksum are preserved
+for recovery. Every downloaded crate must match its reserved checksum, Git source
+SHA and, for bamboo-server, original embedded frontend bytes. Only the complete
+verified closure becomes a public GitHub Release. Reruns reuse the matching
+source/frontend reservation; completed reruns verify without republishing.
 
-Keep the existing repository `CARGO_REGISTRY_TOKEN` for crates.io. Set
-`BAMBOO_RELEASE_TOKEN` in `bamboo-release` with repository Contents write and
-Workflows write permissions for historical source with workflow files different
-from the default `dev` branch. Remove its repository-level copy. The workflow
-otherwise uses `github.token`. Tag creation checks that authority before any
-crate upload and rejects a tag pointing to different source. A token permission
-failure leaves the candidate unpublished and requires configuration before rerun.
-Also set `BAMBOO_RELEASE_SIGNING_KEY` in that Environment to 32 random bytes
-encoded as 64 lowercase hex characters, and remove its repository-level copy.
-Set the Environment variable `BAMBOO_RELEASE_SIGNING_KEY_SHA256` to the lowercase
-SHA-256 of the decoded 32 key bytes. Keep both names absent from repository/org
-configuration. This public digest checks key configuration before history reads
-or publication, so a wrong key cannot silently discard authenticated history.
-Keep this recovery authority stable independently of registry and API token
-rotation. Missing, malformed or mismatched configuration fails before publication;
-replacing or losing the key makes existing authenticated receipts unverifiable.
-Stop and manually verify recovery evidence rather than accepting unsigned
-history or automatically re-signing it. A dry run does not require this key.
-The pre-existing repository-level Cargo token branch exposure is tracked
-separately in [#1699](https://github.com/bigduu/Bamboo-agent/issues/1699).
+Authenticated reservations and registry versions advance the full-u64 allocator;
+unsigned names only occupy candidates. Verified registry/source ancestry prevents
+stale sources overtaking newer versions or GitHub latest, even after Release
+metadata deletion. Public target claims and copied receipts grant no recovery
+authority; transport failures stop publication.
+
+In that Environment, set `BAMBOO_RELEASE_TOKEN` with repository Contents/Workflows
+write, `BAMBOO_RELEASE_SIGNING_KEY` to 32 random bytes as 64 lowercase hex digits,
+and variable `BAMBOO_RELEASE_SIGNING_KEY_SHA256` to the SHA-256 of decoded key bytes.
+Keep these names absent from repository/org configuration and the key stable
+across token rotation. Missing/mismatched configuration stops publication; lost
+keys require manual evidence verification, never accepting or re-signing unsigned
+history. Tag authority is checked before upload.
+
+### Manual and Zenith publication
+
+Manual dispatch retains the existing Cargo-only publication path, including
+frozen source tags and dev. Required `expected_source_sha` must be a lowercase
+40-character commit matching both dispatched `GITHUB_SHA` and clean checkout
+HEAD before Node/npm/package work. Zenith also verifies its accepted tag object,
+peeled source and root pointer before dispatching. Manual runs have Contents read,
+no Environment, and no new GitHub token or signing key. Only the final non-dry
+publish step receives the existing repository `CARGO_REGISTRY_TOKEN`.
+
+Pass a real Cargo SemVer `version`; empty/`latest` uses the source manifest and
+rejects `0.0.0`. Build metadata is unsupported. Stable versions cannot exceed the
+current UTC year/month; historical versions, u64 counters and prereleases remain
+valid. Inputs are parsed as environment data. Locked frontend and fixed legacy
+rollback inputs remain available.
+
+`dry_run=true` validates stamped workspace buildability without credentials or
+uploads. Manual publication retains the existing dependency-order, propagation,
+rate-limit and skip-existing loop. It does not recover signed drafts, create
+GitHub Releases, change latest or add provenance to historical manual skips.
+
+Environment filtering is not build-script isolation: Cargo process/filesystem
+isolation [#1752](https://github.com/bigduu/Bamboo-agent/issues/1752) is required
+before automatic activation. Existing repository Cargo token branch exposure is
+tracked separately in [#1699](https://github.com/bigduu/Bamboo-agent/issues/1699).
 
 ## Additional Notes
 

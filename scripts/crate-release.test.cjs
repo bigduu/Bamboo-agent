@@ -4,7 +4,7 @@ const os = require('node:os')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 const { test } = require('node:test')
-const { assertVersion, validateSource, validateReceipt, nextVersion, selectVersion,
+const { assertVersion, assertManualVersion, validateSource, validateReceipt, nextVersion, selectVersion,
   plan, publish, sha256, githubArgs, receiptBody, readBodyReceipt,
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend,
   shouldMakeLatest, gitIsAncestor, canonicalJson, signReceipt, authenticateReceipt,
@@ -34,7 +34,7 @@ function fixture(extra = {}) {
   const bodies = []
   const published = new Map()
   const context = { automatic: true, identity: clone(identity), crates: [...crates],
-    frontendBytes: { ...frontendBytes }, requestedVersion: '', sourceVersion: '0.0.0', now,
+    frontendBytes: { ...frontendBytes }, now,
     releases: async () => [], receipts: [], tags: async () => [], versions: async () => [],
     readReceipt: async (entry, options) => readAuthenticatedReceipt(entry, signingKey, options),
     verifyReceipt: (receipt) => authenticateReceipt(receipt, signingKey),
@@ -81,8 +81,7 @@ test('automatic release accepts only the exact successful same-repository main p
     request.event.workflow_run[key] = value
     assert.throws(() => validateSource(request), `${key} must be rejected`)
   }
-  assert.equal(validateSource({ ...base, eventName: 'workflow_dispatch', workflowRevision: sourceRevision }), false)
-  assert.throws(() => validateSource({ ...base, eventName: 'workflow_dispatch' }), /exact dispatched commit/)
+  assert.throws(() => validateSource({ ...base, eventName: 'workflow_dispatch' }), /Unsupported/)
   assert.throws(() => validateSource({ ...base, eventName: 'push' }), /Unsupported/)
 })
 
@@ -111,10 +110,8 @@ test('automatic counters preserve the full Cargo u64 range and stop before reser
     await assert.rejects(() => plan(context), /Cargo u64 limit/)
     assert.deepEqual(calls, [], 'Exhaustion must not reserve a release, tag or upload')
   }
-  const largeManual = fixture({ automatic: false, requestedVersion: '2026.10.9007199254740992' })
-  const result = await plan(largeManual.context)
-  assert.equal(result.receipt.version, '2026.10.9007199254740992')
-  const automatic = fixture({ releases: async () => [result.release], tagSource: async () => sourceRevision })
+  const historical = makeReceipt({ automatic: false, version: '2026.10.9007199254740992' })
+  const automatic = fixture({ releases: async () => [release(historical)], tagSource: async () => sourceRevision })
   assert.equal((await plan(automatic.context)).receipt.version, '2026.10.9007199254740993')
 })
 
@@ -158,24 +155,6 @@ test('automatic reruns reuse the source/frontend reservation and do not allocate
   const changed = clone(identity)
   changed.frontend.bundleHash = `sha256:${'9'.repeat(64)}`
   assert.equal(selectVersion({ ...options, identity: changed }), '2026.10.91')
-})
-
-test('manual dispatch retains explicit versions but refuses unknown or mismatched occupied source', () => {
-  const receipt = makeReceipt({ automatic: false })
-  const options = { automatic: false, requestedVersion: receipt.version, sourceVersion: '0.0.0', identity, crates,
-    releases: [release(receipt)], receipts: [receipt], versions: [receipt.version], now }
-  assert.equal(selectVersion(options), receipt.version)
-  assert.throws(() => selectVersion({ ...options, receipts: [] }), /provenance/)
-  assert.throws(() => selectVersion({ ...options, releases: [], receipts: [] }), /occupied/)
-  const foreign = makeReceipt()
-  foreign.identity.sourceRevision = 'b'.repeat(40)
-  assert.throws(() => selectVersion({ ...options, receipts: [foreign] }), /different source/)
-  const differentFrontend = makeReceipt()
-  differentFrontend.identity.frontend.packageName = '@bigduu/lotus'
-  assert.throws(() => selectVersion({ ...options, receipts: [differentFrontend] }), /different source/)
-  for (const requestedVersion of ['', 'latest', '0.0.0']) {
-    assert.throws(() => selectVersion({ ...options, requestedVersion }), /placeholder/)
-  }
 })
 
 test('receipt is included atomically at reservation and PATCH updates do not delete recovery state', () => {
@@ -244,20 +223,6 @@ test('missing, malformed, wrong-key and modified receipt authentication cannot b
   }
   assert.throws(() => authenticateReceipt(original, '8'.repeat(64)), /authentication failed/)
   assert.deepEqual(readAuthenticatedReceipt(release(original), signingKey), original)
-})
-
-test('explicit manual unsigned or bad-MAC drafts cannot be re-signed into a privileged publication', async () => {
-  for (const version of ['2026.9.9999', '2026.10.9999']) {
-    for (const unsigned of [true, false]) {
-      const forged = makeReceipt({ version, automatic: false })
-      if (unsigned) delete forged.authentication
-      else forged.authentication.mac = 'f'.repeat(64)
-      const { context, calls } = fixture({ automatic: false, requestedVersion: version,
-        releases: async () => [release(forged)] })
-      await assert.rejects(() => plan(context), /authentication/)
-      assert.deepEqual(calls, [])
-    }
-  }
 })
 
 test('unauthenticated drafts targeting the public current SHA only occupy their names during automatic publication', async () => {
@@ -338,12 +303,6 @@ test('unrelated forged or misplaced signed history cannot block allocation, publ
     assert.equal(tagReads, index === examples.length - 1 ? 3 : 0,
       'Only valid authenticated metadata may reach tag lookup; unrelated invalid tag results have no authority')
   }
-  const requested = clone(foreign)
-  requested.authentication.mac = 'f'.repeat(64)
-  const manual = fixture({ automatic: false, requestedVersion: requested.version,
-    releases: async () => [release(requested)] })
-  await assert.rejects(() => plan(manual.context), /authentication/)
-  assert.deepEqual(manual.calls, [])
 })
 
 test('history tag lookup transport failures still stop every publication boundary before crate writes', async () => {
@@ -362,7 +321,7 @@ test('history tag lookup transport failures still stop every publication boundar
   }
 })
 
-test('deep untrusted JSON authentication cannot block automatic history but still rejects explicit manual recovery', async () => {
+test('deep untrusted JSON authentication cannot block automatic history', async () => {
   const foreign = completedReceipt('2026.10.500', 'b'.repeat(40))
   const encoded = JSON.stringify(foreign).slice(0, -1) + ',"extra":' + '['.repeat(10000) + '0' + ']'.repeat(10000) + '}'
   const entry = release(foreign, { id: 43, draft: false, target_commitish: sourceRevision,
@@ -376,9 +335,6 @@ test('deep untrusted JSON authentication cannot block automatic history but stil
   assert.equal(result.receipt.version, '2026.10.8')
   await publish(context, result.release, result.receipt)
   assert.deepEqual(completions, [{ version: '2026.10.8', makeLatest: true }])
-  const current = fixture({ automatic: false, requestedVersion: foreign.version, releases: async () => [entry] })
-  await assert.rejects(() => plan(current.context), RangeError)
-  assert.deepEqual(current.calls, [])
 })
 
 test('unrelated unsigned releases and huge bare tags are bounded occupancy without allocation or source-order authority', async () => {
@@ -421,9 +377,6 @@ test('a valid current receipt copied to a different tag cannot block or authoriz
     assert.equal(tagReads, hasCanonical ? 1 : 0, 'The invalid copy must not reach tag transport at any boundary')
     assert.deepEqual(copied, originalCopy, 'The copied receipt must never be changed or re-signed')
   }
-  const manual = fixture({ automatic: false, requestedVersion: '2026.10.9999', releases: async () => [copied] })
-  await assert.rejects(() => plan(manual.context), assert.AssertionError)
-  assert.deepEqual(manual.calls, [])
 })
 
 test('canonical authenticated history still rejects target, shape, repository and duplicate version replay', async () => {
@@ -452,64 +405,31 @@ test('reservation and each partial/completed update persist a newly authenticate
   assert.throws(() => authenticateReceipt(stale, signingKey), /authentication failed/)
 })
 
-test('signed manual reservations retain explicit resume and cannot be relabeled as an automatic reservation', async () => {
-  const manual = makeReceipt({ automatic: false })
-  const { context, calls, completions } = fixture({ automatic: false, requestedVersion: manual.version,
-    releases: async () => [release(manual)] })
-  const resumed = await plan(context)
-  await publish(context, resumed.release, resumed.receipt)
-  assert.ok(!calls.includes('reserve'))
-  assert.deepEqual(completions, [{ version: manual.version, makeLatest: false }])
-  const automatic = fixture({ releases: async () => [release(manual)] })
-  const planned = await plan(automatic.context)
-  assert.equal(planned.receipt.version, '2026.10.9')
-  assert.equal(planned.receipt.automatic, true)
-})
-
-test('dry run performs no registry/GitHub reads, draft reservation, tag or asset writes', async () => {
-  const forbidden = async () => { throw new Error('External call during dry run') }
-  const { context, calls } = fixture({ automatic: false, requestedVersion: '2026.10.8', dryRun: true,
-    releases: forbidden, tags: forbidden, versions: forbidden, reserve: forbidden,
-    ensureTag: forbidden, ensureFrontend: forbidden, saveReceipt: forbidden, assertSigningKey: forbidden })
-  assert.deepEqual(await plan(context), { version: '2026.10.8', dryRun: true })
-  assert.deepEqual(calls, [])
-})
-
-test('future manual stable versions are rejected before history or reservation, including signed retries', async () => {
-  const forbidden = () => { throw new Error('Future manual version must not access external state') }
+test('manual calendar guard rejects future stable versions while pure receipt decoding remains compatible', () => {
   for (const version of ['9999.1.1', '2026.11.1', '2026.9999.1',
     '18446744073709551615.1.1', '2026.18446744073709551615.1']) {
     const receipt = makeReceipt({ version, automatic: false })
-    assert.equal(assertVersion(version), version, 'Pure Cargo SemVer validation remains unchanged')
+    assert.equal(assertVersion(version), version)
     assert.equal(validateReceipt(receipt, identity, crates).version, version)
     assert.equal(readAuthenticatedReceipt(release(receipt), signingKey, { required: true }).version, version)
-    assert.throws(() => selectVersion({ automatic: false, requestedVersion: version, identity, crates,
-      releases: [release(receipt)], receipts: [receipt], versions: [version], now }), /current UTC year\/month/)
-    for (const requestedVersion of [version, '', 'latest']) {
-      for (const dryRun of [false, true]) {
-        const { context, calls } = fixture({ automatic: false, requestedVersion, sourceVersion: version, dryRun,
-          releases: forbidden, assertSigningKey: forbidden })
-        await assert.rejects(() => plan(context), /current UTC year\/month/)
-        assert.deepEqual(calls, [])
-      }
-    }
+    assert.throws(() => assertManualVersion(version, now), /current UTC year\/month/)
   }
 })
 
-test('direct manual publication rejects a future signed partial or completed reservation without side effects', async () => {
-  for (const completed of [false, true]) {
-    const receipt = makeReceipt({ version: '9999.1.1', automatic: false, completed,
-      packageChecksums: Object.fromEntries((completed ? crates : crates.slice(0, 1)).map(crate => [crate, checksum])) })
-    const original = clone(receipt)
-    const { context, calls } = fixture({ automatic: false,
-      registry: async () => { throw new Error('Future manual version must not read the registry') } })
-    await assert.rejects(() => publish(context, release(receipt), receipt), /current UTC year\/month/)
-    assert.deepEqual(calls, [], 'No package, receipt, upload, tag or completion writes')
-    assert.deepEqual(receipt, original)
-  }
+test('manual dispatch cannot enter the privileged receipt controller', async () => {
+  const receipt = makeReceipt()
+  const { context, calls } = fixture({ automatic: false,
+    assertSigningKey: () => { throw new Error('Manual dispatch must not require signing credentials') } })
+  await assert.rejects(() => plan(context), /only for automatic main publication/)
+  await assert.rejects(() => publish(context, release(receipt), receipt), /only for automatic main publication/)
+  assert.deepEqual(calls, [])
+  const automatic = fixture()
+  const manual = makeReceipt({ automatic: false })
+  await assert.rejects(() => publish(automatic.context, release(manual), manual), /Manual history cannot authorize/)
+  assert.deepEqual(automatic.calls, [])
 })
 
-test('manual stable limits follow UTC month and year boundaries while preserving historical and prerelease versions', async () => {
+test('manual stable limits follow UTC month and year boundaries while preserving historical and prerelease versions', () => {
   for (const [clock, version, allowed] of [
     ['2026-11-01T00:30:00+08:00', '2026.11.1', false],
     ['2026-10-31T17:00:00-07:00', '2026.11.1', true],
@@ -518,10 +438,8 @@ test('manual stable limits follow UTC month and year boundaries while preserving
     ...['1.2.3', '1.18446744073709551615.1', '2026.10.18446744073709551615',
       '9999.1.1-rc.0'].map(version => [now.toISOString(), version, true]),
   ]) {
-    const { context, calls } = fixture({ automatic: false, requestedVersion: version, now: new Date(clock), dryRun: true })
-    if (allowed) assert.deepEqual(await plan(context), { version, dryRun: true })
-    else await assert.rejects(() => plan(context), /current UTC year\/month/)
-    assert.deepEqual(calls, [])
+    if (allowed) assert.equal(assertManualVersion(version, new Date(clock)), version)
+    else assert.throws(() => assertManualVersion(version, new Date(clock)), /current UTC year\/month/)
   }
 })
 
@@ -544,10 +462,7 @@ test('manual versions obey Cargo SemVer before external operations and retain th
     } else {
       if (unsupported.includes(version)) assert.equal(cargo.status, 0, cargo.stderr)
       else assert.notEqual(cargo.status, 0, version)
-      const { context, calls } = fixture({ automatic: false, requestedVersion: version,
-        releases: async () => { throw new Error('Invalid version must not read external history') } })
-      await assert.rejects(() => plan(context), /Pass a real, explicit publish version/)
-      assert.deepEqual(calls, [])
+      assert.throws(() => assertManualVersion(version, now), /Pass a real, explicit publish version/)
     }
   }
 })
@@ -672,14 +587,6 @@ test('a newer main source becomes latest after a fresh completed-release ancestr
   assert.deepEqual(completions, [{ version: result.receipt.version, makeLatest: true }])
 })
 
-test('manual publication never changes latest or needs automatic source ordering', async () => {
-  const { context, completions } = fixture({ automatic: false,
-    releases: async () => { throw new Error('Manual completion must not query latest ordering') } })
-  const receipt = makeReceipt({ automatic: false })
-  await publish(context, release(receipt), receipt)
-  assert.deepEqual(completions, [{ version: receipt.version, makeLatest: false }])
-})
-
 test('latest uses numeric versions only for the same source and rejects unproven completed tag identity', async () => {
   const current = makeReceipt({ version: '2026.10.9' })
   const other = completedReceipt('2026.10.10', sourceRevision)
@@ -774,17 +681,6 @@ test('newer automatic sources cannot recover below older registry versions while
     isAncestor: async () => { throw new Error('Identical source needs no ancestry lookup') } })
   await publish(allowed.context, release(receipt), receipt)
   assert.deepEqual(allowed.completions, [{ version: receipt.version, makeLatest: false }])
-})
-
-test('manual recovery of an originally automatic reservation preserves its signature without claiming latest', async () => {
-  const receipt = makeReceipt()
-  const { context, completions } = fixture({ automatic: false, requestedVersion: receipt.version,
-    releases: async () => [release(receipt)], registryFrontier: async () => { throw new Error('Manual recovery needs no automatic ordering') } })
-  const result = await plan(context)
-  await publish(context, result.release, result.receipt)
-  assert.equal(result.receipt.automatic, true)
-  authenticateReceipt(result.receipt, signingKey)
-  assert.deepEqual(completions, [{ version: receipt.version, makeLatest: false }])
 })
 
 test('registry source selection is refreshed at completion and uses numeric stable versions across months', async () => {
@@ -955,23 +851,27 @@ test('interrupted initial frontend upload can recover before any crate, while pa
   assert.deepEqual(calls, ['atomic-body', 'upload'])
 })
 
-test('workflow preserves the exact CI commit, shared publication queue and separate manual CI queue', () => {
+test('manual fixed-tag publication and automatic receipts share a queue without sharing new authority', () => {
   const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+  const [manual, automatic] = workflow.split('  manual:\n')[1].split('  automatic:\n')
   assert.match(workflow, /workflow_run:\n    workflows: \[CI\]\n    types: \[completed\]\n    branches: \[main\]/)
   assert.match(workflow, /group: bamboo-crate-publication\n  queue: max\n  cancel-in-progress: false/)
   assert.match(workflow, /permissions:\n  contents: read/)
-  assert.match(workflow, /environment: bamboo-release\n    permissions:\n      contents: write\n    steps: \*release-steps/)
-  assert.doesNotMatch(workflow.split('  dry-run:\n')[1].split('    steps:')[0], /environment:/)
-  assert.match(workflow, /ref: \$\{\{ steps.source.outputs.revision \}\}\n          fetch-depth: 0\n          persist-credentials: false/)
-  assert.ok(workflow.indexOf('Authorize the exact source') < workflow.indexOf('uses: actions/checkout'))
-  assert.ok(workflow.indexOf('Verify checkout matches') < workflow.indexOf('node scripts/'))
-  for (const name of ['CARGO_REGISTRY_TOKEN', 'BAMBOO_RELEASE_SIGNING_KEY']) {
-    assert.equal(workflow.split(`${name}: \${{ github.job == 'publish' && secrets.${name} || '' }}`).length - 1, 2)
+  assert.match(manual, /if: github.event_name == 'workflow_dispatch'/)
+  assert.match(manual, /expected_source_sha/)
+  assert.doesNotMatch(manual, /environment:|contents: write|BAMBOO_RELEASE_|GH_TOKEN:|crate-release.cjs (?:plan|publish)/)
+  assert.equal(manual.split('CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}').length - 1, 1)
+  assert.match(manual, /if: github.event.inputs.dry_run != 'true'/)
+  assert.match(manual, /cargo publish --locked --allow-dirty -p/)
+  assert.match(automatic, /github.event_name == 'workflow_run'/)
+  assert.match(automatic, /environment: bamboo-release\n    permissions:\n      contents: write/)
+  assert.match(automatic, /ref: \$\{\{ steps.source.outputs.revision \}\}\n          fetch-depth: 0\n          persist-credentials: false/)
+  assert.ok(automatic.indexOf('Authorize the exact source') < automatic.indexOf('uses: actions/checkout'))
+  assert.ok(automatic.indexOf('Verify checkout matches') < automatic.indexOf('node scripts/'))
+  assert.doesNotMatch(automatic, /expected_source_sha|inputs\.dry_run|inputs\.version/)
+  for (const name of ['BAMBOO_RELEASE_TOKEN', 'BAMBOO_RELEASE_SIGNING_KEY']) {
+    assert.equal(automatic.split(`secrets.${name}`).length - 1, 2)
   }
-  assert.equal(workflow.split("BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ github.job == 'publish' && vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 || '' }}").length - 1, 2)
-  assert.equal(fs.readFileSync('scripts/crate-release.cjs', 'utf8').split(
-    'assertSigningConfiguration(env.BAMBOO_RELEASE_SIGNING_KEY, env.BAMBOO_RELEASE_SIGNING_KEY_SHA256)').length - 1, 2)
-  assert.equal(workflow.split("GH_TOKEN: ${{ github.job == 'publish' && secrets.BAMBOO_RELEASE_TOKEN || github.token }}").length - 1, 2)
   assert.doesNotMatch(workflow, /VERSION="\$\{\{ github.event.inputs.version/)
   const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8')
   assert.match(ci, /group: ci-\$\{\{ github.event_name \}\}/)
@@ -980,13 +880,45 @@ test('workflow preserves the exact CI commit, shared publication queue and separ
   assert.match(ci, /node --test scripts\/ci-policy.test.cjs scripts\/crate-release.test.cjs/)
 })
 
+test('the real manual version resolver has no signing or API dependency and never emits invalid output', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-manual-version-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+  const inline = workflow.split("          node - <<'JS'\n")[1].split('\n          JS')[0]
+    .split('\n').map(line => line.replace(/^ {10}/, '')).join('\n')
+    .replace("'./scripts/crate-release.cjs'", JSON.stringify(path.join(__dirname, 'crate-release.cjs')))
+  const clock = "const RealDate = Date; global.Date = class extends RealDate { constructor(...args) { super(...(args.length ? args : ['2026-10-07T12:00:00Z'])) } };\n"
+  const output = path.join(directory, 'output')
+  const check = (requested, sourceVersion = '0.0.0') => {
+    fs.writeFileSync(path.join(directory, 'Cargo.toml'), `[package]\nversion = "${sourceVersion}"\n`)
+    fs.writeFileSync(output, '')
+    return spawnSync(process.execPath, ['-e', clock + inline], { cwd: directory, encoding: 'utf8',
+      env: { PUBLISH_VERSION: requested, GITHUB_OUTPUT: output } })
+  }
+  for (const version of ['1.2.3', '2026.10.18446744073709551615', '9999.1.1-rc.0']) {
+    const result = check(version)
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(fs.readFileSync(output, 'utf8'), `version=${version}\n`)
+  }
+  for (const requested of ['', 'latest']) {
+    assert.equal(check(requested, '1.2.3').status, 0)
+    assert.equal(fs.readFileSync(output, 'utf8'), 'version=1.2.3\n')
+    assert.notEqual(check(requested).status, 0)
+    assert.equal(fs.readFileSync(output, 'utf8'), '')
+  }
+  for (const version of ['0.0.0', '9999.1.1', '2026.11.1', '1.2.3\npoison=true', '1.2.3;false']) {
+    assert.notEqual(check(version).status, 0)
+    assert.equal(fs.readFileSync(output, 'utf8'), '')
+  }
+})
+
 function workflowPython(name) {
   return fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8').split(`      - name: ${name}`)[1]
     .split("          python3 - <<'PY'\n")[1].split('\n          PY')[0]
     .split('\n').map((line) => line.replace(/^ {10}/, '')).join('\n')
 }
 
-test('trusted inline bootstrap authorizes protected historical source and workflow before checkout, while dry feature source has no API calls', (t) => {
+test('automatic inline bootstrap authorizes the exact successful CI source and protected historical workflow before checkout', (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-release-bootstrap-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const git = (...args) => {
@@ -1026,45 +958,55 @@ else:
   const eventPath = path.join(directory, 'event.json')
   const output = path.join(directory, 'output')
   const bootstrap = workflowPython('Authorize the exact source before checkout')
-  const run = (overrides = {}, event = {}) => {
-    fs.writeFileSync(eventPath, JSON.stringify(event))
+  const event = { workflow_run: { name: 'CI', event: 'push', conclusion: 'success', head_branch: 'main', head_sha: historical,
+    repository: { full_name: 'bigduu/Bamboo-agent' }, head_repository: { full_name: 'bigduu/Bamboo-agent' } } }
+  const run = (overrides = {}, payload = event) => {
+    fs.writeFileSync(eventPath, JSON.stringify(payload))
     fs.writeFileSync(output, '')
     fs.writeFileSync(calls, '')
     const result = spawnSync('python3', ['-c', bootstrap], { encoding: 'utf8', env: { ...process.env,
-      PATH: `${bin}:${process.env.PATH}`, GITHUB_REPOSITORY: 'bigduu/Bamboo-agent', GITHUB_EVENT_NAME: 'workflow_dispatch',
+      PATH: `${bin}:${process.env.PATH}`, GITHUB_REPOSITORY: 'bigduu/Bamboo-agent', GITHUB_EVENT_NAME: 'workflow_run',
       GITHUB_EVENT_PATH: eventPath, GITHUB_SHA: historical, GITHUB_OUTPUT: output, GITHUB_REF: 'refs/heads/dev',
       GITHUB_REF_PROTECTED: 'true', GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/publish-crate.yml@refs/heads/dev',
-      GITHUB_WORKFLOW_SHA: dev, DRY_RUN: 'false', FIXTURE_REPOSITORY: directory, FIXTURE_CALLS: calls,
+      GITHUB_WORKFLOW_SHA: dev, FIXTURE_REPOSITORY: directory, FIXTURE_CALLS: calls,
       FIXTURE_TIPS: JSON.stringify({ dev, main }), ...overrides } })
     return { ...result, output: fs.readFileSync(output, 'utf8'), calls: fs.readFileSync(calls, 'utf8') }
   }
   for (const source of [historical, dev, main]) {
-    const result = run({ GITHUB_SHA: source })
+    const payload = clone(event)
+    payload.workflow_run.head_sha = source
+    const result = run({}, payload)
     assert.equal(result.status, 0, result.stderr)
     assert.equal(result.output, `revision=${source}\n`)
   }
-  for (const overrides of [{ GITHUB_SHA: feature }, { GITHUB_SHA: 'f'.repeat(40) }, { GITHUB_SHA: 'invalid' },
-    { GITHUB_WORKFLOW_SHA: feature }, { FIXTURE_UNPROTECTED: 'true' }, { FIXTURE_API_FAILURE: 'true' },
+  for (const invalid of [feature, 'f'.repeat(40), 'invalid']) {
+    const payload = clone(event)
+    payload.workflow_run.head_sha = invalid
+    const result = run({}, payload)
+    assert.notEqual(result.status, 0)
+    assert.equal(result.output, '')
+  }
+  for (const overrides of [{ GITHUB_WORKFLOW_SHA: feature }, { FIXTURE_UNPROTECTED: 'true' }, { FIXTURE_API_FAILURE: 'true' },
     { GITHUB_REF: 'refs/heads/feature' }, { GITHUB_REF_PROTECTED: 'false' },
     { GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/publish-crate.yml@refs/heads/feature' }]) {
     const result = run(overrides)
     assert.notEqual(result.status, 0)
     assert.equal(result.output, '', 'Untrusted source cannot be handed to checkout or repository code')
   }
-  const event = { workflow_run: { event: 'push', conclusion: 'success', head_branch: 'main', head_sha: historical,
-    repository: { full_name: 'bigduu/Bamboo-agent' }, head_repository: { full_name: 'bigduu/Bamboo-agent' } } }
-  const automatic = run({ GITHUB_EVENT_NAME: 'workflow_run', GITHUB_SHA: dev }, event)
+  const automatic = run({ GITHUB_SHA: dev })
   assert.equal(automatic.status, 0, automatic.stderr)
-  assert.equal(automatic.output, `revision=${historical}\n`)
-  for (const change of [(run) => { run.head_repository.full_name = 'foreign/repository' }, (run) => { run.event = 'pull_request' }]) {
+  assert.equal(automatic.output, `revision=${historical}\n`, 'workflow SHA cannot replace the tested CI source')
+  for (const [key, value] of [['name', 'Other'], ['head_repository', { full_name: 'foreign/repository' }],
+    ['event', 'pull_request'], ['conclusion', 'failure'], ['head_branch', 'dev']]) {
     const changed = clone(event)
-    change(changed.workflow_run)
-    assert.notEqual(run({ GITHUB_EVENT_NAME: 'workflow_run' }, changed).status, 0)
+    changed.workflow_run[key] = value
+    assert.notEqual(run({}, changed).status, 0)
   }
-  const dry = run({ DRY_RUN: 'true', GITHUB_SHA: feature, GITHUB_REF: 'refs/heads/feature', GITHUB_REF_PROTECTED: 'false' })
-  assert.equal(dry.status, 0, dry.stderr)
-  assert.equal(dry.output, `revision=${feature}\n`)
-  assert.equal(dry.calls, '')
+  const manual = run({ GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REF: 'refs/tags/frozen-source' })
+  assert.notEqual(manual.status, 0)
+  assert.equal(manual.output, '')
+  assert.equal(manual.calls, '')
+
 })
 
 test('temporary manifest stamping uses exact internal dependency versions and real package versions', (t) => {
@@ -1077,12 +1019,11 @@ test('temporary manifest stamping uses exact internal dependency versions and re
     'bamboo-domain = { path = "crates/core/bamboo-domain", version = "0.0.0" }\n' +
     '[build-dependencies]\nbamboo-domain = { path = "crates/core/bamboo-domain" }\n')
   fs.writeFileSync(path.join(member, 'Cargo.toml'), '[package]\nname = "bamboo-domain"\nversion.workspace = true\n')
-  const inline = workflowPython('Prepare workspace manifests for publish')
   const python = ['python3', 'python3.12', 'python3.14'].find((candidate) =>
     spawnSync(candidate, ['-c', 'import tomllib']).status === 0)
   assert.ok(python, 'Python >= 3.11 is required by the publication manifest policy')
-  const result = spawnSync(python, ['-c', inline], { cwd: directory, encoding: 'utf8',
-    env: { ...process.env, TARGET_VERSION: '2026.10.8' } })
+  const result = spawnSync(python, [path.join(__dirname, 'crate-release-lock.py'), 'stamp', '2026.10.8'],
+    { cwd: directory, encoding: 'utf8' })
   assert.equal(result.status, 0, result.stderr)
   const stamped = fs.readFileSync(path.join(directory, 'Cargo.toml'), 'utf8')
   assert.match(stamped, /\[workspace.package\]\nversion = "2026.10.8"/)
