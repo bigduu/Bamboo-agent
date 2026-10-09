@@ -55,6 +55,22 @@ pub(crate) fn ordinary_main(session: &Session) -> bool {
         && !session.root_orchestration_only_enabled()
 }
 
+// Capture the resolved directory once. Re-resolving the original alias on
+// every page would let a redirected symlink silently retarget an active run.
+fn workspace_identity(session: &Session) -> Result<Option<std::path::PathBuf>, ToolError> {
+    session
+        .workspace_path_meta()
+        .map(|path| {
+            let canonical = std::fs::canonicalize(path)
+                .map_err(|_| denied("Native canonical workspace is unavailable"))?;
+            if !canonical.is_dir() {
+                return Err(denied("Native canonical workspace is not a directory"));
+            }
+            Ok(canonical)
+        })
+        .transpose()
+}
+
 fn ceiling(session: &Session) -> Result<Option<BTreeSet<String>>, ToolError> {
     session
         .metadata
@@ -159,7 +175,7 @@ struct Policy {
     root_revision: u64,
     permission_mode: SessionPermissionMode,
     plan: bool,
-    workspace: Option<String>,
+    workspace: Option<std::path::PathBuf>,
     project: Option<String>,
     ceiling: Option<BTreeSet<String>>,
     mode: Option<String>,
@@ -191,7 +207,7 @@ impl Policy {
                 .agent_runtime_state
                 .as_ref()
                 .is_some_and(|s| s.plan_mode.is_some()),
-            workspace: session.workspace_path_meta(),
+            workspace: workspace_identity(session)?,
             project: session.project_id_meta(),
             ceiling: ceiling(session)?,
             mode: mode(session),
@@ -237,7 +253,7 @@ impl Policy {
     }
     fn check_session(&self, session: &Session) -> Result<(), ToolError> {
         self.check_execution_session(session)?;
-        if session.workspace_path_meta() != self.workspace
+        if workspace_identity(session)? != self.workspace
             || session.project_id_meta() != self.project
         {
             #[cfg(test)]
