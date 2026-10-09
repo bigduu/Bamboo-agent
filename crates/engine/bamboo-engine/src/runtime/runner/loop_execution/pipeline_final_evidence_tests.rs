@@ -51,6 +51,20 @@ fn provider_usage(input: u64, output: u64) -> LLMChunk {
     }
 }
 
+fn native_item(
+    author: ProviderTranscriptAuthor,
+    payload: serde_json::Value,
+) -> ProviderTranscriptItem {
+    ProviderTranscriptItem::try_from_payload(
+        ProviderFamily::OpenAi,
+        ProviderProtocol::OpenAiResponsesV1,
+        ProviderTranscriptOrigin::Provider,
+        author,
+        payload,
+    )
+    .unwrap()
+}
+
 #[async_trait::async_trait]
 impl LLMProvider for FinalProvider {
     async fn chat_stream(
@@ -82,29 +96,21 @@ impl LLMProvider for FinalProvider {
                 (true, _) => DISCOVERY_PROGRESS,
                 _ => CANDIDATE,
             };
-            let payload = if search {
-                json!({"type":"tool_search_call", "id":"native-search", "call_id":"search-1",
-                    "execution":"client", "status":"completed", "arguments":{"query":"checks"}})
-            } else {
-                json!({"type":"message", "id":format!("native-message-{round}"), "role":"assistant", "status":"completed",
-                    "content":[{"type":"output_text", "text":content, "annotations":[]}]})
-            };
-            let native = ProviderTranscriptItem::try_from_payload(
-                ProviderFamily::OpenAi,
-                ProviderProtocol::OpenAiResponsesV1,
-                ProviderTranscriptOrigin::Provider,
-                ProviderTranscriptAuthor::Model,
-                payload,
-            )
-            .unwrap();
-            return Ok(Box::pin(stream::iter(vec![
+            let mut chunks = vec![
+                Ok(LLMChunk::ResponseId("main-response".into())),
                 Ok(LLMChunk::ReasoningToken("original signed thought".into())),
                 Ok(LLMChunk::ReasoningSignature("original-signature".into())),
                 Ok(LLMChunk::Token(content.into())),
-                Ok(LLMChunk::ProviderTranscriptItem(native)),
-                Ok(provider_usage(100, 10)),
-                Ok(LLMChunk::Done),
-            ])));
+            ];
+            if search {
+                chunks.push(Ok(LLMChunk::ProviderTranscriptItem(native_item(
+                    ProviderTranscriptAuthor::Model,
+                    json!({"type":"tool_search_call", "id":"native-search", "call_id":"search-1",
+                        "execution":"client", "status":"completed", "arguments":{"query":"checks"}}),
+                ))));
+            }
+            chunks.extend([Ok(provider_usage(100, 10)), Ok(LLMChunk::Done)]);
+            return Ok(Box::pin(stream::iter(chunks)));
         }
         self.auxiliary_calls.fetch_add(1, Ordering::SeqCst);
         *self.evidence_prompt.lock().unwrap() = messages[1].content.clone();
@@ -359,6 +365,9 @@ impl bamboo_agent_core::AgentHook for FinalGateProbe {
             .filter(|message| message.role == Role::Assistant && message.tool_calls.is_none())
         {
             assert!(native_replay_count(session) > 0);
+            assert!(session
+                .metadata
+                .contains_key("responses.previous_response_id"));
             *self.candidate_id.lock().unwrap() = Some(message.id.clone());
             self.transcript_epoch.store(
                 session.provider_transcript.epoch() as usize,
@@ -470,6 +479,27 @@ async fn native_discovery_replays_progress_once_with_the_committed_identity_befo
 async fn gold_committed_candidate_is_revised_in_place_without_a_duplicate_or_stale_native_chain() {
     for verdict in [Verdict::Revise, Verdict::InvalidReference] {
         let (mut session, mut config, mut state) = fixture(true);
+        let boundary = bamboo_domain::provider_transcript_boundary_sha256(
+            config.provider_name.as_deref(),
+            config.provider_type.as_deref(),
+        )
+        .unwrap();
+        session
+            .activate_provider_transcript_route(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                &boundary,
+            )
+            .unwrap();
+        let anchor = session.messages[1].id.clone();
+        session.append_provider_transcript_group(&anchor, None, vec![
+            native_item(ProviderTranscriptAuthor::Model,
+                json!({"type":"tool_search_call", "id":"hosted-search", "call_id":"hosted-1",
+                    "execution":"server", "status":"completed", "arguments":{"query":"checks"}})),
+            native_item(ProviderTranscriptAuthor::ToolResult,
+                json!({"type":"tool_search_output", "id":"hosted-output", "call_id":"hosted-1",
+                    "execution":"server", "status":"completed", "tools":[]})),
+        ]).unwrap();
         config.gold_config = Some(crate::runtime::config::GoldConfig {
             enabled: true,
             auto_continue_enabled: true,
