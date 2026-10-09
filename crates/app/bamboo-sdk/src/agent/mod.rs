@@ -3199,19 +3199,26 @@ mod constructor_parity_tests {
     #[tokio::test]
     async fn constructor_parity_sdk_cancellation_keeps_the_consumed_fresh_user() {
         for streaming in [false, true] {
+            let phase = std::cell::Cell::new("setup: temporary root");
+            let started = std::time::Instant::now();
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 let root = tempfile::tempdir().unwrap();
                 let provider = Arc::new(PendingProvider::default());
+                phase.set("setup: AgentBuilder defaults");
                 let agent = agent(root.path(), provider.clone()).await;
+                phase.set("setup: Session and fresh input");
                 let id = format!("constructor-sdk-cancel-{streaming}");
                 watch_inputs(&id);
                 let mut session = Session::new(&id, "claude-test");
                 let converted = Arc::new(AtomicUsize::new(0));
                 let input = ObservedInput(converted.clone());
                 if streaming {
+                    phase.set("provider_start: streaming spawn");
                     let (mut rx, cancel) = agent.run_stream_cancellable(session, input);
                     assert_eq!(converted.load(Ordering::SeqCst), 1);
+                    phase.set("provider_start: streaming notify");
                     provider.started.notified().await;
+                    phase.set("cancel_termination: streaming drain");
                     cancel.cancel();
                     let (mut errors, mut complete, mut cancelled) = (0, 0, 0);
                     while let Some(event) = rx.recv().await {
@@ -3228,15 +3235,21 @@ mod constructor_parity_tests {
                     let cancel = CancellationToken::new();
                     let stop = cancel.clone();
                     let execution = agent.clone();
+                    phase.set("provider_start: blocking spawn");
                     let task = tokio::spawn(async move {
                         execution.run_with_cancel(&mut session, input, cancel).await
                     });
+                    phase.set("provider_start: blocking notify");
                     provider.started.notified().await;
+                    phase.set("cancel_termination: blocking join");
                     stop.cancel();
                     assert!(matches!(task.await.unwrap(), Err(AgentError::Cancelled)));
                 }
+                phase.set("oracle: input converted once");
                 assert_eq!(converted.load(Ordering::SeqCst), 1);
+                phase.set("persistence: load canonical Session");
                 let persisted = agent.storage().load_session(&id).await.unwrap().unwrap();
+                phase.set("oracle: fresh User, input observation and provider request");
                 let users = persisted
                     .messages
                     .iter()
@@ -3261,7 +3274,13 @@ mod constructor_parity_tests {
                 );
             })
             .await
-            .expect("actual provider cancellation must terminate");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "actual provider cancellation must terminate: streaming={streaming}, phase={}, elapsed={:?}, timeout={error}",
+                    phase.get(),
+                    started.elapsed()
+                )
+            });
         }
     }
 
