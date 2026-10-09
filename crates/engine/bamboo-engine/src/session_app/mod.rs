@@ -8,6 +8,7 @@ pub mod errors;
 pub mod execute;
 pub mod execution_prep;
 pub mod metadata;
+pub mod no_progress;
 pub mod provider_model;
 pub mod repository;
 pub mod resolution;

@@ -18,6 +18,7 @@ use bamboo_domain::{
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 
+pub(crate) use no_progress::pause_for_no_progress;
 pub(crate) use policy::ToolPolicyGuard;
 
 fn build_context_pressure(session: &Session) -> Option<output_compressor::ContextPressure> {
@@ -57,6 +58,7 @@ mod clarification;
 mod events;
 mod execution_paths;
 mod loop_state;
+mod no_progress;
 mod output_compressor;
 mod per_call;
 mod policy;
