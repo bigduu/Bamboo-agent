@@ -1,4 +1,3 @@
-//! Actual Native HTTP routes -> reserved Engine -> Reader -> provider/task tests.
 use super::*;
 use actix_web::{http::StatusCode, test, App};
 use bamboo_agent_core::tools::{FunctionCall, ToolSchema};
@@ -27,7 +26,6 @@ struct Trace {
     main_pages: usize,
 }
 static NEXT_PROVIDER_CALL: AtomicU64 = AtomicU64::new(0);
-
 struct SkillsProvider {
     wanted: Vec<String>,
     task: PathBuf,
@@ -86,8 +84,7 @@ impl SkillsProvider {
                     LLMChunk::Done,
                 ];
             }
-            let page: Value = serde_json::from_str(&message.content)
-                .expect("generic compressor must preserve complete page JSON");
+            let page: Value = serde_json::from_str(&message.content).unwrap();
             let chat = bamboo_llm::providers::common::openai_compat::messages_to_openai_compat_json(
                 messages,
             );
@@ -309,6 +306,9 @@ async fn done(state: &web::Data<AppState>, id: &str) -> AgentStatus {
                     status,
                     AgentStatus::Completed | AgentStatus::Error(_) | AgentStatus::Cancelled
                 ) {
+                    if matches!(status, AgentStatus::Error(_)) {
+                        eprintln!("actual Native terminal {id}: {status:?}");
+                    }
                     return status;
                 }
             }
@@ -441,8 +441,6 @@ async fn native_http_implicit_main_retains_current_user_across_nonew_pages() {
     assert_eq!(user.content, "Inspect proof and perform its normal action");
 }
 
-// Capture only a binding created by the actual reserved HTTP path. This tap
-// observes a real executor; it never creates a caller, Q batch or permission.
 fn bindings() -> &'static Mutex<BTreeMap<String, std::sync::Weak<NativeExecutor>>> {
     static TAPS: std::sync::OnceLock<Mutex<BTreeMap<String, std::sync::Weak<NativeExecutor>>>> =
         std::sync::OnceLock::new();
@@ -518,6 +516,27 @@ async fn native_http_actual_stop_and_provider_unwind_revoke_retained_executor() 
             .upgrade()
             .unwrap();
         assert!(executor.run.live.load(Ordering::Acquire));
+        let spoof = ToolCall {
+            id: "live-spoofed-context".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "skills_list".into(),
+                arguments: json!({"limit":1}).to_string(),
+            },
+        };
+        assert!(
+            executor
+                .execute_with_context(
+                    &spoof,
+                    ToolExecutionContext {
+                        session_id: Some(&id),
+                        ..ToolExecutionContext::none(&spoof.id)
+                    }
+                )
+                .await
+                .is_err(),
+            "matching public ToolCtx cannot mint private dispatch/Q"
+        );
         assert_eq!(
             executor.run.reservation_id,
             body["run_id"].as_str().unwrap()

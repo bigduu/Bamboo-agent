@@ -396,9 +396,12 @@ impl NativeRun {
     }
 }
 fn is_user(record: &ProjectedInputRequest) -> bool {
-    record.kind == SessionMessageKind::UserInput
+    (record.kind == SessionMessageKind::UserInput
         && matches!(record.source, SessionMessageSource::User)
-        && record.wrapper.is_none()
+        && record.wrapper.is_none())
+        || (record.kind == SessionMessageKind::RuntimeInstruction
+            && matches!(&record.source, SessionMessageSource::Runtime { subsystem } if subsystem == "chat")
+            && record.wrapper.as_deref() == Some("root_chat_turn_v1"))
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Purpose {
@@ -535,12 +538,14 @@ impl SkillExecutionHost for NativeHost {
     }
 }
 
+pub(crate) type NativeExecutionBinding = (Arc<bamboo_engine::Agent>, Arc<dyn ToolExecutor>);
+
 pub(crate) fn bind_execution(
     state: web::Data<AppState>,
     session: &Session,
     reservation: &SessionExecutionReservation,
     base: Arc<dyn ToolExecutor>,
-) -> Result<(Arc<bamboo_engine::Agent>, Arc<dyn ToolExecutor>), ToolError> {
+) -> Result<NativeExecutionBinding, ToolError> {
     if reservation.session_id() != session.id {
         return Err(denied("Native reservation target mismatch"));
     }
@@ -589,6 +594,9 @@ impl NativeExecutor {
         name: &str,
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolOutcome, ToolError> {
+        if matches!(name, "load_skill" | "read_skill_resource") {
+            return Err(denied("Native finite Skills use the scoped Reader"));
+        }
         if !matches!(name, "skills_list" | "skills_read") {
             return self
                 .tools
@@ -676,16 +684,27 @@ impl ToolExecutor for NativeExecutor {
             .await
     }
     fn list_tools(&self) -> Vec<ToolSchema> {
-        self.tools.list_tools()
+        self.tools
+            .list_tools()
+            .into_iter()
+            .filter(|tool| {
+                !matches!(
+                    tool.function.name.as_str(),
+                    "load_skill" | "read_skill_resource"
+                )
+            })
+            .collect()
     }
     fn owns_exact_tool(&self, name: &str) -> bool {
-        self.tools.owns_exact_tool(name)
+        !matches!(name, "load_skill" | "read_skill_resource") && self.tools.owns_exact_tool(name)
     }
     fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
         if matches!(name, "skills_list" | "skills_read") {
             Some(self)
-        } else {
+        } else if self.owns_exact_tool(name) {
             self.tools.exact_tool_owner(name)
+        } else {
+            None
         }
     }
     fn tool_guidance(&self) -> Option<String> {

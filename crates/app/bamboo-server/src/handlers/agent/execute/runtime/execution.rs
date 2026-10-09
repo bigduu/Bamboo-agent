@@ -172,10 +172,7 @@ impl SpawnAgentExecution {
     pub(crate) fn spawn_with_native_inputs(
         self,
         inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
-        native_binding: Option<(
-            Arc<bamboo_engine::Agent>,
-            Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
-        )>,
+        native_binding: Option<crate::skill_runtime::NativeExecutionBinding>,
     ) {
         spawn_agent_execution_with_inputs(self, inputs, native_binding);
     }
@@ -184,10 +181,7 @@ impl SpawnAgentExecution {
 fn spawn_agent_execution_with_inputs(
     mut args: SpawnAgentExecution,
     inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
-    native_binding: Option<(
-        Arc<bamboo_engine::Agent>,
-        Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
-    )>,
+    native_binding: Option<crate::skill_runtime::NativeExecutionBinding>,
 ) {
     let session_model_ref = session_effective_model_ref(&args.session);
     let provider_override = match (session_model_ref.as_ref(), args.provider_override.take()) {
