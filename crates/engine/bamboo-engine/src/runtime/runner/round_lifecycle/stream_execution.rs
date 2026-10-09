@@ -1558,28 +1558,31 @@ pub(super) async fn execute_llm_stream(
     // Keep that first stream silent; the pipeline verifies and executes the
     // model-issued call, then later rounds stream normally once activation is
     // mirrored into the runner-owned Session.
-    let stream_output_result =
-        if crate::runtime::runner::session_setup::legacy_instruction::explicit_activation_pending(
+    let activation_pending =
+        crate::runtime::runner::session_setup::legacy_instruction::explicit_activation_pending(
             session,
-        ) {
-            crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
-                stream,
-                cancel_token,
-                session_id,
-                &timeout_context,
-            )
-            .await
-        } else {
-            crate::runtime::stream::handler::consume_llm_stream_with_context_and_partial(
-                stream,
-                event_tx,
-                cancel_token,
-                session_id,
-                &timeout_context,
-            )
-            .await
-        };
-    let stream_output = match stream_output_result {
+        );
+    // The opt-in evidence check must publish only the final, checked answer.
+    // Buffer this response until tool calls tell us whether it is a candidate.
+    let stream_output_result = if activation_pending || config.features_final_evidence_check {
+        crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
+            stream,
+            cancel_token,
+            session_id,
+            &timeout_context,
+        )
+        .await
+    } else {
+        crate::runtime::stream::handler::consume_llm_stream_with_context_and_partial(
+            stream,
+            event_tx,
+            cancel_token,
+            session_id,
+            &timeout_context,
+        )
+        .await
+    };
+    let mut stream_output = match stream_output_result {
         Ok(output) => output,
         Err(failure) => {
             let appended = append_interrupted_assistant_output(
@@ -1596,6 +1599,29 @@ pub(super) async fn execute_llm_stream(
             return Err(failure.error);
         }
     };
+
+    if config.features_final_evidence_check
+        && !activation_pending
+        && !stream_output.tool_calls.is_empty()
+    {
+        if stream_output.visible_message.is_none() && !stream_output.reasoning_content.is_empty() {
+            let message = Message::assistant(String::new(), None);
+            stream_output.visible_message =
+                Some(crate::runtime::stream::handler::VisibleMessageIdentity {
+                    message_id: message.id,
+                    created_at: message.created_at,
+                });
+        }
+        if let Some(identity) = stream_output.visible_message.as_ref() {
+            crate::runtime::stream::handler::publish_buffered_response(
+                event_tx,
+                identity,
+                &stream_output.content,
+                Some(&stream_output.reasoning_content),
+            )
+            .await;
+        }
+    }
 
     // Update session token usage with actual output/thinking/cache stats from the LLM response.
     if let Some(ref mut usage) = session.token_usage {

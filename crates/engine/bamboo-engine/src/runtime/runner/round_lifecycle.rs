@@ -164,15 +164,29 @@ pub(crate) fn canonical_attempt_usage(
     estimated_prompt_tokens: u64,
     estimated_completion_tokens: u64,
 ) -> MetricsTokenUsage {
-    let prompt_tokens = stream_output
-        .provider_usage
+    canonical_token_usage(
+        stream_output.provider_usage,
+        stream_output.input_tokens,
+        stream_output.output_tokens,
+        estimated_prompt_tokens,
+        estimated_completion_tokens,
+    )
+}
+
+pub(crate) fn canonical_token_usage(
+    provider_usage: Option<crate::runtime::stream::handler::ProviderUsageSnapshot>,
+    legacy_prompt_tokens: u64,
+    legacy_completion_tokens: u64,
+    estimated_prompt_tokens: u64,
+    estimated_completion_tokens: u64,
+) -> MetricsTokenUsage {
+    let prompt_tokens = provider_usage
         .and_then(|usage| usage.input_tokens)
-        .or_else(|| (stream_output.input_tokens > 0).then_some(stream_output.input_tokens))
+        .or_else(|| (legacy_prompt_tokens > 0).then_some(legacy_prompt_tokens))
         .unwrap_or(estimated_prompt_tokens);
-    let completion_tokens = stream_output
-        .provider_usage
+    let completion_tokens = provider_usage
         .and_then(|usage| usage.output_tokens)
-        .or_else(|| (stream_output.output_tokens > 0).then_some(stream_output.output_tokens))
+        .or_else(|| (legacy_completion_tokens > 0).then_some(legacy_completion_tokens))
         .unwrap_or(estimated_completion_tokens);
 
     MetricsTokenUsage {

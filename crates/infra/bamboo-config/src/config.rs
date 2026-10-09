@@ -2438,6 +2438,9 @@ pub struct FeatureFlags {
     /// Enable MiniLoop-based complexity evaluation and dynamic per-round model switching.
     #[serde(default)]
     pub dynamic_model_routing: bool,
+    /// Check a final answer once against this request's recorded tool evidence.
+    #[serde(default)]
+    pub final_evidence_check: bool,
 }
 
 /// Default model assignments for specific capabilities.
@@ -10635,5 +10638,23 @@ mod tests {
             outcome.config.plugin_trust.enforcement,
             PluginTrustEnforcement::Strict
         );
+    }
+}
+
+#[cfg(test)]
+mod final_evidence_feature_tests {
+    use super::FeatureFlags;
+
+    #[test]
+    fn final_evidence_check_is_opt_in_and_survives_config_round_trip() {
+        let existing: FeatureFlags =
+            serde_json::from_str(r#"{"dynamic_model_routing":true}"#).unwrap();
+        assert!(!existing.final_evidence_check);
+        let enabled: FeatureFlags =
+            serde_json::from_str(r#"{"final_evidence_check":true}"#).unwrap();
+        let restored: FeatureFlags =
+            serde_json::from_value(serde_json::to_value(enabled).unwrap()).unwrap();
+        assert!(restored.final_evidence_check);
+        assert!(!FeatureFlags::default().final_evidence_check);
     }
 }
