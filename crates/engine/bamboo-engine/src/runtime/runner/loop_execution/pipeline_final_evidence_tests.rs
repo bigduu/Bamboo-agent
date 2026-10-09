@@ -216,16 +216,9 @@ async fn run(
     provider: Arc<FinalProvider>,
     tx: &mpsc::Sender<AgentEvent>,
 ) -> Result<bool, AgentError> {
-    run_pipeline(
-        session,
-        tx,
-        provider,
-        Arc::new(NoExecution),
-        &CancellationToken::new(),
-        config,
-        state,
-    )
-    .await
+    let tools = Arc::new(NoExecution);
+    let cancel = CancellationToken::new();
+    run_pipeline(session, tx, provider, tools, &cancel, config, state).await
 }
 
 fn drain(rx: &mut mpsc::Receiver<AgentEvent>) -> (String, usize) {
@@ -426,6 +419,7 @@ async fn native_discovery_replays_progress_once_with_the_committed_identity_befo
         let mut current_id = None;
         let mut texts = Vec::new();
         let mut reasoning_count = 0;
+        let mut started_count = 0;
         let mut completes = 0;
         while let Ok(event) = rx.try_recv() {
             let stored = session
@@ -433,13 +427,22 @@ async fn native_discovery_replays_progress_once_with_the_committed_identity_befo
                 .iter()
                 .find(|message| Some(&message.id) == current_id.as_ref());
             match event {
-                AgentEvent::VisibleMessageStart { message_id, .. } => current_id = Some(message_id),
+                AgentEvent::VisibleMessageStart { message_id, .. } => {
+                    current_id = Some(message_id);
+                    started_count += 1;
+                }
                 AgentEvent::Token { content } => {
                     assert_eq!(stored.unwrap().content, content);
                     texts.push(content);
                 }
                 AgentEvent::ReasoningToken { content } => {
-                    assert_eq!(stored.unwrap().reasoning.as_deref(), Some(content.as_str()));
+                    if enabled {
+                        assert_eq!(stored.unwrap().reasoning.as_deref(), Some(content.as_str()));
+                    } else {
+                        assert_eq!(content, "original signed thought");
+                        let expected_starts = if thought_only { 0 } else { reasoning_count };
+                        assert_eq!(started_count, expected_starts);
+                    }
                     reasoning_count += 1;
                 }
                 AgentEvent::Complete { .. } => completes += 1,
