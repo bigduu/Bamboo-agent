@@ -2,21 +2,7 @@ use super::*;
 
 #[actix_web::test]
 async fn test_get_command_by_id_workflow() {
-    let state = crate::e2e::common::create_test_app().await;
-
-    // Create a test workflow file
-    let workflows_dir = state.app_data_dir.join("workflows");
-    let root_existed_before_create = workflows_dir.is_dir();
-    eprintln!("WORKFLOW_GET_PHASE root_before_create={root_existed_before_create}");
-    tokio::fs::create_dir_all(&workflows_dir)
-        .await
-        .expect("Failed to create workflows dir");
-
-    let workflow_content = "# Test Workflow\n\nThis is a test workflow.";
-    let workflow_path = workflows_dir.join("test-workflow.md");
-    tokio::fs::write(&workflow_path, workflow_content)
-        .await
-        .expect("Failed to write workflow");
+    let state = crate::e2e::common::create_test_app_with_workflows().await;
 
     let app = test::init_service(App::new().app_data(state.clone()).route(
         "/v1/commands/{command_type}/{id}",
@@ -24,16 +10,25 @@ async fn test_get_command_by_id_workflow() {
     ))
     .await;
 
-    let mut polls = 0usize;
-    let mut last_status = None;
+    let req = test::TestRequest::get()
+        .uri("/v1/commands/workflow/test-workflow")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_FOUND);
+
+    // Publish a new source after watcher startup; it cannot come from the initial snapshot.
+    let workflow_content = "# Test Workflow\n\nThis is a test workflow.";
+    let workflow_path = state.app_data_dir.join("workflows/test-workflow.md");
+    tokio::fs::write(&workflow_path, workflow_content)
+        .await
+        .expect("Failed to write workflow");
+
     let resp = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let req = test::TestRequest::get()
                 .uri("/v1/commands/workflow/test-workflow")
                 .to_request();
             let resp = test::call_service(&app, req).await;
-            polls += 1;
-            last_status = Some(resp.status());
             if resp.status().is_success() {
                 break resp;
             }
@@ -42,10 +37,7 @@ async fn test_get_command_by_id_workflow() {
         }
     })
     .await
-    .unwrap_or_else(|error| {
-        panic!("watcher should publish the legacy Workflow source: {error:?}; root_before_create={root_existed_before_create}; polls={polls}; last_status={last_status:?}")
-    });
-    eprintln!("WORKFLOW_GET_PHASE published polls={polls} last_status={last_status:?}");
+    .expect("watcher should publish the legacy Workflow source");
 
     let body = test::read_body(resp).await;
     let result: Value = serde_json::from_slice(&body).expect("Response should be valid JSON");
