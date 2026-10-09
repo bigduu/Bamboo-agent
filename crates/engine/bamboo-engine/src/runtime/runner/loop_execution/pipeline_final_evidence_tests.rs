@@ -365,7 +365,8 @@ impl bamboo_agent_core::AgentHook for FinalGateProbe {
             .filter(|message| message.role == Role::Assistant && message.tool_calls.is_none())
         {
             assert!(native_replay_count(session) > 0);
-            assert!(session
+            // The main stream's store=false policy discards even a returned ResponseId.
+            assert!(!session
                 .metadata
                 .contains_key("responses.previous_response_id"));
             *self.candidate_id.lock().unwrap() = Some(message.id.clone());
