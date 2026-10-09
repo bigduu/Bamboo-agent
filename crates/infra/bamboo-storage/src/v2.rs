@@ -1460,6 +1460,7 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     copy.id = new_id.to_string();
     copy.kind = SessionKind::Root;
     copy.parent_session_id = None;
+    copy.parent_created_at = None;
     copy.root_session_id = new_id.to_string();
     copy.spawn_depth = 0;
     copy.title = format!("{} (copy)", source.title.trim_end());
@@ -2086,6 +2087,7 @@ impl SessionStoreV2 {
                     || sidecar.kind != main.kind
                     || sidecar.root_session_id != main.root_session_id
                     || sidecar.parent_session_id != main.parent_session_id
+                    || sidecar.parent_created_at != main.parent_created_at
                     || sidecar.spawn_depth != main.spawn_depth
                     || sidecar.created_at != main.created_at
                 {
@@ -3036,15 +3038,25 @@ impl SessionStoreV2 {
         &self,
         session_id: &str,
     ) -> io::Result<Option<Session>> {
+        Ok(self
+            .load_runtime_control_plane_boxed_unchecked(session_id)
+            .await?
+            .map(|session| *session))
+    }
+
+    async fn load_runtime_control_plane_boxed_unchecked(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Box<Session>>> {
         validate_session_id(session_id)?;
         if session_id == DEFAULT_SUPERVISOR_SESSION_ID {
             if let Some(root) = self.load_root_authority_unchecked(session_id).await? {
-                return Ok(Some(root));
+                return Ok(Some(Box::new(root)));
             }
             // An Ordinary Child may already own this ID in another tree.
             // Only canonical Root absence permits its normal control-plane read.
         }
-        if let Some(side) = self.read_runtime_sidecar(session_id).await? {
+        if let Some(side) = self.read_runtime_sidecar_boxed(session_id).await? {
             self.validate_root_tool_authority_against_proof(session_id, &side)
                 .await?;
             return Ok(self.session_lifetime_is_live(&side).await?.then_some(side));
@@ -3062,7 +3074,7 @@ impl SessionStoreV2 {
             Err(error) => return Err(error),
         };
         compact_main::validate_full_main(raw.as_bytes())?;
-        let mut session: Session = serde_json::from_str(&raw)
+        let mut session: Box<Session> = serde_json::from_str(&raw)
             .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
         supervisor::validate_identity(&session)?;
         self.validate_root_tool_authority_overlay(session_id, &session, None)
@@ -3344,7 +3356,9 @@ impl SessionStoreV2 {
                 ),
             ));
         };
-        if main.parent_session_id != current.parent_session_id {
+        if main.parent_session_id != current.parent_session_id
+            || main.parent_created_at != current.parent_created_at
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -3380,7 +3394,9 @@ impl SessionStoreV2 {
                 main.kind,
                 &main.root_session_id,
             )?;
-            if sidecar.parent_session_id != main.parent_session_id {
+            if sidecar.parent_session_id != main.parent_session_id
+                || sidecar.parent_created_at != main.parent_created_at
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("runtime Task recovery parent identity mismatch for {session_id}"),
@@ -4309,8 +4325,9 @@ impl SessionStoreV2 {
                 &incoming.id,
             )
             .await?
+            .map(Box::new)
         } else {
-            self.load_runtime_control_plane_unchecked(&incoming.id)
+            self.load_runtime_control_plane_boxed_unchecked(&incoming.id)
                 .await?
         };
         if let Some(durable) = durable {
@@ -4543,10 +4560,20 @@ impl SessionStoreV2 {
     /// exists. Returns `None` when the session has no sidecar yet (e.g. legacy
     /// sessions not yet migrated). Path is resolved through the index.
     async fn read_runtime_sidecar(&self, session_id: &str) -> io::Result<Option<Session>> {
+        Ok(self
+            .read_runtime_sidecar_boxed(session_id)
+            .await?
+            .map(|session| *session))
+    }
+
+    async fn read_runtime_sidecar_boxed(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Box<Session>>> {
         let Some(path) = self.runtime_json_path(session_id).await? else {
             return Ok(None);
         };
-        Self::read_runtime_sidecar_at(&path, session_id).await
+        Self::read_runtime_sidecar_boxed_at(&path, session_id).await
     }
 
     /// Read + deserialize a runtime sidecar (`runtime.json`) from a known path.
@@ -4556,11 +4583,20 @@ impl SessionStoreV2 {
     /// [`Self::read_runtime_sidecar`] (index-resolved path) and the index
     /// rebuild (directory-scanned path) so both overlay the sidecar identically.
     async fn read_runtime_sidecar_at(path: &Path, id: &str) -> io::Result<Option<Session>> {
+        Ok(Self::read_runtime_sidecar_boxed_at(path, id)
+            .await?
+            .map(|session| *session))
+    }
+
+    async fn read_runtime_sidecar_boxed_at(
+        path: &Path,
+        id: &str,
+    ) -> io::Result<Option<Box<Session>>> {
         if !path.exists() {
             return Ok(None);
         }
         let raw = fs::read_to_string(path).await?;
-        match serde_json::from_str::<Session>(&raw) {
+        match serde_json::from_str::<Box<Session>>(&raw) {
             Ok(mut side) => {
                 supervisor::validate_identity(&side)?;
                 // The control-plane path (`load_runtime_control_plane`) returns
@@ -5491,6 +5527,13 @@ impl SessionStoreV2 {
                 {
                     self.bump_actor_tree_revision(&root).await?;
                 }
+                self.cancel_descendant_activations_before_child_delete(
+                    &entry.root_session_id,
+                    session_id,
+                    guards,
+                    &tree,
+                )
+                .await?;
                 let abs_dir = self.abs_path_from_rel(&entry.rel_path);
                 let _ = self.remove_child_directory(&abs_dir, guards, &tree).await;
                 self.update_index(|index| {
@@ -6964,7 +7007,7 @@ mod tests {
         root.set_task_list_version_meta("1");
         storage.save_session(&root).await?;
 
-        let mut child = Session::new_child(child_id, root_id, "model", "child");
+        let mut child = Session::new_child_of(child_id, &root, "model", "child");
         child.add_message(Message::user("child transcript secret"));
         child.metadata.insert(
             "unrelated.child".to_string(),

@@ -1610,7 +1610,7 @@ async fn compact_main_malformed_unsupported_missing_and_tight_caps_fail_without_
         .windows(b"\"version\":1".len())
         .position(|w| w == b"\"version\":1")
         .unwrap();
-    unsupported[version + b"\"version\":".len()] = b'2';
+    unsupported[version + b"\"version\":".len()] = b'3';
     for (bytes, error) in [
         (bad_digit, Error::InconsistentAuthority),
         (huge, Error::BudgetExceeded),

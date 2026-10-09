@@ -3,6 +3,7 @@
 //! This module provides integration with OpenAI's chat completion API,
 //! including support for streaming responses and function calling.
 
+use crate::providers::common::log_identity;
 use async_trait::async_trait;
 use reqwest::{
     header::{HeaderMap, HeaderValue, AUTHORIZATION},
@@ -175,8 +176,8 @@ impl OpenAIProvider {
                 .map(bamboo_domain::ModelContextResetReason::as_str),
         );
         tracing::info!(
-            "[{}] Responses wire prefix: relation={} epoch={} reset_reason={} cache_key_hash={} top_level_hash={} input_items={} previous_input_items={} first_divergent_item={} first_divergent_type={} final_cumulative_hash={}",
-            session_log_id,
+            "[session_hash={}] Responses wire prefix: relation={} epoch={} reset_reason={} cache_key_hash={} top_level_hash={} input_items={} previous_input_items={} first_divergent_item={} first_divergent_type_hash={} final_cumulative_hash={}",
+            log_identity(session_log_id),
             diagnostic.relation.as_str(),
             diagnostic
                 .prefix_epoch
@@ -194,7 +195,11 @@ impl OpenAIProvider {
                 .first_divergent_item
                 .map(|index| index.to_string())
                 .unwrap_or_else(|| "none".to_string()),
-            diagnostic.first_divergent_type.as_deref().unwrap_or("none"),
+            diagnostic
+                .first_divergent_type
+                .as_deref()
+                .map(log_identity)
+                .unwrap_or_else(|| "none".to_string()),
             diagnostic
                 .cumulative_item_sha256
                 .last()
@@ -297,9 +302,9 @@ impl OpenAIProvider {
             .and_then(Value::as_str)
             .is_some_and(|value| !value.trim().is_empty());
         tracing::info!(
-            "[{}] OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} input_source={} input_messages_before={} input_messages_after={} duplicate_system_fallback={} explicit_prompt_cache={} prompt_cache_affinity_hint={} cache_hit_guaranteed=false [{}]",
-            session_log_id,
-            model,
+            "[session_hash={}] OpenAI request protocol=responses model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} input_source={} input_messages_before={} input_messages_after={} duplicate_system_fallback={} explicit_prompt_cache={} prompt_cache_affinity_hint={} cache_hit_guaranteed=false purpose_hash={}",
+            log_identity(session_log_id),
+            log_identity(model),
             reasoning_effort
                 .map(ReasoningEffort::as_str)
                 .unwrap_or("none"),
@@ -314,7 +319,7 @@ impl OpenAIProvider {
             input_selection.fallback_removed_duplicate_system,
             self.explicit_prompt_cache,
             prompt_cache_affinity_hint,
-            request_purpose
+            log_identity(request_purpose)
         );
 
         let headers = self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
@@ -348,9 +353,9 @@ impl OpenAIProvider {
                 )
             {
                 tracing::warn!(
-                    "OpenAI /responses could not find previous_response_id for model '{}'; retrying without stateful continuation. Upstream response: {}",
-                    model,
-                    text
+                    "OpenAI /responses could not find previous_response_id for model_hash {}; retrying without stateful continuation. upstream_response_bytes={}",
+                    log_identity(model),
+                    text.len()
                 );
 
                 let mut fallback_options = responses_options.cloned().unwrap_or_default();
@@ -428,8 +433,8 @@ impl OpenAIProvider {
                 && Self::looks_like_reasoning_unsupported_error(status, &text)
             {
                 tracing::warn!(
-                    "OpenAI /responses rejected reasoning for model '{}'; retrying without reasoning_effort",
-                    model
+                    "OpenAI /responses rejected reasoning for model_hash {}; retrying without reasoning_effort",
+                    log_identity(model)
                 );
 
                 let mut fallback_options = responses_options.cloned().unwrap_or_default();
@@ -681,7 +686,7 @@ impl LLMProvider for OpenAIProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
-        tracing::debug!("OpenAI provider using model: {}", model);
+        tracing::debug!("OpenAI provider using model_hash={}", log_identity(model));
         let reasoning_effort = options
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
@@ -744,9 +749,9 @@ impl LLMProvider for OpenAIProvider {
         }
         crate::masking::mask_outbound_body(&mut body, &self.masking_config);
         tracing::info!(
-            "[{}] OpenAI request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} [{}]",
-            session_log_id,
-            model,
+            "[session_hash={}] OpenAI request protocol=chat_completions model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose_hash={}",
+            log_identity(session_log_id),
+            log_identity(model),
             reasoning_effort
                 .map(ReasoningEffort::as_str)
                 .unwrap_or("none"),
@@ -755,7 +760,7 @@ impl LLMProvider for OpenAIProvider {
             max_output_tokens
                 .map(|tokens| tokens.to_string())
                 .unwrap_or_else(|| "none".to_string()),
-            request_purpose
+            log_identity(request_purpose)
         );
 
         let headers =
@@ -779,8 +784,8 @@ impl LLMProvider for OpenAIProvider {
                 && Self::looks_like_reasoning_unsupported_error(status, &text)
             {
                 tracing::warn!(
-                    "OpenAI /chat/completions rejected reasoning for model '{}'; retrying without reasoning_effort",
-                    model
+                    "OpenAI /chat/completions rejected reasoning for model_hash {}; retrying without reasoning_effort",
+                    log_identity(model)
                 );
 
                 let mut fallback_body = build_openai_compat_body(
@@ -838,8 +843,8 @@ impl LLMProvider for OpenAIProvider {
 
             if Self::looks_like_responses_only_error(status, &text) {
                 tracing::info!(
-                    "OpenAI chat/completions rejected model '{}'; retrying via /responses",
-                    model
+                    "OpenAI chat/completions rejected model_hash {}; retrying via /responses",
+                    log_identity(model)
                 );
                 return self
                     .chat_stream_via_responses(
@@ -910,8 +915,8 @@ impl LLMProvider for OpenAIProvider {
                 && (requested_reasoning.is_some() || observed_reasoning_signal)
             {
                 tracing::info!(
-                    "OpenAI chat_completions reasoning summary: model='{}' requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
-                    model_for_log,
+                    "OpenAI chat_completions reasoning summary: model_hash={} requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
+                    log_identity(&model_for_log),
                     requested_reasoning
                         .map(ReasoningEffort::as_str)
                         .unwrap_or("none"),

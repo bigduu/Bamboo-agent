@@ -7,6 +7,10 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      expected_source_sha:
+        description: "Exact accepted source commit selected by the release train"
+        required: true
+        type: string
       version:
         description: "Override unified publish version (for example: 2026.3.11). Leave empty or 'latest' to use the root Cargo.toml version."
         required: false
@@ -121,6 +125,15 @@ jobs:
         # workflow lands on the default dev branch. The next main promotion
         # carries both the workflow and this policy into its exact source.
         run: test -f scripts/crate-release.cjs
+
+      - name: Require the exact accepted publication source
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+        run: |
+          [[ "${EXPECTED_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          test "${GITHUB_SHA}" = "${EXPECTED_SOURCE_SHA}"
+          test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA}"
+          test -z "$(git status --porcelain --untracked-files=all)"
 
       - name: Setup Node.js
         uses: actions/setup-node@v7

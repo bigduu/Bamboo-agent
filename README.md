@@ -94,7 +94,7 @@ No key yet? `bamboo -p "ping" --echo` is a **transport smoke test only**: it use
 
 ### Call it from your application
 
-With a configured provider and running server, the legacy HTTP/SSE sequence is **chat → subscribe → execute**. `chat` persists the message; `execute` starts the agent loop. The example requires `curl` and `jq`; replace the model with one your account supports. In terminal A, create the session and open its live event stream:
+With a configured provider and running server, the legacy HTTP/SSE sequence is **chat → subscribe → execute**. Native `chat` saves session configuration and admits a typed Inbox message with its own RespectSpecificWait intent. Canonical history and `MessageAppended` appear when an existing same-session consumer checkpoints and ACKs it; `execute` starts the agent loop. The example requires `curl` and `jq`; replace the model with one your account supports. In terminal A, create the session and open its live event stream:
 
 ```bash
 SID=$(curl -fsS http://127.0.0.1:9562/api/v1/chat \
@@ -111,6 +111,17 @@ SID="<session-id printed in terminal A>"
 curl -fsS -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
   -H 'Content-Type: application/json' -d '{}'
 ```
+
+Native Chat returns the actual `message_id` and `ingress_seq` receipt fields.
+Its serialized envelope is limited to 256 KiB and must contain semantic content;
+attachments are kept whole, including duplicate images and more than 16 images.
+There is no truncation to fit the limit. Chat without a consumer leaves the input
+in the Inbox and does not append history, emit `MessageAppended`, or start a title.
+Automatic title work moves to checked Native admission followed by successful
+HTTP Ready startup. A running owner or another legitimate same-session activation
+may consume the message before the client's execute request. The specific intent
+does not release staged child/Bash outcomes; their coordinator retains that order.
+Referenced/ticket and Root ingress keep their existing scheduling rules.
 
 Watch terminal A for live events; subscribing after execution can miss response tokens. The browser uses the shared `/v2/stream` WebSocket; legacy SSE routes remain available.
 
@@ -199,6 +210,32 @@ data and a unique successful active receipt, retains originals and uses the
 existing 512 KiB bound. Unsupported history stays intact. Neither helper is
 called by chat, runner setup, providers or persistence; live cutover is separate.
 
+`bamboo_server_tools::SkillInputFactory` is an unwired host preparation entry
+point for an actual User that has not been appended. It requires a freshly
+resolved caller and typed current selections; host ceilings, disabled/manual
+policy, Root Ultra and Project/workspace scope remain separate restrictions.
+New Sessions require explicit host provenance and first/final absent storage
+rows. Existing Sessions reuse their persistence owner before publication guards
+and a final direct fallible storage read. Definition, schema, mode and Source
+are borrowed from one current publication, with charged raw/physical validation
+before rendering and before success. Only ordinary Message data and warnings
+return; no Session, pin or reader permission is written. No production caller
+uses this factory. Its fixtures establish preparation, not live runtime cutover.
+
+Its `prepare_input_with_owner` entry borrows the host's active persistence guard
+and checks the same Session and coordinator map before reading. It compares the
+complete durable checkpoint separately from the request-local candidate; only
+hook observations and the prompt precheck may differ. Runtime permission fields,
+identity, transcript and host authority must remain equal. The borrowed entry
+uses a synchronous resolver that denies by default and does not reenter the
+Session or Config owner. Store refresh may run under the borrowed Session owner;
+it takes no host Config lock or Session callback and retains no publication guard.
+Both entries acquire retained Config after Session and before publication, then
+validate current caller revocation after the final await. The SDK's
+private User construction and append helpers retain one exact message ID/time
+and all four wrappers' original synchronous append, lease and error order.
+These preparations do not connect HTTP, runtime, Reader or production authority.
+
 The runner's existing Instruction activation path is factored into a private,
 stateless `legacy_instruction` adapter. It still publishes the selected pin,
 requires one model-issued `load_skill` call, suppresses first-round answer text,
@@ -222,6 +259,15 @@ from response cancellation; those guards are released before activation.
 Ordinary requests keep their existing input and idempotent replay behavior.
 This adapter adds no caller grant, Session field, reader registration or
 additional writer. The pure prepared-input helpers remain unwired.
+
+Native chat and queued HTTP input use private constructors for the same User
+Message and inbox envelope. Native chat retains its real ID, timestamp and nondeduplicated attachments;
+the existing consumer checkpoints its User and pending handoff. Queued input
+retains authenticated admission and its durable retry identity. The four fresh-input SDK wrappers share one synchronous append
+helper at their original call positions, including synchronous stream creation.
+Session-only execution and resume retain their supplied history. These helpers
+preserve the existing public and serialized layouts and introduce no Skill
+factory or live reader registration.
 
 ## License
 
@@ -282,3 +328,75 @@ exit, cancellation and unwind restore the caller's previous scope.
 Production Reader registration, current-input intent transport, default trusted
 caller resolution and output-helper composition remain disconnected until the
 separate atomic cutover. Existing legacy execution remains the only live path.
+
+Server and deployed workers construct the existing `load_skill` and
+`read_skill_resource` overlays through `assemble_legacy_skill_tools` in
+`skill_runtime/assembly.rs`. Server retains its Project store and the actual
+permission-checked pre-Skill context registry; workers retain their absent
+optional adapters. Strict-native workers bypass this construction, and SDK
+defaults retain their existing tool registration. The old classes remain
+exported. This refactor preserves legacy invocation, resource and metadata
+behavior; it does not register progressive catalog/read Tools or wire the
+prepared ordinary-input helpers. The atomic live cutover remains separate.
+
+Canonical User envelopes can retain bounded, untrusted Skill request data in
+`SessionMessageContent::skill_request`. A current HTTP `workflow_selection`
+supplies one exact id/source/revision/args selection with no mode. Existing
+queued and Root envelopes preserve this data and include it in retry identity;
+the existing native Message path and queue admission conditions are unchanged.
+This carrier does not prepare or invoke a Skill, authorize a source/body read,
+or identify a historical message as current input. Fresh caller, current User,
+Source, schema, configuration and policy checks remain mandatory at eventual
+use. The existing Workflow/Instruction activation path remains live.
+
+Absent request data keeps legacy JSON, `.text()` construction, provider
+text/parts and canonical proof/idempotency bytes compatible. The new optional
+public field intentionally changes Rust struct-literal construction: existing
+`SessionMessageContent { text, parts }` callers must write
+`SessionMessageContent { text, parts, skill_request: None }`. Data bounds limit
+request shape and size; they do not guarantee admission under the existing
+whole-envelope Inbox limit. Guidance, peer messages and child/runtime
+presentation cannot turn this data into a fresh User request.
+
+Execution wrappers can carry a separately owned `UntrustedExecutionInputs`
+parameter into the execution-private config. HTTP checked Native and queue admission
+supply only this call's newly committed User IDs after ACK succeeds; SDK
+`run`, `run_with_cancel`, `run_stream` and `run_stream_cancellable` supply the
+exact User each just appended, with no request derived from its text.
+Old session/resume/custom execute/spawn entrypoints default to `None`.
+The public `SessionExecutionArgs`, `ExecuteRequest` and Server spawn argument
+layouts remain unchanged. At most 128 ID/request records are retained, each
+request bounded by the existing I-W rules; this transport is separate from the
+later aggregate projection cap and does not classify inputs as current.
+Admission/startup failure drops the local data; transcript recovery cannot
+mint it again. No message/images, Skill bodies or Source authority objects
+are retained. This remains unwired caller data, without preparation, Reader
+registration, resource reads, grants or a live Skill cutover. Native nonqueued
+Chat uses the same checked Inbox handoff; NoNew and history cannot reconstruct it.
+
+A separate unwired Engine helper can project borrowed request records into one
+bounded, untrusted batch. It checks all original I-W request data, then charges
+one private compact view including exact session/execution/input IDs, canonical
+source/kind/wrapper provenance, original timestamps and explicit absent requests.
+The whole batch is limited to 128 records and 256 KiB of compact UTF-8 bytes;
+record/selection slots are bounded separately. Owned data copies only validated
+lengths, without retaining Message/image/Source objects or source capacities.
+The helper establishes no New/current-input evidence, publication or permission;
+queued observation, execution transport and live Skill cutover remain separate.
+
+Checked queued admission can now supply execution-local current input data after
+the existing transcript checkpoint and exact ACK succeed. Unknown, failed or
+oversized observations clear prior data; a successful boundary with no new input
+retains data only within the same live session and execution. A new ordered batch
+replaces the old IDs and selections, including when its request is absent.
+Overflow preserves the original admission, events, memory and provider behavior.
+
+The main loop owns this finite value and drops it at every terminal return. The
+optional Lifecycle companion returns data to its caller; old implementations
+run once and return unavailable data. The initial checked HTTP handoff is sealed
+and consumed once under the same measured execution UUID. Its existing I-E
+compatibility slice adds bounded slots and args AST storage; the 256 KiB compact
+cap is not a heap/RSS bound. Old SDK/native/history constructors do not create
+current-input evidence. Host selection remains a ceiling, and every eventual
+Skill use still requires fresh caller, Source, schema, configuration and policy
+checks. This adds no Reader, preparation, registration or live Skill cutover.

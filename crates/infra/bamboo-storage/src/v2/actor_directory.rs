@@ -232,6 +232,38 @@ impl SessionStoreV2 {
         &self,
         actor: &ActorSession,
     ) -> Result<Vec<ActorAncestorObservation>, ActorDirectoryError> {
+        self.validate_actor_lineage_with_record(actor, Some(actor))
+            .await
+    }
+
+    pub(super) async fn validate_actor_lineage_with_record(
+        &self,
+        actor: &ActorSession,
+        recorded: Option<&ActorSession>,
+    ) -> Result<Vec<ActorAncestorObservation>, ActorDirectoryError> {
+        let own_rel = if actor.parent_actor_id.is_some() {
+            Self::child_rel_path(&actor.root_actor_id, &actor.actor_id)
+        } else {
+            Self::root_rel_path(&actor.actor_id)
+        };
+        let own_kind = if actor.parent_actor_id.is_some() {
+            bamboo_domain::SessionKind::Child
+        } else {
+            bamboo_domain::SessionKind::Root
+        };
+        let mut current_session = self
+            .load_session_from_dir_strict(
+                &self.abs_path_from_rel(&own_rel),
+                &actor.actor_id,
+                own_kind,
+                &actor.root_actor_id,
+            )
+            .await
+            .map_err(storage)?
+            .ok_or_else(|| ActorDirectoryError::NotFound(actor.actor_id.clone()))?;
+        if !actor.matches_session(&current_session) {
+            return Err(ActorDirectoryError::InvalidIdentity);
+        }
         let mut current = actor.clone();
         let mut lineage = Vec::new();
         while let Some(parent_id) = current.parent_actor_id.clone() {
@@ -261,7 +293,25 @@ impl SessionStoreV2 {
                 .await
                 .map_err(storage)?
                 .ok_or_else(|| ActorDirectoryError::NotFound(parent_id.clone()))?;
-            let parent = ActorSession::from_session(&parent)?;
+            // Missing creation proof is readable, but never permits a first
+            // activation. A legacy Actor already activated before this upgrade
+            // may continue only against its original complete ancestor births.
+            match current_session.parent_created_at {
+                Some(birth) if birth == parent.created_at => {}
+                None if recorded.is_some_and(|record| {
+                    record.current_attempt > 0
+                        && record
+                            .ancestor_observations
+                            .get(lineage.len())
+                            .is_some_and(|old| {
+                                old.actor_id == parent.id
+                                    && old.session_created_at == parent.created_at
+                            })
+                }) => {}
+                _ => return Err(ActorDirectoryError::InvalidIdentity),
+            }
+            current_session = parent;
+            let parent = ActorSession::from_session(&current_session)?;
             if parent.root_actor_id != *root_id
                 || parent.spawn_depth.checked_add(1) != Some(current.spawn_depth)
                 || parent.project_id != current.project_id
@@ -300,8 +350,25 @@ impl SessionStoreV2 {
         if session.id != actor_id {
             return Err(ActorDirectoryError::InvalidIdentity);
         }
+        let existing = if Self::regular_actor_file(path).await? {
+            let raw = fs::read(path).await.map_err(storage)?;
+            let entry: ActorDirectoryEntry =
+                serde_json::from_slice(&raw).map_err(|_| ActorDirectoryError::Corrupt)?;
+            entry.validate()?;
+            if !entry.actor.matches_session(&session) {
+                return Err(ActorDirectoryError::InvalidIdentity);
+            }
+            Some(entry)
+        } else {
+            None
+        };
         let mut expected = ActorSession::from_session(&session)?;
-        expected.ancestor_observations = self.validate_actor_lineage(&expected).await?;
+        expected.ancestor_observations = self
+            .validate_actor_lineage_with_record(
+                &expected,
+                existing.as_ref().map(|entry| &entry.actor),
+            )
+            .await?;
         let marker_path = directory.join(ACTOR_INITIALIZED_FILE);
         let marker = match Self::regular_actor_file(&marker_path).await? {
             true => {
@@ -318,15 +385,8 @@ impl SessionStoreV2 {
             }
             false => None,
         };
-        let mut entry = match Self::regular_actor_file(path).await? {
-            true => {
-                let raw = fs::read(path).await.map_err(storage)?;
-                let entry: ActorDirectoryEntry =
-                    serde_json::from_slice(&raw).map_err(|_| ActorDirectoryError::Corrupt)?;
-                entry.validate()?;
-                if !entry.actor.matches_session(&session) {
-                    return Err(ActorDirectoryError::InvalidIdentity);
-                }
+        let mut entry = match existing {
+            Some(entry) => {
                 if marker.is_none() {
                     // Only the fully inert first publication can survive a
                     // crash before marker durability. A prior claim without
@@ -342,7 +402,7 @@ impl SessionStoreV2 {
                 }
                 entry
             }
-            false if marker.is_none() => {
+            None if marker.is_none() => {
                 // The Session was durably visible before this publication. A
                 // crash before the marker leaves an inert Cold actor. No claim
                 // is returned until BOTH files have been durably published.
@@ -352,7 +412,7 @@ impl SessionStoreV2 {
                     .await?;
                 entry
             }
-            false => return Err(ActorDirectoryError::Corrupt),
+            None => return Err(ActorDirectoryError::Corrupt),
         };
         let project_changed = entry.actor.project_id != expected.project_id;
         if kind == bamboo_domain::SessionKind::Child && project_changed {
@@ -532,6 +592,140 @@ impl SessionStoreV2 {
             self.write_actor_entry(&path, &entry, &guards).await?;
         }
         Ok(value)
+    }
+
+    /// The caller owns lifecycle/Task exclusivity and this Root's tree guard.
+    /// Cancel only already-published live descendants; never initialize an Actor.
+    /// A cancelled attempt remains recorded so same-birth ancestor restoration
+    /// can permit a fresh claim without ever making the old fence live again.
+    pub(super) async fn cancel_descendant_activations_before_child_delete(
+        &self,
+        root_id: &str,
+        child_id: &str,
+        guards: &Arc<super::SessionDeletionGuards>,
+        tree: &Arc<ActorTreeWriteGuard>,
+    ) -> io::Result<()> {
+        let directory = self.sessions_dir.join(root_id).join("children");
+        let root_id = root_id.to_owned();
+        let child_id = child_id.to_owned();
+        let guards = Arc::clone(guards);
+        let tree = Arc::clone(tree);
+        #[cfg(test)]
+        let hook = self.actor_write_hook.lock().unwrap().clone();
+        tokio::task::spawn_blocking(move || {
+            // The original acquired guards cover the actual scan and every
+            // durable row replacement, including caller/runtime cancellation.
+            let _guards = guards;
+            let _tree = tree;
+            let invalid = || {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid descendant Actor authority during Child deletion",
+                )
+            };
+            match std::fs::symlink_metadata(&directory) {
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => return Err(invalid()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            }
+            let entries = std::fs::read_dir(&directory)?;
+            let read = |path: &Path| -> io::Result<Option<Vec<u8>>> {
+                match std::fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.file_type().is_file() => std::fs::read(path).map(Some),
+                    Ok(_) => Err(invalid()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error),
+                }
+            };
+            let now = Utc::now();
+            let mut replacements = Vec::new();
+            // Preflight the complete same-Root census before changing any row.
+            // The persisted ancestor list covers indirect descendants too.
+            for item in entries {
+                let item = item?;
+                if !item.file_type()?.is_dir() || item.file_name() == child_id.as_str() {
+                    continue;
+                }
+                let path = item.path().join(ACTOR_AUTHORITY_FILE);
+                let marker = read(&item.path().join(ACTOR_INITIALIZED_FILE))?;
+                let row = read(&path)?;
+                let Some(row) = row else {
+                    // Two absent witnesses are ordinary historical Sessions.
+                    if marker.is_some() {
+                        return Err(invalid());
+                    }
+                    continue;
+                };
+                let mut entry: ActorDirectoryEntry =
+                    serde_json::from_slice(&row).map_err(|_| invalid())?;
+                entry.validate().map_err(|_| invalid())?;
+                if item.file_name() != entry.actor.actor_id.as_str()
+                    || entry.actor.root_actor_id != root_id
+                    || entry.actor.parent_actor_id.is_none()
+                {
+                    return Err(invalid());
+                }
+                let Some(marker) = marker else {
+                    // Reuse the first-publication crash rule: an inert Cold
+                    // row has never issued a fence and needs no cancellation.
+                    if entry.actor.current_attempt == 0
+                        && entry.actor.state == ActorLogicalState::Cold
+                        && entry.activation.is_none()
+                    {
+                        continue;
+                    }
+                    return Err(invalid());
+                };
+                let marker: ActorInitializedMarker =
+                    serde_json::from_slice(&marker).map_err(|_| invalid())?;
+                if marker.schema_version != bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION
+                    || marker.actor_id != entry.actor.actor_id
+                    || marker.session_created_at != entry.actor.session_created_at
+                {
+                    return Err(invalid());
+                }
+                if !entry
+                    .actor
+                    .ancestor_observations
+                    .iter()
+                    .any(|ancestor| ancestor.actor_id == child_id)
+                {
+                    continue;
+                }
+                let Some(activation) = entry
+                    .activation
+                    .as_mut()
+                    .filter(|activation| activation.status.is_live())
+                else {
+                    continue;
+                };
+                activation.lease_epoch =
+                    checked_next(activation.lease_epoch).map_err(|_| invalid())?;
+                activation.status = ActorActivationStatus::Cancelled;
+                activation.finished_at = Some(now);
+                activation.lease_expires_at = now;
+                entry.actor.state = ActorLogicalState::Cold;
+                entry.revision = checked_next(entry.revision).map_err(|_| invalid())?;
+                entry.validate().map_err(|_| invalid())?;
+                let bytes = serde_json::to_vec_pretty(&entry).map_err(|_| invalid())?;
+                replacements.push((path, bytes));
+            }
+            replacements.sort_by(|left, right| left.0.cmp(&right.0));
+            for (path, bytes) in replacements {
+                durable_atomic_write_blocking(&path, &bytes, |phase| {
+                    #[cfg(test)]
+                    if let Some(hook) = &hook {
+                        return hook.visit(&path, phase);
+                    }
+                    let _ = phase;
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("join descendant Actor cancellation: {error}")))?
     }
 
     /// Retire a resident only while its exact physical activation is still

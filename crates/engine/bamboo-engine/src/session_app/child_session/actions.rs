@@ -27,7 +27,7 @@ pub async fn create_child_action(
             "Ticket LocalPlan binding requires the trusted work-child entry point".into(),
         ));
     }
-    create_child_action_inner(port, input, None).await
+    create_child_action_inner(port, input, None, None).await
 }
 
 /// Host-only fresh work assignment creation; no model tool deserializes this port.
@@ -86,20 +86,46 @@ pub async fn create_ticket_child_action(
         serde_json::to_string(&required_packet)
             .map_err(|e| ChildSessionError::Execution(e.to_string()))?,
     );
-    create_child_action_inner(port, input, Some(packet)).await
+    create_child_action_inner(port, input, Some(packet), None).await
+}
+
+pub(super) async fn create_profile_child_action(
+    port: &dyn ChildSessionPort,
+    input: CreateChildInput,
+    profile: super::named_profile::ResolvedChildProfile,
+) -> Result<CreateChildResult, ChildSessionError> {
+    if input
+        .runtime_metadata
+        .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+    {
+        return Err(ChildSessionError::InvalidArguments(
+            "invalid Workflow child input".into(),
+        ));
+    }
+    create_child_action_inner(port, input, None, Some(profile)).await
 }
 
 async fn create_child_action_inner(
     port: &dyn ChildSessionPort,
     mut input: CreateChildInput,
     ticket_context: Option<bamboo_tickets::WorkContextPacket>,
+    pinned_profile: Option<super::named_profile::ResolvedChildProfile>,
 ) -> Result<CreateChildResult, ChildSessionError> {
     use crate::runner::refresh_prompt_snapshot;
     use bamboo_agent_core::Message;
 
-    let profile = port
-        .resolve_named_profile(&input.parent_session, &input.subagent_type)
-        .await?;
+    let workflow_usage_requested = pinned_profile.is_some()
+        && input
+            .runtime_metadata
+            .get(bamboo_subagent::proto::WORKFLOW_USAGE_REQUESTED_KEY)
+            .is_some_and(|v| v == "true");
+    let profile = match pinned_profile {
+        Some(profile) => Some(profile),
+        None => {
+            port.resolve_named_profile(&input.parent_session, &input.subagent_type)
+                .await?
+        }
+    };
     if let Some(profile) = &profile {
         if input.lifecycle.as_deref() == Some("resident")
             || input.resident_name.is_some()
@@ -456,7 +482,12 @@ async fn create_child_action_inner(
         .metadata
         .insert("base_system_prompt".to_string(), system_prompt.clone());
 
-    child.add_message(Message::system(&system_prompt));
+    let mut system_message = Message::system(&system_prompt);
+    if workflow_usage_requested {
+        system_message.metadata =
+            Some(json!({(bamboo_subagent::proto::WORKFLOW_USAGE_REQUESTED_KEY): true}));
+    }
+    child.add_message(system_message);
 
     // Child sessions get more aggressive compression: trigger at 70% instead
     // of the default 85%, target 35% instead of 40%. This prevents long child
@@ -904,7 +935,7 @@ pub fn apply_child_session_update(
     update: ChildSessionUpdate,
 ) -> Result<usize, ChildSessionError> {
     let should_refresh_assignment = update.refreshes_assignment();
-    if super::named_profile::has_named_profile(&child)
+    if super::named_profile::has_named_profile(child)
         && (should_refresh_assignment
             || update.assignment_background.is_some()
             || update.model_ref_override.is_some()
@@ -914,7 +945,7 @@ pub fn apply_child_session_update(
             "named_profile_contract_is_frozen; create a new Child to select another profile or model".into()));
     }
     if (should_refresh_assignment || update.assignment_background.is_some())
-        && bamboo_domain::ChildContextBinding::from_session(&child)
+        && bamboo_domain::ChildContextBinding::from_session(child)
             .map_err(|error| ChildSessionError::Execution(error.to_string()))?
             .is_some()
     {
@@ -945,19 +976,19 @@ pub fn apply_child_session_update(
         let effective_responsibility = normalize_required_text(
             update
                 .responsibility
-                .or_else(|| metadata_text(&child, "responsibility")),
+                .or_else(|| metadata_text(child, "responsibility")),
             "responsibility",
         )?;
         let effective_subagent_type = normalize_required_text(
             update
                 .subagent_type
-                .or_else(|| metadata_text(&child, "subagent_type")),
+                .or_else(|| metadata_text(child, "subagent_type")),
             "subagent_type",
         )?;
         let effective_prompt = normalize_required_text(
             update
                 .prompt
-                .or_else(|| metadata_text(&child, "assignment_prompt")),
+                .or_else(|| metadata_text(child, "assignment_prompt")),
             "prompt",
         )?;
 

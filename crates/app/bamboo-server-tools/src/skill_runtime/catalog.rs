@@ -49,6 +49,469 @@ pub struct SelectedSkillSource {
     pub identity: String,
 }
 
+/// Explicit host provenance for a real unappended User's Session. New requires
+/// the host's actual unsaved Session; storage absence alone cannot create one.
+pub enum SkillInputSession<'a> {
+    New(&'a bamboo_agent_core::Session),
+    Existing,
+}
+
+/// Unwired preappend factory. Returns ordinary data, never a reader/activation
+/// grant. `prepare_input` acquires the existing persistence owner itself;
+/// `prepare_input_with_owner` borrows an authenticated owner without reentry.
+pub struct SkillInputFactory {
+    access: SkillToolAccess,
+    resolver: Arc<dyn SkillCatalogCallerResolver>,
+}
+impl SkillInputFactory {
+    pub fn new(
+        manager: Arc<SkillManager>,
+        config: Arc<RwLock<Config>>,
+        sessions: bamboo_engine::SessionRepository,
+        resolver: Arc<dyn SkillCatalogCallerResolver>,
+    ) -> Self {
+        Self {
+            access: SkillToolAccess::new(manager, config, sessions),
+            resolver,
+        }
+    }
+    pub fn with_project_store(mut self, projects: Arc<bamboo_projects::ProjectStore>) -> Self {
+        self.access = self.access.with_project_store(projects);
+        self
+    }
+    pub async fn prepare_input(
+        &self,
+        ctx: &ToolCtx,
+        user: &bamboo_agent_core::Message,
+        host: SkillInputSession<'_>,
+        selections: &[bamboo_skills::WorkflowSelection],
+    ) -> Result<bamboo_engine::session_app::skill_input::PreparedSkillInput, ToolError> {
+        let caller = self.resolver.resolve(ctx).await?;
+        let requested = validate_input_caller(ctx, user, &caller, selections)?;
+        // A fallible direct storage read cannot turn a failed existing lookup
+        // into New. Classification is independent of the cache's fast path.
+        let first = self
+            .access
+            .session_repo
+            .storage()
+            .load_session(&caller.session_id)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let (session, is_new) = match (host, first) {
+            (SkillInputSession::New(session), None)
+                if session.id == caller.session_id
+                    && self.access.session_repo.cache().get(&session.id).is_none() =>
+            {
+                (session.clone(), true)
+            }
+            (SkillInputSession::Existing, Some(session)) if session.id == caller.session_id => {
+                let session = self
+                    .access
+                    .session_repo
+                    .try_load(&session.id)
+                    .await
+                    .map_err(|error| ToolError::Execution(error.to_string()))?
+                    .ok_or_else(|| {
+                        ToolError::Execution("Skill existing Session is unavailable".into())
+                    })?;
+                (session, false)
+            }
+            _ => {
+                return Err(ToolError::Execution(
+                    "Skill host New/existing Session provenance does not match storage".into(),
+                ))
+            }
+        };
+        let expected = serde_json::to_value(&session).map_err(json_error)?;
+        self.prepare_from_session(InputPreparation {
+            ctx,
+            user,
+            selections,
+            caller,
+            requested,
+            session,
+            expected,
+            is_new,
+            owner: None,
+        })
+        .await
+    }
+
+    /// Prepare a real unappended User under the host's existing persistence owner.
+    /// `durable_checkpoint` is the exact snapshot loaded/saved by that transaction,
+    /// independent from `candidate`. Only hook observation fields and its prompt
+    /// precheck may differ; staged authority/history changes are unsupported.
+    /// New still requires the real unsaved Session and absent storage/cache.
+    /// This does not append, persist, classify Fresh or grant a later Skill read.
+    pub async fn prepare_input_with_owner(
+        &self,
+        ctx: &ToolCtx,
+        user: &bamboo_agent_core::Message,
+        host: SkillInputSession<'_>,
+        selections: &[bamboo_skills::WorkflowSelection],
+        owner: &bamboo_storage::session_merge::SessionLockGuard,
+        durable_checkpoint: Option<&bamboo_agent_core::Session>,
+        candidate: &bamboo_agent_core::Session,
+    ) -> Result<bamboo_engine::session_app::skill_input::PreparedSkillInput, ToolError> {
+        self.access
+            .session_repo
+            .persistence()
+            .validate_lock(owner, &candidate.id)
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let caller = self.resolver.resolve_preappend(ctx)?;
+        let requested = validate_input_caller(ctx, user, &caller, selections)?;
+        if candidate.id != caller.session_id {
+            return Err(ToolError::Execution(
+                "Skill candidate Session identity does not match caller".into(),
+            ));
+        }
+        let (expected, is_new) = match (host, durable_checkpoint) {
+            (SkillInputSession::New(actual), None)
+                if serde_json::to_value(actual).map_err(json_error)?
+                    == serde_json::to_value(candidate).map_err(json_error)? =>
+            {
+                (serde_json::to_value(actual).map_err(json_error)?, true)
+            }
+            (SkillInputSession::Existing, Some(checkpoint))
+                if current_input_candidate_matches(checkpoint, candidate)? =>
+            {
+                (serde_json::to_value(checkpoint).map_err(json_error)?, false)
+            }
+            _ => {
+                return Err(ToolError::Execution(
+                    "Skill candidate/checkpoint provenance does not match".into(),
+                ))
+            }
+        };
+        // Direct durable read only: no cache backfill or owner-acquiring try_load.
+        let current = self
+            .access
+            .session_repo
+            .storage()
+            .load_session(&caller.session_id)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        if !current_input_session_matches(
+            &self.access.session_repo,
+            &caller.session_id,
+            current.as_ref(),
+            &expected,
+            is_new,
+        ) {
+            return Err(ToolError::Execution(
+                "Skill durable checkpoint changed before preparation".into(),
+            ));
+        }
+        self.prepare_from_session(InputPreparation {
+            ctx,
+            user,
+            selections,
+            caller,
+            requested,
+            session: candidate.clone(),
+            expected,
+            is_new,
+            owner: Some(owner),
+        })
+        .await
+    }
+
+    async fn prepare_from_session(
+        &self,
+        input: InputPreparation<'_>,
+    ) -> Result<bamboo_engine::session_app::skill_input::PreparedSkillInput, ToolError> {
+        use bamboo_engine::session_app::skill_input::{
+            prepare_current_skill_input, SkillInputRestrictions,
+        };
+        let InputPreparation {
+            ctx,
+            user,
+            selections,
+            caller,
+            requested,
+            session,
+            expected,
+            is_new,
+            owner,
+        } = input;
+        if session.messages.iter().any(|message| message.id == user.id) {
+            return Err(ToolError::Execution(
+                "Skill input is already appended or its ID collides".into(),
+            ));
+        }
+        let access = SkillCatalogEligibility {
+            ceiling: caller.ceiling.clone(),
+            explicit: requested,
+            disabled: self
+                .access
+                .config
+                .read()
+                .await
+                .disabled_skill_ids()
+                .into_iter()
+                .collect(),
+            deny_all: session.root_orchestration_only_enabled(),
+        };
+        // No Skill intent needs no publication, but still uses the same final
+        // caller, Config and durable Session acceptance below.
+        let prepared = if caller.invocation.is_none() && selections.is_empty() {
+            None
+        } else {
+            // Resolve aliases before choosing a store: legacy alias caching exists
+            // for pinned activations and cannot authorize a new current input.
+            let scope = canonical_input_scope(&self.access, &session)?;
+            let expected_scope = (scope.workspace.clone(), scope.project.clone());
+            let store = self.access.store_for_scope(scope).await?;
+            let prepared = store
+                .prepare_current_input_store(caller.mode.as_deref())
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            prepared
+                .validate_scope(
+                    expected_scope.1.as_ref().map(|(_, home)| home.as_path()),
+                    expected_scope.0.as_deref(),
+                )
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            Some((prepared, expected_scope))
+        };
+        let fresh = if owner.is_some() {
+            self.resolver.resolve_preappend(ctx)?
+        } else {
+            // Arbitrary async resolvers run before this factory owns Session/Config.
+            self.resolver.resolve(ctx).await?
+        };
+        let _acquired_owner = if owner.is_none() {
+            Some(
+                self.access
+                    .session_repo
+                    .persistence()
+                    .acquire_lock(&session.id)
+                    .await,
+            )
+        } else {
+            None
+        };
+        // Both entrypoints retain Session -> Config -> publication ordering.
+        let config = self.access.config.read().await;
+        if fingerprint(&caller)? != fingerprint(&fresh)?
+            || access.disabled != config.disabled_skill_ids().into_iter().collect()
+        {
+            return Err(ToolError::Execution(
+                "Skill host caller/config changed during preparation".into(),
+            ));
+        }
+        let sessions = self.access.session_repo.clone();
+        // Compare JSON structure: Session contains HashMaps whose iteration
+        // order legitimately changes across independent durable decodes.
+        let user = user.clone();
+        let restrictions = access.clone();
+        let host_access = self.access.clone();
+        let result = if let Some((prepared, expected_scope)) = prepared {
+            prepared
+                .with_current_inputs(&access, selections, move |publication| {
+                    Box::pin(async move {
+                        // Last await: do not call try_load while the owner/publication are
+                        // held. That reentry deadlocks on a legitimate cache miss.
+                        let current = sessions
+                            .storage()
+                            .load_session(&caller.session_id)
+                            .await
+                            .map_err(|error| {
+                                bamboo_skills::SkillError::Validation(error.to_string())
+                            })?;
+                        if !current_input_session_matches(
+                            &sessions,
+                            &caller.session_id,
+                            current.as_ref(),
+                            &expected,
+                            is_new,
+                        ) {
+                            return Err(bamboo_skills::SkillError::Validation(
+                                "Skill Session changed during preparation".into(),
+                            ));
+                        }
+                        // Synchronous final scope resolution after the last await.
+                        // An unchanged Session path may now resolve elsewhere.
+                        let current_scope =
+                            canonical_input_scope(&host_access, &session).map_err(|error| {
+                                bamboo_skills::SkillError::Validation(error.to_string())
+                            })?;
+                        if (current_scope.workspace, current_scope.project) != expected_scope {
+                            return Err(bamboo_skills::SkillError::Validation(
+                                "Skill Project/workspace scope changed during preparation".into(),
+                            ));
+                        }
+                        publication.validate_current()?;
+                        let caller_intent = caller.invocation.is_some();
+                        let caller = SkillInputRestrictions {
+                            input_id: &caller.input_id,
+                            ceiling: restrictions.ceiling.as_ref(),
+                            disabled: &restrictions.disabled,
+                            root_ultra: restrictions.deny_all,
+                            mode: caller.mode.as_deref(),
+                        };
+                        prepare_current_skill_input(
+                            &user,
+                            Ok(&caller),
+                            caller_intent.then_some((user.id.as_str(), publication.inputs())),
+                        )
+                        .map_err(bamboo_skills::SkillError::Validation)
+                    })
+                })
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?
+        } else {
+            let current = sessions
+                .storage()
+                .load_session(&caller.session_id)
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            if !current_input_session_matches(
+                &sessions,
+                &caller.session_id,
+                current.as_ref(),
+                &expected,
+                is_new,
+            ) {
+                return Err(ToolError::Execution(
+                    "Skill Session changed during preparation".into(),
+                ));
+            }
+            prepare_current_skill_input(&user, Err("ordinary input has no Skill invocation"), None)
+                .map_err(ToolError::Execution)?
+        };
+        // Explicit Source validation has completed and publication has released.
+        // Ordinary input has no Source; both branches accept the same authority.
+        // Config/Session owners remain held; no await follows this acceptance.
+        self.resolver.validate_current(ctx, &fresh)?;
+        Ok(result)
+    }
+}
+
+struct InputPreparation<'a> {
+    ctx: &'a ToolCtx,
+    user: &'a bamboo_agent_core::Message,
+    selections: &'a [bamboo_skills::WorkflowSelection],
+    caller: SkillCatalogCaller,
+    requested: std::collections::BTreeSet<String>,
+    session: bamboo_agent_core::Session,
+    expected: Value,
+    is_new: bool,
+    owner: Option<&'a bamboo_storage::session_merge::SessionLockGuard>,
+}
+
+fn validate_input_caller(
+    ctx: &ToolCtx,
+    user: &bamboo_agent_core::Message,
+    caller: &SkillCatalogCaller,
+    selections: &[bamboo_skills::WorkflowSelection],
+) -> Result<std::collections::BTreeSet<String>, ToolError> {
+    use bamboo_engine::session_app::skill_input::MAX_EXPLICIT_SKILLS;
+    let invalid =
+        || ToolError::Execution("Skill preappend caller/input is stale or invalid".into());
+    if ctx.session_id() != Some(caller.session_id.as_str())
+        || user.role != bamboo_agent_core::Role::User
+        || user.id != caller.input_id
+        || [&caller.caller_id, &caller.input_id, &caller.session_id]
+            .iter()
+            .any(|id| id.is_empty() || id.len() > MAX_HANDLE_BYTES)
+        || caller.mode.as_ref().is_some_and(|mode| {
+            mode.is_empty()
+                || mode.len() > 256
+                || !mode
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        })
+        || caller
+            .invocation
+            .as_ref()
+            .is_some_and(|intent| intent.input_id != user.id)
+        || selections.len() > MAX_EXPLICIT_SKILLS
+    {
+        return Err(invalid());
+    }
+    let requested = selections
+        .iter()
+        .map(|selection| selection.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if caller
+        .invocation
+        .as_ref()
+        .is_some_and(|intent| intent.skills != requested)
+        || (!requested.is_empty() && caller.invocation.is_none())
+    {
+        return Err(invalid());
+    }
+    Ok(requested)
+}
+
+fn current_input_candidate_matches(
+    checkpoint: &bamboo_agent_core::Session,
+    candidate: &bamboo_agent_core::Session,
+) -> Result<bool, ToolError> {
+    // Allow the existing UserPromptSubmit observation checkpoint only. Preserve
+    // all runtime permission/control fields, identity, history and host authority.
+    let normalize = |session: &bamboo_agent_core::Session| -> Result<Value, ToolError> {
+        let mut value = serde_json::to_value(session).map_err(json_error)?;
+        let default_runtime = bamboo_domain::AgentRuntimeState::new(&session.id);
+        let mut runtime = serde_json::to_value(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .unwrap_or(&default_runtime),
+        )
+        .map_err(json_error)?;
+        for key in [
+            "checkpoints",
+            "hook_contexts",
+            "stop_hook_forced_continuations",
+        ] {
+            runtime.as_object_mut().expect("runtime object").remove(key);
+        }
+        value["agent_runtime_state"] = runtime;
+        if let Some(metadata) = value.get_mut("metadata").and_then(Value::as_object_mut) {
+            metadata.remove("runtime.plugin_prompt_prechecked");
+        }
+        Ok(value)
+    };
+    Ok(normalize(checkpoint)? == normalize(candidate)?)
+}
+
+fn current_input_session_matches(
+    sessions: &bamboo_engine::SessionRepository,
+    session_id: &str,
+    current: Option<&bamboo_agent_core::Session>,
+    expected: &Value,
+    is_new: bool,
+) -> bool {
+    if is_new {
+        current.is_none() && sessions.cache().get(session_id).is_none()
+    } else {
+        current.is_some_and(|current| {
+            serde_json::to_value(current).is_ok_and(|actual| &actual == expected)
+        })
+    }
+}
+
+// No await or store/cache mutation: compare the actual canonical scope at the
+// acceptance boundary while the Session owner and publication remain held.
+fn canonical_input_scope(
+    access: &SkillToolAccess,
+    session: &bamboo_agent_core::Session,
+) -> Result<super::SessionSkillScope, ToolError> {
+    let mut scope = access.skill_scope_for_session(session)?;
+    let resolve = |path: &std::path::Path| {
+        std::fs::canonicalize(path).map_err(|error| {
+            ToolError::Execution(format!("Skill input scope is unavailable: {error}"))
+        })
+    };
+    scope.workspace = scope.workspace.as_deref().map(resolve).transpose()?;
+    if let Some((_, home)) = &mut scope.project {
+        *home = resolve(home)?;
+    }
+    Ok(scope)
+}
+
 struct SelectedCatalogContext {
     caller: SkillCatalogCaller,
     snapshot: SkillCatalogSnapshot,

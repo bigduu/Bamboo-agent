@@ -133,31 +133,17 @@ pub(super) fn build_base_tools(
         ledger_tool,
     ));
 
-    let load_skill_tool = Arc::new(
-        crate::tools::LoadSkillTool::new(
-            skill_manager.clone(),
-            config.clone(),
-            session_repo.clone(),
-        )
-        .with_project_store(project_store.clone())
-        .with_permission_checked_context_registry(
-            with_ledger.clone(),
-            permission_checker.permission_config(),
-        ),
+    let with_skills = crate::tools::assemble_legacy_skill_tools(
+        with_ledger.clone(),
+        skill_manager,
+        config.clone(),
+        session_repo,
+        Some(project_store),
+        Some(crate::tools::LegacySkillContextRegistry {
+            tools: with_ledger,
+            permission_config: permission_checker.permission_config(),
+        }),
     );
-    let with_load_skill: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        with_ledger,
-        load_skill_tool,
-    ));
-
-    let read_skill_resource_tool = Arc::new(
-        crate::tools::ReadSkillResourceTool::new(skill_manager, config.clone(), session_repo)
-            .with_project_store(project_store),
-    );
-    let with_skills: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        with_load_skill,
-        read_skill_resource_tool,
-    ));
 
     // compact_context is available to all sessions for manual compression.
     let compact_tool = Arc::new(crate::tools::CompactContextTool);
@@ -640,5 +626,171 @@ mod native_ceiling_tests {
             .await
             .unwrap()
             .contains(&"Write".into()));
+    }
+}
+
+#[cfg(test)]
+mod legacy_skill_assembly_tests {
+    use super::*;
+    use bamboo_agent_core::tools::FunctionCall;
+    use bamboo_agent_core::{Message, Session, Tool, ToolCall, ToolExecutionContext};
+    use serde_json::json;
+
+    fn call(name: &str, skill: &str) -> ToolCall {
+        ToolCall {
+            id: format!("assembly-{name}"),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: json!({"skill_id": skill, "resource_path": "references/proof.txt"})
+                    .to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_assembly_real_server_project_context_and_policy_parity() {
+        for provider_fails in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let policy = bamboo_tools::permission::PermissionConfig::new();
+            policy.set_enabled(true);
+            bamboo_tools::permission::storage::PermissionStorage::new(home.path())
+                .save(&policy)
+                .await
+                .unwrap();
+            let state = super::super::AppState::new_with_provider(
+                home.path().to_path_buf(),
+                Config::default(),
+                Arc::new(super::super::UnconfiguredProvider {
+                    message: "assembly test must not call a model".into(),
+                }),
+            )
+            .await
+            .unwrap();
+            let project = state.project_store.create("Assembly", None).unwrap();
+            let skill_dir = state
+                .project_store
+                .paths()
+                .project_home(&project.id)
+                .join("skills/assembly-project");
+            std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+            std::fs::write(skill_dir.join("SKILL.md"), "---\nname: assembly-project\ndescription: Assembly project\nmetadata:\n  dynamic_context:\n    - id: proof\n      tool: Read\n      input: {path: provider.txt}\n      max_chars: 512\n      timeout_ms: 1000\n---\nPROJECT_INSTRUCTIONS\n").unwrap();
+            std::fs::write(skill_dir.join("references/proof.txt"), "PROJECT_RESOURCE\n").unwrap();
+            let workspace = home.path().join("workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            if provider_fails {
+                std::fs::File::create(workspace.join("provider.txt"))
+                    .unwrap()
+                    .set_len(64 * 1024 * 1024)
+                    .unwrap();
+            } else {
+                std::fs::write(workspace.join("provider.txt"), "REAL_BASE_PROVIDER\n").unwrap();
+            }
+            let mut session = Session::new("assembly-server", "test-model");
+            session.set_project_id_meta(project.id.to_string());
+            session.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+            session.metadata.insert(
+                bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.into(),
+                "[\"assembly-project\"]".into(),
+            );
+            session
+                .metadata
+                .insert("unrelated".into(), "retained".into());
+            session.add_message(Message::user("use assembly-project"));
+            state.session_repo.save(&mut session).await.unwrap();
+            let tools = state.agent.default_tools();
+            assert!(Arc::ptr_eq(
+                tools,
+                &state.tools_for(crate::tools::ToolSurface::Base)
+            ));
+            let schemas = tools.list_tools();
+            assert!(schemas
+                .windows(2)
+                .all(|pair| pair[0].function.name < pair[1].function.name));
+            for schema in [
+                crate::tools::LoadSkillTool::new(
+                    state.skill_manager.clone(),
+                    state.config.clone(),
+                    state.session_repo.clone(),
+                )
+                .to_schema(),
+                crate::tools::ReadSkillResourceTool::new(
+                    state.skill_manager.clone(),
+                    state.config.clone(),
+                    state.session_repo.clone(),
+                )
+                .to_schema(),
+            ] {
+                let matching: Vec<_> = schemas
+                    .iter()
+                    .filter(|s| s.function.name == schema.function.name)
+                    .collect();
+                assert_eq!(matching.len(), 1);
+                assert_eq!(
+                    serde_json::to_value(matching[0]).unwrap(),
+                    serde_json::to_value(schema).unwrap()
+                );
+            }
+            assert!(!tools.owns_exact_tool("skills_list"));
+            assert!(!tools.owns_exact_tool("skills_read"));
+            let load = call("load_skill", "assembly-project");
+            let mut ctx = ToolExecutionContext::none(&load.id);
+            ctx.session_id = Some(&session.id);
+            ctx.root_session_id = Some(&session.root_session_id);
+            ctx.bypass_permissions = true;
+            let result = tools.execute_with_context(&load, ctx).await.unwrap();
+            assert!(result.success);
+            let receipt: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+            // Non-stopping degraded context retains the original active receipt.
+            assert_eq!(receipt["activation_status"], "active");
+            let saved = state
+                .storage
+                .load_session(&session.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let active: bamboo_skills::ActiveWorkflow =
+                serde_json::from_str(&saved.metadata[bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY])
+                    .unwrap();
+            assert_eq!(active.dynamic_context.len(), 1);
+            assert_eq!(
+                active.dynamic_context[0].provenance,
+                "registered_tool_permission_checked"
+            );
+            if provider_fails {
+                assert_eq!(
+                    active.dynamic_context[0].status,
+                    bamboo_skills::WorkflowActivationStatus::Degraded
+                );
+                assert!(active.dynamic_context[0].content.is_empty());
+                assert!(active.dynamic_context[0].diagnostic.is_some());
+            } else {
+                assert!(active.dynamic_context[0]
+                    .content
+                    .contains("REAL_BASE_PROVIDER"));
+            }
+            assert_eq!(saved.metadata["unrelated"], "retained");
+            assert!(saved.metadata
+                [bamboo_skills::runtime_metadata::LAST_LOADED_SKILL_SUMMARY_METADATA_KEY]
+                .contains("assembly-project"));
+            let read = call("read_skill_resource", "assembly-project");
+            let mut ctx = ToolExecutionContext::none(&read.id);
+            ctx.session_id = Some(&session.id);
+            let read_result = tools.execute_with_context(&read, ctx).await.unwrap();
+            assert!(read_result.success && read_result.result.contains("PROJECT_RESOURCE"));
+            let saved = state
+                .storage
+                .load_session(&session.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(saved.metadata
+                [bamboo_skills::runtime_metadata::LAST_RESOURCE_READ_SUMMARY_METADATA_KEY]
+                .contains("references/proof.txt"));
+            state.config.write().await.skills.disabled = vec!["assembly-project".into()];
+            let mut ctx = ToolExecutionContext::none(&load.id);
+            ctx.session_id = Some(&session.id);
+            assert!(tools.execute_with_context(&load, ctx).await.is_err());
+        }
     }
 }

@@ -80,6 +80,8 @@ pub(super) struct LoopRunState {
     /// pipeline execution. Round counters restart on resume/re-execution, so
     /// they are only unique within this private run scope.
     pub(super) execution_id: String,
+    pub(super) current_inputs:
+        Option<crate::runtime::managers::lifecycle::BoundedInputRequestBatch>,
     pub(super) model_name: String,
     pub(super) metrics_collector: Option<MetricsCollector>,
     pub(super) debug_logger: DebugLogger,
@@ -118,6 +120,17 @@ pub(super) async fn initialize_loop_state(
 ) -> super::super::Result<LoopRunState> {
     let debug_logger = DebugLogger::new(tracing::enabled!(tracing::Level::DEBUG));
     let session_id = session.id.clone();
+    // Take before fallible startup work: failed initialization drops the value.
+    let (execution_id, observation) = config
+        .initial_untrusted_inputs
+        .as_ref()
+        .and_then(|inputs| inputs.take_startup_observation(&session_id))
+        .unwrap_or_else(|| {
+            (
+                crate::runtime::runner::round_prelude::new_execution_id(),
+                Default::default(),
+            )
+        });
     let metrics_collector = config.metrics_collector.clone();
     let model_name = config
         .model_name
@@ -229,9 +242,12 @@ pub(super) async fn initialize_loop_state(
     )
     .await?;
 
+    let mut current_inputs = None;
+    observation.update_current(&mut current_inputs, &session_id, &execution_id);
     Ok(LoopRunState {
         session_id,
-        execution_id: crate::runtime::runner::round_prelude::new_execution_id(),
+        execution_id,
+        current_inputs,
         model_name,
         metrics_collector,
         debug_logger,
@@ -246,6 +262,150 @@ pub(super) async fn initialize_loop_state(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn ql_sealed_startup_adopts_exact_measured_uuid_once_and_keeps_ie_view() {
+        use bamboo_agent_core::storage::Storage;
+        use bamboo_domain::{RuntimeSessionPersistence, SessionInboxPort};
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().into())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = store.clone();
+        let persistence: Arc<dyn RuntimeSessionPersistence> =
+            Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+        let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store,
+            bamboo_domain::SessionInboxLimits::default(),
+        ));
+        let mut session = bamboo_agent_core::Session::new("ql-startup", "model");
+        session.add_message(bamboo_agent_core::Message::system("system"));
+        storage.save_session(&session).await.unwrap();
+        let mut envelope =
+            bamboo_domain::SessionMessageEnvelope::user_input(&session.id, "new queued input");
+        let request = bamboo_domain::SessionSkillRequest {
+            mode: Some("original-mode".into()),
+            selections: vec![bamboo_domain::SessionSkillSelection {
+                id: "request-outside-host-ceiling".into(),
+                source: "plugin".into(),
+                revision: 7,
+                args: serde_json::json!({"original":[1.125,null,"原样"]}),
+            }],
+        };
+        if let bamboo_domain::SessionMessageBody::Content(content) = &mut envelope.body {
+            content.skill_request = Some(request.clone());
+        }
+        let receipt = inbox.deliver(&envelope).await.unwrap();
+        inbox
+            .mark_activation_eligible(
+                &session.id,
+                receipt.generation,
+                bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+            )
+            .await
+            .unwrap();
+        let (refresh, carrier) =
+            crate::runtime::config::UntrustedExecutionInputs::admit_with_startup_observation(
+                &mut session,
+                Some(&storage),
+                Some(&persistence),
+                Some(&inbox),
+            )
+            .await;
+        assert_eq!(refresh.merged, 1);
+        let carrier = carrier.unwrap();
+        assert_eq!(carrier.observations()[0].input_id(), envelope.id.as_str());
+        let config = AgentLoopConfig {
+            initial_untrusted_inputs: Some(carrier),
+            selected_skill_ids: Some(Vec::new()),
+            skip_initial_user_message: true,
+            storage: Some(storage),
+            persistence: Some(persistence),
+            session_inbox: Some(inbox),
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let first = initialize_loop_state(
+            &mut session,
+            "",
+            &config,
+            &SuccessfulLoadSkill::default(),
+            &tx,
+        )
+        .await
+        .unwrap();
+        let batch = first.current_inputs.as_ref().unwrap();
+        assert_eq!(batch.execution_id(), first.execution_id);
+        assert_eq!(first.execution_id.len(), 32);
+        assert_eq!(batch.session_id(), first.session_id);
+        assert_eq!(batch.records()[0].input_id, envelope.id.as_str());
+        assert_eq!(batch.records()[0].request.as_ref(), Some(&request));
+        assert_eq!(
+            config.initial_untrusted_inputs().unwrap().observations()[0].request(),
+            Some(&request)
+        );
+        assert_eq!(
+            config.selected_skill_ids,
+            Some(Vec::new()),
+            "request data never widens host ceiling"
+        );
+        assert_eq!(
+            config.initial_untrusted_inputs().unwrap().observations()[0].input_id(),
+            envelope.id.as_str()
+        );
+        let second = initialize_loop_state(
+            &mut session,
+            "",
+            &config,
+            &SuccessfulLoadSkill::default(),
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            second.current_inputs.is_none(),
+            "spent initial data cannot regrant on successor/restart"
+        );
+        assert_ne!(first.execution_id, second.execution_id);
+    }
+
+    #[tokio::test]
+    async fn ql_old_ie_and_history_start_absent_for_each_host_ceiling() {
+        for ceiling in [None, Some(Vec::new()), Some(vec!["host-cap".into()])] {
+            let id = "ql-old-input";
+            let old = crate::runtime::config::UntrustedExecutionInputs::new(vec![
+                crate::runtime::config::UntrustedInputObservation::new("unsealed-N", None).unwrap(),
+            ])
+            .unwrap();
+            let mut session = bamboo_agent_core::Session::new(id, "model");
+            let envelope =
+                bamboo_domain::SessionMessageEnvelope::user_input(id, "historical canonical data");
+            session.add_message(envelope.to_provider_message().unwrap());
+            session
+                .metadata
+                .insert("selected_skill_ids".into(), "[\"old\"]".into());
+            let config = AgentLoopConfig {
+                initial_untrusted_inputs: Some(old),
+                selected_skill_ids: ceiling.clone(),
+                skip_initial_user_message: true,
+                ..Default::default()
+            };
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let state = initialize_loop_state(
+                &mut session,
+                "",
+                &config,
+                &SuccessfulLoadSkill::default(),
+                &tx,
+            )
+            .await
+            .unwrap();
+            assert!(state.current_inputs.is_none());
+            assert_eq!(config.selected_skill_ids, ceiling);
+        }
+    }
+
     use super::{initialize_loop_state, resolve_auxiliary_models, OverflowRecoveryState};
     use crate::runtime::config::{AgentLoopConfig, AuxiliaryModelConfig};
     use async_trait::async_trait;

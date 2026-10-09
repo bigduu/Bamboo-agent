@@ -14,10 +14,9 @@ use bamboo_domain::{
     WorkflowStepKind, WorkflowStepSnapshot, WorkflowStepStatus, WorkflowSuspensionContext,
 };
 use bamboo_engine::{
-    AgentStepPort, AgentStepResult, FileWorkflowRunRepository, NamedAgentSpec, PermissionDecision,
-    WorkflowDefinitionPort, WorkflowPolicyPort, WorkflowPolicyTarget, WorkflowRunEngine,
-    WorkflowRunError, WorkflowSecretMaterial, WorkflowSecretResolverPort,
-    WorkflowSessionPermissionPort,
+    FileWorkflowRunRepository, PermissionDecision, WorkflowDefinitionPort, WorkflowPolicyPort,
+    WorkflowPolicyTarget, WorkflowRunEngine, WorkflowRunError, WorkflowSecretMaterial,
+    WorkflowSecretResolverPort, WorkflowSessionPermissionPort,
 };
 use bamboo_skills::SkillManager;
 use serde::{Deserialize, Serialize};
@@ -30,7 +29,9 @@ const MAX_RETRIES: u32 = 16;
 const MAX_NESTING_DEPTH: u32 = 8;
 const MAX_WALL_TIME_MS: u64 = 60 * 60 * 1000;
 const MAX_TOKENS: u64 = 2_000_000;
-const MAX_COST_MICROS: u64 = 100_000_000;
+#[path = "agent_adapter.rs"]
+mod agent_adapter;
+use agent_adapter::{WorkflowAgentAdapter, READ_ONLY_AGENTS};
 const MAX_PINNED_DEFINITIONS_PER_RUN: usize = 32;
 const MAX_PINNED_BUNDLE_BYTES_PER_RUN: usize = 512 * 1024;
 const MAX_WORKFLOW_RUN_IDS_PER_SESSION: usize = 256;
@@ -50,6 +51,7 @@ pub struct WorkflowRunAccess {
     engine: Arc<WorkflowRunEngine>,
     skills: Arc<SkillManager>,
     sessions: bamboo_engine::SessionRepository,
+    agents: Arc<WorkflowAgentAdapter>,
 }
 
 struct ServerWorkflowSessionPermissions {
@@ -105,10 +107,11 @@ impl WorkflowRunAccess {
             FileWorkflowRunRepository::new(data_dir.join("workflow-runs"))
                 .map_err(|error| format!("failed to initialize workflow journal: {error}"))?,
         );
+        let agents = Arc::new(WorkflowAgentAdapter::default());
         let engine = WorkflowRunEngine::new(
             repository,
             tools,
-            Arc::new(UnavailableAgentPort),
+            agents.clone(),
             Arc::new(ExternallyPinnedDefinitions),
             Arc::new(ServerWorkflowPolicy),
             Arc::new(UnavailableSecretResolver),
@@ -120,7 +123,7 @@ impl WorkflowRunAccess {
                 max_nesting_depth: MAX_NESTING_DEPTH,
                 wall_time_ms: MAX_WALL_TIME_MS,
                 max_tokens: Some(MAX_TOKENS),
-                max_cost_micros: Some(MAX_COST_MICROS),
+                max_cost_micros: None,
             },
         );
         if let Some(permission_config) = permission_config {
@@ -137,7 +140,15 @@ impl WorkflowRunAccess {
             engine,
             skills,
             sessions,
+            agents,
         })
+    }
+
+    pub(crate) fn bind_child_adapter(
+        &self,
+        child: Arc<crate::tools::ChildSessionAdapter>,
+    ) -> Result<(), String> {
+        self.agents.bind(child)
     }
 
     async fn session_context(
@@ -732,6 +743,10 @@ pub(crate) enum PublicWorkflowPlan {
     Map {
         body: Box<PublicWorkflowPlan>,
     },
+    Choice {
+        then_branch: Box<PublicWorkflowPlan>,
+        else_branch: Box<PublicWorkflowPlan>,
+    },
     Retry {
         node: Box<PublicWorkflowPlan>,
         max_attempts: u32,
@@ -794,6 +809,14 @@ fn public_workflow_plan(plan: &WorkflowPlan) -> PublicWorkflowPlan {
         },
         WorkflowPlan::Parallel { nodes } => PublicWorkflowPlan::Parallel {
             nodes: nodes.iter().map(public_workflow_plan).collect(),
+        },
+        WorkflowPlan::Choice {
+            then_branch,
+            else_branch,
+            ..
+        } => PublicWorkflowPlan::Choice {
+            then_branch: Box::new(public_workflow_plan(then_branch)),
+            else_branch: Box::new(public_workflow_plan(else_branch)),
         },
         WorkflowPlan::Map { body, .. } => PublicWorkflowPlan::Map {
             body: Box::new(public_workflow_plan(body)),
@@ -968,29 +991,6 @@ impl WorkflowDefinitionPort for ExternallyPinnedDefinitions {
     }
 }
 
-/// #563 named-agent registry integration is not complete. Unknown and named
-/// agents therefore fail preflight rather than falling back to a dynamic agent.
-struct UnavailableAgentPort;
-
-#[async_trait]
-impl AgentStepPort for UnavailableAgentPort {
-    async fn resolve(&self, _name: &str) -> Result<Option<NamedAgentSpec>, String> {
-        Ok(None)
-    }
-
-    async fn execute(
-        &self,
-        _spec: &NamedAgentSpec,
-        _prompt: Value,
-        _model: Option<&str>,
-        _effort: Option<&str>,
-        _capabilities: &BTreeSet<String>,
-        _session_id: &str,
-    ) -> Result<AgentStepResult, String> {
-        Err("named-agent execution is not available".to_string())
-    }
-}
-
 struct ServerWorkflowPolicy;
 
 #[async_trait]
@@ -1025,6 +1025,12 @@ impl WorkflowPolicyPort for ServerWorkflowPolicy {
                         "workflow capability authority is not available".to_string(),
                     )
                 }
+            }
+            WorkflowPolicyTarget::Agent(name)
+                if READ_ONLY_AGENTS.contains(&name.as_str())
+                    && requested == &BTreeSet::from(["read".to_string()]) =>
+            {
+                PermissionDecision::Allow
             }
             WorkflowPolicyTarget::Agent(_) | WorkflowPolicyTarget::Workflow { .. } => {
                 PermissionDecision::Deny(
@@ -1229,6 +1235,7 @@ fn workflow_tool_error(error: WorkflowRunError) -> ToolError {
         WorkflowRunError::Compile(_) => {
             ToolError::InvalidArguments("workflow definition is invalid".to_string())
         }
+        WorkflowRunError::UnsupportedMonetaryBudget => ToolError::InvalidArguments("workflow_monetary_budget_unsupported: named agents without monetary measurement do not support a finite monetary budget".into()),
         WorkflowRunError::Preflight(_) => {
             ToolError::InvalidArguments("workflow preflight failed".to_string())
         }
@@ -1617,7 +1624,7 @@ mod tests {
                 retries: 1,
                 agents: 3,
                 tokens: 40,
-                cost_micros: 50,
+                cost_micros: Some(50),
             },
             last_sequence: 9,
             output: Some(json!({"raw_run_output": "PRIVATE-RUN-OUTPUT-SENTINEL"})),
@@ -1634,6 +1641,55 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn workflow_choice_public_snapshot_exposes_only_branch_topology() {
+        for condition in [
+            json!({"from":"args","pointer":"/PRIVATE-CONDITION-POINTER"}),
+            json!({"from":"literal","value":"PRIVATE-CONDITION-VALUE"}),
+            json!({"from":"step","step":"PRIVATE-CONDITION-STEP","pointer":"/PRIVATE-CONDITION-POINTER"}),
+            json!({"from":"item","name":"PRIVATE-CONDITION-ITEM","pointer":"/PRIVATE-CONDITION-POINTER"}),
+        ] {
+            let mut snapshot = private_workflow_snapshot(WorkflowRunStatus::Succeeded);
+            snapshot.definition.plan = serde_json::from_value(json!({
+                "type":"choice","condition":condition,
+                "then_branch":{"type":"step","step":"inspect"},
+                "else_branch":{"type":"sequence","nodes":[{"type":"step","step":"explain"}]}
+            }))
+            .expect("Choice plan loads");
+            let public = serde_json::to_value(public_workflow_snapshot(snapshot)).unwrap();
+            assert_eq!(
+                public["plan"],
+                json!({
+                    "type":"choice",
+                    "then_branch":{"type":"step","step":"inspect"},
+                    "else_branch":{"type":"sequence","nodes":[{"type":"step","step":"explain"}]}
+                })
+            );
+            let text = public.to_string();
+            assert!(!text.contains("PRIVATE-"));
+            assert!(!text.contains("condition") && !text.contains("pointer"));
+        }
+    }
+
+    #[test]
+    fn workflow_choice_skipped_event_keeps_sequence_without_private_reason() {
+        let event = public_workflow_event(WorkflowRunEvent {
+            run_id: "choice-run".to_string(),
+            sequence: 5,
+            at: chrono::Utc::now(),
+            step_id: Some("unchosen".to_string()),
+            kind: WorkflowRunEventKind::StepSkipped {
+                reason: "PRIVATE-CONDITION-VALUE".to_string(),
+            },
+        });
+        let public = serde_json::to_value(event).unwrap();
+        assert_eq!(public["type"], "step_skipped");
+        assert_eq!(public["sequence"], 5);
+        assert_eq!(public["step_id"], "unchosen");
+        assert!(public.get("reason").is_none());
+        assert!(!public.to_string().contains("PRIVATE-"));
     }
 
     #[test]

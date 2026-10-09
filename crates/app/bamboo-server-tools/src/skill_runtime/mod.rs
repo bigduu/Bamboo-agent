@@ -14,6 +14,7 @@ use bamboo_agent_core::tools::ToolError;
 use bamboo_agent_core::Session;
 use bamboo_domain::ProjectId;
 
+mod assembly;
 mod catalog;
 mod load_skill;
 mod output_budget;
@@ -22,7 +23,11 @@ mod read_resource;
 #[cfg(test)]
 mod tests;
 
-pub use catalog::{SelectedSkillSource, SkillsListTool, SkillsReadTool, MAX_SKILLS_LIST_BYTES};
+pub use assembly::{assemble_legacy_skill_tools, LegacySkillContextRegistry};
+pub use catalog::{
+    SelectedSkillSource, SkillInputFactory, SkillInputSession, SkillsListTool, SkillsReadTool,
+    MAX_SKILLS_LIST_BYTES,
+};
 pub use load_skill::LoadSkillTool;
 pub use output_budget::skill_response_byte_budget;
 pub use read_resource::ReadSkillResourceTool;
@@ -57,6 +62,39 @@ pub trait SkillCatalogCallerResolver: Send + Sync {
         &self,
         ctx: &bamboo_agent_core::tools::ToolCtx,
     ) -> Result<SkillCatalogCaller, ToolError>;
+
+    /// Resolve the actual preappend caller while its existing Session owner is
+    /// borrowed. Implementations must read actual authority nonblockingly and
+    /// never acquire/reenter Session or Config owners. Unknown, stale, busy or
+    /// unavailable bindings deny. This is not an accepted-input or Source grant.
+    /// Only the unwired borrowed-owner factory uses this additive contract;
+    /// existing list/read and self-owned preparation retain async `resolve`.
+    fn resolve_preappend(
+        &self,
+        _ctx: &bamboo_agent_core::tools::ToolCtx,
+    ) -> Result<SkillCatalogCaller, ToolError> {
+        Err(ToolError::Execution(
+            "Current preappend caller resolution is unavailable".into(),
+        ))
+    }
+
+    /// Synchronous acceptance check for the unwired preappend factory only.
+    /// Read the same actual authority source nonblockingly and compare its full
+    /// current caller/input binding, ceiling, invocation, mode and limits with
+    /// `expected`. Unknown, changed, busy or unavailable authority must deny.
+    /// Do not trust `expected` alone, block, await or reenter Config/Session
+    /// owners: those owners remain held, but Source publication has released.
+    /// This is an acceptance instant, not a lease for subsequent consumption.
+    /// Existing list/read paths continue to use `resolve` exclusively.
+    fn validate_current(
+        &self,
+        _ctx: &bamboo_agent_core::tools::ToolCtx,
+        _expected: &SkillCatalogCaller,
+    ) -> Result<(), ToolError> {
+        Err(ToolError::Execution(
+            "Current Skill caller authority validation is unavailable".into(),
+        ))
+    }
 }
 
 pub(super) const MAX_RESOURCE_CONTENT_CHARS: usize = 50_000;
