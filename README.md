@@ -222,6 +222,20 @@ before rendering and before success. Only ordinary Message data and warnings
 return; no Session, pin or reader permission is written. No production caller
 uses this factory. Its fixtures establish preparation, not live runtime cutover.
 
+Its `prepare_input_with_owner` entry borrows the host's active persistence guard
+and checks the same Session and coordinator map before reading. It compares the
+complete durable checkpoint separately from the request-local candidate; only
+hook observations and the prompt precheck may differ. Runtime permission fields,
+identity, transcript and host authority must remain equal. The borrowed entry
+uses a synchronous resolver that denies by default and does not reenter the
+Session or Config owner. Store refresh may run under the borrowed Session owner;
+it takes no host Config lock or Session callback and retains no publication guard.
+Both entries acquire retained Config after Session and before publication, then
+validate current caller revocation after the final await. The SDK's
+private User construction and append helpers retain one exact message ID/time
+and all four wrappers' original synchronous append, lease and error order.
+These preparations do not connect HTTP, runtime, Reader or production authority.
+
 The runner's existing Instruction activation path is factored into a private,
 stateless `legacy_instruction` adapter. It still publishes the selected pin,
 requires one model-issued `load_skill` call, suppresses first-round answer text,
