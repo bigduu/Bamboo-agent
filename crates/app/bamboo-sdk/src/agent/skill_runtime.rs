@@ -39,7 +39,9 @@ use tokio_util::sync::CancellationToken;
 use super::{Agent, SdkError, SdkSkillInput};
 
 const METADATA_TOKENS: usize = 2_000;
-const RESPONSE_BYTES: usize = 512 * 1024;
+// Complete provider envelopes must also fit the existing Session Tool body
+// ceiling (256KiB), which otherwise truncates structured JSON before dispatch.
+const RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_ID_BYTES: usize = 512;
 
 #[derive(Clone)]

@@ -1408,9 +1408,9 @@ async fn sdk_typed_registered_router_busy_cancel_and_drop_release_before_canonic
     for drop_future in [false, true] {
         let home = tempfile::tempdir().unwrap();
         let main = write_skill(home.path(), "sdk-router-owner", false);
-        // Canonical Existing Root uses the real zero-B finite 512KiB ceiling.
-        // Keep the complete main large enough to require genuine pagination.
-        let main = format!("{main}\n{}\n", "a".repeat(RESPONSE_BYTES + 4096));
+        // Canonical Existing Root retains its real zero-B token policy.
+        // Keep the same >512KiB source across the SDK envelope ceiling fix.
+        let main = format!("{main}\n{}\n", "a".repeat(512 * 1024 + 4096));
         std::fs::write(home.path().join("skills/sdk-router-owner/SKILL.md"), &main).unwrap();
         write_config(home.path());
         let task = home.path().join("router-retry-task.txt");
