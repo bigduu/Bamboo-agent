@@ -1403,3 +1403,335 @@ async fn sdk_real_loaded_instruction_converts_checkpointed_history_once_and_rest
     assert_eq!(provider.inner.0.lock().unwrap().requests.len(), 2);
     assert_eq!(restarted_provider.inner.0.lock().unwrap().requests.len(), 2);
 }
+#[tokio::test]
+async fn sdk_typed_registered_router_busy_cancel_and_drop_release_before_canonical_owner_retry() {
+    for drop_future in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let main = write_skill(home.path(), "sdk-router-owner", false);
+        write_config(home.path());
+        let task = home.path().join("router-retry-task.txt");
+        std::fs::write(&task, "NORMAL_TASK_ACTION").unwrap();
+        let provider = Arc::new(SkillsProvider {
+            wanted: vec!["sdk-router-owner".into()],
+            task,
+            read_references: false,
+            cap: 4096,
+            trace: Mutex::default(),
+        });
+        let router = bamboo_engine::SessionActivationRouter::new();
+        let agent = Agent::builder()
+            .provider(provider.clone())
+            .model("claude-test")
+            .instruction("Complete the requested proof task.")
+            .session_delivery(router.clone())
+            .with_defaults_for_data_dir(home.path().to_owned())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(agent.sdk_skills.is_some());
+        assert!(Arc::ptr_eq(agent.activation_router().unwrap(), &router));
+        assert!(agent.session_inbox().is_some() && agent.session_messenger().is_some());
+        // No inbox work is admitted in this case: a direct registration does
+        // not reserve a successor or need a fixture spawner.
+        let target = format!("sdk-router-owner-{drop_future}");
+        let mut session = agent.new_session(&target).unwrap();
+        budget(&mut session, 4096);
+        let defaults = agent.sdk_skills.as_ref().unwrap();
+        defaults.sessions.save(&mut session).await.unwrap();
+        let selections = selections(&agent, &["sdk-router-owner"]).await;
+        let before = serde_json::to_value(&session).unwrap();
+        let mut contender = session.clone();
+        let owner = defaults.sessions.persistence().acquire_lock(&target).await;
+        let cancel = CancellationToken::new();
+        {
+            let mut run = Box::pin(agent.run_with_skills_and_cancel(
+                &mut session,
+                SdkSkillInput::new(
+                    "registered owner waits before accepting a User",
+                    selections.clone(),
+                ),
+                cancel.clone(),
+            ));
+            let real_run_id = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = &mut run => panic!("canonical owner must keep preparation pending: {result:?}"),
+                        _ = tokio::task::yield_now() => {},
+                    }
+                    if let Some(run_id) = router.current_run_id(&target).await {
+                        break run_id;
+                    }
+                }
+            }).await.expect("actual typed entry must register its real router owner");
+            assert!(router.owns_run(&target, &real_run_id).await);
+            let busy = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                agent.run_with_skills(
+                    &mut contender,
+                    SdkSkillInput::new("busy contender cannot append", selections.clone()),
+                ),
+            )
+            .await
+            .expect(
+                "actual competing registration must fail rather than wait for the canonical owner",
+            )
+            .expect_err("second exact typed run must collide with the real router owner");
+            assert!(busy
+                .to_string()
+                .contains("session activation owner collision"));
+            assert!(busy.to_string().contains(&real_run_id));
+            assert!(router.owns_run(&target, &real_run_id).await);
+            assert_eq!(serde_json::to_value(&contender).unwrap(), before);
+            if drop_future {
+                drop(run); // Real SDK future -> DirectLease -> registration Drop.
+            } else {
+                cancel.cancel();
+                let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut run)
+                    .await
+                    .expect("handled cancellation must finish registered cleanup");
+                assert!(result.is_err());
+                drop(run);
+                assert!(
+                    router.current_run_id(&target).await.is_none(),
+                    "handled cancellation returns only after its exact registration is released"
+                );
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while router.current_run_id(&target).await.is_some() {
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("dropped future cleanup must release registered Busy while canonical owner is still held");
+            assert!(!router.owns_run(&target, &real_run_id).await);
+        }
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(
+                agent
+                    .storage()
+                    .load_session(&target)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            before
+        );
+        assert!(provider.trace.lock().unwrap().requests.is_empty());
+        drop(owner);
+        agent
+            .run_with_skills(
+                &mut session,
+                SdkSkillInput::new("retry after actual registered cleanup", selections),
+            )
+            .await
+            .unwrap();
+        assert!(router.current_run_id(&target).await.is_none());
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| message.role == Role::User)
+                .count(),
+            1
+        );
+        let trace = provider.trace.lock().unwrap();
+        assert!(trace.failures.is_empty(), "{:?}", trace.failures);
+        assert!(trace.main_pages > 1 && trace.task_completed);
+        assert_eq!(
+            trace.contents[&("sdk-router-owner".into(), "SKILL.md".into())],
+            main
+        );
+    }
+}
+
+struct SdkReservationBarrier {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[async_trait]
+impl bamboo_engine::SessionActivationSpawner for SdkReservationBarrier {
+    async fn reserve_activation(
+        &self,
+        _: &str,
+        _: u64,
+    ) -> Result<bamboo_engine::SessionActivationReserveOutcome, bamboo_domain::SessionActivationError>
+    {
+        // This controls the public host-reservation adapter's actual await.
+        // The real router publishes/releases its own reservation token; this
+        // adapter never installs an owner, invents a registration or grants Q.
+        self.entered.notify_one();
+        self.release.notified().await;
+        Err(bamboo_domain::SessionActivationError::Internal(
+            "fixture stops the unlaunched reservation".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn sdk_typed_cancel_wakes_real_public_router_reservation_wait_without_append() {
+    for already_cancelled in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        write_skill(home.path(), "sdk-reservation-wait", false);
+        write_config(home.path());
+        let provider = Arc::new(PassiveProvider::default());
+        let router = bamboo_engine::SessionActivationRouter::new();
+        let spawner = Arc::new(SdkReservationBarrier {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        router.set_spawner(spawner.clone()).await;
+        let agent = Agent::builder()
+            .provider(provider.clone())
+            .model("claude-test")
+            .instruction("Complete the requested proof task.")
+            .session_delivery(router.clone())
+            .with_defaults_for_data_dir(home.path().to_owned())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(agent.sdk_skills.is_some());
+        assert!(Arc::ptr_eq(agent.activation_router().unwrap(), &router));
+        let target = format!("sdk-reservation-wait-{already_cancelled}");
+        let mut session = agent.new_session(&target).unwrap();
+        let defaults = agent.sdk_skills.as_ref().unwrap();
+        defaults.sessions.save(&mut session).await.unwrap();
+        let selected = selections(&agent, &["sdk-reservation-wait"]).await;
+        let messenger = agent.session_messenger().unwrap().clone();
+        let envelope = bamboo_domain::SessionMessageEnvelope::user_input(
+            &target,
+            "real durable inbox work awaiting its host reservation",
+        );
+        let activation = tokio::spawn(async move { messenger.send(envelope).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            spawner.entered.notified(),
+        )
+        .await
+        .expect("real messenger admission must enter the public router reservation adapter");
+        assert_eq!(
+            agent
+                .session_inbox()
+                .unwrap()
+                .inspect(&target)
+                .await
+                .unwrap()
+                .pending,
+            1
+        );
+        assert!(router.current_run_id(&target).await.is_none());
+        let before = serde_json::to_value(&session).unwrap();
+        let durable_before = agent
+            .storage()
+            .load_session(&target)
+            .await
+            .unwrap()
+            .unwrap();
+        let cancel = CancellationToken::new();
+        if already_cancelled {
+            cancel.cancel();
+        }
+        {
+            let mut run = Box::pin(agent.run_with_skills_and_cancel(
+                &mut session,
+                SdkSkillInput::new(
+                    "typed User must not append while registration waits",
+                    selected.clone(),
+                ),
+                cancel.clone(),
+            ));
+            if !already_cancelled {
+                tokio::select! {
+                    biased;
+                    result = &mut run => panic!("actual router reservation must keep registration pending: {result:?}"),
+                    _ = tokio::task::yield_now() => {},
+                }
+                cancel.cancel();
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut run)
+                .await.expect("typed cancellation must interrupt actual register_run reservation_wait.changed without releasing the spawner");
+            assert!(result.unwrap_err().to_string().contains("cancelled"));
+        }
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(
+                agent
+                    .storage()
+                    .load_session(&target)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&durable_before).unwrap()
+        );
+        assert!(provider.0.lock().unwrap().is_empty());
+        assert!(router.current_run_id(&target).await.is_none());
+        assert!(
+            !activation.is_finished(),
+            "typed cancellation must leave the other genuine host reservation alone"
+        );
+        // A second genuine typed entry proves that canceling the first waiter
+        // did not clear the foreign router reservation token. With a wrongly
+        // cleared token it would register an owner or finish, instead of
+        // remaining pending on the actual public register_run wait.
+        let second_cancel = CancellationToken::new();
+        {
+            let mut second = Box::pin(agent.run_with_skills_and_cancel(
+                &mut session,
+                SdkSkillInput::new(
+                    "independent typed waiter must preserve the foreign reservation",
+                    selected.clone(),
+                ),
+                second_cancel.clone(),
+            ));
+            let pending =
+                tokio::time::timeout(std::time::Duration::from_secs(2), &mut second).await;
+            assert!(pending.is_err(), "second genuine typed entry must stay pending while the original reservation remains held");
+            assert!(router.current_run_id(&target).await.is_none());
+            assert!(!activation.is_finished());
+            assert!(provider.0.lock().unwrap().is_empty());
+            second_cancel.cancel();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut second)
+                .await.expect("independent typed waiter cancellation must wake without taking the foreign token");
+            assert!(result.unwrap_err().to_string().contains("cancelled"));
+        }
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(
+                agent
+                    .storage()
+                    .load_session(&target)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&durable_before).unwrap()
+        );
+        assert!(router.current_run_id(&target).await.is_none());
+        assert!(!activation.is_finished());
+        // Release only the original public spawner future. Its intentional
+        // fail-closed result rolls back the real router token; durable inbox
+        // admission stays present and has not become SDK caller authority.
+        spawner.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), activation)
+            .await
+            .expect("original reservation must finish rollback")
+            .unwrap();
+        assert!(result.is_err());
+        assert!(router.current_run_id(&target).await.is_none());
+        assert_eq!(
+            agent
+                .session_inbox()
+                .unwrap()
+                .inspect(&target)
+                .await
+                .unwrap()
+                .pending,
+            1
+        );
+    }
+}
