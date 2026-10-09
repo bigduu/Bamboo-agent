@@ -1,0 +1,40 @@
+name: Release Cargo Isolation
+
+on:
+  pull_request:
+    branches: [dev, main]
+    paths:
+      - scripts/release-cargo-sandbox*
+      - .github/workflows/publish-crate.yml
+      - .github/workflows/release-cargo-isolation.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify real Linux Cargo boundary with dummy credentials only
+        env:
+          BAMBOO_CARGO_INTEGRATION: "1"
+        run: node --test scripts/release-cargo-sandbox.test.cjs
+      - name: Verify existing release frontend policies
+        run: node --test scripts/release-frontend-policy.test.cjs scripts/lotus-next-artifact.test.cjs
+      - name: Install isolated Cargo for actual workspace compatibility
+        run: node scripts/release-cargo-sandbox.cjs install
+      - name: Check locked workspace graph and verify an actual source package
+        run: |
+          cargo metadata --locked --all-features --format-version 1 > "$RUNNER_TEMP/release-metadata.json"
+          cargo package --allow-dirty --locked -p bamboo-domain
+          tar -xOf target/package/bamboo-domain-0.0.0.crate bamboo-domain-0.0.0/.cargo_vcs_info.json > "$RUNNER_TEMP/release-vcs.json"
+          node -e 'const fs=require("node:fs"),assert=require("node:assert/strict"); assert.equal(JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/release-vcs.json")).git.sha1,process.env.GITHUB_SHA)'

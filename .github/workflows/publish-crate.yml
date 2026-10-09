@@ -42,6 +42,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Require the exact accepted publication source
         env:
@@ -92,14 +94,9 @@ jobs:
             exit 1
           fi
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          shared-key: bamboo-publish-crate-${{ runner.os }}
-          cache-on-failure: true
+      - name: Install isolated Cargo publication entrypoint
+        # PATH also covers Cargo metadata launched by compute-publish-order.py.
+        run: node scripts/release-cargo-sandbox.cjs install
 
       - name: Resolve publish version
         id: version
