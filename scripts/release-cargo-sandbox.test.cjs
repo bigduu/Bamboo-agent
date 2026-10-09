@@ -50,6 +50,8 @@ fn main() {
   assert!(status.lines().any(|s|s=="CapEff:\\t0000000000000000"));
   assert!(status.lines().any(|s|s.starts_with("Uid:\\t65532\\t")));
   assert!(!fs::read_to_string("/source/.git/config").unwrap().contains("dummy-checkout-header"));
+  assert_eq!(fs::read("/source/crates/app/bamboo-server/frontend_package/lotus-frontend.zip").unwrap(),b"dummy-staged-frontend");
+  assert_eq!(fs::read_to_string("/source/crates/app/bamboo-server/frontend_package/frontend-manifest.json").unwrap(),"{\\\"frontend_version\\\":\\\"dummy-staged\\\"}\\n");
   if env::var("CARGO_MANIFEST_DIR").unwrap().starts_with("/source/") {fs::write("/source/probe/worker-mutated",b"worker").unwrap();}
  }
 }
@@ -71,7 +73,10 @@ function controller() {
   } else console.log("Local Docker smoke only: Linux ancestor positive control requires Ubuntu CI");
   fs.writeFileSync(hostFile, "untouched");
   fs.writeFileSync(path.join(source, "probe/build.rs"), probe(hostFile, false));
-  exec("git", ["-C", source, "add", "probe/build.rs"]);
+  const staged = "crates/app/bamboo-server/frontend_package";
+  fs.mkdirSync(path.join(source, staged), { recursive: true });
+  for (const name of ["lotus-frontend.zip", "frontend-manifest.json"]) fs.writeFileSync(path.join(source, staged, name), "stale-committed-frontend");
+  exec("git", ["-C", source, "add", "probe/build.rs", staged]);
   exec("git", ["-C", source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "probe"]);
   const sha = exec("git", ["-C", source, "rev-parse", "HEAD"]).trim();
   // Exercise a linked worktree and dirty stamped manifests, as in publication.
@@ -81,9 +86,8 @@ function controller() {
     const file = path.join(linked, relative);
     fs.writeFileSync(file, fs.readFileSync(file, "utf8").replaceAll("0.0.0", "2026.10.17"));
   }
-  const staged = "crates/app/bamboo-server/frontend_package";
-  fs.mkdirSync(path.join(linked, staged), { recursive: true });
   fs.writeFileSync(path.join(linked, staged, "lotus-frontend.zip"), "dummy-staged-frontend");
+  fs.writeFileSync(path.join(linked, staged, "frontend-manifest.json"), '{"frontend_version":"dummy-staged"}\n');
   const state = sandbox.install(linked, path.join(root, "isolation"));
   const env = { ...process.env, BAMBOO_CARGO_SANDBOX: path.join(state.stateRoot, "state.json"), PATH: path.join(state.stateRoot, "bin") + path.delimiter + process.env.PATH };
   const cargo = args => exec("cargo", args, { cwd: linked, env, logs: args[0] !== "metadata" });
