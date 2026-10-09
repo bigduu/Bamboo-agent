@@ -6,6 +6,7 @@ use crate::app_state::AppState;
 use bamboo_agent_core::AgentEvent;
 use bamboo_agent_core::NativeToolEventDisplay;
 use bamboo_engine::config::GoldConfig;
+use bamboo_engine::execution::event_forwarder::interrupt_root_on_authority_loss;
 use bamboo_engine::execution::{history_commit_barrier, HistoryCommitBarrier};
 use bamboo_engine::gold_auto_answer::{maybe_auto_answer_pending_question, GoldAutoAnswerOutcome};
 
@@ -125,7 +126,7 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                 session_id: session_id.clone(),
                 started_at: chrono::Utc::now().to_rfc3339(),
             };
-            let (publication, visible_messages) = {
+            let (publication, visible_messages, cancel_token) = {
                 let runners = state.agent_runners.clone().read_owned().await;
                 let Some(runner) = runners
                     .get(&session_id)
@@ -135,6 +136,7 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                 };
                 let publication = runner.event_publication.clone();
                 let visible_messages = runner.visible_messages.clone();
+                let cancel_token = runner.cancel_token.clone();
                 let publish_tx = session_tx.clone();
                 let account_event = started_event.clone();
                 let result = publish_root_event(state.get_ref(), root_actor.as_ref(), &session_id, &account_event, Box::new(move || {
@@ -142,8 +144,14 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                     let _ = publish_tx.send(started_event);
                     true
                 })).await;
-                if result.is_err() { return; }
-                (publication, visible_messages)
+                if let Err(error) = result {
+                    interrupt_root_on_authority_loss(
+                        &error, &session_id, &run_id, &state.agent_runners,
+                        &publication, &visible_messages, &cancel_token,
+                    ).await;
+                    return;
+                }
+                (publication, visible_messages, cancel_token)
             };
             let mut forwarded_lifecycle_ids = HashSet::new();
             let mut tool_event_display = NativeToolEventDisplay::default();
@@ -204,6 +212,10 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                     })).await;
                     if let Err(error) = result {
                         tracing::warn!(%session_id, %run_id, %error, "obsolete Root runtime event rejected before publication");
+                        interrupt_root_on_authority_loss(
+                            &error, &session_id, &run_id, &state.agent_runners,
+                            &publication, &visible_messages, &cancel_token,
+                        ).await;
                         return;
                     }
                     if is_history_commit { history_commit_acknowledger.acknowledge(); }
@@ -223,12 +235,12 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                         let publish_tx = session_tx.clone();
                         let account_event = event.clone();
                         let route = event.session_id().unwrap_or(&session_id).to_owned();
-                        let publication = publication.clone();
+                        let event_publication = publication.clone();
                         let visible = visible_messages.clone();
                         let accepted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                         let publication_accepted = accepted.clone();
                         let result = publish_root_event(state.get_ref(), root_actor.as_ref(), &route, &account_event, Box::new(move || {
-                            let published = publication.publish(|| {
+                            let published = event_publication.publish(|| {
                                 if let Some(round_count) = round_count { visible.begin_round(round_count); }
                                 if let Some(content) = visible_token { visible.append(content); }
                                 let _ = publish_tx.send(event);
@@ -240,6 +252,10 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                         })).await;
                         if let Err(error) = result {
                             tracing::warn!(%session_id, %run_id, %error, "obsolete Root terminal event rejected before publication");
+                            interrupt_root_on_authority_loss(
+                                &error, &session_id, &run_id, &state.agent_runners,
+                                &publication, &visible_messages, &cancel_token,
+                            ).await;
                             return;
                         }
                         if !accepted.load(std::sync::atomic::Ordering::Acquire) { return; }
@@ -326,6 +342,10 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
 
     history_commit_barrier
 }
+
+#[cfg(test)]
+#[path = "root_authority_loss_tests.rs"]
+mod root_authority_loss_tests;
 
 #[cfg(test)]
 mod tests {
