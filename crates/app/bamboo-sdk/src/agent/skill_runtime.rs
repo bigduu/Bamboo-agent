@@ -158,7 +158,13 @@ impl DefaultSdkSkills {
         ),
         SdkError,
     > {
-        let lease = agent.inner.begin_direct_execution(&session.id).await?;
+        let lease = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err(SdkError::Unsupported("SDK Skill submission was cancelled".into()));
+            }
+            result = agent.inner.begin_direct_execution(&session.id) => result?,
+        };
         let preparation = async {
             if cancel.is_cancelled() {
                 return Err(SdkError::Unsupported(
