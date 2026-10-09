@@ -2894,6 +2894,19 @@ async fn run_pipeline_inner(
     );
 
     loop {
+        // Startup has already admitted this run's input. A runtime-only wakeup
+        // cannot spend model calls while the Human progress question is pending,
+        // including auxiliary evaluations and prompt-memory work below.
+        if crate::session_app::no_progress::resume_after_user_message(
+            session,
+            &mut state.runtime_state,
+        ) {
+            tool_policy_guard.reset_observation_progress();
+        }
+        if crate::session_app::no_progress::retain_pending_pause(session, &mut state.runtime_state)
+        {
+            break;
+        }
         if let Some(message) = tool_policy_guard.delegation_failure_message() {
             // The preceding round has already persisted every tool response and
             // accounted for its usage. Stop before another model request rather
@@ -3007,11 +3020,43 @@ async fn run_pipeline_inner(
                 &state.execution_id,
             )
             .await?;
+        // Use this boundary's newly admitted inputs, never replayed history or
+        // hook-authored User text, to reset the unchanged-observation streak.
+        let fresh_human_input = observation.new_inputs().is_some_and(|batch| {
+            batch.records().iter().any(|input| {
+                (input.source == bamboo_domain::SessionMessageSource::User
+                    && input.kind == bamboo_domain::SessionMessageKind::UserInput)
+                    || input.wrapper.as_deref() == Some("root_chat_turn_v1")
+            })
+        });
         observation.update_current(
             &mut state.current_inputs,
             &state.session_id,
             &state.execution_id,
         );
+
+        let resumed_progress_question = crate::session_app::no_progress::resume_after_user_message(
+            session,
+            &mut state.runtime_state,
+        );
+        if fresh_human_input || resumed_progress_question {
+            tool_policy_guard.reset_observation_progress();
+        }
+        // Consume once after input admission and before recording another model
+        // round. Retries reuse this request-only hint. A pause creates no
+        // phantom model round and leaves every completed tool pair intact.
+        let observation_progress_hint = tool_policy_guard.observation_progress_hint();
+        if tool_policy_guard.should_pause_for_observation_progress()
+            && crate::runtime::runner::tool_execution::pause_for_no_progress(
+                session,
+                &mut state.runtime_state,
+                event_tx,
+                config,
+            )
+            .await?
+        {
+            break;
+        }
 
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {
@@ -3079,9 +3124,6 @@ async fn run_pipeline_inner(
         } else {
             0
         };
-        // Consume the completed observation round once. Ordinary/overflow
-        // retries receive the same request-only advice, never a new User turn.
-        let observation_progress_hint = tool_policy_guard.observation_progress_hint();
         for attempt in 1..=MAX_LLM_TURN_ATTEMPTS + extra_attempts {
             if config.goal_loop_active() && extra_attempts > 0 {
                 if let Some(delay_ms) = crate::runtime::goal_recovery::pending_delay(
