@@ -193,11 +193,79 @@ bamboo/
 
 ## Release Process
 
-1. Update CHANGELOG.md with new version
-2. Update version in Cargo.toml
-3. Create a git tag: `git tag v0.x.0`
-4. Push tag: `git push origin v0.x.0`
-5. CI will automatically publish to crates.io
+Feature pull requests target `dev`. After a normal protected `dev → main`
+promotion, successful same-repository main push CI queues publication of its
+exact tested commit to crates.io and a GitHub Release. The workflow must first
+reach main through that normal promotion; do not promote unrelated development
+solely to activate it. Source manifests keep `0.0.0`; temporary publication
+stamps an unused `YYYY.M.N` UTC version and embeds the committed frontend lock.
+
+Automatic runs and manual/Zenith dispatches using this workflow share one
+`bamboo-crate-publication` queue without canceling queued uploads. Previously
+frozen tags retain their own workflow definitions; this change does not
+retroactively add the queue or new guards to those tags.
+
+Before main activation, coordinate outstanding frozen-tag trains' explicit
+versions and same-source resume through [Zenith #322](https://github.com/bigduu/Zenith/issues/322)
+and [#370](https://github.com/bigduu/Zenith/issues/370), alongside the normal
+promotion and Environment configuration. Their historical workflows cannot join
+the new queue retroactively.
+
+### Automatic main publication
+
+Only the automatic job uses the `bamboo-release` Environment and new GitHub/HMAC
+authority. Its exact branch-type rules allow dev/main, with no tag rule. Before
+checkout, a fixed bootstrap verifies the successful same-repository main push CI
+source and that source/workflow SHAs belong to protected dev/main history. The
+checkout uses the tested CI SHA, which may differ from the workflow's SHA.
+Pre-policy main commits cannot acquire the new publication authority.
+
+An authenticated draft body reserves source, frontend and version before any
+crate upload. Original frontend assets and each package checksum are preserved
+for recovery. Every downloaded crate must match its reserved checksum, Git source
+SHA and, for bamboo-server, original embedded frontend bytes. Only the complete
+verified closure becomes a public GitHub Release. Reruns reuse the matching
+source/frontend reservation; completed reruns verify without republishing.
+
+Authenticated reservations and registry versions advance the full-u64 allocator;
+unsigned names only occupy candidates. Verified registry/source ancestry prevents
+stale sources overtaking newer versions or GitHub latest, even after Release
+metadata deletion. Public target claims and copied receipts grant no recovery
+authority; transport failures stop publication.
+
+In that Environment, set `BAMBOO_RELEASE_TOKEN` with repository Contents/Workflows
+write, `BAMBOO_RELEASE_SIGNING_KEY` to 32 random bytes as 64 lowercase hex digits,
+and variable `BAMBOO_RELEASE_SIGNING_KEY_SHA256` to the SHA-256 of decoded key bytes.
+Keep these names absent from repository/org configuration and the key stable
+across token rotation. Missing/mismatched configuration stops publication; lost
+keys require manual evidence verification, never accepting or re-signing unsigned
+history. Tag authority is checked before upload.
+
+### Manual and Zenith publication
+
+Manual dispatch retains the existing Cargo-only publication path, including
+frozen source tags and dev. Required `expected_source_sha` must be a lowercase
+40-character commit matching both dispatched `GITHUB_SHA` and clean checkout
+HEAD before Node/npm/package work. Zenith also verifies its accepted tag object,
+peeled source and root pointer before dispatching. Manual runs have Contents read,
+no Environment, and no new GitHub token or signing key. Only the final non-dry
+publish step receives the existing repository `CARGO_REGISTRY_TOKEN`.
+
+Pass a real Cargo SemVer `version`; empty/`latest` uses the source manifest and
+rejects `0.0.0`. Build metadata is unsupported. Stable versions cannot exceed the
+current UTC year/month; historical versions, u64 counters and prereleases remain
+valid. Inputs are parsed as environment data. Locked frontend and fixed legacy
+rollback inputs remain available.
+
+`dry_run=true` validates stamped workspace buildability without credentials or
+uploads. Manual publication retains the existing dependency-order, propagation,
+rate-limit and skip-existing loop. It does not recover signed drafts, create
+GitHub Releases, change latest or add provenance to historical manual skips.
+
+Both publication paths use the isolated Cargo entrypoint delivered in
+[#1752](https://github.com/bigduu/Bamboo-agent/issues/1752), described below.
+Existing repository Cargo token branch exposure is
+tracked separately in [#1699](https://github.com/bigduu/Bamboo-agent/issues/1699).
 
 ## Additional Notes
 
@@ -218,7 +286,7 @@ Bamboo uses GitHub Actions for continuous integration and publishing:
 
 - **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run locked Rust build/test, formatting, and CI workflow policy checks in the required `Test` gate. Pull requests into `main`, pushes to `main`, and manual dispatches retain comprehensive validation, with the all-feature library and integration suite in the required `E2E Tests` job. Only promotion pull requests from this repository's `dev` branch into `main` add release builds on Linux, macOS, and Windows; manual dispatches also run that platform matrix. Linux TLS and frontend contract tests run in `Test`, while macOS and Windows run their platform-specific checks. Successful dev PR builds can reuse their own Rust cache until closure; `.github/workflows/pr-cache-cleanup.yml` then removes only that same-repository PR's merge-ref caches.
 - **CodeQL** (`.github/workflows/codeql.yml`) -- Runs the Actions, JavaScript/TypeScript, Python, and Rust analyses for pull requests into `main`, pushes to `main`, and explicit manual dispatches. Routine `dev` activity does not run CodeQL.
-- **Publish Crate** (`.github/workflows/publish-crate.yml`) -- Publishes the workspace crates to crates.io in dependency order. Normally dispatched by the Zenith release train with the unified date version and the `@bigduu/lotus` frontend version to embed; supports `dry_run`.
+- **Publish Crate** (`.github/workflows/publish-crate.yml`) -- Publishes successful main CI source commits to crates.io and GitHub Releases with verified same-source recovery. Manual/Zenith dispatches retain explicit versions, the exact locked frontend and `dry_run`.
   Its Cargo PATH entrypoint, including metadata invoked from Python, runs the
   digest-pinned official Rust 1.99.0 Bookworm image. Docker failure is fatal;
   publication never falls back to host Cargo. The entrypoint needs Node,
