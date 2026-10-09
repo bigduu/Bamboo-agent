@@ -12,7 +12,10 @@ pub(crate) async fn pause_for_no_progress(
     event_tx: &mpsc::Sender<AgentEvent>,
     config: &AgentLoopConfig,
 ) -> Result<bool, AgentError> {
-    if session.kind != SessionKind::Root || session.pending_question.is_some() {
+    if session.kind != SessionKind::Root
+        || runtime_state.no_human_approver
+        || session.pending_question.is_some()
+    {
         return Ok(false);
     }
     crate::session_app::no_progress::create_question(session, runtime_state);
@@ -128,7 +131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_progress_pause_does_not_change_child_or_existing_question() {
+    async fn no_progress_pause_does_not_change_child_headless_root_or_existing_question() {
         let (tx, mut rx) = mpsc::channel(4);
         let mut runtime = AgentRuntimeState::default();
         let mut child = Session::new_child("child", "root", "model", "Inspect");
@@ -138,6 +141,19 @@ mod tests {
                 .unwrap()
         );
         assert!(child.pending_question.is_none());
+        let mut headless = Session::new("headless-root", "model");
+        let headless_before = serde_json::to_value(&headless).unwrap();
+        runtime.no_human_approver = true;
+        assert!(!pause_for_no_progress(
+            &mut headless,
+            &mut runtime,
+            &tx,
+            &AgentLoopConfig::default()
+        )
+        .await
+        .unwrap());
+        assert_eq!(serde_json::to_value(&headless).unwrap(), headless_before);
+        runtime.no_human_approver = false;
         let mut session = Session::new("existing-question", "model");
         session.set_pending_question(
             "real-tool".into(),
