@@ -397,52 +397,74 @@ async fn stop_hook_continuation_keeps_original_evidence_and_checks_only_the_fina
 
 #[tokio::test]
 async fn gold_committed_candidate_is_revised_in_place_without_a_duplicate_or_stale_native_chain() {
-    let (mut session, mut config, mut state) = fixture(true);
-    config.gold_config = Some(crate::runtime::config::GoldConfig {
-        enabled: true,
-        auto_continue_enabled: true,
-        goal: Some("report the check".into()),
-        max_auto_continuations: 0,
-        ..Default::default()
-    });
-    let probe = install_probe(&mut config, false);
-    let provider = FinalProvider::new(Verdict::Revise);
-    let (tx, mut rx) = mpsc::channel(128);
-    assert!(run_pipeline(
-        &mut session,
-        &tx,
-        provider.clone(),
-        Arc::new(NoExecution),
-        &CancellationToken::new(),
-        &config,
-        &mut state
-    )
-    .await
-    .unwrap());
-    let candidate_id = probe
-        .committed_candidate_id
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap();
-    assert_eq!(session.messages.last().unwrap().id, candidate_id);
-    assert_eq!(
-        session
-            .messages
-            .iter()
-            .filter(|message| message.role == Role::Assistant && message.tool_calls.is_none())
-            .count(),
-        1
-    );
-    assert_eq!(session.messages.last().unwrap().content, CORRECTED);
-    assert!(
-        session.provider_transcript.epoch() as usize
-            > probe.transcript_epoch.load(Ordering::SeqCst)
-    );
-    assert!(!session
-        .metadata
-        .contains_key("responses.previous_response_id"));
-    assert_eq!(drain(&mut rx), (CORRECTED.to_string(), 1));
-    assert_eq!(provider.main_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(provider.auxiliary_calls.load(Ordering::SeqCst), 1);
+    for verdict in [Verdict::Revise, Verdict::InvalidReference] {
+        let (mut session, mut config, mut state) = fixture(true);
+        config.gold_config = Some(crate::runtime::config::GoldConfig {
+            enabled: true,
+            auto_continue_enabled: true,
+            goal: Some("report the check".into()),
+            max_auto_continuations: 0,
+            ..Default::default()
+        });
+        let probe = install_probe(&mut config, false);
+        let provider = FinalProvider::new(verdict);
+        let (tx, mut rx) = mpsc::channel(128);
+        let result = run_pipeline(
+            &mut session,
+            &tx,
+            provider.clone(),
+            Arc::new(NoExecution),
+            &CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await;
+        let candidate_id = probe
+            .committed_candidate_id
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let revised = matches!(verdict, Verdict::Revise);
+        if revised {
+            assert!(result.unwrap());
+            assert_eq!(session.messages.last().unwrap().id, candidate_id);
+            assert_eq!(session.messages.last().unwrap().content, CORRECTED);
+        } else {
+            assert!(matches!(result, Err(AgentError::LLM(_))));
+            assert!(!session
+                .messages
+                .iter()
+                .any(|message| message.id == candidate_id));
+            assert_eq!(session.messages.last().unwrap().role, Role::Tool);
+        }
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| message.role == Role::Assistant && message.tool_calls.is_none())
+                .count(),
+            usize::from(revised)
+        );
+        assert!(
+            session.provider_transcript.epoch() as usize
+                > probe.transcript_epoch.load(Ordering::SeqCst)
+        );
+        assert!(!session
+            .metadata
+            .contains_key("responses.previous_response_id"));
+        assert_eq!(
+            drain(&mut rx),
+            (
+                if revised {
+                    CORRECTED.to_string()
+                } else {
+                    String::new()
+                },
+                usize::from(revised)
+            )
+        );
+        assert_eq!(provider.main_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.auxiliary_calls.load(Ordering::SeqCst), 1);
+    }
 }
