@@ -786,6 +786,8 @@ pub struct AgentLoopConfig {
     /// When true, the pipeline classifies complexity at each round end and
     /// stores the result in session metadata.
     pub(crate) features_dynamic_model_routing: bool,
+    /// Opt-in, single auxiliary check before publishing a final answer.
+    pub(crate) features_final_evidence_check: bool,
     /// Optional per-round resolver for auxiliary model settings that should
     /// follow live global config rather than stay frozen for the whole run.
     ///
@@ -884,6 +886,7 @@ impl Default for AgentLoopConfig {
             approval_delegate: None,
             hook_runner: Arc::new(HookRunner::new()),
             features_dynamic_model_routing: false,
+            features_final_evidence_check: false,
             auxiliary_model_resolver: None,
             disabled_filter_resolver: None,
             mcp_tool_guidance: None,

@@ -75,7 +75,7 @@ default. The full field list of `Config`:
 | `env_vars` | `Vec<EnvVarEntry>` | User-managed env vars injected into `Bash`-tool child processes. `secret: true` entries persist only stable `credential_ref`/`configured` metadata; their values live in the isolated credential store and are returned masked by the API. |
 | `default_work_area` | `Option<DefaultWorkAreaConfig>` | `{ path: Option<String> }` — default workspace when a session has none set. |
 | `access_control` | `Option<AccessControlConfig>` | Password gate for the HTTP API/UI (`password_enabled`, hashed+salted). |
-| `features` | `FeatureFlags` | `{ provider_model_ref: bool, dynamic_model_routing: bool }` — incremental rollout toggles, both off by default. |
+| `features` | `FeatureFlags` | Incremental rollout toggles, off by default. `final_evidence_check` enables the single final-answer check described below. |
 | `stream_timeout` | `StreamTimeoutConfig` | Independent transport, first-semantic, and midstream-semantic watchdog deadlines. See below. |
 | `context_management` | `ContextManagementConfig` | Selects legacy summary compression or the opt-in exact-history retrieval window. See below. |
 | `memory` | `Option<MemoryConfig>` | Memory/auto-dream/gardener settings. See below. |
@@ -830,3 +830,26 @@ does not crash or silently reset to defaults — it runs a recovery flow
 Net effect: a corrupted `config.json` never causes silent data loss — you
 always get either your own values back (salvage/backup) or an explicit,
 confirmable prompt before anything is overwritten.
+
+### Final-answer evidence check
+
+Set `features.final_evidence_check` to `true` to check a final answer once against
+the current request's canonical Tool call/result records. The default is `false`.
+The check runs after Gold, Guardian and BeforeFinalize allow completion. It uses
+the configured fast provider/model, falling back to the current chat model, and
+shares the existing auxiliary concurrency limit, stream deadlines, cancellation
+and remaining run token budget. Its reported tokens count toward run usage and
+a separate `final_evidence_check` metrics round. No additional work tools run.
+
+When enabled, the engine buffers each response; tool-round text is published
+after that response completes, and final text is published after the check. A
+revision replaces the candidate in both visible output and canonical history,
+and clears the provider-native continuation so the next request uses that same
+answer. Disabled runs retain their existing streaming behavior.
+
+`runtime.final_evidence_check` records `supported`, `revised`,
+`skipped_no_evidence`, `skipped_budget`, `cancelled` or `failed`. Missing tool
+evidence skips the auxiliary call. An invalid verdict, provider failure, budget
+rejection or cancellation does not produce a verified completion. The check is
+a model judgment over bounded records; it does not certify omitted evidence or
+prove that an external operation completed.
