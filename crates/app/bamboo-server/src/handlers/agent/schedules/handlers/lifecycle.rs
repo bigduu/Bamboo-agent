@@ -6,7 +6,7 @@ use crate::schedule_app::ScheduleRunJob;
 use super::super::types::{CreateScheduleRequest, PatchScheduleRequest, ScheduleView};
 use super::super::validation::{
     resolve_create_schedule_definition, resolve_patch_schedule_definition,
-    validate_auto_execute_run_config, validate_schedule_name,
+    validate_auto_execute_run_config, validate_schedule_name, validate_workflow_target,
 };
 use super::response::{internal_server_error, schedule_not_found};
 
@@ -23,6 +23,9 @@ pub async fn create_schedule(
         Ok(value) => value,
         Err(response) => return Ok(*response),
     };
+    if let Err(response) = validate_workflow_target(&req.trigger, &req.run_config) {
+        return Ok(*response);
+    }
     let run_config = match validate_auto_execute_run_config(&state, &req.run_config).await {
         Ok(run_config) => run_config,
         Err(response) => return Ok(*response),
@@ -45,12 +48,18 @@ pub async fn patch_schedule(
 ) -> Result<HttpResponse> {
     let id = path.into_inner();
     let name = normalize_optional_name(req.name.as_deref());
+    let Some(existing) = state.schedule_store.get_schedule(&id).await else {
+        return Ok(schedule_not_found(&id));
+    };
+    if let Err(response) = validate_workflow_target(
+        req.trigger.as_ref().unwrap_or(&existing.trigger),
+        req.run_config.as_ref().unwrap_or(&existing.run_config),
+    ) {
+        return Ok(*response);
+    }
 
     let run_config = match req.run_config.as_ref() {
         Some(run_config) => {
-            let Some(existing) = state.schedule_store.get_schedule(&id).await else {
-                return Ok(schedule_not_found(&id));
-            };
             let mut run_config = run_config.clone();
             // `project_id` predates many PATCH clients. Its serde default is
             // `None`, so an omitted nested field is indistinguishable from
@@ -109,6 +118,9 @@ pub async fn run_now(state: web::Data<AppState>, path: web::Path<String>) -> Res
     let Some(schedule) = state.schedule_store.get_schedule(&id).await else {
         return Ok(schedule_not_found(&id));
     };
+    if let Err(response) = validate_workflow_target(&schedule.trigger, &schedule.run_config) {
+        return Ok(*response);
+    }
     if let Err(response) = validate_auto_execute_run_config(&state, &schedule.run_config).await {
         return Ok(*response);
     }
