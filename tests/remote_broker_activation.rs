@@ -3,22 +3,26 @@
 use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;
 use bamboo_broker::{client_config_trusting_cert, BrokerClient};
-use bamboo_domain::{ActorActivationStatus, ActorDirectoryPort, Session};
+use bamboo_domain::{
+    ActorActivation, ActorActivationStatus, ActorDirectoryError, ActorDirectoryPort,
+    HostRegistryError, Session, WorkerSlotLease,
+};
+use bamboo_storage::v2::{BrokerTerminalReceipt, FileHostRegistry};
 use bamboo_storage::SessionStoreV2;
 use bamboo_subagent::{
     provision::{ChildIdentity, ExecutorSpec, ModelRefSpec, ScopedCredential},
     AgentRef, BusEndpoint, ProvisionSpec,
 };
 use chrono::{Duration as ChronoDuration, Utc};
-use futures::StreamExt;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
     time::{Duration, SystemTime},
 };
@@ -82,13 +86,22 @@ struct Probe {
     ids: Mutex<Vec<String>>,
     calls: AtomicUsize,
     hold: AtomicBool,
+    held_closed: Arc<AtomicUsize>,
     operation: AtomicUsize,
     turn: AtomicUsize,
     step: AtomicUsize,
     target: AtomicUsize,
 }
+struct HeldResponse(Arc<AtomicUsize>);
+impl Drop for HeldResponse {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+const STALE_OUTPUT: &str = "CANCELLED_OWNER_MUST_NOT_REACH_SUCCESSOR";
 async fn response(body: web::Json<Value>, p: web::Data<Probe>) -> HttpResponse {
     let body = body.into_inner();
+    assert!(!body.to_string().contains(STALE_OUTPUT));
     let (delta, finish) = if body["model"] == "remote-child" {
         assert!(body["messages"].to_string().contains("REMOTE_NATIVE_TASK"));
         assert!(!body.to_string().contains(HOST));
@@ -96,18 +109,22 @@ async fn response(body: web::Json<Value>, p: web::Data<Probe>) -> HttpResponse {
         if p.hold.load(Ordering::SeqCst) {
             let event = json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"INFLIGHT"},"finish_reason":null}]});
             let first = web::Bytes::from(format!("data: {event}\n\n"));
+            let closed = HeldResponse(p.held_closed.clone());
             return HttpResponse::Ok()
                 .content_type("text/event-stream")
-                .streaming(
-                    futures::stream::once(async { Ok::<_, std::io::Error>(first) })
-                        .chain(futures::stream::once(async move {
-                            while p.hold.load(Ordering::SeqCst) {
-                                tokio::time::sleep(Duration::from_millis(20)).await;
-                            }
-                            let end = json!({"choices":[{"index":0,"delta":{"content":"REMOTE_NATIVE_REPLY"},"finish_reason":"stop"}]});
-                            Ok(web::Bytes::from(format!("data: {end}\n\ndata: [DONE]\n\n")))
-                        })),
-                );
+                .streaming(async_stream::stream! {
+                    let _closed = closed;
+                    yield Ok::<_, std::io::Error>(first);
+                    while p.hold.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        // Keep the transport observable while the provider stays held.
+                        yield Ok(web::Bytes::from_static(b": held
+
+"));
+                    }
+                    let end = json!({"choices":[{"index":0,"delta":{"content":"REMOTE_NATIVE_REPLY"},"finish_reason":"stop"}]});
+                    yield Ok(web::Bytes::from(format!("data: {end}\n\ndata: [DONE]\n\n")));
+                });
         }
         (json!({"content":"REMOTE_NATIVE_REPLY"}), "stop")
     } else if body["model"] == "remote-root" && body["tools"].to_string().contains("SubAgent") {
@@ -179,9 +196,9 @@ async fn wait_child(data: &Path, id: &str, status: &str) -> Session {
     wait_child_after(data, id, status, SystemTime::UNIX_EPOCH).await
 }
 async fn wait_child_after(data: &Path, id: &str, status: &str, since: SystemTime) -> Session {
+    let reader = SessionStoreV2::new(data.to_path_buf()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
-            let reader = SessionStoreV2::new(data.to_path_buf()).await.unwrap();
             let runtime = data
                 .join(reader.resolve_rel_path(id).await.unwrap())
                 .join("runtime.json");
@@ -243,9 +260,10 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
             .status()
             .is_success());
     }
+    let reader = SessionStoreV2::new(p.data.clone()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
-            let root = cold(&p.data, "remote-root").await;
+            let root = reader.load_session("remote-root").await.unwrap().unwrap();
             let call_id = format!("remote-op-{number}");
             let result = matches!(op, 0 | 1 | 2 | 4)
                 .then(|| {
@@ -322,7 +340,7 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
                     && existing_wait.is_some()
                     && result["observed_status"] == "running_in_background"
                 {
-                    let child = cold(&p.data, actor).await;
+                    let child = reader.load_session(actor).await.unwrap().unwrap();
                     if child.last_run_status().as_deref() == Some("running")
                         && root.last_run_status().as_deref() == Some("suspended")
                     {
@@ -479,6 +497,378 @@ async fn wait_runs_settled(data: &Path) {
     .await
     .expect("actual old Run completed and ACKed before operator replacement");
 }
+fn mailbox_messages(data: &Path, mailbox: &str) -> Vec<(PathBuf, bamboo_subagent::InboxMessage)> {
+    let root = data.join("broker/scoped-peers-v1/mailboxes").join(mailbox);
+    let mut messages = Vec::new();
+    for directory in ["new", "cur"] {
+        for entry in std::fs::read_dir(root.join(directory)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            match std::fs::read(&path) {
+                Ok(bytes) => messages.push((path, serde_json::from_slice(&bytes).unwrap())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("physical broker mailbox: {error}"),
+            }
+        }
+    }
+    messages
+}
+async fn placement(data: &Path, id: &str) -> (ActorActivation, WorkerSlotLease) {
+    let store = SessionStoreV2::new(data.to_path_buf()).await.unwrap();
+    let activation = store.inspect_actor(id).await.unwrap().activation.unwrap();
+    assert_eq!(activation.status, ActorActivationStatus::Running);
+    let reference = activation.placement_ref.as_ref().unwrap();
+    let registry = FileHostRegistry::new(data.to_path_buf()).await.unwrap();
+    let lease = registry
+        .inspect_slot_by_lease_id(&reference.lease_id, id, &activation.run_id, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(reference.slot_epoch, Some(lease.epoch));
+    registry.validate_slot(&lease, Utc::now()).await.unwrap();
+    (activation, lease)
+}
+fn transcript_digest(session: &Session) -> String {
+    let bytes = serde_json::to_vec(&serde_json::to_value(&session.messages).unwrap()).unwrap();
+    let hash = Sha256::digest(bytes);
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut encoded = String::new();
+    for chunk in hash.chunks(3) {
+        let bits = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for shift in [18, 12, 6, 0].into_iter().take(chunk.len() + 1) {
+            encoded.push(alphabet[((bits >> shift) & 63) as usize] as char);
+        }
+    }
+    encoded
+}
+async fn terminal_ack(
+    data: &Path,
+    session: &Session,
+    activation: &ActorActivation,
+    status: &str,
+) -> BrokerTerminalReceipt {
+    let store = SessionStoreV2::new(data.to_path_buf()).await.unwrap();
+    let path = data
+        .join(store.resolve_rel_path(&session.id).await.unwrap())
+        .join("broker-terminal-receipts.v1.json");
+    let receipt = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                Err(error) => panic!("actual terminal receipt: {error}"),
+            };
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            if let Ok(receipt) = serde_json::from_value::<BrokerTerminalReceipt>(
+                value["acknowledged_anchor"].clone(),
+            ) {
+                if receipt.activation_run_id == activation.run_id {
+                    assert_eq!(value["receipts"], json!([]));
+                    break receipt;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("actual Host terminal receipt confirmed ACK");
+    assert_eq!(receipt.session_id, session.id);
+    assert_eq!(receipt.created_at, session.created_at);
+    assert_eq!(
+        Some(receipt.parent_session_id.as_str()),
+        session.parent_session_id.as_deref()
+    );
+    assert_eq!(receipt.root_session_id, session.root_session_id);
+    assert_eq!(receipt.terminal_status, status);
+    assert_eq!(receipt.message_count, session.messages.len());
+    assert_eq!(receipt.messages_sha256, transcript_digest(session));
+    assert!(!receipt.message_ids.is_empty());
+    assert_eq!(
+        receipt
+            .message_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        receipt.message_ids.len()
+    );
+    assert!(!receipt.broker_correlation_id.is_empty());
+    assert_eq!(receipt.parent_mailbox, "remote-parent");
+    match (
+        &receipt.required_execution_epoch,
+        &receipt.terminal_completeness,
+    ) {
+        (Some(epoch), Some(proof)) => {
+            assert_eq!(proof.execution_epoch, *epoch);
+            assert_eq!(proof.activation_run_id, activation.run_id);
+            assert_eq!(proof.messages_sha256, receipt.messages_sha256);
+            assert_eq!(proof.message_count, receipt.message_count);
+        }
+        (None, None) => {}
+        _ => panic!("strict receipt requires matching Host completeness proof"),
+    }
+    assert!(mailbox_messages(data, &receipt.parent_mailbox)
+        .iter()
+        .all(|(_, msg)| !receipt.message_ids.contains(&msg.id.0)));
+    receipt
+}
+struct RemoteProofContext<'a> {
+    data: &'a PathBuf,
+    child_id: &'a str,
+    client: &'a reqwest::Client,
+    base: &'a str,
+    p: &'a Probe,
+    resident: &'a mut Process,
+    url: &'a str,
+    cert: &'a Path,
+}
+async fn cancelled_slot_reuse(context: RemoteProofContext<'_>) {
+    let RemoteProofContext {
+        data,
+        child_id,
+        client,
+        base,
+        p,
+        resident,
+        url,
+        cert,
+    } = context;
+    let resident_pid = resident.0.id();
+    let (cancelled_activation, old_slot) = placement(&data, &child_id).await;
+    let old_event = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(message) = mailbox_messages(&data, "remote-parent")
+                .into_iter()
+                .map(|(_, message)| message)
+                .find(|message| {
+                    message.kind == bamboo_subagent::InboxKind::Event
+                        && serde_json::from_value::<bamboo_subagent::ActorEventBatch>(
+                            message.body.clone(),
+                        )
+                        .is_ok_and(|batch| batch.execution_epoch != 0)
+                })
+            {
+                break message;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("capture actual held Run event route before cancellation");
+    turn(&client, &base, &p, 0, 0).await;
+    let sibling = p.ids.lock().unwrap()[1].clone();
+    turn(&client, &base, &p, 2, 1).await;
+    wait_child(&data, &sibling, "cancelled").await;
+    assert_eq!(
+        p.calls.load(Ordering::SeqCst),
+        2,
+        "cancelled subscription waiter must not dispatch Run"
+    );
+    turn(&client, &base, &p, 2, 0).await;
+    let cancelled = wait_child(&data, &child_id, "cancelled").await;
+    let registry = FileHostRegistry::new(data.clone()).await.unwrap();
+    let authority = SessionStoreV2::new(data.clone()).await.unwrap();
+    let finished = authority
+        .inspect_actor(&child_id)
+        .await
+        .unwrap()
+        .activation
+        .unwrap();
+    assert_eq!(finished.fence(), cancelled_activation.fence());
+    assert_eq!(finished.status, ActorActivationStatus::Cancelled);
+    let cancelled_receipt =
+        terminal_ack(&data, &cancelled, &cancelled_activation, "cancelled").await;
+    assert_eq!(
+        old_event.correlation_id.as_ref().map(|id| id.0.as_str()),
+        Some(cancelled_receipt.broker_correlation_id.as_str())
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while p.held_closed.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cancel closes actual held provider stream before fixture release or successor");
+    assert!(p.hold.load(Ordering::SeqCst));
+    wait_runs_settled(&data).await;
+    assert!(registry
+        .inspect_host(&old_slot.host_ref)
+        .await
+        .unwrap()
+        .unwrap()
+        .slots
+        .is_empty());
+    assert!(resident.0.try_wait().unwrap().is_none());
+
+    // Reuse the same live resident, before any operator replacement or lease expiry.
+    turn(&client, &base, &p, 1, 0).await;
+    wait_calls(&p, 3).await;
+    let (successor, successor_slot) = placement(&data, &child_id).await;
+    assert_eq!(resident.0.id(), resident_pid);
+    assert!(resident.0.try_wait().unwrap().is_none());
+    assert_eq!(successor_slot.host_ref, old_slot.host_ref);
+    assert_eq!(
+        successor_slot.connection_generation,
+        old_slot.connection_generation
+    );
+    assert_eq!(successor_slot.slot, old_slot.slot);
+    assert_ne!(successor_slot.lease_id, old_slot.lease_id);
+    assert!(successor_slot.epoch > old_slot.epoch);
+    assert_ne!(successor.fence(), cancelled_activation.fence());
+    assert_ne!(successor.run_id, cancelled_activation.run_id);
+    assert!(successor.lease_epoch > cancelled_activation.lease_epoch);
+    assert!(matches!(
+        registry.release_slot(&old_slot).await,
+        Err(HostRegistryError::StaleLease)
+    ));
+    assert!(matches!(
+        registry
+            .renew_slot(
+                &old_slot,
+                Utc::now(),
+                Utc::now() + ChronoDuration::seconds(80)
+            )
+            .await,
+        Err(HostRegistryError::StaleLease)
+    ));
+    assert!(matches!(
+        authority
+            .renew_activation(
+                &cancelled_activation.fence(),
+                Utc::now(),
+                Utc::now() + ChronoDuration::seconds(80)
+            )
+            .await,
+        Err(ActorDirectoryError::StaleFence)
+    ));
+    assert!(matches!(
+        authority
+            .checkpoint_activation(
+                &cancelled_activation.fence(),
+                Utc::now(),
+                cancelled_activation.checkpoint_revision
+            )
+            .await,
+        Err(ActorDirectoryError::StaleFence)
+    ));
+    registry
+        .validate_slot(&successor_slot, Utc::now())
+        .await
+        .unwrap();
+    authority
+        .validate_fence(&successor.fence(), Utc::now())
+        .await
+        .unwrap();
+
+    // This authenticated publish-only connection does not replace the resident subscription.
+    let mut publisher = BrokerClient::connect_with_tls(
+        &url,
+        old_event.from.clone(),
+        WORKER,
+        Some(client_config_trusting_cert(&cert).unwrap()),
+    )
+    .await
+    .unwrap();
+    let mut stale = old_event;
+    let mut batch: bamboo_subagent::ActorEventBatch = serde_json::from_value(stale.body).unwrap();
+    batch.first_seq = batch.last_seq.checked_add(1).unwrap();
+    batch.last_seq = batch.first_seq;
+    batch.qos = bamboo_subagent::ActorEventQos::Durable;
+    batch.events = vec![json!({"type":"token","content":STALE_OUTPUT})];
+    batch.validate().unwrap();
+    stale.id = bamboo_subagent::MsgId::new();
+    stale.created_at = Utc::now();
+    stale.body = serde_json::to_value(batch).unwrap();
+    let stale_id = stale.id.clone();
+    assert_eq!(
+        publisher
+            .deliver(&cancelled_receipt.parent_mailbox, stale)
+            .await
+            .unwrap(),
+        stale_id
+    );
+    drop(publisher);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if mailbox_messages(&data, "remote-parent")
+                .iter()
+                .any(|(path, msg)| msg.id == stale_id && path.parent().unwrap().ends_with("cur"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("actual stale output delivered to current Host, retained for old Run recovery");
+    assert_eq!(
+        authority
+            .inspect_actor(&child_id)
+            .await
+            .unwrap()
+            .activation
+            .unwrap()
+            .fence(),
+        successor.fence()
+    );
+    registry
+        .validate_slot(&successor_slot, Utc::now())
+        .await
+        .unwrap();
+    assert!(
+        !serde_json::to_string(&cold(&data, &child_id).await.messages)
+            .unwrap()
+            .contains(STALE_OUTPUT)
+    );
+    p.hold.store(false, Ordering::SeqCst);
+    let reused = wait_child(&data, &child_id, "completed").await;
+    let reused_receipt = terminal_ack(&data, &reused, &successor, "completed").await;
+    assert!(!reused_receipt.message_ids.contains(&stale_id.0));
+    assert!(!serde_json::to_string(&reused.messages)
+        .unwrap()
+        .contains(STALE_OUTPUT));
+    assert!(mailbox_messages(&data, "remote-parent")
+        .iter()
+        .any(|(_, msg)| msg.id == stale_id));
+    assert_eq!(p.calls.load(Ordering::SeqCst), 3);
+    assert!(registry
+        .inspect_host(&old_slot.host_ref)
+        .await
+        .unwrap()
+        .unwrap()
+        .slots
+        .is_empty());
+    assert_eq!(
+        authority
+            .inspect_actor(&child_id)
+            .await
+            .unwrap()
+            .activation
+            .unwrap()
+            .status,
+        ActorActivationStatus::Succeeded
+    );
+    for entry in std::fs::read_dir(data.join("events")).unwrap() {
+        assert!(!std::fs::read_to_string(entry.unwrap().path())
+            .unwrap()
+            .contains(STALE_OUTPUT));
+    }
+    eprintln!(
+        "remote cancel slot proof: {}",
+        json!({"resident_pid":resident_pid,
+        "old_slot":old_slot,"successor_slot":successor_slot,"cancelled_fence":cancelled_activation.fence(),
+        "successor_fence":successor.fence(),"cancelled_ack_count":cancelled_receipt.message_ids.len(),
+        "successor_ack_count":reused_receipt.message_ids.len(),"required_execution_epoch":cancelled_receipt.required_execution_epoch,
+        "held_provider_closed":p.held_closed.load(Ordering::SeqCst),"stale_delivered_retained_id":stale_id,
+        "provider_admissions":p.calls.load(Ordering::SeqCst)})
+    );
+    wait_runs_settled(&data).await;
+}
 #[actix_web::test]
 async fn actual_host_pinned_remote_runs_cancels_and_explicitly_replaces_over_wss() {
     Box::pin(fixture()).await;
@@ -590,6 +980,7 @@ async fn fixture() {
         ids: Mutex::new(vec![]),
         calls: AtomicUsize::new(0),
         hold: AtomicBool::new(false),
+        held_closed: Arc::new(AtomicUsize::new(0)),
         operation: AtomicUsize::new(0),
         turn: AtomicUsize::new(0),
         step: AtomicUsize::new(0),
@@ -866,19 +1257,17 @@ async fn fixture() {
     // below still covers failed/cancelled Runs without rewriting that answer.
     turn(&client, &base, &p, 4, 0).await;
     wait_calls(&p, 2).await;
-    turn(&client, &base, &p, 0, 0).await;
-    let sibling = p.ids.lock().unwrap()[1].clone();
-    turn(&client, &base, &p, 2, 1).await;
-    wait_child(&data, &sibling, "cancelled").await;
-    assert_eq!(
-        p.calls.load(Ordering::SeqCst),
-        2,
-        "cancelled subscription waiter must not dispatch Run"
-    );
-    turn(&client, &base, &p, 2, 0).await;
-    wait_child(&data, &child_id, "cancelled").await;
-    p.hold.store(false, Ordering::SeqCst);
-    wait_runs_settled(&data).await;
+    Box::pin(cancelled_slot_reuse(RemoteProofContext {
+        data: &data,
+        child_id: &child_id,
+        client: &client,
+        base: &base,
+        p: &p,
+        resident: &mut resident,
+        url: &url,
+        cert: &cert,
+    }))
+    .await;
     resident.stop();
     assert!(resident.0.try_wait().unwrap().is_some());
     std::fs::write(
@@ -920,7 +1309,7 @@ async fn fixture() {
         .contains("remote_environment_checkout_not_clean"));
     assert_eq!(
         p.calls.load(Ordering::SeqCst),
-        2,
+        3,
         "a replacement with a different checkout must not call the provider"
     );
     std::fs::write(
@@ -929,11 +1318,11 @@ async fn fixture() {
     )
     .unwrap();
     turn(&client, &base, &p, 1, 0).await;
-    wait_calls(&p, 3).await;
+    wait_calls(&p, 4).await;
     wait_child(&data, &child_id, "completed").await;
     p.hold.store(true, Ordering::SeqCst);
     turn(&client, &base, &p, 4, 0).await;
-    wait_calls(&p, 4).await;
+    wait_calls(&p, 5).await;
     h.stop();
     // Disconnection is not worker Run anti-replay. Settle the actual old Run
     // before explicit quiescent replacement; stale parent frames remain queued.
@@ -965,7 +1354,7 @@ async fn fixture() {
     resident = worker(&data, &replacement_spec, &url, &cert, "cold");
     let (mut h, base) = host(&data, &config, "cold").await;
     turn(&client, &base, &p, 1, 0).await;
-    wait_calls(&p, 5).await;
+    wait_calls(&p, 6).await;
     let final_child = wait_child(&data, &child_id, "completed").await;
     h.stop();
     resident.stop();
@@ -985,7 +1374,7 @@ async fn fixture() {
             .iter()
             .any(|m| m.content == "REMOTE_NATIVE_REPLY"));
     }
-    assert_eq!(p.calls.load(Ordering::SeqCst), 5);
+    assert_eq!(p.calls.load(Ordering::SeqCst), 6);
     handle.stop(true).await;
     drop(_broker);
     std::fs::remove_dir_all(&data).unwrap();
