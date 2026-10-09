@@ -123,6 +123,9 @@ impl GrepTool {
         type_filter: Option<&str>,
         include_ignored: bool,
     ) -> Vec<PathBuf> {
+        #[cfg(test)]
+        tests::pause_directory_discovery(base);
+
         let ext_map = Self::extension_map();
         let allowed_ext = type_filter.and_then(|name| ext_map.get(name).copied());
 
@@ -357,16 +360,32 @@ impl Tool for GrepTool {
         let regex = Self::compile_regex(&parsed.pattern, case_insensitive, multiline)?;
         let glob_filter = Self::compile_glob(parsed.glob.as_deref())?;
 
-        let files = if root.is_file() {
-            vec![root.clone()]
-        } else if root.is_dir() {
-            Self::collect_files(&root, parsed.r#type.as_deref(), parsed.include_ignored)
-        } else {
-            return Err(ToolError::Execution(format!(
-                "Path does not exist: {}",
-                root.display()
-            )));
-        };
+        let discovery_root = root.clone();
+        let type_filter = parsed.r#type.clone();
+        let include_ignored = parsed.include_ignored;
+        // Path inspection and ignore::Walk perform synchronous directory IO.
+        // Keep discovery off the runtime so a slow filesystem cannot delay
+        // lease renewal or other tasks on an Actix current-thread worker.
+        let files = tokio::task::spawn_blocking(move || {
+            if discovery_root.is_file() {
+                Ok(vec![discovery_root])
+            } else if discovery_root.is_dir() {
+                Ok(Self::collect_files(
+                    &discovery_root,
+                    type_filter.as_deref(),
+                    include_ignored,
+                ))
+            } else {
+                Err(ToolError::Execution(format!(
+                    "Path does not exist: {}",
+                    discovery_root.display()
+                )))
+            }
+        })
+        .await
+        .map_err(|error| {
+            ToolError::Execution(format!("Failed to discover search files: {}", error))
+        })??;
 
         let mut matched_files = Vec::new();
         let mut count_rows = Vec::new();
@@ -479,6 +498,110 @@ impl Tool for GrepTool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{mpsc, Mutex, OnceLock};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    struct DiscoveryPause {
+        started: oneshot::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    fn discovery_pauses() -> &'static Mutex<HashMap<PathBuf, DiscoveryPause>> {
+        static PAUSES: OnceLock<Mutex<HashMap<PathBuf, DiscoveryPause>>> = OnceLock::new();
+        PAUSES.get_or_init(Mutex::default)
+    }
+
+    pub(super) fn pause_directory_discovery(path: &Path) {
+        let pause = discovery_pauses().lock().unwrap().remove(path);
+        if let Some(pause) = pause {
+            pause.started.send(()).unwrap();
+            // A watchdog makes a regression fail instead of deadlocking the
+            // current-thread test runtime; this is not a traversal benchmark.
+            pause
+                .release
+                .recv_timeout(Duration::from_secs(5))
+                .expect("directory discovery blocked the async runtime");
+        }
+    }
+
+    fn pause_next_discovery(path: &Path) -> (oneshot::Receiver<()>, mpsc::Sender<()>) {
+        let (started, observed) = oneshot::channel();
+        let (release, wait) = mpsc::channel();
+        assert!(discovery_pauses()
+            .lock()
+            .unwrap()
+            .insert(
+                path.to_owned(),
+                DiscoveryPause {
+                    started,
+                    release: wait,
+                },
+            )
+            .is_none());
+        (observed, release)
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn grep_directory_discovery_keeps_async_heartbeat_running() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("match.rs"), "needle\n").unwrap();
+        let mut heartbeat_timer = tokio::time::interval(Duration::from_secs(5));
+        heartbeat_timer.tick().await;
+        let (started, release) = pause_next_discovery(dir.path());
+        let args = json!({"pattern": "needle", "path": dir.path()});
+        let search = tokio::spawn(async move { run(&GrepTool::new(), args).await });
+
+        started.await.unwrap();
+        let heartbeat = tokio::spawn(async move { heartbeat_timer.tick().await });
+        tokio::time::advance(Duration::from_secs(5)).await;
+        heartbeat.await.unwrap();
+        assert!(
+            !search.is_finished(),
+            "heartbeat must run while directory discovery is still blocked"
+        );
+        release.send(()).unwrap();
+
+        let result = search.await.unwrap().unwrap();
+        assert!(result.success);
+        assert!(result.result.contains("match.rs"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn grep_can_be_cancelled_while_directory_discovery_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (started, release) = pause_next_discovery(dir.path());
+        let args = json!({"pattern": "needle", "path": dir.path()});
+        let search = tokio::spawn(async move { run(&GrepTool::new(), args).await });
+
+        started.await.unwrap();
+        search.abort();
+        let cancelled = search.await.unwrap_err().is_cancelled();
+        release.send(()).unwrap();
+        assert!(cancelled);
+    }
+
+    #[tokio::test]
+    async fn grep_missing_path_preserves_execution_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let error = run(
+            &GrepTool::new(),
+            json!({"pattern": "needle", "path": missing}),
+        )
+        .await
+        .unwrap_err();
+
+        match error {
+            ToolError::Execution(message) => {
+                assert_eq!(
+                    message,
+                    format!("Path does not exist: {}", missing.display())
+                );
+            }
+            other => panic!("expected execution error, got {other}"),
+        }
+    }
 
     #[test]
     fn grep_args_preserve_flag_names_and_all_values() {
