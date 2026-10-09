@@ -277,7 +277,8 @@ async fn no_progress_registered_http_ordinary_chat_message_resumes_runtime_quest
     let provider = Arc::new(ProgressProvider::default());
     let state = state_with_provider(dir.path(), provider.clone()).await;
     let paused = save_paused(&state, "http-progress-chat").await;
-    let evidence = serde_json::to_value(&paused.messages[..2]).unwrap();
+    let evidence_messages = paused.messages[..2].to_vec();
+    let evidence = serde_json::to_value(&evidence_messages).unwrap();
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
@@ -327,10 +328,18 @@ async fn no_progress_registered_http_ordinary_chat_message_resumes_runtime_quest
     let durable = wait_completed(&state, "http-progress-chat").await;
     assert!(durable.pending_question.is_none());
     assert!(!durable.metadata.contains_key("runtime.suspend_reason"));
-    assert_eq!(
-        serde_json::to_value(&durable.messages[..2]).unwrap(),
-        evidence
-    );
+    // Chat may prepend its system prompt; the original records keep their IDs
+    // and full contents regardless of their new positions in the history.
+    let retained: Vec<_> = durable
+        .messages
+        .iter()
+        .filter(|message| {
+            evidence_messages
+                .iter()
+                .any(|original| original.id == message.id)
+        })
+        .collect();
+    assert_eq!(serde_json::to_value(retained).unwrap(), evidence);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert!(provider
         .user_directions
