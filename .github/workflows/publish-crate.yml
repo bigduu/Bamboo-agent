@@ -105,14 +105,9 @@ jobs:
             exit 1
           fi
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          shared-key: bamboo-publish-crate-${{ runner.os }}
-          cache-on-failure: true
+      - name: Install isolated Cargo publication entrypoint
+        # PATH also covers Cargo metadata launched by compute-publish-order.py.
+        run: node scripts/release-cargo-sandbox.cjs install
 
       - name: Resolve publish version
         id: version
@@ -409,14 +404,9 @@ jobs:
             exit 1
           fi
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          shared-key: bamboo-publish-crate-${{ runner.os }}
-          cache-on-failure: true
+      - name: Install isolated Cargo publication entrypoint
+        # PATH also covers controller and Python metadata/package/publish calls.
+        run: node scripts/release-cargo-sandbox.cjs install
 
       - name: Reserve or resume the exact release identity
         id: version

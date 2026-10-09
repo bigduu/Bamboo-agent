@@ -205,6 +205,12 @@ Automatic runs and manual/Zenith dispatches using this workflow share one
 frozen tags retain their own workflow definitions; this change does not
 retroactively add the queue or new guards to those tags.
 
+Before main activation, coordinate outstanding frozen-tag trains' explicit
+versions and same-source resume through [Zenith #322](https://github.com/bigduu/Zenith/issues/322)
+and [#370](https://github.com/bigduu/Zenith/issues/370), alongside the normal
+promotion and Environment configuration. Their historical workflows cannot join
+the new queue retroactively.
+
 ### Automatic main publication
 
 Only the automatic job uses the `bamboo-release` Environment and new GitHub/HMAC
@@ -256,9 +262,9 @@ uploads. Manual publication retains the existing dependency-order, propagation,
 rate-limit and skip-existing loop. It does not recover signed drafts, create
 GitHub Releases, change latest or add provenance to historical manual skips.
 
-Environment filtering is not build-script isolation: Cargo process/filesystem
-isolation [#1752](https://github.com/bigduu/Bamboo-agent/issues/1752) is required
-before automatic activation. Existing repository Cargo token branch exposure is
+Both publication paths use the isolated Cargo entrypoint delivered in
+[#1752](https://github.com/bigduu/Bamboo-agent/issues/1752), described below.
+Existing repository Cargo token branch exposure is
 tracked separately in [#1699](https://github.com/bigduu/Bamboo-agent/issues/1699).
 
 ## Additional Notes
@@ -281,6 +287,25 @@ Bamboo uses GitHub Actions for continuous integration and publishing:
 - **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run locked Rust build/test, formatting, and CI workflow policy checks in the required `Test` gate. Pull requests into `main`, pushes to `main`, and manual dispatches retain comprehensive validation, with the all-feature library and integration suite in the required `E2E Tests` job. Only promotion pull requests from this repository's `dev` branch into `main` add release builds on Linux, macOS, and Windows; manual dispatches also run that platform matrix. Linux TLS and frontend contract tests run in `Test`, while macOS and Windows run their platform-specific checks. Successful dev PR builds can reuse their own Rust cache until closure; `.github/workflows/pr-cache-cleanup.yml` then removes only that same-repository PR's merge-ref caches.
 - **CodeQL** (`.github/workflows/codeql.yml`) -- Runs the Actions, JavaScript/TypeScript, Python, and Rust analyses for pull requests into `main`, pushes to `main`, and explicit manual dispatches. Routine `dev` activity does not run CodeQL.
 - **Publish Crate** (`.github/workflows/publish-crate.yml`) -- Publishes successful main CI source commits to crates.io and GitHub Releases with verified same-source recovery. Manual/Zenith dispatches retain explicit versions, the exact locked frontend and `dry_run`.
+  Its Cargo PATH entrypoint, including metadata invoked from Python, runs the
+  digest-pinned official Rust 1.99.0 Bookworm image. Docker failure is fatal;
+  publication never falls back to host Cargo. The entrypoint needs Node,
+  Python 3.11+ and a local Unix Docker daemon, using an empty Docker client
+  config so host proxy configuration cannot inject worker variables.
+  Workers use a separate UID,
+  private PID namespace, no capabilities, no-new-privileges, and a read-only
+  root filesystem. Only disposable source and isolated Cargo/target data are
+  mounted. The exact Git SHA, stamped manifests and staged frontend are copied
+  without checkout credentials, host Git pointers or hooks. Workers cannot
+  modify the original source/controller; only regular Cargo.lock and selected
+  package archive bytes return after the container exits. Metadata paths map
+  back to the original workspace and its target/package directory.
+  GitHub/HMAC credentials never enter Cargo. Only `cargo publish` receives the
+  registry token; build scripts during that operation can still read that
+  intentional Cargo authority. Repository token access is separately tracked
+  in #1699. The Release Cargo Isolation workflow proves the Linux ancestor
+  boundary using dummy credentials and a real dependency build script, plus
+  metadata/check/package/publish-dry-run; a macOS Docker smoke alone is weaker.
 - **Publish Docker image** (`.github/workflows/docker-publish.yml`) -- Builds the multi-arch container image and pushes it to GHCR.
 - **Documentation** (`.github/workflows/docs.yml`) -- Builds documentation on every push to main. Deploys to GitHub Pages.
 

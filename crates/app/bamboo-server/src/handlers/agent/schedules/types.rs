@@ -115,6 +115,8 @@ pub struct ScheduleRunRecordView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_lag_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_duration_ms: Option<u64>,
@@ -133,6 +135,7 @@ impl From<ScheduleRunRecord> for ScheduleRunRecordView {
             status: value.status,
             outcome_reason: value.outcome_reason,
             session_id: value.session_id,
+            workflow_run_id: value.workflow_run_id,
             dispatch_lag_ms: value.dispatch_lag_ms,
             execution_duration_ms: value.execution_duration_ms,
             was_catch_up: value.was_catch_up,
@@ -376,6 +379,7 @@ mod tests {
             status: ScheduleRunStatus::Queued,
             outcome_reason: Some("waiting".to_string()),
             session_id: None,
+            workflow_run_id: None,
             dispatch_lag_ms: Some(15),
             execution_duration_ms: None,
             was_catch_up: false,

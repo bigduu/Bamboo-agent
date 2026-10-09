@@ -44,6 +44,13 @@ const SAFE_UNTRUSTED_WORKFLOW_TOOLS: &[&str] = &[
     "Grep",
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkflowInvoker {
+    Explicit,
+    Automatic,
+    Schedule,
+}
+
 /// Server-owned access boundary for workflow runs. Session, workspace trust and
 /// capabilities are derived here rather than accepted from HTTP/tool callers.
 #[derive(Clone)]
@@ -191,8 +198,15 @@ impl WorkflowRunAccess {
         args: Value,
         budget: Option<WorkflowBudgets>,
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
-        self.start_for_invoker(session_id, workflow_id, revision, args, budget, false)
-            .await
+        self.start_for_invoker(
+            session_id,
+            workflow_id,
+            revision,
+            args,
+            budget,
+            WorkflowInvoker::Explicit,
+        )
+        .await
     }
 
     pub async fn start_from_tool(
@@ -203,8 +217,37 @@ impl WorkflowRunAccess {
         args: Value,
         budget: Option<WorkflowBudgets>,
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
-        self.start_for_invoker(session_id, workflow_id, revision, args, budget, true)
-            .await
+        self.start_for_invoker(
+            session_id,
+            workflow_id,
+            revision,
+            args,
+            budget,
+            WorkflowInvoker::Automatic,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_from_schedule(
+        &self,
+        session_id: &str,
+        workflow_id: &str,
+        revision: u64,
+        args: Value,
+    ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
+        self.start_for_invoker(
+            session_id,
+            workflow_id,
+            revision,
+            args,
+            None,
+            WorkflowInvoker::Schedule,
+        )
+        .await
+    }
+
+    pub(crate) fn is_run_active(&self, run_id: &str) -> bool {
+        self.engine.is_run_active(run_id)
     }
 
     async fn start_for_invoker(
@@ -214,7 +257,7 @@ impl WorkflowRunAccess {
         revision: u64,
         args: Value,
         budget: Option<WorkflowBudgets>,
-        model_started: bool,
+        invoker: WorkflowInvoker,
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
         self.ensure_run_index_capacity(session_id).await?;
         let (workspace, workspace_trusted) = self.session_context(session_id).await?;
@@ -245,7 +288,8 @@ impl WorkflowRunAccess {
                 "instruction workflows must be activated with load_skill".to_string(),
             ));
         }
-        if model_started {
+        let automatic = invoker != WorkflowInvoker::Explicit;
+        if automatic {
             let session = self
                 .sessions
                 .try_load(session_id)
@@ -269,11 +313,7 @@ impl WorkflowRunAccess {
             .pin_workflow_definition_bundle(workspace.as_deref(), workflow_id, revision)
             .await
             .map_err(|_| WorkflowRunError::Preflight("workflow catalog pin failed".to_string()))?;
-        let policy = if model_started {
-            "automatic"
-        } else {
-            "explicit"
-        };
+        let policy = if automatic { "automatic" } else { "explicit" };
         if bundle.root_invocation_policy[policy].as_bool() != Some(true) {
             return Err(WorkflowRunError::Preflight(format!(
                 "pinned workflow invocation policy denies {policy} start"
@@ -286,6 +326,9 @@ impl WorkflowRunAccess {
         let mut definition = bundle.root().cloned().ok_or_else(|| {
             WorkflowRunError::Preflight("pinned workflow root is missing".to_string())
         })?;
+        if invoker == WorkflowInvoker::Schedule {
+            ensure_scheduled_readonly_workflow(&bundle, &definition)?;
+        }
         if let Some(requested) = budget {
             validate_requested_budget(&requested)?;
             definition.budgets = tighten_workflow_budget(&definition.budgets, &requested);
@@ -555,6 +598,21 @@ impl WorkflowRunAccess {
             .await
     }
 
+    pub async fn continue_completed_prefix_for_session(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
+        let progress = self
+            .progress_for_session(session_id, run_id, u64::MAX)
+            .await?;
+        ensure_completed_prefix_allowed(&progress.snapshot)?;
+        let (_, workspace_trusted) = self.session_context(session_id).await?;
+        self.engine
+            .continue_completed_prefix(run_id, session_id, workspace_trusted, vec!["read".into()])
+            .await
+    }
+
     pub async fn restart_from_tool(
         &self,
         session_id: &str,
@@ -599,6 +657,53 @@ fn ensure_workflow_cancel_allowed(snapshot: &WorkflowRunSnapshot) -> Result<(), 
     }
 }
 
+fn ensure_scheduled_readonly_workflow(
+    bundle: &WorkflowDefinitionBundle,
+    definition: &WorkflowRunDefinition,
+) -> Result<(), WorkflowRunError> {
+    let refuse = || {
+        WorkflowRunError::Preflight(
+            "scheduled workflows require a readonly Tool step or flat Sequence".into(),
+        )
+    };
+    if bundle.definitions.len() != 1 {
+        return Err(refuse());
+    }
+    let leaves = match &definition.plan {
+        WorkflowPlan::Step { step } => vec![step.as_str()],
+        WorkflowPlan::Sequence { nodes } => nodes
+            .iter()
+            .map(|node| match node {
+                WorkflowPlan::Step { step } => Ok(step.as_str()),
+                _ => Err(refuse()),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(refuse()),
+    };
+    let ids = leaves.iter().copied().collect::<BTreeSet<_>>();
+    if leaves.is_empty()
+        || ids.len() != leaves.len()
+        || ids.len() != definition.steps.len()
+        || definition.steps.iter().any(|step| {
+            !ids.contains(step.id.as_str())
+                || match &step.kind {
+                    WorkflowStepKind::Tool {
+                        tool, capabilities, ..
+                    } => {
+                        !SAFE_UNTRUSTED_WORKFLOW_TOOLS
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(tool))
+                            || capabilities.iter().any(|capability| capability != "read")
+                    }
+                    _ => true,
+                }
+        })
+    {
+        return Err(refuse());
+    }
+    Ok(())
+}
+
 fn ensure_workflow_restart_as_new_run_allowed(
     snapshot: &WorkflowRunSnapshot,
 ) -> Result<(), WorkflowRunError> {
@@ -609,6 +714,36 @@ fn ensure_workflow_restart_as_new_run_allowed(
             "only recovery-suspended workflows can restart as a new run".to_string(),
         )),
     }
+}
+
+fn ensure_completed_prefix_allowed(snapshot: &WorkflowRunSnapshot) -> Result<(), WorkflowRunError> {
+    WorkflowRunEngine::completed_prefix(snapshot)?;
+    if snapshot.definition_bundle.root_invocation_policy["explicit"].as_bool() != Some(true)
+        || snapshot
+            .definition
+            .steps
+            .iter()
+            .any(|step| match &step.kind {
+                WorkflowStepKind::Tool {
+                    tool, capabilities, ..
+                } => {
+                    !readonly_workflow_tool(tool)
+                        || capabilities.iter().any(|capability| capability != "read")
+                }
+                _ => true,
+            })
+    {
+        return Err(WorkflowRunError::Preflight(
+            "workflow completed-prefix continuation requires explicit readonly authority".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn readonly_workflow_tool(name: &str) -> bool {
+    SAFE_UNTRUSTED_WORKFLOW_TOOLS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 
 fn tighten_workflow_budget(
@@ -688,6 +823,7 @@ pub(crate) struct PublicWorkflowRunSnapshot {
     pub status: WorkflowRunStatus,
     pub can_cancel: bool,
     pub can_restart_as_new_run: bool,
+    pub can_resume_completed_prefix: bool,
     pub planned_steps: BTreeMap<String, PublicWorkflowPlannedStep>,
     pub plan: PublicWorkflowPlan,
     pub steps: BTreeMap<String, PublicWorkflowStepSnapshot>,
@@ -912,6 +1048,7 @@ fn public_workflow_phase(name: &str) -> &'static str {
 pub(crate) fn public_workflow_snapshot(snapshot: WorkflowRunSnapshot) -> PublicWorkflowRunSnapshot {
     let can_cancel = ensure_workflow_cancel_allowed(&snapshot).is_ok();
     let can_restart_as_new_run = ensure_workflow_restart_as_new_run_allowed(&snapshot).is_ok();
+    let can_resume_completed_prefix = ensure_completed_prefix_allowed(&snapshot).is_ok();
     let planned_steps = public_planned_steps(&snapshot.definition);
     let plan = public_workflow_plan(&snapshot.definition.plan);
     let child_agent_count = snapshot.usage.agents;
@@ -926,6 +1063,7 @@ pub(crate) fn public_workflow_snapshot(snapshot: WorkflowRunSnapshot) -> PublicW
         status: snapshot.status,
         can_cancel,
         can_restart_as_new_run,
+        can_resume_completed_prefix,
         planned_steps,
         plan,
         steps: snapshot
@@ -1015,9 +1153,7 @@ impl WorkflowPolicyPort for ServerWorkflowPolicy {
                 PermissionDecision::Allow
             }
             WorkflowPolicyTarget::Tool(name) => {
-                let safe_target = SAFE_UNTRUSTED_WORKFLOW_TOOLS
-                    .iter()
-                    .any(|candidate| candidate.eq_ignore_ascii_case(name));
+                let safe_target = readonly_workflow_tool(name);
                 if safe_target && requested.iter().all(|capability| capability == "read") {
                     PermissionDecision::Allow
                 } else {
@@ -3165,5 +3301,421 @@ mod tests {
             MAX_PINNED_BUNDLE_BYTES_PER_RUN + 1
         )
         .is_err());
+    }
+
+    struct StopAfterCompletedPrefix {
+        repository: FileWorkflowRunRepository,
+        committed: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        drained: tokio::sync::Notify,
+        checkpoint: tokio::sync::Mutex<Option<WorkflowRunSnapshot>>,
+    }
+
+    #[async_trait]
+    impl WorkflowRunRepository for StopAfterCompletedPrefix {
+        async fn create(
+            &self,
+            snapshot: &WorkflowRunSnapshot,
+            event: &WorkflowRunEvent,
+        ) -> std::io::Result<()> {
+            self.repository.create(snapshot, event).await
+        }
+        async fn commit(
+            &self,
+            snapshot: &WorkflowRunSnapshot,
+            event: &WorkflowRunEvent,
+        ) -> std::io::Result<()> {
+            self.repository.commit(snapshot, event).await?;
+            if event.step_id.as_deref() == Some("prefix")
+                && matches!(event.kind, WorkflowRunEventKind::StepCompleted { .. })
+            {
+                *self.checkpoint.lock().await = Some(snapshot.clone());
+                self.committed.notify_one();
+                self.release.notified().await;
+                self.drained.notify_one();
+            }
+            Ok(())
+        }
+        async fn load(&self, run_id: &str) -> std::io::Result<Option<WorkflowRunSnapshot>> {
+            self.repository.load(run_id).await
+        }
+        async fn events_since(
+            &self,
+            run_id: &str,
+            since: u64,
+        ) -> std::io::Result<Vec<WorkflowRunEvent>> {
+            self.repository.events_since(run_id, since).await
+        }
+        async fn list_run_ids(&self) -> std::io::Result<Vec<String>> {
+            self.repository.list_run_ids().await
+        }
+    }
+
+    #[derive(Default)]
+    struct PrefixContinuationTools {
+        calls: tokio::sync::Mutex<Vec<(String, Value)>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for PrefixContinuationTools {
+        async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+            let args: Value = serde_json::from_str(&call.function.arguments).unwrap();
+            self.calls
+                .lock()
+                .await
+                .push((call.function.name.clone(), args.clone()));
+            Ok(ToolResult::text(
+                true,
+                serde_json::to_string(&args).unwrap(),
+            ))
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    #[actix_web::test]
+    async fn completed_prefix_file_interruption_reconstructs_and_continues_through_same_session_http(
+    ) {
+        use actix_web::{http::StatusCode, test, web, App};
+        let tools = Arc::new(PrefixContinuationTools::default());
+        let (access, sessions, directory) = workflow_test_access_with_tools(tools.clone()).await;
+        let session_id = "completed-prefix-http-owner";
+        let mut owner = Session::new(session_id, "model");
+        sessions.save(&mut owner).await.unwrap();
+        let mut other = Session::new("completed-prefix-http-other", "model");
+        sessions.save(&mut other).await.unwrap();
+        let schema = json!({"type":"object","required":["value"],"properties":{"value":{"type":"integer"}},"additionalProperties":false});
+        let definition = WorkflowRunDefinition {
+            workflow_schema: 1,
+            id: "completed-prefix-http".into(),
+            revision: 7,
+            input_schema: schema.clone(),
+            output_schema: Some(schema.clone()),
+            steps: vec![
+                bamboo_domain::WorkflowStepDefinition {
+                    id: "prefix".into(),
+                    kind: WorkflowStepKind::Tool {
+                        tool: "Read".into(),
+                        args: json!({"from":"args"}),
+                        capabilities: vec!["read".into()],
+                    },
+                    failure: bamboo_domain::FailurePolicy::FailFast,
+                    output_schema: Some(schema.clone()),
+                },
+                bamboo_domain::WorkflowStepDefinition {
+                    id: "suffix".into(),
+                    kind: WorkflowStepKind::Tool {
+                        tool: "Grep".into(),
+                        args: json!({"from":"step","step":"prefix"}),
+                        capabilities: vec!["read".into()],
+                    },
+                    failure: bamboo_domain::FailurePolicy::FailFast,
+                    output_schema: Some(schema),
+                },
+            ],
+            plan: WorkflowPlan::Sequence {
+                nodes: vec![
+                    WorkflowPlan::Step {
+                        step: "prefix".into(),
+                    },
+                    WorkflowPlan::Step {
+                        step: "suffix".into(),
+                    },
+                ],
+            },
+            budgets: WorkflowBudgets {
+                max_concurrency: 1,
+                max_agents: 0,
+                max_steps: 2,
+                max_retries: 0,
+                max_nesting_depth: 1,
+                wall_time_ms: 600_000,
+                max_tokens: Some(0),
+                max_cost_micros: Some(0),
+            },
+        };
+        let bundle = WorkflowDefinitionBundle {
+            publication_revision: 17,
+            root_id: definition.id.clone(),
+            root_revision: definition.revision,
+            root_invocation_policy: json!({"explicit":true,"automatic":false}),
+            definitions: BTreeMap::from([(
+                WorkflowDefinitionBundle::key(&definition.id, definition.revision),
+                definition.clone(),
+            )]),
+        };
+        let interrupted_repository = Arc::new(StopAfterCompletedPrefix {
+            repository: FileWorkflowRunRepository::new(directory.path().join("workflow-runs"))
+                .unwrap(),
+            committed: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            drained: tokio::sync::Notify::new(),
+            checkpoint: tokio::sync::Mutex::new(None),
+        });
+        let original_engine = WorkflowRunEngine::new(
+            interrupted_repository.clone(),
+            tools.clone(),
+            access.agents.clone(),
+            Arc::new(ExternallyPinnedDefinitions),
+            Arc::new(ServerWorkflowPolicy),
+            Arc::new(UnavailableSecretResolver),
+            definition.budgets.clone(),
+        );
+        let running = {
+            let engine = original_engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .run_pinned(
+                        StartWorkflowRun {
+                            definition,
+                            args: json!({"value":42}),
+                            session_id: session_id.into(),
+                            workspace_trusted: false,
+                            allowed_capabilities: vec!["read".into()],
+                        },
+                        bundle,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            interrupted_repository.committed.notified(),
+        )
+        .await
+        .unwrap();
+        let checkpoint = interrupted_repository
+            .checkpoint
+            .lock()
+            .await
+            .clone()
+            .unwrap();
+        assert_eq!(checkpoint.status, WorkflowRunStatus::Running);
+        assert_eq!(checkpoint.usage.steps, 1);
+        assert_eq!(checkpoint.steps.len(), 1);
+        assert_eq!(
+            tools.calls.lock().await.as_slice(),
+            &[("Read".into(), json!({"value":42}))]
+        );
+        running.abort();
+        assert!(running.await.unwrap_err().is_cancelled());
+        // transition() shields the durable commit in an owned task. Drain that
+        // already-committed task before a new repository owner is constructed.
+        interrupted_repository.release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            interrupted_repository.drained.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(!original_engine.is_run_active(&checkpoint.run_id));
+        drop(original_engine);
+        drop(interrupted_repository);
+        access
+            .remember_run_id(session_id, &checkpoint.run_id)
+            .await
+            .unwrap();
+        let skills = access.skills.clone();
+        drop(access);
+        let reopened = WorkflowRunAccess::new(directory.path(), tools.clone(), skills, sessions)
+            .await
+            .unwrap();
+        let recovered = reopened
+            .progress_for_session(session_id, &checkpoint.run_id, 0)
+            .await
+            .unwrap();
+        assert_eq!(recovered.snapshot.status, WorkflowRunStatus::Suspended);
+        assert_eq!(recovered.snapshot.steps, checkpoint.steps);
+        assert_eq!(recovered.snapshot.usage, checkpoint.usage);
+        assert!(public_workflow_snapshot(recovered.snapshot.clone()).can_resume_completed_prefix);
+        let before = recovered.snapshot;
+        let mut state = crate::app_state::AppState::new(directory.path().join("http-server-state"))
+            .await
+            .unwrap();
+        state.workflow_runs = reopened.clone();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let repository =
+            FileWorkflowRunRepository::new(directory.path().join("workflow-runs")).unwrap();
+        for label in [
+            "mutating-target",
+            "explicit-denied",
+            "original-deadline-expired",
+        ] {
+            let mut rejected = before.clone();
+            rejected.run_id = format!("refuse-{label}");
+            rejected.last_sequence = 1;
+            match label {
+                "mutating-target" => {
+                    if let WorkflowStepKind::Tool {
+                        tool, capabilities, ..
+                    } = &mut rejected.definition.steps[1].kind
+                    {
+                        *tool = "Write".into();
+                        capabilities.clear();
+                    }
+                    rejected.definition_bundle.definitions.insert(
+                        WorkflowDefinitionBundle::key(
+                            &rejected.definition.id,
+                            rejected.definition.revision,
+                        ),
+                        rejected.definition.clone(),
+                    );
+                }
+                "explicit-denied" => {
+                    rejected.definition_bundle.root_invocation_policy["explicit"] = json!(false)
+                }
+                _ => rejected.created_at -= chrono::Duration::minutes(11),
+            }
+            use sha2::{Digest, Sha256};
+            rejected.definition_bundle_hash = hex::encode(Sha256::digest(
+                serde_json::to_vec(&rejected.definition_bundle).unwrap(),
+            ));
+            assert!(
+                !public_workflow_snapshot(rejected.clone()).can_resume_completed_prefix,
+                "{label}"
+            );
+            repository
+                .create(
+                    &rejected,
+                    &WorkflowRunEvent {
+                        run_id: rejected.run_id.clone(),
+                        sequence: 1,
+                        at: rejected.updated_at,
+                        step_id: None,
+                        kind: WorkflowRunEventKind::RunSuspended {
+                            reason: "refusal fixture".into(),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            let request = test::TestRequest::post()
+                .uri(&format!(
+                    "/api/v1/sessions/{session_id}/workflow-runs/{}/continue",
+                    rejected.run_id
+                ))
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, request).await.status(),
+                StatusCode::BAD_REQUEST,
+                "{label}"
+            );
+            assert_eq!(
+                repository.load(&rejected.run_id).await.unwrap().unwrap(),
+                rejected,
+                "{label}"
+            );
+            assert_eq!(
+                repository
+                    .events_since(&rejected.run_id, 0)
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "{label}"
+            );
+            assert_eq!(tools.calls.lock().await.len(), 1, "{label}");
+        }
+        // The real registered action hides another session's run and performs
+        // no dispatch or checkpoint mutation for that rejected request.
+        let wrong = test::TestRequest::post()
+            .uri(&format!(
+                "/api/v1/sessions/completed-prefix-http-other/workflow-runs/{}/continue",
+                checkpoint.run_id
+            ))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, wrong).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            reopened
+                .progress_for_session(session_id, &checkpoint.run_id, u64::MAX)
+                .await
+                .unwrap()
+                .snapshot,
+            before
+        );
+        let request = test::TestRequest::post()
+            .uri(&format!(
+                "/api/v1/sessions/{session_id}/workflow-runs/{}/continue",
+                checkpoint.run_id
+            ))
+            .to_request();
+        let response = test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let started: Value = test::read_body_json(response).await;
+        assert_eq!(started["run_id"], checkpoint.run_id);
+        assert_eq!(started["status"], "running");
+        assert_eq!(started["can_resume_completed_prefix"], false);
+        let saved = wait_for_workflow_run_to_settle(&reopened, &checkpoint.run_id).await;
+        assert_eq!(saved.status, WorkflowRunStatus::Succeeded);
+        assert_eq!(saved.output, Some(json!({"value":42})));
+        assert_eq!(saved.definition_bundle, checkpoint.definition_bundle);
+        assert_eq!(
+            saved.definition_bundle_hash,
+            checkpoint.definition_bundle_hash
+        );
+        assert_eq!(saved.validated_args, checkpoint.validated_args);
+        assert_eq!(saved.created_at, checkpoint.created_at);
+        assert_eq!(saved.steps["prefix"], checkpoint.steps["prefix"]);
+        assert_eq!(saved.steps["suffix"].attempts, 1);
+        assert_eq!(saved.usage.steps, 2);
+        assert_eq!(
+            tools.calls.lock().await.as_slice(),
+            &[
+                ("Read".into(), json!({"value":42})),
+                ("Grep".into(), json!({"value":42}))
+            ]
+        );
+        let progress = reopened
+            .progress_for_session(session_id, &checkpoint.run_id, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            progress.snapshot.last_sequence,
+            progress.events.len() as u64
+        );
+        assert!(progress
+            .events
+            .windows(2)
+            .all(|pair| pair[1].sequence == pair[0].sequence + 1));
+        assert_eq!(
+            progress
+                .events
+                .iter()
+                .filter(|event| event.step_id.as_deref() == Some("prefix")
+                    && matches!(event.kind, WorkflowRunEventKind::StepCompleted { .. }))
+                .count(),
+            1
+        );
+        let list = reopened.list_for_session(session_id).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].run_id, checkpoint.run_id);
+        let terminal = test::TestRequest::post()
+            .uri(&format!(
+                "/api/v1/sessions/{session_id}/workflow-runs/{}/continue",
+                checkpoint.run_id
+            ))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, terminal).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        // The legacy route mounts the same action; an unknown run proves route
+        // resolution via the handler's JSON 404 rather than an unmatched route.
+        let legacy = test::TestRequest::post()
+            .uri("/v1/sessions/completed-prefix-http-owner/workflow-runs/missing/continue")
+            .to_request();
+        let response = test::call_service(&app, legacy).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["message"], "workflow run not found");
     }
 }

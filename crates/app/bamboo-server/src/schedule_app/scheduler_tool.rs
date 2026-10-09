@@ -64,6 +64,11 @@ impl ScheduleTasksTool {
         &self,
         run_config: &ScheduleRunConfig,
     ) -> Result<ScheduleRunConfig, ToolError> {
+        if run_config.workflow_target.is_some() {
+            return Err(ToolError::InvalidArguments(
+                "Workflow schedule targets require explicit human HTTP configuration".to_string(),
+            ));
+        }
         let mut normalized = run_config.clone();
         if let Some(project_id) = run_config.project_id.as_ref() {
             match self.project_store.get(project_id) {
@@ -458,6 +463,12 @@ impl Tool for ScheduleTasksTool {
                         ToolError::Execution(format!("Schedule not found: {}", schedule_id.trim()))
                     })?;
                 Self::require_schedule_in_caller_scope(caller_project_id.as_ref(), &existing)?;
+                if existing.run_config.workflow_target.is_some() {
+                    return Err(ToolError::InvalidArguments(
+                        "Workflow schedules can only be updated through human HTTP configuration"
+                            .to_string(),
+                    ));
+                }
 
                 let updated = self
                     .schedule_store
@@ -1666,5 +1677,58 @@ mod tests {
             .list_run_records_for_schedule(&foreign.id)
             .await
             .is_empty());
+    }
+    #[tokio::test]
+    async fn llm_scheduler_refuses_create_patch_and_run_of_workflow_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::AppState::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut caller = Session::new("human-only-workflow-target-caller", "model");
+        caller.kind = SessionKind::Root;
+        state.storage.save_session(&caller).await.unwrap();
+        let tool = ScheduleTasksTool::new(
+            state.schedule_store.clone(),
+            state.schedule_manager.clone(),
+            state.session_store.clone(),
+            state.storage.clone(),
+            state.config.clone(),
+            state.project_store.clone(),
+            state.workspace_resolver.clone(),
+        );
+        let run_config = json!({"auto_execute":true,"model":"bookkeeping-model",
+            "workflow_target":{"workflow_id":"read-once","revision":7,"args":{}}});
+        let at = chrono::Utc::now() + chrono::Duration::hours(1);
+        let error = tool.invoke(json!({"action":"create","name":"model target","trigger":{"type":"once","at":at},"run_config":run_config}), context(&caller.id)).await.unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        assert!(state.schedule_store.list_schedules().await.is_empty());
+        let human = state
+            .schedule_store
+            .create_schedule(
+                "human target".into(),
+                ScheduleTrigger::Once { at },
+                true,
+                serde_json::from_value(run_config.clone()).unwrap(),
+            )
+            .await
+            .unwrap();
+        let original = state.schedule_store.get_schedule(&human.id).await.unwrap();
+        for args in [
+            json!({"action":"patch","schedule_id":human.id,"enabled":false}),
+            json!({"action":"patch","schedule_id":human.id,"run_config":run_config}),
+            json!({"action":"run_now","schedule_id":human.id}),
+        ] {
+            let error = tool.invoke(args, context(&caller.id)).await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments(_)));
+            assert_eq!(
+                state.schedule_store.get_schedule(&human.id).await.unwrap(),
+                original
+            );
+            assert!(state
+                .schedule_store
+                .list_run_records_for_schedule(&human.id)
+                .await
+                .is_empty());
+        }
     }
 }
