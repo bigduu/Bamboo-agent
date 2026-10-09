@@ -44,6 +44,7 @@ mod approval_replay;
 mod builder;
 mod error;
 mod execute_request;
+mod skill_runtime;
 mod tools;
 
 #[cfg(test)]
@@ -115,6 +116,31 @@ pub use bamboo_tools::{BuiltinToolExecutor, BuiltinToolExecutorBuilder, ToolOutp
 /// Default event-channel buffer used by [`Agent::run`].
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// A new SDK User turn with explicit, host-validated Skill selections.
+///
+/// The SDK constructs the User identity. Selections are request data; they do
+/// not grant caller, Source or filesystem permissions. An empty selection is
+/// ordinary input and still permits eligible implicit catalog reads.
+#[derive(Debug)]
+pub struct SdkSkillInput {
+    pub content: String,
+    pub parts: Vec<bamboo_domain::MessagePart>,
+    pub selections: Vec<bamboo_skills::WorkflowSelection>,
+}
+
+impl SdkSkillInput {
+    pub fn new(
+        content: impl Into<String>,
+        selections: Vec<bamboo_skills::WorkflowSelection>,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            parts: Vec::new(),
+            selections,
+        }
+    }
+}
+
 /// Stable, ergonomic entry point for agent execution.
 ///
 /// Wraps a [`bamboo_engine::Agent`] (which owns the shared runtime) plus the
@@ -122,6 +148,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 #[derive(Clone)]
 pub struct Agent {
     inner: bamboo_engine::Agent,
+    sdk_skills: Option<Arc<skill_runtime::DefaultSdkSkills>>,
     /// Instruction (system-prompt fragment) injected into the session at `run`
     /// time; the engine assembles the full prompt around it.
     system_prompt: Option<String>,
@@ -182,6 +209,77 @@ impl Agent {
         Self::append_constructed_user_input(session, Self::construct_user_input(input))
     }
 
+    fn append_local_user_input(
+        &self,
+        session: &mut Session,
+        input: impl Into<String>,
+    ) -> Option<bamboo_engine::config::UntrustedExecutionInputs> {
+        if self.sdk_skills.is_none() {
+            return Self::append_user_input(session, input);
+        }
+        let (message, _) = Self::construct_user_input(input);
+        let fallback = message.clone();
+        match self
+            .inner
+            .append_sdk_user_input(session, message, None, None)
+        {
+            Ok(inputs) => Some(inputs),
+            Err(_) => {
+                // Optional SDK observation cannot change the old append/error
+                // contract. An unavailable receipt gives no Skill authority.
+                if !session.messages.iter().any(|user| user.id == fallback.id) {
+                    session.add_message(fallback);
+                }
+                None
+            }
+        }
+    }
+
+    /// Prepare and run a new typed Skill input through the actual SDK host.
+    ///
+    /// Requires the complete built-in defaults surface. Hook or preparation
+    /// failure returns before append. String entrypoints retain their original
+    /// synchronous append and error order.
+    pub async fn run_with_skills(
+        &self,
+        session: &mut Session,
+        input: SdkSkillInput,
+    ) -> Result<(), SdkError> {
+        self.run_with_skills_and_cancel(session, input, CancellationToken::new())
+            .await
+    }
+
+    /// Like `run_with_skills`, with cancellation covering preparation and run.
+    pub async fn run_with_skills_and_cancel(
+        &self,
+        session: &mut Session,
+        input: SdkSkillInput,
+        cancel_token: CancellationToken,
+    ) -> Result<(), SdkError> {
+        let skills = self.sdk_skills.as_ref().ok_or_else(|| {
+            SdkError::Unsupported(
+                "typed Skills require the complete defaults-backed built-in SDK host".into(),
+            )
+        })?;
+        let (guard, inputs, lease) = skills
+            .prepare_typed_run(self, session, input, cancel_token.clone())
+            .await?;
+        let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let result = self
+            .execute_internal_prepared(
+                session,
+                event_tx,
+                cancel_token,
+                Some(inputs),
+                Some(guard),
+                Some(lease),
+            )
+            .await;
+        drain.abort();
+        result.map_err(SdkError::from)
+    }
+
     /// Return a new ergonomic builder.
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
@@ -192,6 +290,7 @@ impl Agent {
     pub fn from_runtime(inner: bamboo_engine::Agent) -> Self {
         Self {
             inner,
+            sdk_skills: None,
             system_prompt: None,
             model: None,
             session_model: None,
@@ -216,6 +315,7 @@ impl Agent {
     ) -> Self {
         Self {
             inner,
+            sdk_skills: None,
             system_prompt,
             model,
             session_model,
@@ -241,7 +341,7 @@ impl Agent {
         session: &mut Session,
         input: impl Into<String>,
     ) -> Result<(), AgentError> {
-        let inputs = Self::append_user_input(session, input);
+        let inputs = self.append_local_user_input(session, input);
         self.run_session_with_cancel_and_inputs(session, CancellationToken::new(), inputs)
             .await
     }
@@ -255,7 +355,7 @@ impl Agent {
         input: impl Into<String>,
         cancel_token: CancellationToken,
     ) -> Result<(), AgentError> {
-        let inputs = Self::append_user_input(session, input);
+        let inputs = self.append_local_user_input(session, input);
         self.run_session_with_cancel_and_inputs(session, cancel_token, inputs)
             .await
     }
@@ -325,7 +425,7 @@ impl Agent {
         mut session: Session,
         input: impl Into<String>,
     ) -> mpsc::Receiver<AgentEvent> {
-        let inputs = Self::append_user_input(&mut session, input);
+        let inputs = self.append_local_user_input(&mut session, input);
         self.run_stream_session_with_cancel_and_inputs(session, CancellationToken::new(), inputs)
     }
 
@@ -338,7 +438,7 @@ impl Agent {
         mut session: Session,
         input: impl Into<String>,
     ) -> (mpsc::Receiver<AgentEvent>, CancellationToken) {
-        let inputs = Self::append_user_input(&mut session, input);
+        let inputs = self.append_local_user_input(&mut session, input);
         let cancel_token = CancellationToken::new();
         let rx =
             self.run_stream_session_with_cancel_and_inputs(session, cancel_token.clone(), inputs);
@@ -442,8 +542,21 @@ impl Agent {
         inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentError>> + Send + 'a>>
     {
-        // Keep the shared execution body off nested public run/resume futures.
-        // The boxed future retains the existing ownership and cancellation order.
+        self.execute_internal_prepared(session, event_tx, cancel_token, inputs, None, None)
+    }
+
+    fn execute_internal_prepared<'a>(
+        &'a self,
+        session: &'a mut Session,
+        event_tx: mpsc::Sender<AgentEvent>,
+        cancel_token: CancellationToken,
+        inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
+        supplied_guard: Option<skill_runtime::SdkSkillRunGuard>,
+        supplied_lease: Option<bamboo_engine::DirectExecutionLease>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentError>> + Send + 'a>>
+    {
+        // Keep the existing execution and String append/lease order. The guard
+        // is owned by this actual future, independently from cloned executors.
         Box::pin(async move {
             // One execution-private view covers Project assignment, approved
             // tool replay and all later runtime checkpoints. Freeze None too.
@@ -463,7 +576,51 @@ impl Agent {
             // Own the logical session before any pre-execution mutation or approved
             // tool replay. Two cloned SDK Session values must collide before either
             // can duplicate a mutating side effect.
-            let direct_lease = execution.inner.begin_direct_execution(&session.id).await?;
+            let direct_lease = match supplied_lease {
+                Some(lease) => lease,
+                None => execution.inner.begin_direct_execution(&session.id).await?,
+            };
+            let sdk_guard = match (supplied_guard, execution.sdk_skills.as_ref()) {
+                (Some(guard), _) => Some(guard),
+                (None, Some(skills)) => {
+                    if let Some((carrier, execution_id)) = inputs
+                        .as_ref()
+                        .and_then(|carrier| carrier.sdk_execution_id().map(|id| (carrier, id)))
+                    {
+                        // Only an opaque receipt from this real SDK append has
+                        // this scalar. Generic input/history carriers have none.
+                        let input = carrier.observations().first().ok_or_else(|| {
+                            AgentError::Tool("SDK append observation is unavailable".into())
+                        })?;
+                        let user = session
+                            .messages
+                            .iter()
+                            .find(|message| {
+                                message.id == input.input_id() && message.role == Role::User
+                            })
+                            .ok_or_else(|| {
+                                AgentError::Tool("SDK appended User is unavailable".into())
+                            })?;
+                        Some(
+                            skills
+                                .begin_run(
+                                    session,
+                                    execution_id,
+                                    user,
+                                    input.request(),
+                                    cancel_token.clone(),
+                                )
+                                .map_err(|error| AgentError::Tool(error.to_string()))?,
+                        )
+                    } else {
+                        Some(skills.begin_without_input(session, cancel_token.clone()))
+                    }
+                }
+                _ => None,
+            };
+            if let Some(guard) = sdk_guard.as_ref() {
+                execution.inner = execution.inner.with_sdk_skill_execution_host(guard.host());
+            }
             if session.project_id_meta().is_none() {
                 if let Some(project_id) = execution.project_id.as_ref() {
                     let existing = if session.kind == bamboo_domain::SessionKind::Root {
@@ -615,8 +772,14 @@ impl Agent {
             // built from exactly the configured tool set, so no per-run
             // `disabled_tools` filter is needed here.
             let mut builder = ExecuteRequestBuilder::new(initial_message, event_tx, cancel_token);
+            if let Some(store) = execution.session_store.as_ref() {
+                builder = builder.app_data_dir(store.bamboo_home_dir().to_path_buf());
+            }
             if let Some(model) = execution.model.clone() {
                 builder = builder.model(model);
+            }
+            if let Some(guard) = sdk_guard.as_ref() {
+                builder = builder.tools(guard.tools(execution.inner.default_tools().clone()));
             }
 
             #[cfg(test)]
@@ -3036,10 +3199,12 @@ mod constructor_parity_tests {
     #[tokio::test]
     async fn constructor_parity_sdk_cancellation_keeps_the_consumed_fresh_user() {
         for streaming in [false, true] {
+            // Real default assembly must not consume the execution/cancellation budget.
+            // The watchdog still covers fresh input, provider startup and durable oracles.
+            let root = tempfile::tempdir().unwrap();
+            let provider = Arc::new(PendingProvider::default());
+            let agent = agent(root.path(), provider.clone()).await;
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                let root = tempfile::tempdir().unwrap();
-                let provider = Arc::new(PendingProvider::default());
-                let agent = agent(root.path(), provider.clone()).await;
                 let id = format!("constructor-sdk-cancel-{streaming}");
                 watch_inputs(&id);
                 let mut session = Session::new(&id, "claude-test");

@@ -40,10 +40,25 @@ pub fn data_dir_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// Create a test app with AppState
 pub async fn create_test_app() -> actix_web::web::Data<AppState> {
+    create_test_app_inner(false).await
+}
+
+/// Prepare an empty Workflow root before AppState registers its filesystem watcher.
+/// Workflow command tests still create their source files after AppState starts.
+pub async fn create_test_app_with_workflows() -> actix_web::web::Data<AppState> {
+    create_test_app_inner(true).await
+}
+
+async fn create_test_app_inner(prepare_workflows: bool) -> actix_web::web::Data<AppState> {
     ensure_test_home_dir();
     let temp_dir = tempfile::tempdir()
         .expect("Failed to create temp dir")
         .keep();
+    if prepare_workflows {
+        tokio::fs::create_dir_all(temp_dir.join("workflows"))
+            .await
+            .expect("Failed to create workflows dir before AppState starts");
+    }
 
     actix_web::web::Data::new(
         AppState::new_with_memory_store(

@@ -3192,9 +3192,6 @@ async fn run_pipeline_inner(
             &state.model_name,
         );
 
-        // --- Resolve tool schemas ---
-        let tool_schemas = resolve_tool_schemas_for_round(config, tools.as_ref(), session);
-
         // --- LLM call with retry ---
         let mut overflow_recovery_attempted = false;
         let mut turn_outcome: Option<TurnOutcome> = None;
@@ -3207,6 +3204,27 @@ async fn run_pipeline_inner(
         // `RoundActivity` for why it must sum, never overwrite); an attempt
         // that errors before streaming contributes 0.
         let mut round_activity = RoundActivity::default();
+
+        if let Some(host) = config.sdk_skill_execution_host.as_ref() {
+            host.observe_current_inputs(
+                &state.session_id,
+                &state.execution_id,
+                state.current_inputs.as_ref(),
+            )?;
+        }
+        let current_inputs = state.current_inputs.take();
+        let (round_result, current_inputs) =
+            crate::runtime::managers::lifecycle::scope_input_request_data(current_inputs, async {
+        if let Some(host) = config.sdk_skill_execution_host.as_ref() {
+            let context = host.render_skill_prompt(session, &state.execution_id).await?;
+            if context.is_empty() {
+                session.metadata.remove("skill.context");
+            } else {
+                session.metadata.insert("skill.context".into(), context);
+            }
+            super::super::session_setup::refresh_prompt_snapshot(session);
+        }
+        let tool_schemas = resolve_tool_schemas_for_round(config, tools.as_ref(), session);
 
         if config.goal_loop_active() {
             let goal = crate::runtime::goal_state::ensure_goal_state(
@@ -3760,6 +3778,11 @@ async fn run_pipeline_inner(
                 }
             }
         }
+
+        Ok::<(), AgentError>(())
+        }).await;
+        state.current_inputs = current_inputs;
+        round_result?;
 
         // Commit once for every exit from the attempt loop. In particular, a
         // terminal validation/post-LLM failure must retain the same accumulated
