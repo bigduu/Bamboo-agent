@@ -844,11 +844,9 @@ impl BambooRuntimeExecutor {
                     .unwrap_or_default(),
             });
 
-        // A worker BELOW the depth cap orchestrates its OWN children directly: it
-        // builds its own external-child runner + scheduler + adapter and runs the
-        // REAL SubAgent tool against them (no host proxy). `nested_spawn` is set
-        // by the host's build_spec purely from depth (< MAX_SPAWN_DEPTH), so it
-        // auto-propagates down the tree and bottoms out at the cap.
+        // A worker below the provisioned cap prepares its SubAgent template.
+        // The per-run overlay binds it to the canonical HostBridge, so actual
+        // nested creation uses the Host's current policy and durable lineage.
         type RunTools = Arc<dyn bamboo_agent_core::tools::ToolExecutor>;
         type ChildRunner = Arc<dyn bamboo_engine::runtime::execution::ExternalChildRunner>;
         let (run_tools, run_sub_agent, child_runner): (
@@ -2491,8 +2489,10 @@ fn build_isolated_config(
         "provider": factory_name,
         "providers": { factory_name: slot },
     });
-    serde_json::from_value::<Config>(value)
-        .map_err(|e| format!("assemble isolated config for '{factory_name}': {e}"))
+    let mut config = serde_json::from_value::<Config>(value)
+        .map_err(|e| format!("assemble isolated config for '{factory_name}': {e}"))?;
+    config.subagents_mut().max_spawn_depth = spec.capabilities.max_spawn_depth;
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -5329,6 +5329,21 @@ mod tests {
         assert_eq!(config.provider, "openai");
         let slot = config.providers().openai.as_ref().expect("openai slot");
         assert_eq!(slot.api_key, "sk-oa");
+    }
+
+    #[test]
+    fn spawn_depth_worker_config_preserves_provisioned_cap_and_legacy_default() {
+        let mut spec = spec_with("openai", "sk-test", Some(("openai", "gpt-test")));
+        for cap in [None, Some(0), Some(7)] {
+            spec.capabilities.max_spawn_depth = cap;
+            let config =
+                build_isolated_config("openai", spec.secrets.provider_credentials.first(), &spec)
+                    .unwrap();
+            assert_eq!(
+                config.subagents().effective_max_spawn_depth(),
+                cap.unwrap_or(bamboo_config::DEFAULT_MAX_SPAWN_DEPTH)
+            );
+        }
     }
 
     #[tokio::test]
