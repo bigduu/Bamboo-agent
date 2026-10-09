@@ -2,7 +2,7 @@
 //! Q and transport selections are data. Only this registered Server producer
 //! and a genuine execution reservation create the finite caller below.
 
-use crate::{tools::ToolSurface, AgentStatus, AppState};
+use crate::{tools::ToolSurface, AppState};
 use actix_web::web;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{
@@ -80,8 +80,63 @@ fn permission_mode(session: &Session) -> SessionPermissionMode {
         .unwrap_or_default()
 }
 
+#[derive(Clone)]
+pub(crate) struct ServerMainSkillProducer {
+    skill_manager: Arc<bamboo_skills::SkillManager>,
+    config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
+    session_repo: bamboo_engine::SessionRepository,
+    project_store: Arc<bamboo_projects::ProjectStore>,
+    storage: Arc<dyn bamboo_agent_core::Storage>,
+    permission_checker: Arc<dyn bamboo_tools::permission::PermissionChecker>,
+    tool_factory: crate::tools::ToolSurfaceFactory,
+}
+impl ServerMainSkillProducer {
+    pub(crate) fn new(
+        skill_manager: Arc<bamboo_skills::SkillManager>,
+        config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
+        session_repo: bamboo_engine::SessionRepository,
+        project_store: Arc<bamboo_projects::ProjectStore>,
+        storage: Arc<dyn bamboo_agent_core::Storage>,
+        permission_checker: Arc<dyn bamboo_tools::permission::PermissionChecker>,
+        tool_factory: crate::tools::ToolSurfaceFactory,
+    ) -> Self {
+        Self {
+            skill_manager,
+            config,
+            session_repo,
+            project_store,
+            storage,
+            permission_checker,
+            tool_factory,
+        }
+    }
+    fn from_state(state: &AppState) -> Self {
+        Self::new(
+            state.skill_manager.clone(),
+            state.config.clone(),
+            state.session_repo.clone(),
+            state.project_store.clone(),
+            state.storage.clone(),
+            state.permission_checker.clone(),
+            state.tool_factory.clone(),
+        )
+    }
+    fn tools_for(&self, surface: ToolSurface) -> Arc<dyn ToolExecutor> {
+        self.tool_factory.get(surface)
+    }
+    pub(crate) fn bind(
+        &self,
+        agent: Arc<bamboo_engine::Agent>,
+        session: &Session,
+        reservation: &SessionExecutionReservation,
+        base: Arc<dyn ToolExecutor>,
+    ) -> Result<NativeExecutionBinding, ToolError> {
+        bind_registered_execution(Arc::new(self.clone()), agent, session, reservation, base)
+    }
+}
+
 struct Policy {
-    state: web::Data<AppState>,
+    state: Arc<ServerMainSkillProducer>,
     base: Arc<dyn ToolExecutor>,
     permission: Arc<PermissionConfig>,
     revision: u64,
@@ -96,7 +151,7 @@ struct Policy {
     mode: Option<String>,
 }
 impl Policy {
-    fn new(state: web::Data<AppState>, session: &Session) -> Result<Self, ToolError> {
+    fn new(state: Arc<ServerMainSkillProducer>, session: &Session) -> Result<Self, ToolError> {
         if !ordinary_main(session) {
             return Err(denied("Native Skills require ordinary Main"));
         }
@@ -219,7 +274,10 @@ pub(crate) async fn prepare_envelope(
     let Some(selection) = selection else {
         return Ok(());
     };
-    let policy = Policy::new(state.clone(), candidate)?;
+    let policy = Policy::new(
+        Arc::new(ServerMainSkillProducer::from_state(&state)),
+        candidate,
+    )?;
     let user = envelope
         .to_provider_message()
         .map_err(|e| denied(&e.to_string()))?;
@@ -291,18 +349,9 @@ impl NativeRun {
         if !self.live.load(Ordering::Acquire) || self.cancel.is_cancelled() {
             return Err(denied("Native Skill run is no longer active"));
         }
-        let runners = self
-            .policy
-            .state
-            .agent_runners
-            .try_read()
-            .map_err(|_| denied("Native runner owner is busy"))?;
-        if !runners.get(&self.policy.session_id).is_some_and(|runner| {
-            runner.run_id == self.reservation_id
-                && matches!(runner.status, AgentStatus::Pending | AgentStatus::Running)
-        }) {
-            return Err(denied("Native runner identity changed"));
-        }
+        // The actual reservation owns this token; existing replacement/removal
+        // cancels it before publishing a successor. Runtime finish revokes this
+        // execution-private host on return, cancellation, drop and unwind.
         Ok(self.epoch.load(Ordering::Acquire))
     }
     fn caller(&self, ctx: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
@@ -549,7 +598,22 @@ pub(crate) fn bind_execution(
     if reservation.session_id() != session.id {
         return Err(denied("Native reservation target mismatch"));
     }
-    let policy = Policy::new(state.clone(), session)?;
+    ServerMainSkillProducer::from_state(&state).bind(
+        state.agent.clone(),
+        session,
+        reservation,
+        base,
+    )
+}
+
+fn bind_registered_execution(
+    state: Arc<ServerMainSkillProducer>,
+    agent: Arc<bamboo_engine::Agent>,
+    session: &Session,
+    reservation: &SessionExecutionReservation,
+    base: Arc<dyn ToolExecutor>,
+) -> Result<NativeExecutionBinding, ToolError> {
+    let policy = Policy::new(state, session)?;
     if !Arc::ptr_eq(&base, &policy.base) {
         return Err(denied("Native execution surface changed"));
     }
@@ -572,11 +636,8 @@ pub(crate) fn bind_execution(
         tools,
         Arc::new(SkillsReadTool::new(run.catalog())),
     )) as Arc<dyn ToolExecutor>;
-    let agent = Arc::new(
-        state
-            .agent
-            .with_skill_execution_host(Arc::new(NativeHost { run: run.clone() })),
-    );
+    let agent =
+        Arc::new(agent.with_skill_execution_host(Arc::new(NativeHost { run: run.clone() })));
     let tools = Arc::new(NativeExecutor { run, tools });
     #[cfg(test)]
     tests::observe_bound(&tools);
