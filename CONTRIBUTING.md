@@ -219,6 +219,25 @@ Bamboo uses GitHub Actions for continuous integration and publishing:
 - **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run locked Rust build/test, formatting, and CI workflow policy checks in the required `Test` gate. Pull requests into `main`, pushes to `main`, and manual dispatches retain comprehensive validation, with the all-feature library and integration suite in the required `E2E Tests` job. Only promotion pull requests from this repository's `dev` branch into `main` add release builds on Linux, macOS, and Windows; manual dispatches also run that platform matrix. Linux TLS and frontend contract tests run in `Test`, while macOS and Windows run their platform-specific checks. Successful dev PR builds can reuse their own Rust cache until closure; `.github/workflows/pr-cache-cleanup.yml` then removes only that same-repository PR's merge-ref caches.
 - **CodeQL** (`.github/workflows/codeql.yml`) -- Runs the Actions, JavaScript/TypeScript, Python, and Rust analyses for pull requests into `main`, pushes to `main`, and explicit manual dispatches. Routine `dev` activity does not run CodeQL.
 - **Publish Crate** (`.github/workflows/publish-crate.yml`) -- Publishes the workspace crates to crates.io in dependency order. Normally dispatched by the Zenith release train with the unified date version and the `@bigduu/lotus` frontend version to embed; supports `dry_run`.
+  Its Cargo PATH entrypoint, including metadata invoked from Python, runs the
+  digest-pinned official Rust 1.99.0 Bookworm image. Docker failure is fatal;
+  publication never falls back to host Cargo. The entrypoint needs Node,
+  Python 3.11+ and a local Unix Docker daemon, using an empty Docker client
+  config so host proxy configuration cannot inject worker variables.
+  Workers use a separate UID,
+  private PID namespace, no capabilities, no-new-privileges, and a read-only
+  root filesystem. Only disposable source and isolated Cargo/target data are
+  mounted. The exact Git SHA, stamped manifests and staged frontend are copied
+  without checkout credentials, host Git pointers or hooks. Workers cannot
+  modify the original source/controller; only regular Cargo.lock and selected
+  package archive bytes return after the container exits. Metadata paths map
+  back to the original workspace and its target/package directory.
+  GitHub/HMAC credentials never enter Cargo. Only `cargo publish` receives the
+  registry token; build scripts during that operation can still read that
+  intentional Cargo authority. Repository token access is separately tracked
+  in #1699. The Release Cargo Isolation workflow proves the Linux ancestor
+  boundary using dummy credentials and a real dependency build script, plus
+  metadata/check/package/publish-dry-run; a macOS Docker smoke alone is weaker.
 - **Publish Docker image** (`.github/workflows/docker-publish.yml`) -- Builds the multi-arch container image and pushes it to GHCR.
 - **Documentation** (`.github/workflows/docs.yml`) -- Builds documentation on every push to main. Deploys to GitHub Pages.
 
