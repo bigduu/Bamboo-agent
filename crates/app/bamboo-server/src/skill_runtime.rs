@@ -488,16 +488,17 @@ impl SkillExecutionHost for NativeHost {
             .policy
             .check_session(session)
             .map_err(engine_error)?;
-        let current = self
-            .run
-            .current
-            .try_read()
-            .map_err(|_| engine_error(denied("Native input owner is busy")))?;
-        if current.execution_id.as_deref() != Some(execution_id) {
-            return Err(engine_error(denied("Native metadata execution changed")));
-        }
-        let has_input = current.current_input_id.is_some();
-        drop(current);
+        let has_input = {
+            let current = self
+                .run
+                .current
+                .try_read()
+                .map_err(|_| engine_error(denied("Native input owner is busy")))?;
+            if current.execution_id.as_deref() != Some(execution_id) {
+                return Err(engine_error(denied("Native metadata execution changed")));
+            }
+            current.current_input_id.is_some()
+        };
         if !has_input {
             return Ok(String::new());
         }
@@ -571,7 +572,10 @@ pub(crate) fn bind_execution(
             .agent
             .with_skill_execution_host(Arc::new(NativeHost { run: run.clone() })),
     );
-    Ok((agent, Arc::new(NativeExecutor { run, tools })))
+    let tools = Arc::new(NativeExecutor { run, tools });
+    #[cfg(test)]
+    tests::observe_bound(&tools);
+    Ok((agent, tools))
 }
 
 struct NativeExecutor {

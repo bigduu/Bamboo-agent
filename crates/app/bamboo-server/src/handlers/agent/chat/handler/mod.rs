@@ -1089,9 +1089,24 @@ async fn handle_chat(
                 )
             }
         };
-        let mut candidate = session.clone();
-        workflow_metadata_checkpoint.restore(&mut candidate);
-        root_tool_authority_checkpoint.restore(&mut candidate);
+        let mut candidate = checkpoint.clone();
+        if let Some(observed) = session.agent_runtime_state.as_ref() {
+            let runtime = candidate
+                .agent_runtime_state
+                .get_or_insert_with(|| bamboo_domain::AgentRuntimeState::new(&checkpoint.id));
+            runtime.checkpoints = observed.checkpoints.clone();
+            runtime.hook_contexts = observed.hook_contexts.clone();
+            runtime.stop_hook_forced_continuations = observed.stop_hook_forced_continuations;
+        }
+        const PRECHECK: &str = "runtime.plugin_prompt_prechecked";
+        match session.metadata.get(PRECHECK) {
+            Some(value) => {
+                candidate.metadata.insert(PRECHECK.into(), value.clone());
+            }
+            None => {
+                candidate.metadata.remove(PRECHECK);
+            }
+        }
         let envelope = native_input.as_mut().or(queued_input.as_mut());
         if let Some(envelope) = envelope {
             if let Err(error) = crate::skill_runtime::prepare_envelope(

@@ -440,3 +440,292 @@ async fn native_http_implicit_main_retains_current_user_across_nonew_pages() {
     assert_eq!(user.role, Role::User);
     assert_eq!(user.content, "Inspect proof and perform its normal action");
 }
+
+// Capture only a binding created by the actual reserved HTTP path. This tap
+// observes a real executor; it never creates a caller, Q batch or permission.
+fn bindings() -> &'static Mutex<BTreeMap<String, std::sync::Weak<NativeExecutor>>> {
+    static TAPS: std::sync::OnceLock<Mutex<BTreeMap<String, std::sync::Weak<NativeExecutor>>>> =
+        std::sync::OnceLock::new();
+    TAPS.get_or_init(Mutex::default)
+}
+pub(super) fn observe_bound(executor: &Arc<NativeExecutor>) {
+    let mut taps = bindings().lock().unwrap();
+    if let Some(slot) = taps.get_mut(&executor.run.policy.session_id) {
+        *slot = Arc::downgrade(executor);
+    }
+}
+struct GatedProvider {
+    inner: Arc<SkillsProvider>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    panic: bool,
+}
+#[async_trait]
+impl LLMProvider for GatedProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        assert!(!self.panic, "controlled actual provider unwind");
+        Ok(Box::pin(futures::stream::iter(
+            self.inner.next(messages, tools).into_iter().map(Ok),
+        )))
+    }
+}
+#[actix_web::test]
+async fn native_http_actual_stop_and_provider_unwind_revoke_retained_executor() {
+    for unwind in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        write_skill(home.path(), "native-proof", true);
+        let provider = Arc::new(GatedProvider {
+            inner: provider(home.path(), 4096, false),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            panic: unwind,
+        });
+        let state = state(home.path(), provider.clone()).await;
+        let id = format!("native-revoke-{unwind}");
+        seed(&state, &id, 4096).await;
+        bindings()
+            .lock()
+            .unwrap()
+            .insert(id.clone(), std::sync::Weak::new());
+        let (status, body) = http(
+            &state,
+            "/api/v1/chat",
+            json!({"session_id":id,"message":"Inspect proof"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let executor = bindings()
+            .lock()
+            .unwrap()
+            .remove(&id)
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        assert!(executor.run.live.load(Ordering::Acquire));
+        assert_eq!(
+            executor.run.reservation_id,
+            body["run_id"].as_str().unwrap()
+        );
+        if unwind {
+            provider.release.notify_one();
+        } else {
+            let (status, body) =
+                http(&state, &format!("/api/v1/sessions/{id}/stop"), json!({})).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(executor.run.cancel.is_cancelled());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while executor.run.live.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual runtime drop/unwind must finish its host");
+        assert!(executor.run.check_live().is_err());
+        let call = ToolCall {
+            id: "retained-native-call".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "skills_read".into(),
+                arguments: json!({"package":"spoof","resource":"SKILL.md"}).to_string(),
+            },
+        };
+        assert!(executor
+            .execute_with_context(
+                &call,
+                ToolExecutionContext {
+                    session_id: Some(&id),
+                    ..ToolExecutionContext::none(&call.id)
+                }
+            )
+            .await
+            .is_err());
+        assert!(!provider.inner.trace.lock().unwrap().task_started);
+    }
+}
+
+struct RevokingProvider {
+    inner: Arc<SkillsProvider>,
+    config: Mutex<Option<Arc<tokio::sync::RwLock<bamboo_llm::Config>>>>,
+    source: Option<PathBuf>,
+    revoked: AtomicBool,
+}
+#[async_trait]
+impl LLMProvider for RevokingProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let continuation = {
+            let trace = self.inner.trace.lock().unwrap();
+            trace.pending.as_ref().is_some_and(|(id, name)| {
+                name == "skills_read"
+                    && messages.iter().any(|m| {
+                        m.tool_call_id.as_deref() == Some(id)
+                            && m.tool_success == Some(true)
+                            && serde_json::from_str::<Value>(&m.content)
+                                .is_ok_and(|p| p["next_cursor"].is_string())
+                    })
+            })
+        };
+        if continuation && !self.revoked.swap(true, Ordering::AcqRel) {
+            if let Some(source) = &self.source {
+                let mut body = std::fs::read_to_string(source).unwrap();
+                body.push('\n');
+                std::fs::write(source, body).unwrap();
+            } else {
+                let config = self.config.lock().unwrap().as_ref().unwrap().clone();
+                config
+                    .write()
+                    .await
+                    .skills
+                    .disabled
+                    .push("native-proof".into());
+            }
+        }
+        Ok(Box::pin(futures::stream::iter(
+            self.inner.next(messages, tools).into_iter().map(Ok),
+        )))
+    }
+}
+#[actix_web::test]
+async fn native_http_warm_reader_checks_current_disabled_and_raw_source_before_task() {
+    for source_changed in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        write_skill(home.path(), "native-proof", true);
+        let provider = Arc::new(RevokingProvider {
+            inner: provider(home.path(), 4096, false),
+            config: Mutex::default(),
+            source: source_changed.then(|| home.path().join("skills/native-proof/SKILL.md")),
+            revoked: AtomicBool::new(false),
+        });
+        let state = state(home.path(), provider.clone()).await;
+        *provider.config.lock().unwrap() = Some(state.config.clone());
+        let id = format!("native-source-revoked-{source_changed}");
+        seed(&state, &id, 4096).await;
+        let (status, body) = http(
+            &state,
+            "/api/v1/chat",
+            json!({"session_id":id,"message":"Inspect proof"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert!(matches!(done(&state, &id).await, AgentStatus::Completed));
+        assert!(provider.revoked.load(Ordering::Acquire));
+        let trace = provider.inner.trace.lock().unwrap();
+        assert_eq!(trace.main_pages, 1);
+        assert_eq!(trace.failures.len(), 1, "{:?}", trace.failures);
+        assert!(trace.eof.is_empty() && !trace.task_started && !trace.task_completed);
+    }
+}
+
+#[actix_web::test]
+async fn native_http_existing_root_second_typed_input_uses_canonical_f_with_hook_once() {
+    let home = tempfile::tempdir().unwrap();
+    write_skill(home.path(), "native-proof", true);
+    let provider = provider(home.path(), 4096, false);
+    let state = state(home.path(), provider.clone()).await;
+    let id = "native-existing-root";
+    seed(&state, id, 4096).await;
+    let (status, body) = http(
+        &state,
+        "/api/v1/chat",
+        json!({"session_id":id,"message":"initial ordinary action"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(matches!(done(&state, id).await, AgentStatus::Completed));
+    *provider.trace.lock().unwrap() = Trace::default();
+    let count = home.path().join("hook-count.txt");
+    state.config.write().await.lifecycle_hooks=bamboo_config::LifecycleHooksConfig { enabled:true,
+        user_prompt_submit:vec![bamboo_config::LifecycleHookGroup {enabled:true,matcher:None,hooks:vec![
+            bamboo_config::LifecycleHookHandler::command(format!("printf 'hit\\n' >> '{}'; printf '%s' '{{\"additional_context\":\"HTTP_HOOK_ACCEPTED\"}}'",count.display()),bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS)
+        ]}],..Default::default()};
+    let selection = selection(&state, "native-proof").await;
+    let old = state.storage.load_session(id).await.unwrap().unwrap();
+    let (status, body) = http(
+        &state,
+        "/api/v1/chat",
+        json!({"session_id":id,"message":"new real User", "workflow_selection":selection}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let input = body["message_id"].as_str().unwrap();
+    let checkpoint = state.storage.load_session(id).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&old.messages).unwrap(),
+        serde_json::to_value(&checkpoint.messages).unwrap()
+    );
+    assert!(!checkpoint.messages.iter().any(|m| m.id == input));
+    let (status, body) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(matches!(done(&state, id).await, AgentStatus::Completed));
+    assert_eq!(std::fs::read_to_string(count).unwrap(), "hit\n");
+    let trace = provider.trace.lock().unwrap();
+    let user = trace.requests[0].iter().find(|m| m.id == input).unwrap();
+    assert!(user.content.contains("HTTP_HOOK_ACCEPTED") && user.content.contains("Explicit Skill"));
+    assert!(
+        trace.failures.is_empty() && trace.task_completed,
+        "{:?}",
+        trace.failures
+    );
+}
+
+#[actix_web::test]
+async fn native_http_stale_and_oversized_selection_reject_before_inbox_or_user_append() {
+    let home = tempfile::tempdir().unwrap();
+    write_skill(home.path(), "native-proof", true);
+    let provider = provider(home.path(), 4096, false);
+    let state = state(home.path(), provider.clone()).await;
+    let id = "native-invalid-selection";
+    seed(&state, id, 4096).await;
+    let selected = selection(&state, "native-proof").await;
+    for oversized in [false, true] {
+        let mut invalid = selected.clone();
+        if oversized {
+            invalid.args = json!({"data":"a".repeat(8193)});
+        } else {
+            invalid.revision += 1;
+        }
+        let (status, body) = http(
+            &state,
+            "/api/v1/chat",
+            json!({"session_id":id,"message":"must not append","workflow_selection":invalid}),
+        )
+        .await;
+        assert!(status.is_client_error(), "{status} {body}");
+        assert!(state
+            .storage
+            .load_session(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .messages
+            .is_empty());
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 0);
+        assert!(provider.trace.lock().unwrap().requests.is_empty());
+    }
+}
