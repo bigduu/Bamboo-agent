@@ -579,7 +579,8 @@ const ROOT_AUTHORITY_LOST: &str =
 /// The exact local runner guard keeps this fixed error ahead of any successor's
 /// Started frame on the shared session channel. A successor already installed
 /// in the registry must not receive the obsolete run's error or cancellation.
-async fn interrupt_root_on_authority_loss(
+/// Server adapters share this boundary with the generic engine forwarder.
+pub async fn interrupt_root_on_authority_loss(
     error: &std::io::Error,
     session_id: &str,
     run_id: &str,
