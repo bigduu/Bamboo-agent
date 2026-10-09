@@ -109,6 +109,12 @@ impl ResponseResumeHandoff {
         self.event_sender.subscribe()
     }
 
+    /// Let a terminal response use the same fenced forwarder without resuming
+    /// the model. Its owner must publish the history barrier before release.
+    pub fn into_parts(self) -> (SessionExecutionReservation, broadcast::Sender<AgentEvent>) {
+        (self.execution_reservation, self.event_sender)
+    }
+
     pub fn publish_event(&mut self, event: AgentEvent) {
         if let Some(event) = self.execution_reservation.queue_root_response_event(event) {
             let _ = self.event_sender.send(event);

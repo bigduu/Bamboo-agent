@@ -68,6 +68,18 @@ fn no_progress_continue_and_custom_direction_preserve_tool_evidence() {
             bamboo_agent_core::Role::User
         );
         assert_eq!(session.messages.last().unwrap().content, response);
+        let runtime_kind = session
+            .messages
+            .last()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("runtime_kind"))
+            .and_then(|kind| kind.as_str());
+        assert_eq!(
+            runtime_kind,
+            (response == "Continue").then_some("no_progress_continue")
+        );
         assert_eq!(
             session
                 .messages

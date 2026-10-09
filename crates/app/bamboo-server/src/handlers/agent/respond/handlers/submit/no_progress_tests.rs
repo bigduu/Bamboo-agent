@@ -149,6 +149,16 @@ async fn no_progress_registered_http_stop_is_consumed_once_with_zero_provider_ca
             .configure(crate::routes::configure_routes),
     )
     .await;
+    // Subscribe through the registered SSE route while the Root is paused.
+    // The Stop response must reach this live stream before releasing ownership.
+    let events = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/sessions/http-progress-stop/events")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(events.status(), actix_web::http::StatusCode::OK);
     let request = || {
         test::TestRequest::post()
             .uri("/api/v1/sessions/http-progress-stop/respond")
@@ -160,6 +170,16 @@ async fn no_progress_registered_http_stop_is_consumed_once_with_zero_provider_ca
     let body: serde_json::Value = test::read_body_json(response).await;
     assert_eq!(body["stopped"], true);
     assert_eq!(body["auto_resume_status"], "completed");
+    let stream = tokio::time::timeout(std::time::Duration::from_secs(5), test::read_body(events))
+        .await
+        .expect("Stop closes the existing HTTP stream");
+    let stream = String::from_utf8(stream.to_vec()).unwrap();
+    assert!(
+        stream.contains("Stopped this run. Send another message to continue."),
+        "{stream}"
+    );
+    assert!(stream.contains("\"type\":\"cancelled\""), "{stream}");
+    assert_eq!(stream.matches("[DONE]").count(), 1);
     let duplicate = test::call_service(&app, request()).await;
     assert_eq!(duplicate.status(), actix_web::http::StatusCode::BAD_REQUEST);
     let durable = state

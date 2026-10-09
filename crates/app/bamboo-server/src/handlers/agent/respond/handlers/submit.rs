@@ -23,6 +23,40 @@ fn response_expected_tool_call_id(
     })
 }
 
+async fn publish_progress_stop(
+    state: web::Data<AppState>,
+    session_id: String,
+    message: bamboo_agent_core::Message,
+    handoff: bamboo_engine::session_app::resume::ResponseResumeHandoff,
+) -> bool {
+    let (reservation, event_sender) = handoff.into_parts();
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(4);
+    let mut history_commit =
+        crate::handlers::agent::execute::runtime::spawn_event_forwarder_with_root_actor(
+            state,
+            session_id.clone(),
+            reservation.run_id().to_string(),
+            event_rx,
+            event_sender,
+            None,
+            reservation.root_actor_writer(),
+        );
+    let published = event_tx
+        .send(AgentEvent::message_appended(&session_id, &message))
+        .await
+        .is_ok()
+        && event_tx
+            .send(AgentEvent::Cancelled {
+                message: Some("Stopped by the user.".into()),
+            })
+            .await
+            .is_ok()
+        && history_commit.send_and_wait(&event_tx, session_id).await;
+    drop(event_tx);
+    reservation.abandon().await;
+    published
+}
+
 /// Submit a user response to a pending question from the `conclusion_with_options` tool.
 ///
 /// When the agent calls the `conclusion_with_options` tool, it pauses execution and waits
@@ -268,11 +302,26 @@ async fn submit_response_inner(
 
     if stop_progress_pause {
         // The same guarded CAS consumed the runtime question and saved the
-        // stopped session. Release its unused successor without provider work.
-        if let Some(message) = session.messages.last() {
-            handoff.publish_event(AgentEvent::message_appended(&session_id, message));
+        // stopped session. A detached owner publishes through the existing
+        // fenced forwarder/barrier before releasing its unused successor.
+        let message = session
+            .messages
+            .last()
+            .expect("Stop acknowledgement")
+            .clone();
+        if !tokio::spawn(publish_progress_stop(
+            state.clone(),
+            session_id.clone(),
+            message,
+            handoff,
+        ))
+        .await
+        .unwrap_or(false)
+        {
+            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": crate::error::error_value("Stop was saved but its event publication failed")
+            })));
         }
-        handoff.abandon().await;
         return Ok(HttpResponse::Ok().json(serde_json::json!({
             "success": true,
             "message": "Run stopped.",

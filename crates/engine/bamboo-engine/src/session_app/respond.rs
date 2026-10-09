@@ -552,7 +552,11 @@ fn apply_pending_response(
     let found = if no_progress_question {
         // Runtime questions have no ToolCall. Keep every real tool result and
         // append the Human's direction as an ordinary User turn.
-        session.add_message(Message::user(input.user_response.clone()));
+        let mut direction = Message::user(input.user_response.clone());
+        if input.user_response == super::no_progress::CONTINUE_OPTION {
+            direction.metadata = Some(serde_json::json!({"runtime_kind": "no_progress_continue"}));
+        }
+        session.add_message(direction);
         true
     } else {
         update_or_append_tool_result_message(
