@@ -1118,7 +1118,7 @@ impl WorkflowRunEngine {
                 self.active.remove(run_id);
                 self.events.remove(run_id);
             }
-            return Ok(result);
+            Ok(result)
         }
     }
 
