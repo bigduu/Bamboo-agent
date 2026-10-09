@@ -127,7 +127,47 @@ pub(crate) async fn prepare_session_for_loop(
     // Resume compatibility: recover metadata before any workspace-scoped skill
     // or instruction lookup, then permanently remove the legacy prompt marker.
     migrate_legacy_workspace_prompt(session);
-    publish_pending_workflow_lifecycle_event(session, config, event_tx).await?;
+    if config.sdk_skill_execution_host.is_some() {
+        // Validate and convert old Instruction history before any old outbox,
+        // without resolving a live workflow or changing WorkflowRun state.
+        let plan =
+            legacy_skill_history::plan_legacy_skill_history(&session.messages, &session.metadata)
+                .map_err(AgentError::Tool)?;
+        if plan.unsupported.is_none()
+            && (plan.message.is_some() || !plan.remove_metadata.is_empty())
+        {
+            if let (Some(after), Some(message)) = (plan.insert_after, plan.message) {
+                session.messages.insert(after + 1, message);
+            }
+            for key in plan.remove_metadata {
+                session.metadata.remove(&key);
+            }
+            let persistence = config.persistence.as_ref().ok_or_else(|| {
+                AgentError::Tool(
+                    "SDK legacy history conversion requires runtime persistence".into(),
+                )
+            })?;
+            persistence
+                .checkpoint_runtime_session(session)
+                .await
+                .map_err(|error| {
+                    AgentError::Tool(format!(
+                        "SDK legacy history conversion checkpoint failed: {error}"
+                    ))
+                })?;
+        }
+        // WorkflowRun / Orchestration retains its existing lifecycle outbox.
+        let orchestration = session
+            .metadata
+            .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
+            .and_then(|raw| serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw).ok())
+            .is_some_and(|active| active.kind == bamboo_skills::WorkflowKind::Orchestration);
+        if orchestration {
+            publish_pending_workflow_lifecycle_event(session, config, event_tx).await?;
+        }
+    } else {
+        publish_pending_workflow_lifecycle_event(session, config, event_tx).await?;
+    }
     let skill_context = legacy_instruction::prepare_context(
         session,
         initial_message,

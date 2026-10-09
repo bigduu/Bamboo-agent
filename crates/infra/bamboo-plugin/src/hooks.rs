@@ -337,14 +337,29 @@ mod tests {
     fn rejects_non_unicode_file_and_directory_names() {
         use std::os::unix::ffi::OsStringExt;
         let temp = tempfile::tempdir().unwrap();
+        let created = |result: std::io::Result<()>| {
+            #[cfg(target_os = "macos")]
+            if let Err(error) = &result {
+                if error.raw_os_error() == Some(92) {
+                    // macOS can reject the name before hash_tree can inspect it.
+                    assert_eq!(error.raw_os_error(), Some(92)); // Darwin EILSEQ
+                    assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none());
+                    return false;
+                }
+            }
+            result.unwrap();
+            true
+        };
         for byte in [0xff, 0xfe] {
             let path = temp.path().join(std::ffi::OsString::from_vec(vec![byte]));
-            std::fs::create_dir(&path).unwrap();
-            assert!(hash_tree(temp.path(), temp.path(), &mut Sha256::new(), &mut 0).is_err());
-            std::fs::remove_dir(&path).unwrap();
-            std::fs::write(&path, "policy").unwrap();
-            assert!(hash_tree(temp.path(), temp.path(), &mut Sha256::new(), &mut 0).is_err());
-            std::fs::remove_file(&path).unwrap();
+            if created(std::fs::create_dir(&path)) {
+                assert!(hash_tree(temp.path(), temp.path(), &mut Sha256::new(), &mut 0).is_err());
+                std::fs::remove_dir(&path).unwrap();
+            }
+            if created(std::fs::write(&path, "policy")) {
+                assert!(hash_tree(temp.path(), temp.path(), &mut Sha256::new(), &mut 0).is_err());
+                std::fs::remove_file(&path).unwrap();
+            }
         }
     }
 

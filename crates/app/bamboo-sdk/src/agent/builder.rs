@@ -181,6 +181,7 @@ pub struct AgentBuilder {
     /// permission policy, so policy setters are order-independent.
     assembled_config: Option<Arc<RwLock<Config>>>,
     assembled_mcp_tools: Option<Arc<dyn ToolExecutor>>,
+    assembled_skill_manager: Option<Arc<SkillManager>>,
     /// Concrete session-index handle assembled by `with_defaults_for_data_dir`
     /// (internal — not settable directly). Carried onto [`Agent`] to back the
     /// session-listing ergonomics ([`Agent::list_sessions`](super::Agent::list_sessions)),
@@ -220,6 +221,7 @@ impl AgentBuilder {
             tool_event_publisher: Arc::new(NoopToolEventPublisher),
             assembled_config: None,
             assembled_mcp_tools: None,
+            assembled_skill_manager: None,
             session_store: None,
             project_store: None,
             project_sessions: None,
@@ -642,7 +644,9 @@ impl AgentBuilder {
         // 4. Skill manager.
         let skill_manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
             skills_dir: data_dir.join("skills"),
-            project_dir: std::env::current_dir().ok(),
+            // Session Project/workspace sources are selected from their actual
+            // canonical scope; ambient process cwd cannot stand in for it.
+            project_dir: None,
             active_mode: None,
         }));
         skill_manager
@@ -658,13 +662,14 @@ impl AgentBuilder {
 
         self.session_store = Some(store.clone());
         self.project_store = Some(project_store);
-        self.project_sessions = Some(project_sessions);
+        self.project_sessions = Some(project_sessions.clone());
+        self.assembled_skill_manager = Some(skill_manager.clone());
         self.assembled_config = Some(assembled_config.clone());
         self.assembled_mcp_tools = mcp_tools;
         self.inner = self
             .inner
             .storage(store.clone())
-            .persistence(persistence)
+            .persistence(Arc::new(project_sessions))
             .attachment_reader(store)
             .skill_manager(skill_manager)
             .metrics_collector(metrics_collector)
@@ -729,6 +734,7 @@ impl AgentBuilder {
             self.inner = self.inner.provider(provider);
         }
 
+        let mut sdk_skills = None;
         // An explicit `tools` policy (including the empty policy) always has
         // final precedence. Otherwise preserve an explicitly injected default
         // executor across defaults assembly.
@@ -752,10 +758,11 @@ impl AgentBuilder {
             let builtin_tools = match self.permission_checker.clone() {
                 Some(checker) => {
                     bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
-                        config, checker,
+                        config.clone(),
+                        checker,
                     )
                 }
-                None => bamboo_tools::BuiltinToolExecutor::new_with_config(config),
+                None => bamboo_tools::BuiltinToolExecutor::new_with_config(config.clone()),
             }
             .with_tool_event_publisher(self.tool_event_publisher.clone());
             if let (Some(sessions), Some(projects)) =
@@ -776,6 +783,15 @@ impl AgentBuilder {
                 builtin_tools
                     .register_tool(bamboo_server_tools::ProjectTool::new(sessions, projects))
                     .map_err(|error| SdkError::Build(error.to_string()))?;
+            }
+            if let (Some(manager), Some(sessions), Some(projects)) = (
+                self.assembled_skill_manager.clone(),
+                self.project_sessions.clone(),
+                self.project_store.clone(),
+            ) {
+                sdk_skills = Some(Arc::new(super::skill_runtime::DefaultSdkSkills::new(
+                    manager, config, sessions, projects,
+                )));
             }
             let builtin_tools: Arc<dyn ToolExecutor> = Arc::new(builtin_tools);
             let executor: Arc<dyn ToolExecutor> = match self.assembled_mcp_tools.take() {
@@ -815,7 +831,7 @@ impl AgentBuilder {
             .inner
             .build()
             .map_err(|e| SdkError::Build(e.to_string()))?;
-        Ok(Agent::from_runtime_with_config(
+        let mut agent = Agent::from_runtime_with_config(
             runtime,
             self.system_prompt,
             self.model,
@@ -824,7 +840,9 @@ impl AgentBuilder {
             self.session_store,
             self.permission_checker,
             self.permission_mode,
-        ))
+        );
+        agent.sdk_skills = sdk_skills;
+        Ok(agent)
     }
 }
 

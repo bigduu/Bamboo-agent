@@ -1346,6 +1346,39 @@ async fn refresh_turn_boundary_inner(
     // Read via the typed accessor (prefers `runtime_metadata`, falls back to the
     // legacy `pending_injected_messages` JSON string; defensive on malformed).
     let Some(messages) = latest.pending_injected_messages() else {
+        if let Some((execution_id, observation)) =
+            capture.filter(|_| super::session_setup::legacy_instruction::sdk_runtime_active())
+        {
+            let pending_absent = !latest.metadata.contains_key("pending_injected_messages")
+                && latest
+                    .runtime_metadata
+                    .as_ref()
+                    .is_none_or(|metadata| metadata.pending_injected_messages.is_none());
+            let current_users = session
+                .messages
+                .iter()
+                .filter(|message| message.role == bamboo_agent_core::Role::User);
+            let durable_users = latest
+                .messages
+                .iter()
+                .filter(|message| message.role == bamboo_agent_core::Role::User);
+            let mut current_users = current_users;
+            let mut durable_users = durable_users;
+            let same_inputs = loop {
+                match (current_users.next(), durable_users.next()) {
+                    (None, None) => break true,
+                    (Some(current), Some(durable))
+                        if crate::runtime::config::sdk_message_digest(current)
+                            == crate::runtime::config::sdk_message_digest(durable) => {}
+                    _ => break false,
+                }
+            };
+            if read_complete && pending_absent && same_inputs {
+                *observation = crate::runtime::managers::lifecycle::InputObservation::projected(
+                    project_input_request_batch(&session.id, execution_id, &[]),
+                );
+            }
+        }
         return TurnBoundaryRefresh {
             merged: 0,
             committed_messages: Vec::new(),
@@ -1538,6 +1571,70 @@ mod tests {
             snapshots[0], snapshots[1],
             "provider input, memory refresh, events and posture remain identical"
         );
+    }
+
+    #[tokio::test]
+    async fn sdk_no_inbox_no_new_checks_user_inputs_only_and_unknown_storage_clears() {
+        use crate::runtime::runner::session_setup::legacy_instruction::scope_sdk_runtime;
+        use bamboo_domain::RuntimeSessionPersistence;
+        let (_home, store, locked, _inbox, mut session) = durable_inbox_fixture("sdk-no-new").await;
+        session.add_message(Message::user("accepted SDK input"));
+        locked
+            .checkpoint_runtime_session(&mut session)
+            .await
+            .unwrap();
+        let storage: Arc<dyn Storage> = store;
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> = locked;
+        session.add_message(Message::system("normal assembled system"));
+        session.add_message(Message::assistant("normal output", None));
+        let (_, generic) = refresh_turn_boundary_with_observation(
+            &mut session,
+            Some(&storage),
+            Some(&persistence),
+            None,
+            None,
+            "sdk-actual",
+        )
+        .await;
+        assert!(
+            generic.is_unavailable(),
+            "generic history never establishes SDK currentness"
+        );
+        let (_, same) = scope_sdk_runtime(refresh_turn_boundary_with_observation(
+            &mut session,
+            Some(&storage),
+            Some(&persistence),
+            None,
+            None,
+            "sdk-actual",
+        ))
+        .await;
+        assert!(same.is_successful_no_new_input());
+        assert!(
+            same.new_inputs().is_none(),
+            "NoNew never manufactures a User or Source"
+        );
+        session.add_message(Message::user("unsaved input"));
+        let (_, changed) = scope_sdk_runtime(refresh_turn_boundary_with_observation(
+            &mut session,
+            Some(&storage),
+            Some(&persistence),
+            None,
+            None,
+            "sdk-actual",
+        ))
+        .await;
+        assert!(changed.is_unavailable());
+        let (_, missing) = scope_sdk_runtime(refresh_turn_boundary_with_observation(
+            &mut session,
+            None,
+            Some(&persistence),
+            None,
+            None,
+            "sdk-actual",
+        ))
+        .await;
+        assert!(missing.is_unavailable());
     }
 
     fn ql_envelope(id: &str, ordinal: usize, bytes: Option<usize>) -> SessionMessageEnvelope {

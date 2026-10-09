@@ -49,6 +49,8 @@ pub struct AgentRuntime {
     pub persistence: Arc<dyn RuntimeSessionPersistence>,
     /// Capturing no inherited wait is also immutable for this execution.
     pub(crate) inherited_child_wait_captured: bool,
+    pub(crate) sdk_skill_execution_host:
+        Option<Arc<dyn crate::runtime::config::SdkSkillExecutionHost>>,
     pub session_inbox: Option<Arc<dyn SessionInboxPort>>,
     pub activation_router: Option<Arc<SessionActivationRouter>>,
     pub session_messenger: Option<Arc<SessionMessenger>>,
@@ -223,6 +225,7 @@ impl AgentRuntimeBuilder {
         }
         Ok(AgentRuntime {
             inherited_child_wait_captured: false,
+            sdk_skill_execution_host: None,
             storage: self.storage.ok_or_else(|| format_missing("storage"))?,
             persistence: self
                 .persistence
@@ -734,6 +737,27 @@ impl AgentRuntime {
         req: ExecuteRequest,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     ) -> crate::runtime::runner::Result<()> {
+        struct SdkFinish {
+            host: Option<Arc<dyn crate::runtime::config::SdkSkillExecutionHost>>,
+            session_id: String,
+            execution_id: String,
+        }
+        impl Drop for SdkFinish {
+            fn drop(&mut self) {
+                if let Some(host) = self.host.as_ref() {
+                    host.finish(&self.session_id, &self.execution_id);
+                }
+            }
+        }
+        let _sdk_finish = SdkFinish {
+            host: self.sdk_skill_execution_host.clone(),
+            session_id: session.id.clone(),
+            execution_id: inputs
+                .as_ref()
+                .and_then(|inputs| inputs.sdk_execution_id())
+                .unwrap_or("")
+                .to_owned(),
+        };
         let existing = self.persistence.inherited_child_wait();
         if let Some(inherited) = existing.as_ref() {
             inherited
@@ -828,10 +852,15 @@ impl AgentRuntime {
             provider_type,
             ..
         } = model_roster;
-        let hook_runner = Arc::new(
-            self.hook_runner
-                .with_lifecycle_config(&config.lifecycle_hooks, app_data_dir.clone()),
-        );
+        let hook_runner = inputs
+            .as_ref()
+            .and_then(|inputs| inputs.sdk_hook_runner())
+            .unwrap_or_else(|| {
+                Arc::new(
+                    self.hook_runner
+                        .with_lifecycle_config(&config.lifecycle_hooks, app_data_dir.clone()),
+                )
+            });
 
         let loop_config = AgentLoopConfig {
             ticket_worker_plan: ticket_worker_plan.clone(),
@@ -844,6 +873,7 @@ impl AgentRuntime {
             selected_skill_ids,
             selected_skill_mode,
             initial_untrusted_inputs: inputs,
+            sdk_skill_execution_host: self.sdk_skill_execution_host.clone(),
             skill_manager: Some(self.skill_manager.clone()),
             project_context_resolver: self.project_context_resolver.clone(),
             skip_initial_user_message: true,
@@ -959,7 +989,8 @@ impl AgentRuntime {
         let trace_message_start = session.messages.len();
         let session_end_runner = loop_config.hook_runner.clone();
         let session_end_event_tx = event_tx.clone();
-        let result = Box::pin(run_agent_loop_with_config(
+        let sdk_mode = loop_config.sdk_skill_execution_host.is_some();
+        let loop_future = Box::pin(run_agent_loop_with_config(
             session,
             initial_message,
             event_tx,
@@ -967,8 +998,15 @@ impl AgentRuntime {
             tools,
             cancel_token,
             loop_config,
-        ))
-        .await;
+        ));
+        let result = if sdk_mode {
+            crate::runtime::runner::session_setup::legacy_instruction::scope_sdk_runtime(
+                loop_future,
+            )
+            .await
+        } else {
+            loop_future.await
+        };
 
         crate::runtime::hooks::run_session_end_hooks(
             &session_end_runner,

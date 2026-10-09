@@ -948,7 +948,12 @@ async fn fixture_sessions_poll_survives_idle_peer_close() {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
             match listener.accept() {
-                Ok((peer, _)) => return Ok(peer),
+                Ok((peer, _)) => {
+                    // Darwin inherits the listener's nonblocking mode. The
+                    // bounded request reader below expects a blocking stream.
+                    peer.set_nonblocking(false)?;
+                    return Ok(peer);
+                }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         && std::time::Instant::now() < deadline =>
