@@ -420,18 +420,6 @@ impl NativeRun {
     }
     async fn check_owner(&self) -> Result<u64, ToolError> {
         let epoch = self.check_live()?;
-        if let Some(observer) = self.policy.state.root_observer.as_ref() {
-            let current = tokio::select! { biased;
-                _ = self.cancel.cancelled() => return Err(denied("Native surface check was cancelled")),
-                current = observer() => current,
-            };
-            if current
-                .as_ref()
-                .is_none_or(|current| !Arc::ptr_eq(current, &self.policy.base))
-            {
-                return Err(denied("Native registered Root surface changed"));
-            }
-        }
         let registry = self
             .policy
             .state
@@ -450,6 +438,18 @@ impl NativeRun {
                 )
         }) {
             return Err(denied("Native runner identity changed"));
+        }
+        if let Some(observer) = self.policy.state.root_observer.as_ref() {
+            let current = tokio::select! { biased;
+                _ = self.cancel.cancelled() => return Err(denied("Native surface check was cancelled")),
+                current = observer() => current,
+            };
+            if current
+                .as_ref()
+                .is_none_or(|current| !Arc::ptr_eq(current, &self.policy.base))
+            {
+                return Err(denied("Native registered Root surface changed"));
+            }
         }
         if self.check_live()? != epoch {
             return Err(denied("Native owner changed during validation"));
