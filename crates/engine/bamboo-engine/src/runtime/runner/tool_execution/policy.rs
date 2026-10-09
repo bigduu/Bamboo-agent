@@ -8,9 +8,10 @@ use sha2::{Digest, Sha256};
 const MAX_TOOL_CALLS_PER_ROUND: usize = 80;
 const MAX_CONSECUTIVE_FAILURES_PER_TOOL: usize = 3;
 const UNCHANGED_OBSERVATION_ROUNDS: usize = 3;
+const PAUSE_UNCHANGED_OBSERVATION_ROUNDS: usize = 6;
 const MAX_TRACKED_OBSERVATIONS: usize = 80;
 
-/// Advisory only: compare complete successful filesystem-observation rounds.
+/// Compare complete successful filesystem-observation rounds.
 /// Keep fingerprints, not arguments or output, and forget everything at run end.
 #[derive(Debug, Clone, Default)]
 struct ObservationProgress {
@@ -259,6 +260,15 @@ impl ToolPolicyGuard {
 
     pub(crate) fn observation_progress_hint(&mut self) -> Option<&'static str> {
         self.observation_progress.finish_round()
+    }
+
+    /// Checked after `observation_progress_hint` consumes the completed round.
+    pub(crate) fn should_pause_for_observation_progress(&self) -> bool {
+        self.observation_progress.unchanged_rounds == PAUSE_UNCHANGED_OBSERVATION_ROUNDS
+    }
+
+    pub(crate) fn reset_observation_progress(&mut self) {
+        self.observation_progress = ObservationProgress::default();
     }
 
     pub(super) fn check_before_execution(
@@ -513,6 +523,7 @@ mod tests {
         let mut guard = ToolPolicyGuard::default();
         for round in 0..8 {
             assert_eq!(observation_round(&mut guard, round, &calls), round == 2);
+            assert_eq!(guard.should_pause_for_observation_progress(), round == 5);
             assert!(guard
                 .check_before_execution(&tool_call("Read", "{}"), 0)
                 .is_ok());
@@ -521,6 +532,9 @@ mod tests {
         assert!(!observation_round(&mut fresh, 0, &calls));
         assert!(!observation_round(&mut fresh, 1, &calls));
         assert!(observation_round(&mut fresh, 2, &calls));
+        fresh.reset_observation_progress();
+        assert!(!fresh.should_pause_for_observation_progress());
+        assert!(!observation_round(&mut fresh, 3, &calls));
     }
 
     #[test]
