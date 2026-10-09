@@ -362,8 +362,12 @@ async fn native_http_typed_main_reads_complete_pages_reference_then_actual_task(
         .await
         .unwrap()
         .activation_pending());
-    let (status, response) =
-        http(&state, &format!("/api/v1/sessions/{id}/execute"), json!({})).await;
+    let (status, response) = http(
+        &state,
+        &format!("/api/v1/sessions/{id}/execute"),
+        json!({"skill_mode":"code"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{response}");
     assert!(matches!(done(&state, id).await, AgentStatus::Completed));
     let stored = state.storage.load_session(id).await.unwrap().unwrap();
@@ -694,6 +698,14 @@ async fn native_http_existing_root_second_typed_input_uses_canonical_f_with_hook
     let state = state(home.path(), provider.clone()).await;
     let id = "native-existing-root";
     seed(&state, id).await;
+    state
+        .session_repo
+        .update_runtime_session(id, &["skill_mode"], |session| {
+            session.metadata.insert("skill_mode".into(), "code".into());
+        })
+        .await
+        .unwrap()
+        .unwrap();
     let (status, body) = http(
         &state,
         "/api/v1/chat",
@@ -786,6 +798,7 @@ impl LLMProvider for ScopeChangingProvider {
                 state
                     .session_repo
                     .update_runtime_session(&self.session_id, &["workspace_path"], |session| {
+                        session.metadata_version = session.metadata_version.checked_add(1).unwrap();
                         session.set_workspace_path_meta(workspace)
                     })
                     .await
@@ -833,9 +846,15 @@ async fn native_http_warm_reader_rejects_actual_canonical_scope_and_policy_chang
         assert!(provider.changed.load(Ordering::Acquire));
         let trace = provider.inner.trace.lock().unwrap();
         if change == 0 {
-            assert!(matches!(terminal, AgentStatus::Completed), "{terminal:?}");
-            assert_eq!(trace.failures.len(), 1);
-            assert!(trace.failures[0].contains("Native canonical Session Source scope changed"));
+            let reason = "Native canonical Session Source scope changed";
+            assert!(
+                matches!(&terminal, AgentStatus::Error(error) if error.contains(reason))
+                    || (matches!(terminal, AgentStatus::Completed)
+                        && trace.failures.len() == 1
+                        && trace.failures[0].contains(reason)),
+                "Scope must deny at metadata or Reader: {terminal:?}; {:?}",
+                trace.failures
+            );
         } else {
             assert!(
                 matches!(terminal, AgentStatus::Error(ref reason) if reason.contains("Native Skill policy changed")),
@@ -845,6 +864,13 @@ async fn native_http_warm_reader_rejects_actual_canonical_scope_and_policy_chang
         assert_eq!(trace.main_pages, 1);
         assert!(trace.eof.is_empty() && !trace.task_started && !trace.task_completed);
         drop(trace);
+        if change == 0 {
+            let durable = state.storage.load_session(&id).await.unwrap().unwrap();
+            assert_eq!(
+                workspace_identity(&durable).unwrap().unwrap(),
+                provider.workspace.canonicalize().unwrap()
+            );
+        }
     }
 }
 

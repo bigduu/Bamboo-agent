@@ -465,11 +465,9 @@ impl NativeRun {
                 if record.input_id != input_id || !is_user(record) {
                     return Err(denied("Native current User binding changed"));
                 }
-                if record
-                    .request
-                    .as_ref()
-                    .is_some_and(|request| request.mode != self.policy.mode)
-                {
+                if record.request.as_ref().is_some_and(|request| {
+                    request.mode.is_some() && request.mode != self.policy.mode
+                }) {
                     return Err(denied("Native Skill mode differs from its host"));
                 }
                 Ok(record
