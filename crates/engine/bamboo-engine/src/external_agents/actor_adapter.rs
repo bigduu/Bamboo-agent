@@ -54,12 +54,8 @@ use crate::runtime::execution::{ExternalChildRunner, SessionInboxRuntimeBinding,
 /// supported operating point rather than an opt-in escape hatch.
 pub const DEFAULT_MAX_CONCURRENT_ACTORS: usize = 200;
 
-/// Max nesting depth for direct nested execution (Phase 6). A worker whose
-/// session `spawn_depth` is below this gets its own spawn stack + the real
-/// SubAgent tool; at/over it, neither (and the tool itself refuses). Mirrors
-/// `bamboo_server_tools::DEFAULT_MAX_SPAWN_DEPTH` (kept in sync; engine can't
-/// depend on server-tools). Root orchestrator = 0 ⇒ 4 levels of sub-agents.
-pub const MAX_SPAWN_DEPTH: u32 = 4;
+/// Compatibility name for the default. Runtime creation uses Host config.
+pub use bamboo_config::DEFAULT_MAX_SPAWN_DEPTH as MAX_SPAWN_DEPTH;
 
 /// Default cap on idle pooled (warm, reusable) workers kept per fingerprint.
 const DEFAULT_MAX_IDLE_PER_KEY: usize = 4;
@@ -1455,9 +1451,11 @@ pub struct ActorChildRunner {
     credentials: Vec<ScopedCredential>,
     /// Parent's default provider (used when the child has no explicit one).
     default_provider: String,
+    /// Startup fallback for embeddings without a live Host configuration.
+    max_spawn_depth: u32,
     /// Live server configuration used to resolve provider credentials at child
-    /// activation time. This is deliberately limited to provider provisioning:
-    /// executor/placement policy remains the immutable runner configuration.
+    /// activation time, including the depth cap for new worker provisioning.
+    /// Executor/placement policy remains the immutable runner configuration.
     live_provider_config: Option<Arc<tokio::sync::RwLock<bamboo_llm::Config>>>,
     /// The mailbox bus to run local children over (the unified transport). Local
     /// sub-agents require it; `None` only when no broker could be embedded.
@@ -1756,6 +1754,7 @@ impl ActorChildRunner {
             executor,
             credentials,
             default_provider,
+            max_spawn_depth: MAX_SPAWN_DEPTH,
             live_provider_config: None,
             native_tool_ceiling: None,
             bus: None,
@@ -1813,6 +1812,11 @@ impl ActorChildRunner {
         config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
     ) -> Self {
         self.live_provider_config = Some(config);
+        self
+    }
+
+    pub fn with_max_spawn_depth(mut self, max_spawn_depth: u32) -> Self {
+        self.max_spawn_depth = max_spawn_depth;
         self
     }
 
@@ -2118,6 +2122,7 @@ impl ActorChildRunner {
         job: &SpawnJob,
         credentials: &[ScopedCredential],
         default_provider: &str,
+        max_spawn_depth: u32,
     ) -> ProvisionSpec {
         let mut spec = ProvisionSpec::new(
             ChildIdentity {
@@ -2224,14 +2229,10 @@ impl ActorChildRunner {
                 }
             }
         }
-        // Phase 6 (direct nested execution): a worker BELOW the depth cap may
-        // orchestrate its OWN children — on startup it builds its own spawn
-        // stack and runs the real SubAgent tool (no host proxy). The cap (the
-        // SubAgent tool refuses to spawn at/over `max_spawn_depth`) bounds the
-        // recursion. Driven purely by the child's depth, so it auto-propagates
-        // down the tree without any extra config threading.
-        spec.capabilities.nested_spawn = session.spawn_depth < MAX_SPAWN_DEPTH;
-        spec.capabilities.max_spawn_depth = Some(MAX_SPAWN_DEPTH);
+        // Tool exposure is baked at provision time. Every actual nested create
+        // is also checked against the canonical Host's current depth policy.
+        spec.capabilities.nested_spawn = session.spawn_depth < max_spawn_depth;
+        spec.capabilities.max_spawn_depth = Some(max_spawn_depth);
         // #69: activate child-approval review. Sub-agents enforce permissions so
         // their DANGEROUS actions (the worker uses a HIGH threshold) reach the
         // parent for review — escalated to the human, or model-reviewed off-loop
@@ -2384,6 +2385,7 @@ impl ActorChildRunner {
             job,
             &self.credentials,
             &self.default_provider,
+            self.max_spawn_depth,
         )
     }
 
@@ -2399,7 +2401,13 @@ impl ActorChildRunner {
         let config = config.read().await;
         let credentials = super::runtime::extract_provider_credentials(&config);
         let default_provider = config.effective_default_provider().to_string();
-        self.build_spec_with_provider_config(session, job, &credentials, &default_provider)
+        self.build_spec_with_provider_config(
+            session,
+            job,
+            &credentials,
+            &default_provider,
+            config.subagents().effective_max_spawn_depth(),
+        )
     }
 
     /// The `metadata["placement"]` JSON to stamp on a child from its resolved
@@ -8975,7 +8983,7 @@ async fn remote_canonical_lineage(
         .map_err(|_| remote_broker_unavailable())?;
     let mut chain = Vec::new();
     loop {
-        if chain.len() > MAX_SPAWN_DEPTH as usize {
+        if chain.len() > session.spawn_depth as usize {
             return Err(remote_broker_unavailable());
         }
         let saved = binding
@@ -12319,6 +12327,23 @@ mod tests {
         assert!(remote_canonical_lineage(&binding, &changed).await.is_err());
         store.delete_session(&parent.id).await.unwrap();
         assert!(remote_canonical_lineage(&binding, &child).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn spawn_depth_remote_lineage_accepts_existing_tree_above_default() {
+        let (_temp, store, locked, inbox, root, _claim) =
+            actor_inbox_fixture("deep-remote-root").await;
+        let mut parent = root;
+        for depth in 1..=6 {
+            let child =
+                Session::new_child_of(format!("remote-depth-{depth}"), &parent, "model", "child");
+            store.save_session(&child).await.unwrap();
+            parent = child;
+        }
+        let binding = actor_binding(store, inbox, locked);
+        let chain = remote_canonical_lineage(&binding, &parent).await.unwrap();
+        assert_eq!(chain.len(), 7);
+        assert_eq!(chain.last().unwrap().spawn_depth, 0);
     }
 
     #[tokio::test]
@@ -17471,8 +17496,54 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
+    #[tokio::test]
+    async fn spawn_depth_provisioning_uses_live_policy_for_local_and_remote_workers() {
+        let live = Arc::new(tokio::sync::RwLock::new(bamboo_llm::Config::default()));
+        live.write().await.subagents_mut().max_spawn_depth = Some(1);
+        let mut remote = HashMap::new();
+        remote.insert(
+            "remote-role".into(),
+            ResolvedRemotePlacement {
+                endpoint: "wss://worker.example:8443".into(),
+                token: None,
+                ca_cert_file: None,
+                host_label: None,
+                broker_peer: None,
+                requirements: None,
+            },
+        );
+        let runner = bogus_runner(remote).with_live_provider_config(live.clone());
+        let root = Session::new("provision-root", "model");
+        for role in ["local-role", "remote-role"] {
+            let mut child =
+                Session::new_child_of(format!("provision-{role}"), &root, "model", "child");
+            child.metadata.insert("subagent_type".into(), role.into());
+            let first = runner.build_live_spec(&child, &job_for(&child.id)).await;
+            assert_eq!(first.capabilities.max_spawn_depth, Some(1));
+            assert!(!first.capabilities.nested_spawn);
+            assert_eq!(
+                matches!(first.placement, Placement::Remote { .. }),
+                role == "remote-role"
+            );
+            live.write().await.subagents_mut().max_spawn_depth = Some(7);
+            let second = runner.build_live_spec(&child, &job_for(&child.id)).await;
+            assert_eq!(second.capabilities.max_spawn_depth, Some(7));
+            assert!(second.capabilities.nested_spawn);
+            assert_ne!(
+                ActorChildRunner::fingerprint(&first),
+                ActorChildRunner::fingerprint(&second)
+            );
+            assert_eq!(second.identity.depth, 1);
+            live.write().await.subagents_mut().max_spawn_depth = Some(1);
+        }
+        let fallback = bogus_runner(HashMap::new()).with_max_spawn_depth(0);
+        let spec = fallback.build_spec(&root, &job_for(&root.id));
+        assert_eq!(spec.capabilities.max_spawn_depth, Some(0));
+        assert!(!spec.capabilities.nested_spawn);
+    }
+
     struct RecordingChildSessionPort {
+        parent: Session,
         saved: std::sync::Mutex<Option<Session>>,
     }
 
@@ -17490,9 +17561,10 @@ mod tests {
     impl crate::session_app::child_session::ChildSessionPort for RecordingChildSessionPort {
         async fn load_root_session(
             &self,
-            _root_id: &str,
+            root_id: &str,
         ) -> Result<Session, crate::session_app::child_session::ChildSessionError> {
-            unreachable!("create_child_action does not load the root")
+            assert_eq!(root_id, self.parent.id);
+            Ok(self.parent.clone())
         }
 
         async fn load_child_for_parent(
@@ -18108,7 +18180,10 @@ mod tests {
                 .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
                 .set_permission_mode(mode);
             let workspace = tempfile::tempdir().expect("workspace fixture");
-            let port = RecordingChildSessionPort::default();
+            let port = RecordingChildSessionPort {
+                parent: parent.clone(),
+                saved: Default::default(),
+            };
             let child_id = format!("child-{label}-{}", uuid::Uuid::new_v4());
             crate::session_app::child_session::create_child_action(
                 &port,
@@ -18176,7 +18251,10 @@ mod tests {
         ] {
             let mut parent = Session::new(format!("parent-{role}"), "test-model");
             parent.set_project_id_meta(project_id.to_string());
-            let port = RecordingChildSessionPort::default();
+            let port = RecordingChildSessionPort {
+                parent: parent.clone(),
+                saved: Default::default(),
+            };
             let child_id = format!("child-{role}-{}", uuid::Uuid::new_v4());
             crate::session_app::child_session::create_child_action(
                 &port,

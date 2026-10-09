@@ -400,3 +400,18 @@ cap is not a heap/RSS bound. Old SDK/native/history constructors do not create
 current-input evidence. Host selection remains a ceiling, and every eventual
 Skill use still requires fresh caller, Source, schema, configuration and policy
 checks. This adds no Reader, preparation, registration or live Skill cutover.
+
+### Sub-agent depth
+
+`subagents.max_spawn_depth` controls new child creation. Root is depth 0; the
+default of 4 permits four child levels, and 0 disables new child creation. The
+Host derives each child's depth from the durable parent chain for SubAgent,
+Plan and other child creation entry points. Tool arguments cannot select a
+parent depth or reset the tree root.
+
+Reloading this setting affects later creation attempts without rewriting
+existing sessions. A lower cap does not cancel existing children or hide their
+history. Worker tool exposure is fixed when the worker is provisioned; after
+raising the cap, newly provisioned workers receive the new nesting capability.
+Existing workers that were provisioned at their former cap keep their original
+tool surface. Remote workers use the same Host creation checks.

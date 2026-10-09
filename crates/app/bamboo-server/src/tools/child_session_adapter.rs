@@ -982,6 +982,14 @@ impl bamboo_engine::GuardianSpawner for ChildSessionAdapter {
 
 #[async_trait]
 impl ChildSessionPort for ChildSessionAdapter {
+    async fn max_spawn_depth(&self) -> u32 {
+        self.config
+            .read()
+            .await
+            .subagents()
+            .effective_max_spawn_depth()
+    }
+
     async fn validate_child_model(&self, child: &Session) -> Result<(), ChildSessionError> {
         let config = self.config.read().await;
         Self::validate_configured_child_model(&config, child)
