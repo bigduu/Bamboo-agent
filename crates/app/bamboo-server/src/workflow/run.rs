@@ -44,6 +44,13 @@ const SAFE_UNTRUSTED_WORKFLOW_TOOLS: &[&str] = &[
     "Grep",
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkflowInvoker {
+    Explicit,
+    Automatic,
+    Schedule,
+}
+
 /// Server-owned access boundary for workflow runs. Session, workspace trust and
 /// capabilities are derived here rather than accepted from HTTP/tool callers.
 #[derive(Clone)]
@@ -191,8 +198,15 @@ impl WorkflowRunAccess {
         args: Value,
         budget: Option<WorkflowBudgets>,
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
-        self.start_for_invoker(session_id, workflow_id, revision, args, budget, false)
-            .await
+        self.start_for_invoker(
+            session_id,
+            workflow_id,
+            revision,
+            args,
+            budget,
+            WorkflowInvoker::Explicit,
+        )
+        .await
     }
 
     pub async fn start_from_tool(
@@ -203,8 +217,37 @@ impl WorkflowRunAccess {
         args: Value,
         budget: Option<WorkflowBudgets>,
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
-        self.start_for_invoker(session_id, workflow_id, revision, args, budget, true)
-            .await
+        self.start_for_invoker(
+            session_id,
+            workflow_id,
+            revision,
+            args,
+            budget,
+            WorkflowInvoker::Automatic,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_from_schedule(
+        &self,
+        session_id: &str,
+        workflow_id: &str,
+        revision: u64,
+        args: Value,
+    ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
+        self.start_for_invoker(
+            session_id,
+            workflow_id,
+            revision,
+            args,
+            None,
+            WorkflowInvoker::Schedule,
+        )
+        .await
+    }
+
+    pub(crate) fn is_run_active(&self, run_id: &str) -> bool {
+        self.engine.is_run_active(run_id)
     }
 
     async fn start_for_invoker(
@@ -214,7 +257,7 @@ impl WorkflowRunAccess {
         revision: u64,
         args: Value,
         budget: Option<WorkflowBudgets>,
-        model_started: bool,
+        invoker: WorkflowInvoker,
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
         self.ensure_run_index_capacity(session_id).await?;
         let (workspace, workspace_trusted) = self.session_context(session_id).await?;
@@ -245,7 +288,8 @@ impl WorkflowRunAccess {
                 "instruction workflows must be activated with load_skill".to_string(),
             ));
         }
-        if model_started {
+        let automatic = invoker != WorkflowInvoker::Explicit;
+        if automatic {
             let session = self
                 .sessions
                 .try_load(session_id)
@@ -269,11 +313,7 @@ impl WorkflowRunAccess {
             .pin_workflow_definition_bundle(workspace.as_deref(), workflow_id, revision)
             .await
             .map_err(|_| WorkflowRunError::Preflight("workflow catalog pin failed".to_string()))?;
-        let policy = if model_started {
-            "automatic"
-        } else {
-            "explicit"
-        };
+        let policy = if automatic { "automatic" } else { "explicit" };
         if bundle.root_invocation_policy[policy].as_bool() != Some(true) {
             return Err(WorkflowRunError::Preflight(format!(
                 "pinned workflow invocation policy denies {policy} start"
@@ -286,6 +326,9 @@ impl WorkflowRunAccess {
         let mut definition = bundle.root().cloned().ok_or_else(|| {
             WorkflowRunError::Preflight("pinned workflow root is missing".to_string())
         })?;
+        if invoker == WorkflowInvoker::Schedule {
+            ensure_scheduled_readonly_workflow(&bundle, &definition)?;
+        }
         if let Some(requested) = budget {
             validate_requested_budget(&requested)?;
             definition.budgets = tighten_workflow_budget(&definition.budgets, &requested);
@@ -597,6 +640,53 @@ fn ensure_workflow_cancel_allowed(snapshot: &WorkflowRunSnapshot) -> Result<(), 
         | WorkflowRunStatus::Suspended
         | WorkflowRunStatus::Cancelled => Ok(()),
     }
+}
+
+fn ensure_scheduled_readonly_workflow(
+    bundle: &WorkflowDefinitionBundle,
+    definition: &WorkflowRunDefinition,
+) -> Result<(), WorkflowRunError> {
+    let refuse = || {
+        WorkflowRunError::Preflight(
+            "scheduled workflows require a readonly Tool step or flat Sequence".into(),
+        )
+    };
+    if bundle.definitions.len() != 1 {
+        return Err(refuse());
+    }
+    let leaves = match &definition.plan {
+        WorkflowPlan::Step { step } => vec![step.as_str()],
+        WorkflowPlan::Sequence { nodes } => nodes
+            .iter()
+            .map(|node| match node {
+                WorkflowPlan::Step { step } => Ok(step.as_str()),
+                _ => Err(refuse()),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(refuse()),
+    };
+    let ids = leaves.iter().copied().collect::<BTreeSet<_>>();
+    if leaves.is_empty()
+        || ids.len() != leaves.len()
+        || ids.len() != definition.steps.len()
+        || definition.steps.iter().any(|step| {
+            !ids.contains(step.id.as_str())
+                || match &step.kind {
+                    WorkflowStepKind::Tool {
+                        tool, capabilities, ..
+                    } => {
+                        !SAFE_UNTRUSTED_WORKFLOW_TOOLS
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(tool))
+                            || capabilities.iter().any(|capability| capability != "read")
+                    }
+                    _ => true,
+                }
+        })
+    {
+        return Err(refuse());
+    }
+    Ok(())
 }
 
 fn ensure_workflow_restart_as_new_run_allowed(

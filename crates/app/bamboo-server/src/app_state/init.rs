@@ -528,9 +528,11 @@ pub fn build_schedule_manager(
     notification_relay: crate::app_state::session_events::NotificationRelayDeps,
     project_store: Arc<bamboo_projects::ProjectStore>,
     workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
+    workflow_runs: crate::workflow::WorkflowRunAccess,
 ) -> Arc<ScheduleManager> {
     let base_ctx = ScheduleContext {
         schedule_store,
+        workflow_runs: Some(workflow_runs),
         agent,
         tools: tools_for_schedules,
         permission_config,
