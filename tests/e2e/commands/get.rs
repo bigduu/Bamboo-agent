@@ -6,6 +6,8 @@ async fn test_get_command_by_id_workflow() {
 
     // Create a test workflow file
     let workflows_dir = state.app_data_dir.join("workflows");
+    let root_existed_before_create = workflows_dir.is_dir();
+    eprintln!("WORKFLOW_GET_PHASE root_before_create={root_existed_before_create}");
     tokio::fs::create_dir_all(&workflows_dir)
         .await
         .expect("Failed to create workflows dir");
@@ -22,12 +24,16 @@ async fn test_get_command_by_id_workflow() {
     ))
     .await;
 
+    let mut polls = 0usize;
+    let mut last_status = None;
     let resp = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let req = test::TestRequest::get()
                 .uri("/v1/commands/workflow/test-workflow")
                 .to_request();
             let resp = test::call_service(&app, req).await;
+            polls += 1;
+            last_status = Some(resp.status());
             if resp.status().is_success() {
                 break resp;
             }
@@ -36,7 +42,10 @@ async fn test_get_command_by_id_workflow() {
         }
     })
     .await
-    .expect("watcher should publish the legacy Workflow source");
+    .unwrap_or_else(|error| {
+        panic!("watcher should publish the legacy Workflow source: {error:?}; root_before_create={root_existed_before_create}; polls={polls}; last_status={last_status:?}")
+    });
+    eprintln!("WORKFLOW_GET_PHASE published polls={polls} last_status={last_status:?}");
 
     let body = test::read_body(resp).await;
     let result: Value = serde_json::from_slice(&body).expect("Response should be valid JSON");
