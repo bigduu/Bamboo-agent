@@ -462,10 +462,7 @@ async fn cancellation_while_queued_does_not_dispatch_or_consume_a_slot() {
     cancel.cancel();
     assert!(matches!(
         check.await,
-        Err(FinalEvidenceFailure {
-            error: AgentError::Cancelled,
-            ..
-        })
+        Err(failure) if matches!(failure.error.as_ref(), AgentError::Cancelled)
     ));
     assert!(provider.requests.lock().unwrap().is_empty());
     drop(held);
@@ -498,10 +495,7 @@ async fn cancellation_stops_bootstrap_and_stream_without_retrying() {
         cancel.cancel();
         assert!(matches!(
             task.await.unwrap(),
-            Err(FinalEvidenceFailure {
-                error: AgentError::Cancelled,
-                ..
-            })
+            Err(failure) if matches!(failure.error.as_ref(), AgentError::Cancelled)
         ));
         assert_eq!(provider.requests.lock().unwrap().len(), 1);
     }
@@ -534,10 +528,7 @@ async fn existing_watchdog_bounds_an_unresponsive_auxiliary_request() {
     tokio::time::advance(std::time::Duration::from_secs(2)).await;
     assert!(matches!(
         task.await.unwrap(),
-        Err(FinalEvidenceFailure {
-            error: AgentError::StreamTimeout(_),
-            ..
-        })
+        Err(failure) if matches!(failure.error.as_ref(), AgentError::StreamTimeout(_))
     ));
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
 }
@@ -555,10 +546,7 @@ async fn unavailable_provider_is_an_error_without_a_fabricated_pass_or_retry() {
     .await;
     assert!(matches!(
         result,
-        Err(FinalEvidenceFailure {
-            error: AgentError::LLM(_),
-            ..
-        })
+        Err(failure) if matches!(failure.error.as_ref(), AgentError::LLM(_))
     ));
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
 }
@@ -577,7 +565,7 @@ async fn run_token_budget_checks_prompt_and_clamps_completion_before_dispatch() 
     assert!(matches!(
         evaluate_final_evidence(&session, "10 tests passed.", provider.clone(), &request_frame,
             || panic!("exhausted budget cannot dispatch")).await,
-        Err(FinalEvidenceFailure { error: AgentError::Budget(message), usage }) if message == "final evidence token budget exhausted" && usage.total_tokens == 0
+        Err(failure) if matches!(failure.error.as_ref(), AgentError::Budget(message) if message == "final evidence token budget exhausted") && failure.usage.total_tokens == 0
     ));
     assert!(provider.requests.lock().unwrap().is_empty());
 
@@ -618,7 +606,7 @@ async fn interrupted_evaluator_keeps_received_provider_usage_including_explicit_
             Err(failure) => failure,
             Ok(_) => panic!("interrupted stream cannot yield a final verdict"),
         };
-        assert!(matches!(failure.error, AgentError::LLM(_)));
+        assert!(matches!(failure.error.as_ref(), AgentError::LLM(_)));
         assert_eq!(failure.usage.prompt_tokens, input);
         assert_eq!(failure.usage.completion_tokens, output);
         assert_eq!(failure.usage.total_tokens, input + output);

@@ -88,7 +88,7 @@ pub(super) async fn check(
             metrics.round_completed(
                 evaluation_id,
                 chrono::Utc::now(),
-                if matches!(&result, Err(failure) if matches!(failure.error, AgentError::Cancelled))
+                if matches!(&result, Err(failure) if matches!(failure.error.as_ref(), AgentError::Cancelled))
                 {
                     RoundStatus::Cancelled
                 } else if error.is_some() {
@@ -105,19 +105,21 @@ pub(super) async fn check(
     }
     if let Some(error) = error {
         let status = match &result {
-            Err(failure) if matches!(failure.error, AgentError::Cancelled) => "cancelled",
-            Err(failure) if matches!(failure.error, AgentError::Budget(_)) => "skipped_budget",
+            Err(failure) if matches!(failure.error.as_ref(), AgentError::Cancelled) => "cancelled",
+            Err(failure) if matches!(failure.error.as_ref(), AgentError::Budget(_)) => {
+                "skipped_budget"
+            }
             _ => "failed",
         };
         record_status(session, status, &[]);
         return Err(match result {
-            Err(failure) => failure.error,
+            Err(failure) => *failure.error,
             Ok(_) => AgentError::LLM(format!("final evidence check failed: {error}")),
         });
     }
     let evaluation = match result {
         Ok(evaluation) => evaluation,
-        Err(failure) => return Err(failure.error),
+        Err(failure) => return Err(*failure.error),
     };
     let revised = evaluation.verdict == Some(FinalEvidenceVerdict::Revise);
     let status = if evaluation.is_skipped() {

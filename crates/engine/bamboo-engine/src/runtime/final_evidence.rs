@@ -72,14 +72,14 @@ pub(crate) struct FinalEvidenceEvaluation {
 
 #[derive(Debug)]
 pub(crate) struct FinalEvidenceFailure {
-    pub error: AgentError,
+    pub error: Box<AgentError>,
     pub usage: TokenUsage,
 }
 
 impl From<AgentError> for FinalEvidenceFailure {
     fn from(error: AgentError) -> Self {
         Self {
-            error,
+            error: Box::new(error),
             usage: TokenUsage::default(),
         }
     }
@@ -419,7 +419,7 @@ pub(crate) async fn evaluate_final_evidence(
                 u64::from(counter.count_text(&completion_surface)),
             );
             return Err(FinalEvidenceFailure {
-                error: failure.error,
+                error: Box::new(failure.error),
                 usage,
             });
         }
