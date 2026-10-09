@@ -429,8 +429,9 @@ async fn recover_user_handoff(state: &AppState, observed: &Session) -> ResponseR
     }
     if crate::handlers::agent::events::startup_work_id(&latest).is_none()
         && bamboo_engine::session_app::execute::has_pending_user_message(&latest)
+        && latest.last_run_status().as_deref() != Some("running")
     {
-        // ACK may have succeeded before the original handoff metadata save failed.
+        // Preserve a running turn while repairing an ACKed handoff token.
         // Repair only its old scheduling token; no New seal, data or title is minted.
         crate::handlers::agent::events::mark_pending_turn(&mut latest);
         super::persist_and_cache_session_locked(state, &latest)
