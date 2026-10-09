@@ -3672,3 +3672,645 @@ async fn workflow_agent_result_handoff_cancel_counts_once() {
 async fn workflow_agent_result_handoff_timeout_retains_usage() {
     workflow_agent_handoff_control(true).await;
 }
+
+fn completed_prefix_checkpoint(run_id: &str) -> WorkflowRunSnapshot {
+    use sha2::{Digest, Sha256};
+    let mut checkpoint = snapshot(run_id, WorkflowRunStatus::Suspended, 1);
+    let mut prefix = tool_step("prefix", "echo", json!({"from":"args"}));
+    prefix.output_schema = Some(
+        json!({"type":"object","required":["value"],"properties":{"value":{"type":"integer"}},"additionalProperties":false}),
+    );
+    checkpoint.definition = definition(
+        vec![
+            prefix,
+            tool_step("suffix", "echo", json!({"from":"step","step":"prefix"})),
+        ],
+        WorkflowPlan::Sequence {
+            nodes: vec![choice_leaf("prefix"), choice_leaf("suffix")],
+        },
+    );
+    checkpoint.definition_bundle.root_id = checkpoint.definition.id.clone();
+    checkpoint.definition_bundle.root_revision = checkpoint.definition.revision;
+    checkpoint.definition_bundle.definitions = BTreeMap::from([(
+        WorkflowDefinitionBundle::key(&checkpoint.definition.id, checkpoint.definition.revision),
+        checkpoint.definition.clone(),
+    )]);
+    checkpoint.definition_bundle_hash = hex::encode(Sha256::digest(
+        serde_json::to_vec(&checkpoint.definition_bundle).unwrap(),
+    ));
+    checkpoint.validated_args = json!({"value":42});
+    checkpoint.steps.insert(
+        "prefix".into(),
+        WorkflowStepSnapshot {
+            id: "prefix".into(),
+            status: WorkflowStepStatus::Succeeded,
+            input_hash: hex::encode(Sha256::digest(
+                serde_json::to_vec(&checkpoint.validated_args).unwrap(),
+            )),
+            output: Some(checkpoint.validated_args.clone()),
+            failure: None,
+            attempts: 1,
+        },
+    );
+    checkpoint.usage.steps = 1;
+    checkpoint.usage.tokens = 3;
+    checkpoint.usage.cost_micros = Some(5);
+    checkpoint.suspension = Some(WorkflowSuspensionContext::Recovery {
+        reason: "process restarted".into(),
+    });
+    checkpoint
+}
+
+async fn seed_completed_prefix(
+    repository: &dyn WorkflowRunRepository,
+    checkpoint: &WorkflowRunSnapshot,
+) {
+    repository
+        .create(
+            checkpoint,
+            &run_event(
+                &checkpoint.run_id,
+                checkpoint.last_sequence,
+                WorkflowRunEventKind::RunSuspended {
+                    reason: "process restarted".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+}
+
+async fn await_continuation(engine: &WorkflowRunEngine, run_id: &str) -> WorkflowProgress {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let progress = engine.progress(run_id, 0).await.unwrap();
+            if progress.snapshot.status.is_terminal() && !engine.is_run_active(run_id) {
+                return progress;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("continuation settles")
+}
+
+#[tokio::test]
+async fn completed_prefix_continuation_preserves_checkpoint_and_finalizes_complete_prefix() {
+    for complete in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let repository =
+            Arc::new(FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap());
+        let mut checkpoint = completed_prefix_checkpoint("completed-prefix");
+        if complete {
+            let mut suffix = checkpoint.steps["prefix"].clone();
+            suffix.id = "suffix".into();
+            checkpoint.steps.insert("suffix".into(), suffix);
+            checkpoint.usage.steps = 2;
+        }
+        seed_completed_prefix(repository.as_ref(), &checkpoint).await;
+        let engine = engine(directory.path(), MockDefinitions::default());
+        let started = engine
+            .continue_completed_prefix(
+                &checkpoint.run_id,
+                &checkpoint.session_id,
+                true,
+                vec!["read".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.run_id, checkpoint.run_id);
+        let progress = await_continuation(&engine, &checkpoint.run_id).await;
+        let saved = progress.snapshot;
+        assert_eq!(saved.status, WorkflowRunStatus::Succeeded);
+        assert_eq!(saved.output, Some(json!({"value":42})));
+        assert_eq!(saved.definition_bundle, checkpoint.definition_bundle);
+        assert_eq!(
+            saved.definition_bundle_hash,
+            checkpoint.definition_bundle_hash
+        );
+        assert_eq!(saved.validated_args, checkpoint.validated_args);
+        assert_eq!(saved.created_at, checkpoint.created_at);
+        assert_eq!(saved.steps["prefix"], checkpoint.steps["prefix"]);
+        assert_eq!(saved.usage.steps, 2);
+        assert_eq!(saved.usage.tokens, 3);
+        assert_eq!(saved.usage.cost_micros, Some(5));
+        assert_eq!(saved.steps["suffix"].attempts, 1);
+        assert!(!progress
+            .events
+            .iter()
+            .any(|event| event.step_id.as_deref() == Some("prefix")));
+        assert_eq!(
+            progress
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind, WorkflowRunEventKind::StepStarted))
+                .count(),
+            usize::from(!complete)
+        );
+        assert!(progress
+            .events
+            .windows(2)
+            .all(|pair| pair[1].sequence == pair[0].sequence + 1));
+        assert_eq!(engine.runtime_resource_counts(), (0, 0));
+    }
+}
+
+#[tokio::test]
+async fn completed_prefix_continuation_refuses_ambiguous_or_invalid_checkpoints_without_writes() {
+    type Mutation = fn(&mut WorkflowRunSnapshot);
+    let cases: &[(&str, Mutation)] = &[
+        ("running", |s| s.status = WorkflowRunStatus::Running),
+        ("terminal", |s| s.status = WorkflowRunStatus::Succeeded),
+        ("nested-run", |s| s.parent_run_id = Some("parent".into())),
+        ("approval", |s| {
+            s.suspension = Some(WorkflowSuspensionContext::ToolApproval {
+                step_id: "prefix".into(),
+                tool: "echo".into(),
+                tool_call_id: "call".into(),
+            })
+        }),
+        ("running-tool", |s| {
+            s.suspension = Some(WorkflowSuspensionContext::ToolRunning {
+                step_id: "prefix".into(),
+                tool: "echo".into(),
+                tool_call_id: "call".into(),
+                killed: true,
+            })
+        }),
+        ("empty-prefix", |s| {
+            s.steps.clear();
+            s.usage.steps = 0;
+        }),
+        ("missing-output", |s| {
+            s.steps.get_mut("prefix").unwrap().output = None
+        }),
+        ("bad-output", |s| {
+            s.steps.get_mut("prefix").unwrap().output = Some(json!({"value":"wrong-type"}))
+        }),
+        ("bad-input-hash", |s| {
+            s.steps.get_mut("prefix").unwrap().input_hash = "changed".into()
+        }),
+        ("extra-reservation", |s| s.usage.steps += 1),
+        ("entered-suffix", |s| {
+            let mut state = s.steps["prefix"].clone();
+            state.id = "suffix".into();
+            state.status = WorkflowStepStatus::Suspended;
+            s.steps.insert("suffix".into(), state);
+            s.usage.steps += 1;
+        }),
+        ("non-prefix-success", |s| {
+            let mut state = s.steps.remove("prefix").unwrap();
+            state.id = "suffix".into();
+            s.steps.insert("suffix".into(), state);
+        }),
+        ("extra-state", |s| {
+            let mut state = s.steps["prefix"].clone();
+            state.id = "unknown".into();
+            s.steps.insert("unknown".into(), state);
+        }),
+        ("changed-bundle", |s| {
+            s.definition_bundle.publication_revision += 1
+        }),
+        ("changed-schema", |s| s.definition.workflow_schema = 99),
+        ("nonflat", |s| {
+            s.definition.plan = WorkflowPlan::Parallel {
+                nodes: vec![choice_leaf("prefix"), choice_leaf("suffix")],
+            }
+        }),
+        ("agent", |s| {
+            let mut step = workflow_agent_step();
+            step.id = "suffix".into();
+            s.definition.steps[1] = step;
+        }),
+        ("mutating", |s| {
+            if let WorkflowStepKind::Tool { capabilities, .. } = &mut s.definition.steps[1].kind {
+                capabilities.push("write".into());
+            }
+        }),
+        ("steps-exhausted", |s| s.definition.budgets.max_steps = 1),
+        ("tokens-exceeded", |s| s.usage.tokens = 10001),
+        ("cost-exceeded", |s| s.usage.cost_micros = Some(10001)),
+        ("wall-time-exhausted", |s| {
+            s.created_at -= chrono::Duration::seconds(11)
+        }),
+    ];
+    for (label, mutate) in cases {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap();
+        let mut checkpoint = completed_prefix_checkpoint(label);
+        mutate(&mut checkpoint);
+        if *label != "changed-bundle" {
+            use sha2::{Digest, Sha256};
+            checkpoint.definition_bundle.definitions.insert(
+                WorkflowDefinitionBundle::key(
+                    &checkpoint.definition.id,
+                    checkpoint.definition.revision,
+                ),
+                checkpoint.definition.clone(),
+            );
+            checkpoint.definition_bundle_hash = hex::encode(Sha256::digest(
+                serde_json::to_vec(&checkpoint.definition_bundle).unwrap(),
+            ));
+        }
+        seed_completed_prefix(&repository, &checkpoint).await;
+        let engine = engine(directory.path(), MockDefinitions::default());
+        assert!(
+            engine
+                .continue_completed_prefix(label, &checkpoint.session_id, true, vec!["read".into()])
+                .await
+                .is_err(),
+            "{label}"
+        );
+        assert_eq!(
+            repository.load(label).await.unwrap().unwrap(),
+            checkpoint,
+            "{label}"
+        );
+        assert_eq!(
+            repository.events_since(label, 0).await.unwrap().len(),
+            1,
+            "{label}"
+        );
+        assert_eq!(engine.runtime_resource_counts(), (0, 0), "{label}");
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let repository = FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap();
+    let checkpoint = completed_prefix_checkpoint("session-policy");
+    seed_completed_prefix(&repository, &checkpoint).await;
+    let engine = engine(directory.path(), MockDefinitions::default());
+    assert!(matches!(
+        engine
+            .continue_completed_prefix("missing", &checkpoint.session_id, true, vec!["read".into()])
+            .await,
+        Err(WorkflowRunError::NotFound)
+    ));
+    assert!(matches!(
+        engine
+            .continue_completed_prefix(
+                &checkpoint.run_id,
+                "other-session",
+                true,
+                vec!["read".into()]
+            )
+            .await,
+        Err(WorkflowRunError::NotFound)
+    ));
+    assert!(engine
+        .continue_completed_prefix(
+            &checkpoint.run_id,
+            &checkpoint.session_id,
+            false,
+            vec!["read".into()]
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        repository.load(&checkpoint.run_id).await.unwrap().unwrap(),
+        checkpoint
+    );
+}
+
+struct RefuseContinuationCommit(FileWorkflowRunRepository);
+
+#[async_trait]
+impl WorkflowRunRepository for RefuseContinuationCommit {
+    async fn create(
+        &self,
+        snapshot: &WorkflowRunSnapshot,
+        event: &WorkflowRunEvent,
+    ) -> std::io::Result<()> {
+        self.0.create(snapshot, event).await
+    }
+    async fn commit(
+        &self,
+        snapshot: &WorkflowRunSnapshot,
+        event: &WorkflowRunEvent,
+    ) -> std::io::Result<()> {
+        if matches!(event.kind, WorkflowRunEventKind::RunStarted) {
+            return Err(std::io::Error::other(
+                "injected continuation commit refusal",
+            ));
+        }
+        self.0.commit(snapshot, event).await
+    }
+    async fn load(&self, run_id: &str) -> std::io::Result<Option<WorkflowRunSnapshot>> {
+        self.0.load(run_id).await
+    }
+    async fn events_since(
+        &self,
+        run_id: &str,
+        sequence: u64,
+    ) -> std::io::Result<Vec<WorkflowRunEvent>> {
+        self.0.events_since(run_id, sequence).await
+    }
+    async fn list_run_ids(&self) -> std::io::Result<Vec<String>> {
+        self.0.list_run_ids().await
+    }
+}
+
+#[tokio::test]
+async fn completed_prefix_continuation_commit_failure_dispatches_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = Arc::new(RefuseContinuationCommit(
+        FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap(),
+    ));
+    let checkpoint = completed_prefix_checkpoint("commit-failure");
+    seed_completed_prefix(repository.as_ref(), &checkpoint).await;
+    let tools = Arc::new(ContextRecordingTools::default());
+    let engine = WorkflowRunEngine::new(
+        repository.clone(),
+        tools.clone(),
+        Arc::new(MockAgents),
+        Arc::new(MockDefinitions::default()),
+        Arc::new(MockPolicy),
+        Arc::new(MockSecrets),
+        budgets(),
+    );
+    assert!(matches!(
+        engine
+            .continue_completed_prefix(
+                &checkpoint.run_id,
+                &checkpoint.session_id,
+                true,
+                vec!["read".into()]
+            )
+            .await,
+        Err(WorkflowRunError::Storage(_))
+    ));
+    assert_eq!(tools.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        repository.load(&checkpoint.run_id).await.unwrap().unwrap(),
+        checkpoint
+    );
+    assert_eq!(
+        repository
+            .events_since(&checkpoint.run_id, 0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(engine.runtime_resource_counts(), (0, 0));
+}
+
+struct ContinuationGateTools {
+    calls: AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait]
+impl ToolExecutor for ContinuationGateTools {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_one();
+        let _permit = self.release.acquire().await.unwrap();
+        Ok(ToolResult::text(true, call.function.arguments.clone()))
+    }
+    fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+        Vec::new()
+    }
+}
+
+#[tokio::test]
+async fn completed_prefix_concurrent_continuations_have_one_owner_and_cancel_keeps_usage() {
+    for round in 0..20 {
+        let directory = tempfile::tempdir().unwrap();
+        let repository =
+            Arc::new(FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap());
+        let checkpoint = completed_prefix_checkpoint(&format!("continue-race-{round}"));
+        seed_completed_prefix(repository.as_ref(), &checkpoint).await;
+        let tools = Arc::new(ContinuationGateTools {
+            calls: AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let engine = WorkflowRunEngine::new(
+            repository,
+            tools.clone(),
+            Arc::new(MockAgents),
+            Arc::new(MockDefinitions::default()),
+            Arc::new(MockPolicy),
+            Arc::new(MockSecrets),
+            budgets(),
+        );
+        let (left, right) = tokio::join!(
+            engine.continue_completed_prefix(
+                &checkpoint.run_id,
+                &checkpoint.session_id,
+                true,
+                vec!["read".into()]
+            ),
+            engine.continue_completed_prefix(
+                &checkpoint.run_id,
+                &checkpoint.session_id,
+                true,
+                vec!["read".into()]
+            ),
+        );
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(3), tools.entered.notified())
+            .await
+            .expect("suffix entered its explicit gate");
+        assert_eq!(tools.calls.load(Ordering::SeqCst), 1);
+        let cancelled = engine.cancel(&checkpoint.run_id).await.unwrap();
+        assert_eq!(cancelled.status, WorkflowRunStatus::Cancelled);
+        // Ordinary Tool cancellation keeps its existing lifecycle. Release the
+        // test Tool explicitly, then require its owner to drain without sleep.
+        tools.release.add_permits(1);
+        let progress = await_continuation(&engine, &checkpoint.run_id).await;
+        assert_eq!(
+            progress.snapshot.steps["prefix"],
+            checkpoint.steps["prefix"]
+        );
+        assert_eq!(progress.snapshot.usage.tokens, checkpoint.usage.tokens);
+        assert_eq!(
+            progress.snapshot.usage.cost_micros,
+            checkpoint.usage.cost_micros
+        );
+        assert_eq!(
+            progress
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind, WorkflowRunEventKind::RunStarted))
+                .count(),
+            1
+        );
+        assert!(!progress
+            .events
+            .iter()
+            .any(|event| event.step_id.as_deref() == Some("prefix")));
+        assert_eq!(tools.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+struct PausedInactiveCancellation {
+    repository: FileWorkflowRunRepository,
+    loads: AtomicUsize,
+    paused: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl WorkflowRunRepository for PausedInactiveCancellation {
+    async fn create(
+        &self,
+        snapshot: &WorkflowRunSnapshot,
+        event: &WorkflowRunEvent,
+    ) -> std::io::Result<()> {
+        self.repository.create(snapshot, event).await
+    }
+    async fn commit(
+        &self,
+        snapshot: &WorkflowRunSnapshot,
+        event: &WorkflowRunEvent,
+    ) -> std::io::Result<()> {
+        self.repository.commit(snapshot, event).await
+    }
+    async fn load(&self, run_id: &str) -> std::io::Result<Option<WorkflowRunSnapshot>> {
+        if self.loads.fetch_add(1, Ordering::SeqCst) == 1 {
+            self.paused.notify_one();
+            self.release.notified().await;
+        }
+        self.repository.load(run_id).await
+    }
+    async fn events_since(
+        &self,
+        run_id: &str,
+        since: u64,
+    ) -> std::io::Result<Vec<WorkflowRunEvent>> {
+        self.repository.events_since(run_id, since).await
+    }
+    async fn list_run_ids(&self) -> std::io::Result<Vec<String>> {
+        self.repository.list_run_ids().await
+    }
+}
+
+#[tokio::test]
+async fn completed_prefix_inactive_cancel_owns_admission_before_terminal_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = Arc::new(PausedInactiveCancellation {
+        repository: FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap(),
+        loads: AtomicUsize::new(0),
+        paused: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let checkpoint = completed_prefix_checkpoint("inactive-cancel-race");
+    seed_completed_prefix(repository.as_ref(), &checkpoint).await;
+    let tools = Arc::new(ContextRecordingTools::default());
+    let engine = WorkflowRunEngine::new(
+        repository.clone(),
+        tools.clone(),
+        Arc::new(MockAgents),
+        Arc::new(MockDefinitions::default()),
+        Arc::new(MockPolicy),
+        Arc::new(MockSecrets),
+        budgets(),
+    );
+    let cancellation = {
+        let engine = engine.clone();
+        let run_id = checkpoint.run_id.clone();
+        tokio::spawn(async move { engine.cancel(&run_id).await })
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        repository.paused.notified(),
+    )
+    .await
+    .unwrap();
+    assert!(engine.is_run_active(&checkpoint.run_id));
+    assert!(engine
+        .continue_completed_prefix(
+            &checkpoint.run_id,
+            &checkpoint.session_id,
+            true,
+            vec!["read".into()]
+        )
+        .await
+        .is_err());
+    assert_eq!(tools.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        repository
+            .repository
+            .load(&checkpoint.run_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        checkpoint
+    );
+    repository.release.notify_one();
+    let cancelled = tokio::time::timeout(std::time::Duration::from_secs(3), cancellation)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled.status, WorkflowRunStatus::Cancelled);
+    assert_eq!(cancelled.usage, checkpoint.usage);
+    assert_eq!(cancelled.steps, checkpoint.steps);
+    assert!(engine
+        .continue_completed_prefix(
+            &checkpoint.run_id,
+            &checkpoint.session_id,
+            true,
+            vec!["read".into()]
+        )
+        .await
+        .is_err());
+    assert_eq!(tools.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(engine.runtime_resource_counts(), (0, 0));
+}
+
+#[tokio::test]
+async fn completed_prefix_corrupt_saved_run_id_refuses_without_owner_or_other_run_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository =
+        Arc::new(FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap());
+    let first = completed_prefix_checkpoint("corrupt-requested-run");
+    let second = completed_prefix_checkpoint("unrelated-saved-run");
+    seed_completed_prefix(repository.as_ref(), &first).await;
+    seed_completed_prefix(repository.as_ref(), &second).await;
+    let path = directory.path().join(&first.run_id).join("snapshot.json");
+    let mut corrupt = first.clone();
+    corrupt.run_id = second.run_id.clone();
+    tokio::fs::write(&path, serde_json::to_vec(&corrupt).unwrap())
+        .await
+        .unwrap();
+    let watched = [
+        path,
+        directory.path().join(&first.run_id).join("journal.jsonl"),
+        directory.path().join(&second.run_id).join("snapshot.json"),
+        directory.path().join(&second.run_id).join("journal.jsonl"),
+    ];
+    let before = futures::future::join_all(watched.iter().map(tokio::fs::read))
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let tools = Arc::new(ContextRecordingTools::default());
+    let engine = WorkflowRunEngine::new(
+        repository,
+        tools.clone(),
+        Arc::new(MockAgents),
+        Arc::new(MockDefinitions::default()),
+        Arc::new(MockPolicy),
+        Arc::new(MockSecrets),
+        budgets(),
+    );
+    assert!(matches!(
+        engine
+            .continue_completed_prefix(&first.run_id, &first.session_id, true, vec!["read".into()])
+            .await,
+        Err(WorkflowRunError::NotFound)
+    ));
+    assert_eq!(tools.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(engine.runtime_resource_counts(), (0, 0));
+    let after = futures::future::join_all(watched.iter().map(tokio::fs::read))
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after, before,
+        "both runs' saved bytes must remain unchanged"
+    );
+}

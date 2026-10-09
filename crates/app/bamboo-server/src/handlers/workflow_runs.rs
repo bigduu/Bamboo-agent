@@ -124,6 +124,21 @@ pub async fn restart(
     }
 }
 
+pub async fn continue_completed_prefix(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+) -> HttpResponse {
+    let (session_id, run_id) = path.into_inner();
+    match state
+        .workflow_runs
+        .continue_completed_prefix_for_session(&session_id, &run_id)
+        .await
+    {
+        Ok(snapshot) => HttpResponse::Accepted().json(public_workflow_snapshot(snapshot)),
+        Err(error) => workflow_error(error),
+    }
+}
+
 fn workflow_error(error: WorkflowRunError) -> HttpResponse {
     match error {
         WorkflowRunError::NotFound => HttpResponse::NotFound().json(serde_json::json!({
