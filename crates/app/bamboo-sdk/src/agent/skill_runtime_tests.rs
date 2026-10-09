@@ -1408,6 +1408,10 @@ async fn sdk_typed_registered_router_busy_cancel_and_drop_release_before_canonic
     for drop_future in [false, true] {
         let home = tempfile::tempdir().unwrap();
         let main = write_skill(home.path(), "sdk-router-owner", false);
+        // Canonical Existing Root uses the real zero-B finite 512KiB ceiling.
+        // Keep the complete main large enough to require genuine pagination.
+        let main = format!("{main}\n{}\n", "a".repeat(RESPONSE_BYTES + 4096));
+        std::fs::write(home.path().join("skills/sdk-router-owner/SKILL.md"), &main).unwrap();
         write_config(home.path());
         let task = home.path().join("router-retry-task.txt");
         std::fs::write(&task, "NORMAL_TASK_ACTION").unwrap();
@@ -1415,7 +1419,7 @@ async fn sdk_typed_registered_router_busy_cancel_and_drop_release_before_canonic
             wanted: vec!["sdk-router-owner".into()],
             task,
             read_references: false,
-            cap: 4096,
+            cap: 0,
             trace: Mutex::default(),
         });
         let router = bamboo_engine::SessionActivationRouter::new();
@@ -1440,7 +1444,12 @@ async fn sdk_typed_registered_router_busy_cancel_and_drop_release_before_canonic
         let defaults = agent.sdk_skills.as_ref().unwrap();
         defaults.sessions.save(&mut session).await.unwrap();
         // Reload the genuine durable Existing input after runtime-only budget state is stripped.
-        session = agent.storage().load_session(&target).await.unwrap().unwrap();
+        session = agent
+            .storage()
+            .load_session(&target)
+            .await
+            .unwrap()
+            .unwrap();
         let selections = selections(&agent, &["sdk-router-owner"]).await;
         let before = serde_json::to_value(&session).unwrap();
         let mut contender = session.clone();
@@ -1537,6 +1546,14 @@ async fn sdk_typed_registered_router_busy_cancel_and_drop_release_before_canonic
                 .filter(|message| message.role == Role::User)
                 .count(),
             1
+        );
+        assert_eq!(
+            session
+                .effective_token_budget()
+                .unwrap()
+                .max_tool_output_tokens,
+            0,
+            "registered retry must use its actual current zero-B budget"
         );
         let trace = provider.trace.lock().unwrap();
         assert!(trace.failures.is_empty(), "{:?}", trace.failures);
