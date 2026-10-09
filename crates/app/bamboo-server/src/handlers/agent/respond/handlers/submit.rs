@@ -12,6 +12,17 @@ enum ResponseEndpoint {
     TypedPermission,
 }
 
+fn response_expected_tool_call_id(
+    session: &bamboo_agent_core::Session,
+    pending: &bamboo_agent_core::PendingQuestion,
+    requested: Option<&str>,
+) -> Option<String> {
+    requested.map(str::to_owned).or_else(|| {
+        bamboo_engine::session_app::no_progress::is_no_progress_question(session, pending)
+            .then(|| pending.tool_call_id.clone())
+    })
+}
+
 /// Submit a user response to a pending question from the `conclusion_with_options` tool.
 ///
 /// When the agent calls the `conclusion_with_options` tool, it pauses execution and waits
@@ -105,6 +116,10 @@ async fn submit_response_inner(
     let stop_progress_pause =
         bamboo_engine::session_app::no_progress::is_no_progress_question(&preflight, pending)
             && user_response == bamboo_engine::session_app::no_progress::STOP_OPTION;
+    // Bind runtime control to the exact preflight question even when an older
+    // client omits its expected ID. A replacement before CAS must stay pending.
+    let expected_tool_call_id =
+        response_expected_tool_call_id(&preflight, pending, req.expected_tool_call_id.as_deref());
     if let Some(expected) = req.expected_tool_call_id.as_deref() {
         if expected != pending.tool_call_id {
             return Ok(HttpResponse::Conflict().json(serde_json::json!({
@@ -197,7 +212,7 @@ async fn submit_response_inner(
         bamboo_engine::session_app::respond::submit_pending_permission_response_checked_guarded(
             response_access,
             input,
-            req.expected_tool_call_id.clone(),
+            expected_tool_call_id,
             permission_receipt,
             response_guard,
         )
@@ -206,7 +221,7 @@ async fn submit_response_inner(
         bamboo_engine::session_app::respond::submit_pending_response_checked_guarded(
             response_access,
             input,
-            req.expected_tool_call_id.clone(),
+            expected_tool_call_id,
             response_guard,
         )
         .await

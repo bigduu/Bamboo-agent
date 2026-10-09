@@ -188,6 +188,35 @@ async fn no_progress_registered_http_stop_is_consumed_once_with_zero_provider_ca
 }
 
 #[actix_web::test]
+async fn no_progress_preflight_binds_question_for_clients_without_expected_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ProgressProvider::default());
+    let state = state_with_provider(dir.path(), provider).await;
+    let paused = save_paused(&state, "progress-default-cas-id").await;
+    let pending = paused.pending_question.as_ref().unwrap();
+    assert_eq!(
+        response_expected_tool_call_id(&paused, pending, None),
+        Some(pending.tool_call_id.clone())
+    );
+    assert_eq!(
+        response_expected_tool_call_id(&paused, pending, Some("client-expected")),
+        Some("client-expected".into())
+    );
+    let mut other = paused.clone();
+    other.set_pending_question(
+        "other-call".into(),
+        "conclusion_with_options".into(),
+        "Choose".into(),
+        vec![],
+        true,
+    );
+    assert_eq!(
+        response_expected_tool_call_id(&other, other.pending_question.as_ref().unwrap(), None),
+        None
+    );
+}
+
+#[actix_web::test]
 async fn no_progress_registered_http_continue_and_custom_input_resume_once() {
     for (id, direction) in [
         ("http-progress-continue", "Continue"),

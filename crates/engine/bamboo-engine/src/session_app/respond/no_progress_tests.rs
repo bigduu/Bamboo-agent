@@ -138,3 +138,43 @@ fn no_progress_response_rejects_stale_identity_and_gold() {
         assert_eq!(serde_json::to_value(session).unwrap(), before);
     }
 }
+
+#[test]
+fn no_progress_preflight_id_cannot_stop_a_replacement_question() {
+    for another_progress_question in [false, true] {
+        let mut session = paused_session();
+        let bound_preflight_id = session
+            .pending_question
+            .as_ref()
+            .unwrap()
+            .tool_call_id
+            .clone();
+        if another_progress_question {
+            create_question(&mut session, &mut AgentRuntimeState::default());
+        } else {
+            session.set_pending_question(
+                "replacement-tool".into(),
+                "conclusion_with_options".into(),
+                "Choose next action".into(),
+                vec!["Stop".into()],
+                true,
+            );
+        }
+        let before = serde_json::to_value(&session).unwrap();
+        assert!(matches!(
+            apply_pending_response(
+                &mut session,
+                &input("Stop"),
+                Some(&bound_preflight_id),
+                ResponseSource::Human,
+                None
+            ),
+            Err(RespondError::PendingQuestionMismatch { .. })
+        ));
+        assert_eq!(
+            serde_json::to_value(session).unwrap(),
+            before,
+            "the replacement question and its evidence remain unconsumed"
+        );
+    }
+}
