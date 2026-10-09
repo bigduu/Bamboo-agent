@@ -1439,6 +1439,8 @@ async fn sdk_typed_registered_router_busy_cancel_and_drop_release_before_canonic
         budget(&mut session, 4096);
         let defaults = agent.sdk_skills.as_ref().unwrap();
         defaults.sessions.save(&mut session).await.unwrap();
+        // Reload the genuine durable Existing input after runtime-only budget state is stripped.
+        session = agent.storage().load_session(&target).await.unwrap().unwrap();
         let selections = selections(&agent, &["sdk-router-owner"]).await;
         let before = serde_json::to_value(&session).unwrap();
         let mut contender = session.clone();
