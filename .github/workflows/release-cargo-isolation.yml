@@ -5,6 +5,7 @@ on:
     branches: [dev, main]
     paths:
       - scripts/release-cargo-sandbox*
+      - scripts/release-cargo-upload*
       - .github/workflows/publish-crate.yml
       - .github/workflows/release-cargo-isolation.yml
   workflow_dispatch:
@@ -27,7 +28,7 @@ jobs:
       - name: Verify real Linux Cargo boundary with dummy credentials only
         env:
           BAMBOO_CARGO_INTEGRATION: "1"
-        run: node --test scripts/release-cargo-sandbox.test.cjs
+        run: node --test scripts/release-cargo-sandbox.test.cjs scripts/release-cargo-upload.test.cjs
       - name: Verify existing release frontend policies
         run: node --test scripts/release-frontend-policy.test.cjs scripts/lotus-next-artifact.test.cjs
       - name: Install isolated Cargo for actual workspace compatibility

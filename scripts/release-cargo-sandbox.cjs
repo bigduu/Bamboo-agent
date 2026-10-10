@@ -108,6 +108,7 @@ function install(source, stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bamb
   const state = { source, revision, stateRoot, endpoint, target: path.join(source, "target") };
   fs.writeFileSync(path.join(stateRoot, "state.json"), JSON.stringify(state), { mode: 0o600 });
   fs.copyFileSync(__filename, path.join(stateRoot, "bin/cargo"));
+  copyRegular(__dirname, "release-cargo-upload.cjs", path.join(stateRoot, "bin"));
   fs.chmodSync(path.join(stateRoot, "bin/cargo"), 0o700);
   return state;
 }
@@ -151,14 +152,57 @@ function recover(state, source, file) {
   assert.equal(destination, path.join(state.target, "package"));
   copyRegular(packageRoot, `package/${file}`, state.target, true);
 }
+async function publishArchive(state, args) {
+  // Package verification may execute arbitrary build scripts and Cargo config.
+  // It must run in the same credential-free worker as every other Cargo command.
+  const flags = new Set();
+  let name;
+  for (let index = 1; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === "-p" || arg === "--package") {
+      assert.equal(name, undefined, "Publication requires one explicit package");
+      name = args[++index];
+      assert.match(name || "", /^[A-Za-z0-9_-]+$/);
+    } else {
+      assert.ok(["--locked", "--allow-dirty", "--dry-run"].includes(arg) && !flags.has(arg), "Unsupported publication argument");
+      flags.add(arg);
+    }
+  }
+  assert.ok(name && flags.has("--locked") && flags.has("--allow-dirty"), "Publication requires --locked --allow-dirty and one -p package");
+  const dryRun = flags.has("--dry-run");
+  assert.ok(dryRun || process.env.CARGO_REGISTRY_TOKEN, "Missing CARGO_REGISTRY_TOKEN");
+  const file = packageFile(state, args);
+  const archivePath = path.join(state.target, "package", file);
+  const sha256 = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
+  // Automatic publication reserves this checksum before calling the shim. A
+  // second package verification must never substitute other bytes for it.
+  const expected = fs.lstatSync(archivePath, { throwIfNoEntry: false })
+    ? sha256(fs.readFileSync(regular(state.target, `package/${file}`))) : null;
+  const status = run(state, ["package", "--locked", "--allow-dirty", "-p", name]);
+  if (status !== 0) return status;
+  const bytes = fs.readFileSync(regular(state.target, `package/${file}`));
+  if (expected) assert.equal(sha256(bytes), expected, "Verified package archive changed from the reserved bytes");
+  const { describeArchive, uploadArchive } = require("./release-cargo-upload.cjs");
+  const version = file.slice(name.length + 1, -".crate".length);
+  const metadata = describeArchive(bytes, name, version);
+  if (dryRun) {
+    process.stderr.write(`Verified ${name}@${version} without credentials; upload skipped for dry run\n`);
+    return 0;
+  }
+  // This trusted HTTP client consumes the already-read immutable bytes. It runs
+  // no Cargo, build script, dependency, source hook or credential provider.
+  const result = await uploadArchive(bytes, metadata, process.env.CARGO_REGISTRY_TOKEN);
+  process.stderr.write(result.output + "\n");
+  return result.status;
+}
 function run(state, args) {
   assert.ok(["metadata", "check", "build", "test", "package", "publish", "--version"].includes(args[0]), "Unsupported publication Cargo command");
   assert.equal(git(state.source, ["rev-parse", "HEAD"]).trim(), state.revision, "Publication source moved");
+  if (args[0] === "publish") return publishArchive(state, args);
   const outputFile = packageFile(state, args);
   const work = fs.mkdtempSync(path.join(state.stateRoot, "data/work-"));
   const source = path.join(work, "source");
   const env = { ...childEnv(), DOCKER_HOST: state.endpoint };
-  if (args[0] === "publish" && process.env.CARGO_REGISTRY_TOKEN) env.CARGO_REGISTRY_TOKEN = process.env.CARGO_REGISTRY_TOKEN;
   try {
     snapshot(state.source, source, state.revision);
     const dockerArgs = ["--config", path.join(state.stateRoot, "docker"), "run", "--rm", "--init", "--user", "65532:65532", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
@@ -167,7 +211,6 @@ function run(state, args) {
       "--mount", `type=bind,src=${path.join(state.stateRoot, "data/target")},dst=/target`, "--workdir", "/source",
       "--env", "HOME=/tmp", "--env", "CARGO_HOME=/cargo-home", "--env", "CARGO_TARGET_DIR=/target",
       "--env", "RUSTUP_TOOLCHAIN=1.99.0", "--env", "RUSTUP_AUTO_INSTALL=0", "--env", "CARGO_TERM_COLOR=never"];
-    if (env.CARGO_REGISTRY_TOKEN) dockerArgs.push("--env", "CARGO_REGISTRY_TOKEN");
     dockerArgs.push(IMAGE, "/bin/sh", "-c", 'umask 022; cargo "$@"; status=$?; chmod -R a+rwX /source /cargo-home /target; exit "$status"', "cargo", ...args);
     const result = spawnSync("docker", dockerArgs, { env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
     if (result.error) throw result.error;
@@ -184,7 +227,7 @@ function run(state, args) {
     fs.rmSync(work, { recursive: true, force: true });
   }
 }
-if (require.main === module) {
+async function main() {
   try {
     if (process.argv[2] === "install") {
       const state = install(process.cwd());
@@ -193,8 +236,9 @@ if (require.main === module) {
       fs.appendFileSync(process.env.GITHUB_ENV, `BAMBOO_CARGO_SANDBOX=${path.join(state.stateRoot, "state.json")}\n`);
     } else {
       assert.ok(process.env.BAMBOO_CARGO_SANDBOX, "Cargo isolation is not installed");
-      process.exitCode = run(JSON.parse(fs.readFileSync(process.env.BAMBOO_CARGO_SANDBOX, "utf8")), process.argv.slice(2));
+      process.exitCode = await run(JSON.parse(fs.readFileSync(process.env.BAMBOO_CARGO_SANDBOX, "utf8")), process.argv.slice(2));
     }
   } catch (error) { console.error(error.message); process.exitCode = 1; }
 }
-module.exports = { IMAGE, childEnv, install, snapshot, regular, copyRegular, packageFile, recover, remapMetadata, run };
+if (require.main === module) main();
+module.exports = { IMAGE, childEnv, install, snapshot, regular, copyRegular, packageFile, recover, remapMetadata, publishArchive, run };
