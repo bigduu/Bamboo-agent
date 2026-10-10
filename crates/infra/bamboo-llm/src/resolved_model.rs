@@ -72,6 +72,10 @@ impl RoleReasoningProvider {
 
 #[async_trait]
 impl LLMProvider for RoleReasoningProvider {
+    async fn supports_vision(&self, model: &str) -> Option<bool> {
+        self.inner.supports_vision(model).await
+    }
+
     async fn capability_loading_mode(
         &self,
         model: &str,

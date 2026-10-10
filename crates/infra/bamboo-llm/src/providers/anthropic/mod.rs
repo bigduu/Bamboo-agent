@@ -1425,21 +1425,28 @@ fn messages_to_anthropic_json(
     // at the marked stable source, not at a later volatile coalesced tail.
     let mut out_spans: Vec<Vec<SourceSpan>> = Vec::new();
 
-    // Keep only the MOST RECENT tool-result image (e.g. screenshot); older ones
-    // are dropped from the request to control context size, since a conversation
-    // can accumulate many large images. (User-attached images are untouched.)
+    // Keep every image in the latest tool-result batch. Parallel ViewImage
+    // calls must all reach their first subsequent request. Older batches retain
+    // the existing explicit omission marker to bound accumulated screenshots.
+    // User-attached images are untouched.
     let last_image_tool_idx = messages
         .iter()
         .enumerate()
         .filter(|(_, m)| matches!(m.role, Role::Tool) && message_has_image(m))
         .map(|(i, _)| i)
         .next_back();
+    let latest_image_batch_start = last_image_tool_idx.map(|last| {
+        messages[..last]
+            .iter()
+            .rposition(|m| !matches!(m.role, Role::Tool | Role::System))
+            .map_or(0, |idx| idx + 1)
+    });
 
     for (idx, m) in messages.iter().enumerate() {
         match m.role {
             Role::System => system_parts.push(m.content.as_str()),
             Role::User | Role::Assistant | Role::Tool => {
-                let keep_image = Some(idx) == last_image_tool_idx;
+                let keep_image = latest_image_batch_start.is_some_and(|start| idx >= start);
                 // `message_to_anthropic_json` returns `None` only for a stray
                 // System message; skip it (rather than emit a null/empty entry)
                 // so a malformed conversation never pollutes the `messages`
@@ -5320,6 +5327,28 @@ mod anthropic_request_building {
     }
 
     #[test]
+    fn vision_messages_keep_every_image_in_the_latest_tool_batch() {
+        let img = |d: &str| bamboo_domain::ToolResultImage {
+            mime_type: "image/png".to_string(),
+            data: d.to_string(),
+        };
+        let messages = vec![
+            Message::user("look"),
+            Message::tool_result_with_images("old", "old shot", true, vec![img("OLDER")]),
+            Message::assistant("inspect both files", None),
+            Message::tool_result_with_images("first", "first shot", true, vec![img("FIRST")]),
+            Message::tool_result_with_images("second", "second shot", true, vec![img("SECOND")]),
+        ];
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+        let dumped = out.to_string();
+        assert!(dumped.contains("FIRST"));
+        assert!(dumped.contains("SECOND"));
+        assert!(!dumped.contains("OLDER"));
+        assert!(dumped.contains("omitted"));
+    }
+
+    #[test]
     fn messages_keep_only_the_most_recent_tool_image() {
         let img = |d: &str| bamboo_domain::ToolResultImage {
             mime_type: "image/jpeg".to_string(),
@@ -5328,6 +5357,7 @@ mod anthropic_request_building {
         let messages = vec![
             Message::user("look"),
             Message::tool_result_with_images("t1", "shot1", true, vec![img("FIRST")]),
+            Message::assistant("take another screenshot", None),
             Message::tool_result_with_images("t2", "shot2", true, vec![img("LAST")]),
         ];
         let out =

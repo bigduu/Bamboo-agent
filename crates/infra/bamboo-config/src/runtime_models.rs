@@ -129,6 +129,7 @@ pub fn validate_runtime_model_admission(config: &Config) -> Result<(), String> {
             .collect();
     instances.extend(config.provider_instances.clone());
     for (id, instance) in &instances {
+        crate::model_vision_overrides(instance)?;
         if let Some(admitted) = explicit_runtime_models(instance)? {
             for model in configured_models(config, id, instance) {
                 if !admitted.contains(&model) {

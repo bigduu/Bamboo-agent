@@ -853,3 +853,40 @@ evidence skips the auxiliary call. An invalid verdict, provider failure, budget
 rejection or cancellation does not produce a verified completion. The check is
 a model judgment over bounded records; it does not certify omitted evidence or
 prove that an external operation completed.
+
+
+## Per-model Vision capability
+
+Provider instances may declare `model_capabilities` in their native configuration
+(exposed as `config.model_capabilities` by provider-instance CRUD). Keys are exact,
+non-empty model IDs scoped to that instance; they do not admit a runtime model.
+
+```json
+{
+  "provider_type": "openai",
+  "runtime_models": ["image-model", "text-model"],
+  "model_capabilities": {
+    "image-model": { "supports_vision": true },
+    "text-model": { "supports_vision": false }
+  }
+}
+```
+
+An explicit boolean overrides the routed provider's declared Vision capability.
+Missing/null `supports_vision` inherits that declaration. If the provider has no
+declaration, it remains unknown: existing image transport and
+`hooks.image_fallback` behavior are preserved. Current built-in model-info feeds
+expose token limits rather than a Vision declaration; a catalog's historical
+default `supports_vision: false` is not proof that every legacy model lacks Vision.
+There is no model-name inference, provider-wide toggle, or automatic migration.
+The settings UI exposes Supports Vision / No Vision / Inherit for each admitted
+model. Null restores inheritance through the existing update merge behavior.
+
+`ViewImage` uses the actual provider handle and model of the current round,
+including role wrappers and reloaded providers. Explicit No Vision produces a
+paired tool error before reading or sending an image, including legacy aliases.
+Explicit Supports Vision sends the image parts to the next model request without
+the legacy image fallback. Switching to No Vision while image history remains
+produces an explicit model-request error and preserves that history; switch back
+to a Vision model to continue. It does not silently drop images or claim they
+were seen. Unconfigured legacy models retain their existing fallback policy.

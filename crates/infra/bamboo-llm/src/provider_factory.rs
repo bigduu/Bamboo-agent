@@ -107,10 +107,14 @@ pub async fn create_provider_from_instance(
         )));
     }
 
+    let overrides = bamboo_config::model_vision_overrides(instance).map_err(LLMError::Api)?;
     let masking_config = config.keyword_masking.clone();
     let http_client = build_http_client(config)?;
 
-    match instance.provider_type.as_str() {
+    let provider: std::result::Result<Arc<dyn LLMProvider>, LLMError> = match instance
+        .provider_type
+        .as_str()
+    {
         "copilot" => {
             let headless_auth = instance
                 .extra
@@ -287,6 +291,15 @@ pub async fn create_provider_from_instance(
             instance.provider_type,
             AVAILABLE_PROVIDERS.join(", ")
         ))),
+    };
+    let provider = provider?;
+    if overrides.is_empty() {
+        Ok(provider)
+    } else {
+        Ok(Arc::new(crate::model_vision::ModelVisionProvider {
+            inner: provider,
+            overrides,
+        }))
     }
 }
 

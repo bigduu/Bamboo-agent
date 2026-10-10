@@ -409,7 +409,29 @@ fn apply_instance_update(
             obj.remove(bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY);
         }
 
-        for (key, value) in patch_obj {
+        for (key, mut value) in patch_obj {
+            if key == "model_capabilities" {
+                if let (Some(current), Some(patch)) =
+                    (obj.get(&key).and_then(Value::as_object), value.as_object())
+                {
+                    let mut merged = current.clone();
+                    for (model, capability) in patch {
+                        let capability = match (
+                            merged.get(model).and_then(Value::as_object),
+                            capability.as_object(),
+                        ) {
+                            (Some(old), Some(new)) => {
+                                let mut fields = old.clone();
+                                fields.extend(new.clone());
+                                Value::Object(fields)
+                            }
+                            _ => capability.clone(),
+                        };
+                        merged.insert(model.clone(), capability);
+                    }
+                    value = Value::Object(merged);
+                }
+            }
             obj.insert(key, value);
         }
     }
@@ -2064,5 +2086,39 @@ mod tests {
             .resolve(&credential_ref)
             .expect("cleared credential lookup")
             .is_none());
+    }
+    #[test]
+    fn vision_crud_round_trips_per_model_and_can_restore_inheritance() {
+        let mut request = create_request("fixture-key");
+        request.config["model_capabilities"] =
+            serde_json::json!({"image":{"supports_vision":true},"text":{"supports_vision":false}});
+        let instance = build_instance_from_create(&request).unwrap();
+        let response = instance_config_to_api(&instance, true);
+        assert_eq!(
+            response["model_capabilities"]["image"]["supports_vision"],
+            true
+        );
+        assert_eq!(
+            response["model_capabilities"]["text"]["supports_vision"],
+            false
+        );
+        let update = UpdateInstanceRequest {
+            label: None,
+            enabled: None,
+            config: Some(
+                serde_json::json!({"model_capabilities":{"image":{"supports_vision":null}}}),
+            ),
+        };
+        let inherited = apply_instance_update(&instance, &update).unwrap();
+        let overrides = bamboo_config::model_vision_overrides(&inherited).unwrap();
+        assert!(!overrides.contains_key("image"));
+        assert_eq!(overrides["text"], false);
+        let invalid = UpdateInstanceRequest {
+            config: Some(
+                serde_json::json!({"model_capabilities":{"image":{"supports_vision":"false"}}}),
+            ),
+            ..update
+        };
+        assert!(apply_instance_update(&instance, &invalid).is_err());
     }
 }

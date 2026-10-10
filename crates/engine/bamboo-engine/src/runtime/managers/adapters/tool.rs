@@ -58,6 +58,10 @@ impl ToolManager for DefaultToolManager {
             metrics_collector,
             config,
             llm: &self.llm,
+            vision_support: self
+                .llm
+                .supports_vision(config.model_name.as_deref().unwrap_or(&session.model))
+                .await,
             tools: &self.tools,
         };
         let mut runtime_state = session

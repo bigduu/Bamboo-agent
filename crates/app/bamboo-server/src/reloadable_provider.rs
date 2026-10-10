@@ -27,6 +27,10 @@ impl ReloadableProvider {
 
 #[async_trait]
 impl LLMProvider for ReloadableProvider {
+    async fn supports_vision(&self, model: &str) -> Option<bool> {
+        self.current().await.supports_vision(model).await
+    }
+
     async fn capability_loading_mode(
         &self,
         model: &str,
@@ -199,5 +203,31 @@ mod tests {
             ProviderVisibleToolSegmentKind::ProviderLateBound
         );
         assert_eq!(footprint.segments[0].serialized, r#"{"forwarded":true}"#);
+    }
+    struct VisionMetadataProvider(bool);
+    #[async_trait]
+    impl LLMProvider for VisionMetadataProvider {
+        async fn supports_vision(&self, model: &str) -> Option<bool> {
+            (model == "same").then_some(self.0)
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream> {
+            panic!("no model dispatch")
+        }
+    }
+    #[tokio::test]
+    async fn vision_capability_follows_current_provider_after_reload() {
+        let inner: Arc<RwLock<Arc<dyn LLMProvider>>> =
+            Arc::new(RwLock::new(Arc::new(VisionMetadataProvider(true))));
+        let p = ReloadableProvider::new(inner.clone());
+        assert_eq!(p.supports_vision("same").await, Some(true));
+        *inner.write().await = Arc::new(VisionMetadataProvider(false));
+        assert_eq!(p.supports_vision("same").await, Some(false));
+        assert_eq!(p.supports_vision("unknown").await, None);
     }
 }

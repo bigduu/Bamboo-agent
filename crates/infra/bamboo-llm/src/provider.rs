@@ -269,6 +269,12 @@ pub(crate) fn required_tool_from_options<'a>(
 /// ```
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
+    /// Declared Vision support for the exact model. None means unknown and
+    /// preserves the legacy image/fallback behavior; never infer from its name.
+    async fn supports_vision(&self, _model: &str) -> Option<bool> {
+        None
+    }
+
     /// Select the provider's callable-catalog policy for one model request.
     ///
     /// Providers must opt in explicitly. The default preserves the complete

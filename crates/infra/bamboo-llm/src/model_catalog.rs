@@ -41,10 +41,11 @@ impl ModelCatalogService {
                     }
                     None => Vec::new(),
                 };
-                (meta, provider.is_some(), admitted, info)
+                (meta, provider, admitted, info)
             }
         });
-        for (meta, authenticated, admitted, info) in futures::future::join_all(lookups).await {
+        for (meta, provider, admitted, info) in futures::future::join_all(lookups).await {
+            let authenticated = provider.is_some();
             providers.push(ProviderDescriptor {
                 id: meta.id.clone(),
                 display_name: meta.display_name.clone(),
@@ -61,9 +62,15 @@ impl ModelCatalogService {
                     let upstream = info.get(&id);
                     models.push(ProviderModelDescriptor {
                         reference: ProviderModelRef::new(&meta.id, &id),
-                        display_name: id,
+                        display_name: id.clone(),
                         provider_display_name: meta.display_name.clone(),
                         capabilities: ModelCapabilities {
+                            supports_vision: provider
+                                .as_ref()
+                                .unwrap()
+                                .supports_vision(&id)
+                                .await
+                                .unwrap_or(false),
                             max_context_tokens: upstream.and_then(|info| info.max_context_tokens),
                             max_output_tokens: upstream.and_then(|info| info.max_output_tokens),
                             ..ModelCapabilities::default()
@@ -107,21 +114,23 @@ impl ModelCatalogService {
             .await
             .map_err(|e| e.to_string())?;
 
-        Ok(info_list
-            .into_iter()
-            .map(|info| ProviderModelDescriptor {
+        let mut models = Vec::new();
+        for info in info_list {
+            models.push(ProviderModelDescriptor {
                 reference: ProviderModelRef::new(provider_name, &info.id),
                 display_name: info.id.clone(),
                 provider_display_name: provider_display_name.clone(),
                 capabilities: ModelCapabilities {
+                    supports_vision: provider.supports_vision(&info.id).await.unwrap_or(false),
                     max_context_tokens: info.max_context_tokens,
                     max_output_tokens: info.max_output_tokens,
                     ..ModelCapabilities::default()
                 },
                 source: Some(ModelSource::Upstream),
                 discovered_at: None,
-            })
-            .collect())
+            });
+        }
+        Ok(models)
     }
 
     /// Fetch model lists from all registered providers.

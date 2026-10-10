@@ -5,6 +5,7 @@ pub mod error;
 pub mod http_client;
 pub mod masking;
 pub mod model_catalog;
+mod model_vision;
 pub mod models;
 pub mod prompt_ir;
 pub mod protocol;

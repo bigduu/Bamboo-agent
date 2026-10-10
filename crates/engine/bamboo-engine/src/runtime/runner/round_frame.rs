@@ -34,6 +34,7 @@ pub(crate) struct RoundFrame<'a> {
     // -- Engine resources --
     pub config: &'a AgentLoopConfig,
     pub llm: &'a Arc<dyn LLMProvider>,
+    pub vision_support: Option<bool>,
     pub tools: &'a Arc<dyn ToolExecutor>,
 }
 

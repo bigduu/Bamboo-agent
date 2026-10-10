@@ -53,7 +53,7 @@ impl Tool for ViewImageTool {
     }
 
     fn description(&self) -> &str {
-        "View a local PNG, JPEG, GIF, or WebP image. Returns the image as base64 multimodal content; when hooks.image_fallback is enabled in vision mode, Bamboo uses the resolved vision model to replace it with a detailed description before the next model turn."
+        "View a local PNG, JPEG, GIF, or WebP image. Returns base64 multimodal content for the current model. Models explicitly configured without Vision reject this tool. Models with inherited capability retain the configured hooks.image_fallback behavior."
     }
 
     fn classify(&self, _args: &serde_json::Value) -> ToolClass {
