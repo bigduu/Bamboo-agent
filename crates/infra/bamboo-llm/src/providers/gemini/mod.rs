@@ -216,6 +216,7 @@ impl LLMProvider for GeminiProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
+        crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
         tracing::debug!("Gemini provider using model_hash={}", log_identity(model));
         let reasoning_effort = options
             .and_then(|o| o.reasoning_effort)

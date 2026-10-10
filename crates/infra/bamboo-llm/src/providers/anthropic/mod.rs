@@ -396,6 +396,8 @@ impl LLMProvider for AnthropicProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
+        crate::image_budget::validate_tool_image_budget(ir.body_chat_iter())
+            .map_err(LLMError::Api)?;
         let required_tool = options
             .and_then(|options| options.required_tool.as_deref())
             .map(str::trim)
@@ -452,6 +454,7 @@ impl AnthropicProvider {
         options: Option<&LLMRequestOptions>,
         capability_loading_mode: CapabilityLoadingMode,
     ) -> Result<LLMStream> {
+        crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
         let max_tokens = max_output_tokens.unwrap_or(self.max_tokens);
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
         let required_tool = required_tool_from_options(options, tools)?;

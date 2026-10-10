@@ -617,6 +617,8 @@ impl LLMProvider for OpenAIProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
+        crate::image_budget::validate_tool_image_budget(ir.body_chat_iter())
+            .map_err(LLMError::Api)?;
         let messages = if ir.continuation.is_some() {
             ir.continuation_delta()
         } else {

@@ -889,3 +889,5 @@ models without an override; it does not declare the model unsupported.
 Switching to No Vision while image history remains produces an explicit
 model-request error and preserves that history; switch back to a Vision model to
 continue. Images are not silently dropped or claimed to have been seen.
+
+The canonical IR request entry and native Anthropic/Gemini serializers (including Bodhi proxy paths) reject tool-image batches exceeding 32 MiB of cumulative encoded image URL bytes before request cloning/serialization. The error is explicit, image history is preserved, and no upstream request is sent; use smaller images or batches. The per-file ViewImage size limit is unchanged.

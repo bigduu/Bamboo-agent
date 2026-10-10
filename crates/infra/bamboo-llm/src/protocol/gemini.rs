@@ -328,6 +328,8 @@ pub struct GeminiRequestBuilder;
 
 impl ToProvider<GeminiRequest> for Vec<Message> {
     fn to_provider(&self) -> ProtocolResult<GeminiRequest> {
+        crate::image_budget::validate_tool_image_budget(self)
+            .map_err(ProtocolError::InvalidContent)?;
         let mut system_texts = Vec::new();
         let mut contents = Vec::new();
 

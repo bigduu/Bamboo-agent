@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod error;
 pub mod http_client;
+mod image_budget;
 pub mod masking;
 pub mod model_catalog;
 mod model_vision;

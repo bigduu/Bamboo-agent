@@ -144,21 +144,34 @@ impl PromptIR {
     /// SystemRemainder sits between DynamicContext and Conversation — the exact
     /// legacy order (`envelope.conversation_messages = remainder ++ conversation`).
     pub fn body_chat(&self) -> Vec<Message> {
-        let mut out = Vec::new();
-        out.extend_from_slice(self.run(SegmentRole::StablePrefix));
-        if self
+        self.body_chat_iter().cloned().collect()
+    }
+
+    /// Borrow the canonical chat body before allocating request projections.
+    /// ModelTranscript replaces the legacy context/history runs, as in body_chat.
+    pub fn body_chat_iter(&self) -> impl Iterator<Item = &Message> {
+        let has_transcript = self
             .segments
             .iter()
-            .any(|segment| segment.role == SegmentRole::ModelTranscript)
-        {
-            out.extend_from_slice(self.run(SegmentRole::ModelTranscript));
-            return out;
-        }
-        out.extend_from_slice(self.run(SegmentRole::DynamicContext));
-        out.extend_from_slice(self.run(SegmentRole::SystemRemainder));
-        out.extend_from_slice(self.run(SegmentRole::Conversation));
-        out.extend_from_slice(self.run(SegmentRole::VolatileTail));
-        out
+            .any(|segment| segment.role == SegmentRole::ModelTranscript);
+        [
+            SegmentRole::StablePrefix,
+            SegmentRole::ModelTranscript,
+            SegmentRole::DynamicContext,
+            SegmentRole::SystemRemainder,
+            SegmentRole::Conversation,
+            SegmentRole::VolatileTail,
+        ]
+        .into_iter()
+        .filter(move |role| {
+            *role == SegmentRole::StablePrefix
+                || if has_transcript {
+                    *role == SegmentRole::ModelTranscript
+                } else {
+                    *role != SegmentRole::ModelTranscript
+                }
+        })
+        .flat_map(|role| self.run(role))
     }
 
     /// Flat message list for chat / non-block providers: `[system?] ++ body_chat`.
