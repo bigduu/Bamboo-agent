@@ -31,7 +31,7 @@ test("routine dev pull requests run locked Rust, formatting, and policy checks",
 
   const testJob = job("test")
   assert.match(testJob, /name: Test\n/u)
-  assert.match(testJob, /name: Test\n    runs-on: ubuntu-latest\n    timeout-minutes: 45\n/u)
+  assert.match(testJob, /name: Test\n    runs-on: ubuntu-latest\n    timeout-minutes: 75\n/u)
   assert.match(testJob, /run: cargo build --locked\n/u)
   assert.match(
     testJob,
@@ -77,7 +77,7 @@ test("locked Rust test compilation has a separate budget before the complete sui
   const testJob = job("test")
   const [settings, ...steps] = testJob.split(/(?=^      - )/mu)
   assert.doesNotMatch(settings, /^    (?:if|continue-on-error):/mu)
-  assert.match(settings, /^    timeout-minutes: 45$/mu)
+  assert.match(settings, /^    timeout-minutes: 75$/mu)
 
   const requiredSteps = [
     ["Build locked Rust workspace", "cargo build --locked", undefined],
