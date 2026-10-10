@@ -227,6 +227,8 @@ jobs:
 
       - name: Run all-feature library and integration tests
         run: cargo test --locked --all-features --lib --tests
+        env:
+          RUST_MIN_STACK: "8388608"
 
   lint:
     name: Lint
