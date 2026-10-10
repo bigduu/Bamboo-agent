@@ -41,9 +41,11 @@ fn main() {
  let own=env::var_os("BAMBOO_TEST_PARENT_SECRET").is_some();
  let authority=["GH_TOKEN","GITHUB_TOKEN","GH_ENTERPRISE_TOKEN","GITHUB_ENTERPRISE_TOKEN","BAMBOO_RELEASE_TOKEN","BAMBOO_RELEASE_SIGNING_KEY","BAMBOO_RELEASE_SIGNING_KEY_SHA256","CARGO_REGISTRIES_OTHER_TOKEN","GITHUB_ENV","GITHUB_OUTPUT"].iter().any(|k|env::var_os(k).is_some());
  let token=env::var_os("CARGO_REGISTRY_TOKEN").is_some();
+ let host_read=fs::read(${JSON.stringify(controllerFile)}).is_ok();
  let host_write=fs::write(${JSON.stringify(controllerFile)},b"modified").is_ok();
- println!("cargo:warning=ISOLATION own={own} authority={authority} ancestor={seen} host_write={host_write} token={token}");
+ println!("cargo:warning=ISOLATION own={own} authority={authority} ancestor={seen} host_write={host_write} token={token} host_read={host_read}");
  assert!(!own && !authority); assert_eq!(seen,${visible}); assert_eq!(host_write,${visible});
+ assert_eq!(host_read,${visible});
  if !${visible} {
   let status=fs::read_to_string("/proc/self/status").unwrap();
   assert!(status.lines().any(|s|s=="NoNewPrivs:\\t1"));
@@ -57,7 +59,7 @@ fn main() {
 }
 `;
 }
-function controller() {
+async function controller() {
   const root = temporary();
   const hostFile = path.join(root, "controller-only");
   fs.writeFileSync(hostFile, "untouched");
@@ -104,17 +106,52 @@ function controller() {
   const vcs = JSON.parse(exec("tar", ["-xOf", archive, "fixture-probe-2026.10.17/.cargo_vcs_info.json"]));
   assert.equal(vcs.git.sha1, sha);
   assert.equal(vcs.git.dirty, true);
-  assert.match(cargo(["publish", "--dry-run", "--allow-dirty", "--locked", "-p", "fixture-probe"]), /ancestor=false host_write=false token=true/);
+  assert.match(cargo(["publish", "--dry-run", "--allow-dirty", "--locked", "-p", "fixture-probe"]), /ancestor=false host_write=false token=false/);
+  const reserved = fs.readFileSync(archive);
+  fs.appendFileSync(archive, "tampered-reservation");
+  const drift = spawnSync("cargo", ["publish", "--dry-run", "--allow-dirty", "--locked", "-p", "fixture-probe"], { cwd: linked, env, encoding: "utf8" });
+  assert.notEqual(drift.status, 0);
+  assert.match(drift.stderr, /Verified package archive changed from the reserved bytes/);
+  assert.deepEqual(fs.readFileSync(archive), reserved);
+  // Exercise the real non-dry publication route, replacing only its final
+  // network call. No production endpoint or credential is used by this test.
+  const uploader = require("./release-cargo-upload.cjs");
+  const upload = uploader.uploadArchive;
+  let uploads = 0;
+  uploader.uploadArchive = async (bytes, metadata, token) => {
+    uploads++;
+    assert.equal(token, "dummy-registry");
+    assert.equal(metadata.name, "fixture-probe");
+    assert.equal(metadata.vers, "2026.10.17");
+    assert.deepEqual(bytes, reserved);
+    return { status: 0, output: "Fixture upload of exact verified bytes" };
+  };
+  try {
+    const buildFile = path.join(linked, "probe/build.rs");
+    const build = fs.readFileSync(buildFile);
+    fs.writeFileSync(buildFile, 'compile_error!("fixture verification must stop upload");\n');
+    assert.notEqual(await sandbox.run(state, ["publish", "--locked", "--allow-dirty", "-p", "fixture-probe"]), 0);
+    assert.equal(uploads, 0);
+    fs.writeFileSync(buildFile, build);
+    assert.equal(await sandbox.run(state, ["publish", "--locked", "--allow-dirty", "-p", "fixture-probe"]), 0);
+    assert.equal(uploads, 1);
+  } finally { uploader.uploadArchive = upload; }
   assert.equal(fs.readFileSync(hostFile, "utf8"), "untouched");
   assert.ok(!fs.existsSync(path.join(linked, "probe/worker-mutated")));
   console.log("Isolated metadata/check/package/publish-dry-run and Python shim: passed; exact dirty source provenance: passed");
   fs.rmSync(root, { recursive: true, force: true });
 }
-if (process.argv[2] === "--controller") controller();
+if (process.argv[2] === "--controller") controller().catch(error => { console.error(error); process.exitCode = 1; });
 else {
   test("worker client environment excludes publication authority", () => {
     for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "BAMBOO_RELEASE_SIGNING_KEY", "CARGO_REGISTRY_TOKEN", "GITHUB_OUTPUT"]) assert.ok(!(key in sandbox.childEnv()));
     assert.match(sandbox.IMAGE, /^rust:1\.99\.0-bookworm@sha256:[a-f0-9]{64}$/);
+  });
+  test("publication rejects credential, registry and execution overrides before starting a worker", async () => {
+    for (const flag of ["--token", "--registry", "--index", "--config", "--no-verify", "--features"]) {
+      await assert.rejects(sandbox.publishArchive({}, ["publish", "--locked", "--allow-dirty", "-p", "fixture-probe", flag]), /Unsupported publication argument/);
+    }
+    await assert.rejects(sandbox.publishArchive({}, ["publish", "--locked", "--allow-dirty", "--dry-run", "-p", "fixture-probe", "-p", "other"]), /one explicit package/);
   });
   test("transfers reject source and destination symlinks, including parent directories", () => {
     const root = temporary();
