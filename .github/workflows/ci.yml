@@ -113,6 +113,19 @@ jobs:
         env:
           RUST_MIN_STACK: "8388608"
 
+      - name: Preserve failed synthetic Ticket fixture evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ticket-fixture-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          # These fixtures use isolated synthetic providers and retain their
+          # directories only on failure. Never upload config or session stores.
+          path: |
+            /tmp/bamboo-1481-ticket-lifecycle-*/host/host.log
+            /tmp/bamboo-1481-ticket-lifecycle-*/host/question-readiness.json
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Build examples
         if: github.event_name != 'pull_request' || github.base_ref == 'main'
         # Compile-only (no network/config needed): guards `examples/*.rs` —
