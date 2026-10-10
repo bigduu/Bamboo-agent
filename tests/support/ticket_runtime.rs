@@ -119,9 +119,37 @@ pub struct Probe {
     pub held: AtomicUsize,
     pub input_checks: AtomicUsize,
     pub questions: AtomicUsize,
+    pub question_retries: AtomicUsize,
     pub answer_checks: AtomicUsize,
     pub release: tokio::sync::Notify,
 }
+
+/// A new model attempt must not reuse a completed tool-call identity. Only the
+/// known concurrent Ticket revision conflict permits this fixture to retry.
+pub fn question_call(messages: &Value, letter: &str, probe: &Probe) -> Value {
+    let prefix = format!("ticket-native-question-{letter}-");
+    let previous: Vec<_> = messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    for (attempt, result) in previous.iter().enumerate() {
+        assert_eq!(result["tool_call_id"], format!("{prefix}{attempt}"));
+        let content = result["content"].as_str().unwrap();
+        assert_eq!(
+            content, "authority_unavailable: revision_conflict",
+            "question may retry only an observed native revision conflict: {result}"
+        );
+    }
+    if !previous.is_empty() {
+        probe.question_retries.fetch_add(1, Ordering::SeqCst);
+    }
+    probe.questions.fetch_add(1, Ordering::SeqCst);
+    let args = json!({"tasks":[{"id":"own-step","content":format!("Own private plan {letter}"),"status":"blocked"}],"question":{"prompt":format!("问题 {letter}：请给出专属答案")}});
+    json!({"index":0,"id":format!("{prefix}{}", previous.len()),"type":"function","function":{"name":"Task","arguments":args.to_string()}})
+}
+
 async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
     let task_only = body["tools"]
         .as_array()
@@ -262,9 +290,8 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 body["tools"][0]["function"]["parameters"]["properties"]["question"].is_object()
             );
             if !content.contains(&format!("答案 {letter}")) {
-                probe.questions.fetch_add(1, Ordering::SeqCst);
-                let args = json!({"tasks":[{"id":"own-step","content":format!("Own private plan {letter}"),"status":"blocked"}],"question":{"prompt":format!("问题 {letter}：请给出专属答案")}});
-                let delta = json!({"tool_calls":[{"index":0,"id":"ticket-native-question","type":"function","function":{"name":"Task","arguments":args.to_string()}}]});
+                let delta =
+                    json!({"tool_calls":[question_call(&body["messages"], letter, &probe)]});
                 let event = json!({"id":"ticket-question","object":"chat.completion.chunk","choices":[{"index":0,"delta":delta,"finish_reason":"tool_calls"}]});
                 return HttpResponse::Ok()
                     .content_type("text/event-stream")
