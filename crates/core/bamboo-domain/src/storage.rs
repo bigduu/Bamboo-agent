@@ -260,6 +260,7 @@ pub trait Storage: Send + Sync {
 
     /// Trusted host bootstrap for one stable default Supervisor Root. Only the
     /// initial model is caller supplied and is used on first creation only.
+    /// It may be empty before provider setup; bootstrap does not execute a run.
     /// Implementations must publish the complete identity atomically, protect it
     /// from ordinary writers, and return a receipt rather than a partial Session.
     async fn get_or_create_default_supervisor(

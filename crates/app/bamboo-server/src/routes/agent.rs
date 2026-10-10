@@ -90,6 +90,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             settings::enforce_access_password_middleware,
         ))
         .route("/bootstrap", web::get().to(agent::bootstrap::handler))
+        .route(
+            "/supervisor/default",
+            web::post().to(agent::supervisor::open_default),
+        )
         .service(
             web::scope("/tickets")
                 .route("/scope", web::get().to(agent::tickets::scope))
