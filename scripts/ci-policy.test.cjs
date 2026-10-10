@@ -1,5 +1,8 @@
 const assert = require("node:assert/strict")
-const { readFileSync } = require("node:fs")
+const { mkdtempSync, readFileSync, rmSync, writeFileSync } = require("node:fs")
+const { spawnSync } = require("node:child_process")
+const os = require("node:os")
+const path = require("node:path")
 const { test } = require("node:test")
 
 const workflow = readFileSync(".github/workflows/ci.yml", "utf8")
@@ -24,6 +27,64 @@ const job = (id) => {
 
 const comprehensiveOnly =
   "if: github.event_name != 'pull_request' || github.base_ref == 'main'"
+
+test("macOS link guard preserves Cargo failures and rejects lost or oversized diagnostics", {
+  skip: process.platform === "win32" && "the macOS helper requires a POSIX shell",
+}, () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-macos-link-guard-"))
+  const helper = path.resolve(__dirname, "run-macos-server-lib-tests.sh")
+  const expectedArgs = [
+    "test", "--locked", "--profile", "dev", "-p", "bamboo-server",
+    "--all-features", "--lib", "server::tls::tests", "--", "--nocapture",
+  ]
+  const stub = (name, body) => writeFileSync(path.join(directory, name), `#!/bin/bash\n${body}\n`, { mode: 0o755 })
+  stub("uname", 'printf "%s\\n" Darwin')
+  stub("cargo", [
+    'printf "%s\\n" "$@" > "$FIXTURE_ARGS"',
+    'printf "%s\\n" "test result: ok. 8 passed; 0 failed"',
+    'if [[ "$FIXTURE_WARNING" == 1 ]]; then',
+    '  echo "ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table" >&2',
+    "fi",
+    'exit "$FIXTURE_CARGO_STATUS"',
+  ].join("\n"))
+  const run = (overrides = {}) => spawnSync("bash", [helper], {
+    encoding: "utf8",
+    env: {
+      PATH: `${directory}${path.delimiter}${process.env.PATH}`,
+      TMPDIR: directory,
+      FIXTURE_ARGS: path.join(directory, "cargo-args"),
+      FIXTURE_WARNING: "0",
+      FIXTURE_CARGO_STATUS: "0",
+      ...overrides,
+    },
+  })
+  try {
+    const success = run()
+    assert.equal(success.status, 0, success.stderr)
+    assert.deepEqual(readFileSync(path.join(directory, "cargo-args"), "utf8").trim().split("\n"), expectedArgs)
+    assert.match(success.stdout, /8 passed; 0 failed/u)
+
+    const warning = run({ FIXTURE_WARNING: "1" })
+    assert.equal(warning.status, 1)
+    assert.match(warning.stderr, /emitted the oversized __eh_frame warning/u)
+
+    const cargoFailure = run({ FIXTURE_CARGO_STATUS: "23" })
+    assert.equal(cargoFailure.status, 23, cargoFailure.stderr)
+
+    stub("tee", "cat >/dev/null\nexit 13")
+    const captureFailure = run()
+    assert.equal(captureFailure.status, 1)
+    assert.match(captureFailure.stderr, /failed to capture.*linker diagnostics/u)
+    rmSync(path.join(directory, "tee"))
+
+    stub("grep", "exit 2")
+    const inspectFailure = run()
+    assert.equal(inspectFailure.status, 1)
+    assert.match(inspectFailure.stderr, /failed to inspect.*linker diagnostics/u)
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
 
 test("routine dev pull requests run locked Rust, formatting, and policy checks", () => {
   assert.match(workflow, /push:\n\s+branches: \[ main \]/u)
