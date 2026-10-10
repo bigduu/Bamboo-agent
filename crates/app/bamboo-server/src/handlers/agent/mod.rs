@@ -31,6 +31,7 @@ pub mod sessions;
 pub mod stop;
 pub mod stream;
 pub mod subagent_snapshot;
+pub mod supervisor;
 pub mod task;
 pub mod tickets;
 pub mod ws_v2;

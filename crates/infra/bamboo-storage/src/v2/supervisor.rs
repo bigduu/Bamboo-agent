@@ -341,12 +341,9 @@ impl SessionStoreV2 {
                 ));
             }
         }
-        if initial_model.trim().is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a model is required to bootstrap the default Supervisor",
-            ));
-        }
+        // Identity exists before model setup or the first message. An empty
+        // model leaves this idle Session unbound; normal chat admission still
+        // resolves/validates the configured model before it can execute.
         let incarnation_id = Uuid::new_v4();
         let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, initial_model.trim());
         session.created_at = self.fresh_root_birth(DEFAULT_SUPERVISOR_SESSION_ID).await?;

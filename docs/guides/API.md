@@ -14,6 +14,39 @@ http://localhost:9562/api/v1
 
 ## API Endpoints
 
+### Open the Default Supervisor
+
+```http
+POST /api/v1/supervisor/default
+```
+
+Open the persistent, independent `bamboo-default-supervisor` Session without
+appending a message or starting a run. No request body is required. This owner
+endpoint uses the atomic Supervisor bootstrap port; concurrent clicks and
+reopening after restart return the same `session_id` and `incarnation_id`.
+Existing messages, model selection and birth identity are preserved. Clients
+can then read the normal Session detail and history endpoints.
+
+```json
+{
+  "session_id": "bamboo-default-supervisor",
+  "incarnation_id": "550e8400-e29b-41d4-a716-446655440000",
+  "created": true
+}
+```
+
+`created` is false when the authority already exists. First creation uses the
+configured default model when available, otherwise it remains unbound until
+the user configures/selects a model for normal chat admission. An Ordinary or
+Child occupying the reserved identity returns HTTP 409 and is never promoted
+or replaced. Unverifiable authority returns HTTP 503. Verified owner access is
+required, including on an otherwise open remote instance; Worker run
+credentials cannot create or open this authority.
+
+This endpoint is independent of `ticket_mutation` and `ticket_dispatch`: it
+does not change either flag or attach/import a Ticket scope. Session-list GETs
+remain read-only and include the real empty Supervisor after it is opened.
+
 ### Chat Operations
 
 #### Create Chat Message
