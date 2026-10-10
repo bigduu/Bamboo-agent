@@ -74,7 +74,7 @@ fn tool_start_name_for_display(tool_name: &str) -> String {
 }
 
 pub(super) struct ToolExecutionOnlyContext<'a> {
-    pub vision_support: Option<bool>,
+    pub vision_support: bool,
     pub tool_call: &'a ToolCall,
     pub event_tx: &'a mpsc::Sender<AgentEvent>,
     pub metrics_collector: Option<&'a MetricsCollector>,
@@ -213,7 +213,7 @@ pub(super) async fn execute_model_requested_tool_call_only(
         });
     };
 
-    if execution_name == "ViewImage" && ctx.vision_support == Some(false) {
+    if execution_name == "ViewImage" && !ctx.vision_support {
         return Ok(ToolExecutionOutcome {
             output_cap: None, permission_replay_origin: None,
             result: Err("ViewImage is unavailable: the current model does not support Vision. Select a Vision-capable model or enable supports_vision for this model in provider settings. No image was read or sent.".into()),
@@ -1515,7 +1515,7 @@ mod hook_tests {
         let outcome = execute_model_requested_tool_call_only(
             callable,
             ToolExecutionOnlyContext {
-                vision_support: None,
+                vision_support: true,
                 output_cap: None,
                 executing_supervisor: None,
                 tool_call: call,
@@ -1692,7 +1692,7 @@ mod hook_tests {
             let execution = execute_model_requested_tool_call_only(
                 &callable,
                 ToolExecutionOnlyContext {
-                    vision_support: None,
+                    vision_support: true,
                     output_cap: cap,
                     executing_supervisor: None,
                     tool_call: &call,
@@ -1837,7 +1837,7 @@ mod hook_tests {
         execute_model_requested_tool_call_only(
             effective_callable_set,
             ToolExecutionOnlyContext {
-                vision_support: None,
+                vision_support: true,
                 output_cap: None,
                 executing_supervisor: None,
                 tool_call,
@@ -2000,7 +2000,7 @@ mod hook_tests {
         let unloaded = execute_model_requested_tool_call_only(
             &effective_callable_set,
             ToolExecutionOnlyContext {
-                vision_support: None,
+                vision_support: true,
                 output_cap: None,
                 executing_supervisor: None,
                 tool_call: &unloaded_call,
@@ -2275,7 +2275,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
-            vision_support: None,
+            vision_support: true,
             output_cap: None,
             executing_supervisor: None,
             tool_call: &tool_call,
@@ -2338,7 +2338,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
-            vision_support: None,
+            vision_support: true,
             output_cap: None,
             executing_supervisor: None,
             tool_call: &tool_call,
@@ -2420,7 +2420,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
-            vision_support: None,
+            vision_support: true,
             output_cap: None,
             executing_supervisor: None,
             tool_call: &tool_call,
@@ -2478,7 +2478,7 @@ mod hook_tests {
         let outcome = bamboo_tools::with_approval_proxy(
             Some(reviewer_proxy),
             execute_tool_call_only(ToolExecutionOnlyContext {
-                vision_support: None,
+                vision_support: true,
                 output_cap: None,
                 executing_supervisor: None,
                 tool_call: &tool_call,
@@ -3147,7 +3147,7 @@ mod hook_tests {
             let mut session = Session::new(session_id, "model");
             let session_flags = ToolExecutionSessionFlags::from_session(&session);
             let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
-                vision_support: None,
+                vision_support: true,
                 output_cap: Some(97),
                 executing_supervisor: None,
                 tool_call: &tool_call,
@@ -3210,7 +3210,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
-            vision_support: None,
+            vision_support: true,
             output_cap: None,
             executing_supervisor: None,
             tool_call: &tool_call,
@@ -3297,7 +3297,7 @@ mod hook_tests {
         execute_model_requested_tool_call_only(
             &callable,
             ToolExecutionOnlyContext {
-                vision_support: None,
+                vision_support: true,
                 output_cap: None,
                 executing_supervisor: None,
                 tool_call: call,

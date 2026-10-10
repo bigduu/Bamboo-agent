@@ -131,7 +131,7 @@ struct SingleToolExecutionControl {
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_and_apply_single_tool_call(
-    vision_support: Option<bool>,
+    vision_support: bool,
     tool_call: &ToolCall,
     event_tx: &mpsc::Sender<AgentEvent>,
     metrics_collector: Option<&MetricsCollector>,
@@ -1262,7 +1262,7 @@ mod tests {
         let llm: Arc<dyn LLMProvider> = Arc::new(BoundaryNoopProvider);
         let session_id = session.id.clone();
         let frame = crate::runtime::runner::round_frame::RoundFrame {
-            vision_support: None,
+            vision_support: true,
             session_id: &session_id,
             round_id: "permission-boundary-round",
             turn: 0,
@@ -1877,7 +1877,7 @@ mod tests {
         );
 
         let control = execute_and_apply_single_tool_call(
-            None,
+            true,
             &tool_call,
             &event_tx,
             None,
@@ -1941,7 +1941,7 @@ mod tests {
             tool_call_with_args("Read", json!({"file_path": file_path.to_str().unwrap()}));
 
         let control = execute_and_apply_single_tool_call(
-            None,
+            true,
             &tool_call,
             &event_tx,
             None,
@@ -1998,7 +1998,7 @@ mod tests {
         let tool_call = tool_call_with_args("request_permissions", json!({}));
 
         let control = execute_and_apply_single_tool_call(
-            None,
+            true,
             &tool_call,
             &event_tx,
             None,
@@ -2059,7 +2059,7 @@ mod tests {
         );
 
         let control = execute_and_apply_single_tool_call(
-            None,
+            true,
             &tool_call,
             &event_tx,
             None,
@@ -2117,7 +2117,7 @@ mod tests {
         let tool_call = tool_call_with_args("ExitPlanMode", json!({"plan": "test plan"}));
 
         let control = execute_and_apply_single_tool_call(
-            None,
+            true,
             &tool_call,
             &event_tx,
             None,
@@ -2176,7 +2176,7 @@ mod tests {
         );
 
         let control = execute_and_apply_single_tool_call(
-            None,
+            true,
             &tool_call,
             &event_tx,
             None,
@@ -2496,7 +2496,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(128);
         let sid = session.id.clone();
         let frame = crate::runtime::runner::round_frame::RoundFrame {
-            vision_support: None,
+            vision_support: true,
             session_id: &sid,
             round_id: "cap-round",
             turn: 0,
@@ -2596,7 +2596,7 @@ mod tests {
             session.resolved_token_budget = resolved.map(|n| ("model".into(), cap_budget(n)));
             let call = named_call(&format!("host-call-{index}"), "cap_probe");
             let control = super::execute_and_apply_single_tool_call(
-                None,
+                true,
                 &call,
                 &event_tx,
                 None,

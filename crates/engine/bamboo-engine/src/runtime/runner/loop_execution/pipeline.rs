@@ -11365,7 +11365,7 @@ mod tests {
         let config = AgentLoopConfig::default();
         let mut session = Session::new("s-cancel", "model");
         let frame = RoundFrame {
-            vision_support: None,
+            vision_support: true,
             session_id: "s-cancel",
             round_id: "r1",
             turn: 0,
@@ -11459,7 +11459,7 @@ mod tests {
         let config = AgentLoopConfig::default();
         let mut session = Session::new("s-normal", "model");
         let frame = RoundFrame {
-            vision_support: None,
+            vision_support: true,
             session_id: "s-normal",
             round_id: "r1",
             turn: 0,
@@ -11667,7 +11667,7 @@ mod tests {
         session.add_message(Message::user("keep going"));
 
         let frame = RoundFrame {
-            vision_support: None,
+            vision_support: true,
             session_id: "s-compress-fail",
             round_id: "r1",
             turn: 0,
@@ -12989,7 +12989,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl LLMProvider for VisionLoopProvider {
-        async fn supports_vision(&self, model: &str) -> Option<bool> {
+        async fn vision_support_override(&self, model: &str) -> Option<bool> {
             assert_eq!(model, "actual-model");
             self.support
         }
@@ -13039,7 +13039,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn vision_real_viewimage_loop_delivers_support_rejects_no_support_and_keeps_legacy() {
+    async fn vision_real_viewimage_loop_delivers_default_support_and_rejects_only_false() {
         let image = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
         std::fs::write(image.path(), b"\x89PNG\r\n\x1a\nvision-test").unwrap();
         for support in [Some(true), Some(false), None] {

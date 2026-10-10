@@ -65,12 +65,7 @@ impl ModelCatalogService {
                         display_name: id.clone(),
                         provider_display_name: meta.display_name.clone(),
                         capabilities: ModelCapabilities {
-                            supports_vision: provider
-                                .as_ref()
-                                .unwrap()
-                                .supports_vision(&id)
-                                .await
-                                .unwrap_or(false),
+                            supports_vision: provider.as_ref().unwrap().supports_vision(&id).await,
                             max_context_tokens: upstream.and_then(|info| info.max_context_tokens),
                             max_output_tokens: upstream.and_then(|info| info.max_output_tokens),
                             ..ModelCapabilities::default()
@@ -121,7 +116,7 @@ impl ModelCatalogService {
                 display_name: info.id.clone(),
                 provider_display_name: provider_display_name.clone(),
                 capabilities: ModelCapabilities {
-                    supports_vision: provider.supports_vision(&info.id).await.unwrap_or(false),
+                    supports_vision: provider.supports_vision(&info.id).await,
                     max_context_tokens: info.max_context_tokens,
                     max_output_tokens: info.max_output_tokens,
                     ..ModelCapabilities::default()

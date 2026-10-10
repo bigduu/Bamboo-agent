@@ -293,14 +293,10 @@ pub async fn create_provider_from_instance(
         ))),
     };
     let provider = provider?;
-    if overrides.is_empty() {
-        Ok(provider)
-    } else {
-        Ok(Arc::new(crate::model_vision::ModelVisionProvider {
-            inner: provider,
-            overrides,
-        }))
-    }
+    Ok(Arc::new(crate::model_vision::ModelVisionProvider {
+        inner: provider,
+        overrides,
+    }))
 }
 
 /// Validate provider configuration without creating the provider

@@ -872,21 +872,20 @@ non-empty model IDs scoped to that instance; they do not admit a runtime model.
 }
 ```
 
-An explicit boolean overrides the routed provider's declared Vision capability.
-Missing/null `supports_vision` inherits that declaration. If the provider has no
-declaration, it remains unknown: existing image transport and
-`hooks.image_fallback` behavior are preserved. Current built-in model-info feeds
-expose token limits rather than a Vision declaration; a catalog's historical
-default `supports_vision: false` is not proof that every legacy model lacks Vision.
-There is no model-name inference, provider-wide toggle, or automatic migration.
-The settings UI exposes Supports Vision / No Vision / Inherit for each admitted
-model. Null restores inheritance through the existing update merge behavior.
+Vision is supported by default for new models, old configurations and missing or
+null `supports_vision` fields. Only an explicit `false` disables this model in
+this provider instance. No provider-wide toggle, model-name inference or migration
+overwrites user choices. The settings UI exposes Supports Vision / No Vision for
+each admitted model and saves new selections as supported unless opted out.
+Null restores the default supported policy through the model-level merge.
 
 `ViewImage` uses the actual provider handle and model of the current round,
 including role wrappers and reloaded providers. Explicit No Vision produces a
 paired tool error before reading or sending an image, including legacy aliases.
-Explicit Supports Vision sends the image parts to the next model request without
-the legacy image fallback. Switching to No Vision while image history remains
-produces an explicit model-request error and preserves that history; switch back
-to a Vision model to continue. It does not silently drop images or claim they
-were seen. Unconfigured legacy models retain their existing fallback policy.
+Supported models receive image parts in the next model request. An explicit
+Supports Vision override bypasses legacy image fallback rewriting. A separately
+configured legacy `hooks.image_fallback` remains an opt-in image transform for
+models without an override; it does not declare the model unsupported.
+Switching to No Vision while image history remains produces an explicit
+model-request error and preserves that history; switch back to a Vision model to
+continue. Images are not silently dropped or claimed to have been seen.

@@ -2088,7 +2088,7 @@ mod tests {
             .is_none());
     }
     #[test]
-    fn vision_crud_round_trips_per_model_and_can_restore_inheritance() {
+    fn vision_crud_round_trips_per_model_and_can_restore_default_support() {
         let mut request = create_request("fixture-key");
         request.config["model_capabilities"] =
             serde_json::json!({"image":{"supports_vision":true},"text":{"supports_vision":false}});

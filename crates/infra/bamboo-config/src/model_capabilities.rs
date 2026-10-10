@@ -2,7 +2,7 @@
 use crate::ProviderInstanceConfig;
 use std::collections::BTreeMap;
 
-/// Missing/null overrides inherit provider metadata or legacy behavior.
+/// Missing/null overrides mean Vision is enabled by default. Only false opts out.
 pub fn model_vision_overrides(
     instance: &ProviderInstanceConfig,
 ) -> Result<BTreeMap<String, bool>, String> {

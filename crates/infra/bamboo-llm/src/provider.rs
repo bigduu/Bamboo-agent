@@ -269,9 +269,15 @@ pub(crate) fn required_tool_from_options<'a>(
 /// ```
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
-    /// Declared Vision support for the exact model. None means unknown and
-    /// preserves the legacy image/fallback behavior; never infer from its name.
-    async fn supports_vision(&self, _model: &str) -> Option<bool> {
+    /// Effective Vision support. Missing declarations default to enabled;
+    /// only an explicit false disables it. Never infer from model names.
+    async fn supports_vision(&self, model: &str) -> bool {
+        self.vision_support_override(model).await.unwrap_or(true)
+    }
+
+    /// Explicit per-model policy, used to distinguish a user's override from
+    /// their separately configured legacy image fallback. None is default-on.
+    async fn vision_support_override(&self, _model: &str) -> Option<bool> {
         None
     }
 

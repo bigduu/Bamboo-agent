@@ -27,8 +27,8 @@ impl ReloadableProvider {
 
 #[async_trait]
 impl LLMProvider for ReloadableProvider {
-    async fn supports_vision(&self, model: &str) -> Option<bool> {
-        self.current().await.supports_vision(model).await
+    async fn vision_support_override(&self, model: &str) -> Option<bool> {
+        self.current().await.vision_support_override(model).await
     }
 
     async fn capability_loading_mode(
@@ -207,7 +207,7 @@ mod tests {
     struct VisionMetadataProvider(bool);
     #[async_trait]
     impl LLMProvider for VisionMetadataProvider {
-        async fn supports_vision(&self, model: &str) -> Option<bool> {
+        async fn vision_support_override(&self, model: &str) -> Option<bool> {
             (model == "same").then_some(self.0)
         }
         async fn chat_stream(
@@ -225,9 +225,9 @@ mod tests {
         let inner: Arc<RwLock<Arc<dyn LLMProvider>>> =
             Arc::new(RwLock::new(Arc::new(VisionMetadataProvider(true))));
         let p = ReloadableProvider::new(inner.clone());
-        assert_eq!(p.supports_vision("same").await, Some(true));
+        assert_eq!(p.vision_support_override("same").await, Some(true));
         *inner.write().await = Arc::new(VisionMetadataProvider(false));
-        assert_eq!(p.supports_vision("same").await, Some(false));
-        assert_eq!(p.supports_vision("unknown").await, None);
+        assert_eq!(p.vision_support_override("same").await, Some(false));
+        assert_eq!(p.vision_support_override("unknown").await, None);
     }
 }

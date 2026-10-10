@@ -12,11 +12,8 @@ pub(crate) struct ModelVisionProvider {
 
 #[async_trait]
 impl LLMProvider for ModelVisionProvider {
-    async fn supports_vision(&self, model: &str) -> Option<bool> {
-        match self.overrides.get(model) {
-            Some(value) => Some(*value),
-            None => self.inner.supports_vision(model).await,
-        }
+    async fn vision_support_override(&self, model: &str) -> Option<bool> {
+        self.overrides.get(model).copied()
     }
     async fn capability_loading_mode(
         &self,
@@ -85,7 +82,7 @@ mod tests {
     struct MetadataProvider;
     #[async_trait]
     impl LLMProvider for MetadataProvider {
-        async fn supports_vision(&self, model: &str) -> Option<bool> {
+        async fn vision_support_override(&self, model: &str) -> Option<bool> {
             (model == "metadata").then_some(true)
         }
         async fn chat_stream(
@@ -105,26 +102,76 @@ mod tests {
         })
     }
     #[tokio::test]
-    async fn manual_vision_wins_over_metadata_and_unknown_preserves_legacy() {
+    async fn vision_defaults_on_and_only_manual_false_disables_the_model() {
         let p = provider(BTreeMap::from([
             ("metadata".into(), false),
             ("image".into(), true),
         ]));
-        assert_eq!(p.supports_vision("metadata").await, Some(false));
-        assert_eq!(p.supports_vision("image").await, Some(true));
-        assert_eq!(p.supports_vision("gpt-name-is-not-evidence").await, None);
+        assert_eq!(p.vision_support_override("metadata").await, Some(false));
+        assert_eq!(p.vision_support_override("image").await, Some(true));
         assert_eq!(
-            provider(BTreeMap::new()).supports_vision("metadata").await,
-            Some(true)
+            p.vision_support_override("gpt-name-is-not-evidence").await,
+            None
         );
+        assert!(p.supports_vision("new-model").await);
+        assert!(p.supports_vision("gpt-name-is-not-evidence").await);
+        assert!(!p.supports_vision("metadata").await);
+        assert!(provider(BTreeMap::new()).supports_vision("metadata").await);
         let mut reference = ProviderModelRef::new("work", "metadata");
         reference.reasoning_effort = Some(ReasoningEffort::Low);
         let role = ResolvedModel::from_ref(p, &reference);
         assert_eq!(
-            role.provider.supports_vision(&role.model_name).await,
+            role.provider
+                .vision_support_override(&role.model_name)
+                .await,
             Some(false)
         );
     }
+    #[tokio::test]
+    async fn vision_factory_old_and_new_models_default_on_missing_or_null_fields() {
+        let config = bamboo_config::Config::default();
+        let temp = tempfile::tempdir().unwrap();
+        for capability in [
+            serde_json::json!(null),
+            serde_json::json!({"old":{}, "new":{"supports_vision":null}}),
+            serde_json::json!({"text":{"supports_vision":false}}),
+        ] {
+            let instance: bamboo_config::ProviderInstanceConfig =
+                serde_json::from_value(serde_json::json!({
+                    "provider_type":"openai", "api_key":"offline-fixture", "model":"old",
+                    "runtime_models":["old","new","text"], "model_capabilities":capability,
+                }))
+                .unwrap();
+            let provider = crate::provider_factory::create_provider_from_instance(
+                &config,
+                &instance,
+                temp.path().to_owned(),
+            )
+            .await
+            .unwrap();
+            assert!(provider.supports_vision("old").await);
+            assert!(provider.supports_vision("new").await);
+            assert_eq!(
+                provider.supports_vision("text").await,
+                capability["text"]["supports_vision"] != false
+            );
+        }
+        let legacy: bamboo_config::ProviderInstanceConfig =
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "api_key":"offline-fixture", "model":"old",
+            }))
+            .unwrap();
+        let provider = crate::provider_factory::create_provider_from_instance(
+            &config,
+            &legacy,
+            temp.path().to_owned(),
+        )
+        .await
+        .unwrap();
+        assert!(provider.supports_vision("old").await);
+        assert!(provider.supports_vision("new").await);
+    }
+
     #[tokio::test]
     async fn routing_catalog_and_reload_keep_model_and_instance_vision_independent() {
         use std::collections::HashMap;
@@ -163,7 +210,7 @@ mod tests {
                 registry
                     .provider_for_model(&target)
                     .unwrap()
-                    .supports_vision(model)
+                    .vision_support_override(model)
                     .await,
                 Some(expected)
             );

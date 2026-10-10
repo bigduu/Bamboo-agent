@@ -18,20 +18,22 @@ pub(super) async fn apply_message_transforms(
     model_name: &str,
 ) -> Result<(), AgentError> {
     normalize_tool_chains(&mut prepared_context.messages, session_id);
-    match llm.supports_vision(model_name).await {
-        Some(true) => {} // Deliver image parts directly to this model.
-        Some(false) => {
-            if prepared_context.messages.iter().any(|message| {
-                message.content_parts.as_ref().is_some_and(|parts| {
-                    parts
-                        .iter()
-                        .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. }))
-                })
-            }) {
-                return Err(AgentError::LLM(format!("Model '{model_name}' does not support Vision; image history was preserved but cannot be sent. Select a Vision-capable model or enable supports_vision for this model in provider settings.")));
-            }
+    if !llm.supports_vision(model_name).await {
+        if prepared_context.messages.iter().any(|message| {
+            message.content_parts.as_ref().is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. }))
+            })
+        }) {
+            return Err(AgentError::LLM(format!("Model '{model_name}' does not support Vision; image history was preserved but cannot be sent. Select a Vision-capable model or enable supports_vision for this model in provider settings.")));
         }
-        None => apply_image_fallback(config, prepared_context, llm).await?,
+    } else if llm.vision_support_override(model_name).await != Some(true) {
+        // Vision remains enabled by default. Preserve a legacy fallback only
+        // when the user independently opted into that transform; it is not a
+        // declaration that this model lacks Vision. Explicit support sends the
+        // native image parts without rewriting them.
+        apply_image_fallback(config, prepared_context, llm).await?;
     }
     resolve_attachments(config, prepared_context).await?;
     Ok(())
@@ -162,7 +164,7 @@ mod vision_tests {
     struct SwitchingProvider;
     #[async_trait::async_trait]
     impl LLMProvider for SwitchingProvider {
-        async fn supports_vision(&self, model: &str) -> Option<bool> {
+        async fn vision_support_override(&self, model: &str) -> Option<bool> {
             match model {
                 "image" => Some(true),
                 "text" => Some(false),
@@ -229,6 +231,21 @@ mod vision_tests {
         apply_message_transforms(&config, &mut messages, &llm, "switch", "image")
             .await
             .unwrap();
+        assert!(llm.supports_vision("old").await);
+        let mut default_on = prepared();
+        apply_message_transforms(
+            &AgentLoopConfig::default(),
+            &mut default_on,
+            &llm,
+            "switch",
+            "old",
+        )
+        .await
+        .unwrap();
+        assert!(
+            default_on.messages[0].content_parts.is_some(),
+            "missing capability defaults to supported image transport"
+        );
         let mut legacy = prepared();
         apply_message_transforms(&config, &mut legacy, &llm, "switch", "old")
             .await
