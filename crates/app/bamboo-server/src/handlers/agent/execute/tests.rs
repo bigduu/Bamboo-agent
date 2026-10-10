@@ -167,6 +167,51 @@ mod execution_input_http {
             _max: Option<u32>,
             _model: &str,
         ) -> Result<LLMStream, LLMError> {
+            if tools.iter().any(|tool| tool.function.name == "skills_list")
+                && !messages.iter().any(|message| {
+                    message.tool_call_id.as_deref() == Some("execution-input-existing-load")
+                })
+            {
+                let page = messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.tool_call_id.as_deref() == Some("execution-input-list"));
+                let (id, name, arguments) = if let Some(page) = page {
+                    let page: serde_json::Value = serde_json::from_str(&page.content).unwrap();
+                    let package = page["skills"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|skill| skill["name"] == "review")
+                        .unwrap()["package"]
+                        .as_str()
+                        .unwrap();
+                    (
+                        "execution-input-existing-load",
+                        "skills_read",
+                        serde_json::json!({"package":package,"resource":"SKILL.md"}),
+                    )
+                } else {
+                    (
+                        "execution-input-list",
+                        "skills_list",
+                        serde_json::json!({"limit":20}),
+                    )
+                };
+                return Ok(Box::pin(futures::stream::iter([
+                    Ok(LLMChunk::ToolCalls(vec![
+                        bamboo_agent_core::tools::ToolCall {
+                            id: id.into(),
+                            tool_type: "function".into(),
+                            function: bamboo_agent_core::tools::FunctionCall {
+                                name: name.into(),
+                                arguments: arguments.to_string(),
+                            },
+                        },
+                    ])),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
             // The actual Chat selection keeps its existing legacy activation
             // contract: load the selected workflow before producing an answer.
             // I-E neither bypasses that gate nor creates a new consumer.
@@ -589,7 +634,11 @@ mod execution_input_http {
                     message.tool_call_id.as_deref() == Some("execution-input-existing-load")
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(loads.len(), 1, "one real existing workflow prerequisite");
+            assert_eq!(
+                loads.len(),
+                1,
+                "one real workflow prerequisite through the admitted surface"
+            );
             assert_eq!(loads[0].tool_success, Some(true));
             assert_eq!(stored.messages.iter().filter(|m| m.id == input).count(), 1);
             assert!(crate::handlers::agent::chat::admit_for_execute(&state, id)
