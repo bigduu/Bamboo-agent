@@ -959,6 +959,15 @@ async fn handle_chat(
         None
     };
 
+    let native_skills = crate::skill_runtime::ordinary_main(&session)
+        && [
+            &req.message_id,
+            &req.thread_id,
+            &req.in_reply_to,
+            &req.correlation_id,
+        ]
+        .into_iter()
+        .all(Option::is_none);
     let queue_root_input = root_input_messages.is_some();
     let metadata_before_input = session.metadata.clone();
     let runtime_metadata_before_input = session.runtime_metadata.clone();
@@ -1061,6 +1070,65 @@ async fn handle_chat(
     } else {
         None
     };
+
+    if native_skills {
+        // Keep the real durable checkpoint and only the permitted post-hook
+        // observations in F; staged Workflow authority is committed afterwards.
+        let checkpoint = match state.persistence.storage().load_session(&session_id).await {
+            Ok(Some(checkpoint)) => checkpoint,
+            Ok(None) => {
+                return crate::error::json_error(
+                    actix_web::http::StatusCode::CONFLICT,
+                    "Native Skill checkpoint is missing",
+                )
+            }
+            Err(error) => {
+                return crate::error::json_error(
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    error.to_string(),
+                )
+            }
+        };
+        let mut candidate = checkpoint.clone();
+        if let Some(observed) = session.agent_runtime_state.as_ref() {
+            let runtime = candidate
+                .agent_runtime_state
+                .get_or_insert_with(|| bamboo_domain::AgentRuntimeState::new(&checkpoint.id));
+            runtime.checkpoints = observed.checkpoints.clone();
+            runtime.hook_contexts = observed.hook_contexts.clone();
+            runtime.stop_hook_forced_continuations = observed.stop_hook_forced_continuations;
+        }
+        const PRECHECK: &str = "runtime.plugin_prompt_prechecked";
+        match session.metadata.get(PRECHECK) {
+            Some(value) => {
+                candidate.metadata.insert(PRECHECK.into(), value.clone());
+            }
+            None => {
+                candidate.metadata.remove(PRECHECK);
+            }
+        }
+        let envelope = native_input.as_mut().or(queued_input.as_mut());
+        if let Some(envelope) = envelope {
+            if let Err(error) = crate::skill_runtime::prepare_envelope(
+                state.clone(),
+                &candidate,
+                &checkpoint,
+                &persistence_guard,
+                envelope,
+                requested_workflow_selection.as_ref(),
+            )
+            .await
+            {
+                if let Some(staging) = staged_workflow_activation.as_mut() {
+                    staging.release().await;
+                }
+                return crate::error::json_error(
+                    actix_web::http::StatusCode::BAD_REQUEST,
+                    error.to_string(),
+                );
+            }
+        }
+    }
 
     if retire_workflow {
         // The old candidate can otherwise be restored on the next execute,
