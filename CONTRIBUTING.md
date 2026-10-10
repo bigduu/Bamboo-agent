@@ -213,8 +213,8 @@ the new queue retroactively.
 
 ### Automatic main publication
 
-Only the automatic job uses the `bamboo-release` Environment and new GitHub/HMAC
-authority. Its exact branch-type rules allow dev/main, with no tag rule. Before
+Both production jobs use the `bamboo-release` Environment; only the automatic
+job receives the GitHub/HMAC authority. Before
 checkout, a fixed bootstrap verifies the successful same-repository main push CI
 source and that source/workflow SHAs belong to protected dev/main history. The
 checkout uses the tested CI SHA, which may differ from the workflow's SHA.
@@ -243,13 +243,40 @@ history. Tag authority is checked before upload.
 
 ### Manual and Zenith publication
 
-Manual dispatch retains the existing Cargo-only publication path, including
-frozen source tags and dev. Required `expected_source_sha` must be a lowercase
-40-character commit matching both dispatched `GITHUB_SHA` and clean checkout
-HEAD before Node/npm/package work. Zenith also verifies its accepted tag object,
-peeled source and root pointer before dispatching. Manual runs have Contents read,
-no Environment, and no new GitHub token or signing key. Only the final non-dry
-publish step receives the existing repository `CARGO_REGISTRY_TOKEN`.
+Production manual dispatch retains the Cargo-only publication path on protected
+dev/main or a protected annotated `bamboo-release-source-<40-character-source-SHA>`
+tag. The tag suffix, required `expected_source_sha`, dispatched `GITHUB_SHA`,
+workflow SHA and clean checkout HEAD must match. Before checkout, an inline
+bootstrap verifies the exact workflow ref, protection status, a single annotated
+tag object peeling directly to that commit, protected dev/main ancestry, and the
+committed trusted-publication policy marker. Historical branch runs remain pinned
+to their dispatched SHA even if the protected branch advances while queued.
+Manual runs have Contents read and no GitHub release token or signing key. Only
+the final publish step receives the Environment `CARGO_REGISTRY_TOKEN`.
+
+Configure that Environment with exactly branch rules dev/main and a tag rule
+`bamboo-release-source-*`. The tag namespace needs two active repository rulesets:
+creation restricted with only RepositoryRole admin (actor_id 5) always-bypass,
+and update/deletion restricted with no bypass actors. A protected-ref flag alone
+does not prove these restrictions; verify their live configuration before use.
+Create accepted tags only after the hardened publisher is merged into protected
+history. Zenith separately accepts the new tag object, peeled source and matching
+root pointer through its normal PR flow; old `bamboo-bodhi-source-*` tags cannot
+be granted production authority by this workflow.
+
+Before activation, provision the existing owner-controlled crates.io credential
+in this Environment, verify its intended managed-crate publish scope, drain old
+queued/running frozen publishers, and remove repository/org Cargo-token copies.
+Old workflows must then fail for lack of credentials. This migration does not
+revoke a potentially shared token globally. Secret-free dry runs do not prove
+production token scope or real upload permission for the complete crate closure.
+
+After merging the credential-check workflow into a protected branch, dispatch
+`release-credentials-check.yml` there to verify the Environment GitHub and Cargo
+authentication and signing-key fingerprint without checking out source or
+uploading artifacts. This read-only check does not prove GitHub write scopes or
+publish permissions for every managed crate; the actual authorized publication
+must still verify those permissions and the resulting release identity.
 
 Pass a real Cargo SemVer `version`; empty/`latest` uses the source manifest and
 rejects `0.0.0`. Build metadata is unsupported. Stable versions cannot exceed the
@@ -257,15 +284,18 @@ current UTC year/month; historical versions, u64 counters and prereleases remain
 valid. Inputs are parsed as environment data. Locked frontend and fixed legacy
 rollback inputs remain available.
 
-`dry_run=true` validates stamped workspace buildability without credentials or
-uploads. Manual publication retains the existing dependency-order, propagation,
+`dry_run=true` uses a separate job without an Environment and with publication
+credential variables explicitly empty, including on feature refs. It validates
+the exact dispatched source and stamped workspace buildability without uploads.
+Manual publication retains the existing dependency-order, propagation,
 rate-limit and skip-existing loop. It does not recover signed drafts, create
 GitHub Releases, change latest or add provenance to historical manual skips.
 
 Both publication paths use the isolated Cargo entrypoint delivered in
 [#1752](https://github.com/bigduu/Bamboo-agent/issues/1752), described below.
-Existing repository Cargo token branch exposure is
-tracked separately in [#1699](https://github.com/bigduu/Bamboo-agent/issues/1699).
+The protected-ref credential migration is tracked in
+[#1699](https://github.com/bigduu/Bamboo-agent/issues/1699); its operational gates
+must finish before independent main publication is activated.
 
 ## Additional Notes
 
@@ -302,8 +332,8 @@ Bamboo uses GitHub Actions for continuous integration and publishing:
   back to the original workspace and its target/package directory.
   GitHub/HMAC credentials never enter Cargo. Only `cargo publish` receives the
   registry token; build scripts during that operation can still read that
-  intentional Cargo authority. Repository token access is separately tracked
-  in #1699. The Release Cargo Isolation workflow proves the Linux ancestor
+  intentional Cargo authority. Production token access is restricted through
+  the #1699 Environment migration. The Release Cargo Isolation workflow proves the Linux ancestor
   boundary using dummy credentials and a real dependency build script, plus
   metadata/check/package/publish-dry-run; a macOS Docker smoke alone is weaker.
 - **Publish Docker image** (`.github/workflows/docker-publish.yml`) -- Builds the multi-arch container image and pushes it to GHCR.
@@ -322,7 +352,7 @@ After workflows run, badges resolve to:
 
 1. Push changes to GitHub to trigger CI.
 2. Enable GitHub Pages: **Settings > Pages > Source** set to **GitHub Actions**.
-3. Add `CARGO_REGISTRY_TOKEN` secret under **Settings > Secrets and variables > Actions** for crates.io publishing.
+3. Configure the protected `bamboo-release` Environment and its publication secrets as described above; keep Cargo-token copies absent from repository/org secrets.
 4. Verify badge status in README after pushing.
 
 ## E2E Testing

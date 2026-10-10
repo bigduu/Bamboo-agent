@@ -851,18 +851,38 @@ test('interrupted initial frontend upload can recover before any crate, while pa
   assert.deepEqual(calls, ['atomic-body', 'upload'])
 })
 
-test('manual fixed-tag publication and automatic receipts share a queue without sharing new authority', () => {
+test('trusted manual publication and automatic receipts share a queue while dry runs stay credential-free', () => {
   const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
-  const [manual, automatic] = workflow.split('  manual:\n')[1].split('  automatic:\n')
+  const manual = workflow.split('  manual:\n')[1].split('  dry-run:\n')[0]
+  const dry = workflow.split('  dry-run:\n')[1].split('  automatic:\n')[0]
+  const automatic = workflow.split('  automatic:\n')[1]
   assert.match(workflow, /workflow_run:\n    workflows: \[CI\]\n    types: \[completed\]\n    branches: \[main\]/)
   assert.match(workflow, /group: bamboo-crate-publication\n  queue: max\n  cancel-in-progress: false/)
   assert.match(workflow, /permissions:\n  contents: read/)
-  assert.match(manual, /if: github.event_name == 'workflow_dispatch'/)
+  assert.match(manual, /if: github.event_name == 'workflow_dispatch' && !inputs\.dry_run/)
+  assert.match(manual, /environment: bamboo-release/)
+  assert.match(manual, /GH_TOKEN: \$\{\{ github\.token \}\}/)
+  assert.ok(manual.indexOf('Authorize the trusted manual') < manual.indexOf('uses: actions/checkout'))
+  assert.ok(manual.indexOf('Require the exact accepted') < manual.indexOf('node scripts/'))
   assert.match(manual, /expected_source_sha/)
-  assert.doesNotMatch(manual, /environment:|contents: write|BAMBOO_RELEASE_|GH_TOKEN:|crate-release.cjs (?:plan|publish)/)
+  assert.doesNotMatch(manual, /contents: write|secrets\.BAMBOO_RELEASE_|crate-release.cjs (?:plan|publish)/)
   assert.equal(manual.split('CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}').length - 1, 1)
   assert.match(manual, /if: github.event.inputs.dry_run != 'true'/)
   assert.match(manual, /cargo publish --locked --allow-dirty -p/)
+  assert.match(dry, /if: github.event_name == 'workflow_dispatch' && inputs\.dry_run/)
+  assert.doesNotMatch(dry, /environment:|secrets\.|cargo publish|crate-release.cjs (?:plan|publish)/)
+  for (const name of ['GH_TOKEN', 'CARGO_REGISTRY_TOKEN', 'BAMBOO_RELEASE_TOKEN',
+    'BAMBOO_RELEASE_SIGNING_KEY', 'BAMBOO_RELEASE_SIGNING_KEY_SHA256']) {
+    assert.ok(dry.includes(`${name}: ""`), `${name} must be explicitly empty in dry runs`)
+  }
+  const aliases = [...dry.matchAll(/^      - \*([a-z-]+)$/gm)].map(match => match[1])
+  assert.deepEqual(aliases, ['manual-checkout', 'manual-source', 'manual-node', 'manual-frontend',
+    'manual-stage', 'manual-isolation', 'manual-version', 'manual-stamp', 'manual-lock'])
+  for (const alias of aliases) {
+    const step = workflow.match(new RegExp(`      - &${alias}\\n([\\s\\S]*?)(?=\\n      - |\\n  [a-z-]+:|$)`))?.[1]
+    assert.ok(step, `Missing shared preparation step ${alias}`)
+    assert.doesNotMatch(step, /secrets\.|BAMBOO_RELEASE_|CARGO_REGISTRY_TOKEN|cargo publish/)
+  }
   assert.match(automatic, /github.event_name == 'workflow_run'/)
   assert.match(automatic, /environment: bamboo-release\n    permissions:\n      contents: write/)
   assert.match(automatic, /ref: \$\{\{ steps.source.outputs.revision \}\}\n          fetch-depth: 0\n          persist-credentials: false/)
@@ -912,11 +932,216 @@ test('the real manual version resolver has no signing or API dependency and neve
   }
 })
 
-function workflowPython(name) {
-  return fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8').split(`      - name: ${name}`)[1]
+function workflowPython(name, filename = '.github/workflows/publish-crate.yml') {
+  return fs.readFileSync(filename, 'utf8').split(`      - name: ${name}`)[1]
     .split("          python3 - <<'PY'\n")[1].split('\n          PY')[0]
     .split('\n').map((line) => line.replace(/^ {10}/, '')).join('\n')
 }
+
+test('Environment readiness checks authentication without executing source or uploading, and rejects invalid authority', (t) => {
+  const filename = '.github/workflows/release-credentials-check.yml'
+  const workflow = fs.readFileSync(filename, 'utf8')
+  assert.match(workflow, /workflow_dispatch:/)
+  assert.doesNotMatch(workflow, /workflow_run:|schedule:|uses:|cargo publish|actions\/checkout/)
+  assert.match(workflow, /permissions:\n  contents: read/)
+  assert.match(workflow, /environment: bamboo-release/)
+  assert.match(workflow, /group: bamboo-crate-publication\n  queue: max\n  cancel-in-progress: false/)
+  assert.match(workflow, /github\.ref_protected/)
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-credential-check-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const calls = path.join(directory, 'calls.json')
+  const bootstrap = workflowPython('Check Environment authentication without publishing', filename)
+  const runner = `import io, json, os, pathlib, urllib.error, urllib.request
+from unittest.mock import patch
+calls = []
+class Opener:
+    def open(self, request, timeout):
+        assert request.get_method() == 'GET' and request.data is None
+        assert request.get_header('Cookie') is None and timeout == 30
+        url = request.full_url
+        calls.append(url)
+        if url == 'https://api.github.com/repos/bigduu/Bamboo-agent':
+            assert request.get_header('Authorization') == 'Bearer fixture-github-secret'
+            status = int(os.environ.get('FIXTURE_GITHUB_STATUS', '200'))
+            if status != 200: raise urllib.error.HTTPError(url, status, '', {}, io.BytesIO(b'{}'))
+            return io.BytesIO(json.dumps({'full_name': 'bigduu/Bamboo-agent', 'permissions': {'push': os.environ.get('FIXTURE_PUSH', 'true') == 'true'}}).encode())
+        assert url == 'https://crates.io/api/v1/me'
+        assert request.get_header('Authorization') == 'fixture-cargo-secret'
+        status = int(os.environ.get('FIXTURE_CARGO_STATUS', '403'))
+        if status == 200: return io.BytesIO(b'{}')
+        body = json.dumps({'errors': [{'detail': os.environ.get('FIXTURE_CARGO_DETAIL', 'this action can only be performed on the crates.io website')}]}).encode()
+        raise urllib.error.HTTPError(url, status, '', {}, io.BytesIO(body))
+def opener(*handlers):
+    assert len(handlers) == 1
+    assert handlers[0].redirect_request(None, None, 302, None, None, 'https://untrusted.invalid') is None
+    return Opener()
+try:
+    with patch('urllib.request.build_opener', opener):
+        exec(compile(os.environ['FIXTURE_SCRIPT'], '<credential-check>', 'exec'))
+finally:
+    pathlib.Path(os.environ['FIXTURE_CALLS']).write_text(json.dumps(calls))
+`
+  const key = '12'.repeat(32)
+  const environment = {
+    PATH: process.env.PATH, GITHUB_REPOSITORY: 'bigduu/Bamboo-agent', GITHUB_EVENT_NAME: 'workflow_dispatch',
+    GITHUB_REF: 'refs/heads/dev', GITHUB_REF_PROTECTED: 'true', GITHUB_SHA: sourceRevision,
+    GITHUB_WORKFLOW_SHA: sourceRevision,
+    GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/release-credentials-check.yml@refs/heads/dev',
+    GH_TOKEN: 'fixture-github-secret', CARGO_REGISTRY_TOKEN: 'fixture-cargo-secret',
+    BAMBOO_RELEASE_SIGNING_KEY: key, BAMBOO_RELEASE_SIGNING_KEY_SHA256: sha256(Buffer.from(key, 'hex')),
+    FIXTURE_SCRIPT: bootstrap, FIXTURE_CALLS: calls,
+  }
+  const run = (overrides = {}) => {
+    fs.writeFileSync(calls, '[]')
+    const result = spawnSync('python3', ['-c', runner], { encoding: 'utf8', env: { ...environment, ...overrides } })
+    for (const secret of [key, environment.GH_TOKEN, environment.CARGO_REGISTRY_TOKEN]) {
+      assert.ok(!`${result.stdout}${result.stderr}`.includes(secret), 'Credentials must never appear in diagnostic output')
+    }
+    return { ...result, calls: JSON.parse(fs.readFileSync(calls, 'utf8')) }
+  }
+  const accepted = run()
+  assert.equal(accepted.status, 0, accepted.stderr)
+  assert.equal(accepted.calls.length, 2)
+  assert.match(accepted.stdout, /complete crate upload permissions still require the actual authorized release/)
+  for (const overrides of [
+    { GITHUB_REPOSITORY: 'foreign/repository' }, { GITHUB_EVENT_NAME: 'workflow_run' },
+    { GITHUB_REF: 'refs/tags/example' }, { GITHUB_REF_PROTECTED: 'false' },
+    { GITHUB_WORKFLOW_SHA: 'b'.repeat(40) }, { GITHUB_WORKFLOW_REF: 'untrusted-workflow' },
+    { BAMBOO_RELEASE_SIGNING_KEY: '' }, { BAMBOO_RELEASE_SIGNING_KEY_SHA256: '0'.repeat(64) },
+    { GH_TOKEN: '' }, { CARGO_REGISTRY_TOKEN: '' },
+  ]) {
+    const denied = run(overrides)
+    assert.notEqual(denied.status, 0, JSON.stringify(overrides))
+    assert.deepEqual(denied.calls, [])
+  }
+  for (const overrides of [
+    { FIXTURE_GITHUB_STATUS: '401' }, { FIXTURE_GITHUB_STATUS: '302' }, { FIXTURE_PUSH: 'false' },
+    { FIXTURE_CARGO_DETAIL: 'authentication failed' }, { FIXTURE_CARGO_DETAIL: 'insufficient scope' },
+    { FIXTURE_CARGO_STATUS: '500' }, { FIXTURE_CARGO_STATUS: '200' },
+  ]) assert.notEqual(run(overrides).status, 0, 'Unavailable or unverified authentication must fail closed')
+})
+
+test('manual inline bootstrap accepts only protected branches and exact annotated trusted source tags before checkout', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-manual-bootstrap-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const git = (...args) => {
+    const result = spawnSync('git', ['-c', 'user.name=Manual fixture', '-c', 'user.email=fixture@example.invalid', ...args],
+      { cwd: directory, encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stderr)
+    return result.stdout.trim()
+  }
+  git('init', '-q')
+  const commit = (value) => {
+    fs.writeFileSync(path.join(directory, 'source'), value)
+    git('add', 'source')
+    git('commit', '-qm', value)
+    return git('rev-parse', 'HEAD')
+  }
+  const historical = commit('historical')
+  const main = commit('main')
+  const dev = commit('dev')
+  git('checkout', '--detach', historical)
+  const feature = commit('feature')
+  const tagName = source => `bamboo-release-source-${source}`
+  const tagRef = source => `refs/tags/${tagName(source)}`
+  git('tag', '-a', tagName(historical), historical, '-m', 'Accepted source')
+  git('tag', '-a', tagName(feature), feature, '-m', 'Unaccepted source')
+  const bin = path.join(directory, 'bin')
+  fs.mkdirSync(bin)
+  const calls = path.join(directory, 'api-calls')
+  fs.writeFileSync(path.join(bin, 'gh'), `#!/usr/bin/env python3
+import base64, json, os, pathlib, subprocess, sys
+route = sys.argv[2]
+with open(os.environ['FIXTURE_CALLS'], 'a') as stream: stream.write(route + '\\n')
+if os.environ.get('FIXTURE_API_FAILURE') == 'true': sys.exit(1)
+responses = json.loads(os.environ.get('FIXTURE_RESPONSES', '{}'))
+if route in responses:
+    print(json.dumps(responses[route]))
+    sys.exit(0)
+def git(*args):
+    return subprocess.check_output(['git', *args], cwd=os.environ['FIXTURE_REPOSITORY'], text=True).strip()
+if '/branches/' in route:
+    name = route.rsplit('/', 1)[-1]
+    result = {'name': name, 'protected': os.environ.get('FIXTURE_UNPROTECTED') != 'true', 'commit': {'sha': json.loads(os.environ['FIXTURE_TIPS'])[name]}}
+elif '/compare/' in route:
+    source, tip = route.rsplit('/', 1)[-1].split('...')
+    base = git('merge-base', source, tip)
+    status = 'identical' if source == tip else 'ahead' if base == source else 'behind' if base == tip else 'diverged'
+    result = {'status': status, 'merge_base_commit': {'sha': base}}
+elif '/git/ref/tags/' in route:
+    ref = 'refs/tags/' + route.split('/git/ref/tags/')[1]
+    sha = git('rev-parse', ref)
+    result = {'ref': ref, 'object': {'type': git('cat-file', '-t', sha), 'sha': sha}}
+elif '/git/tags/' in route:
+    sha = route.rsplit('/', 1)[-1]
+    headers = dict(line.split(' ', 1) for line in git('cat-file', '-p', sha).split('\\n\\n')[0].splitlines())
+    result = {'sha': sha, 'tag': headers['tag'], 'object': {'type': headers['type'], 'sha': headers['object']}}
+elif '/contents/' in route:
+    content = pathlib.Path(os.environ['FIXTURE_POLICY']).read_bytes()
+    if os.environ.get('FIXTURE_OLD_POLICY') == 'true': content = content.replace(b'# BAMBOO_TRUSTED_PUBLICATION_POLICY_V1', b'# old policy')
+    result = {'type': 'file', 'path': '.github/workflows/publish-crate.yml', 'encoding': 'base64', 'content': base64.b64encode(content).decode()}
+else: raise AssertionError('Unexpected route: ' + route)
+print(json.dumps(result))
+`, { mode: 0o755 })
+  const bootstrap = workflowPython('Authorize the trusted manual publication ref before checkout')
+  const run = (source = historical, ref = tagRef(source), overrides = {}) => {
+    fs.writeFileSync(calls, '')
+    const result = spawnSync('python3', ['-c', bootstrap], { cwd: directory, encoding: 'utf8', env: {
+      PATH: `${bin}:${process.env.PATH}`, GH_TOKEN: 'dummy-readonly',
+      GITHUB_REPOSITORY: 'bigduu/Bamboo-agent', GITHUB_EVENT_NAME: 'workflow_dispatch',
+      EXPECTED_SOURCE_SHA: source, GITHUB_SHA: source, GITHUB_WORKFLOW_SHA: source,
+      GITHUB_REF: ref, GITHUB_REF_TYPE: ref.startsWith('refs/tags/') ? 'tag' : 'branch', GITHUB_REF_PROTECTED: 'true',
+      GITHUB_WORKFLOW_REF: `bigduu/Bamboo-agent/.github/workflows/publish-crate.yml@${ref}`,
+      FIXTURE_REPOSITORY: directory, FIXTURE_CALLS: calls, FIXTURE_TIPS: JSON.stringify({ dev, main }),
+      FIXTURE_POLICY: path.resolve('.github/workflows/publish-crate.yml'), ...overrides,
+    } })
+    return { ...result, calls: fs.readFileSync(calls, 'utf8') }
+  }
+  for (const [source, ref] of [[historical, tagRef(historical)], [dev, 'refs/heads/dev'],
+    [main, 'refs/heads/main'], [historical, 'refs/heads/dev']]) {
+    const result = run(source, ref)
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.calls, new RegExp(`contents/.github/workflows/publish-crate.yml\\?ref=${source}`))
+  }
+  for (const [ref, overrides] of [
+    ['refs/heads/feature', {}], ['refs/tags/bamboo-bodhi-source-2026.10.9', {}],
+    [tagRef(dev), {}], [tagRef(historical) + '-extra', {}],
+    [tagRef(historical), { GITHUB_REF_TYPE: 'branch' }],
+    [tagRef(historical), { GITHUB_REF_PROTECTED: 'false' }],
+    [tagRef(historical), { GITHUB_WORKFLOW_SHA: dev }],
+    [tagRef(historical), { GITHUB_SHA: dev }],
+    [tagRef(historical), { EXPECTED_SOURCE_SHA: 'not-a-sha' }],
+    [tagRef(historical), { GITHUB_REPOSITORY: 'foreign/repository' }],
+    [tagRef(historical), { GITHUB_EVENT_NAME: 'workflow_run' }],
+    [tagRef(historical), { GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/other.yml@' + tagRef(historical) }],
+  ]) {
+    const result = run(historical, ref, overrides)
+    assert.notEqual(result.status, 0, `${ref} must not authorize checkout`)
+    assert.equal(result.calls, '', 'Untrusted dispatch must fail before API or repository execution')
+  }
+  for (const overrides of [{ FIXTURE_API_FAILURE: 'true' }, { FIXTURE_UNPROTECTED: 'true' }, { FIXTURE_OLD_POLICY: 'true' }]) {
+    const result = run(historical, tagRef(historical), overrides)
+    assert.notEqual(result.status, 0, 'Unavailable API, unprotected history or pre-policy source must fail closed')
+  }
+  assert.notEqual(run(feature).status, 0, 'A protected tag cannot admit unrelated source history')
+  const annotation = git('rev-parse', tagRef(historical))
+  const tagRoute = `repos/bigduu/Bamboo-agent/git/tags/${annotation}`
+  for (const response of [
+    { sha: annotation, tag: tagName(historical), object: { type: 'commit', sha: dev } },
+    { sha: annotation, tag: tagName(historical), object: { type: 'tag', sha: annotation } },
+    { sha: annotation, tag: 'another-tag', object: { type: 'commit', sha: historical } },
+    { sha: dev, tag: tagName(historical), object: { type: 'commit', sha: historical } },
+  ]) {
+    const result = run(historical, tagRef(historical), { FIXTURE_RESPONSES: JSON.stringify({ [tagRoute]: response }) })
+    assert.notEqual(result.status, 0, 'Malformed, moved and nested annotation identities cannot authorize checkout')
+    assert.doesNotMatch(result.calls, /contents\//)
+  }
+  git('tag', '-d', tagName(historical))
+  git('tag', tagName(historical), historical)
+  assert.notEqual(run().status, 0, 'A real lightweight tag must fail')
+  git('tag', '-fa', tagName(historical), dev, '-m', 'Moved source')
+  assert.notEqual(run().status, 0, 'A real moved annotated tag must fail')
+})
 
 test('automatic inline bootstrap authorizes the exact successful CI source and protected historical workflow before checkout', (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-release-bootstrap-'))
