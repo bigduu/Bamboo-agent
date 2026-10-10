@@ -957,7 +957,8 @@ async fn build_retrieval_window_accounting_frame(
     }
 
     let mut prepared = all_active_prepared_context(session, budget, counter);
-    transforms::apply_message_transforms(config, &mut prepared, llm, session_id).await?;
+    transforms::apply_message_transforms(config, &mut prepared, llm, session_id, model_name)
+        .await?;
 
     let mut transformed_by_id = BTreeMap::new();
     for message in &prepared.messages {
@@ -1345,7 +1346,8 @@ async fn maybe_prepare_retrieval_window_context(
                 retained.compressed_message_ids.len()
             )));
         }
-        transforms::apply_message_transforms(config, &mut retained, llm, session_id).await?;
+        transforms::apply_message_transforms(config, &mut retained, llm, session_id, model_name)
+            .await?;
         let projected = super::stream_execution::project_request_usage(
             &staged,
             &retained,
@@ -2475,7 +2477,8 @@ pub(super) async fn prepare_round_context(
             ledger_usage.tokens,
         )
         .map_err(|error| AgentError::Budget(error.to_string()))?;
-        transforms::apply_message_transforms(config, &mut prepared, llm, session_id).await?;
+        transforms::apply_message_transforms(config, &mut prepared, llm, session_id, model_name)
+            .await?;
         prepared
     };
     let manual_archive_rejections = manual_archive_rejections(session);

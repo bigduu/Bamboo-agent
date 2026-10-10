@@ -853,3 +853,41 @@ evidence skips the auxiliary call. An invalid verdict, provider failure, budget
 rejection or cancellation does not produce a verified completion. The check is
 a model judgment over bounded records; it does not certify omitted evidence or
 prove that an external operation completed.
+
+
+## Per-model Vision capability
+
+Provider instances may declare `model_capabilities` in their native configuration
+(exposed as `config.model_capabilities` by provider-instance CRUD). Keys are exact,
+non-empty model IDs scoped to that instance; they do not admit a runtime model.
+
+```json
+{
+  "provider_type": "openai",
+  "runtime_models": ["image-model", "text-model"],
+  "model_capabilities": {
+    "image-model": { "supports_vision": true },
+    "text-model": { "supports_vision": false }
+  }
+}
+```
+
+Vision is supported by default for new models, old configurations and missing or
+null `supports_vision` fields. Only an explicit `false` disables this model in
+this provider instance. No provider-wide toggle, model-name inference or migration
+overwrites user choices. The settings UI exposes Supports Vision / No Vision for
+each admitted model and saves new selections as supported unless opted out.
+Null restores the default supported policy through the model-level merge.
+
+`ViewImage` uses the actual provider handle and model of the current round,
+including role wrappers and reloaded providers. Explicit No Vision produces a
+paired tool error before reading or sending an image, including legacy aliases.
+Supported models receive image parts in the next model request. An explicit
+Supports Vision override bypasses legacy image fallback rewriting. A separately
+configured legacy `hooks.image_fallback` remains an opt-in image transform for
+models without an override; it does not declare the model unsupported.
+Switching to No Vision while image history remains produces an explicit
+model-request error and preserves that history; switch back to a Vision model to
+continue. Images are not silently dropped or claimed to have been seen.
+
+The canonical IR request entry and native Anthropic/Gemini serializers (including Bodhi proxy paths) reject tool-image batches exceeding 32 MiB of cumulative encoded image URL bytes before request cloning/serialization. The error is explicit, image history is preserved, and no upstream request is sent; use smaller images or batches. The per-file ViewImage size limit is unchanged.

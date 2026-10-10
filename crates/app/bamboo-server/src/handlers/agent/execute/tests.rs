@@ -1106,4 +1106,106 @@ mod execution_input_http {
             1
         );
     }
+
+    struct VisionStartupProvider {
+        support: Option<bool>,
+        received_image: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl LLMProvider for VisionStartupProvider {
+        async fn vision_support_override(&self, model: &str) -> Option<bool> {
+            if model == "test-model" {
+                self.support
+            } else {
+                None
+            }
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            tools: &[bamboo_agent_core::tools::ToolSchema],
+            max: Option<u32>,
+            model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            assert_eq!(model, "test-model");
+            assert!(
+                messages
+                    .iter()
+                    .any(
+                        |message| message.content_parts.as_ref().is_some_and(|parts| parts
+                            .iter()
+                            .any(|part| matches!(
+                                part,
+                                bamboo_domain::MessagePart::ImageUrl { .. }
+                            )))
+                    ),
+                "explicit Vision support reaches the real provider with images"
+            );
+            self.received_image.store(true, Ordering::SeqCst);
+            LocalProvider.chat_stream(messages, tools, max, model).await
+        }
+    }
+    #[actix_web::test]
+    async fn vision_actual_execute_startup_uses_routed_model_before_legacy_error_fallback() {
+        for (support, model, expected) in [
+            (Some(true), "test-model", StatusCode::ACCEPTED),
+            (Some(false), "test-model", StatusCode::BAD_REQUEST),
+            (None, "test-model", StatusCode::BAD_REQUEST),
+            (Some(true), "other-model", StatusCode::BAD_REQUEST),
+        ] {
+            let received = Arc::new(AtomicBool::new(false));
+            let provider = Arc::new(VisionStartupProvider {
+                support,
+                received_image: received.clone(),
+            });
+            let (_home, state, _fault) = state_with_provider(None, provider).await;
+            let id = format!("vision-startup-{support:?}-{model}");
+            bootstrap(&state, &id).await;
+            let mut session = state.storage.load_session(&id).await.unwrap().unwrap();
+            session.model = model.into();
+            session.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", model));
+            let message = session
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|message| matches!(message.role, bamboo_agent_core::Role::User))
+                .unwrap();
+            message.content_parts = Some(vec![bamboo_domain::MessagePart::ImageUrl {
+                image_url: bamboo_domain::ImageUrlRef {
+                    url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                    detail: None,
+                },
+            }]);
+            state.save_and_cache_session(&mut session).await;
+            {
+                let mut config = state.config.write().await;
+                config.hooks.image_fallback.enabled = true;
+                config.hooks.image_fallback.mode = "error".into();
+            }
+            let (status, body) = execute(&state, &id, None).await;
+            assert_eq!(status, expected, "{support:?} {model}: {body}");
+            if expected == StatusCode::ACCEPTED {
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                    while !received.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("real provider receives the supported image");
+            } else {
+                assert!(
+                    !received.load(Ordering::SeqCst),
+                    "rejected images are not dispatched"
+                );
+            }
+            let saved = state.storage.load_session(&id).await.unwrap().unwrap();
+            assert!(
+                saved
+                    .messages
+                    .iter()
+                    .any(|message| message.content_parts.is_some()),
+                "image history preserved"
+            );
+        }
+    }
 }

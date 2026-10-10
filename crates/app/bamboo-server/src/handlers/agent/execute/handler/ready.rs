@@ -6,7 +6,7 @@
 //! reserve the runner, persist + cache, kick auto-title-gen, resolve the
 //! session-effective provider/area models, and spawn the agent loop.
 //!
-//! Behavior is identical to the prior inline branch — this is a pure extraction.
+//! Image validation uses the routed provider before runner reservation.
 
 use actix_web::{web, HttpResponse};
 use std::collections::BTreeSet;
@@ -122,6 +122,32 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     } else {
         None
     };
+
+    // Consult the same provider/model that will execute this session. A legacy
+    // Error fallback must not reject explicitly supported native image input.
+    let vision_provider = match provider_override.as_ref() {
+        Some(provider) => provider.clone(),
+        None => state.provider.read().await.clone(),
+    };
+    let vision_override = vision_provider
+        .vision_support_override(&ready.effective_model)
+        .await;
+    if let Err(error) = bamboo_engine::session_app::execute::validate_image_fallback_for_session(
+        &session,
+        image_fallback.as_ref(),
+        &ready.effective_model,
+        vision_override,
+    ) {
+        super::fail_pending_startup(
+            state,
+            session_id,
+            ready.startup_turn_id.as_deref(),
+            &error,
+            &mut *ready.startup_guard,
+        )
+        .await;
+        return bad_request_error_response(error);
+    }
 
     // #74: re-derive the "no interactive human approver" posture per
     // user-initiated execute, OVERWRITING the session's persisted flag (see
