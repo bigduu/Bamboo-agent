@@ -44,6 +44,7 @@ mod approval_replay;
 mod builder;
 mod error;
 mod execute_request;
+mod skill_runtime;
 mod tools;
 
 #[cfg(test)]
@@ -115,6 +116,31 @@ pub use bamboo_tools::{BuiltinToolExecutor, BuiltinToolExecutorBuilder, ToolOutp
 /// Default event-channel buffer used by [`Agent::run`].
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// A new SDK User turn with explicit, host-validated Skill selections.
+///
+/// The SDK constructs the User identity. Selections are request data; they do
+/// not grant caller, Source or filesystem permissions. An empty selection is
+/// ordinary input and still permits eligible implicit catalog reads.
+#[derive(Debug)]
+pub struct SdkSkillInput {
+    pub content: String,
+    pub parts: Vec<bamboo_domain::MessagePart>,
+    pub selections: Vec<bamboo_skills::WorkflowSelection>,
+}
+
+impl SdkSkillInput {
+    pub fn new(
+        content: impl Into<String>,
+        selections: Vec<bamboo_skills::WorkflowSelection>,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            parts: Vec::new(),
+            selections,
+        }
+    }
+}
+
 /// Stable, ergonomic entry point for agent execution.
 ///
 /// Wraps a [`bamboo_engine::Agent`] (which owns the shared runtime) plus the
@@ -122,6 +148,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 #[derive(Clone)]
 pub struct Agent {
     inner: bamboo_engine::Agent,
+    sdk_skills: Option<Arc<skill_runtime::DefaultSdkSkills>>,
     /// Instruction (system-prompt fragment) injected into the session at `run`
     /// time; the engine assembles the full prompt around it.
     system_prompt: Option<String>,
@@ -150,6 +177,109 @@ pub struct Agent {
 }
 
 impl Agent {
+    fn construct_user_input(
+        input: impl Into<String>,
+    ) -> (
+        Message,
+        Option<bamboo_engine::config::UntrustedExecutionInputs>,
+    ) {
+        let message = Message::user(input.into());
+        // Observe this exact constructor; never decode text/config/history.
+        let inputs = bamboo_engine::config::UntrustedInputObservation::new(&message.id, None)
+            .and_then(|input| bamboo_engine::config::UntrustedExecutionInputs::new(vec![input]));
+        (message, inputs)
+    }
+
+    fn append_constructed_user_input(
+        session: &mut Session,
+        (message, inputs): (
+            Message,
+            Option<bamboo_engine::config::UntrustedExecutionInputs>,
+        ),
+    ) -> Option<bamboo_engine::config::UntrustedExecutionInputs> {
+        session.add_message(message);
+        inputs
+    }
+
+    fn append_user_input(
+        session: &mut Session,
+        input: impl Into<String>,
+    ) -> Option<bamboo_engine::config::UntrustedExecutionInputs> {
+        // The four wrappers retain consecutive synchronous construct -> append.
+        Self::append_constructed_user_input(session, Self::construct_user_input(input))
+    }
+
+    fn append_local_user_input(
+        &self,
+        session: &mut Session,
+        input: impl Into<String>,
+    ) -> Option<bamboo_engine::config::UntrustedExecutionInputs> {
+        if self.sdk_skills.is_none() {
+            return Self::append_user_input(session, input);
+        }
+        let (message, _) = Self::construct_user_input(input);
+        let fallback = message.clone();
+        match self
+            .inner
+            .append_sdk_user_input(session, message, None, None)
+        {
+            Ok(inputs) => Some(inputs),
+            Err(_) => {
+                // Optional SDK observation cannot change the old append/error
+                // contract. An unavailable receipt gives no Skill authority.
+                if !session.messages.iter().any(|user| user.id == fallback.id) {
+                    session.add_message(fallback);
+                }
+                None
+            }
+        }
+    }
+
+    /// Prepare and run a new typed Skill input through the actual SDK host.
+    ///
+    /// Requires the complete built-in defaults surface. Hook or preparation
+    /// failure returns before append. String entrypoints retain their original
+    /// synchronous append and error order.
+    pub async fn run_with_skills(
+        &self,
+        session: &mut Session,
+        input: SdkSkillInput,
+    ) -> Result<(), SdkError> {
+        self.run_with_skills_and_cancel(session, input, CancellationToken::new())
+            .await
+    }
+
+    /// Like `run_with_skills`, with cancellation covering preparation and run.
+    pub async fn run_with_skills_and_cancel(
+        &self,
+        session: &mut Session,
+        input: SdkSkillInput,
+        cancel_token: CancellationToken,
+    ) -> Result<(), SdkError> {
+        let skills = self.sdk_skills.as_ref().ok_or_else(|| {
+            SdkError::Unsupported(
+                "typed Skills require the complete defaults-backed built-in SDK host".into(),
+            )
+        })?;
+        let (guard, inputs, lease) = skills
+            .prepare_typed_run(self, session, input, cancel_token.clone())
+            .await?;
+        let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let result = self
+            .execute_internal_prepared(
+                session,
+                event_tx,
+                cancel_token,
+                Some(inputs),
+                Some(guard),
+                Some(lease),
+            )
+            .await;
+        drain.abort();
+        result.map_err(SdkError::from)
+    }
+
     /// Return a new ergonomic builder.
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
@@ -160,6 +290,7 @@ impl Agent {
     pub fn from_runtime(inner: bamboo_engine::Agent) -> Self {
         Self {
             inner,
+            sdk_skills: None,
             system_prompt: None,
             model: None,
             session_model: None,
@@ -184,6 +315,7 @@ impl Agent {
     ) -> Self {
         Self {
             inner,
+            sdk_skills: None,
             system_prompt,
             model,
             session_model,
@@ -209,8 +341,9 @@ impl Agent {
         session: &mut Session,
         input: impl Into<String>,
     ) -> Result<(), AgentError> {
-        session.add_message(Message::user(input.into()));
-        self.run_session(session).await
+        let inputs = self.append_local_user_input(session, input);
+        self.run_session_with_cancel_and_inputs(session, CancellationToken::new(), inputs)
+            .await
     }
 
     /// Like [`run`](Self::run) but driven by a caller-owned
@@ -222,8 +355,9 @@ impl Agent {
         input: impl Into<String>,
         cancel_token: CancellationToken,
     ) -> Result<(), AgentError> {
-        session.add_message(Message::user(input.into()));
-        self.run_session_with_cancel(session, cancel_token).await
+        let inputs = self.append_local_user_input(session, input);
+        self.run_session_with_cancel_and_inputs(session, cancel_token, inputs)
+            .await
     }
 
     /// Run the agent loop on `session` exactly as it stands — i.e. on a
@@ -257,12 +391,24 @@ impl Agent {
         session: &mut Session,
         cancel_token: CancellationToken,
     ) -> Result<(), AgentError> {
+        self.run_session_with_cancel_and_inputs(session, cancel_token, None)
+            .await
+    }
+
+    async fn run_session_with_cancel_and_inputs(
+        &self,
+        session: &mut Session,
+        cancel_token: CancellationToken,
+        inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
+    ) -> Result<(), AgentError> {
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(EVENT_CHANNEL_CAPACITY);
 
         // Drain events so the bounded channel never blocks the loop.
         let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
 
-        let result = self.execute_internal(session, event_tx, cancel_token).await;
+        let result = self
+            .execute_internal(session, event_tx, cancel_token, inputs)
+            .await;
 
         // Stop draining once execution returns. Detached engine tasks (e.g.
         // background evaluations) may still hold a cloned sender, so awaiting
@@ -279,8 +425,8 @@ impl Agent {
         mut session: Session,
         input: impl Into<String>,
     ) -> mpsc::Receiver<AgentEvent> {
-        session.add_message(Message::user(input.into()));
-        self.run_stream_session(session)
+        let inputs = self.append_local_user_input(&mut session, input);
+        self.run_stream_session_with_cancel_and_inputs(session, CancellationToken::new(), inputs)
     }
 
     /// Like [`run_stream`](Self::run_stream), but also returns a
@@ -292,8 +438,11 @@ impl Agent {
         mut session: Session,
         input: impl Into<String>,
     ) -> (mpsc::Receiver<AgentEvent>, CancellationToken) {
-        session.add_message(Message::user(input.into()));
-        self.run_stream_session_cancellable(session)
+        let inputs = self.append_local_user_input(&mut session, input);
+        let cancel_token = CancellationToken::new();
+        let rx =
+            self.run_stream_session_with_cancel_and_inputs(session, cancel_token.clone(), inputs);
+        (rx, cancel_token)
     }
 
     /// Stream the run's [`AgentEvent`]s for a caller-provided message list,
@@ -318,8 +467,17 @@ impl Agent {
     /// helpers funnel into.
     pub fn run_stream_session_with_cancel(
         &self,
+        session: Session,
+        cancel_token: CancellationToken,
+    ) -> mpsc::Receiver<AgentEvent> {
+        self.run_stream_session_with_cancel_and_inputs(session, cancel_token, None)
+    }
+
+    fn run_stream_session_with_cancel_and_inputs(
+        &self,
         mut session: Session,
         cancel_token: CancellationToken,
+        inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
     ) -> mpsc::Receiver<AgentEvent> {
         let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(EVENT_CHANNEL_CAPACITY);
         let agent = self.clone();
@@ -332,7 +490,7 @@ impl Agent {
             // its successor.
             let execution_tx = event_tx.clone();
             if let Err(error) = agent
-                .execute_internal(&mut session, execution_tx, cancel_token)
+                .execute_internal(&mut session, execution_tx, cancel_token, inputs)
                 .await
             {
                 tracing::warn!("Agent::run_stream execution failed: {error}");
@@ -368,163 +526,274 @@ impl Agent {
         session: &mut Session,
         request: ExecuteRequest,
     ) -> Result<(), AgentError> {
+        #[cfg(test)]
+        constructor_parity_tests::observe_inputs(&session.id, None);
         self.inner.execute_direct(session, request).await
     }
 
     /// Shared execution path: prepare the session (system prompt + model), build
     /// the [`ExecuteRequest`], and delegate to the canonical engine execution
     /// path. Tool restriction is applied via the agent's executor (built time).
-    async fn execute_internal(
-        &self,
-        session: &mut Session,
+    fn execute_internal<'a>(
+        &'a self,
+        session: &'a mut Session,
         event_tx: mpsc::Sender<AgentEvent>,
         cancel_token: CancellationToken,
-    ) -> Result<(), AgentError> {
-        // Own the logical session before any pre-execution mutation or approved
-        // tool replay. Two cloned SDK Session values must collide before either
-        // can duplicate a mutating side effect.
-        let direct_lease = self.inner.begin_direct_execution(&session.id).await?;
-        if session.project_id_meta().is_none() {
-            if let Some(project_id) = self.project_id.as_ref() {
-                let existing = if session.kind == bamboo_domain::SessionKind::Root {
-                    match self.storage().load_root_authority(&session.id).await {
-                        // Preserve compatibility for custom Storage backends that
-                        // predate the strict Root port. V2 always uses its canonical
-                        // directory lookup, even when this instance's index is stale.
-                        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                            self.storage().load_session(&session.id).await
-                        }
-                        result => result,
-                    }
-                    .map_err(|error| AgentError::ProjectContext(error.to_string()))?
-                } else {
-                    None
-                };
-                if let Some(current) = existing {
-                    if current.kind != bamboo_domain::SessionKind::Root
-                        || current.created_at != session.created_at
-                        || current.metadata_version != session.metadata_version
-                        || current.authority_identity != session.authority_identity
-                        || current.project_id_meta().is_some()
+        inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentError>> + Send + 'a>>
+    {
+        self.execute_internal_prepared(session, event_tx, cancel_token, inputs, None, None)
+    }
+
+    fn execute_internal_prepared<'a>(
+        &'a self,
+        session: &'a mut Session,
+        event_tx: mpsc::Sender<AgentEvent>,
+        cancel_token: CancellationToken,
+        inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
+        supplied_guard: Option<skill_runtime::SdkSkillRunGuard>,
+        supplied_lease: Option<bamboo_engine::DirectExecutionLease>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentError>> + Send + 'a>>
+    {
+        // Keep the existing execution and String append/lease order. The guard
+        // is owned by this actual future, independently from cloned executors.
+        Box::pin(async move {
+            // One execution-private view covers Project assignment, approved
+            // tool replay and all later runtime checkpoints. Freeze None too.
+            let mut execution = self.clone();
+            let persistence = if self.persistence().inherited_child_wait().is_none() {
+                match bamboo_domain::InheritedChildWait::capture(session) {
+                    Some(inherited) => self
+                        .persistence()
+                        .bind_inherited_child_wait(inherited)
+                        .map_err(|error| AgentError::LLM(error.to_string()))?,
+                    None => self.persistence().clone(),
+                }
+            } else {
+                self.persistence().clone()
+            };
+            execution.inner = self.inner.with_execution_persistence(persistence);
+            // Own the logical session before any pre-execution mutation or approved
+            // tool replay. Two cloned SDK Session values must collide before either
+            // can duplicate a mutating side effect.
+            let direct_lease = match supplied_lease {
+                Some(lease) => lease,
+                None => execution.inner.begin_direct_execution(&session.id).await?,
+            };
+            let sdk_guard = match (supplied_guard, execution.sdk_skills.as_ref()) {
+                (Some(guard), _) => Some(guard),
+                (None, Some(skills)) => {
+                    if let Some((carrier, execution_id)) = inputs
+                        .as_ref()
+                        .and_then(|carrier| carrier.sdk_execution_id().map(|id| (carrier, id)))
                     {
-                        return Err(AgentError::ProjectContext(
-                            "Session context changed; reload before assigning its first Project"
-                                .to_string(),
-                        ));
-                    }
-                    let next_version =
-                        current.metadata_version.checked_add(1).ok_or_else(|| {
-                            AgentError::ProjectContext(
-                                "Session metadata revision cannot advance".to_string(),
-                            )
+                        // Only an opaque receipt from this real SDK append has
+                        // this scalar. Generic input/history carriers have none.
+                        let input = carrier.observations().first().ok_or_else(|| {
+                            AgentError::Tool("SDK append observation is unavailable".into())
                         })?;
-                    let mut candidate = session.clone();
-                    candidate.set_project_id_meta(project_id.to_string());
-                    candidate.metadata_version = next_version;
-                    candidate.updated_at = std::time::SystemTime::now().into();
-                    self.inner
-                        .prepare_external_project_assignment_read_only(&mut candidate)
-                        .await?;
-                    #[cfg(test)]
-                    reexecute_and_child_approval_tests::pause_project_assignment(&session.id).await;
-                    // Commit the narrow context change before publishing a runtime
-                    // workspace or replaying an approved tool. The final writer
-                    // fences an independent store's competing assignment. The
-                    // V2 runtime path leaves conversation history untouched.
-                    self.storage()
-                        .save_runtime_state(&candidate)
-                        .await
+                        let user = session
+                            .messages
+                            .iter()
+                            .find(|message| {
+                                message.id == input.input_id() && message.role == Role::User
+                            })
+                            .ok_or_else(|| {
+                                AgentError::Tool("SDK appended User is unavailable".into())
+                            })?;
+                        Some(
+                            skills
+                                .begin_run(
+                                    session,
+                                    execution_id,
+                                    user,
+                                    input.request(),
+                                    cancel_token.clone(),
+                                )
+                                .map_err(|error| AgentError::Tool(error.to_string()))?,
+                        )
+                    } else {
+                        Some(skills.begin_without_input(session, cancel_token.clone()))
+                    }
+                }
+                _ => None,
+            };
+            if let Some(guard) = sdk_guard.as_ref() {
+                execution.inner = execution.inner.with_sdk_skill_execution_host(guard.host());
+            }
+            if session.project_id_meta().is_none() {
+                if let Some(project_id) = execution.project_id.as_ref() {
+                    let existing = if session.kind == bamboo_domain::SessionKind::Root {
+                        match execution.storage().load_root_authority(&session.id).await {
+                            // Preserve compatibility for custom Storage backends that
+                            // predate the strict Root port. V2 always uses its canonical
+                            // directory lookup, even when this instance's index is stale.
+                            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                                execution.storage().load_session(&session.id).await
+                            }
+                            result => result,
+                        }
+                        .map_err(|error| AgentError::ProjectContext(error.to_string()))?
+                    } else {
+                        None
+                    };
+                    if let Some(current) = existing {
+                        if current.kind != bamboo_domain::SessionKind::Root
+                            || current.created_at != session.created_at
+                            || current.metadata_version != session.metadata_version
+                            || current.authority_identity != session.authority_identity
+                            || current.project_id_meta().is_some()
+                        {
+                            return Err(AgentError::ProjectContext(
+                                "Session context changed; reload before assigning its first Project"
+                                    .to_string(),
+                            ));
+                        }
+                        let next_version =
+                            current.metadata_version.checked_add(1).ok_or_else(|| {
+                                AgentError::ProjectContext(
+                                    "Session metadata revision cannot advance".to_string(),
+                                )
+                            })?;
+                        let mut candidate = session.clone();
+                        candidate.set_project_id_meta(project_id.to_string());
+                        candidate.metadata_version = next_version;
+                        candidate.updated_at = std::time::SystemTime::now().into();
+                        execution
+                            .inner
+                            .prepare_external_project_assignment_read_only(&mut candidate)
+                            .await?;
+                        #[cfg(test)]
+                        reexecute_and_child_approval_tests::pause_project_assignment(&session.id)
+                            .await;
+                        // Commit the narrow context change before publishing a runtime
+                        // workspace or replaying an approved tool. The final writer
+                        // fences an independent store's competing assignment. The
+                        // V2 runtime path leaves conversation history untouched.
+                        if let Some(inherited) = execution.persistence().inherited_child_wait() {
+                            // Preserve this assignment's original authoritative
+                            // candidate and default-writer fence. Ordinary metadata
+                            // adoption would conceal a competing Project CAS.
+                            execution
+                                .storage()
+                                .save_runtime_with_inherited_child_wait(
+                                    &mut candidate,
+                                    &inherited,
+                                    true,
+                                    None,
+                                    None,
+                                )
+                                .await
+                        } else {
+                            execution.storage().save_runtime_state(&candidate).await
+                        }
                         .map_err(|error| AgentError::ProjectContext(error.to_string()))?;
-                    *session = candidate;
-                } else {
-                    // First creation keeps its existing revision and persistence
-                    // lifecycle; Child assignment keeps its prior SDK semantics.
-                    session.set_project_id_meta(project_id.to_string());
+                        *session = candidate;
+                    } else {
+                        // First creation keeps its existing revision and persistence
+                        // lifecycle; Child assignment keeps its prior SDK semantics.
+                        session.set_project_id_meta(project_id.to_string());
+                    }
                 }
             }
-        }
 
-        // Complete the external Project/Workspace handoff before replaying an
-        // approved mutating tool. The replay executor reads the runtime
-        // workspace registry, so deferring this until the loop's first round
-        // would execute against stale process state. Assigned sessions fail
-        // closed here when this runtime has no Project resolver; the pending
-        // replay marker remains intact for a correctly configured retry.
-        self.inner
-            .prepare_external_session_for_execution(session)
-            .await?;
+            // Complete the external Project/Workspace handoff before replaying an
+            // approved mutating tool. The replay executor reads the runtime
+            // workspace registry, so deferring this until the loop's first round
+            // would execute against stale process state. Assigned sessions fail
+            // closed here when this runtime has no Project resolver; the pending
+            // replay marker remains intact for a correctly configured retry.
+            execution
+                .inner
+                .prepare_external_session_for_execution(session)
+                .await?;
 
-        // If `answer()` just approved a gated tool call, `session.metadata` carries
-        // the re-execution marker `submit_pending_response` set — the gated tool
-        // never actually ran (the permission gate intercepted it before
-        // execution), so re-run it now for real and write the genuine output back
-        // before the loop resumes. An unanswered typed request also keeps this
-        // entry waiting after its replay markers have been cleared. Check every
-        // ergonomic entry into the loop, not just `resume`. See
-        // `reexecute_approved_tool_if_pending` for the full rationale.
-        match self
-            .reexecute_approved_tool_if_pending(session, &event_tx)
-            .await
-        {
-            Ok(ReplayDisposition::Continue) => {}
-            Ok(ReplayDisposition::AwaitingApproval(pending)) => {
-                direct_lease.abandon().await;
-                let _ = event_tx
-                    .send(AgentEvent::NeedClarification {
-                        question: pending.question,
-                        options: (!pending.options.is_empty()).then_some(pending.options),
-                        tool_call_id: Some(pending.tool_call_id),
-                        tool_name: Some(pending.tool_name),
-                        allow_custom: pending.allow_custom,
-                        source: Some(pending.source),
-                    })
-                    .await;
-                return Ok(());
+            // If `answer()` just approved a gated tool call, `session.metadata` carries
+            // the re-execution marker `submit_pending_response` set — the gated tool
+            // never actually ran (the permission gate intercepted it before
+            // execution), so re-run it now for real and write the genuine output back
+            // before the loop resumes. An unanswered typed request also keeps this
+            // entry waiting after its replay markers have been cleared. Check every
+            // ergonomic entry into the loop, not just `resume`. See
+            // `reexecute_approved_tool_if_pending` for the full rationale.
+            match execution
+                .reexecute_approved_tool_if_pending(session, &event_tx)
+                .await
+            {
+                Ok(ReplayDisposition::Continue) => {}
+                Ok(ReplayDisposition::AwaitingApproval(pending)) => {
+                    direct_lease.abandon().await;
+                    let _ = event_tx
+                        .send(AgentEvent::NeedClarification {
+                            question: pending.question,
+                            options: (!pending.options.is_empty()).then_some(pending.options),
+                            tool_call_id: Some(pending.tool_call_id),
+                            tool_name: Some(pending.tool_name),
+                            allow_custom: pending.allow_custom,
+                            source: Some(pending.source),
+                        })
+                        .await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    direct_lease.abandon().await;
+                    let _ = event_tx
+                        .send(AgentEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    return Err(error);
+                }
             }
-            Err(error) => {
-                direct_lease.abandon().await;
-                let _ = event_tx
-                    .send(AgentEvent::Error {
-                        message: error.to_string(),
-                    })
-                    .await;
-                return Err(error);
+
+            // Apply the instruction as the session's leading System message, set
+            // the configured model, and refresh the typed prompt snapshot via the
+            // single authoritative pre-execution mutation point. This intentionally
+            // follows replay: a failed replay remains observable without replacing
+            // caller System bytes, while a successful handoff always reaches the
+            // provider with one clean configured System message.
+            bamboo_engine::session_app::execution_prep::prepare_session_for_execution(
+                session,
+                execution.system_prompt.as_deref(),
+                execution.model.as_deref(),
+            );
+
+            // The last user message in the session drives execution (the engine
+            // skips echoing `initial_message`, so we surface it for logging only).
+            let initial_message = session
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, Role::User))
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+
+            // Tool restriction is handled at build time: the agent's executor is
+            // built from exactly the configured tool set, so no per-run
+            // `disabled_tools` filter is needed here.
+            let mut builder = ExecuteRequestBuilder::new(initial_message, event_tx, cancel_token);
+            if let Some(store) = execution.session_store.as_ref() {
+                builder = builder.app_data_dir(store.bamboo_home_dir().to_path_buf());
             }
-        }
+            if let Some(model) = execution.model.clone() {
+                builder = builder.model(model);
+            }
+            if let Some(guard) = sdk_guard.as_ref() {
+                builder = builder.tools(guard.tools(execution.inner.default_tools().clone()));
+            }
 
-        // Apply the instruction as the session's leading System message, set
-        // the configured model, and refresh the typed prompt snapshot via the
-        // single authoritative pre-execution mutation point. This intentionally
-        // follows replay: a failed replay remains observable without replacing
-        // caller System bytes, while a successful handoff always reaches the
-        // provider with one clean configured System message.
-        bamboo_engine::session_app::execution_prep::prepare_session_for_execution(
-            session,
-            self.system_prompt.as_deref(),
-            self.model.as_deref(),
-        );
-
-        // The last user message in the session drives execution (the engine
-        // skips echoing `initial_message`, so we surface it for logging only).
-        let initial_message = session
-            .messages
-            .iter()
-            .rev()
-            .find(|m| matches!(m.role, Role::User))
-            .map(|m| m.content.clone())
-            .unwrap_or_default();
-
-        // Tool restriction is handled at build time: the agent's executor is
-        // built from exactly the configured tool set, so no per-run
-        // `disabled_tools` filter is needed here.
-        let mut builder = ExecuteRequestBuilder::new(initial_message, event_tx, cancel_token);
-        if let Some(model) = self.model.clone() {
-            builder = builder.model(model);
-        }
-
-        self.inner
-            .execute_direct_registered(session, builder.build(), direct_lease)
-            .await
+            #[cfg(test)]
+            constructor_parity_tests::observe_inputs(&session.id, inputs.as_ref());
+            execution
+                .inner
+                .execute_direct_registered_with_inputs(
+                    session,
+                    builder.build(),
+                    direct_lease,
+                    inputs,
+                )
+                .await
+        })
     }
 
     /// Access the shared storage backend.
@@ -1805,10 +2074,26 @@ mod reexecute_and_child_approval_tests {
 
     #[tokio::test]
     async fn root_context_fence_sdk_first_project_assignment_rejects_final_store_race() {
+        for inherited in [false, true] {
+            prove_first_project_assignment_rejects_race(inherited).await;
+        }
+    }
+
+    async fn prove_first_project_assignment_rejects_race(inherited: bool) {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let (agent, tool, provider) = root_context_test_agent(data.path(), workspace.path()).await;
         let mut session = seed_gated_tool_session("sdk-root-context-race", "context-race-call");
+        if inherited {
+            session
+                .agent_runtime_state
+                .get_or_insert_with(|| bamboo_domain::AgentRuntimeState::new("prior-run"))
+                .waiting_for_children = Some(bamboo_domain::WaitingForChildrenState::for_children(
+                vec!["prior-project-child".into()],
+                bamboo_domain::ChildWaitPolicy::All,
+                session.created_at,
+            ));
+        }
         session.metadata.insert(
             PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
             "context-race-call".to_string(),
@@ -1830,7 +2115,7 @@ mod reexecute_and_child_approval_tests {
         winner.set_project_id_meta("competing-project");
         winner.metadata_version += 1;
         let (tx, mut rx) = mpsc::channel(16);
-        let run = agent.execute_internal(&mut session, tx, CancellationToken::new());
+        let run = agent.execute_internal(&mut session, tx, CancellationToken::new(), None);
         let compete = async {
             tokio::time::timeout(std::time::Duration::from_secs(5), hook.reached.notified())
                 .await
@@ -1874,15 +2159,18 @@ mod reexecute_and_child_approval_tests {
         let mut session = Session::new("sdk-root-context-stale-index", "claude-test");
         session.add_message(Message::user("continue"));
         second.save_session(&session).await.unwrap();
-        assert!(
-            agent
-                .storage()
-                .load_session(&session.id)
-                .await
-                .unwrap()
-                .is_none(),
-            "SDK instance intentionally predates this Root"
-        );
+        let error = agent
+            .storage()
+            .load_session(&session.id)
+            .await
+            .expect_err("stale SDK index must not report a canonical Root as absent");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));
+        assert!(error
+            .to_string()
+            .contains("Root index is missing while canonical files require recovery"));
         agent.run_session(&mut session).await.unwrap();
         let persisted = second
             .load_root_authority(&session.id)
@@ -1927,7 +2215,7 @@ mod reexecute_and_child_approval_tests {
         let before = serde_json::to_vec(&session).unwrap();
         let (tx, mut rx) = mpsc::channel(16);
         let error = agent
-            .execute_internal(&mut session, tx, CancellationToken::new())
+            .execute_internal(&mut session, tx, CancellationToken::new(), None)
             .await
             .unwrap_err();
         assert!(
@@ -2134,7 +2422,7 @@ mod reexecute_and_child_approval_tests {
         let (event_tx, mut event_rx) = mpsc::channel(16);
 
         let error = agent
-            .execute_internal(&mut session, event_tx, CancellationToken::new())
+            .execute_internal(&mut session, event_tx, CancellationToken::new(), None)
             .await
             .expect_err("assigned SDK session must fail without Project resolver");
 
@@ -2466,5 +2754,566 @@ mod reexecute_and_child_approval_tests {
 
         // One-shot: a replay of the same request_id is rejected.
         assert!(!agent.answer_child_approval("child-x", "req-1", true));
+    }
+
+    #[tokio::test]
+    async fn execution_input_answer_and_resume_replays_real_tool_with_absent_observation() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.json"),r#"{"provider":"anthropic","providers":{"anthropic":{"api_key":"fixture","model":"claude-test"}}}"#).unwrap();
+        let tool = Arc::new(RealOutputTool::new());
+        let agent = Agent::builder()
+            .provider(Arc::new(ImmediateDoneProvider))
+            .tool_shared(tool.clone())
+            .model("claude-test")
+            .instruction("existing replay parity")
+            .with_defaults_for_data_dir(tmp.path().into())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let id = "execution-input-answer-resume";
+        let session = seed_gated_tool_session(id, "answer-replay-call");
+        agent.storage().save_session(&session).await.unwrap();
+        constructor_parity_tests::watch_inputs(id);
+        let mut rx = agent.answer_and_resume_stream(id, "Approve").await.unwrap();
+        while let Some(event) = rx.recv().await {
+            assert!(!matches!(event, AgentEvent::Error { .. }), "{event:?}");
+        }
+        assert_eq!(
+            tool.calls.load(Ordering::SeqCst),
+            1,
+            "one real approved replay before the canonical execution"
+        );
+        assert_eq!(
+            constructor_parity_tests::take_inputs(id),
+            vec![None],
+            "answer/replay/resume is not a freshly appended User observation"
+        );
+        let stored = agent.storage().load_session(id).await.unwrap().unwrap();
+        let tool_result = stored
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("answer-replay-call"))
+            .unwrap();
+        assert_eq!(tool_result.content, "REAL TOOL OUTPUT #0");
+        assert_eq!(tool_result.tool_success, Some(true));
+    }
+}
+
+#[cfg(test)]
+mod constructor_parity_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    #[derive(Default)]
+    struct RecordingProvider(Mutex<Vec<Vec<Message>>>);
+
+    type InputSnapshot = Option<Vec<(String, Option<bamboo_domain::SessionSkillRequest>)>>;
+    fn input_taps() -> &'static Mutex<std::collections::HashMap<String, Vec<InputSnapshot>>> {
+        static TAPS: std::sync::OnceLock<
+            Mutex<std::collections::HashMap<String, Vec<InputSnapshot>>>,
+        > = std::sync::OnceLock::new();
+        TAPS.get_or_init(Mutex::default)
+    }
+    pub(super) fn watch_inputs(id: &str) {
+        input_taps().lock().unwrap().insert(id.into(), Vec::new());
+    }
+    pub(super) fn take_inputs(id: &str) -> Vec<InputSnapshot> {
+        input_taps().lock().unwrap().remove(id).unwrap()
+    }
+    pub(super) fn observe_inputs(
+        id: &str,
+        inputs: Option<&bamboo_engine::config::UntrustedExecutionInputs>,
+    ) {
+        let mut taps = input_taps().lock().unwrap();
+        if let Some(entries) = taps.get_mut(id) {
+            entries.push(inputs.map(|inputs| {
+                inputs
+                    .observations()
+                    .iter()
+                    .map(|item| (item.input_id().into(), item.request().cloned()))
+                    .collect()
+            }));
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for RecordingProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            self.0.lock().unwrap().push(messages.to_vec());
+            Ok(Box::pin(futures::stream::iter([
+                Ok(bamboo_llm::LLMChunk::Token(
+                    "constructor parity done".into(),
+                )),
+                Ok(bamboo_llm::LLMChunk::Done),
+            ])))
+        }
+    }
+
+    async fn agent(root: &std::path::Path, provider: Arc<dyn LLMProvider>) -> Agent {
+        std::fs::write(root.join("config.json"), r#"{"provider":"anthropic","providers":{"anthropic":{"api_key":"fixture","model":"claude-test"}}}"#).unwrap();
+        Agent::builder()
+            .provider(provider)
+            .session_delivery(bamboo_engine::SessionActivationRouter::new())
+            .model("claude-test")
+            .instruction("constructor fixture")
+            .with_defaults_for_data_dir(root.into())
+            .await
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    struct ObservedInput(Arc<AtomicUsize>);
+    impl From<ObservedInput> for String {
+        fn from(input: ObservedInput) -> Self {
+            input.0.fetch_add(1, Ordering::SeqCst);
+            "fresh 原样\n\"input\"".into()
+        }
+    }
+
+    async fn drain(mut rx: mpsc::Receiver<AgentEvent>) {
+        let mut complete = 0;
+        while let Some(event) = rx.recv().await {
+            assert!(!matches!(event, AgentEvent::Error { .. }), "{event:?}");
+            complete += usize::from(matches!(event, AgentEvent::Complete { .. }));
+        }
+        assert_eq!(complete, 1);
+    }
+
+    #[test]
+    fn constructor_parity_owned_user_can_be_prepared_before_append_without_reminting() {
+        let mut session = Session::new("constructor-staged", "model");
+        session.add_message(Message::user("history"));
+        let before = serde_json::to_value(&session).unwrap();
+        let converted = Arc::new(AtomicUsize::new(0));
+        let (user, inputs) = Agent::construct_user_input(ObservedInput(converted.clone()));
+        let original = serde_json::to_value(&user).unwrap();
+        assert_eq!(converted.load(Ordering::SeqCst), 1);
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        assert_eq!(
+            inputs.as_ref().unwrap().observations()[0].input_id(),
+            user.id
+        );
+        assert!(inputs.as_ref().unwrap().observations()[0]
+            .request()
+            .is_none());
+        let prepared = bamboo_engine::session_app::skill_input::prepare_current_skill_input(
+            &user,
+            Err("no authority or explicit request"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(&prepared.message).unwrap(), original);
+        let mut invalid = user.clone();
+        invalid.role = Role::Assistant;
+        assert!(
+            bamboo_engine::session_app::skill_input::prepare_current_skill_input(
+                &invalid,
+                Err("unavailable"),
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        let inputs = Agent::append_constructed_user_input(&mut session, (prepared.message, inputs));
+        assert_eq!(
+            serde_json::to_value(session.messages.last().unwrap()).unwrap(),
+            original
+        );
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(
+            inputs.as_ref().unwrap().observations()[0].input_id(),
+            user.id
+        );
+        assert_eq!(converted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn constructor_parity_four_sdk_fresh_wrappers_append_once_at_original_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let agent = agent(root.path(), provider.clone()).await;
+        for mode in 0..4 {
+            provider.0.lock().unwrap().clear();
+            let mut session = Session::new(format!("constructor-sdk-fresh-{mode}"), "claude-test");
+            watch_inputs(&session.id);
+            let historical = Message::user("historical input");
+            let historical_id = historical.id.clone();
+            session.add_message(historical);
+            let converted = Arc::new(AtomicUsize::new(0));
+            let input = ObservedInput(converted.clone());
+            let before = std::time::SystemTime::now();
+            let mut sync_returned = None;
+            match mode {
+                0 => agent.run(&mut session, input).await.unwrap(),
+                1 => agent
+                    .run_with_cancel(&mut session, input, CancellationToken::new())
+                    .await
+                    .unwrap(),
+                2 => {
+                    let rx = agent.run_stream(session, input);
+                    assert_eq!(
+                        converted.load(Ordering::SeqCst),
+                        1,
+                        "stream constructor stays synchronous"
+                    );
+                    sync_returned = Some(std::time::SystemTime::now());
+                    drain(rx).await;
+                }
+                _ => {
+                    let (rx, cancel) = agent.run_stream_cancellable(session, input);
+                    assert_eq!(converted.load(Ordering::SeqCst), 1);
+                    assert!(!cancel.is_cancelled());
+                    sync_returned = Some(std::time::SystemTime::now());
+                    drain(rx).await;
+                }
+            }
+            assert_eq!(converted.load(Ordering::SeqCst), 1);
+            let persisted = agent
+                .storage()
+                .load_session(&format!("constructor-sdk-fresh-{mode}"))
+                .await
+                .unwrap()
+                .unwrap();
+            let users = persisted
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .collect::<Vec<_>>();
+            assert_eq!(users.len(), 2);
+            assert_eq!(users[0].id, historical_id);
+            assert_eq!(users[1].content, "fresh 原样\n\"input\"");
+            assert_ne!(users[1].id, historical_id);
+            assert_eq!(
+                take_inputs(&persisted.id),
+                vec![Some(vec![(users[1].id.clone(), None)])],
+                "exact newly generated User, no history/text/config request reconstruction"
+            );
+            assert!(users[1].content_parts.is_none());
+            let minted: std::time::SystemTime = users[1].created_at.into();
+            assert!(
+                minted >= before
+                    && minted <= sync_returned.unwrap_or_else(std::time::SystemTime::now)
+            );
+            let requests = provider.0.lock().unwrap();
+            assert!(!requests.is_empty(), "actual provider consumer executed");
+            let sent = requests[0]
+                .iter()
+                .filter(|m| m.role == Role::User && m.id == users[1].id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                sent.len(),
+                1,
+                "actual fresh User identity reaches provider once"
+            );
+            assert_eq!(
+                requests[0]
+                    .iter()
+                    .filter(|m| m.role == Role::User && m.id == historical_id)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                serde_json::to_value(sent[0]).unwrap(),
+                serde_json::to_value(users[1]).unwrap(),
+                "minted identity/time/body reach provider and checkpoint unchanged"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn constructor_parity_fresh_append_remains_before_existing_execution_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let agent = agent(root.path(), provider.clone()).await;
+        for mode in 0..4 {
+            let id = format!("constructor-sdk-prelease-{mode}");
+            watch_inputs(&id);
+            let mut session = Session::new(&id, "claude-test");
+            let lease = agent.inner.begin_direct_execution(&id).await.unwrap();
+            let converted = Arc::new(AtomicUsize::new(0));
+            let input = ObservedInput(converted.clone());
+            match mode {
+                0 | 1 => {
+                    let result = if mode == 0 {
+                        agent.run(&mut session, input).await
+                    } else {
+                        agent
+                            .run_with_cancel(&mut session, input, CancellationToken::new())
+                            .await
+                    };
+                    assert!(
+                        result.is_err(),
+                        "occupied direct lease must still reject execution"
+                    );
+                    let users = session
+                        .messages
+                        .iter()
+                        .filter(|m| m.role == Role::User)
+                        .collect::<Vec<_>>();
+                    assert_eq!(users.len(), 1, "existing fresh append precedes rejection");
+                    assert_eq!(users[0].content, "fresh 原样\n\"input\"");
+                }
+                _ => {
+                    let mut rx = if mode == 2 {
+                        agent.run_stream(session, input)
+                    } else {
+                        agent.run_stream_cancellable(session, input).0
+                    };
+                    assert_eq!(
+                        converted.load(Ordering::SeqCst),
+                        1,
+                        "synchronous conversion cannot move behind spawn/lease"
+                    );
+                    let mut errors = 0;
+                    while let Some(event) = rx.recv().await {
+                        errors += usize::from(matches!(event, AgentEvent::Error { .. }));
+                        assert!(!matches!(event, AgentEvent::Complete { .. }));
+                    }
+                    assert_eq!(
+                        errors, 0,
+                        "original prelease failure closes the stream without an Error event"
+                    );
+                }
+            }
+            assert_eq!(converted.load(Ordering::SeqCst), 1);
+            assert!(provider.0.lock().unwrap().is_empty());
+            assert!(
+                take_inputs(&id).is_empty(),
+                "startup lease rejection drops the local observation before execution"
+            );
+            lease.abandon().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn constructor_parity_session_resume_and_execute_do_not_append_fresh_users() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let agent = agent(root.path(), provider.clone()).await;
+        for mode in 0..10 {
+            provider.0.lock().unwrap().clear();
+            let id = format!("constructor-sdk-session-only-{mode}");
+            watch_inputs(&id);
+            let mut session = Session::new(&id, "claude-test");
+            let historical = Message::user("original history, never new input");
+            let expected = serde_json::to_value(&historical).unwrap();
+            session.add_message(historical);
+            match mode {
+                0 => agent.run_session(&mut session).await.unwrap(),
+                1 => agent
+                    .run_session_with_cancel(&mut session, CancellationToken::new())
+                    .await
+                    .unwrap(),
+                2 => drain(agent.run_stream_session(session)).await,
+                3 => drain(agent.run_stream_session_cancellable(session).0).await,
+                4 => {
+                    drain(agent.run_stream_session_with_cancel(session, CancellationToken::new()))
+                        .await
+                }
+                5 => agent.resume(&mut session).await.unwrap(),
+                6 => agent
+                    .resume_with_cancel(&mut session, CancellationToken::new())
+                    .await
+                    .unwrap(),
+                7 => drain(agent.resume_stream(session)).await,
+                8 => drain(agent.resume_stream_cancellable(session).0).await,
+                _ => {
+                    let (tx, mut rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+                    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+                    agent
+                        .execute(
+                            &mut session,
+                            ExecuteRequestBuilder::new(
+                                "request text cannot append User",
+                                tx,
+                                CancellationToken::new(),
+                            )
+                            .model("claude-test")
+                            .build(),
+                        )
+                        .await
+                        .unwrap();
+                    drain.abort();
+                }
+            }
+            let persisted = agent.storage().load_session(&id).await.unwrap().unwrap();
+            let users = persisted
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .collect::<Vec<_>>();
+            assert_eq!(users.len(), 1);
+            assert_eq!(serde_json::to_value(users[0]).unwrap(), expected);
+            assert_eq!(
+                take_inputs(&id),
+                vec![None],
+                "all ten session/resume/custom execute paths default to absence"
+            );
+            let requests = provider.0.lock().unwrap();
+            assert!(!requests.is_empty());
+            let sent = requests[0]
+                .iter()
+                .filter(|m| m.role == Role::User && m.id == users[0].id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                sent.len(),
+                1,
+                "supplied historical User reaches provider once"
+            );
+            assert_eq!(serde_json::to_value(sent[0]).unwrap(), expected);
+        }
+    }
+
+    #[derive(Default)]
+    struct PendingProvider {
+        requests: Mutex<Vec<Vec<Message>>>,
+        started: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl LLMProvider for PendingProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            self.started.notify_one();
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+
+    #[tokio::test]
+    async fn constructor_parity_sdk_cancellation_keeps_the_consumed_fresh_user() {
+        for streaming in [false, true] {
+            // Real default assembly must not consume the execution/cancellation budget.
+            // The watchdog still covers fresh input, provider startup and durable oracles.
+            let root = tempfile::tempdir().unwrap();
+            let provider = Arc::new(PendingProvider::default());
+            let agent = agent(root.path(), provider.clone()).await;
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let id = format!("constructor-sdk-cancel-{streaming}");
+                watch_inputs(&id);
+                let mut session = Session::new(&id, "claude-test");
+                let converted = Arc::new(AtomicUsize::new(0));
+                let input = ObservedInput(converted.clone());
+                if streaming {
+                    let (mut rx, cancel) = agent.run_stream_cancellable(session, input);
+                    assert_eq!(converted.load(Ordering::SeqCst), 1);
+                    provider.started.notified().await;
+                    cancel.cancel();
+                    let (mut errors, mut complete, mut cancelled) = (0, 0, 0);
+                    while let Some(event) = rx.recv().await {
+                        errors += usize::from(matches!(event, AgentEvent::Error { .. }));
+                        complete += usize::from(matches!(event, AgentEvent::Complete { .. }));
+                        cancelled += usize::from(matches!(event, AgentEvent::Cancelled { .. }));
+                    }
+                    assert_eq!(
+                        (errors, complete, cancelled),
+                        (0, 0, 0),
+                        "original SDK cancellation closes the stream without a terminal event"
+                    );
+                } else {
+                    let cancel = CancellationToken::new();
+                    let stop = cancel.clone();
+                    let execution = agent.clone();
+                    let task = tokio::spawn(async move {
+                        execution.run_with_cancel(&mut session, input, cancel).await
+                    });
+                    provider.started.notified().await;
+                    stop.cancel();
+                    assert!(matches!(task.await.unwrap(), Err(AgentError::Cancelled)));
+                }
+                assert_eq!(converted.load(Ordering::SeqCst), 1);
+                let persisted = agent.storage().load_session(&id).await.unwrap().unwrap();
+                let users = persisted
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == Role::User)
+                    .collect::<Vec<_>>();
+                assert_eq!(users.len(), 1);
+                assert_eq!(users[0].content, "fresh 原样\n\"input\"");
+                assert_eq!(
+                    take_inputs(&id),
+                    vec![Some(vec![(users[0].id.clone(), None)])]
+                );
+                let requests = provider.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                let sent = requests[0]
+                    .iter()
+                    .filter(|m| m.role == Role::User && m.id == users[0].id)
+                    .collect::<Vec<_>>();
+                assert_eq!(sent.len(), 1);
+                assert_eq!(
+                    serde_json::to_value(users[0]).unwrap(),
+                    serde_json::to_value(sent[0]).unwrap()
+                );
+            })
+            .await
+            .expect("actual provider cancellation must terminate");
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_input_sdk_old_canonical_request_and_fragment_cannot_supply_current_data() {
+        let home = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let agent = agent(home.path(), provider).await;
+        let id = "execution-input-sdk-historical-canonical";
+        let mut session = Session::new(id, "claude-test");
+        let mut envelope =
+            bamboo_domain::SessionMessageEnvelope::user_input(id, "historical canonical input");
+        if let bamboo_domain::SessionMessageBody::Content(content) = &mut envelope.body {
+            content.skill_request = Some(bamboo_domain::SessionSkillRequest {
+                selections: vec![bamboo_domain::SessionSkillSelection {
+                    id: "old-selection".into(),
+                    source: "user".into(),
+                    revision: 8,
+                    args: serde_json::json!({"old":"data"}),
+                }],
+                mode: Some("old-mode".into()),
+            });
+        }
+        let old_id = envelope.id.to_string();
+        session.add_message(envelope.to_provider_message().unwrap());
+        session.metadata.insert(
+            "selected_skill_ids".into(),
+            "[\"configured-selection\"]".into(),
+        );
+        watch_inputs(id);
+        agent
+            .run(
+                &mut session,
+                "<skill_request>{\"id\":\"fragment\"}</skill_request>",
+            )
+            .await
+            .unwrap();
+        let fresh = session
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User && m.id != old_id)
+            .collect::<Vec<_>>();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(
+            take_inputs(id),
+            vec![Some(vec![(fresh[0].id.clone(), None)])],
+            "exact new User identity; no request from old proof/config/text"
+        );
+        watch_inputs(id);
+        agent.run_session(&mut session).await.unwrap();
+        assert_eq!(take_inputs(id), vec![None]);
     }
 }

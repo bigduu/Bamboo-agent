@@ -45,7 +45,12 @@ use bamboo_domain::{
 use dashmap::DashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-const AUTHORITATIVE_METADATA_KEYS: &[&str] = &["gold_config", "workflow.run_ids.v1"];
+const AUTHORITATIVE_METADATA_KEYS: &[&str] = &[
+    "gold_config",
+    "workflow.run_ids.v1",
+    "ticket.runtime.dispatch.v1",
+    "ticket.runtime.owned_stop.v1",
+];
 const ROOT_PROJECT_CONTEXT_KEYS: &[&str] = &[
     "workspace_source",
     "workspace_binding_status",
@@ -65,6 +70,7 @@ const RESPONSE_CONTROL_METADATA_KEYS: &[&str] = &[
     "retry_resume_pending",
     "retry_resume_reason",
     "provider_name",
+    "runtime.child_completion_source_v1",
 ];
 const TASK_CONTROL_PLANE_CONFLICT_PREFIX: &str = "Task control-plane changed while saving session ";
 const MAX_TASK_CONTROL_PLANE_REBASE_RETRIES: usize = 3;
@@ -73,13 +79,324 @@ const LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY: &str =
 const MANUAL_ARCHIVE_REJECTIONS_KEY: &str = "context_management.manual_archive_rejections.v1";
 const MAX_MANUAL_ARCHIVE_REJECTIONS: usize = 64;
 const RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
+const ACTOR_PARENT_QUESTION_HANDOFF_KEY: &str = "runtime.actor_parent_question_handoff";
+
+/// A worker clarification was already checkpointed by the Host while this
+/// runner still held an older in-memory Child snapshot. The Host checkpoint,
+/// and a direct-parent answer that may have followed it, own the transcript
+/// and question control plane. Reconcile under the same lock as the final save
+/// so an old runner cannot erase the question or undo a fast answer.
+fn adopt_durable_actor_parent_question_handoff(
+    session: &mut Session,
+    durable: &Session,
+) -> std::io::Result<()> {
+    if session
+        .metadata
+        .get(ACTOR_PARENT_QUESTION_HANDOFF_KEY)
+        .map(String::as_str)
+        != Some("true")
+    {
+        return Ok(());
+    }
+    let request = durable
+        .metadata
+        .get(bamboo_domain::PARENT_QUESTION_REQUEST_KEY)
+        .and_then(|value| serde_json::from_str::<bamboo_domain::ParentQuestion>(value).ok());
+    let pending_question = request.as_ref().is_some_and(|question| {
+        durable.pending_question.as_ref().is_some_and(|pending| {
+            pending.source == bamboo_domain::PendingQuestionSource::DirectParent
+                && pending.tool_call_id == question.tool_call_id
+        }) && durable
+            .metadata
+            .get("runtime.suspend_reason")
+            .is_some_and(|reason| reason == "awaiting_clarification")
+    });
+    let resolved_question = request.as_ref().is_some_and(|question| {
+        durable
+            .metadata
+            .get(bamboo_domain::PARENT_QUESTION_RESOLUTION_KEY)
+            .and_then(|value| {
+                serde_json::from_str::<bamboo_domain::ParentQuestionResolution>(value).ok()
+            })
+            .is_some_and(|resolution| resolution.request == *question)
+    });
+    if session.kind != bamboo_domain::SessionKind::Child
+        || session.id != durable.id
+        || session.created_at != durable.created_at
+        || session.parent_session_id != durable.parent_session_id
+        || session.root_session_id != durable.root_session_id
+        || session.spawn_depth != durable.spawn_depth
+        || session.project_id_meta() != durable.project_id_meta()
+        || !request.as_ref().is_some_and(|question| {
+            question.child.session_id == durable.id
+                && question.child.created_at == durable.created_at
+                && question.root_session_id == durable.root_session_id
+                && question.project_id == durable.project_id_meta()
+        })
+        || !(pending_question || resolved_question)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "canonical direct-parent question handoff is missing or changed",
+        ));
+    }
+
+    // A suspended question has no legitimate runner-only messages after its
+    // Host checkpoint. In particular, a terminal Worker text is not a new
+    // assistant reply. Durable ordering also includes any fast parent answer.
+    session.messages.clone_from(&durable.messages);
+    session
+        .provider_transcript
+        .clone_from(&durable.provider_transcript);
+    session
+        .pending_question
+        .clone_from(&durable.pending_question);
+    for key in RESPONSE_CONTROL_METADATA_KEYS.iter().copied().chain([
+        bamboo_domain::PARENT_QUESTION_REQUEST_KEY,
+        bamboo_domain::PARENT_QUESTION_RESOLUTION_KEY,
+    ]) {
+        match durable.metadata.get(key) {
+            Some(value) => {
+                session.metadata.insert(key.to_string(), value.clone());
+            }
+            None => {
+                session.metadata.remove(key);
+            }
+        }
+    }
+    session.model.clone_from(&durable.model);
+    session.model_ref.clone_from(&durable.model_ref);
+    session.reasoning_effort = durable.reasoning_effort;
+    session
+        .agent_runtime_state
+        .clone_from(&durable.agent_runtime_state);
+    session.updated_at = session.updated_at.max(durable.updated_at);
+    session.metadata.remove(ACTOR_PARENT_QUESTION_HANDOFF_KEY);
+    Ok(())
+}
 
 fn may_publish_runtime_result(result: &std::io::Result<()>) -> bool {
     !result.as_ref().err().is_some_and(|error| {
-        error
-            .get_ref()
-            .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+        error.get_ref().is_some_and(|cause| {
+            cause.is::<bamboo_domain::SessionAuthorityConflict>()
+                || cause.is::<crate::v2::DirectParentTerminalConflict>()
+                || cause.is::<crate::v2::DirectParentTerminalProofError>()
+        })
     })
+}
+
+fn is_direct_parent_terminal_conflict(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        && error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<crate::v2::DirectParentTerminalConflict>())
+}
+
+/// Ordinary runner writes do not author tagged tool waits. Their first arm is
+/// a runtime-only control-plane write; untagged safety-net waits remain owned
+/// by the runner. Adopt the latest wait under the same lock as this save,
+/// without reverting the new run's Initializing/Running status to Suspended.
+fn adopt_durable_tagged_child_wait(
+    session: &mut Session,
+    latest: &Session,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if session.id != latest.id || session.created_at != latest.created_at {
+        return None;
+    }
+    let incoming = session.agent_runtime_state.as_mut()?;
+    let wait = incoming.waiting_for_children.as_ref()?;
+    wait.registered_by_tool_call_id.as_ref()?;
+    let registered_at = wait.registered_at;
+    incoming.waiting_for_children = latest
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.waiting_for_children.clone());
+    if incoming.waiting_for_children.is_some() {
+        return None;
+    }
+    if session
+        .metadata
+        .get("runtime.suspend_reason")
+        .map(String::as_str)
+        == Some("waiting_for_children")
+    {
+        session.metadata.remove("runtime.suspend_reason");
+    }
+    if incoming
+        .suspension
+        .as_ref()
+        .is_some_and(|s| s.reason == "waiting_for_children")
+    {
+        incoming.suspension = None;
+        if incoming.status == bamboo_domain::AgentStatusState::Suspended {
+            incoming.status = bamboo_domain::AgentStatusState::Idle;
+        }
+    }
+    Some(registered_at)
+}
+
+/// A synchronous SubAgent tool has already persisted its tagged wait before
+/// launching the child. At runner finalization, the durable copy therefore
+/// owns later completion/rollback changes to that wait. Reconcile inside the
+/// same lock as the final save so completion cannot clear the wait between a
+/// read and a stale write. Untagged runner-created waits stay caller-owned:
+/// their first persistence attempt may have failed and this may be the retry.
+pub(crate) fn adopt_finalized_child_wait(
+    session: &mut Session,
+    latest: &Session,
+    inherited: bool,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let incoming = session.agent_runtime_state.as_mut()?;
+    if !inherited
+        && (session
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(String::as_str)
+            != Some("waiting_for_children")
+            || incoming
+                .waiting_for_children
+                .as_ref()
+                .is_none_or(|wait| wait.registered_by_tool_call_id.is_none()))
+    {
+        return None;
+    }
+    let durable = latest.agent_runtime_state.as_ref();
+    if !inherited && durable.is_none() {
+        return None;
+    }
+
+    let registered_at = incoming
+        .waiting_for_children
+        .as_ref()
+        .map(|wait| wait.registered_at);
+    incoming.waiting_for_children = durable.and_then(|state| state.waiting_for_children.clone());
+    let cleared = incoming.waiting_for_children.is_none();
+    let cleared_without_other_suspension =
+        cleared && !latest.metadata.contains_key("runtime.suspend_reason");
+    if cleared {
+        if let Some(durable) = durable {
+            incoming.status = durable.status;
+            incoming.suspension = durable.suspension.clone();
+        }
+        match latest.metadata.get("runtime.suspend_reason") {
+            Some(reason) => {
+                session
+                    .metadata
+                    .insert("runtime.suspend_reason".to_string(), reason.clone());
+            }
+            None => {
+                session.metadata.remove("runtime.suspend_reason");
+            }
+        }
+    }
+    // The child-session adapter still writes the legacy mirror when it arms
+    // a wait. Keep an existing mirror coherent with the reconciled typed
+    // state; do not create new mirrors for modern sessions.
+    if session.metadata.contains_key("agent.runtime.state") {
+        match serde_json::to_string(incoming) {
+            Ok(serialized) => {
+                session
+                    .metadata
+                    .insert("agent.runtime.state".to_string(), serialized);
+            }
+            Err(_) => {
+                session.metadata.remove("agent.runtime.state");
+            }
+        }
+    }
+    if cleared_without_other_suspension && session.last_run_status().as_deref() == Some("suspended")
+    {
+        session.set_last_run_status("completed");
+    }
+    if cleared {
+        registered_at
+    } else {
+        None
+    }
+}
+
+/// Intermediate persistence of a carried untagged wait owns neither its
+/// durable completion nor replacement. Only that exact captured wait is
+/// reconciled; a new wait armed by this run remains caller-owned.
+pub(crate) fn reconcile_inherited_child_wait(
+    session: &mut Session,
+    latest: &Session,
+    inherited: &bamboo_domain::InheritedChildWait,
+) -> std::io::Result<()> {
+    inherited.validate_session(session)?;
+    inherited.validate_session(latest)?;
+    let Some(incoming) = session.agent_runtime_state.as_mut() else {
+        return Ok(());
+    };
+    if incoming.waiting_for_children.as_ref() != Some(inherited.wait()) {
+        return Ok(());
+    }
+    incoming.waiting_for_children = latest
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.waiting_for_children.clone());
+    let cleared = incoming.waiting_for_children.is_none();
+    if cleared {
+        if session
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(String::as_str)
+            == Some("waiting_for_children")
+        {
+            session.metadata.remove("runtime.suspend_reason");
+        }
+        if incoming
+            .suspension
+            .as_ref()
+            .is_some_and(|s| s.reason == "waiting_for_children")
+        {
+            incoming.suspension = None;
+            if incoming.status == bamboo_domain::AgentStatusState::Suspended {
+                incoming.status = bamboo_domain::AgentStatusState::Idle;
+            }
+        }
+    }
+    // Preserve the legacy mirror only where an adapter already installed it.
+    if session.metadata.contains_key("agent.runtime.state") {
+        session.metadata.insert(
+            "agent.runtime.state".into(),
+            serde_json::to_string(incoming).map_err(std::io::Error::other)?,
+        );
+    }
+    if cleared {
+        preserve_finalized_hidden_child_resumes(session, latest, inherited.wait().registered_at);
+    }
+    Ok(())
+}
+
+fn preserve_finalized_hidden_child_resumes(
+    session: &mut Session,
+    latest: &Session,
+    registered_at: chrono::DateTime<chrono::Utc>,
+) {
+    let existing: std::collections::HashSet<_> = session
+        .messages
+        .iter()
+        .map(|message| message.id.as_str())
+        .collect();
+    let missing = latest
+        .messages
+        .iter()
+        .filter(|message| {
+            !existing.contains(message.id.as_str())
+                && message.created_at >= registered_at
+                && message
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("runtime_kind"))
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|kind| {
+                        matches!(kind, "child_completion_resume" | "guardian_review_resume")
+                    })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    session.messages.extend(missing);
 }
 
 /// A pending response is an authoritative compare-and-consume transaction.
@@ -238,6 +555,11 @@ fn unconditional_task_patch_would_regress(
 /// sessions proceed concurrently.
 pub struct LockedSessionStore {
     storage: Arc<dyn Storage>,
+    inherited_child_wait: Option<bamboo_domain::InheritedChildWait>,
+    root_actor_writer: Option<(
+        bamboo_domain::RootActorRuntimeWrite,
+        bamboo_domain::RootActorRuntimePublisher,
+    )>,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     /// Serializes recoverable child/root Task transactions. Per-session locks
     /// still provide the data isolation; this gate ensures a retained recovery
@@ -289,8 +611,79 @@ impl LockedSessionStore {
     pub fn new(storage: Arc<dyn Storage>) -> Self {
         Self {
             storage,
+            inherited_child_wait: None,
+            root_actor_writer: None,
             locks: Arc::new(DashMap::new()),
             task_pair_transaction_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Immutable per-execution binding; shares the existing process locks and
+    /// never changes the default writer's authority.
+    pub fn bind_root_actor_writer(
+        &self,
+        owner: bamboo_domain::RootActorRuntimeWrite,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> std::io::Result<Self> {
+        if !self.storage.supports_root_actor_runtime_write() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "storage does not support a Root Actor writer",
+            ));
+        }
+        Ok(Self {
+            storage: self.storage.clone(),
+            inherited_child_wait: self.inherited_child_wait.clone(),
+            root_actor_writer: Some((owner, publish)),
+            locks: self.locks.clone(),
+            task_pair_transaction_lock: self.task_pair_transaction_lock.clone(),
+        })
+    }
+
+    /// Keep the exact captured birth/wait in a private execution view, sharing
+    /// process serialization and any already-bound ordinary Root capability.
+    pub fn bind_inherited_child_wait(&self, inherited: bamboo_domain::InheritedChildWait) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            inherited_child_wait: Some(inherited),
+            root_actor_writer: self.root_actor_writer.clone(),
+            locks: self.locks.clone(),
+            task_pair_transaction_lock: self.task_pair_transaction_lock.clone(),
+        }
+    }
+
+    fn inherited_for_session(
+        &self,
+        session: &Session,
+    ) -> Option<&bamboo_domain::InheritedChildWait> {
+        self.inherited_child_wait
+            .as_ref()
+            .filter(|wait| wait.session_id() == session.id)
+    }
+
+    async fn save_runtime_snapshot(
+        &self,
+        session: &mut Session,
+        runtime_only: bool,
+    ) -> std::io::Result<()> {
+        if let Some(inherited) = self.inherited_for_session(session) {
+            self.storage
+                .save_runtime_with_inherited_child_wait(
+                    session,
+                    inherited,
+                    runtime_only,
+                    self.root_actor_writer.clone(),
+                    None,
+                )
+                .await
+        } else if let Some((owner, publish)) = self.root_actor_writer.as_ref() {
+            self.storage
+                .save_root_actor_runtime(owner, session, runtime_only, publish.clone())
+                .await
+        } else if runtime_only {
+            self.storage.save_runtime_state(session).await
+        } else {
+            self.storage.save_session(session).await
         }
     }
 
@@ -332,6 +725,22 @@ impl LockedSessionStore {
         guard
     }
 
+    /// Check a borrowed process-serialization owner without acquiring another lock.
+    /// Bound writer views share this lock map; independent stores do not. This
+    /// proves no durable writer fence, current caller or Skill/Source authority.
+    pub fn validate_lock(&self, owner: &SessionLockGuard, session_id: &str) -> std::io::Result<()> {
+        if owner.guard.is_none()
+            || owner.session_id != session_id
+            || !Arc::ptr_eq(&owner.locks, &self.locks)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Session persistence owner does not match this coordinator and session",
+            ));
+        }
+        Ok(())
+    }
+
     /// Save a full snapshot while preserving Task generations advanced by an
     /// independent store instance. V2 rejects such a stale write before any
     /// mutation; reloading and adopting only Task-owned fields makes the retry,
@@ -340,8 +749,53 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
     ) -> std::io::Result<()> {
+        self.save_session_rebasing_task_conflicts_with_input(session, None, None)
+            .await
+    }
+
+    async fn save_session_rebasing_task_conflicts_with_input(
+        &self,
+        session: &mut Session,
+        input: Option<&(
+            Arc<dyn bamboo_domain::SessionInboxPort>,
+            bamboo_domain::SessionInboxOwnedClaim,
+        )>,
+        inherited: Option<&bamboo_domain::session::runtime_state::WaitingForChildrenState>,
+    ) -> std::io::Result<()> {
         for attempt in 0..=MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
-            match self.storage.save_session(session).await {
+            if let Some(provenance) = self.inherited_for_session(session) {
+                provenance.validate_session(session)?;
+            }
+            let result = if inherited.is_none() && self.inherited_for_session(session).is_some() {
+                self.storage
+                    .save_runtime_with_inherited_child_wait(
+                        session,
+                        self.inherited_for_session(session)
+                            .expect("bound provenance"),
+                        false,
+                        self.root_actor_writer.clone(),
+                        input.cloned(),
+                    )
+                    .await
+            } else if let Some((inbox, claim)) = input {
+                let (owner, publish) = self.root_actor_writer.as_ref().ok_or_else(|| {
+                    std::io::Error::other("Root input checkpoint requires a bound writer")
+                })?;
+                self.storage
+                    .save_root_actor_input(owner, session, inbox.clone(), claim, publish.clone())
+                    .await
+            } else if let Some(inherited) = inherited {
+                self.storage
+                    .save_inherited_child_wait_finalized(
+                        session,
+                        inherited,
+                        self.root_actor_writer.clone(),
+                    )
+                    .await
+            } else {
+                self.save_runtime_snapshot(session, false).await
+            };
+            match result {
                 Ok(()) => return Ok(()),
                 Err(error)
                     if is_task_control_plane_save_conflict(&error)
@@ -376,7 +830,7 @@ impl LockedSessionStore {
         session: &mut Session,
     ) -> std::io::Result<()> {
         for attempt in 0..=MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
-            match self.storage.save_runtime_state(session).await {
+            match self.save_runtime_snapshot(session, true).await {
                 Ok(()) => return Ok(()),
                 Err(error)
                     if is_task_control_plane_save_conflict(&error)
@@ -425,6 +879,56 @@ impl LockedSessionStore {
         self.save_runtime_only_and_publish(session, |_| {}).await
     }
 
+    /// Commit an auto-run promise for the exact child generation the caller
+    /// prepared. The adapter uses this for launch paths (such as Plan) that
+    /// first saved a draft and only later chose to enqueue it. Read and write
+    /// the lightweight control plane under one per-session lock, so a stale
+    /// enqueue cannot give an older generation a new launch promise.
+    pub async fn ensure_child_auto_run_launch_intent(
+        &self,
+        expected: &Session,
+    ) -> std::io::Result<Option<Session>> {
+        let _guard = self.acquire_lock(&expected.id).await;
+        let Some(mut latest) = self
+            .storage
+            .load_runtime_control_plane(&expected.id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let generation = expected.child_launch_generation();
+        if latest.kind != bamboo_domain::SessionKind::Child
+            || latest.created_at != expected.created_at
+            || latest.parent_session_id != expected.parent_session_id
+            || latest.root_session_id != expected.root_session_id
+            || latest.child_launch_generation() != generation
+            || latest.is_child_launch_cancelled(generation)
+        {
+            return Ok(None);
+        }
+        if latest.last_run_status().as_deref() != Some("pending") {
+            // Keep the scheduler's existing AlreadyCommitted behavior for a
+            // duplicate delivery after this same promised run has started.
+            // Recovery itself still filters strictly to pending sessions.
+            let already_promised = latest
+                .runtime_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.child_auto_run_launch_intent_generation)
+                == Some(generation);
+            let already_started = matches!(
+                latest.last_run_status().as_deref(),
+                Some("running" | "completed" | "error" | "timeout" | "skipped" | "suspended")
+            );
+            return Ok((already_promised && already_started).then_some(latest));
+        }
+        if latest.recoverable_child_launch_generation() != Some(generation) {
+            latest.mark_child_auto_run_launch_intent();
+            self.save_runtime_state_rebasing_task_conflicts(&mut latest)
+                .await?;
+        }
+        Ok(Some(latest))
+    }
+
     /// Save the runtime control-plane and synchronously publish the committed
     /// snapshot before releasing this session's serialization lock.
     ///
@@ -439,6 +943,34 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
         publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        self.save_runtime_only_and_publish_inner(session, publish, true)
+            .await
+    }
+
+    /// Save a control-plane transition and publish it only after a successful
+    /// durable sidecar write. Callers that use the callback to release an Inbox
+    /// wait must not expose an uncommitted transition after a save error.
+    pub async fn save_runtime_only_and_publish_on_success<F>(
+        &self,
+        session: &mut Session,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        self.save_runtime_only_and_publish_inner(session, publish, false)
+            .await
+    }
+
+    async fn save_runtime_only_and_publish_inner<F>(
+        &self,
+        session: &mut Session,
+        publish: F,
+        publish_on_failure: bool,
     ) -> std::io::Result<()>
     where
         F: FnOnce(&Session) + Send,
@@ -458,10 +990,124 @@ impl LockedSessionStore {
         let result = self
             .save_runtime_state_rebasing_task_conflicts(session)
             .await;
-        if may_publish_runtime_result(&result) {
+        if result.is_ok() || (publish_on_failure && may_publish_runtime_result(&result)) {
             publish(session);
         }
         result
+    }
+
+    /// Forward child-wait mutations to the final physical writer. The local
+    /// lock orders this instance's callers; V2 owns cross-instance atomicity.
+    pub async fn register_child_wait_and_publish(
+        &self,
+        expected: &Session,
+        batch: &[(String, Option<String>)],
+        policy: bamboo_domain::ChildWaitPolicy,
+        check_terminal: bool,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> std::io::Result<(Session, usize)> {
+        let _guard = self.acquire_lock(&expected.id).await;
+        if self.storage.supports_atomic_child_wait_control_plane() {
+            return self
+                .storage
+                .register_child_wait_control_plane(expected, batch, policy, check_terminal, publish)
+                .await;
+        }
+        // Preserve legacy/custom backend support under this instance's existing
+        // serialization lock. Only capable backends claim physical atomicity.
+        use crate::v2::child_wait_control_plane::{
+            register_pending, terminal, validate_incarnation,
+        };
+        let mut latest = self
+            .storage
+            .load_session(&expected.id)
+            .await?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "child wait parent disappeared",
+                )
+            })?;
+        validate_incarnation(expected, &latest)?;
+        let mut pending = Vec::new();
+        let mut satisfied = false;
+        for entry in batch {
+            if !check_terminal {
+                pending.push(entry.clone());
+                continue;
+            }
+            let child = self.storage.load_runtime_control_plane(&entry.0).await?;
+            let status = child
+                .filter(|child| child.parent_session_id.as_deref() == Some(&expected.id))
+                .and_then(|child| child.last_run_status())
+                .filter(|status| terminal(status));
+            if let Some(status) = status {
+                satisfied |= policy == bamboo_domain::ChildWaitPolicy::Any
+                    || (policy == bamboo_domain::ChildWaitPolicy::FirstError
+                        && matches!(status.as_str(), "error" | "timeout" | "cancelled"));
+            } else {
+                pending.push(entry.clone());
+            }
+        }
+        if satisfied || pending.is_empty() {
+            publish(&latest);
+            return Ok((latest, 0));
+        }
+        let count = pending.len();
+        register_pending(&mut latest, pending, policy)?;
+        self.save_runtime_state_rebasing_task_conflicts(&mut latest)
+            .await?;
+        publish(&latest);
+        Ok((latest, count))
+    }
+
+    pub async fn compare_exchange_child_wait_and_publish(
+        &self,
+        expected: &Session,
+        updated: &mut Session,
+        runtime_only: bool,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> std::io::Result<bool> {
+        let _guard = self.acquire_lock(&expected.id).await;
+        if self.storage.supports_atomic_child_wait_control_plane() {
+            return self
+                .storage
+                .compare_exchange_child_wait_control_plane(expected, updated, runtime_only, publish)
+                .await;
+        }
+        use crate::v2::child_wait_control_plane::{
+            apply_transition, is_observation, runtime, validate_incarnation,
+        };
+        let mut latest = self
+            .storage
+            .load_session(&expected.id)
+            .await?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "child wait parent disappeared",
+                )
+            })?;
+        validate_incarnation(expected, &latest)?;
+        validate_incarnation(expected, updated)?;
+        if runtime(&latest).waiting_for_children != runtime(expected).waiting_for_children {
+            return Ok(false);
+        }
+        if is_observation(expected, updated) {
+            *updated = latest;
+            return Ok(true);
+        }
+        apply_transition(&mut latest, expected, updated, runtime_only)?;
+        if runtime_only {
+            self.save_runtime_state_rebasing_task_conflicts(&mut latest)
+                .await?;
+        } else {
+            self.save_session_rebasing_task_conflicts(&mut latest)
+                .await?;
+        }
+        publish(&latest);
+        *updated = latest;
+        Ok(true)
     }
 
     /// Atomically patch Task-owned control-plane fields and publish the saved
@@ -696,7 +1342,41 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
-        self.merge_save_runtime_inner_and_publish(session, true, publish)
+        self.merge_save_runtime_inner_and_publish(session, true, false, None, publish)
+            .await
+    }
+
+    /// Final runner save with a lock-scoped check for a synchronous child
+    /// completion that raced the pipeline's earlier wait-state read.
+    pub async fn merge_save_finalized_runtime(&self, session: &mut Session) -> std::io::Result<()> {
+        self.merge_save_finalized_runtime_and_publish(session, |_, _| {})
+            .await
+    }
+
+    /// Publish the reconciled final snapshot under the same serialization
+    /// lock, with the ordinary runtime save's cache-on-failure semantics.
+    pub async fn merge_save_finalized_runtime_and_publish<F>(
+        &self,
+        session: &mut Session,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
+        self.merge_save_runtime_inner_and_publish(session, true, true, None, publish)
+            .await
+    }
+
+    pub async fn merge_save_inherited_child_wait_and_publish<F>(
+        &self,
+        session: &mut Session,
+        inherited: &bamboo_domain::session::runtime_state::WaitingForChildrenState,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
+        self.merge_save_runtime_inner_and_publish(session, true, true, Some(inherited), publish)
             .await
     }
 
@@ -727,8 +1407,56 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
+        self.checkpoint_runtime_session_with_input(session, None, publish)
+            .await
+    }
+
+    pub async fn checkpoint_root_input(
+        &self,
+        session: &mut Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        claim: &bamboo_domain::SessionInboxOwnedClaim,
+    ) -> std::io::Result<()> {
+        self.checkpoint_runtime_session_with_input(session, Some((inbox, claim.clone())), |_, _| {})
+            .await
+    }
+
+    async fn checkpoint_runtime_session_with_input<F>(
+        &self,
+        session: &mut Session,
+        input: Option<(
+            Arc<dyn bamboo_domain::SessionInboxPort>,
+            bamboo_domain::SessionInboxOwnedClaim,
+        )>,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
         let _guard = self.acquire_lock(&session.id).await;
         let latest = self.storage.load_session(&session.id).await?;
+
+        // This context update belongs to the exact input, not the ordinary
+        // append-only runner snapshot. A durable typed turn is already proof
+        // of its first checkpoint: reconciling its lost ACK must not replay an
+        // old prompt over a subsequent committed prompt.
+        let input_prompt = match input.as_ref() {
+            Some((_, claim))
+                if !latest.as_ref().is_some_and(|durable| {
+                    durable.messages.iter().any(|message| {
+                        bamboo_domain::is_matching_session_message(message, &claim.claim.envelope)
+                    })
+                }) =>
+            {
+                claim
+                    .claim
+                    .envelope
+                    .root_chat_prompt()
+                    .map_err(std::io::Error::other)?
+                    .map(str::to_owned)
+            }
+            _ => None,
+        };
 
         if let Some(latest) = latest.as_ref() {
             ensure_model_context_checkpoint_is_current(session, latest)?;
@@ -748,9 +1476,54 @@ impl LockedSessionStore {
             );
             apply_authoritative_metadata(session, latest);
             adopt_fresher_disk_permission_posture(session, latest);
+            let _ = adopt_durable_tagged_child_wait(session, latest);
         }
 
-        let result = self.save_session_rebasing_task_conflicts(session).await;
+        if let Some(prompt) = input_prompt.as_deref() {
+            session
+                .messages
+                .retain(|message| message.role != bamboo_domain::Role::System);
+            session
+                .messages
+                .insert(0, bamboo_domain::Message::system(prompt));
+        }
+        let mut result = self
+            .save_session_rebasing_task_conflicts_with_input(session, input.as_ref(), None)
+            .await;
+        for _ in 0..MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
+            if !result
+                .as_ref()
+                .err()
+                .is_some_and(is_direct_parent_terminal_conflict)
+            {
+                break;
+            }
+            // A second Store can commit the terminal after the first load but
+            // before V2 acquires its cross-process file lock. Rebase this
+            // checkpoint against that durable suffix, then let V2 validate the
+            // retry under the lock again.
+            let Some(durable) = self.storage.load_session(&session.id).await? else {
+                break;
+            };
+            ensure_model_context_checkpoint_is_current(session, &durable)?;
+            bamboo_domain::append_missing_runtime_messages(session, &durable);
+            bamboo_domain::merge_session_inbox_admission(session, &durable);
+            adopt_durable_consumed_clarification(session, &durable);
+            apply_authoritative_metadata(session, &durable);
+            adopt_fresher_disk_permission_posture(session, &durable);
+            let _ = adopt_durable_tagged_child_wait(session, &durable);
+            if let Some(prompt) = input_prompt.as_deref() {
+                session
+                    .messages
+                    .retain(|message| message.role != bamboo_domain::Role::System);
+                session
+                    .messages
+                    .insert(0, bamboo_domain::Message::system(prompt));
+            }
+            result = self
+                .save_session_rebasing_task_conflicts_with_input(session, input.as_ref(), None)
+                .await;
+        }
         if may_publish_runtime_result(&result) {
             publish(session, result.is_ok());
         }
@@ -914,7 +1687,7 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
     ) -> std::io::Result<()> {
-        self.merge_save_runtime_inner_and_publish(session, false, |_, _| {})
+        self.merge_save_runtime_inner_and_publish(session, false, false, None, |_, _| {})
             .await
     }
 
@@ -922,6 +1695,8 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
         adopt_bypass: bool,
+        finalize_child_wait: bool,
+        inherited: Option<&bamboo_domain::session::runtime_state::WaitingForChildrenState>,
         publish: F,
     ) -> std::io::Result<()>
     where
@@ -964,6 +1739,15 @@ impl LockedSessionStore {
         }
 
         if let Some(latest) = latest.as_ref() {
+            adopt_durable_actor_parent_question_handoff(session, latest)?;
+            if finalize_child_wait {
+                if let Some(registered_at) = adopt_finalized_child_wait(session, latest, false) {
+                    preserve_finalized_hidden_child_resumes(session, latest, registered_at);
+                }
+            }
+            if let Some(registered_at) = adopt_durable_tagged_child_wait(session, latest) {
+                preserve_finalized_hidden_child_resumes(session, latest, registered_at);
+            }
             adopt_durable_consumed_clarification(session, latest);
             apply_authoritative_metadata(session, latest);
             let restored = bamboo_domain::restore_missing_admitted_inbox_messages(session, latest);
@@ -984,7 +1768,9 @@ impl LockedSessionStore {
             }
             adopt_fresher_durable_model_context_state(session, latest);
         }
-        let result = self.save_session_rebasing_task_conflicts(session).await;
+        let result = self
+            .save_session_rebasing_task_conflicts_with_input(session, None, inherited)
+            .await;
         if may_publish_runtime_result(&result) {
             publish(session, result.is_ok());
         }
@@ -1018,6 +1804,27 @@ impl LockedSessionStore {
             })?;
 
         if let Some(latest) = self.storage.load_session(&session.id).await? {
+            // A warm worker constructs a fresh in-memory Session for each RunSpec.
+            // Preserve the durable Child birth only after the new activation has
+            // matched the immutable identity and Project under this write lock.
+            if session.kind == bamboo_domain::SessionKind::Child {
+                if latest.kind != bamboo_domain::SessionKind::Child
+                    || latest.id != session.id
+                    || latest.root_session_id != session.root_session_id
+                    || latest.parent_session_id != session.parent_session_id
+                    || latest.spawn_depth != session.spawn_depth
+                    || latest.project_id_meta() != session.project_id_meta()
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        bamboo_domain::SessionAuthorityConflict(
+                            "warm Child activation disagrees with durable creation identity or Project"
+                                .to_string(),
+                        ),
+                    ));
+                }
+                session.created_at = latest.created_at;
+            }
             apply_authoritative_metadata(session, &latest);
             bamboo_domain::restore_missing_admitted_inbox_messages(session, &latest);
             bamboo_domain::merge_session_inbox_admission(session, &latest);
@@ -1338,8 +2145,32 @@ impl LockedSessionStore {
 /// not define a separate adapter layer for the same behavior.
 #[async_trait::async_trait]
 impl RuntimeSessionPersistence for LockedSessionStore {
+    fn inherited_child_wait(&self) -> Option<bamboo_domain::InheritedChildWait> {
+        self.inherited_child_wait.clone()
+    }
+
+    fn bind_inherited_child_wait(
+        &self,
+        inherited: bamboo_domain::InheritedChildWait,
+    ) -> std::io::Result<Arc<dyn RuntimeSessionPersistence>> {
+        Ok(Arc::new(self.bind_inherited_child_wait(inherited)))
+    }
+
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         self.merge_save_runtime(session).await
+    }
+
+    async fn save_finalized_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.merge_save_finalized_runtime(session).await
+    }
+
+    async fn save_finalized_runtime_with_inherited_child_wait(
+        &self,
+        session: &mut Session,
+        inherited: &bamboo_domain::session::runtime_state::WaitingForChildrenState,
+    ) -> std::io::Result<()> {
+        self.merge_save_inherited_child_wait_and_publish(session, inherited, |_, _| {})
+            .await
     }
 
     async fn seed_runtime_activation(&self, session: &mut Session) -> std::io::Result<()> {
@@ -2135,6 +2966,55 @@ fn adopt_fresher_disk_permission_posture(session: &mut Session, latest: &Session
 /// disk copy (e.g. [`LockedSessionStore::merge_save_runtime`]) don't pay for a
 /// second read.
 fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
+    if session.kind == bamboo_domain::SessionKind::Child
+        && latest.kind == bamboo_domain::SessionKind::Child
+        && session.created_at == latest.created_at
+    {
+        // A runner's earlier snapshot must not erase a parent's durable
+        // cancellation fence during a later transcript checkpoint.
+        let latest_launch = latest
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_launch_generation);
+        let incoming_launch = session
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_launch_generation);
+        if latest_launch > incoming_launch {
+            session
+                .runtime_metadata
+                .get_or_insert_with(Default::default)
+                .child_launch_generation = latest_launch;
+        }
+        let latest_cancelled = latest
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_cancelled_generation);
+        let incoming_cancelled = session
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_cancelled_generation);
+        if latest_cancelled > incoming_cancelled {
+            session
+                .runtime_metadata
+                .get_or_insert_with(Default::default)
+                .child_cancelled_generation = latest_cancelled;
+        }
+        let latest_intent = latest
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_auto_run_launch_intent_generation);
+        let incoming_intent = session
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_auto_run_launch_intent_generation);
+        if latest_intent > incoming_intent {
+            session
+                .runtime_metadata
+                .get_or_insert_with(Default::default)
+                .child_auto_run_launch_intent_generation = latest_intent;
+        }
+    }
     // Identity is independent of the UI metadata revision. Preserve it in the
     // caller snapshot too, so a successful merge-save cannot downgrade the cache.
     // Never replace an explicit Supervisor incarnation: the final storage guard
@@ -2143,6 +3023,15 @@ fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
     // is not a snapshot of the current Root and must not be rebound to it.
     if session.authority_identity.is_ordinary() && session.created_at == latest.created_at {
         session.authority_identity = latest.authority_identity.clone();
+    }
+    if session.kind == bamboo_domain::SessionKind::Root
+        && latest.kind == bamboo_domain::SessionKind::Root
+    {
+        // Runtime writes own transcript/runtime changes, never Root mode
+        // authority. Adopt the coherent durable tuple, including a recovery
+        // epoch that changed no tool policy. Invalid birth/revision pairs stay
+        // untouched so the final V2 writer rejects them instead of rebinding.
+        let _ = session.adopt_root_tool_authority_from(latest);
     }
     // Relationships are a separate monotonic authority, independent of UI
     // metadata. Adopt the canonical state into the actual caller snapshot only
@@ -2258,6 +3147,7 @@ mod tests {
 
     struct AuthoritySavePauseStorage {
         inner: Arc<SessionStoreV2>,
+        calls: std::sync::atomic::AtomicUsize,
         reached: tokio::sync::Barrier,
         release: tokio::sync::Barrier,
     }
@@ -2353,6 +3243,7 @@ mod tests {
             current.set_project_id_meta("project-b");
             let paused = Arc::new(AuthoritySavePauseStorage {
                 inner: first.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
                 reached: tokio::sync::Barrier::new(2),
                 release: tokio::sync::Barrier::new(2),
             });
@@ -2406,14 +3297,94 @@ mod tests {
             self.inner.delete_session(id).await
         }
         async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             self.reached.wait().await;
             self.release.wait().await;
             self.inner.save_session(session).await
         }
         async fn save_runtime_state(&self, session: &Session) -> std::io::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             self.reached.wait().await;
             self.release.wait().await;
             self.inner.save_runtime_state(session).await
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_claim_after_merge_read_rejects_once_without_cache_publication() {
+        use bamboo_domain::{ActorActivationClaim, ActorDirectoryPort};
+        for runtime_only in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let first = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+            let mut stale = Session::new("actor-cache-race", "model");
+            stale.add_message(bamboo_domain::Message::user("durable"));
+            first.save_session(&stale).await.unwrap();
+            let second = SessionStoreV2::new(home.path().into()).await.unwrap();
+            let paused = Arc::new(AuthoritySavePauseStorage {
+                inner: first.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                reached: tokio::sync::Barrier::new(2),
+                release: tokio::sync::Barrier::new(2),
+            });
+            let locked = LockedSessionStore::new(paused.clone());
+            let id = stale.id.clone();
+            let cached = Arc::new(std::sync::Mutex::new(stale.clone()));
+            let publications = std::sync::atomic::AtomicUsize::new(0);
+            stale.conversation_summary =
+                Some(bamboo_domain::ConversationSummary::new("reject", 1, 1));
+            let save = async {
+                if runtime_only {
+                    locked
+                        .save_runtime_only_and_publish(&mut stale, |saved| {
+                            publications.fetch_add(1, Ordering::SeqCst);
+                            *cached.lock().unwrap() = saved.clone();
+                        })
+                        .await
+                } else {
+                    locked
+                        .merge_save_runtime_and_publish(&mut stale, |saved, _| {
+                            publications.fetch_add(1, Ordering::SeqCst);
+                            *cached.lock().unwrap() = saved.clone();
+                        })
+                        .await
+                }
+            };
+            let activate = async {
+                paused.reached.wait().await;
+                let now = chrono::Utc::now();
+                second
+                    .claim_activation(&ActorActivationClaim {
+                        actor_id: id.clone(),
+                        run_id: "claim".into(),
+                        lease_owner: "owner".into(),
+                        lease_expires_at: now + chrono::Duration::minutes(5),
+                        inbox_generation: 0,
+                        placement_ref: None,
+                        now,
+                    })
+                    .await
+                    .unwrap();
+                paused.release.wait().await;
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(save, activate)
+            })
+            .await
+            .expect("real final save/activation race terminates");
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            assert!(!is_task_control_plane_save_conflict(&error));
+            assert!(!may_publish_runtime_result(&Err(error)));
+            assert_eq!(paused.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(publications.load(Ordering::SeqCst), 0);
+            assert!(cached.lock().unwrap().conversation_summary.is_none());
+            assert!(first
+                .load_session(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .conversation_summary
+                .is_none());
         }
     }
 
@@ -2430,6 +3401,7 @@ mod tests {
             let second = SessionStoreV2::new(temp.path().into()).await.unwrap();
             let paused = Arc::new(AuthoritySavePauseStorage {
                 inner: first.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
                 reached: tokio::sync::Barrier::new(2),
                 release: tokio::sync::Barrier::new(2),
             });
@@ -2477,6 +3449,7 @@ mod tests {
             let second = SessionStoreV2::new(temp.path().into()).await.unwrap();
             let paused = Arc::new(AuthoritySavePauseStorage {
                 inner: first.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
                 reached: tokio::sync::Barrier::new(2),
                 release: tokio::sync::Barrier::new(2),
             });
@@ -3867,6 +4840,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actor_parent_question_handoff_adopts_canonical_question_and_discards_terminal_text() {
+        use bamboo_domain::{
+            FunctionCall, Message, ParentQuestion, PendingQuestionSource, ToolCall,
+            PARENT_QUESTION_REQUEST_KEY,
+        };
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let parent = fresh("question-handoff-parent");
+        storage.save_session(&parent).await.unwrap();
+        let mut child = Session::new_child_of("question-handoff-child", &parent, "model", "child");
+        child.add_message(Message::user("assignment"));
+        storage.save_session(&child).await.unwrap();
+        let mut old_run = child.clone();
+        old_run
+            .metadata
+            .insert(ACTOR_PARENT_QUESTION_HANDOFF_KEY.into(), "true".into());
+        old_run.set_last_run_status("suspended");
+        old_run.add_message(Message::assistant("old terminal text", None));
+
+        child.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "ask-call".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "AskUserQuestion".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+        ));
+        child.add_message(Message::tool_result_with_status(
+            "ask-call",
+            "Clarification needed: Choose?",
+            true,
+        ));
+        child.set_pending_question_with_source(
+            "ask-call".into(),
+            "AskUserQuestion".into(),
+            "Choose?".into(),
+            vec!["A".into(), "B".into()],
+            true,
+            PendingQuestionSource::DirectParent,
+        );
+        child.metadata.insert(
+            "runtime.suspend_reason".into(),
+            "awaiting_clarification".into(),
+        );
+        let question = ParentQuestion::issue_at(&parent, &child, chrono::Utc::now()).unwrap();
+        child.metadata.insert(
+            PARENT_QUESTION_REQUEST_KEY.into(),
+            serde_json::to_string(&question).unwrap(),
+        );
+        storage.save_session(&child).await.unwrap();
+
+        store.merge_save_runtime(&mut old_run).await.unwrap();
+        let saved = storage.load_session(&child.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved.messages).unwrap(),
+            serde_json::to_value(&child.messages).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&saved.pending_question).unwrap(),
+            serde_json::to_value(&child.pending_question).unwrap()
+        );
+        assert_eq!(
+            saved.metadata.get(PARENT_QUESTION_REQUEST_KEY),
+            child.metadata.get(PARENT_QUESTION_REQUEST_KEY)
+        );
+        assert_eq!(saved.last_run_status().as_deref(), Some("suspended"));
+        assert!(!saved
+            .metadata
+            .contains_key(ACTOR_PARENT_QUESTION_HANDOFF_KEY));
+    }
+
+    #[tokio::test]
+    async fn actor_parent_question_handoff_cannot_undo_fast_parent_answer() {
+        use bamboo_domain::{
+            FunctionCall, Message, ParentQuestion, ParentQuestionResolution, PendingQuestionSource,
+            ToolCall, PARENT_QUESTION_REQUEST_KEY, PARENT_QUESTION_RESOLUTION_KEY,
+        };
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let parent = fresh("answered-handoff-parent");
+        storage.save_session(&parent).await.unwrap();
+        let mut child = Session::new_child_of("answered-handoff-child", &parent, "model", "child");
+        child.add_message(Message::user("assignment"));
+        storage.save_session(&child).await.unwrap();
+        let mut old_run = child.clone();
+        old_run
+            .metadata
+            .insert(ACTOR_PARENT_QUESTION_HANDOFF_KEY.into(), "true".into());
+        old_run.set_last_run_status("suspended");
+
+        child.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "ask-call".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "AskUserQuestion".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+        ));
+        child.add_message(Message::tool_result_with_status(
+            "ask-call",
+            "Clarification needed: Choose?",
+            true,
+        ));
+        child.set_pending_question_with_source(
+            "ask-call".into(),
+            "AskUserQuestion".into(),
+            "Choose?".into(),
+            vec!["A".into(), "B".into()],
+            true,
+            PendingQuestionSource::DirectParent,
+        );
+        child.metadata.insert(
+            "runtime.suspend_reason".into(),
+            "awaiting_clarification".into(),
+        );
+        let issued_at = chrono::Utc::now();
+        let question = ParentQuestion::issue_at(&parent, &child, issued_at).unwrap();
+        child.metadata.insert(
+            PARENT_QUESTION_REQUEST_KEY.into(),
+            serde_json::to_string(&question).unwrap(),
+        );
+        storage.save_session(&child).await.unwrap();
+
+        let mut answered = child;
+        answered.clear_pending_question();
+        answered.metadata.remove("runtime.suspend_reason");
+        let paired = answered
+            .messages
+            .iter_mut()
+            .find(|message| message.id == question.tool_result_message_id)
+            .unwrap();
+        paired.content = "A".into();
+        paired.tool_success = Some(true);
+        let resolution = ParentQuestionResolution::answered(
+            &question,
+            issued_at + chrono::Duration::milliseconds(1),
+            "A",
+        )
+        .unwrap();
+        answered.metadata.insert(
+            PARENT_QUESTION_RESOLUTION_KEY.into(),
+            serde_json::to_string(&resolution).unwrap(),
+        );
+        let source_key = "runtime.child_completion_source_v1";
+        // Storage preserves opaque source bytes; only the engine validates them.
+        answered
+            .metadata
+            .insert(source_key.into(), "new-run-terminal-source".into());
+        storage.save_session(&answered).await.unwrap();
+
+        store.merge_save_runtime(&mut old_run).await.unwrap();
+        let saved = storage.load_session(&answered.id).await.unwrap().unwrap();
+        assert_eq!(
+            saved.metadata.get(source_key),
+            answered.metadata.get(source_key),
+            "an old question handoff must preserve the source of the adopted canonical transcript"
+        );
+        assert!(saved.pending_question.is_none());
+        assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
+        assert_eq!(
+            saved.metadata.get(PARENT_QUESTION_RESOLUTION_KEY),
+            answered.metadata.get(PARENT_QUESTION_RESOLUTION_KEY)
+        );
+        assert_eq!(
+            serde_json::to_value(&saved.messages).unwrap(),
+            serde_json::to_value(&answered.messages).unwrap()
+        );
+        assert_eq!(saved.last_run_status().as_deref(), Some("suspended"));
+        assert!(!saved
+            .metadata
+            .contains_key(ACTOR_PARENT_QUESTION_HANDOFF_KEY));
+    }
+
+    #[tokio::test]
     async fn runtime_checkpoint_cannot_resurrect_a_consumed_clarification() {
         use bamboo_domain::session::types::Message;
 
@@ -4205,6 +5360,192 @@ mod tests {
         assert_eq!(runner_snapshot.messages[2].id, saved.messages[2].id);
         assert_eq!(saved.messages[1].content, "concurrent injected message");
         assert_eq!(saved.messages[2].content, "partial runner output");
+    }
+
+    fn direct_parent_proof_pair(
+        parent: &Session,
+    ) -> (
+        bamboo_domain::SessionMessageEnvelope,
+        bamboo_domain::SessionMessageEnvelope,
+    ) {
+        use bamboo_domain::{
+            ParentRequest, ParentRequestActivation, ParentRequestActor, ParentRequestDelegation,
+            ParentRequestKind, ParentRequestOption, ParentResolution, SessionMessageBody,
+            SessionMessageContent, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
+            SessionMessageSource, SessionProviderMessage, SessionRuntimeInstruction,
+            PARENT_REQUEST_VERSION,
+        };
+        use serde_json::json;
+
+        let generation = uuid::Uuid::new_v4().to_string();
+        let child_birth = parent.created_at + chrono::Duration::milliseconds(1);
+        let created_at = child_birth;
+        let deadline = created_at + chrono::Duration::seconds(120);
+        let activation = ParentRequestActivation {
+            host_scope: uuid::Uuid::new_v4().to_string(),
+            attempt: 1,
+            run: "run-1".into(),
+            epoch: 1,
+            reply: "reply-1".into(),
+        };
+        let request_id = SessionMessageId::stable(
+            "direct-parent-forced-approval-v1",
+            &json!({
+                "child": "approval-child",
+                "birth": child_birth,
+                "parent": parent.id,
+                "parent_birth": parent.created_at,
+                "generation": generation,
+            }),
+        );
+        let typed = ParentRequest {
+            version: PARENT_REQUEST_VERSION,
+            id: request_id.clone(),
+            generation: generation.clone(),
+            child: ParentRequestActor {
+                session_id: "approval-child".into(),
+                created_at: child_birth,
+            },
+            parent: ParentRequestActor {
+                session_id: parent.id.clone(),
+                created_at: parent.created_at,
+            },
+            root_session_id: parent.root_session_id.clone(),
+            project_id: parent.project_id_meta(),
+            activation: activation.clone(),
+            deadline,
+            kind: ParentRequestKind::ForcedPermission {
+                operation_digest: format!("stable-{}", "a".repeat(64)),
+                policy_revision: 1,
+                maximum_delegation: ParentRequestDelegation::ExactOperationOnce,
+                options: vec![ParentRequestOption::Deny, ParentRequestOption::ApproveOnce],
+            },
+        };
+        let live = json!({
+            "host_scope": activation.host_scope,
+            "attempt": activation.attempt,
+            "run": activation.run,
+            "epoch": activation.epoch,
+            "reply": activation.reply,
+            "deadline": deadline,
+        });
+        let request_text = "Parent permission request";
+        let request = SessionMessageEnvelope {
+            id: request_id.clone(),
+            source: SessionMessageSource::Runtime {
+                subsystem: "direct_parent_permission_review".into(),
+            },
+            target_session_id: parent.id.clone(),
+            kind: SessionMessageKind::RuntimeInstruction,
+            body: SessionMessageBody::RuntimeInstruction(SessionRuntimeInstruction {
+                instruction: "direct_parent_forced_permission_request_v1".into(),
+                content: Some(SessionMessageContent::text(request_text)),
+                data: Some(json!({
+                    "parent_request": typed,
+                    "parent_created_at": parent.created_at,
+                    "child_session_id": "approval-child",
+                    "child_created_at": child_birth,
+                    "root_session_id": parent.root_session_id,
+                    "project_id": parent.project_id_meta(),
+                    "request_generation": generation,
+                    "operation_digest": format!("stable-{}", "a".repeat(64)),
+                    "policy_revision": 1,
+                    "live": live,
+                })),
+                provider_message: Some(SessionProviderMessage {
+                    content: SessionMessageContent::text(request_text),
+                    metadata: Default::default(),
+                    never_compress: true,
+                }),
+            }),
+            created_at,
+            thread_id: None,
+            in_reply_to: None,
+            attempt: None,
+            correlation_id: None,
+        };
+        assert!(ParentRequest::from_forced_permission_envelope(&request).is_some());
+        let resolved_at = created_at + chrono::Duration::seconds(1);
+        let resolution = ParentResolution::for_forced_permission(&typed, resolved_at, false);
+        let terminal_text =
+            "Live parent permission review recorded Denied. This record is not a permission grant.";
+        let mut terminal = request.clone();
+        terminal.id = resolution.id.clone();
+        terminal.created_at = resolved_at;
+        terminal.in_reply_to = Some(request_id.clone());
+        terminal.body = SessionMessageBody::RuntimeInstruction(SessionRuntimeInstruction {
+            instruction: "direct_parent_forced_permission_terminal_v1".into(),
+            content: Some(SessionMessageContent::text(terminal_text)),
+            data: Some(json!({
+                "request": request_id,
+                "live": live,
+                "approved": false,
+                "parent_resolution": resolution,
+            })),
+            provider_message: Some(SessionProviderMessage {
+                content: SessionMessageContent::text(terminal_text),
+                metadata: Default::default(),
+                never_compress: true,
+            }),
+        });
+        assert!(ParentResolution::from_forced_permission_terminal(&request, &terminal).is_some());
+        (request, terminal)
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rebases_direct_parent_terminal_committed_by_another_store() {
+        let home = tempfile::tempdir().unwrap();
+        let first = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+        let mut parent = fresh("direct-parent-terminal-race");
+        let (request, terminal) = direct_parent_proof_pair(&parent);
+        parent.add_message(request.to_provider_message().unwrap());
+        first.save_session(&parent).await.unwrap();
+        let second = SessionStoreV2::new(home.path().into()).await.unwrap();
+
+        let paused = Arc::new(AuthoritySavePauseStorage {
+            inner: first.clone(),
+            calls: AtomicUsize::new(0),
+            reached: tokio::sync::Barrier::new(2),
+            release: tokio::sync::Barrier::new(2),
+        });
+        let checkpoint_store = LockedSessionStore::new(paused.clone());
+        let mut stale = parent.clone();
+        stale.add_message(bamboo_domain::Message::assistant("runner output", None));
+        let checkpoint = tokio::spawn(async move {
+            checkpoint_store
+                .checkpoint_runtime_session(&mut stale)
+                .await?;
+            Ok::<_, std::io::Error>(stale)
+        });
+
+        // The first Store has already loaded the pending request and is now
+        // paused before its V2 file lock. Commit the decision through a second
+        // Store, whose in-memory session lock is independent.
+        paused.reached.wait().await;
+        let mut decided = second.load_session(&parent.id).await.unwrap().unwrap();
+        decided.add_message(terminal.to_provider_message().unwrap());
+        second.save_session(&decided).await.unwrap();
+
+        let stale_write = first.save_session(&parent).await.unwrap_err();
+        assert!(is_direct_parent_terminal_conflict(&stale_write));
+        assert!(!may_publish_runtime_result(&Err(stale_write)));
+        let mut forged = decided.clone();
+        forged.messages.last_mut().unwrap().content = "forged decision".into();
+        let forged_write = second.save_session(&forged).await.unwrap_err();
+        assert_eq!(forged_write.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!may_publish_runtime_result(&Err(forged_write)));
+
+        paused.release.wait().await;
+        paused.reached.wait().await;
+        paused.release.wait().await;
+        let reconciled = checkpoint.await.unwrap().unwrap();
+        let saved = second.load_session(&parent.id).await.unwrap().unwrap();
+        assert_eq!(paused.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(saved.messages.len(), 3);
+        assert_eq!(saved.messages[0].id, request.id.as_str());
+        assert_eq!(saved.messages[1].id, terminal.id.as_str());
+        assert_eq!(saved.messages[2].content, "runner output");
+        assert_eq!(reconciled.messages[1].id, terminal.id.as_str());
     }
 
     #[tokio::test]
@@ -4948,6 +6289,369 @@ mod tests {
         assert_eq!(state.status, AgentStatusState::Idle);
         assert!(state.waiting_for_children.is_some());
         assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_and_checkpoint_tagged_wait_adoption_preserves_current_run_and_clear_winner() {
+        use bamboo_domain::session::runtime_state::SuspensionState;
+        use bamboo_domain::session::types::Message;
+        use bamboo_domain::{
+            AgentRuntimeState, AgentStatusState, ChildWaitPolicy, WaitingForChildrenState,
+        };
+
+        for checkpoint in [false, true] {
+            for status in [AgentStatusState::Initializing, AgentStatusState::Running] {
+                for current_wait in 0..3 {
+                    let (_temp, storage) = make_storage().await;
+                    let store = LockedSessionStore::new(storage.clone());
+                    let mut parent = fresh("mid-run-tagged-wait");
+                    let mut wait = WaitingForChildrenState::for_children(
+                        vec!["child-b".into(), "child-a".into()],
+                        ChildWaitPolicy::Any,
+                        chrono::Utc::now() - chrono::Duration::minutes(5),
+                    );
+                    wait.registered_by_tool_call_id = Some("original-call".into());
+                    let mut previous = AgentRuntimeState::new("old-run");
+                    previous.status = AgentStatusState::Suspended;
+                    previous.waiting_for_children = Some(wait.clone());
+                    parent.agent_runtime_state = Some(previous);
+                    parent.add_message(Message::user("original task"));
+                    storage.save_session(&parent).await.unwrap();
+                    let mut incoming = parent.clone();
+                    let runtime = incoming.agent_runtime_state.as_mut().unwrap();
+                    runtime.run_id = "reasoning-run".into();
+                    runtime.status = status;
+                    incoming.metadata.remove("runtime.suspend_reason");
+                    incoming.add_message(Message::user("new admitted reasoning"));
+                    let expected = match current_wait {
+                        0 => Some(wait),
+                        1 => None,
+                        _ => {
+                            let mut new_wait = wait;
+                            new_wait.wait_for = ChildWaitPolicy::FirstError;
+                            new_wait.registered_by_tool_call_id = Some("new-tool-call".into());
+                            Some(new_wait)
+                        }
+                    };
+                    let current = expected.clone();
+                    store
+                        .update_runtime_config(&parent.id, move |latest| {
+                            let runtime = latest.agent_runtime_state.as_mut().unwrap();
+                            runtime.waiting_for_children = current;
+                            if runtime.waiting_for_children.is_none() {
+                                runtime.status = AgentStatusState::Idle;
+                                runtime.suspension = None;
+                                latest.metadata.remove("runtime.suspend_reason");
+                            }
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if expected.is_none() {
+                        let mut completed =
+                            storage.load_session(&parent.id).await.unwrap().unwrap();
+                        for (content, created_at) in [
+                            (
+                                "old consumed outcome",
+                                chrono::Utc::now() - chrono::Duration::hours(1),
+                            ),
+                            ("current completed outcome", chrono::Utc::now()),
+                        ] {
+                            let mut message = Message::user(content);
+                            message.created_at = created_at;
+                            message.metadata =
+                                Some(serde_json::json!({"runtime_kind":"child_completion_resume"}));
+                            completed.add_message(message);
+                        }
+                        store.merge_save_runtime(&mut completed).await.unwrap();
+                    }
+                    if checkpoint {
+                        store
+                            .checkpoint_runtime_session(&mut incoming)
+                            .await
+                            .unwrap();
+                    } else {
+                        store.merge_save_runtime(&mut incoming).await.unwrap();
+                    }
+                    for saved in [
+                        incoming.clone(),
+                        storage.load_session(&parent.id).await.unwrap().unwrap(),
+                    ] {
+                        let runtime = saved.agent_runtime_state.unwrap();
+                        assert_eq!(runtime.waiting_for_children, expected);
+                        assert_eq!(runtime.status, status);
+                        assert_eq!(runtime.run_id, "reasoning-run");
+                        assert!(runtime.suspension.is_none());
+                        assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
+                        assert_eq!(
+                            saved
+                                .messages
+                                .iter()
+                                .filter(|m| m.content == "new admitted reasoning")
+                                .count(),
+                            1
+                        );
+                        assert!(saved.messages.iter().any(|m| m.content == "original task"));
+                        if expected.is_none() {
+                            assert_eq!(
+                                saved
+                                    .messages
+                                    .iter()
+                                    .filter(|m| m.content == "current completed outcome")
+                                    .count(),
+                                1
+                            );
+                            assert_eq!(
+                                saved
+                                    .messages
+                                    .iter()
+                                    .any(|m| m.content == "old consumed outcome"),
+                                checkpoint
+                            );
+                        }
+                    }
+
+                    if expected.is_none() {
+                        incoming.agent_runtime_state.as_mut().unwrap().status =
+                            AgentStatusState::Completed;
+                        store
+                            .merge_save_finalized_runtime(&mut incoming)
+                            .await
+                            .unwrap();
+                        let finalized = storage.load_session(&parent.id).await.unwrap().unwrap();
+                        assert!(finalized
+                            .agent_runtime_state
+                            .as_ref()
+                            .unwrap()
+                            .waiting_for_children
+                            .is_none());
+                        assert_eq!(
+                            finalized
+                                .messages
+                                .iter()
+                                .filter(|m| m.content == "current completed outcome")
+                                .count(),
+                            1
+                        );
+                    }
+
+                    // A separate current suspension is not owned by wait adoption.
+                    if expected.is_none() {
+                        let mut unrelated = parent;
+                        let runtime = unrelated.agent_runtime_state.as_mut().unwrap();
+                        runtime.status = AgentStatusState::Suspended;
+                        runtime.suspension = Some(SuspensionState {
+                            reason: "awaiting_clarification".into(),
+                            suspended_at: chrono::Utc::now(),
+                            resumable: true,
+                            hook_point: Some("AfterToolExecution".into()),
+                        });
+                        let suspension = runtime.suspension.clone();
+                        unrelated.metadata.insert(
+                            "runtime.suspend_reason".into(),
+                            "awaiting_clarification".into(),
+                        );
+                        store
+                            .checkpoint_runtime_session(&mut unrelated)
+                            .await
+                            .unwrap();
+                        let runtime = unrelated.agent_runtime_state.as_ref().unwrap();
+                        assert!(runtime.waiting_for_children.is_none());
+                        assert_eq!(runtime.status, AgentStatusState::Suspended);
+                        assert_eq!(runtime.suspension, suspension);
+                        assert_eq!(
+                            unrelated
+                                .metadata
+                                .get("runtime.suspend_reason")
+                                .map(String::as_str),
+                            Some("awaiting_clarification")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tagged_control_plane_first_arm_and_untagged_runner_first_save_remain_owned() {
+        use bamboo_domain::{AgentRuntimeState, ChildWaitPolicy, WaitingForChildrenState};
+        for tagged in [true, false] {
+            let (_temp, storage) = make_storage().await;
+            let store = LockedSessionStore::new(storage.clone());
+            let mut parent = fresh("first-wait-publication");
+            parent.agent_runtime_state = Some(AgentRuntimeState::new("parent-run"));
+            storage.save_session(&parent).await.unwrap();
+            let mut wait = WaitingForChildrenState::for_children(
+                vec!["new-child".into()],
+                ChildWaitPolicy::All,
+                chrono::Utc::now(),
+            );
+            if tagged {
+                wait.registered_by_tool_call_id = Some("first-arm-call".into());
+            }
+            parent
+                .agent_runtime_state
+                .as_mut()
+                .unwrap()
+                .waiting_for_children = Some(wait.clone());
+            if tagged {
+                // The real ChildSessionAdapter authors tools through this API.
+                store.save_runtime_only(&mut parent).await.unwrap();
+            } else {
+                store.merge_save_runtime(&mut parent).await.unwrap();
+            }
+            let saved = storage.load_session(&parent.id).await.unwrap().unwrap();
+            assert_eq!(
+                saved
+                    .agent_runtime_state
+                    .as_ref()
+                    .unwrap()
+                    .waiting_for_children
+                    .as_ref(),
+                Some(&wait)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn finalized_save_adopts_child_completion_after_pipeline_wait_read() {
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState,
+            WaitingForChildrenState,
+        };
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let mut parent = fresh("finalize-fast-child");
+        let mut runtime = AgentRuntimeState::new("parent-run");
+        runtime.status = AgentStatusState::Suspended;
+        runtime.suspension = Some(SuspensionState {
+            reason: "waiting_for_children".to_string(),
+            suspended_at: chrono::Utc::now(),
+            resumable: true,
+            hook_point: Some("AfterToolExecution".to_string()),
+        });
+        let mut wait = WaitingForChildrenState::for_children(
+            vec!["fast-child".to_string()],
+            ChildWaitPolicy::All,
+            chrono::Utc::now(),
+        );
+        wait.registered_by_tool_call_id = Some("spawn-call".to_string());
+        let registered_at = wait.registered_at;
+        runtime.waiting_for_children = Some(wait);
+        parent.agent_runtime_state = Some(runtime);
+        parent.metadata.insert(
+            "agent.runtime.state".to_string(),
+            serde_json::to_string(parent.agent_runtime_state.as_ref().unwrap()).unwrap(),
+        );
+        parent.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+        parent.set_last_run_status("suspended");
+        storage.save_session(&parent).await.unwrap();
+
+        // The pipeline already read this snapshot. Completion then commits
+        // before the runner's final merge-save reaches the per-session lock.
+        let mut stale_runner = parent.clone();
+        let mut completed = parent;
+        let completed_runtime = completed.agent_runtime_state.as_mut().unwrap();
+        completed_runtime.waiting_for_children = None;
+        completed_runtime.status = AgentStatusState::Idle;
+        completed_runtime.suspension = None;
+        completed.metadata.remove("runtime.suspend_reason");
+        let mut old_resume = Message::user("old consumed child outcome");
+        old_resume.created_at = registered_at - chrono::Duration::seconds(1);
+        old_resume.metadata = Some(serde_json::json!({
+            "runtime_kind": "child_completion_resume"
+        }));
+        completed.add_message(old_resume);
+        let mut outcome = Message::user("fast child outcome");
+        outcome.metadata = Some(serde_json::json!({
+            "runtime_kind": "child_completion_resume"
+        }));
+        completed.add_message(outcome);
+        storage.save_session(&completed).await.unwrap();
+
+        RuntimeSessionPersistence::save_finalized_runtime_session(&store, &mut stale_runner)
+            .await
+            .unwrap();
+        let saved = storage
+            .load_session("finalize-fast-child")
+            .await
+            .unwrap()
+            .unwrap();
+        let state = saved.agent_runtime_state.as_ref().unwrap();
+        assert!(state.waiting_for_children.is_none());
+        assert!(state.suspension.is_none());
+        assert_eq!(state.status, AgentStatusState::Idle);
+        assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
+        assert_eq!(saved.last_run_status().as_deref(), Some("completed"));
+        let mirrored: AgentRuntimeState =
+            serde_json::from_str(saved.metadata.get("agent.runtime.state").unwrap()).unwrap();
+        assert!(mirrored.waiting_for_children.is_none());
+        assert_eq!(mirrored.status, AgentStatusState::Idle);
+        assert!(saved
+            .messages
+            .iter()
+            .any(|message| message.content == "fast child outcome"));
+        assert!(!saved
+            .messages
+            .iter()
+            .any(|message| message.content == "old consumed child outcome"));
+    }
+
+    #[tokio::test]
+    async fn finalized_save_retains_unpersisted_untagged_safety_net_wait() {
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, AgentStatusState, ChildWaitPolicy, WaitingForChildrenState,
+        };
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let mut parent = fresh("finalize-safety-net");
+        parent.agent_runtime_state = Some(AgentRuntimeState::new("parent-run"));
+        storage.save_session(&parent).await.unwrap();
+
+        // A runner-created safety-net wait may reach finalization after its
+        // first persistence attempt failed. There is no durable clear to adopt.
+        let mut runner = parent;
+        let runtime = runner.agent_runtime_state.as_mut().unwrap();
+        runtime.status = AgentStatusState::Suspended;
+        runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
+            vec!["active-child".to_string()],
+            ChildWaitPolicy::All,
+            chrono::Utc::now(),
+        ));
+        runner.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+        runner.set_last_run_status("suspended");
+
+        RuntimeSessionPersistence::save_finalized_runtime_session(&store, &mut runner)
+            .await
+            .unwrap();
+        let saved = storage
+            .load_session("finalize-safety-net")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(saved
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .waiting_for_children
+            .is_some());
+        assert_eq!(
+            saved
+                .metadata
+                .get("runtime.suspend_reason")
+                .map(String::as_str),
+            Some("waiting_for_children")
+        );
+        assert_eq!(saved.last_run_status().as_deref(), Some("suspended"));
     }
 
     #[tokio::test]
@@ -6475,6 +8179,52 @@ mod tests {
     }
 
     // ── Self-cleaning per-session lock (issue #346) ─────────────────
+
+    #[tokio::test]
+    async fn validate_lock_requires_active_same_session_same_map_and_accepts_bound_view() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let independent = LockedSessionStore::new(storage);
+        let owner = store.acquire_lock("owned").await;
+        assert!(store.validate_lock(&owner, "owned").is_ok());
+        assert!(store.validate_lock(&owner, "other").is_err());
+        assert!(independent.validate_lock(&owner, "owned").is_err());
+        let mut session = fresh("owned");
+        let mut runtime = bamboo_domain::AgentRuntimeState::new("owned");
+        runtime.waiting_for_children = Some(bamboo_domain::WaitingForChildrenState::for_children(
+            vec!["child".into()],
+            Default::default(),
+            chrono::Utc::now(),
+        ));
+        session.agent_runtime_state = Some(runtime);
+        let bound = store.bind_inherited_child_wait(
+            bamboo_domain::InheritedChildWait::capture(&session).unwrap(),
+        );
+        assert!(bound.validate_lock(&owner, "owned").is_ok());
+        let inactive = SessionLockGuard {
+            guard: None,
+            locks: store.locks.clone(),
+            session_id: "owned".into(),
+        };
+        assert!(store.validate_lock(&inactive, "owned").is_err());
+        drop(inactive);
+        let mut waiter = Box::pin(bound.acquire_lock("owned"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiter)
+                .await
+                .is_err()
+        );
+        drop(waiter);
+        drop(owner);
+        assert_eq!(store.locks.len(), 0);
+        let successor = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            bound.acquire_lock("owned"),
+        )
+        .await
+        .unwrap();
+        assert!(store.validate_lock(&successor, "owned").is_ok());
+    }
 
     #[tokio::test]
     async fn acquire_lock_self_evicts_when_no_other_holder() {

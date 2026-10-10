@@ -124,6 +124,21 @@ pub async fn restart(
     }
 }
 
+pub async fn continue_completed_prefix(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+) -> HttpResponse {
+    let (session_id, run_id) = path.into_inner();
+    match state
+        .workflow_runs
+        .continue_completed_prefix_for_session(&session_id, &run_id)
+        .await
+    {
+        Ok(snapshot) => HttpResponse::Accepted().json(public_workflow_snapshot(snapshot)),
+        Err(error) => workflow_error(error),
+    }
+}
+
 fn workflow_error(error: WorkflowRunError) -> HttpResponse {
     match error {
         WorkflowRunError::NotFound => HttpResponse::NotFound().json(serde_json::json!({
@@ -153,6 +168,10 @@ fn workflow_error(error: WorkflowRunError) -> HttpResponse {
         WorkflowRunError::InvalidInput(_) => HttpResponse::BadRequest().json(serde_json::json!({
             "error": crate::error::error_value("workflow input is invalid")
         })),
+        WorkflowRunError::UnsupportedMonetaryBudget => HttpResponse::BadRequest().json(serde_json::json!({
+            "error": crate::error::error_value("named agents without monetary measurement do not support a finite monetary budget"),
+            "code": "workflow_monetary_budget_unsupported",
+        })),
         WorkflowRunError::Preflight(_) => HttpResponse::BadRequest().json(serde_json::json!({
             "error": crate::error::error_value("workflow preflight failed")
         })),
@@ -170,6 +189,20 @@ fn recovery_run_id_from_storage_details(details: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[actix_web::test]
+    async fn unmetered_agent_monetary_budget_has_safe_explicit_error() {
+        let response = workflow_error(WorkflowRunError::UnsupportedMonetaryBudget);
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "workflow_monetary_budget_unsupported");
+        assert!(body
+            .to_string()
+            .contains("do not support a finite monetary budget"));
+    }
 
     #[test]
     fn start_request_rejects_spoofed_trust_and_capabilities() {

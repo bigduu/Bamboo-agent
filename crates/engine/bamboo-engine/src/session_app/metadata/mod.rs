@@ -15,7 +15,8 @@
 //!    setters that would be a no-op).
 //! 5. Mutate the field, bump `title_version` (for title) and always bump
 //!    `metadata_version`, set `updated_at`.
-//! 6. Plain `storage.save_session(&session)` — no merge needed because we
+//! 6. `storage.save_manual_title(&session)` for manual titles; other setters
+//!    use `storage.save_session(&session)` — no merge needed because we
 //!    loaded the latest copy inside the lock and no other writer for this
 //!    session could have interleaved.
 //! 7. Refresh the in-memory cache (`state.sessions`).
@@ -102,21 +103,42 @@ impl SessionMetadataService {
         let mut session = load_latest(state, session_id).await?;
         ensure_if_match(&session, if_match)?;
         if session.title == trimmed && session.title_generated {
+            state
+                .persistence()
+                .storage()
+                .validate_title_observations(&session)
+                .await
+                .map_err(|e| MetadataError::Storage(format!("validate title: {e}")))?;
             return Ok(None);
         }
 
         session.title = trimmed.to_string();
         session.title_generated = true;
-        session.title_version = session.title_version.saturating_add(1);
-        session.metadata_version = session.metadata_version.saturating_add(1);
+        session.title_version = session
+            .title_version
+            .checked_add(1)
+            .ok_or_else(|| MetadataError::Storage("title version overflow".into()))?;
+        session.metadata_version = session
+            .metadata_version
+            .checked_add(1)
+            .ok_or_else(|| MetadataError::Storage("metadata version overflow".into()))?;
         session.updated_at = Utc::now();
 
         state
             .persistence()
             .storage()
-            .save_session(&session)
+            .save_manual_title(&session)
             .await
-            .map_err(|e| MetadataError::Storage(format!("save_session: {e}")))?;
+            .map_err(|e| MetadataError::Storage(format!("save_manual_title: {e}")))?;
+        // Confirm the backend's committed observations before reporting
+        // success, including compatibility backends that delegate this port
+        // to their generic full writer.
+        state
+            .persistence()
+            .storage()
+            .validate_title_observations(&session)
+            .await
+            .map_err(|e| MetadataError::Storage(format!("validate title: {e}")))?;
         refresh_in_memory_cache(state, session_id, session.clone()).await;
 
         let event = AgentEvent::SessionTitleUpdated {

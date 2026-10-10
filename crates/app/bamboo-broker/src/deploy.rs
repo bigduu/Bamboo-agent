@@ -164,6 +164,15 @@ impl DeployedAgent {
         }
     }
 
+    /// Observe whether a process-backed worker has exited without waiting for
+    /// it. In-process remote handles have no process status through this API.
+    pub fn process_exited(&mut self) -> std::io::Result<Option<bool>> {
+        match &mut self.inner {
+            DeployedInner::Process { child, .. } => Ok(Some(child.try_wait()?.is_some())),
+            DeployedInner::Remote(_) => Ok(None),
+        }
+    }
+
     /// Stop the deployment: SIGTERM the launched process / remote worker, then
     /// run cleanup if any. Uses [`DEFAULT_GRACEFUL_STOP_TIMEOUT`] as the grace
     /// window before falling back to a hard kill; see
@@ -223,6 +232,27 @@ impl DeployedAgent {
             DeployedInner::Remote(h) => h.shutdown_with_timeout(timeout).await,
         }
     }
+}
+
+async fn feed_spec_to_process(handle: &mut DeployedAgent, spec_json: &str) -> BrokerResult<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let DeployedInner::Process { child, .. } = &mut handle.inner else {
+        return Err(BrokerError::Transport(
+            "deployed worker has no process stdin".into(),
+        ));
+    };
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        BrokerError::Transport("deployed worker spec stdin is unavailable".into())
+    })?;
+    stdin
+        .write_all(spec_json.as_bytes())
+        .await
+        .map_err(|error| BrokerError::Transport(format!("write spec to stdin: {error}")))?;
+    stdin
+        .shutdown()
+        .await
+        .map_err(|error| BrokerError::Transport(format!("close worker stdin: {error}")))
 }
 
 /// Send SIGTERM to `pid` by shelling out to `kill -TERM` — deliberately NOT
@@ -325,22 +355,16 @@ impl Deployer for LocalProcessDeployer {
                 }
             }
         }
-        let mut child = cmd.spawn().map_err(spawn_err)?;
+        let child = cmd.spawn().map_err(spawn_err)?;
+        let mut handle = DeployedAgent::from_parts(d.id.clone(), child, None);
         // Feed the spec, then close stdin so the worker reads to EOF.
         if let Some(spec_json) = &d.spec_json {
-            use tokio::io::AsyncWriteExt;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(spec_json.as_bytes())
-                    .await
-                    .map_err(|e| BrokerError::Transport(format!("write spec to stdin: {e}")))?;
-                stdin
-                    .shutdown()
-                    .await
-                    .map_err(|e| BrokerError::Transport(format!("close worker stdin: {e}")))?;
+            if let Err(error) = feed_spec_to_process(&mut handle, spec_json).await {
+                handle.shutdown_with_timeout(Duration::ZERO).await;
+                return Err(error);
             }
         }
-        Ok(DeployedAgent::from_parts(d.id.clone(), child, None))
+        Ok(handle)
     }
 
     async fn tail_log(&self, log_path: &str, lines: usize) -> BrokerResult<String> {
@@ -489,23 +513,8 @@ impl Deployer for DockerDeployer {
         if d.spec_json.is_some() {
             cmd.stdin(std::process::Stdio::piped());
         }
-        let mut child = cmd.spawn().map_err(spawn_err)?;
-        // Feed the spec, then close stdin so the worker reads to EOF (same
-        // handshake as `LocalProcessDeployer`).
-        if let Some(spec_json) = &d.spec_json {
-            use tokio::io::AsyncWriteExt;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(spec_json.as_bytes())
-                    .await
-                    .map_err(|e| BrokerError::Transport(format!("write spec to stdin: {e}")))?;
-                stdin
-                    .shutdown()
-                    .await
-                    .map_err(|e| BrokerError::Transport(format!("close worker stdin: {e}")))?;
-            }
-        }
-        Ok(DeployedAgent::from_parts(
+        let child = cmd.spawn().map_err(spawn_err)?;
+        let mut handle = DeployedAgent::from_parts(
             d.id.clone(),
             child,
             Some(vec![
@@ -514,7 +523,16 @@ impl Deployer for DockerDeployer {
                 "-f".into(),
                 container,
             ]),
-        ))
+        );
+        // Feed the spec, then close stdin so the worker reads to EOF (same
+        // handshake as `LocalProcessDeployer`).
+        if let Some(spec_json) = &d.spec_json {
+            if let Err(error) = feed_spec_to_process(&mut handle, spec_json).await {
+                handle.shutdown_with_timeout(Duration::ZERO).await;
+                return Err(error);
+            }
+        }
+        Ok(handle)
     }
 }
 
@@ -883,6 +901,39 @@ pub(crate) fn broker_scheme(endpoint: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_spec_write_failure_removes_spawned_container() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let docker = home.path().join("fake-docker");
+        let marker = home.path().join("container-running");
+        let cleaned = home.path().join("cleanup-called");
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = rm ]; then\n  rm -f {marker}\n  touch {cleaned}\n  exit 0\nfi\ntouch {marker}\nexec 0<&-\nexec sleep 60\n",
+                marker = sh_quote(&marker.to_string_lossy()),
+                cleaned = sh_quote(&cleaned.to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut deployment = dep();
+        deployment.spec_json = Some("x".repeat(8 * 1024 * 1024));
+        let mut deployer = DockerDeployer::new("fake-image");
+        deployer.docker_bin = docker.to_string_lossy().into_owned();
+
+        let result = deployer.deploy(&deployment).await;
+        assert!(result.is_err(), "closed stdin must fail spec publication");
+        assert!(cleaned.exists(), "spawned Docker worker must run cleanup");
+        assert!(
+            !marker.exists(),
+            "failed deployment must leave no container"
+        );
+    }
+
     fn dep() -> AgentDeployment {
         AgentDeployment {
             id: "w1".into(),
@@ -1231,9 +1282,11 @@ mod tests {
                 .as_nanos()
         ));
         let _ = std::fs::remove_file(&marker);
+        let cleanup_marker = marker.with_extension("cleanup");
+        let _ = std::fs::remove_file(&cleanup_marker);
 
-        // A fake "docker" that just `cat`s its stdin to the marker file,
-        // ignoring all the run/--rm/etc. argv (it never touches a real image).
+        // Fake "docker run" copies stdin without touching an image.
+        // Fake "docker rm" records cleanup separately from the spec.
         let fake_docker = std::env::temp_dir().join(format!(
             "bamboo_fake_docker_{}_{:?}.sh",
             std::process::id(),
@@ -1244,7 +1297,11 @@ mod tests {
         ));
         std::fs::write(
             &fake_docker,
-            format!("#!/bin/sh\ncat > {}\n", marker.display()),
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = rm ]; then\n  printf '%s\\n' \"$@\" >> {}\n  exit 0\nfi\ncat > {}\n",
+                sh_quote(&cleanup_marker.to_string_lossy()),
+                sh_quote(&marker.to_string_lossy()),
+            ),
         )
         .unwrap();
         #[cfg(unix)]
@@ -1258,31 +1315,30 @@ mod tests {
         let mut deployer = DockerDeployer::new("img");
         deployer.docker_bin = fake_docker.to_string_lossy().into_owned();
 
-        let agent = deployer.deploy(&d).await.expect("fake docker deploy");
-        // The fake "docker" is `cat`, which finishes writing the marker once
-        // stdin (closed by `deploy()` right after writing the spec) hits EOF.
-        // Poll the marker's CONTENT rather than the child's liveness: an
-        // unreaped exited child still answers `kill -0` (zombie) until
-        // something calls `wait()` on it, which would race this assertion. We
-        // deliberately never call `shutdown()` here — it would re-invoke the
-        // same fake binary as a `rm -f` cleanup command and clobber the marker
-        // with an empty write.
+        let mut agent = deployer.deploy(&d).await.expect("fake docker deploy");
+        // `cat` publishes the exact spec and exits only after stdin reaches EOF.
+        // Wait on the owned child so a delayed poll still observes completion.
+        // The fake rm records cleanup separately, preserving the published spec.
         let expected = r#"{"version":1,"secret":"do-not-mount-whole-home"}"#;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut written = String::new();
-        while std::time::Instant::now() < deadline {
-            if let Ok(s) = std::fs::read_to_string(&marker) {
-                if s == expected {
-                    written = s;
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let DeployedInner::Process { child, .. } = &mut agent.inner else {
+            panic!("fake docker deployment must own a child process");
+        };
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("fake docker did not finish within five seconds")
+            .expect("wait for fake docker process");
+        assert!(status.success(), "fake docker failed: {status}");
+        agent.shutdown_with_timeout(Duration::ZERO).await;
+        let written = std::fs::read_to_string(&marker).expect("read completed fake docker spec");
         assert_eq!(written, expected, "fake docker never wrote the piped spec");
+        assert_eq!(
+            std::fs::read_to_string(&cleanup_marker).expect("read fake docker cleanup receipt"),
+            format!("rm\n-f\nbamboo-agent-{}\n", d.id),
+            "cleanup must run once without overwriting the spec"
+        );
 
         let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&cleanup_marker);
         let _ = std::fs::remove_file(&fake_docker);
-        drop(agent);
     }
 }

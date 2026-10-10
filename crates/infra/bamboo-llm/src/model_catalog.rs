@@ -1,6 +1,7 @@
 //! Aggregates model lists from all configured providers into a unified [`ProviderCatalog`].
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bamboo_domain::provider_catalog::{
     ModelCapabilities, ModelSource, ProviderCatalog, ProviderDescriptor, ProviderModelDescriptor,
@@ -19,40 +20,63 @@ impl ModelCatalogService {
         Self { registry }
     }
 
-    /// Build a full catalog by querying every provider for its model list.
+    /// Runtime candidates come only from admission configuration. Upstream
+    /// metadata enriches these IDs within a bounded best-effort lookup; a
+    /// failed lookup never removes an admitted custom model.
     pub async fn get_catalog(&self) -> ProviderCatalog {
         let mut providers = Vec::new();
         let mut models = Vec::new();
-
-        for meta in self.registry.provider_metadata() {
+        let mut metadata = self.registry.provider_metadata();
+        metadata.sort_by(|left, right| left.id.cmp(&right.id));
+        let lookups = metadata.into_iter().map(|meta| {
+            let (provider, admitted) = self.registry.runtime_provider_snapshot(&meta.id);
+            async move {
+                let info = match provider.as_ref().filter(|_| !admitted.is_empty()) {
+                    Some(provider) => {
+                        tokio::time::timeout(Duration::from_secs(3), provider.list_model_info())
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .unwrap_or_default()
+                    }
+                    None => Vec::new(),
+                };
+                (meta, provider, admitted, info)
+            }
+        });
+        for (meta, provider, admitted, info) in futures::future::join_all(lookups).await {
+            let authenticated = provider.is_some();
             providers.push(ProviderDescriptor {
                 id: meta.id.clone(),
                 display_name: meta.display_name.clone(),
                 enabled: true,
-                authenticated: self.registry.get(&meta.id).is_some(),
+                authenticated,
             });
 
-            if let Some(provider) = self.registry.get(&meta.id) {
-                match provider.list_model_info().await {
-                    Ok(info_list) => {
-                        for info in info_list {
-                            models.push(ProviderModelDescriptor {
-                                reference: ProviderModelRef::new(&meta.id, &info.id),
-                                display_name: info.id.clone(),
-                                provider_display_name: meta.display_name.clone(),
-                                capabilities: ModelCapabilities {
-                                    max_context_tokens: info.max_context_tokens,
-                                    max_output_tokens: info.max_output_tokens,
-                                    ..ModelCapabilities::default()
-                                },
-                                source: Some(ModelSource::Upstream),
-                                discovered_at: None,
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(provider = &meta.id, error = %e, "Failed to list models");
-                    }
+            if authenticated {
+                let info: std::collections::HashMap<_, _> = info
+                    .into_iter()
+                    .map(|info| (info.id.clone(), info))
+                    .collect();
+                for id in admitted {
+                    let upstream = info.get(&id);
+                    models.push(ProviderModelDescriptor {
+                        reference: ProviderModelRef::new(&meta.id, &id),
+                        display_name: id.clone(),
+                        provider_display_name: meta.display_name.clone(),
+                        capabilities: ModelCapabilities {
+                            supports_vision: provider.as_ref().unwrap().supports_vision(&id).await,
+                            max_context_tokens: upstream.and_then(|info| info.max_context_tokens),
+                            max_output_tokens: upstream.and_then(|info| info.max_output_tokens),
+                            ..ModelCapabilities::default()
+                        },
+                        source: Some(if upstream.is_some() {
+                            ModelSource::Upstream
+                        } else {
+                            ModelSource::Manual
+                        }),
+                        discovered_at: None,
+                    });
                 }
             }
         }
@@ -64,7 +88,8 @@ impl ModelCatalogService {
         }
     }
 
-    /// List models for a single provider.
+    /// Discover upstream models for selection in settings. Discovery never
+    /// mutates the admitted runtime list.
     pub async fn list_models_for_provider(
         &self,
         provider_name: &str,
@@ -84,21 +109,23 @@ impl ModelCatalogService {
             .await
             .map_err(|e| e.to_string())?;
 
-        Ok(info_list
-            .into_iter()
-            .map(|info| ProviderModelDescriptor {
+        let mut models = Vec::new();
+        for info in info_list {
+            models.push(ProviderModelDescriptor {
                 reference: ProviderModelRef::new(provider_name, &info.id),
                 display_name: info.id.clone(),
                 provider_display_name: provider_display_name.clone(),
                 capabilities: ModelCapabilities {
+                    supports_vision: provider.supports_vision(&info.id).await,
                     max_context_tokens: info.max_context_tokens,
                     max_output_tokens: info.max_output_tokens,
                     ..ModelCapabilities::default()
                 },
                 source: Some(ModelSource::Upstream),
                 discovered_at: None,
-            })
-            .collect())
+            });
+        }
+        Ok(models)
     }
 
     /// Fetch model lists from all registered providers.
@@ -209,13 +236,20 @@ mod tests {
         default: &str,
     ) -> Arc<ProviderRegistry> {
         let mut map = HashMap::new();
+        let mut admitted = HashMap::new();
         for (name, models) in providers {
+            admitted.insert(
+                name.to_string(),
+                models.iter().map(|model| model.id.clone()).collect(),
+            );
             map.insert(
                 name.to_string(),
                 Arc::new(MockProvider { models }) as Arc<dyn LLMProvider>,
             );
         }
-        Arc::new(ProviderRegistry::new(map, default.to_string()))
+        let registry = Arc::new(ProviderRegistry::new(map, default.to_string()));
+        registry.set_runtime_models(admitted);
+        registry
     }
 
     // ---- display_name_for_provider ----
@@ -315,17 +349,11 @@ mod tests {
             "copilot",
         );
         let service = ModelCatalogService::new(registry);
-        let catalog = service.get_catalog().await;
+        let models = service.get_catalog().await.models;
 
-        assert_eq!(catalog.models.len(), 1);
-        assert_eq!(
-            catalog.models[0].capabilities.max_context_tokens,
-            Some(264_000)
-        );
-        assert_eq!(
-            catalog.models[0].capabilities.max_output_tokens,
-            Some(64_000)
-        );
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].capabilities.max_context_tokens, Some(264_000));
+        assert_eq!(models[0].capabilities.max_output_tokens, Some(64_000));
     }
 
     #[tokio::test]
@@ -362,7 +390,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_skips_provider_on_list_error() {
+    async fn catalog_includes_admitted_custom_model_even_when_discovery_fails() {
         let mut map = HashMap::new();
         map.insert(
             "openai".to_string(),
@@ -375,13 +403,45 @@ mod tests {
             Arc::new(FailingProvider) as Arc<dyn LLMProvider>,
         );
         let registry = Arc::new(ProviderRegistry::new(map, "openai".to_string()));
+        registry.set_runtime_models(HashMap::from([
+            ("openai".into(), vec!["gpt-4o".into()]),
+            ("broken".into(), vec!["custom/id".into()]),
+        ]));
         let service = ModelCatalogService::new(registry);
         let catalog = service.get_catalog().await;
 
-        // Both providers listed, but broken one has no models
         assert_eq!(catalog.providers.len(), 2);
+        assert_eq!(catalog.models.len(), 2);
+        assert!(catalog
+            .models
+            .iter()
+            .any(|model| model.reference.model == "custom/id"));
+    }
+
+    #[tokio::test]
+    async fn discovery_never_admits_its_relay_catalog_to_runtime() {
+        let registry = make_registry(
+            vec![(
+                "relay",
+                (0..1000)
+                    .map(|n| ProviderModelInfo::from_id(format!("relay-{n}")))
+                    .collect(),
+            )],
+            "relay",
+        );
+        registry.set_runtime_models(HashMap::from([("relay".into(), vec!["custom/id".into()])]));
+        let service = ModelCatalogService::new(registry);
+        assert_eq!(
+            service
+                .list_models_for_provider("relay")
+                .await
+                .unwrap()
+                .len(),
+            1000
+        );
+        let catalog = service.get_catalog().await;
         assert_eq!(catalog.models.len(), 1);
-        assert_eq!(catalog.models[0].reference.model, "gpt-4o");
+        assert_eq!(catalog.models[0].reference.model, "custom/id");
     }
 
     // ---- list_models_for_provider ----

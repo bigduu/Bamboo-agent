@@ -20,7 +20,8 @@ use tokio::time::{sleep, timeout, Instant};
 use crate::discovery::Fabric;
 use crate::proto::AgentRecord;
 use crate::provision::{
-    ProvisionSpec, WorkerCapabilityReport, WorkerOwner, TYPED_READ_ONLY_WORKER_CAPABILITY,
+    ProvisionSpec, WorkerCapabilityReport, WorkerOwner, REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY,
+    TYPED_READ_ONLY_WORKER_CAPABILITY,
 };
 use crate::transport::{TransportError, TransportResult};
 
@@ -44,15 +45,24 @@ fn provision_for_local_spawn(spec: &ProvisionSpec) -> ProvisionSpec {
 
 const WORKER_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
 fn validate_worker_capability_report(output: &[u8]) -> TransportResult<()> {
-    let report: WorkerCapabilityReport = serde_json::from_slice(output).map_err(|error| {
-        TransportError::Protocol(format!(
-            "worker capability probe returned invalid JSON: {error}"
-        ))
+    validate_required_capability(output, TYPED_READ_ONLY_WORKER_CAPABILITY)
+}
+
+fn validate_required_capability(output: &[u8], capability: &str) -> TransportResult<()> {
+    let report: WorkerCapabilityReport = serde_json::from_slice(output).map_err(|_| {
+        TransportError::Protocol("worker capability probe returned invalid JSON".into())
     })?;
-    if !report.supports(TYPED_READ_ONLY_WORKER_CAPABILITY) {
+    if (matches!(
+        capability,
+        REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY
+            | crate::provision::CHILD_CREATION_IDENTITY_WORKER_CAPABILITY
+    ) && report.provision_version != crate::provision::PROVISION_VERSION)
+        || !report.supports(capability)
+    {
         return Err(TransportError::Protocol(format!(
-            "worker does not acknowledge required capability '{TYPED_READ_ONLY_WORKER_CAPABILITY}'"
+            "worker does not acknowledge required capability '{capability}'"
         )));
     }
     Ok(())
@@ -64,6 +74,16 @@ fn validate_worker_capability_report(output: &[u8]) -> TransportResult<()> {
 async fn require_typed_read_only_worker_capability(
     worker_bin: &Path,
     worker_args: &[String],
+) -> TransportResult<()> {
+    require_worker_capability(worker_bin, worker_args, TYPED_READ_ONLY_WORKER_CAPABILITY).await
+}
+
+/// Probe a trusted local worker before creating a required-context child.
+/// Capability support is protocol compatibility, not loaded-build attestation.
+pub async fn require_worker_capability(
+    worker_bin: &Path,
+    worker_args: &[String],
+    capability: &str,
 ) -> TransportResult<()> {
     let mut probe = Command::new(worker_bin);
     probe.args(worker_args);
@@ -80,11 +100,11 @@ async fn require_typed_read_only_worker_capability(
         .map_err(TransportError::Io)?;
     if !output.status.success() {
         return Err(TransportError::Protocol(format!(
-            "worker capability probe failed with status {}; refusing typed read-only activation",
+            "worker capability probe failed with status {}; refusing required capability activation",
             output.status
         )));
     }
-    validate_worker_capability_report(&output.stdout)
+    validate_required_capability(&output.stdout, capability)
 }
 
 async fn ensure_provision_capabilities(
@@ -92,8 +112,32 @@ async fn ensure_provision_capabilities(
     worker_args: &[String],
     spec: &ProvisionSpec,
 ) -> TransportResult<()> {
+    if spec.capabilities.native_tool_ceiling_required {
+        require_worker_capability(
+            worker_bin,
+            worker_args,
+            crate::provision::NATIVE_TOOL_CEILING_WORKER_CAPABILITY,
+        )
+        .await?;
+    }
+    if spec.capabilities.child_creation_identity {
+        require_worker_capability(
+            worker_bin,
+            worker_args,
+            crate::provision::CHILD_CREATION_IDENTITY_WORKER_CAPABILITY,
+        )
+        .await?;
+    }
     if spec.capabilities.read_only_enforced() {
         require_typed_read_only_worker_capability(worker_bin, worker_args).await?;
+    }
+    if spec.capabilities.required_child_context {
+        require_worker_capability(
+            worker_bin,
+            worker_args,
+            REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -109,9 +153,46 @@ async fn ensure_provision_capabilities(
 pub struct SpawnedChild {
     pub record: AgentRecord,
     process: Option<Child>,
+    owned_pid: Option<u32>,
+}
+
+/// A Host-owned process handle was reaped. Never decoded from Worker messages.
+#[derive(Debug)]
+pub struct ConfirmedLocalStop {
+    pid: u32,
+}
+
+impl ConfirmedLocalStop {
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
 }
 
 impl SpawnedChild {
+    /// Confirm termination through the owned OS Child handle. A registry
+    /// record, lease, disconnected stream or remote handle is insufficient.
+    pub async fn kill_confirmed(mut self) -> std::io::Result<ConfirmedLocalStop> {
+        let mut process = self
+            .process
+            .take()
+            .ok_or_else(|| std::io::Error::other("no owned local process to confirm"))?;
+        let pid = process
+            .id()
+            .or(self.owned_pid)
+            .ok_or_else(|| std::io::Error::other("owned process identity unavailable"))?;
+        if process.try_wait()?.is_none() {
+            process.start_kill()?;
+            tokio::time::timeout(Duration::from_secs(5), process.wait())
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "owned process stop not confirmed",
+                    )
+                })??;
+        }
+        Ok(ConfirmedLocalStop { pid })
+    }
     /// Build a record-only handle for a worker this process does not own (a
     /// remote resident worker connected to, not spawned). `kill()`/`pid()` are
     /// inert.
@@ -119,6 +200,7 @@ impl SpawnedChild {
         Self {
             record,
             process: None,
+            owned_pid: None,
         }
     }
 
@@ -190,6 +272,7 @@ pub async fn spawn_worker(
         if let Ok(Some(record)) = fab.resolve(&child_id).await {
             return Ok(SpawnedChild {
                 record,
+                owned_pid: process.id(),
                 process: Some(process),
             });
         }
@@ -259,6 +342,7 @@ pub async fn spawn_worker_on_bus(
     };
     Ok(SpawnedChild {
         record,
+        owned_pid: process.id(),
         process: Some(process),
     })
 }
@@ -267,6 +351,38 @@ pub async fn spawn_worker_on_bus(
 mod tests {
     use super::*;
     use crate::provision::{ChildIdentity, ExecutorSpec};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirmed_stop_uses_owned_handle_even_after_liveness_reaped_it() {
+        let mut process = Command::new("/usr/bin/true").spawn().unwrap();
+        let owned_pid = process.id();
+        process.wait().await.unwrap();
+        assert!(process.id().is_none());
+        let record = AgentRecord {
+            agent_id: "stop-fixture".into(),
+            role: "worker".into(),
+            labels: Vec::new(),
+            endpoint: String::new(),
+            pid: 1,
+            version: String::new(),
+            started_at: chrono::Utc::now(),
+            lease_expires_at: chrono::Utc::now(),
+        };
+        assert!(SpawnedChild::remote(record.clone())
+            .kill_confirmed()
+            .await
+            .is_err());
+        let child = SpawnedChild {
+            record,
+            process: Some(process),
+            owned_pid,
+        };
+        assert_eq!(
+            child.kill_confirmed().await.unwrap().pid(),
+            owned_pid.unwrap()
+        );
+    }
 
     #[test]
     fn typed_read_only_worker_requires_explicit_capability_acknowledgement() {
@@ -284,6 +400,25 @@ mod tests {
             .contains(TYPED_READ_ONLY_WORKER_CAPABILITY));
 
         assert!(validate_worker_capability_report(b"not-json").is_err());
+    }
+
+    #[test]
+    fn child_creation_requires_exact_schema_and_explicit_capability() {
+        let capability = crate::provision::CHILD_CREATION_IDENTITY_WORKER_CAPABILITY;
+        let mut report = WorkerCapabilityReport::current();
+        validate_required_capability(&serde_json::to_vec(&report).unwrap(), capability).unwrap();
+        report.capabilities.retain(|entry| entry != capability);
+        assert!(
+            validate_required_capability(&serde_json::to_vec(&report).unwrap(), capability)
+                .is_err()
+        );
+        report.capabilities.push(capability.into());
+        report.provision_version += 1;
+        assert!(
+            validate_required_capability(&serde_json::to_vec(&report).unwrap(), capability)
+                .is_err()
+        );
+        assert!(validate_required_capability(b"not-json", capability).is_err());
     }
 
     #[test]

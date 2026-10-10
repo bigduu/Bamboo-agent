@@ -3,6 +3,7 @@
 //! Creates LLM providers based on configuration.
 
 use crate::provider::{LLMError, LLMProvider};
+use crate::providers::common::llm_error_kind;
 use crate::providers::{
     AnthropicProvider, BodhiProvider, CopilotProvider, GeminiProvider, OpenAIProvider,
 };
@@ -106,10 +107,14 @@ pub async fn create_provider_from_instance(
         )));
     }
 
+    let overrides = bamboo_config::model_vision_overrides(instance).map_err(LLMError::Api)?;
     let masking_config = config.keyword_masking.clone();
     let http_client = build_http_client(config)?;
 
-    match instance.provider_type.as_str() {
+    let provider: std::result::Result<Arc<dyn LLMProvider>, LLMError> = match instance
+        .provider_type
+        .as_str()
+    {
         "copilot" => {
             let headless_auth = instance
                 .extra
@@ -141,7 +146,7 @@ pub async fn create_provider_from_instance(
                     // This allows the user to see the authentication error and know what to do
                 }
                 Err(e) => {
-                    tracing::warn!("Copilot silent authentication failed: {}. Use POST /v1/bamboo/copilot/auth/start to authenticate.", e);
+                    tracing::warn!(error_kind = llm_error_kind(&e), "Copilot silent authentication failed. Use POST /v1/bamboo/copilot/auth/start to authenticate.");
                 }
             }
             Ok(Arc::new(provider.with_masking(masking_config.clone())))
@@ -286,7 +291,12 @@ pub async fn create_provider_from_instance(
             instance.provider_type,
             AVAILABLE_PROVIDERS.join(", ")
         ))),
-    }
+    };
+    let provider = provider?;
+    Ok(Arc::new(crate::model_vision::ModelVisionProvider {
+        inner: provider,
+        overrides,
+    }))
 }
 
 /// Validate provider configuration without creating the provider

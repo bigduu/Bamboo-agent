@@ -17,6 +17,7 @@ pub use stream::{
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 
+use crate::providers::common::log_identity;
 use async_trait::async_trait;
 use bamboo_domain::bounded_dedup::{BoundedFingerprintSet, DEFAULT_BOUNDED_FINGERPRINT_CAPACITY};
 use bamboo_domain::{
@@ -395,6 +396,8 @@ impl LLMProvider for AnthropicProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
+        crate::image_budget::validate_tool_image_budget(ir.body_chat_iter())
+            .map_err(LLMError::Api)?;
         let required_tool = options
             .and_then(|options| options.required_tool.as_deref())
             .map(str::trim)
@@ -451,6 +454,7 @@ impl AnthropicProvider {
         options: Option<&LLMRequestOptions>,
         capability_loading_mode: CapabilityLoadingMode,
     ) -> Result<LLMStream> {
+        crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
         let max_tokens = max_output_tokens.unwrap_or(self.max_tokens);
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
         let required_tool = required_tool_from_options(options, tools)?;
@@ -494,7 +498,10 @@ impl AnthropicProvider {
             .and_then(|o| o.session_id.as_deref())
             .unwrap_or("unknown-session");
 
-        tracing::debug!("Anthropic provider using model: {}", model);
+        tracing::debug!(
+            "Anthropic provider using model_hash={}",
+            log_identity(model)
+        );
 
         let mut body = build_anthropic_request_with_cache_blocks_native_mode(
             messages,
@@ -547,10 +554,10 @@ impl AnthropicProvider {
             })
             .unwrap_or(0);
         tracing::info!(
-            "[{}] Anthropic request image_blocks_on_wire={} model='{}'",
-            session_log_id,
+            "[session_hash={}] Anthropic request image_blocks_on_wire={} model_hash={}",
+            log_identity(session_log_id),
             image_blocks_on_wire,
-            model
+            log_identity(model)
         );
         let mut applied_reasoning_effort = reasoning_effort;
         let mut thinking_enabled = body.get("thinking").is_some();
@@ -559,9 +566,9 @@ impl AnthropicProvider {
             .and_then(|thinking| thinking.get("budget_tokens"))
             .and_then(|value| value.as_u64());
         tracing::info!(
-            "[{}] Anthropic request model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_enabled={} thinking_budget_tokens={} max_tokens={} [{}]",
-            session_log_id,
-            model,
+            "[session_hash={}] Anthropic request model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_enabled={} thinking_budget_tokens={} max_tokens={} purpose_hash={}",
+            log_identity(session_log_id),
+            log_identity(model),
             applied_reasoning_effort
                 .map(ReasoningEffort::as_str)
                 .unwrap_or("none"),
@@ -572,7 +579,7 @@ impl AnthropicProvider {
                 .map(|tokens| tokens.to_string())
                 .unwrap_or_else(|| "none".to_string()),
             max_tokens,
-            request_purpose
+            log_identity(request_purpose)
         );
         let mut headers = self.build_headers(request_overrides::ENDPOINT_MESSAGES, Some(model))?;
         if extended_cache_ttl {
@@ -606,9 +613,9 @@ impl AnthropicProvider {
                 && looks_like_thinking_forced_tool_choice_error(status, &text)
             {
                 tracing::warn!(
-                    "[{}] Anthropic model '{}' rejected forced named tool_choice in thinking mode; retrying activation with tool_choice=auto and parallel tool use disabled",
-                    session_log_id,
-                    model
+                    "[session_hash={}] Anthropic model_hash {} rejected forced named tool_choice in thinking mode; retrying activation with tool_choice=auto and parallel tool use disabled",
+                    log_identity(session_log_id),
+                    log_identity(model)
                 );
                 let mut fallback_body = build_anthropic_request_with_cache_blocks_native_mode(
                     messages,
@@ -660,8 +667,8 @@ impl AnthropicProvider {
                 && Self::looks_like_reasoning_unsupported_error(status, &text)
             {
                 tracing::warn!(
-                    "Anthropic /messages rejected reasoning for model '{}'; retrying without reasoning_effort",
-                    model
+                    "Anthropic /messages rejected reasoning for model_hash {}; retrying without reasoning_effort",
+                    log_identity(model)
                 );
 
                 let mut fallback_body = build_anthropic_request_with_cache_blocks_native_mode(
@@ -690,12 +697,12 @@ impl AnthropicProvider {
                 thinking_enabled = false;
                 thinking_budget_tokens = None;
                 tracing::info!(
-                    "[{}] Anthropic request retry model='{}' reasoning_effort=none reasoning_source={} request_reasoning_enabled=false thinking_enabled=false thinking_budget_tokens=none max_tokens={} [{}]",
-                    session_log_id,
-                    model,
+                    "[session_hash={}] Anthropic request retry model_hash={} reasoning_effort=none reasoning_source={} request_reasoning_enabled=false thinking_enabled=false thinking_budget_tokens=none max_tokens={} purpose_hash={}",
+                    log_identity(session_log_id),
+                    log_identity(model),
                     reasoning_source,
                     max_tokens,
-                    request_purpose
+                    log_identity(request_purpose)
                 );
                 response =
                     crate::retry::send_with_retry(crate::retry::global(), "Anthropic", || {
@@ -1421,21 +1428,28 @@ fn messages_to_anthropic_json(
     // at the marked stable source, not at a later volatile coalesced tail.
     let mut out_spans: Vec<Vec<SourceSpan>> = Vec::new();
 
-    // Keep only the MOST RECENT tool-result image (e.g. screenshot); older ones
-    // are dropped from the request to control context size, since a conversation
-    // can accumulate many large images. (User-attached images are untouched.)
+    // Keep every image in the latest tool-result batch. Parallel ViewImage
+    // calls must all reach their first subsequent request. Older batches retain
+    // the existing explicit omission marker to bound accumulated screenshots.
+    // User-attached images are untouched.
     let last_image_tool_idx = messages
         .iter()
         .enumerate()
         .filter(|(_, m)| matches!(m.role, Role::Tool) && message_has_image(m))
         .map(|(i, _)| i)
         .next_back();
+    let latest_image_batch_start = last_image_tool_idx.map(|last| {
+        messages[..last]
+            .iter()
+            .rposition(|m| !matches!(m.role, Role::Tool | Role::System))
+            .map_or(0, |idx| idx + 1)
+    });
 
     for (idx, m) in messages.iter().enumerate() {
         match m.role {
             Role::System => system_parts.push(m.content.as_str()),
             Role::User | Role::Assistant | Role::Tool => {
-                let keep_image = Some(idx) == last_image_tool_idx;
+                let keep_image = latest_image_batch_start.is_some_and(|start| idx >= start);
                 // `message_to_anthropic_json` returns `None` only for a stray
                 // System message; skip it (rather than emit a null/empty entry)
                 // so a malformed conversation never pollutes the `messages`
@@ -1827,9 +1841,9 @@ pub(super) fn tool_arguments_to_input(arguments: &str) -> Value {
         }
         Err(error) => {
             tracing::warn!(
-                "Anthropic tool_use input fallback to _raw object: invalid JSON arguments, args_len={}, error={}",
+                "Anthropic tool_use input fallback to _raw object: invalid JSON arguments, args_len={}, error_kind={:?}",
                 trimmed.len(),
-                error
+                error.classify()
             );
             json!({ "_raw": arguments })
         }
@@ -2553,7 +2567,7 @@ pub fn parse_anthropic_sse_event(
                                     "Anthropic stream stop_reason=max_tokens; response may be truncated"
                                 );
                             } else {
-                                tracing::debug!("Anthropic stream stop_reason={stop_reason}");
+                                tracing::debug!(stop_reason_hash = %log_identity(stop_reason), "Anthropic stream stop reason");
                             }
                         }
 
@@ -2616,8 +2630,8 @@ pub fn parse_anthropic_sse_event(
                     }
                     Err(error) => {
                         tracing::debug!(
-                            "Failed to parse Anthropic message_delta payload for logging: {} (payload_len={})",
-                            error,
+                            "Failed to parse Anthropic message_delta payload for logging: error_kind={:?} payload_len={}",
+                            error.classify(),
                             data.len()
                         );
                     }
@@ -2645,15 +2659,9 @@ pub fn parse_anthropic_sse_event(
             }
 
             if !state.tool_uses_by_index.is_empty() {
-                let open_blocks: Vec<String> = state
-                    .tool_uses_by_index
-                    .iter()
-                    .map(|(index, (id, name))| format!("{index}:{name}:{id}"))
-                    .collect();
                 tracing::warn!(
-                    "Anthropic message_stop received with {} open tool_use blocks (possible incomplete tool arguments): {}",
-                    open_blocks.len(),
-                    open_blocks.join(", ")
+                    open_tool_count = state.tool_uses_by_index.len(),
+                    "Anthropic message_stop received with open tool_use blocks (possible incomplete tool arguments)"
                 );
                 state.tool_uses_by_index.clear();
             }
@@ -2745,10 +2753,10 @@ pub fn parse_anthropic_sse_event(
                 .tool_uses_by_index
                 .insert(index, (id.to_string(), name.to_string()));
             tracing::debug!(
-                "Anthropic tool_use started: index={}, tool_call_id={}, tool_name={}",
+                "Anthropic tool_use started: index={}, tool_call_hash={}, tool_name_hash={}",
                 index,
-                id,
-                name
+                log_identity(id),
+                log_identity(name)
             );
 
             Ok(Some(LLMChunk::ToolCalls(vec![bamboo_domain::ToolCall {
@@ -2828,10 +2836,10 @@ pub fn parse_anthropic_sse_event(
                         return Ok(None);
                     };
                     tracing::trace!(
-                        "Anthropic tool_use input_json_delta: index={}, tool_call_id={}, tool_name={}, chunk_len={}",
+                        "Anthropic tool_use input_json_delta: index={}, tool_call_hash={}, tool_name_hash={}, chunk_len={}",
                         index,
-                        id,
-                        name,
+                        log_identity(id),
+                        log_identity(name),
                         partial.len()
                     );
 
@@ -5322,6 +5330,28 @@ mod anthropic_request_building {
     }
 
     #[test]
+    fn vision_messages_keep_every_image_in_the_latest_tool_batch() {
+        let img = |d: &str| bamboo_domain::ToolResultImage {
+            mime_type: "image/png".to_string(),
+            data: d.to_string(),
+        };
+        let messages = vec![
+            Message::user("look"),
+            Message::tool_result_with_images("old", "old shot", true, vec![img("OLDER")]),
+            Message::assistant("inspect both files", None),
+            Message::tool_result_with_images("first", "first shot", true, vec![img("FIRST")]),
+            Message::tool_result_with_images("second", "second shot", true, vec![img("SECOND")]),
+        ];
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+        let dumped = out.to_string();
+        assert!(dumped.contains("FIRST"));
+        assert!(dumped.contains("SECOND"));
+        assert!(!dumped.contains("OLDER"));
+        assert!(dumped.contains("omitted"));
+    }
+
+    #[test]
     fn messages_keep_only_the_most_recent_tool_image() {
         let img = |d: &str| bamboo_domain::ToolResultImage {
             mime_type: "image/jpeg".to_string(),
@@ -5330,6 +5360,7 @@ mod anthropic_request_building {
         let messages = vec![
             Message::user("look"),
             Message::tool_result_with_images("t1", "shot1", true, vec![img("FIRST")]),
+            Message::assistant("take another screenshot", None),
             Message::tool_result_with_images("t2", "shot2", true, vec![img("LAST")]),
         ];
         let out =

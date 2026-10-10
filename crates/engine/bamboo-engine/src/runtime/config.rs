@@ -333,6 +333,449 @@ impl From<&MemoryConfig> for PromptMemoryFlags {
     }
 }
 
+/// Execution-local adapter for a registered host. Input presence is data,
+/// never a Skill grant; each host owns and validates its actual caller policy.
+#[async_trait::async_trait]
+pub trait SkillExecutionHost: Send + Sync {
+    fn observe_current_inputs(
+        &self,
+        session_id: &str,
+        execution_id: &str,
+        current: Option<&crate::runtime::managers::lifecycle::BoundedInputRequestBatch>,
+    ) -> Result<(), bamboo_agent_core::AgentError>;
+
+    async fn render_skill_prompt(
+        &self,
+        session: &bamboo_agent_core::Session,
+        execution_id: &str,
+    ) -> Result<String, bamboo_agent_core::AgentError>;
+
+    fn finish(&self, session_id: &str, execution_id: &str);
+}
+
+/// Compatibility name for the default SDK host.
+pub use SkillExecutionHost as SdkSkillExecutionHost;
+
+/// One bounded, explicitly supplied input observation. This carries caller data,
+/// never proof of currentness, a Source grant, or permission to invoke a Skill.
+#[derive(Debug, PartialEq)]
+pub struct UntrustedInputObservation {
+    input_id: bamboo_domain::SessionMessageId,
+    request: Option<bamboo_domain::SessionSkillRequest>,
+}
+
+impl UntrustedInputObservation {
+    pub fn new(
+        input_id: &str,
+        request: Option<&bamboo_domain::SessionSkillRequest>,
+    ) -> Option<Self> {
+        // Bound before the owned ID/request copy. Use the existing canonical ID
+        // contract, including its path rules, without trimming or normalizing.
+        if input_id.is_empty() || input_id.len() > 256 {
+            return None;
+        }
+        let input_id = bamboo_domain::SessionMessageId::parse(input_id.to_owned()).ok()?;
+        if let Some(request) = request {
+            request.validate().ok()?;
+        }
+        Some(Self {
+            input_id,
+            request: request.cloned(),
+        })
+    }
+
+    pub fn input_id(&self) -> &str {
+        self.input_id.as_str()
+    }
+    pub fn request(&self) -> Option<&bamboo_domain::SessionSkillRequest> {
+        self.request.as_ref()
+    }
+}
+
+/// Execution-owned transport, with at most one existing Inbox admission batch
+/// (128 records), each retaining only an ID and an I-W-bounded request. There
+/// is no whole-batch Clone/Arc or body/config/Source snapshot. This is not Q-B's
+/// aggregate compact projection or its eventual current-input classification.
+pub struct UntrustedExecutionInputs {
+    observations: Box<[UntrustedInputObservation]>,
+    startup: std::sync::Mutex<Option<StartupInputObservation>>,
+    sdk_execution_id: Option<String>,
+    sdk_hook_runner: Option<Arc<HookRunner>>,
+    sdk_pending: std::sync::Mutex<Option<SdkPendingInput>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SdkPendingInput {
+    pub session_id: String,
+    pub input_id: String,
+    pub header_digest: [u8; 32],
+    pub final_digest: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for UntrustedExecutionInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UntrustedExecutionInputs")
+            .field("observations", &self.observations)
+            .field("sdk_execution_id", &self.sdk_execution_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Hash one original record, without retaining a body in the input carrier.
+pub(crate) fn sdk_message_digest(message: &bamboo_agent_core::Message) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(message).expect("Message serialization is infallible");
+    Sha256::digest(bytes).into()
+}
+
+/// F may alter content and the first native Text, while identity and all other
+/// original fields must remain bound to the SDK producer.
+pub(crate) fn sdk_message_header_digest(message: &bamboo_agent_core::Message) -> [u8; 32] {
+    let mut header = message.clone();
+    header.content.clear();
+    if let Some(parts) = header.content_parts.as_mut() {
+        if let Some(bamboo_domain::MessagePart::Text { text }) =
+            parts.iter_mut().find(|part| matches!(part, bamboo_domain::MessagePart::Text { text } if text == &message.content))
+        {
+            text.clear();
+        }
+    }
+    sdk_message_digest(&header)
+}
+
+#[derive(Debug)]
+struct StartupInputObservation {
+    session_id: String,
+    execution_id: String,
+    observation: crate::runtime::managers::lifecycle::InputObservation,
+}
+
+impl UntrustedExecutionInputs {
+    pub fn new(observations: Vec<UntrustedInputObservation>) -> Option<Self> {
+        if observations.is_empty() || observations.len() > 128 {
+            return None;
+        }
+        let mut ids = std::collections::HashSet::with_capacity(observations.len());
+        if observations.iter().any(|item| !ids.insert(item.input_id())) {
+            return None;
+        }
+        Some(Self {
+            observations: observations.into_boxed_slice(),
+            startup: std::sync::Mutex::new(None),
+            sdk_execution_id: None,
+            sdk_hook_runner: None,
+            sdk_pending: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Exact producer-reserved execution identity; generic carriers have none.
+    pub fn sdk_execution_id(&self) -> Option<&str> {
+        self.sdk_execution_id.as_deref()
+    }
+
+    pub(crate) fn bind_sdk_append(
+        mut self,
+        execution_id: String,
+        pending: SdkPendingInput,
+        hook_runner: Option<Arc<HookRunner>>,
+    ) -> Self {
+        // Reserve the real execution identity even when optional acceptance
+        // fails. Identity is not a positive input observation or Source grant.
+        self.startup = std::sync::Mutex::new(Some(StartupInputObservation {
+            session_id: pending.session_id.clone(),
+            execution_id: execution_id.clone(),
+            observation: Default::default(),
+        }));
+        self.sdk_execution_id = Some(execution_id);
+        self.sdk_hook_runner = hook_runner;
+        self.sdk_pending = std::sync::Mutex::new(Some(pending));
+        self
+    }
+
+    pub(crate) fn sdk_hook_runner(&self) -> Option<Arc<HookRunner>> {
+        self.sdk_hook_runner.clone()
+    }
+
+    /// Consume the private append receipt after the real startup hook, then
+    /// checkpoint and verify the exact final User before publishing New data.
+    pub(crate) async fn seal_sdk_input(
+        &self,
+        session: &mut bamboo_agent_core::Session,
+        persistence: Option<&Arc<dyn RuntimeSessionPersistence>>,
+    ) -> Result<(), bamboo_agent_core::AgentError> {
+        let pending = self
+            .sdk_pending
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let execution_id = self.sdk_execution_id.as_deref().unwrap_or("");
+        let invalid = || {
+            bamboo_agent_core::AgentError::Tool("SDK input acceptance could not be verified".into())
+        };
+        if session.id != pending.session_id || execution_id.is_empty() {
+            return Err(invalid());
+        }
+        let mut matching = session
+            .messages
+            .iter()
+            .filter(|message| message.id == pending.input_id);
+        let message = matching.next().ok_or_else(invalid)?;
+        if matching.next().is_some()
+            || message.role != bamboo_agent_core::Role::User
+            || sdk_message_header_digest(message) != pending.header_digest
+            || pending
+                .final_digest
+                .is_some_and(|digest| sdk_message_digest(message) != digest)
+        {
+            return Err(invalid());
+        }
+        let final_digest = sdk_message_digest(message);
+        let created_at = message.created_at;
+        let persistence = persistence.ok_or_else(invalid)?;
+        persistence
+            .checkpoint_runtime_session(session)
+            .await
+            .map_err(|error| {
+                bamboo_agent_core::AgentError::Tool(format!("SDK input checkpoint failed: {error}"))
+            })?;
+        let accepted = persistence
+            .load_runtime_session(&session.id)
+            .await
+            .map_err(|error| {
+                bamboo_agent_core::AgentError::Tool(format!(
+                    "SDK input verification failed: {error}"
+                ))
+            })?
+            .ok_or_else(invalid)?;
+        let mut matching = accepted
+            .messages
+            .iter()
+            .filter(|message| message.id == pending.input_id);
+        let accepted_user = matching.next().ok_or_else(invalid)?;
+        if matching.next().is_some()
+            || accepted_user.role != bamboo_agent_core::Role::User
+            || sdk_message_digest(accepted_user) != final_digest
+        {
+            return Err(invalid());
+        }
+        let observation = self
+            .observations
+            .iter()
+            .find(|item| item.input_id() == pending.input_id)
+            .ok_or_else(invalid)?;
+        let source = bamboo_domain::SessionMessageSource::User;
+        let record = crate::runtime::runner::state_bridge::BorrowedInputRequestRecord {
+            input_id: &pending.input_id,
+            source: &source,
+            kind: bamboo_domain::SessionMessageKind::UserInput,
+            wrapper: None,
+            created_at,
+            request: observation.request(),
+        };
+        let projection = crate::runtime::runner::state_bridge::project_input_request_batch(
+            &session.id,
+            execution_id,
+            &[record],
+        );
+        let observation =
+            crate::runtime::managers::lifecycle::InputObservation::projected(projection);
+        *self.startup.lock().map_err(|_| invalid())? = Some(StartupInputObservation {
+            session_id: session.id.clone(),
+            execution_id: execution_id.to_owned(),
+            observation,
+        });
+        Ok(())
+    }
+
+    pub fn observations(&self) -> &[UntrustedInputObservation] {
+        &self.observations
+    }
+
+    /// Additive checked boundary companion. Original public refresh layout stays
+    /// unchanged; the caller still performs its original error/persist checks.
+    /// An unavailable projection changes only this optional data handoff.
+    pub async fn admit_with_startup_observation(
+        session: &mut bamboo_agent_core::Session,
+        storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
+        persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+        inbox: Option<&Arc<dyn bamboo_domain::SessionInboxPort>>,
+    ) -> (crate::runtime::runner::TurnBoundaryRefresh, Option<Self>) {
+        let execution_id = crate::runtime::runner::round_prelude::new_execution_id();
+        let (refresh, observation) =
+            crate::runtime::runner::state_bridge::refresh_turn_boundary_with_observation(
+                session,
+                storage,
+                persistence,
+                inbox,
+                None,
+                &execution_id,
+            )
+            .await;
+        // Compatibility slice is created only after complete aggregate fit.
+        // It retains one extra initial IE view: bounded slots and args AST,
+        // whose compact payload fits the same cap (not a heap/RSS bound).
+        let carrier = observation
+            .new_inputs()
+            .and_then(|batch| {
+                Self::new(
+                    batch
+                        .records()
+                        .iter()
+                        .map(|record| {
+                            Some(UntrustedInputObservation {
+                                input_id: bamboo_domain::SessionMessageId::parse(
+                                    record.input_id.clone(),
+                                )
+                                .ok()?,
+                                request: record.request.clone(),
+                            })
+                        })
+                        .collect::<Option<Vec<_>>>()?,
+                )
+            })
+            .map(|mut carrier| {
+                carrier.startup = std::sync::Mutex::new(Some(StartupInputObservation {
+                    session_id: session.id.clone(),
+                    execution_id,
+                    observation,
+                }));
+                carrier
+            });
+        (refresh, carrier)
+    }
+
+    pub(crate) fn take_startup_observation(
+        &self,
+        session_id: &str,
+    ) -> Option<(
+        String,
+        crate::runtime::managers::lifecycle::InputObservation,
+    )> {
+        let startup = self.startup.lock().ok()?.take()?;
+        (startup.session_id == session_id
+            && (startup.observation.is_unavailable()
+                || startup.observation.matches_session(session_id)))
+        .then_some((startup.execution_id, startup.observation))
+    }
+
+    /// Caller supplies ONLY this call's newly checkpointed messages, after its
+    /// ACK/rejection checks. Never call this on stored Session history. The
+    /// existing admission producer already checked their envelope proof.
+    pub fn from_committed_messages(messages: &[bamboo_agent_core::Message]) -> Option<Self> {
+        if messages.len() > 128 {
+            return None;
+        }
+        let mut observations = Vec::with_capacity(messages.len());
+        for message in messages {
+            if message.role != bamboo_agent_core::Role::User {
+                continue;
+            }
+            let Some(proof) = message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("session_message"))
+            else {
+                continue;
+            };
+            if proof.get("id")?.as_str()? != message.id {
+                return None;
+            }
+            let body = proof.get("body")?;
+            let request = if proof.get("source")?.get("type")?.as_str()? == "user"
+                && proof.get("kind")?.as_str()? == "user_input"
+                && body.get("type")?.as_str()? == "content"
+            {
+                body.get("skill_request")
+            } else if proof.get("source")?.get("type")?.as_str()? == "runtime"
+                && proof.get("source")?.get("subsystem")?.as_str()? == "chat"
+                && proof.get("kind")?.as_str()? == "runtime_instruction"
+                && body.get("instruction")?.as_str()? == "root_chat_turn_v1"
+            {
+                body.get("content")?.get("skill_request")
+            } else {
+                continue;
+            };
+            let request = request
+                .filter(|value| !value.is_null())
+                .map(copy_checked_request)
+                .transpose()
+                .ok()?;
+            if message.id.is_empty() || message.id.len() > 256 {
+                return None;
+            }
+            let input_id = bamboo_domain::SessionMessageId::parse(message.id.clone()).ok()?;
+            observations.push(UntrustedInputObservation { input_id, request });
+        }
+        Self::new(observations)
+    }
+}
+
+// Read only the exact bounded request, never deserialize/copy the Message,
+// images, body, proof, or publication metadata merely to transport caller data.
+fn copy_checked_request(
+    value: &serde_json::Value,
+) -> Result<bamboo_domain::SessionSkillRequest, ()> {
+    let selections = value
+        .get("selections")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(())?;
+    if selections.is_empty() || selections.len() > 32 {
+        return Err(());
+    }
+    let mode = match value.get("mode") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let mode = value.as_str().ok_or(())?;
+            if mode.is_empty()
+                || mode.len() > 64
+                || !mode
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            {
+                return Err(());
+            }
+            Some(mode)
+        }
+    };
+    // Bound every original args tree before copying any selection. Existing
+    // I-W validation supplies nonrecursive depth/node/compact-byte checks.
+    for selection in selections {
+        bamboo_domain::SessionSkillSelection::validate_borrowed(
+            selection
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?,
+            selection
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?,
+            selection
+                .get("revision")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(())?,
+            selection.get("args").unwrap_or(&serde_json::Value::Null),
+        )
+        .map_err(|_| ())?;
+    }
+    let request = bamboo_domain::SessionSkillRequest {
+        selections: selections
+            .iter()
+            .map(|selection| bamboo_domain::SessionSkillSelection {
+                id: selection["id"].as_str().unwrap().to_owned(),
+                source: selection["source"].as_str().unwrap().to_owned(),
+                revision: selection["revision"].as_u64().unwrap(),
+                args: selection.get("args").cloned().unwrap_or_default(),
+            })
+            .collect(),
+        mode: mode.map(str::to_owned),
+    };
+    request.validate().map_err(|_| ())?;
+    Ok(request)
+}
+
 /// Configuration for the agent loop.
 ///
 /// # One-config-per-run invariant (#44)
@@ -356,6 +799,8 @@ impl From<&MemoryConfig> for PromptMemoryFlags {
 pub struct AgentLoopConfig {
     /// Keep tool guidance stable while activation updates append to model context.
     pub freeze_tool_exposure_for_cache: bool,
+    /// Host-installed exact Assignment/Run permit; never taken from model args.
+    pub(crate) ticket_worker_plan: Option<Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>>,
     pub(crate) system_prompt: Option<String>,
     /// Skill IDs that are disabled globally for this execution.
     pub(crate) disabled_skill_ids: BTreeSet<String>,
@@ -367,6 +812,9 @@ pub struct AgentLoopConfig {
     /// When set, skill discovery prefers `skills-<mode>` directories over generic
     /// directories for the same skill id.
     pub(crate) selected_skill_mode: Option<String>,
+    /// Untrusted inputs supplied by this startup call, never inferred.
+    pub(crate) initial_untrusted_inputs: Option<UntrustedExecutionInputs>,
+    pub(crate) sdk_skill_execution_host: Option<Arc<dyn SdkSkillExecutionHost>>,
     pub(crate) additional_tool_schemas: Vec<ToolSchema>,
     pub(crate) tool_registry: Arc<ToolRegistry>,
     pub(crate) skill_manager: Option<Arc<SkillManager>>,
@@ -530,6 +978,8 @@ pub struct AgentLoopConfig {
     /// When true, the pipeline classifies complexity at each round end and
     /// stores the result in session metadata.
     pub(crate) features_dynamic_model_routing: bool,
+    /// Opt-in, single auxiliary check before publishing a final answer.
+    pub(crate) features_final_evidence_check: bool,
     /// Optional per-round resolver for auxiliary model settings that should
     /// follow live global config rather than stay frozen for the whole run.
     ///
@@ -561,14 +1011,24 @@ pub struct AgentLoopConfig {
     pub(crate) run_budget: bamboo_config::RunBudgetConfig,
 }
 
+impl AgentLoopConfig {
+    /// Data-only execution transport. This accessor does not classify or grant.
+    pub fn initial_untrusted_inputs(&self) -> Option<&UntrustedExecutionInputs> {
+        self.initial_untrusted_inputs.as_ref()
+    }
+}
+
 impl Default for AgentLoopConfig {
     fn default() -> Self {
         Self {
             freeze_tool_exposure_for_cache: true,
+            ticket_worker_plan: None,
             system_prompt: None,
             disabled_skill_ids: BTreeSet::new(),
             selected_skill_ids: None,
             selected_skill_mode: None,
+            initial_untrusted_inputs: None,
+            sdk_skill_execution_host: None,
             additional_tool_schemas: Vec::new(),
             tool_registry: Arc::new(ToolRegistry::new()),
             skill_manager: None,
@@ -619,6 +1079,7 @@ impl Default for AgentLoopConfig {
             approval_delegate: None,
             hook_runner: Arc::new(HookRunner::new()),
             features_dynamic_model_routing: false,
+            features_final_evidence_check: false,
             auxiliary_model_resolver: None,
             disabled_filter_resolver: None,
             mcp_tool_guidance: None,
@@ -628,6 +1089,12 @@ impl Default for AgentLoopConfig {
 }
 
 impl AgentLoopConfig {
+    pub fn bind_ticket_worker_plan(
+        &mut self,
+        plan: Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>,
+    ) {
+        self.ticket_worker_plan = Some(plan);
+    }
     /// Live `(disabled_tools, disabled_skill_ids)` for the current round: the
     /// resolver if one is wired (#136 — follows live global config between
     /// rounds), else the per-run snapshot (#44 frozen behavior). `Cow` avoids
@@ -707,3 +1174,271 @@ impl AgentLoopConfig {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod execution_input_tests {
+    use super::*;
+    fn request() -> bamboo_domain::SessionSkillRequest {
+        bamboo_domain::SessionSkillRequest {
+            selections: vec![bamboo_domain::SessionSkillSelection {
+                id: "exact Case".into(),
+                source: "builtin".into(),
+                revision: 1,
+                args: serde_json::json!({"raw":"保持原样"}),
+            }],
+            mode: None,
+        }
+    }
+    #[test]
+    fn execution_input_owned_bounds_and_old_config_default() {
+        assert!(AgentLoopConfig::default()
+            .initial_untrusted_inputs()
+            .is_none());
+        let request = request();
+        let input = UntrustedInputObservation::new("exact-input", Some(&request)).unwrap();
+        assert_eq!(input.input_id(), "exact-input");
+        assert_eq!(input.request(), Some(&request));
+        for id in [
+            "",
+            " leading",
+            "trailing ",
+            "unsafe/id",
+            "unsafe\\id",
+            "unsafe..id",
+        ] {
+            assert!(UntrustedInputObservation::new(id, None).is_none());
+        }
+        assert!(UntrustedInputObservation::new(&"a".repeat(257), None).is_none());
+        assert!(UntrustedExecutionInputs::new(Vec::new()).is_none());
+        let batch = UntrustedExecutionInputs::new(
+            (0..128)
+                .map(|i| {
+                    UntrustedInputObservation::new(&format!("input-{i}"), Some(&request)).unwrap()
+                })
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(batch.observations().len(), 128);
+        assert_eq!(batch.observations()[127].input_id(), "input-127");
+        assert!(UntrustedExecutionInputs::new(
+            (0..129)
+                .map(|i| UntrustedInputObservation::new(&format!("input-{i}"), None).unwrap())
+                .collect()
+        )
+        .is_none());
+        assert!(UntrustedExecutionInputs::new(vec![
+            UntrustedInputObservation::new("same", None).unwrap(),
+            UntrustedInputObservation::new("same", None).unwrap()
+        ])
+        .is_none());
+        let mut malformed = request;
+        malformed.selections[0].args = (0..65).fold(serde_json::Value::Null, |v, _| {
+            serde_json::Value::Array(vec![v])
+        });
+        assert!(UntrustedInputObservation::new("deep", Some(&malformed)).is_none());
+    }
+    #[test]
+    fn execution_input_only_explicit_checked_commit_slice_copies_request_fields() {
+        let request = request();
+        let mut user = bamboo_domain::SessionMessageEnvelope::user_input("target", "ordinary");
+        if let bamboo_domain::SessionMessageBody::Content(content) = &mut user.body {
+            content.skill_request = Some(request.clone());
+        }
+        let id = user.id.to_string();
+        let plain = user.to_provider_message().unwrap();
+        let root = user
+            .with_root_chat_prompt("system prompt is not retained".into())
+            .unwrap()
+            .to_provider_message()
+            .unwrap();
+        for message in [plain, root] {
+            let batch = UntrustedExecutionInputs::from_committed_messages(&[message]).unwrap();
+            assert_eq!(batch.observations().len(), 1);
+            assert_eq!(batch.observations()[0].input_id(), id);
+            assert_eq!(batch.observations()[0].request(), Some(&request));
+        }
+        let text = bamboo_agent_core::Message::user("{\"skill_request\":\"fragment\"}");
+        assert!(UntrustedExecutionInputs::from_committed_messages(&[text]).is_none());
+        assert!(UntrustedExecutionInputs::from_committed_messages(&[]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod sdk_acceptance_tests {
+    use super::*;
+    use crate::runtime::managers::lifecycle::BoundedInputRequestBatch;
+    use bamboo_agent_core::{Message, Role, Session};
+
+    struct Repository {
+        stored: std::sync::Mutex<Option<Session>>,
+        reject: bool,
+        corrupt: bool,
+    }
+    #[async_trait::async_trait]
+    impl RuntimeSessionPersistence for Repository {
+        async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            if self.reject {
+                return Err(std::io::Error::other("checkpoint refused"));
+            }
+            let mut accepted = session.clone();
+            if self.corrupt {
+                accepted
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.role == Role::User)
+                    .unwrap()
+                    .content
+                    .push_str(" changed");
+            }
+            *self.stored.lock().unwrap() = Some(accepted);
+            Ok(())
+        }
+        async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            self.save_runtime_session(session).await
+        }
+        async fn load_runtime_session(&self, _: &str) -> std::io::Result<Option<Session>> {
+            Ok(self.stored.lock().unwrap().clone())
+        }
+    }
+    fn repository(reject: bool, corrupt: bool) -> Arc<dyn RuntimeSessionPersistence> {
+        Arc::new(Repository {
+            stored: Default::default(),
+            reject,
+            corrupt,
+        })
+    }
+    fn producer(session: &Session, user: &Message, typed: bool) -> UntrustedExecutionInputs {
+        UntrustedExecutionInputs::new(vec![UntrustedInputObservation::new(&user.id, None).unwrap()])
+            .unwrap()
+            .bind_sdk_append(
+                "actual-sdk-execution".into(),
+                SdkPendingInput {
+                    session_id: session.id.clone(),
+                    input_id: user.id.clone(),
+                    header_digest: sdk_message_header_digest(user),
+                    final_digest: typed.then(|| sdk_message_digest(user)),
+                },
+                None,
+            )
+    }
+    fn current(
+        inputs: &UntrustedExecutionInputs,
+        session: &Session,
+    ) -> Option<BoundedInputRequestBatch> {
+        let (execution_id, observation) = inputs.take_startup_observation(&session.id).unwrap();
+        assert_eq!(execution_id, "actual-sdk-execution");
+        let mut current = None;
+        observation.update_current(&mut current, &session.id, &execution_id);
+        assert!(inputs.take_startup_observation(&session.id).is_none());
+        current
+    }
+    #[tokio::test]
+    async fn sdk_startup_requires_exact_checkpoint_and_preserves_request_absence_as_new() {
+        let mut session = Session::new("sdk-accept", "model");
+        let user = Message::user("final prepared");
+        let inputs = producer(&session, &user, true);
+        session.add_message(user.clone());
+        inputs
+            .seal_sdk_input(&mut session, Some(&repository(false, false)))
+            .await
+            .unwrap();
+        let batch = current(&inputs, &session).unwrap();
+        assert_eq!(batch.records().len(), 1);
+        assert_eq!(batch.records()[0].input_id, user.id);
+        assert_eq!(
+            batch.records()[0].source,
+            bamboo_domain::SessionMessageSource::User
+        );
+        assert!(batch.records()[0].request.is_none());
+    }
+    #[tokio::test]
+    async fn sdk_startup_unknown_checkpoint_or_modified_final_user_stays_unavailable() {
+        for (reject, corrupt, mutate, duplicate, wrong_session) in [
+            (true, false, false, false, false),
+            (false, true, false, false, false),
+            (false, false, true, false, false),
+            (false, false, false, true, false),
+            (false, false, false, false, true),
+        ] {
+            let mut session = Session::new("sdk-deny", "model");
+            let user = Message::user("prepared");
+            let inputs = producer(&session, &user, true);
+            session.add_message(user.clone());
+            if mutate {
+                session.messages[0].content.push_str(" changed");
+            }
+            if duplicate {
+                session.add_message(user);
+            }
+            if wrong_session {
+                session.id = "wrong".into();
+            }
+            assert!(inputs
+                .seal_sdk_input(&mut session, Some(&repository(reject, corrupt)))
+                .await
+                .is_err());
+            if wrong_session {
+                assert!(inputs.take_startup_observation(&session.id).is_none());
+            } else {
+                assert!(current(&inputs, &session).is_none());
+            }
+        }
+    }
+    #[tokio::test]
+    async fn sdk_legacy_hook_rewrite_is_bound_to_original_id_while_generic_history_is_unsealed() {
+        let mut session = Session::new("sdk-string", "model");
+        let user = Message::user("original");
+        let inputs = producer(&session, &user, false);
+        session.add_message(user.clone());
+        session.messages[0].content = "real portable hook result".into();
+        inputs
+            .seal_sdk_input(&mut session, Some(&repository(false, false)))
+            .await
+            .unwrap();
+        assert_eq!(
+            current(&inputs, &session).unwrap().records()[0].input_id,
+            user.id
+        );
+        let generic =
+            UntrustedExecutionInputs::new(vec![
+                UntrustedInputObservation::new(&user.id, None).unwrap()
+            ])
+            .unwrap();
+        generic
+            .seal_sdk_input(&mut session, Some(&repository(false, false)))
+            .await
+            .unwrap();
+        assert!(generic.sdk_execution_id().is_none());
+        assert!(generic.take_startup_observation(&session.id).is_none());
+    }
+    #[test]
+    fn sdk_header_binding_accepts_only_the_canonical_prompt_changes() {
+        let mut original = Message::user("canonical");
+        original.content_parts = Some(vec![
+            bamboo_domain::MessagePart::Text {
+                text: "unrelated native text".into(),
+            },
+            bamboo_domain::MessagePart::Text {
+                text: "canonical".into(),
+            },
+        ]);
+        let digest = sdk_message_header_digest(&original);
+        let mut prepared = original.clone();
+        prepared.content = "canonical plus F".into();
+        if let bamboo_domain::MessagePart::Text { text } =
+            &mut prepared.content_parts.as_mut().unwrap()[1]
+        {
+            *text = prepared.content.clone();
+        }
+        assert_eq!(sdk_message_header_digest(&prepared), digest);
+        prepared.id = "different".into();
+        assert_ne!(sdk_message_header_digest(&prepared), digest);
+        prepared = original;
+        if let bamboo_domain::MessagePart::Text { text } =
+            &mut prepared.content_parts.as_mut().unwrap()[0]
+        {
+            *text = "tampered".into();
+        }
+        assert_ne!(sdk_message_header_digest(&prepared), digest);
+    }
+}

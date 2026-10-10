@@ -37,6 +37,26 @@ pub(super) async fn maybe_handle_taskwrite(
         return;
     }
 
+    if session
+        .metadata
+        .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+    {
+        // TicketService already committed the exact private LocalPlan. This
+        // Session list is a display cache, and must never patch an old Root Task.
+        reinitialize_task_context(task_context, session, session_id, true);
+        if let Some(task_list) = session.task_list.clone() {
+            let _ = event_tx
+                .send(AgentEvent::TaskListUpdated {
+                    task_list,
+                    version: session
+                        .task_list_version_meta()
+                        .and_then(|v| v.parse().ok()),
+                })
+                .await;
+        }
+        return;
+    }
+
     let Ok(args) = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments) else {
         return;
     };

@@ -208,6 +208,11 @@ fn validate_provider_type(provider_type: &str) -> Result<(), AppError> {
 
 fn validate_instance_config(instance: &ProviderInstanceConfig) -> Result<(), AppError> {
     validate_provider_type(&instance.provider_type)?;
+    let mut config = bamboo_config::Config::default();
+    config
+        .provider_instances
+        .insert("instance".into(), instance.clone());
+    bamboo_config::validate_runtime_model_admission(&config).map_err(AppError::BadRequest)?;
 
     if let Some(request_overrides) = &instance.request_overrides {
         let original = serde_json::to_value(request_overrides).map_err(|error| {
@@ -404,7 +409,29 @@ fn apply_instance_update(
             obj.remove(bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY);
         }
 
-        for (key, value) in patch_obj {
+        for (key, mut value) in patch_obj {
+            if key == "model_capabilities" {
+                if let (Some(current), Some(patch)) =
+                    (obj.get(&key).and_then(Value::as_object), value.as_object())
+                {
+                    let mut merged = current.clone();
+                    for (model, capability) in patch {
+                        let capability = match (
+                            merged.get(model).and_then(Value::as_object),
+                            capability.as_object(),
+                        ) {
+                            (Some(old), Some(new)) => {
+                                let mut fields = old.clone();
+                                fields.extend(new.clone());
+                                Value::Object(fields)
+                            }
+                            _ => capability.clone(),
+                        };
+                        merged.insert(model.clone(), capability);
+                    }
+                    value = Value::Object(merged);
+                }
+            }
             obj.insert(key, value);
         }
     }
@@ -717,6 +744,39 @@ mod tests {
             enabled: None,
             config: serde_json::json!({ "api_key": api_key }),
         }
+    }
+
+    #[test]
+    fn admission_rejects_malformed_lists_and_removal_of_assigned_models() {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!("all"),
+            serde_json::json!([42]),
+            serde_json::json!([""]),
+        ] {
+            let mut request = create_request("sk-real");
+            request.config["runtime_models"] = value;
+            assert!(build_instance_from_create(&request).is_err());
+        }
+        let mut request = create_request("sk-real");
+        request.config["model"] = serde_json::json!("chat");
+        request.config["runtime_models"] = serde_json::json!(["chat", "custom/id"]);
+        let instance = build_instance_from_create(&request).unwrap();
+        let update = UpdateInstanceRequest {
+            label: None,
+            enabled: None,
+            config: Some(serde_json::json!({"runtime_models":["custom/id"]})),
+        };
+        assert!(apply_instance_update(&instance, &update).is_err());
+        let update = UpdateInstanceRequest {
+            config: Some(serde_json::json!({"model":null,"runtime_models":[]})),
+            ..update
+        };
+        let empty = apply_instance_update(&instance, &update).unwrap();
+        assert_eq!(
+            instance_config_to_api(&empty, true)["runtime_models"],
+            serde_json::json!([])
+        );
     }
 
     #[test]
@@ -2026,5 +2086,39 @@ mod tests {
             .resolve(&credential_ref)
             .expect("cleared credential lookup")
             .is_none());
+    }
+    #[test]
+    fn vision_crud_round_trips_per_model_and_can_restore_default_support() {
+        let mut request = create_request("fixture-key");
+        request.config["model_capabilities"] =
+            serde_json::json!({"image":{"supports_vision":true},"text":{"supports_vision":false}});
+        let instance = build_instance_from_create(&request).unwrap();
+        let response = instance_config_to_api(&instance, true);
+        assert_eq!(
+            response["model_capabilities"]["image"]["supports_vision"],
+            true
+        );
+        assert_eq!(
+            response["model_capabilities"]["text"]["supports_vision"],
+            false
+        );
+        let update = UpdateInstanceRequest {
+            label: None,
+            enabled: None,
+            config: Some(
+                serde_json::json!({"model_capabilities":{"image":{"supports_vision":null}}}),
+            ),
+        };
+        let inherited = apply_instance_update(&instance, &update).unwrap();
+        let overrides = bamboo_config::model_vision_overrides(&inherited).unwrap();
+        assert!(!overrides.contains_key("image"));
+        assert_eq!(overrides["text"], false);
+        let invalid = UpdateInstanceRequest {
+            config: Some(
+                serde_json::json!({"model_capabilities":{"image":{"supports_vision":"false"}}}),
+            ),
+            ..update
+        };
+        assert!(apply_instance_update(&instance, &invalid).is_err());
     }
 }

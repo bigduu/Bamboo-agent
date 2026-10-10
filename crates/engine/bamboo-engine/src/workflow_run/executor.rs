@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Weak,
+};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,7 +21,7 @@ use bamboo_domain::{
     WorkflowSuspensionContext,
 };
 use chrono::Utc;
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use futures::{future::join_all, stream::FuturesUnordered, StreamExt};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -36,19 +39,27 @@ type SecretResolutionFuture<'a> =
 pub struct NamedAgentSpec {
     pub name: String,
     pub allowed_capabilities: BTreeSet<String>,
+    pub profile:
+        Option<Arc<crate::session_app::child_session::named_profile::ResolvedChildProfile>>,
+    pub cost_supported: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct AgentStepResult {
     pub output: Value,
     pub tokens: u64,
-    pub cost_micros: u64,
+    pub cost_micros: Option<u64>,
+    /// A completed attempt may fail after consuming tokens; its usage still counts.
+    pub failure: Option<WorkflowFailure>,
+    /// Process-local ownership handoff; absent for ports without retained results.
+    pub attempt_id: Option<String>,
 }
 
 #[async_trait]
 pub trait AgentStepPort: Send + Sync {
     /// #563 seam. Unknown names must return `Ok(None)` and fail preflight.
-    async fn resolve(&self, name: &str) -> Result<Option<NamedAgentSpec>, String>;
+    async fn resolve(&self, name: &str, session_id: &str)
+        -> Result<Option<NamedAgentSpec>, String>;
     async fn execute(
         &self,
         spec: &NamedAgentSpec,
@@ -57,7 +68,20 @@ pub trait AgentStepPort: Send + Sync {
         effort: Option<&str>,
         capabilities: &BTreeSet<String>,
         session_id: &str,
+        root_run_id: &str,
+        cancellation: CancellationToken,
     ) -> Result<AgentStepResult, String>;
+    /// Consume a retained result while the caller owns the usage ledger lock.
+    fn acknowledge_result(&self, _attempt_id: &str) -> bool {
+        true
+    }
+    /// Stop and drain cancelled executions owned by this root run.
+    async fn drain_cancelled(
+        &self,
+        _root_run_id: &str,
+    ) -> (Vec<Result<AgentStepResult, String>>, Option<String>) {
+        (Vec::new(), None)
+    }
 }
 
 #[async_trait]
@@ -135,6 +159,8 @@ pub enum WorkflowRunError {
     InvalidInput(String),
     #[error("workflow preflight failed: {0}")]
     Preflight(String),
+    #[error("named agents without monetary measurement do not support a finite monetary budget")]
+    UnsupportedMonetaryBudget,
     #[error("workflow storage failed: {0}")]
     Storage(String),
     #[error("workflow run not found")]
@@ -159,6 +185,11 @@ pub struct WorkflowRunEngine {
 struct ActiveRun {
     cancellation: CancellationToken,
     snapshot: Arc<Mutex<WorkflowRunSnapshot>>,
+    root_run_id: String,
+    ledger: Arc<Mutex<WorkflowBudgetUsage>>,
+    drain_lock: Arc<Mutex<()>>,
+    cleanup_pending: AtomicBool,
+    has_agents: bool,
 }
 
 struct RuntimeRegistration {
@@ -169,8 +200,14 @@ struct RuntimeRegistration {
 impl Drop for RuntimeRegistration {
     fn drop(&mut self) {
         if let Some(engine) = self.engine.upgrade() {
-            engine.active.remove(&self.run_id);
-            engine.events.remove(&self.run_id);
+            let pending = engine
+                .active
+                .get(&self.run_id)
+                .is_some_and(|run| run.cleanup_pending.load(Ordering::Acquire));
+            if !pending {
+                engine.active.remove(&self.run_id);
+                engine.events.remove(&self.run_id);
+            }
         }
     }
 }
@@ -191,6 +228,8 @@ struct RunContext {
     depth: u32,
     ledger: Arc<Mutex<WorkflowBudgetUsage>>,
     root_limits: WorkflowBudgets,
+    root_run_id: String,
+    drain_lock: Arc<Mutex<()>>,
 }
 
 impl Clone for RunContext {
@@ -211,6 +250,8 @@ impl Clone for RunContext {
             depth: self.depth,
             ledger: self.ledger.clone(),
             root_limits: self.root_limits.clone(),
+            root_run_id: self.root_run_id.clone(),
+            drain_lock: self.drain_lock.clone(),
         }
     }
 }
@@ -290,6 +331,7 @@ impl WorkflowRunEngine {
             limits,
             semaphore,
             None,
+            None,
         )
         .await
     }
@@ -341,6 +383,7 @@ impl WorkflowRunEngine {
                     limits,
                     semaphore,
                     Some(signal.clone()),
+                    None,
                 )
                 .await;
             if let Err(error) = result {
@@ -359,7 +402,7 @@ impl WorkflowRunEngine {
     }
 
     /// Phase-1 safe restart starts a fresh run from the suspended run's pinned
-    /// definition snapshot. Prefix/script resume remains explicitly out of scope (#581).
+    /// definition snapshot. Entered-step replay and script resume remain out of scope.
     pub async fn restart(
         self: &Arc<Self>,
         run_id: &str,
@@ -405,6 +448,276 @@ impl WorkflowRunEngine {
         .await
     }
 
+    /// Validate an unentered suffix using only the durable checkpoint. This is
+    /// also the metadata predicate; invocation authority is checked separately.
+    pub fn completed_prefix(snapshot: &WorkflowRunSnapshot) -> Result<usize, WorkflowRunError> {
+        let refuse = || {
+            WorkflowRunError::Preflight("workflow has no safe completed-prefix checkpoint".into())
+        };
+        if snapshot.status != WorkflowRunStatus::Suspended
+            || !matches!(
+                snapshot.suspension,
+                Some(WorkflowSuspensionContext::Recovery { .. })
+            )
+            || snapshot.parent_run_id.is_some()
+            || snapshot.parent_step_id.is_some()
+            || snapshot.output.is_some()
+            || snapshot.failure.is_some()
+        {
+            return Err(refuse());
+        }
+        let bundle = &snapshot.definition_bundle;
+        if bundle.definitions.len() != 1
+            || bundle.root_id != snapshot.definition.id
+            || bundle.root_revision != snapshot.definition.revision
+            || bundle.root() != Some(&snapshot.definition)
+            || definition_bundle_hash(bundle)? != snapshot.definition_bundle_hash
+        {
+            return Err(refuse());
+        }
+        let compiled = CompiledWorkflow::compile(snapshot.definition.clone())?;
+        compiled
+            .validate_input(&snapshot.validated_args)
+            .map_err(WorkflowRunError::InvalidInput)?;
+        reject_secret_material(&snapshot.validated_args).map_err(WorkflowRunError::InvalidInput)?;
+        let serialized = serde_json::to_value(bundle)
+            .map_err(|error| WorkflowRunError::Preflight(error.to_string()))?;
+        reject_secret_material_in_definition(&serialized).map_err(WorkflowRunError::Preflight)?;
+        let WorkflowPlan::Sequence { nodes } = &snapshot.definition.plan else {
+            return Err(refuse());
+        };
+        let ids = nodes
+            .iter()
+            .map(|node| match node {
+                WorkflowPlan::Step { step } => Ok(step.as_str()),
+                _ => Err(refuse()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.is_empty()
+            || ids.len() != compiled.steps.len()
+            || ids.iter().copied().collect::<BTreeSet<_>>().len() != ids.len()
+        {
+            return Err(refuse());
+        }
+        let mut outputs = BTreeMap::new();
+        let mut prefix = 0;
+        let mut suffix = false;
+        for id in ids.iter().copied() {
+            let step = compiled.steps.get(id).ok_or_else(refuse)?;
+            let WorkflowStepKind::Tool {
+                args, capabilities, ..
+            } = &step.kind
+            else {
+                return Err(refuse());
+            };
+            if capabilities.iter().any(|capability| capability != "read")
+                || contains_secret_handle(args)
+            {
+                return Err(refuse());
+            }
+            let Some(state) = snapshot.steps.get(id) else {
+                suffix = true;
+                continue;
+            };
+            if suffix
+                || state.id != id
+                || state.status != WorkflowStepStatus::Succeeded
+                || state.attempts != 1
+                || state.failure.is_some()
+            {
+                return Err(refuse());
+            }
+            let input = resolve_checkpoint_template(args, &snapshot.validated_args, &outputs)?;
+            let hash = hex::encode(Sha256::digest(
+                serde_json::to_vec(&input)
+                    .map_err(|error| WorkflowRunError::InvalidInput(error.to_string()))?,
+            ));
+            let output = state.output.as_ref().ok_or_else(refuse)?;
+            if hash != state.input_hash {
+                return Err(refuse());
+            }
+            if let Some(schema) = &step.output_schema {
+                validate_schema(schema, output).map_err(|_| refuse())?;
+            }
+            reject_secret_material(output).map_err(|_| refuse())?;
+            outputs.insert(id.to_string(), output.clone());
+            prefix += 1;
+        }
+        let usage = &snapshot.usage;
+        let budget = &snapshot.definition.budgets;
+        if prefix == 0
+            || snapshot.steps.len() != prefix
+            || usage.steps as usize != prefix
+            || usage.agents != 0
+            || usage.retries != 0
+            || ids.len() > budget.max_steps as usize
+            || budget.max_tokens.is_some_and(|limit| usage.tokens > limit)
+            || budget
+                .max_cost_micros
+                .is_some_and(|limit| usage.cost_micros.is_none_or(|cost| cost > limit))
+            || remaining_wall_time(snapshot) == 0
+        {
+            return Err(refuse());
+        }
+        Ok(prefix)
+    }
+
+    /// Explicitly continue the same readonly run; no entered step is replayed.
+    /// The original created_at + wall_time_ms deadline includes time offline.
+    pub async fn continue_completed_prefix(
+        self: &Arc<Self>,
+        run_id: &str,
+        session_id: &str,
+        workspace_trusted: bool,
+        allowed_capabilities: Vec<String>,
+    ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
+        let previous = self
+            .repository
+            .load(run_id)
+            .await
+            .map_err(storage)?
+            .ok_or(WorkflowRunError::NotFound)?;
+        if previous.run_id != run_id || previous.session_id != session_id {
+            return Err(WorkflowRunError::NotFound);
+        }
+        Self::completed_prefix(&previous)?;
+        let snapshot = Arc::new(Mutex::new(previous.clone()));
+        let cancellation = CancellationToken::new();
+        let ledger = Arc::new(Mutex::new(previous.usage.clone()));
+        let drain_lock = Arc::new(Mutex::new(()));
+        let active = Arc::new(ActiveRun {
+            cancellation: cancellation.clone(),
+            snapshot: snapshot.clone(),
+            root_run_id: run_id.to_string(),
+            ledger: ledger.clone(),
+            drain_lock: drain_lock.clone(),
+            cleanup_pending: AtomicBool::new(false),
+            has_agents: false,
+        });
+        match self.active.entry(run_id.to_string()) {
+            Entry::Occupied(_) => {
+                return Err(WorkflowRunError::Preflight(
+                    "workflow continuation is already active".into(),
+                ))
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(active);
+            }
+        }
+        let registration = RuntimeRegistration {
+            engine: Arc::downgrade(self),
+            run_id: run_id.to_string(),
+        };
+        // A concurrent cancellation may have committed while admission was
+        // loading the checkpoint. Re-read after acquiring the existing owner.
+        let current = self
+            .repository
+            .load(run_id)
+            .await
+            .map_err(storage)?
+            .ok_or(WorkflowRunError::NotFound)?;
+        let prefix = Self::completed_prefix(&current)?;
+        if current != previous {
+            return Err(WorkflowRunError::Preflight(
+                "workflow checkpoint changed during continuation admission".into(),
+            ));
+        }
+        self.validate_bundle(&current.definition, &current.definition_bundle)?;
+        self.enforce_ceilings(&current.definition.budgets)?;
+        let allowed_capabilities = allowed_capabilities.into_iter().collect::<BTreeSet<_>>();
+        let root_limits = effective_limits(&current.definition.budgets, &self.ceilings);
+        self.preflight_bundle(
+            &current.definition_bundle,
+            session_id,
+            &allowed_capabilities,
+            workspace_trusted,
+            &root_limits,
+        )
+        .await?;
+        let permission_port = self
+            .session_permissions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(port) = permission_port {
+            port.flags_for_session(session_id).await.map_err(|_| {
+                WorkflowRunError::Preflight(
+                    "workflow session permission posture is unavailable".into(),
+                )
+            })?;
+        }
+        Self::completed_prefix(&current)?;
+        let compiled = Arc::new(CompiledWorkflow::compile(current.definition.clone())?);
+        let context = RunContext {
+            engine: self.clone(),
+            compiled,
+            bundle: Arc::new(current.definition_bundle),
+            pinned_agents: Arc::new(HashMap::new()),
+            snapshot: snapshot.clone(),
+            cancellation: cancellation.clone(),
+            branch_cancellation: cancellation.child_token(),
+            allowed_capabilities,
+            workspace_trusted,
+            semaphore: Arc::new(Semaphore::new(root_limits.max_concurrency)),
+            items: HashMap::new(),
+            scope: "root".into(),
+            depth: 0,
+            ledger,
+            root_limits,
+            root_run_id: run_id.to_string(),
+            drain_lock,
+        };
+        let (sender, _) = broadcast::channel(256);
+        self.events.insert(run_id.to_string(), sender);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let _registration = registration;
+            let start = {
+                let mut snapshot = snapshot.lock().await;
+                if cancellation.is_cancelled() {
+                    Err(WorkflowRunError::Preflight(
+                        "workflow continuation was cancelled during admission".into(),
+                    ))
+                } else {
+                    engine
+                        .transition(
+                            &mut snapshot,
+                            None,
+                            WorkflowRunEventKind::RunStarted,
+                            |snapshot| {
+                                snapshot.status = WorkflowRunStatus::Running;
+                                snapshot.suspension = None;
+                            },
+                        )
+                        .await
+                        .map(|()| snapshot.clone())
+                }
+            };
+            match start {
+                Ok(started) => {
+                    let timeout_ms = remaining_wall_time(&started);
+                    let _ = tx.send(Ok(started));
+                    if engine
+                        .execute_context(context, timeout_ms, prefix)
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!(
+                            "background workflow continuation failed after durable start"
+                        );
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(error));
+                }
+            }
+        });
+        rx.await.map_err(|_| {
+            WorkflowRunError::Storage("workflow continuation exited before durable start".into())
+        })?
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn run_internal(
         self: &Arc<Self>,
@@ -419,6 +732,7 @@ impl WorkflowRunEngine {
         root_limits: WorkflowBudgets,
         semaphore: Arc<Semaphore>,
         started: Option<StartSignal>,
+        root_run_id: Option<String>,
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
         if request.definition.steps.len() > self.ceilings.max_steps as usize {
             return Err(WorkflowRunError::Preflight(
@@ -444,6 +758,7 @@ impl WorkflowRunEngine {
         })?;
 
         let run_id = Uuid::new_v4().to_string();
+        let root_run_id = root_run_id.unwrap_or_else(|| run_id.clone());
         let now = Utc::now();
         let snapshot = WorkflowRunSnapshot {
             run_id: run_id.clone(),
@@ -473,11 +788,17 @@ impl WorkflowRunEngine {
         self.events.insert(run_id.clone(), sender);
         self.publish(&queued);
         let snapshot = Arc::new(Mutex::new(snapshot));
+        let drain_lock = Arc::new(Mutex::new(()));
         self.active.insert(
             run_id.clone(),
             Arc::new(ActiveRun {
                 cancellation: cancellation.clone(),
                 snapshot: snapshot.clone(),
+                root_run_id: root_run_id.clone(),
+                ledger: ledger.clone(),
+                drain_lock: drain_lock.clone(),
+                cleanup_pending: AtomicBool::new(false),
+                has_agents: !pinned_agents.is_empty(),
             }),
         );
         let _registration = RuntimeRegistration {
@@ -522,13 +843,65 @@ impl WorkflowRunEngine {
             depth,
             ledger,
             root_limits,
+            root_run_id: root_run_id.clone(),
+            drain_lock,
         };
+        self.execute_context(context, compiled.definition.budgets.wall_time_ms, 0)
+            .await
+    }
+
+    async fn execute_context(
+        self: &Arc<Self>,
+        context: RunContext,
+        timeout_ms: u64,
+        completed_prefix: usize,
+    ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
+        let compiled = &context.compiled;
+        let snapshot = &context.snapshot;
+        let cancellation = &context.cancellation;
+        let run_id = snapshot.lock().await.run_id.clone();
         let result = tokio::time::timeout(
-            Duration::from_millis(compiled.definition.budgets.wall_time_ms),
-            context.execute_node(&compiled.definition.plan, "root"),
+            Duration::from_millis(timeout_ms),
+            context.execute_root(completed_prefix),
         )
         .await;
+        if result.is_err() {
+            cancellation.cancel();
+        }
+        let _drain_guard = context.drain_lock.lock().await;
+        {
+            let snapshot = snapshot.lock().await;
+            if snapshot.status.is_terminal() {
+                return Ok(snapshot.clone());
+            }
+        }
+        if result.is_err() {
+            if let Some(durable) = self.repository.load(&run_id).await.map_err(storage)? {
+                *snapshot.lock().await = durable;
+            }
+        }
+        let (usage_unavailable, drain_error) = context.drain_agents().await;
+        // A node can be dropped after its ledger handoff but before checkpoint.
+        if context.ledger.lock().await.agents > 0 {
+            context
+                .checkpoint_agent_usage("AgentDrained")
+                .await
+                .map_err(|e| WorkflowRunError::Storage(e.message))?;
+        }
+        if drain_error.is_some() {
+            if let Some(active) = self.active.get(&run_id) {
+                active.cleanup_pending.store(true, Ordering::Release);
+            }
+            return Err(WorkflowRunError::Preflight(
+                "Workflow children have not confirmed stop; cancellation can be retried".into(),
+            ));
+        }
         let mut final_snapshot = snapshot.lock().await;
+        if usage_unavailable && !final_snapshot.status.is_terminal() {
+            self.finish_failed(&mut final_snapshot, failure(WorkflowFailureCode::ExecutionFailed,
+                "workflow Agent stopped but cumulative token observation unavailable; usage is not measured", false)).await?;
+            return Ok(final_snapshot.clone());
+        }
         if final_snapshot.status.is_terminal() {
             return Ok(final_snapshot.clone());
         }
@@ -620,8 +993,20 @@ impl WorkflowRunEngine {
         self.active.contains_key(run_id)
     }
 
-    pub async fn cancel(&self, run_id: &str) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
-        let mut snapshot = self
+    #[cfg(test)]
+    pub(super) fn test_active_ledger(
+        &self,
+        run_id: &str,
+    ) -> (Arc<Mutex<WorkflowBudgetUsage>>, CancellationToken) {
+        let active = self.active.get(run_id).unwrap();
+        (active.ledger.clone(), active.cancellation.clone())
+    }
+
+    pub async fn cancel(
+        self: &Arc<Self>,
+        run_id: &str,
+    ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
+        let snapshot = self
             .repository
             .load(run_id)
             .await
@@ -633,16 +1018,108 @@ impl WorkflowRunEngine {
         if snapshot.status.is_terminal() {
             return Err(WorkflowRunError::Terminal);
         }
-        if let Some(active) = self.active.get(run_id).map(|active| active.clone()) {
+        // Inactive cancellation must own the same entry as continuation.
+        // Otherwise it can commit a terminal outcome after a new worker has
+        // registered without cancelling that worker's token.
+        let (active, _registration) = match self.active.entry(run_id.to_string()) {
+            Entry::Occupied(entry) => (entry.get().clone(), None),
+            Entry::Vacant(entry) => {
+                let active = Arc::new(ActiveRun {
+                    cancellation: CancellationToken::new(),
+                    snapshot: Arc::new(Mutex::new(snapshot)),
+                    root_run_id: run_id.to_string(),
+                    ledger: Arc::new(Mutex::new(WorkflowBudgetUsage::default())),
+                    drain_lock: Arc::new(Mutex::new(())),
+                    cleanup_pending: AtomicBool::new(false),
+                    has_agents: false,
+                });
+                entry.insert(active.clone());
+                (
+                    active,
+                    Some(RuntimeRegistration {
+                        engine: Arc::downgrade(self),
+                        run_id: run_id.to_string(),
+                    }),
+                )
+            }
+        };
+        {
             active.cancellation.cancel();
+            // Tool-only runs keep their existing cancellation/repository path.
+            if !active.has_agents {
+                let mut shared = active.snapshot.lock().await;
+                if !shared.status.is_terminal() {
+                    self.finish_cancelled(&mut shared).await?;
+                }
+                return Ok(shared.clone());
+            }
+            let _drain_guard = active.drain_lock.lock().await;
+            {
+                let snapshot = active.snapshot.lock().await;
+                if snapshot.status.is_terminal() {
+                    return Ok(snapshot.clone());
+                }
+            }
+            let mut usage_unavailable = false;
+            let mut ledger = active.ledger.lock().await;
+            let (drained, drain_error) = self.agents.drain_cancelled(&active.root_run_id).await;
+            let usage = {
+                let usage = &mut *ledger;
+                for result in drained {
+                    match result {
+                        Ok(result) => {
+                            usage.tokens = usage.tokens.saturating_add(result.tokens);
+                            usage.cost_micros = usage
+                                .cost_micros
+                                .zip(result.cost_micros)
+                                .map(|(a, b)| a.saturating_add(b));
+                        }
+                        Err(_) => {
+                            usage_unavailable = true;
+                            usage.cost_micros = None;
+                        }
+                    }
+                }
+                usage.clone()
+            };
+            drop(ledger);
+            {
+                let mut shared = active.snapshot.lock().await;
+                self.transition(
+                    &mut shared,
+                    None,
+                    WorkflowRunEventKind::Phase {
+                        name: "AgentDrained".into(),
+                    },
+                    |snapshot| {
+                        snapshot.usage.tokens = usage.tokens;
+                        snapshot.usage.cost_micros = usage.cost_micros;
+                    },
+                )
+                .await?;
+            }
+            if drain_error.is_some() {
+                active.cleanup_pending.store(true, Ordering::Release);
+                return Err(WorkflowRunError::Preflight(
+                    "Workflow children have not confirmed stop; cancellation can be retried".into(),
+                ));
+            }
             let mut shared = active.snapshot.lock().await;
             if !shared.status.is_terminal() {
-                self.finish_cancelled(&mut shared).await?;
+                if usage_unavailable {
+                    self.finish_failed(&mut shared, failure(WorkflowFailureCode::ExecutionFailed,
+                        "workflow Agent stopped but cumulative token observation unavailable; usage is not measured", false)).await?;
+                } else {
+                    self.finish_cancelled(&mut shared).await?;
+                }
             }
-            return Ok(shared.clone());
+            let result = shared.clone();
+            if active.cleanup_pending.swap(false, Ordering::AcqRel) {
+                self.active.remove(run_id);
+                self.events.remove(run_id);
+            }
+            Ok(result)
         }
-        self.finish_cancelled(&mut snapshot).await?;
-        Ok(snapshot)
     }
 
     pub async fn recover(&self) -> Result<Vec<WorkflowRunSnapshot>, WorkflowRunError> {
@@ -835,7 +1312,7 @@ impl WorkflowRunEngine {
                         } else {
                             let spec = self
                                 .agents
-                                .resolve(agent)
+                                .resolve(agent, session_id)
                                 .await
                                 .map_err(|_| {
                                     WorkflowRunError::Preflight(
@@ -855,6 +1332,12 @@ impl WorkflowRunEngine {
                             pinned_agents.insert(agent.clone(), spec.clone());
                             spec
                         };
+                        if (root_limits.max_cost_micros.is_some()
+                            || compiled.definition.budgets.max_cost_micros.is_some())
+                            && !spec.cost_supported
+                        {
+                            return Err(WorkflowRunError::UnsupportedMonetaryBudget);
+                        }
                         if !capabilities
                             .iter()
                             .all(|capability| spec.allowed_capabilities.contains(capability))
@@ -1166,6 +1649,28 @@ impl WorkflowRunEngine {
 }
 
 impl RunContext {
+    async fn execute_root(&self, completed_prefix: usize) -> Result<Value, WorkflowFailure> {
+        if completed_prefix == 0 {
+            return self
+                .execute_node(&self.compiled.definition.plan, "root")
+                .await;
+        }
+        let WorkflowPlan::Sequence { nodes } = &self.compiled.definition.plan else {
+            unreachable!("validated flat sequence");
+        };
+        let WorkflowPlan::Step { step } = &nodes[completed_prefix - 1] else {
+            unreachable!("validated tool leaf");
+        };
+        let mut result = self.snapshot.lock().await.steps[step]
+            .output
+            .clone()
+            .expect("validated completed output");
+        for (index, node) in nodes.iter().enumerate().skip(completed_prefix) {
+            result = self.execute_node(node, &format!("root.{index}")).await?;
+        }
+        Ok(result)
+    }
+
     fn execute_node<'a>(&'a self, plan: &'a WorkflowPlan, path: &'a str) -> NodeFuture<'a> {
         Box::pin(async move {
             self.check_cancelled()?;
@@ -1217,6 +1722,22 @@ impl RunContext {
                                 // leaving it parked inside FuturesUnordered would
                                 // deadlock this reconciliation.
                                 drop(futures);
+                                if !self.pinned_agents.is_empty() {
+                                    let _drain_guard = self.drain_lock.lock().await;
+                                    let (usage_unavailable, drain_error) =
+                                        self.drain_agents().await;
+                                    self.checkpoint_agent_usage("AgentDrained").await?;
+                                    if usage_unavailable {
+                                        return Err(failure(WorkflowFailureCode::ExecutionFailed, "workflow Agent cumulative token observation unavailable; usage is not measured", false));
+                                    }
+                                    if drain_error.is_some() {
+                                        return Err(failure(
+                                            WorkflowFailureCode::ExecutionFailed,
+                                            "Workflow children have not confirmed stop",
+                                            false,
+                                        ));
+                                    }
+                                }
                                 self.cancel_active_parallel_steps(nodes).await?;
                                 error.message =
                                     format!("parallel branch[{index}] failed: {}", error.message);
@@ -1225,6 +1746,28 @@ impl RunContext {
                         }
                     }
                     Ok(Value::Array(output))
+                }
+                WorkflowPlan::Choice {
+                    condition,
+                    then_branch,
+                    else_branch,
+                } => {
+                    let condition = self.resolve_ref(condition).await?;
+                    let selected = condition.as_bool().ok_or_else(|| {
+                        failure(
+                            WorkflowFailureCode::InvalidInput,
+                            "choice condition must be a boolean",
+                            false,
+                        )
+                    })?;
+                    let (chosen, unchosen, branch) = if selected {
+                        (then_branch, else_branch, "then")
+                    } else {
+                        (else_branch, then_branch, "else")
+                    };
+                    self.skip_plan(unchosen, "conditional branch not selected")
+                        .await?;
+                    self.execute_node(chosen, &format!("{path}.{branch}")).await
                 }
                 WorkflowPlan::Map { source, item, body } => {
                     let source = self.resolve_ref(source).await?;
@@ -1700,6 +2243,9 @@ impl RunContext {
                 for _ in 0..*structured_output_attempts {
                     self.ensure_agent_usage_budget_available().await?;
                     self.reserve_agent().await?;
+                    if !spec.cost_supported {
+                        self.ledger.lock().await.cost_micros = None;
+                    }
                     self.checkpoint_usage("agent_reserved").await?;
                     match self
                         .engine
@@ -1711,13 +2257,35 @@ impl RunContext {
                             effort.as_deref(),
                             &requested,
                             &session_id,
+                            &self.root_run_id,
+                            self.branch_cancellation.child_token(),
                         )
                         .await
                     {
                         Ok(result) => {
+                            let _drain_guard = self.drain_lock.lock().await;
+                            let mut usage = self.ledger.lock().await;
+                            if result
+                                .attempt_id
+                                .as_ref()
+                                .is_some_and(|id| !self.engine.agents.acknowledge_result(id))
+                            {
+                                self.check_cancelled()?;
+                                return Err(failure(
+                                    WorkflowFailureCode::Cancelled,
+                                    "workflow Agent result already drained",
+                                    false,
+                                ));
+                            }
+                            // No await between ownership transfer and accounting.
                             let exceeded =
-                                self.record_usage(result.tokens, result.cost_micros).await;
+                                self.record_usage(&mut usage, result.tokens, result.cost_micros);
+                            drop(usage);
                             self.checkpoint_usage("agent_usage_recorded").await?;
+                            self.check_cancelled()?;
+                            if let Some(error) = result.failure {
+                                return Err(error);
+                            }
                             if let Some(error) = exceeded {
                                 return Err(error);
                             }
@@ -1730,7 +2298,12 @@ impl RunContext {
                             return Ok(result.output);
                         }
                         Err(_error) => {
-                            last_error = Some("named agent execution failed".to_string())
+                            self.check_cancelled()?;
+                            return Err(failure(
+                                WorkflowFailureCode::ExecutionFailed,
+                                "named agent execution or usage observation unavailable",
+                                false,
+                            ));
                         }
                     }
                 }
@@ -1783,6 +2356,7 @@ impl RunContext {
                     self.root_limits.clone(),
                     self.semaphore.clone(),
                     None,
+                    Some(self.root_run_id.clone()),
                 ))
                 .await
                 .map_err(|_error| {
@@ -1892,10 +2466,17 @@ impl RunContext {
         Ok(())
     }
 
-    async fn record_usage(&self, tokens: u64, cost_micros: u64) -> Option<WorkflowFailure> {
-        let mut usage = self.ledger.lock().await;
+    fn record_usage(
+        &self,
+        usage: &mut WorkflowBudgetUsage,
+        tokens: u64,
+        cost_micros: Option<u64>,
+    ) -> Option<WorkflowFailure> {
         let next_tokens = usage.tokens.saturating_add(tokens);
-        let next_cost = usage.cost_micros.saturating_add(cost_micros);
+        let next_cost = usage
+            .cost_micros
+            .zip(cost_micros)
+            .map(|(a, b)| a.saturating_add(b));
         usage.tokens = next_tokens;
         usage.cost_micros = next_cost;
         if self
@@ -1905,7 +2486,7 @@ impl RunContext {
             || self
                 .root_limits
                 .max_cost_micros
-                .is_some_and(|limit| next_cost > limit)
+                .is_some_and(|limit| next_cost.is_none_or(|cost| cost > limit))
         {
             return Some(failure(
                 WorkflowFailureCode::BudgetExceeded,
@@ -1914,6 +2495,26 @@ impl RunContext {
             ));
         }
         None
+    }
+
+    async fn drain_agents(&self) -> (bool, Option<String>) {
+        // Acquire before the port transfers results; after it returns there is
+        // no await until all rows are accounted. Provider execution stays parallel.
+        let mut ledger = self.ledger.lock().await;
+        let (results, error) = self.engine.agents.drain_cancelled(&self.root_run_id).await;
+        let mut unavailable = false;
+        for result in results {
+            match result {
+                Ok(result) => {
+                    self.record_usage(&mut ledger, result.tokens, result.cost_micros);
+                }
+                Err(_) => {
+                    unavailable = true;
+                    ledger.cost_micros = None;
+                }
+            }
+        }
+        (unavailable, error)
     }
 
     async fn ensure_agent_usage_budget_available(&self) -> Result<(), WorkflowFailure> {
@@ -1925,7 +2526,7 @@ impl RunContext {
             || self
                 .root_limits
                 .max_cost_micros
-                .is_some_and(|limit| usage.cost_micros >= limit)
+                .is_some_and(|limit| usage.cost_micros.is_none_or(|cost| cost >= limit))
         {
             return Err(failure(
                 WorkflowFailureCode::BudgetExceeded,
@@ -1934,6 +2535,27 @@ impl RunContext {
             ));
         }
         Ok(())
+    }
+
+    async fn checkpoint_agent_usage(&self, name: &str) -> Result<(), WorkflowFailure> {
+        let usage = self.ledger.lock().await.clone();
+        let mut snapshot = self.snapshot.lock().await;
+        self.engine
+            .transition(
+                &mut snapshot,
+                None,
+                WorkflowRunEventKind::Phase {
+                    name: name.to_string(),
+                },
+                move |snapshot| {
+                    // Only completed Agent usage is reconciled here. Other counters
+                    // retain their existing durable reservation/checkpoint semantics.
+                    snapshot.usage.tokens = usage.tokens;
+                    snapshot.usage.cost_micros = usage.cost_micros;
+                },
+            )
+            .await
+            .map_err(|e| failure(WorkflowFailureCode::Storage, e.to_string(), false))
     }
 
     async fn checkpoint_usage(&self, name: &str) -> Result<(), WorkflowFailure> {
@@ -2089,42 +2711,63 @@ impl RunContext {
                     } else {
                         format!("{step}@{}", self.scope)
                     };
-                    let reason_owned = reason.to_string();
-                    let state_id = instance_id.clone();
-                    self.step_transition(
-                        &instance_id,
-                        WorkflowRunEventKind::StepSkipped {
-                            reason: reason.to_string(),
-                        },
-                        move |snapshot| {
-                            let state = snapshot.steps.entry(state_id.clone()).or_insert(
-                                WorkflowStepSnapshot {
-                                    id: state_id,
-                                    status: WorkflowStepStatus::Skipped,
-                                    input_hash: String::new(),
-                                    output: None,
-                                    failure: Some(failure(
-                                        WorkflowFailureCode::DependencySkipped,
-                                        reason_owned.clone(),
-                                        false,
-                                    )),
-                                    attempts: 0,
-                                },
-                            );
-                            state.status = WorkflowStepStatus::Skipped;
-                            state.failure = Some(failure(
-                                WorkflowFailureCode::DependencySkipped,
-                                reason_owned,
-                                false,
-                            ));
-                        },
-                    )
-                    .await?;
+                    // A previous Retry attempt may have materialized Map items
+                    // in this branch. Close only instances in the current scope.
+                    let mut instances = {
+                        let snapshot = self.snapshot.lock().await;
+                        snapshot
+                            .steps
+                            .keys()
+                            .filter(|id| instance_is_in_scope(id, step, &self.scope))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    };
+                    if instances.is_empty() {
+                        instances.push(instance_id);
+                    }
+                    for instance_id in instances {
+                        let reason_owned = reason.to_string();
+                        let state_id = instance_id.clone();
+                        self.step_transition(
+                            &instance_id,
+                            WorkflowRunEventKind::StepSkipped {
+                                reason: reason.to_string(),
+                            },
+                            move |snapshot| {
+                                let state = snapshot.steps.entry(state_id.clone()).or_insert(
+                                    WorkflowStepSnapshot {
+                                        id: state_id,
+                                        status: WorkflowStepStatus::Skipped,
+                                        input_hash: String::new(),
+                                        output: None,
+                                        failure: None,
+                                        attempts: 0,
+                                    },
+                                );
+                                state.status = WorkflowStepStatus::Skipped;
+                                state.output = None;
+                                state.failure = Some(failure(
+                                    WorkflowFailureCode::DependencySkipped,
+                                    reason_owned,
+                                    false,
+                                ));
+                            },
+                        )
+                        .await?;
+                    }
                 }
                 WorkflowPlan::Sequence { nodes } | WorkflowPlan::Parallel { nodes } => {
                     for node in nodes {
                         self.skip_plan(node, reason).await?;
                     }
+                }
+                WorkflowPlan::Choice {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    self.skip_plan(then_branch, reason).await?;
+                    self.skip_plan(else_branch, reason).await?;
                 }
                 WorkflowPlan::Map { body, .. } | WorkflowPlan::Retry { node: body, .. } => {
                     self.skip_plan(body, reason).await?;
@@ -2294,6 +2937,71 @@ fn enforce_budget_within(
     }
 }
 
+fn remaining_wall_time(snapshot: &WorkflowRunSnapshot) -> u64 {
+    let elapsed = Utc::now()
+        .signed_duration_since(snapshot.created_at)
+        .num_milliseconds()
+        .max(0) as u64;
+    snapshot
+        .definition
+        .budgets
+        .wall_time_ms
+        .saturating_sub(elapsed)
+}
+
+fn resolve_checkpoint_template(
+    value: &Value,
+    args: &Value,
+    outputs: &BTreeMap<String, Value>,
+) -> Result<Value, WorkflowRunError> {
+    match value {
+        Value::Object(object) if object.contains_key("from") => {
+            let reference: ValueRef = serde_json::from_value(value.clone())
+                .map_err(|_| WorkflowRunError::Preflight("invalid checkpoint reference".into()))?;
+            let (root, pointer) = match &reference {
+                ValueRef::Args { pointer } => (args, pointer),
+                ValueRef::Step { step, pointer } => (
+                    outputs.get(step).ok_or_else(|| {
+                        WorkflowRunError::Preflight(
+                            "checkpoint reference is not in the completed prefix".into(),
+                        )
+                    })?,
+                    pointer,
+                ),
+                ValueRef::Literal { value } => return Ok(value.clone()),
+                ValueRef::Item { .. } => {
+                    return Err(WorkflowRunError::Preflight(
+                        "map references are unsupported for continuation".into(),
+                    ))
+                }
+            };
+            if pointer.is_empty() {
+                Ok(root.clone())
+            } else {
+                root.pointer(pointer).cloned().ok_or_else(|| {
+                    WorkflowRunError::Preflight("checkpoint reference pointer is missing".into())
+                })
+            }
+        }
+        Value::Object(object) => object
+            .iter()
+            .map(|(key, value)| {
+                Ok((
+                    key.clone(),
+                    resolve_checkpoint_template(value, args, outputs)?,
+                ))
+            })
+            .collect::<Result<serde_json::Map<_, _>, _>>()
+            .map(Value::Object),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| resolve_checkpoint_template(value, args, outputs))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        value => Ok(value.clone()),
+    }
+}
+
 fn definition_bundle_hash(bundle: &WorkflowDefinitionBundle) -> Result<String, WorkflowRunError> {
     let bytes = serde_json::to_vec(bundle)
         .map_err(|_| WorkflowRunError::Preflight("workflow bundle hashing failed".to_string()))?;
@@ -2431,6 +3139,11 @@ fn plan_leaf_count(plan: &WorkflowPlan) -> usize {
                 total.saturating_add(plan_leaf_count(node))
             })
         }
+        WorkflowPlan::Choice {
+            then_branch,
+            else_branch,
+            ..
+        } => plan_leaf_count(then_branch).max(plan_leaf_count(else_branch)),
         WorkflowPlan::Map { body, .. } | WorkflowPlan::Retry { node: body, .. } => {
             plan_leaf_count(body)
         }
@@ -2442,6 +3155,15 @@ fn plan_step_ids(plan: &WorkflowPlan) -> Vec<String> {
         WorkflowPlan::Step { step } => vec![step.clone()],
         WorkflowPlan::Sequence { nodes } | WorkflowPlan::Parallel { nodes } => {
             nodes.iter().flat_map(plan_step_ids).collect()
+        }
+        WorkflowPlan::Choice {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let mut result = plan_step_ids(then_branch);
+            result.extend(plan_step_ids(else_branch));
+            result
         }
         WorkflowPlan::Map { body, .. } | WorkflowPlan::Retry { node: body, .. } => {
             plan_step_ids(body)
@@ -2469,6 +3191,15 @@ fn plan_frontier(plan: &WorkflowPlan) -> Vec<String> {
         WorkflowPlan::Step { step } => vec![step.clone()],
         WorkflowPlan::Sequence { nodes } => nodes.first().map_or_else(Vec::new, plan_frontier),
         WorkflowPlan::Parallel { nodes } => nodes.iter().flat_map(plan_frontier).collect(),
+        WorkflowPlan::Choice {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let mut result = plan_frontier(then_branch);
+            result.extend(plan_frontier(else_branch));
+            result
+        }
         WorkflowPlan::Map { body, .. } | WorkflowPlan::Retry { node: body, .. } => {
             plan_frontier(body)
         }

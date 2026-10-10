@@ -75,7 +75,7 @@ default. The full field list of `Config`:
 | `env_vars` | `Vec<EnvVarEntry>` | User-managed env vars injected into `Bash`-tool child processes. `secret: true` entries persist only stable `credential_ref`/`configured` metadata; their values live in the isolated credential store and are returned masked by the API. |
 | `default_work_area` | `Option<DefaultWorkAreaConfig>` | `{ path: Option<String> }` — default workspace when a session has none set. |
 | `access_control` | `Option<AccessControlConfig>` | Password gate for the HTTP API/UI (`password_enabled`, hashed+salted). |
-| `features` | `FeatureFlags` | `{ provider_model_ref: bool, dynamic_model_routing: bool }` — incremental rollout toggles, both off by default. |
+| `features` | `FeatureFlags` | Incremental rollout toggles, off by default. `final_evidence_check` enables the single final-answer check described below. |
 | `stream_timeout` | `StreamTimeoutConfig` | Independent transport, first-semantic, and midstream-semantic watchdog deadlines. See below. |
 | `context_management` | `ContextManagementConfig` | Selects legacy summary compression or the opt-in exact-history retrieval window. See below. |
 | `memory` | `Option<MemoryConfig>` | Memory/auto-dream/gardener settings. See below. |
@@ -830,3 +830,64 @@ does not crash or silently reset to defaults — it runs a recovery flow
 Net effect: a corrupted `config.json` never causes silent data loss — you
 always get either your own values back (salvage/backup) or an explicit,
 confirmable prompt before anything is overwritten.
+
+### Final-answer evidence check
+
+Set `features.final_evidence_check` to `true` to check a final answer once against
+the current request's canonical Tool call/result records. The default is `false`.
+The check runs after Gold, Guardian and BeforeFinalize allow completion. It uses
+the configured fast provider/model, falling back to the current chat model, and
+shares the existing auxiliary concurrency limit, stream deadlines, cancellation
+and remaining run token budget. Its reported tokens count toward run usage and
+a separate `final_evidence_check` metrics round. No additional work tools run.
+
+When enabled, the engine buffers each response; tool-round text is published
+after that response completes, and final text is published after the check. A
+revision replaces the candidate in both visible output and canonical history,
+and clears the provider-native continuation so the next request uses that same
+answer. Disabled runs retain their existing streaming behavior.
+
+`runtime.final_evidence_check` records `supported`, `revised`,
+`skipped_no_evidence`, `skipped_budget`, `cancelled` or `failed`. Missing tool
+evidence skips the auxiliary call. An invalid verdict, provider failure, budget
+rejection or cancellation does not produce a verified completion. The check is
+a model judgment over bounded records; it does not certify omitted evidence or
+prove that an external operation completed.
+
+
+## Per-model Vision capability
+
+Provider instances may declare `model_capabilities` in their native configuration
+(exposed as `config.model_capabilities` by provider-instance CRUD). Keys are exact,
+non-empty model IDs scoped to that instance; they do not admit a runtime model.
+
+```json
+{
+  "provider_type": "openai",
+  "runtime_models": ["image-model", "text-model"],
+  "model_capabilities": {
+    "image-model": { "supports_vision": true },
+    "text-model": { "supports_vision": false }
+  }
+}
+```
+
+Vision is supported by default for new models, old configurations and missing or
+null `supports_vision` fields. Only an explicit `false` disables this model in
+this provider instance. No provider-wide toggle, model-name inference or migration
+overwrites user choices. The settings UI exposes Supports Vision / No Vision for
+each admitted model and saves new selections as supported unless opted out.
+Null restores the default supported policy through the model-level merge.
+
+`ViewImage` uses the actual provider handle and model of the current round,
+including role wrappers and reloaded providers. Explicit No Vision produces a
+paired tool error before reading or sending an image, including legacy aliases.
+Supported models receive image parts in the next model request. An explicit
+Supports Vision override bypasses legacy image fallback rewriting. A separately
+configured legacy `hooks.image_fallback` remains an opt-in image transform for
+models without an override; it does not declare the model unsupported.
+Switching to No Vision while image history remains produces an explicit
+model-request error and preserves that history; switch back to a Vision model to
+continue. Images are not silently dropped or claimed to have been seen.
+
+The canonical IR request entry and native Anthropic/Gemini serializers (including Bodhi proxy paths) reject tool-image batches exceeding 32 MiB of cumulative encoded image URL bytes before request cloning/serialization. The error is explicit, image history is preserved, and no upstream request is sent; use smaller images or batches. The per-file ViewImage size limit is unchanged.

@@ -193,7 +193,7 @@ use crate::tool_event_router::ToolEventRouter;
 /// multi-process safety would need an OS-level file lock (e.g. `flock` on a
 /// lockfile under `plugins_dir()`) instead of/in addition to this `Mutex`;
 /// that's a documented follow-up, not implemented here.
-static PLUGIN_OP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use bamboo_plugin::registry::PLUGIN_OPERATION_LOCK as PLUGIN_OP_LOCK;
 
 /// Proof that the caller holds the process-wide plugin-operation boundary.
 /// HTTP source preparation uses this guard across ownership preflight, old
@@ -1116,6 +1116,7 @@ impl ServerPluginInstaller {
         // The set this install INTENDS to own, by declaration order. Used both
         // for the crash-safety journal row (below) and the step-0 drop-diff.
         let intended = RegisteredCapabilities {
+            hooks: bamboo_plugin::hooks::registrations(manifest, plugin_dir)?,
             mcp_server_ids: manifest
                 .provides
                 .mcp_servers
@@ -1288,6 +1289,7 @@ impl ServerPluginInstaller {
         // the ACTUAL registered set (renamed preset ids, the to_register mcp/
         // workflow subsets). Only reached once 0-4 all succeeded.
         let registered = RegisteredCapabilities {
+            hooks: intended.hooks.clone(),
             mcp_server_ids,
             skill_dirs,
             preset_ids,
@@ -1385,9 +1387,19 @@ impl PluginInstaller for ServerPluginInstaller {
         let mut store = InstalledPlugins::load(&installed_json_path).await?;
         // Works on an `Installing` (crash-leftover) row too, so a crashed
         // install is never un-uninstallable.
-        let Some(entry) = store.get_unique(id)?.cloned() else {
+        let Some(mut entry) = store.get_unique(id)?.cloned() else {
             return Err(PluginError::NotFound(id.to_string()));
         };
+
+        // Persist revocation before cleanup. A failed filesystem removal leaves
+        // a retryable row whose plugin commands are already disabled.
+        if !entry.registered.hooks.is_empty() {
+            for hook in &mut entry.registered.hooks {
+                hook.enabled = false;
+            }
+            store.add(entry.clone());
+            store.save(&installed_json_path).await?;
+        }
 
         // De-register everything this plugin's `registered` set names — by
         // construction (see bamboo-plugin's ownership contract) this can

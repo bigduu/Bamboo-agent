@@ -2,6 +2,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -192,8 +194,57 @@ pub struct ProviderUsageSnapshot {
     pub cache_write_input_tokens: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleMessageIdentity {
+    pub message_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl VisibleMessageIdentity {
+    pub(crate) fn apply_to(
+        self,
+        mut message: bamboo_agent_core::Message,
+    ) -> bamboo_agent_core::Message {
+        message.id = self.message_id;
+        message.created_at = self.created_at;
+        message
+    }
+}
+
+/// Publish an already consumed response through the existing visible-message
+/// protocol. Final-answer checks use this after deciding which text to keep.
+pub(crate) async fn publish_buffered_response(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    identity: &VisibleMessageIdentity,
+    content: &str,
+    reasoning: Option<&str>,
+) {
+    let _ = event_tx
+        .send(AgentEvent::VisibleMessageStart {
+            message_id: identity.message_id.clone(),
+            created_at: identity.created_at,
+        })
+        .await;
+    if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
+        let _ = event_tx
+            .send(AgentEvent::ReasoningToken {
+                content: reasoning.to_string(),
+            })
+            .await;
+    }
+    if !content.is_empty() {
+        let _ = event_tx
+            .send(AgentEvent::Token {
+                content: content.to_string(),
+            })
+            .await;
+    }
+}
+
 pub struct StreamHandlingOutput {
     pub response_id: Option<String>,
+    /// Stable identity shared by the safe realtime text and persisted message.
+    pub visible_message: Option<VisibleMessageIdentity>,
     pub content: String,
     pub reasoning_content: String,
     /// Provider-minted signature covering `reasoning_content`, present only
@@ -234,9 +285,13 @@ pub(crate) struct PartialToolCallSnapshot {
 /// field while retaining fragments that finalization intentionally drops or
 /// normalizes.
 pub(crate) struct InterruptedStreamOutput {
+    pub visible_message: Option<VisibleMessageIdentity>,
     pub content: String,
     pub reasoning_content: String,
     pub partial_tool_calls: Vec<PartialToolCallSnapshot>,
+    pub provider_usage: Option<ProviderUsageSnapshot>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 impl From<&bamboo_agent_core::tools::PartialToolCall> for PartialToolCallSnapshot {

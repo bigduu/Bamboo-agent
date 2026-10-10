@@ -695,6 +695,9 @@ pub enum CodexApprovalPolicy {
     OnRequest,
 }
 
+/// Default number of child levels below a Root (whose depth is zero).
+pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = 4;
+
 /// Sub-agent execution settings.
 ///
 /// Sub-agents always run as independent **actor** processes — an isolated OS
@@ -707,6 +710,10 @@ pub enum CodexApprovalPolicy {
 /// custom worker.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SubagentsConfig {
+    /// Maximum child depth below Root=0. Zero disables new child creation.
+    /// Unset preserves the historical four-level limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_spawn_depth: Option<u32>,
     /// Maximum actor activations running at once; further spawns wait their
     /// turn. Default: 200. Warm-idle process retention has a separate, smaller
     /// bound.
@@ -850,6 +857,12 @@ pub struct SubagentsConfig {
     pub mcp_role_allowlist: Vec<McpRoleAllowlistEntry>,
 }
 
+impl SubagentsConfig {
+    pub fn effective_max_spawn_depth(&self) -> u32 {
+        self.max_spawn_depth.unwrap_or(DEFAULT_MAX_SPAWN_DEPTH)
+    }
+}
+
 /// One role's MCP proxy tool allowlist entry (issue #54). See
 /// [`SubagentsConfig::mcp_role_allowlist`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -873,21 +886,39 @@ pub struct McpRoleAllowlistEntry {
     pub tools: Vec<String>,
 }
 
-/// Routes a single sub-agent role to a registry-scheduled worker (remote-actor-
-/// plan §3.4 / P2b, #181). A child whose `subagent_type` matches `role` is run on
-/// a LIVE worker chosen from the agent registry: the engine builds a
-/// `RegistryFabric` at `registry_url`, lists live workers (the registry already
-/// excludes expired leases), filters to those whose `role` == `pool`, picks one
-/// (round-robin), and connects over `wss://` (Bearer-authenticated). If no live
-/// worker exists the run ERRORS — a schedulable role NEVER falls back to a local
-/// subprocess (that would silently defeat the placement).
-///
-/// The bearer token is NEVER stored here in the clear: `token_env` names the
-/// environment variable that holds it (mirroring `RemoteActorPlacement` /
-/// the A2A `auth_ref` pattern), read once at runner-build time and used for BOTH
-/// the registry query AND the worker connect. A `token_env` that is set-but-unset
-/// at build time fails SAFE — the placement is skipped and the role falls back to
-/// Local rather than querying/connecting unauthenticated.
+/// Operator-owned hard constraints for a remote WorkerHost. The broker's
+/// authenticated peer policy advertises capacity; it does not choose the
+/// trust/data boundary for a Child. Missing requirements leave an explicitly
+/// selected remote placement unavailable rather than inferring authority from
+/// the worker's own capabilities.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPlacementRequirements {
+    pub trust_zone: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_zone: Option<String>,
+    #[serde(default)]
+    pub require_network_isolation: bool,
+    /// Operator-declared tools the selected Host must support. The runner adds
+    /// a native tool ceiling when one is bound to the Child.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub required_tools: std::collections::BTreeSet<String>,
+}
+
+/// The fixed parent identity used by a scoped broker pool. Every candidate
+/// WorkerHost is separately selected by its authenticated observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulableBrokerParent {
+    pub parent_mailbox: String,
+    pub parent_role: String,
+}
+
+/// Route a role to a capacity-managed WorkerHost pool through a scoped WSS
+/// broker. The operator supplies the parent identity and hard constraints;
+/// legacy entries remain readable but unavailable until migrated.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SchedulablePlacement {
     /// Sub-agent role this targets (matches the child session's
@@ -895,9 +926,7 @@ pub struct SchedulablePlacement {
     pub role: String,
     /// Logical pool name — the registry `role` to query for live workers.
     pub pool: String,
-    /// VESTIGIAL (Phase 3 retired the HTTP agent registry — pools are now bus
-    /// roles resolved via broker presence). Kept for config back-compat; ignored
-    /// by the resolver. Optional so a placement is just `{role, pool}`.
+    /// Scoped WSS broker endpoint. The old HTTP registry was retired.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub registry_url: String,
     /// Env var holding the bearer token (NOT the raw token — mirrors A2A
@@ -905,10 +934,16 @@ pub struct SchedulablePlacement {
     /// `None` ⇒ query/connect without a bearer (trusted link only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_env: Option<String>,
-    /// PEM file pinning a self-signed worker/registry cert. `None` ⇒ default
-    /// webpki roots.
+    /// PEM file pinning the scoped broker certificate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert_file: Option<String>,
+    /// Required for authority-backed scheduling. `registry_url` is the scoped
+    /// WSS broker URL for this route; legacy entries remain readable but cannot
+    /// dispatch a Run without a trusted parent identity and requirements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_parent: Option<SchedulableBrokerParent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_requirements: Option<OperatorPlacementRequirements>,
 }
 
 /// Pins a single sub-agent role to a remote resident worker (remote-actor-plan
@@ -919,15 +954,15 @@ pub struct SchedulablePlacement {
 /// The bearer token is NEVER stored here in the clear: `token_env` names the
 /// environment variable that holds it (mirroring the A2A `auth_ref` pattern),
 /// read once at runner-build time. A `token_env` that is set-but-unset at build
-/// time fails SAFE — the placement is skipped and the role falls back to Local
-/// rather than connecting unauthenticated.
+/// time leaves an explicit placement unavailable. A `broker_peer` selection
+/// is required for execution; legacy direct-worker config remains readable.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RemoteActorPlacement {
     /// Sub-agent role this targets (matches the child session's
     /// `metadata["subagent_type"]`).
     pub role: String,
-    /// Resident worker endpoint, e.g. `wss://gpu-host:8443` (or `ws://` only on
-    /// a trusted/loopback link).
+    /// Broker endpoint for a scoped peer route. Legacy worker endpoints remain
+    /// readable but are unavailable until migrated to a broker route.
     pub endpoint: String,
     /// Env var holding the bearer token (NOT the raw token — mirrors A2A
     /// `auth_ref`). `None` ⇒ connect without a bearer (trusted link only).
@@ -937,6 +972,46 @@ pub struct RemoteActorPlacement {
     /// (or plaintext `ws://`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert_file: Option<String>,
+    /// Explicit scoped broker route. Absence keeps the placement selected but
+    /// unavailable, never a direct parent-to-worker connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_peer: Option<RemoteBrokerPeer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_requirements: Option<OperatorPlacementRequirements>,
+}
+
+/// Operator-pinned transport identities; these do not grant Actor ownership.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteBrokerPeer {
+    pub parent_mailbox: String,
+    pub worker_mailbox: String,
+    pub parent_role: Option<String>,
+    pub worker_role: Option<String>,
+}
+impl RemoteBrokerPeer {
+    pub fn valid(&self) -> bool {
+        fn identifier(s: &str, mailbox: bool) -> bool {
+            !s.is_empty()
+                && s.len() <= 256
+                && s != "."
+                && s != ".."
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+                && (!mailbox || !s.bytes().any(|b| b.is_ascii_uppercase()))
+        }
+        identifier(&self.parent_mailbox, true)
+            && identifier(&self.worker_mailbox, true)
+            && self.parent_mailbox != self.worker_mailbox
+            && self
+                .parent_role
+                .as_deref()
+                .is_none_or(|s| identifier(s, false))
+            && self
+                .worker_role
+                .as_deref()
+                .is_some_and(|s| identifier(s, false))
+    }
 }
 
 /// How to reach the central sub-agent message broker (`bamboo broker serve`).
@@ -2364,12 +2439,21 @@ impl ProviderConfigs {
 /// Feature flags for incremental rollout of new subsystems.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FeatureFlags {
+    /// File-authoritative Tickets for a newly bootstrapped Supervisor only.
+    #[serde(default)]
+    pub ticket_mutation: bool,
+    /// Actual fresh one-shot dispatch; independent of Ticket record writes.
+    #[serde(default)]
+    pub ticket_dispatch: bool,
     /// Enable the ProviderModelRef system (multi-provider + unified model selection).
     #[serde(default)]
     pub provider_model_ref: bool,
     /// Enable MiniLoop-based complexity evaluation and dynamic per-round model switching.
     #[serde(default)]
     pub dynamic_model_routing: bool,
+    /// Check a final answer once against this request's recorded tool evidence.
+    #[serde(default)]
+    pub final_evidence_check: bool,
 }
 
 /// Default model assignments for specific capabilities.
@@ -4731,6 +4815,7 @@ impl Config {
     /// Persist only provider configuration. Provider plaintext keys are first
     /// refreshed into their encrypted at-rest representation.
     pub fn save_providers_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
+        crate::validate_runtime_model_admission(self).map_err(anyhow::Error::msg)?;
         let mut config = self.clone();
         config.clear_legacy_provider_aliases_for_instance_mode();
         config.refresh_provider_api_keys_encrypted()?;
@@ -4744,6 +4829,7 @@ impl Config {
         &self,
         provider_document: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
+        crate::validate_runtime_model_admission(self).map_err(anyhow::Error::msg)?;
         if let Some(status) = self.recovery_status.as_ref().filter(|s| !s.confirmed) {
             anyhow::bail!(
                 "refusing to overwrite config.json: recovery from {:?} is unconfirmed",
@@ -4905,6 +4991,7 @@ impl Config {
     /// an auto-persisted recovery. Call [`Config::confirm_recovery`] (or
     /// [`Config::confirm_recovery_and_save_to_dir`]) first.
     pub fn save_to_dir(&self, data_dir: PathBuf) -> Result<()> {
+        crate::validate_runtime_model_admission(self).map_err(anyhow::Error::msg)?;
         if let Some(status) = self.recovery_status.as_ref().filter(|s| !s.confirmed) {
             anyhow::bail!(
                 "refusing to overwrite config.json: it was recovered from corruption ({:?}) and \
@@ -6158,6 +6245,34 @@ mod tests {
         // nulls.
         let empty = serde_json::to_string(&RunBudgetConfig::default()).unwrap();
         assert_eq!(empty, "{}");
+    }
+
+    #[test]
+    fn subagents_spawn_depth_preserves_default_and_explicit_zero() {
+        let old: SubagentsConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.effective_max_spawn_depth(), DEFAULT_MAX_SPAWN_DEPTH);
+        assert!(!serde_json::to_string(&old)
+            .unwrap()
+            .contains("max_spawn_depth"));
+        for depth in [0, 1, 8] {
+            let config: SubagentsConfig =
+                serde_json::from_value(serde_json::json!({"max_spawn_depth": depth})).unwrap();
+            assert_eq!(config.effective_max_spawn_depth(), depth);
+            assert_eq!(
+                serde_json::to_value(config).unwrap()["max_spawn_depth"],
+                depth
+            );
+        }
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("4"),
+        ] {
+            assert!(serde_json::from_value::<SubagentsConfig>(
+                serde_json::json!({"max_spawn_depth": invalid}),
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -9312,12 +9427,12 @@ mod tests {
                 denied_tools: vec![],
             },
             bamboo_domain::mcp_config::McpServerConfig {
-                id: "sse-secret".to_string(),
+                id: "http-secret".to_string(),
                 name: None,
                 enabled: true,
-                transport: bamboo_domain::mcp_config::TransportConfig::Sse(
-                    bamboo_domain::mcp_config::SseConfig {
-                        url: "http://localhost:8080/sse".to_string(),
+                transport: bamboo_domain::mcp_config::TransportConfig::StreamableHttp(
+                    bamboo_domain::mcp_config::StreamableHttpConfig {
+                        url: "http://localhost:8080/http".to_string(),
                         headers: vec![bamboo_domain::mcp_config::HeaderConfig {
                             name: "Authorization".to_string(),
                             value: "Bearer token123".to_string(),
@@ -9351,7 +9466,7 @@ mod tests {
         );
         assert!(
             content.contains("Bearer token123"),
-            "config.json should persist MCP SSE headers in mainstream format"
+            "config.json should persist MCP Streamable HTTP headers in mainstream format"
         );
         assert!(
             !content.contains("\"env_encrypted\""),
@@ -9379,17 +9494,17 @@ mod tests {
             _ => panic!("Expected stdio transport"),
         }
 
-        let sse = loaded
+        let http = loaded
             .mcp
             .servers
             .iter()
-            .find(|s| s.id == "sse-secret")
-            .expect("sse server should exist");
-        match &sse.transport {
-            bamboo_domain::mcp_config::TransportConfig::Sse(sse) => {
-                assert_eq!(sse.headers[0].value, "Bearer token123");
+            .find(|s| s.id == "http-secret")
+            .expect("http server should exist");
+        match &http.transport {
+            bamboo_domain::mcp_config::TransportConfig::StreamableHttp(http) => {
+                assert_eq!(http.headers[0].value, "Bearer token123");
             }
-            _ => panic!("Expected SSE transport"),
+            _ => panic!("Expected Streamable HTTP transport"),
         }
     }
 
@@ -10564,5 +10679,23 @@ mod tests {
             outcome.config.plugin_trust.enforcement,
             PluginTrustEnforcement::Strict
         );
+    }
+}
+
+#[cfg(test)]
+mod final_evidence_feature_tests {
+    use super::FeatureFlags;
+
+    #[test]
+    fn final_evidence_check_is_opt_in_and_survives_config_round_trip() {
+        let existing: FeatureFlags =
+            serde_json::from_str(r#"{"dynamic_model_routing":true}"#).unwrap();
+        assert!(!existing.final_evidence_check);
+        let enabled: FeatureFlags =
+            serde_json::from_str(r#"{"final_evidence_check":true}"#).unwrap();
+        let restored: FeatureFlags =
+            serde_json::from_value(serde_json::to_value(enabled).unwrap()).unwrap();
+        assert!(restored.final_evidence_check);
+        assert!(!FeatureFlags::default().final_evidence_check);
     }
 }

@@ -29,8 +29,9 @@ use tokio::sync::broadcast;
 
 use super::session_events::get_or_create_event_sender;
 use super::AppState;
+use crate::handlers::agent::execute::runtime::spawn_event_forwarder_with_root_actor;
 use crate::handlers::agent::execute::runtime::SpawnAgentExecution;
-use crate::handlers::agent::execute::{spawn_agent_execution, spawn_event_forwarder};
+use crate::handlers::agent::execute::spawn_agent_execution;
 
 /// Newtype wrapper that implements `ResumeExecutionPort`.
 ///
@@ -72,6 +73,23 @@ impl ResumeExecutionPort for AppStateResumeRef {
         get_or_create_event_sender(&self.0.session_event_senders, session_id).await
     }
 
+    async fn prepare_response_execution(
+        &self,
+        reservation: &mut bamboo_engine::execution::SessionExecutionReservation,
+    ) -> std::io::Result<()> {
+        use bamboo_engine::session_app::repository::SessionAccess;
+        let session = self
+            .0
+            .session_repo
+            .inspect_for_response(reservation.session_id())
+            .await
+            .map_err(std::io::Error::other)?
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "response session missing")
+            })?;
+        reservation.bind_root_actor(&self.0.agent, &session).await
+    }
+
     fn dispatch_resume_execution(
         &self,
         request: ResumeSpawnRequest,
@@ -98,6 +116,15 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 %error,
                 "cannot resume server session without exact router ownership"
             );
+            return;
+        }
+
+        if let Err(error) = execution_reservation
+            .bind_root_actor(&self.0.agent, &session)
+            .await
+        {
+            tracing::warn!(%session_id, %error, "Root resume Actor binding rejected before execution");
+            execution_reservation.abandon().await;
             return;
         }
 
@@ -194,14 +221,32 @@ impl ResumeExecutionPort for AppStateResumeRef {
         let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel::<bamboo_agent_core::AgentEvent>(100);
 
         let state = self.0.clone();
-        let history_commit_barrier = spawn_event_forwarder(
+        let mut history_commit_barrier = spawn_event_forwarder_with_root_actor(
             state.clone(),
             session_id.clone(),
             execution_reservation.run_id().to_string(),
             mpsc_rx,
             event_sender,
             gold_config.clone(),
+            execution_reservation.root_actor_writer(),
         );
+        let response_events = execution_reservation.take_root_response_events();
+        if !response_events.is_empty() {
+            for event in response_events {
+                if mpsc_tx.send(event).await.is_err() {
+                    execution_reservation.abandon().await;
+                    return;
+                }
+            }
+            if !history_commit_barrier
+                .send_and_wait(&mpsc_tx, session_id.clone())
+                .await
+            {
+                tracing::warn!(%session_id, "Root response publication was not confirmed");
+                execution_reservation.abandon().await;
+                return;
+            }
+        }
 
         let model_roster = bamboo_engine::ModelRoster {
             model: Some(model),
@@ -298,12 +343,15 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 let executor = state.tools_for(crate::tools::ToolSurface::Root);
                 let replay_owner = bamboo_domain::resolve_tool_reference_name(&tool_name, |name| {
                     executor.owns_exact_tool(name)
-                })
-                .unwrap_or_else(|| tool_name.clone());
+                });
+                if replay_owner.is_none() && reexecute_request_generation.is_some() {
+                    tracing::error!(%session_id, %tool_name, "approved replay has no registered execution owner; markers retained");
+                    return;
+                }
                 let executing_supervisor = match validate_permission_replay_authority(
                     &session,
                     &replay_target,
-                    &replay_owner,
+                    replay_owner.as_deref().unwrap_or(&tool_name),
                 ) {
                     Ok(observation) => observation,
                     Err(error) => {
@@ -320,7 +368,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     state.storage.as_ref(),
                     &mut session,
                     configured_mode,
-                    &tool_name,
+                    replay_owner.as_deref(),
                 )
                 .await
                 {
@@ -337,6 +385,11 @@ impl ResumeExecutionPort for AppStateResumeRef {
                         return;
                     }
                 };
+                let blocked_by_tool_authority = matches!(
+                    decision,
+                    ApprovalReplayDecision::BlockedByRootToolAuthority
+                        | ApprovalReplayDecision::BlockedByUnavailableTool
+                );
                 session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
                 session
                     .metadata
@@ -349,7 +402,22 @@ impl ResumeExecutionPort for AppStateResumeRef {
                         ),
                         false,
                     ),
+                    ApprovalReplayDecision::BlockedByRootToolAuthority => (
+                        format!(
+                            "Root orchestration policy blocked approved tool '{tool_name}'; the stale approval was not executed"
+                        ),
+                        false,
+                    ),
+                    ApprovalReplayDecision::BlockedByUnavailableTool => (
+                        format!(
+                            "Approved tool '{tool_name}' is no longer available; the stale approval was not executed"
+                        ),
+                        false,
+                    ),
                     ApprovalReplayDecision::Execute(flags) => {
+                        let replay_owner = replay_owner
+                            .as_deref()
+                            .expect("Execute requires a registered execution owner");
                         let Some(permission_config) =
                             state.permission_checker.permission_config()
                         else {
@@ -364,7 +432,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                             permission_config.as_ref(),
                             &session,
                             &replay_target,
-                            &replay_owner,
+                            replay_owner,
                         ) {
                             tracing::error!(
                                 %session_id,
@@ -376,6 +444,16 @@ impl ResumeExecutionPort for AppStateResumeRef {
                         }
                         let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
                             == bamboo_tools::orchestrator::ToolMutability::Mutating;
+
+                        if let Some(persistence) = execution_reservation.execution_persistence() {
+                            match persistence.load_runtime_session(&session_id).await {
+                                Ok(Some(_)) => {}
+                                result => {
+                                    tracing::warn!(%session_id, ?result, "Root replay lost its execution owner before tool handoff");
+                                    return;
+                                }
+                            }
+                        }
 
                         // Only an admitted replay emits lifecycle start.
                         let mut emitter = bamboo_tools::ToolEmitter::new(
@@ -393,7 +471,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                             reexecute_request_generation.as_deref(),
                             executor.execute_exact_with_context_outcome(
                                     &tool_call,
-                                    &replay_owner,
+                                    replay_owner,
                                 bamboo_agent_core::tools::ToolExecutionContext {
                                     executing_supervisor,
                                     session_id: Some(session.id.as_str()),
@@ -424,7 +502,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                                     &mut session,
                                     &replay_target,
                                     &tool_result,
-                                    &replay_owner,
+                                    replay_owner,
                                 ) {
                                     Ok(Some(reparked)) => {
                                         let _ = mpsc_tx
@@ -457,7 +535,18 @@ impl ResumeExecutionPort for AppStateResumeRef {
                                                 ),
                                             })
                                             .await;
-                                        state.save_and_cache_session(&mut session).await;
+                                        if let Some(persistence) = execution_reservation.execution_persistence() {
+                                            if let Err(error) = persistence.save_runtime_session(&mut session).await {
+                                                tracing::warn!(%session_id, %error, "Root replay pause checkpoint rejected");
+                                                return;
+                                            }
+                                        } else { state.save_and_cache_session(&mut session).await; }
+                                        if !history_commit_barrier.send_and_wait(&mpsc_tx, session_id.clone()).await {
+                                            tracing::warn!(%session_id, "Root replay pause history publication was not confirmed");
+                                            return;
+                                        }
+                                        execution_reservation.finish_root_actor(bamboo_domain::ActorActivationFinish::Succeeded).await;
+                                        execution_reservation.abandon().await;
                                         return;
                                     }
                                     Ok(None) => {}
@@ -518,7 +607,23 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     );
                     return;
                 }
-                state.save_and_cache_session(&mut session).await;
+                if let Some(persistence) = execution_reservation.execution_persistence() {
+                    if let Err(error) = persistence.save_runtime_session(&mut session).await {
+                        tracing::warn!(%session_id, %error, "Root replay checkpoint rejected before continuation");
+                        return;
+                    }
+                } else if blocked_by_tool_authority {
+                    if let Err(error) = state
+                        .session_repo
+                        .save_replay_resolution(&mut session)
+                        .await
+                    {
+                        tracing::error!(%session_id, %error, "blocked approval replay result failed to persist; refusing to resume");
+                        return;
+                    }
+                } else {
+                    state.save_and_cache_session(&mut session).await;
+                }
             } else {
                 tracing::error!(
                     %session_id,

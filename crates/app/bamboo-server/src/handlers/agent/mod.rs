@@ -3,10 +3,12 @@
 //! These handlers provide the core agent functionality including
 //! chat, execution, event streaming, session management, and MCP.
 
+pub mod actor_snapshot;
 pub mod bootstrap;
 pub mod browser;
 pub mod chat;
 pub mod child_approval;
+pub mod dead_letters;
 pub mod delete;
 pub mod dev;
 pub mod events;
@@ -18,6 +20,7 @@ pub mod ledger;
 pub mod mcp;
 pub mod messages;
 pub mod metrics;
+pub mod named_agent_catalog;
 pub mod notifications;
 pub mod plugin;
 pub mod projects;
@@ -28,5 +31,7 @@ pub mod sessions;
 pub mod stop;
 pub mod stream;
 pub mod subagent_snapshot;
+pub mod supervisor;
 pub mod task;
+pub mod tickets;
 pub mod ws_v2;

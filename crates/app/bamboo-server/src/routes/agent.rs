@@ -42,6 +42,11 @@ pub(crate) fn plugin_scope() -> impl HttpServiceFactory {
     web::scope("/plugins")
         .route("", web::get().to(agent::plugin::list_plugins))
         .route("/install", web::post().to(agent::plugin::install_plugin))
+        .route("/{id}/hooks", web::get().to(agent::plugin::plugin_hooks))
+        .route(
+            "/{id}/hooks/review",
+            web::post().to(agent::plugin::review_plugin_hooks),
+        )
         .route("/{id}/update", web::post().to(agent::plugin::update_plugin))
         .route("/{id}", web::delete().to(agent::plugin::remove_plugin))
 }
@@ -85,6 +90,26 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             settings::enforce_access_password_middleware,
         ))
         .route("/bootstrap", web::get().to(agent::bootstrap::handler))
+        .route(
+            "/supervisor/default",
+            web::post().to(agent::supervisor::open_default),
+        )
+        .service(
+            web::scope("/tickets")
+                .route("/scope", web::get().to(agent::tickets::scope))
+                .route("/overview", web::get().to(agent::tickets::overview))
+                .route("/search", web::post().to(agent::tickets::search))
+                .route("/inspect", web::post().to(agent::tickets::inspect))
+                .route("/changes", web::post().to(agent::tickets::changes))
+                .route("/update", web::post().to(agent::tickets::update))
+                .route("/requests/respond", web::post().to(agent::tickets::respond))
+                .route("/dispatch", web::post().to(agent::tickets::dispatch))
+                .route(
+                    "/dispatch/{key:.*}",
+                    web::get().to(agent::tickets::dispatch_query),
+                )
+                .route("/artifacts/{hash}", web::get().to(agent::tickets::artifact)),
+        )
         .route(
             "/browser/sessions/{session_id}",
             web::put().to(agent::browser::open),
@@ -168,6 +193,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::subagent_snapshot::handler),
         )
         .route(
+            "/actors/{root_id}/snapshot",
+            web::get().to(agent::actor_snapshot::handler),
+        )
+        .route(
             "/sessions/{session_id}/guidance",
             web::get().to(agent::guidance::list),
         )
@@ -178,6 +207,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/sessions/{session_id}/guidance/{message_id}",
             web::delete().to(agent::guidance::cancel),
+        )
+        .route(
+            "/sessions/{session_id}/dead-letters",
+            web::get().to(agent::dead_letters::inspect),
+        )
+        .route(
+            "/sessions/{session_id}/dead-letters/{message_id}/retry",
+            web::post().to(agent::dead_letters::retry),
         )
         .route("/sessions", web::get().to(agent::sessions::list_sessions))
         .route("/sessions", web::post().to(agent::sessions::create_session))
@@ -228,6 +265,18 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/sessions/{session_id}",
             web::get().to(agent::sessions::get_session),
+        )
+        .route(
+            "/sessions/{session_id}/root-mode-operations/{operation_id}",
+            web::post().to(agent::sessions::select_root_mode),
+        )
+        .route(
+            "/sessions/{session_id}/named-agent-profiles",
+            web::get().to(agent::named_agent_catalog::handler),
+        )
+        .route(
+            "/sessions/{session_id}/root-mode-operations/{operation_id}/recover",
+            web::post().to(agent::sessions::recover_root_mode),
         )
         .route(
             "/sessions/{session_id}/copy",

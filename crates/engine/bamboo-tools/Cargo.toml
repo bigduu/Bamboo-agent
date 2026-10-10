@@ -4,7 +4,7 @@ version.workspace = true
 edition = "2021"
 rust-version.workspace = true
 description = "Tool execution and integrations for the Bamboo agent framework"
-license = "MIT"
+license = "MIT AND Apache-2.0"
 
 [dependencies]
 bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
@@ -19,10 +19,12 @@ bamboo-plugin-protocol = { path = "../../infra/bamboo-plugin-protocol" }
 bamboo-domain = { path = "../../core/bamboo-domain" }
 serde = { workspace = true }
 serde_json = "1"
+schemars = "1.2.2"
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["full", "test-util"] }
 futures = "0.3"
 async-trait = "0.1"
+bm25 = "=2.3.2"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 thiserror = "2"
@@ -32,6 +34,7 @@ dashmap = "6"
 sha2 = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
+ignore = "0.4"
 globset = "0.4"
 base64 = "0.23"
 url = "2"

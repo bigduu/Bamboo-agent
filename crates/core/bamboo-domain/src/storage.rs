@@ -4,10 +4,29 @@
 //! implementations. Concrete implementations live in infrastructure crates.
 
 use crate::session::types::Session;
+use crate::session::{RootModeOperationDecision, RootModeOperationRequest};
 use crate::{
     SupervisorBootstrapReceipt, SupervisorLinkObservation, SupervisorManagementReceipt,
     SupervisorManagementRequest, SupervisorReference, SupervisorScopeObservation,
 };
+
+/// A concrete ordinary Root execution's write capability. This is never read
+/// from Session metadata or an HTTP request.
+#[derive(Debug, Clone)]
+pub struct RootActorRuntimeWrite {
+    pub fence: crate::ActorActivationFence,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Synchronous cache publication at the storage commit boundary. Implementors
+/// retain the same physical guards and revalidate the owner before invoking it.
+pub type RootActorRuntimePublisher = std::sync::Arc<dyn Fn(&Session) + Send + Sync>;
+
+/// The final sink receives a fresh owner check while the physical authority
+/// guards remain owned by the publication job. Check immediately before each
+/// final effect, including after any journal scan performed by the sink.
+pub type RootActorRuntimeEventPublisher =
+    Box<dyn FnOnce(&dyn Fn() -> std::io::Result<()>) -> std::io::Result<()> + Send>;
 
 /// Trait for session storage backends.
 ///
@@ -16,6 +35,212 @@ use crate::{
 /// (e.g., JSONL files, databases, cloud storage).
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
+    /// Persist an explicit manual-title mutation. Actor-aware backends must
+    /// compare it with current canonical state under the full writer guards,
+    /// allowing only the title fields and exact version advances. Generic
+    /// Session saves (for example resident frame resets) are a separate lane.
+    /// Backends without Actor observations retain their ordinary save behavior.
+    async fn save_manual_title(&self, session: &Session) -> std::io::Result<()> {
+        self.save_session(session).await
+    }
+
+    /// Validate a manual title before reporting success, including a no-op.
+    /// Backends with Actor metadata observations must reread canonical state
+    /// under their writer guards and reject stale or incomplete observations.
+    /// This must not initialize, refresh or repair any authority. The default
+    /// preserves title behavior for stores without Actor observations.
+    async fn validate_title_observations(&self, expected: &Session) -> std::io::Result<()> {
+        let _ = expected;
+        Ok(())
+    }
+
+    /// Bind an Inbox to this exact Root execution before opting into owned
+    /// claims. Unsupported/custom queues fail closed, without a legacy claim.
+    fn bind_root_actor_inbox(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        inbox: std::sync::Arc<dyn crate::SessionInboxPort>,
+    ) -> std::io::Result<std::sync::Arc<dyn crate::SessionInboxPort>> {
+        let _ = (owner, inbox);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support owned Root Inbox admission",
+        ))
+    }
+
+    /// Commit the typed message and cursor through the existing full writer,
+    /// then ACK while retaining the same Root and Inbox physical guards.
+    async fn save_root_actor_input(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &Session,
+        inbox: std::sync::Arc<dyn crate::SessionInboxPort>,
+        claim: &crate::SessionInboxOwnedClaim,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<()> {
+        let _ = (owner, session, inbox, claim, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support fenced Root input checkpoints",
+        ))
+    }
+
+    /// Probe before claiming an Actor; unsupported backends must not leave a
+    /// claimed execution whose writes fall back to an ordinary snapshot save.
+    fn supports_root_actor_runtime_write(&self) -> bool {
+        false
+    }
+
+    /// Publish a synchronous runtime event through the same current-owner
+    /// boundary as canonical writes. The callback must be the actual sink,
+    /// rather than an async queue that could publish after a replacement.
+    async fn publish_root_actor_runtime_event(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        publish: RootActorRuntimeEventPublisher,
+    ) -> std::io::Result<()> {
+        let _ = (owner, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support fenced Root runtime events",
+        ))
+    }
+
+    /// Reuse the existing full/runtime publication protocol under a current
+    /// ordinary Root fence. Validate birth/owner/expiry immediately before each
+    /// canonical replacement and publish only a confirmed snapshot while the
+    /// physical guards are still held. Never fall back to `save_session`.
+    async fn save_root_actor_runtime(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &Session,
+        runtime_only: bool,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<()> {
+        let _ = (owner, session, runtime_only, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support fenced Root runtime writes",
+        ))
+    }
+
+    /// Re-read and reconcile an execution's inherited child wait under the
+    /// physical session lock, retain birth/fence checks, then save and publish.
+    async fn save_inherited_child_wait_finalized(
+        &self,
+        session: &mut Session,
+        inherited: &crate::session::runtime_state::WaitingForChildrenState,
+        root_writer: Option<(RootActorRuntimeWrite, RootActorRuntimePublisher)>,
+    ) -> std::io::Result<()> {
+        let _ = (session, inherited, root_writer);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            crate::SessionAuthorityConflict(
+                "atomic inherited child wait finalization is unsupported".into(),
+            ),
+        ))
+    }
+
+    /// Reconcile only the execution's exact inherited wait at the final
+    /// physical writer lock, preserving live run status and unrelated fields.
+    /// Root input saves retain the same owner, transcript and ACK protocol.
+    async fn save_runtime_with_inherited_child_wait(
+        &self,
+        session: &mut Session,
+        inherited: &crate::InheritedChildWait,
+        runtime_only: bool,
+        root_writer: Option<(RootActorRuntimeWrite, RootActorRuntimePublisher)>,
+        input: Option<(
+            std::sync::Arc<dyn crate::SessionInboxPort>,
+            crate::SessionInboxOwnedClaim,
+        )>,
+    ) -> std::io::Result<()> {
+        let _ = (session, inherited, runtime_only, root_writer, input);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            crate::SessionAuthorityConflict(
+                "atomic inherited child wait runtime persistence is unsupported".into(),
+            ),
+        ))
+    }
+
+    /// Whether this backend owns atomic child-wait mutations. Legacy backends
+    /// retain LockedSessionStore's process-local serialized compatibility path.
+    fn supports_atomic_child_wait_control_plane(&self) -> bool {
+        false
+    }
+
+    /// Read one waited-for Child through its parent's canonical tree. Durable
+    /// linkage must be checked before loading transcript content.
+    async fn load_child_wait_session(
+        &self,
+        parent: &Session,
+        child_id: &str,
+        full: bool,
+    ) -> std::io::Result<Option<Session>> {
+        let control = self.load_runtime_control_plane(child_id).await?;
+        let owned = control.filter(|child| {
+            child.kind == crate::SessionKind::Child
+                && child.parent_session_id.as_deref() == Some(&parent.id)
+        });
+        if !full || owned.is_none() {
+            return Ok(owned);
+        }
+        Ok(self.load_session(child_id).await?.filter(|child| {
+            child.kind == crate::SessionKind::Child
+                && child.parent_session_id.as_deref() == Some(&parent.id)
+        }))
+    }
+
+    /// Merge a child wait into the latest control plane under the physical
+    /// session writer lock. Terminal filtering uses fresh durable child state,
+    /// not a per-instance index. Explicit waits check terminality; pre-launch
+    /// arms retain prior terminal generations until the new launch is queued.
+    /// Zero means the requested explicit policy is satisfied.
+    async fn register_child_wait_control_plane(
+        &self,
+        expected: &Session,
+        batch: &[(String, Option<String>)],
+        policy: crate::ChildWaitPolicy,
+        check_terminal: bool,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<(Session, usize)> {
+        let _ = (expected, batch, policy, check_terminal, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic child wait registration is unsupported",
+        ))
+    }
+
+    /// Commit a child completion only if the full observed wait and Session
+    /// incarnation still match. A conflict performs no write or publication.
+    async fn compare_exchange_child_wait_control_plane(
+        &self,
+        expected: &Session,
+        updated: &mut Session,
+        runtime_only: bool,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<bool> {
+        let _ = (expected, updated, runtime_only, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic child wait completion is unsupported",
+        ))
+    }
+
+    /// Durable Root-mode CAS and terminal recovery at the storage writer lock.
+    /// A backend without this authority protocol fails closed.
+    async fn root_mode_operation(
+        &self,
+        request: &RootModeOperationRequest,
+    ) -> std::io::Result<RootModeOperationDecision> {
+        let _ = request;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support recoverable Root mode operations",
+        ))
+    }
+
     /// Trusted explicit recreation of a previously deleted Ordinary Root ID.
     /// The backend constructs a blank Root and assigns a fresh birth marker;
     /// callers cannot supply an old snapshot or choose its lifetime. Retrying
@@ -35,6 +260,7 @@ pub trait Storage: Send + Sync {
 
     /// Trusted host bootstrap for one stable default Supervisor Root. Only the
     /// initial model is caller supplied and is used on first creation only.
+    /// It may be empty before provider setup; bootstrap does not execute a run.
     /// Implementations must publish the complete identity atomically, protect it
     /// from ordinary writers, and return a receipt rather than a partial Session.
     async fn get_or_create_default_supervisor(

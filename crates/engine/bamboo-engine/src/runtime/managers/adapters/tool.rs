@@ -58,6 +58,10 @@ impl ToolManager for DefaultToolManager {
             metrics_collector,
             config,
             llm: &self.llm,
+            vision_support: self
+                .llm
+                .supports_vision(config.model_name.as_deref().unwrap_or(&session.model))
+                .await,
             tools: &self.tools,
         };
         let mut runtime_state = session
@@ -66,6 +70,10 @@ impl ToolManager for DefaultToolManager {
             .unwrap_or_else(|| bamboo_domain::AgentRuntimeState::new(session_id));
         let effective_callable_set =
             crate::runtime::runner::tool_execution::legacy_effective_callable_set(tool_schemas);
+        let mut policy_guard = crate::runtime::runner::tool_execution::ToolPolicyGuard::new(
+            config.max_tool_calls_per_round,
+            config.max_consecutive_failures_per_tool,
+        );
 
         // Mirror the live pipeline's #30 biased-cancel wrap so a cancel issued
         // DURING tool execution (e.g. a long foreground Bash run) is honored on
@@ -83,6 +91,7 @@ impl ToolManager for DefaultToolManager {
                     frame: &frame,
                     session,
                     runtime_state: &mut runtime_state,
+                    policy_guard: &mut policy_guard,
                     task_context,
                     compression_model_name: config
                         .summarization_model_name

@@ -12,6 +12,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+sha2 = { workspace = true }
 uuid = { workspace = true }
 async-trait = "0.1"
 futures-util = "0.3"
@@ -26,7 +27,6 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 # (#183) so the workspace resolves a single rustls/ring provider.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
-rustls-pemfile = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -36,5 +36,5 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
 tempfile = "3"

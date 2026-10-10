@@ -76,6 +76,167 @@ pub struct RunSpec {
     pub secrets: RunSecrets,
 }
 
+/// Host-selected Workflow usage observation on the existing activation event lane.
+/// Counts use canonical runtime accounting (provider-first, estimate fallback),
+/// not monetary billing. This observation grants no execution authority.
+pub const WORKFLOW_USAGE_REQUESTED_KEY: &str = "workflow.agent_usage_requested.v1";
+pub const WORKFLOW_USAGE_OBSERVATION_KEY: &str = "workflow.agent_usage_observation.v1";
+/// Host-only proof that the selected current activation delivered an accepted terminal.
+pub const WORKFLOW_TERMINAL_OBSERVATION_KEY: &str = "workflow.agent_terminal_observation.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAgentUsage {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub activation_run_id: String,
+    pub child_session_id: String,
+    pub child_created_at: chrono::DateTime<chrono::Utc>,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+impl WorkflowAgentUsage {
+    pub const TYPE: &'static str = "workflow_agent_usage";
+
+    pub fn matches(&self, child: &bamboo_domain::Session, activation: &str) -> bool {
+        self.kind == Self::TYPE
+            && !activation.is_empty()
+            && self.activation_run_id == activation
+            && self.child_session_id == child.id
+            && self.child_created_at == child.created_at
+    }
+
+    pub fn from_session(child: &bamboo_domain::Session, activation: &str) -> Option<Self> {
+        let usage: Self =
+            serde_json::from_str(child.metadata.get(WORKFLOW_USAGE_OBSERVATION_KEY)?).ok()?;
+        usage.matches(child, activation).then_some(usage)
+    }
+
+    pub fn total_tokens(&self) -> u64 {
+        self.prompt_tokens.saturating_add(self.completion_tokens)
+    }
+}
+
+/// Actual worker message suffix, carried in the existing sequenced event lane.
+/// This cache observation grants nothing; the Host separately validates its
+/// current callable ceiling, event trace and fenced canonical append.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum ReadOnlyActorTranscript {
+    #[serde(rename = "owned_readonly_transcript")]
+    Complete { messages: Vec<serde_json::Value> },
+}
+impl ReadOnlyActorTranscript {
+    pub const MAX_BYTES: usize = 64 * 1024;
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let Self::Complete { messages } = self;
+        if messages.len() != 3
+            || serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > Self::MAX_BYTES)
+        {
+            return Err("owned_readonly_transcript_unsupported");
+        }
+        Ok(())
+    }
+}
+
+/// Completion DATA on the existing durable event lane, never Session authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum LocalToolMessages {
+    #[serde(rename = "local_client_tool_messages_v1")]
+    Complete {
+        version: u32,
+        messages: Vec<serde_json::Value>,
+    },
+}
+
+impl LocalToolMessages {
+    pub const TYPE: &'static str = "local_client_tool_messages_v1";
+    pub const MAX_BYTES: usize = 64 * 1024;
+    pub const MAX_MESSAGES: usize = 128;
+    pub const MAX_PAIRS: usize = 32;
+
+    pub fn supports_tools(tools: &[String], read_only: bool) -> bool {
+        if tools.iter().any(|name| name == "Task") {
+            return tools
+                .iter()
+                .all(|name| matches!(name.as_str(), "Task" | "Read" | "Write"));
+        }
+        !tools.is_empty()
+            && !(read_only && tools.len() == 1 && tools[0] == "Glob")
+            && tools
+                .iter()
+                .all(|name| matches!(name.as_str(), "Read" | "Glob" | "Write"))
+    }
+
+    pub fn validate(&self) -> Result<Vec<bamboo_domain::Message>, &'static str> {
+        use std::io::Write;
+        struct Limit(usize);
+        impl Write for Limit {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self
+                    .0
+                    .checked_add(bytes.len())
+                    .filter(|n| *n <= LocalToolMessages::MAX_BYTES)
+                    .ok_or_else(|| std::io::Error::other("local tool history limit"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let Self::Complete { version, messages } = self;
+        if *version != 1
+            || messages.is_empty()
+            || messages.len() > Self::MAX_MESSAGES
+            || serde_json::to_writer(Limit(0), self).is_err()
+        {
+            return Err("local_tool_history_unsupported");
+        }
+        let typed: Vec<bamboo_domain::Message> = messages
+            .iter()
+            .map(|value| {
+                let message: bamboo_domain::Message = serde_json::from_value(value.clone())
+                    .map_err(|_| "local_tool_history_unsupported")?;
+                if serde_json::to_value(&message).map_err(|_| "local_tool_history_unsupported")?
+                    != *value
+                    || message.id.is_empty()
+                    || message.id.len() > 128
+                    || (message.reasoning.is_some()
+                        && message.role != bamboo_domain::Role::Assistant)
+                    || message.reasoning_signature.is_some()
+                    || message.content_parts.is_some()
+                    || message.image_ocr.is_some()
+                    || message.compressed
+                    || message.compressed_by_event_id.is_some()
+                    || message.compression_level != 0
+                {
+                    return Err("local_tool_history_unsupported");
+                }
+                Ok(message)
+            })
+            .collect::<Result<_, _>>()?;
+        let mut ids = std::collections::HashSet::new();
+        let mut calls = std::collections::HashSet::new();
+        for message in &typed {
+            if !ids.insert(&message.id) {
+                return Err("local_tool_history_unsupported");
+            }
+            for call in message.tool_calls.iter().flatten() {
+                if call.id.is_empty()
+                    || call.id.len() > 128
+                    || !calls.insert(&call.id)
+                    || calls.len() > Self::MAX_PAIRS
+                {
+                    return Err("local_tool_history_unsupported");
+                }
+            }
+        }
+        Ok(typed)
+    }
+}
+
 /// Logical session ancestry carried across every actor placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalSessionIdentity {
@@ -83,6 +244,82 @@ pub struct LogicalSessionIdentity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     pub root_session_id: String,
+    /// Host-authored immutable Child birth. Missing only on legacy routes;
+    /// this is identity, not task or permission authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation: Option<ChildCreationIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildCreationIdentity {
+    pub created_at: DateTime<Utc>,
+    pub spawn_depth: u32,
+}
+
+/// Immutable one-shot native name ceiling. It is startup authority, not a
+/// persisted profile or a grant for workspace/network/secret access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeToolCeiling {
+    pub version: u32,
+    pub child_session_id: String,
+    pub parent_session_id: String,
+    pub root_session_id: String,
+    pub created_at: DateTime<Utc>,
+    pub spawn_depth: u32,
+    // Explicit null means unassigned; omission is not an authority observation.
+    #[serde(deserialize_with = "deserialize_project_observation")]
+    pub project_id: Option<ProjectId>,
+    pub tools: Vec<String>,
+}
+
+fn deserialize_project_observation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ProjectId>, D::Error> {
+    Option::<ProjectId>::deserialize(deserializer)
+}
+
+impl NativeToolCeiling {
+    pub const NAMES: [&'static str; 6] = ["Bash", "Edit", "Glob", "Read", "Task", "Write"];
+    pub const MAX_BYTES: usize = 16 * 1024;
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let mut candidate = bamboo_domain::Session::new(self.child_session_id.clone(), "");
+        candidate.kind = bamboo_domain::SessionKind::Child;
+        candidate.parent_session_id = Some(self.parent_session_id.clone());
+        candidate.root_session_id = self.root_session_id.clone();
+        candidate.created_at = self.created_at;
+        candidate.spawn_depth = self.spawn_depth;
+        if self.version != 1
+            || bamboo_domain::ActorSession::from_session(&candidate).is_err()
+            || self.tools.len() > Self::NAMES.len()
+            || self
+                .tools
+                .iter()
+                .any(|name| !Self::NAMES.contains(&name.as_str()))
+            || self.tools.windows(2).any(|pair| pair[0] >= pair[1])
+            || serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > Self::MAX_BYTES)
+        {
+            return Err("native_tool_ceiling_invalid");
+        }
+        Ok(())
+    }
+
+    pub fn matches_run(&self, run: &RunSpec) -> bool {
+        self.validate().is_ok()
+            && run.project_id == self.project_id
+            && run.logical_session.as_ref().is_some_and(|identity| {
+                identity.session_id == self.child_session_id
+                    && identity.parent_session_id.as_deref()
+                        == Some(self.parent_session_id.as_str())
+                    && identity.root_session_id == self.root_session_id
+                    && identity.creation.as_ref().is_some_and(|creation| {
+                        creation.created_at == self.created_at
+                            && creation.spawn_depth == self.spawn_depth
+                    })
+            })
+    }
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -92,7 +329,8 @@ fn is_zero(value: &u64) -> bool {
 /// Delivery semantics for one actor event batch.
 ///
 /// `Durable` batches must use the broker's acknowledged mailbox lane.
-/// `Snapshot` and `Ephemeral` batches may use the bounded live lane: sequence
+/// An executor requiring complete history evidence may upgrade a batch to
+/// `Durable`. `Snapshot` and `Ephemeral` batches may use the bounded live lane: sequence
 /// gaps tell a consumer to reload the authoritative session snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -176,14 +414,48 @@ impl ActorEventBatch {
         if self.first_seq == 0 || self.last_seq != expected_last {
             return Err("actor event batch has an invalid sequence range".to_string());
         }
-        if self
-            .events
-            .iter()
-            .any(|event| ActorEventQos::classify(event) != self.qos)
+        if self.qos != ActorEventQos::Durable
+            && self
+                .events
+                .iter()
+                .any(|event| ActorEventQos::classify(event) != self.qos)
         {
             return Err("actor event batch QoS does not match its events".to_string());
         }
         Ok(())
+    }
+}
+
+/// A current-Run completeness claim for the existing contiguous history lane.
+/// This is not a durable applied cursor or a replay/recovery acknowledgement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActorEventWatermark {
+    pub version: u32,
+    pub logical_session: Option<LogicalSessionIdentity>,
+    pub activation_id: Option<String>,
+    pub execution_epoch: u64,
+    /// Last sequenced event after the transport drained and flushed; zero means
+    /// that this Run emitted no events.
+    pub final_seq: u64,
+}
+
+impl ActorEventWatermark {
+    pub const VERSION: u32 = 1;
+
+    pub fn matches_consumed_run(
+        &self,
+        logical_session: &LogicalSessionIdentity,
+        activation_id: &str,
+        execution_epoch: u64,
+        consumed_seq: u64,
+    ) -> bool {
+        self.version == Self::VERSION
+            && !activation_id.is_empty()
+            && execution_epoch != 0
+            && self.logical_session.as_ref() == Some(logical_session)
+            && self.activation_id.as_deref() == Some(activation_id)
+            && self.execution_epoch == execution_epoch
+            && self.final_seq == consumed_seq
     }
 }
 
@@ -206,6 +478,7 @@ pub struct ActorEventBatcher {
     source_actor_id: Option<String>,
     next_seq: u64,
     pending: Option<PendingActorEventBatch>,
+    durable_events: bool,
 }
 
 impl ActorEventBatcher {
@@ -222,7 +495,15 @@ impl ActorEventBatcher {
             source_actor_id,
             next_seq: 1,
             pending: None,
+            durable_events: false,
         }
+    }
+
+    /// Preserve the bounded coalescing/flush policy while delivering every
+    /// batch through the existing reliable lane for strict history consumers.
+    pub fn with_durable_events(mut self, required: bool) -> Self {
+        self.durable_events = required;
+        self
     }
 
     /// Add one event and return every batch that became ready. At most two are
@@ -272,6 +553,24 @@ impl ActorEventBatcher {
         self.pending.is_some()
     }
 
+    /// Call only after every returned batch was successfully forwarded and the
+    /// final flush succeeded. Ordinary lossy and legacy runs make no complete
+    /// trace claim. The caller, not this builder, owns delivery confirmation.
+    pub fn final_watermark(&self) -> Option<ActorEventWatermark> {
+        (self.durable_events
+            && self.execution_epoch != 0
+            && !self.has_pending()
+            // Saturated native coordinates cannot prove a complete prefix.
+            && self.next_seq < u64::MAX)
+            .then(|| ActorEventWatermark {
+                version: ActorEventWatermark::VERSION,
+                logical_session: self.logical_session.clone(),
+                activation_id: self.activation_id.clone(),
+                execution_epoch: self.execution_epoch,
+                final_seq: self.next_seq - 1,
+            })
+    }
+
     fn build(
         &self,
         first_seq: u64,
@@ -287,7 +586,11 @@ impl ActorEventBatcher {
             source_actor_id: self.source_actor_id.clone(),
             first_seq,
             last_seq,
-            qos,
+            qos: if self.durable_events {
+                ActorEventQos::Durable
+            } else {
+                qos
+            },
             events,
         }
     }
@@ -317,6 +620,135 @@ pub struct SessionMessageAdmissionConfirmation {
     pub envelope_id: String,
     pub canonical_claim_generation: u64,
     pub activation_run_id: String,
+}
+
+/// Closed initial-input barrier. This is not a tool grant or an approval reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialInputReleaseRequest {
+    pub version: u32,
+    pub nonce: String,
+    pub child_id: String,
+    pub parent_id: String,
+    pub root_id: String,
+    pub created_at: DateTime<Utc>,
+    pub spawn_depth: u32,
+    #[serde(deserialize_with = "deserialize_project_observation")]
+    pub project_id: Option<ProjectId>,
+    pub envelope_id: String,
+    pub generation: u64,
+    pub activation_run_id: String,
+    pub execution_epoch: u64,
+}
+impl InitialInputReleaseRequest {
+    pub fn from_run(
+        run: &RunSpec,
+        delivery: &SessionMessageDelivery,
+        nonce: String,
+    ) -> Result<Self, String> {
+        let logical = run
+            .logical_session
+            .as_ref()
+            .ok_or("initial release logical identity missing")?;
+        let birth = logical
+            .creation
+            .as_ref()
+            .ok_or("initial release birth missing")?;
+        let parent = logical
+            .parent_session_id
+            .as_ref()
+            .ok_or("initial release parent missing")?;
+        if uuid::Uuid::parse_str(&nonce).is_err()
+            || nonce.len() != 36
+            || logical.session_id.is_empty()
+            || parent.is_empty()
+            || logical.root_session_id.is_empty()
+            || birth.spawn_depth == 0
+            || run.execution_epoch == 0
+            || delivery.canonical_claim_generation == 0
+            || run.activation_run_id.as_deref() != Some(delivery.activation_run_id.as_str())
+            || delivery.target_session_id != logical.session_id
+            || delivery.envelope.target_session_id != logical.session_id
+        {
+            return Err("initial release binding invalid".into());
+        }
+        let request = Self {
+            version: 1,
+            nonce,
+            child_id: logical.session_id.clone(),
+            parent_id: parent.clone(),
+            root_id: logical.root_session_id.clone(),
+            created_at: birth.created_at,
+            spawn_depth: birth.spawn_depth,
+            project_id: run.project_id.clone(),
+            envelope_id: delivery.envelope.id.as_str().into(),
+            generation: delivery.canonical_claim_generation,
+            activation_run_id: delivery.activation_run_id.clone(),
+            execution_epoch: run.execution_epoch,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        let identity = NativeToolCeiling {
+            version: self.version,
+            child_session_id: self.child_id.clone(),
+            parent_session_id: self.parent_id.clone(),
+            root_session_id: self.root_id.clone(),
+            created_at: self.created_at,
+            spawn_depth: self.spawn_depth,
+            project_id: self.project_id.clone(),
+            tools: Vec::new(),
+        };
+        if identity.validate().is_err()
+            || uuid::Uuid::parse_str(&self.nonce).is_err()
+            || self.nonce.len() != 36
+            || self.generation == 0
+            || self.execution_epoch == 0
+            || self.activation_run_id.is_empty()
+            || self.activation_run_id.len() > 256
+            || bamboo_domain::SessionMessageId::parse(self.envelope_id.clone()).is_err()
+        {
+            return Err("initial release binding invalid".into());
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialInputRelease {
+    pub request: InitialInputReleaseRequest,
+    pub expires_at: DateTime<Utc>,
+}
+impl InitialInputRelease {
+    pub fn permits(&self, request: &InitialInputReleaseRequest, now: DateTime<Utc>) -> bool {
+        &self.request == request && request.version == 1 && now < self.expires_at
+    }
+}
+/// Reserved discriminator: unknown or malformed values never become text steering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "initial_input_control",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum InitialInputControl {
+    Request { request: InitialInputReleaseRequest },
+    Release { release: InitialInputRelease },
+}
+impl InitialInputControl {
+    pub fn decode(body: serde_json::Value) -> Result<Self, String> {
+        if serde_json::to_vec(&body).map_or(true, |bytes| bytes.len() > 4096) {
+            return Err("initial release control exceeds bound".into());
+        }
+        let control: Self =
+            serde_json::from_value(body).map_err(|_| "initial release control malformed")?;
+        match &control {
+            Self::Request { request } => request.validate()?,
+            Self::Release { release } => release.request.validate()?,
+        }
+        Ok(control)
+    }
 }
 
 /// Per-activation secret envelope. A Bamboo-routed Codex token lives here so a
@@ -373,6 +805,10 @@ pub struct PermissionPolicyContext {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
+    /// A portable, admission-time Git snapshot for a fixed remote worker.
+    /// Remote runs carry no host-absolute workspace path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_lease: Option<crate::environment::EnvironmentLease>,
     /// Session grants are deliberately not inherited across an actor boundary;
     /// a future opt-in protocol can set this and carry explicit scoped grants.
     #[serde(default)]
@@ -472,6 +908,9 @@ pub enum ParentFrame {
     SessionMessage {
         delivery: SessionMessageDelivery,
     },
+    InitialInputRelease {
+        release: InitialInputRelease,
+    },
     /// Reply to a [`ChildFrame::ApprovalRequest`] — the host's human/policy
     /// decision on a gated tool the worker proxied back (Phase 2 child→parent
     /// approval delegation). `id` correlates to the request. When
@@ -480,6 +919,18 @@ pub enum ParentFrame {
     ApprovalReply {
         id: String,
         approved: bool,
+    },
+    /// Bounded Host-owned tree page for the active logical Child. A missing
+    /// page is a fail-closed denial; no Session authority travels to Worker.
+    OwnedTreeReply {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page: Option<serde_json::Value>,
+    },
+    /// Canonical Host result for a logical SubAgent operation in this Run.
+    SubAgentReply {
+        id: String,
+        result: serde_json::Value,
     },
 }
 
@@ -498,6 +949,20 @@ pub enum ChildFrame {
     /// host answers with [`ParentFrame::ApprovalReply`] carrying the same `id`.
     /// `body` carries `{tool_name, permission_type, resource, question}`.
     ApprovalRequest { id: String, body: serde_json::Value },
+    /// The Worker supplies only a page cursor. The Host binds this frame to
+    /// the currently fenced logical Child; it never accepts a caller ID here.
+    OwnedTreeRequest {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+    /// The Worker supplies only logical arguments and a transcript call id.
+    /// Caller identity is bound to the active Host drive, not this frame.
+    SubAgentRequest {
+        id: String,
+        tool_call_id: String,
+        args: serde_json::Value,
+    },
     /// Emitted only after the worker's local SessionInbox transcript + cursor
     /// checkpoint and admitted receipt are durable.
     SessionMessageAdmitted {
@@ -505,6 +970,10 @@ pub enum ChildFrame {
     },
     Terminal {
         status: TerminalStatus,
+        /// Transport-owned current-Run completeness claim; absent on legacy or
+        /// ordinary lossy observation routes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_event_watermark: Option<ActorEventWatermark>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -552,6 +1021,188 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workflow_agent_usage_is_bound_to_current_activation_and_birth() {
+        let mut child = bamboo_domain::Session::new("child", "model");
+        child.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new(""));
+        let usage = WorkflowAgentUsage {
+            kind: WorkflowAgentUsage::TYPE.into(),
+            activation_run_id: "activation".into(),
+            child_session_id: child.id.clone(),
+            child_created_at: child.created_at,
+            prompt_tokens: 24,
+            completion_tokens: 12,
+        };
+        child.metadata.insert(
+            WORKFLOW_USAGE_OBSERVATION_KEY.into(),
+            serde_json::to_string(&usage).unwrap(),
+        );
+        assert_eq!(
+            WorkflowAgentUsage::from_session(&child, "activation")
+                .unwrap()
+                .total_tokens(),
+            36
+        );
+        assert!(WorkflowAgentUsage::from_session(&child, "next-activation").is_none());
+        child.created_at += chrono::Duration::seconds(1);
+        assert!(WorkflowAgentUsage::from_session(&child, "activation").is_none());
+    }
+
+    #[test]
+    fn local_tool_messages_are_closed_bounded_and_durable() {
+        let raw = serde_json::to_value(bamboo_domain::Message::user("confirmed")).unwrap();
+        let good = LocalToolMessages::Complete {
+            version: 1,
+            messages: vec![raw.clone()],
+        };
+        assert_eq!(
+            serde_json::to_value(good.validate().unwrap()[0].clone()).unwrap(),
+            raw
+        );
+        let event = serde_json::to_value(&good).unwrap();
+        assert_eq!(ActorEventQos::classify(&event), ActorEventQos::Durable);
+        for field in ["session", "permission", "version_extra"] {
+            let mut changed = event.clone();
+            changed[field] = serde_json::json!({});
+            assert!(
+                serde_json::from_value::<LocalToolMessages>(changed).is_err(),
+                "{field}"
+            );
+        }
+        for mutation in [
+            "version",
+            "missing",
+            "unknown_message",
+            "reasoning",
+            "compressed",
+            "duplicate",
+            "bytes",
+            "rows",
+        ] {
+            let mut changed = event.clone();
+            match mutation {
+                "version" => changed["version"] = 2.into(),
+                "missing" => {
+                    changed.as_object_mut().unwrap().remove("messages");
+                }
+                "unknown_message" => changed["messages"][0]["cursor"] = 1.into(),
+                "reasoning" => changed["messages"][0]["reasoning"] = "private".into(),
+                "compressed" => changed["messages"][0]["compression_level"] = 1.into(),
+                "duplicate" => changed["messages"] = serde_json::json!([raw, raw]),
+                "bytes" => {
+                    changed["messages"][0]["content"] =
+                        "\\\"".repeat(LocalToolMessages::MAX_BYTES).into()
+                }
+                "rows" => {
+                    changed["messages"] =
+                        serde_json::to_value(vec![raw.clone(); LocalToolMessages::MAX_MESSAGES + 1])
+                            .unwrap()
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                serde_json::from_value::<LocalToolMessages>(changed)
+                    .map_or(true, |data| data.validate().is_err()),
+                "{mutation}"
+            );
+        }
+        assert!(LocalToolMessages::supports_tools(
+            &["Read".into(), "Write".into()],
+            false
+        ));
+        assert!(!LocalToolMessages::supports_tools(&["Glob".into()], true));
+        assert!(!LocalToolMessages::supports_tools(&["Bash".into()], false));
+    }
+
+    #[test]
+    fn local_tool_messages_preserve_bounded_assistant_reasoning_without_provider_authority() {
+        let mut assistant = bamboo_domain::Message::assistant("complete report", None);
+        assistant.reasoning = Some("Complete ordinary text reasoning 🪷.".into());
+        let raw = serde_json::to_value(&assistant).unwrap();
+        let data = LocalToolMessages::Complete {
+            version: 1,
+            messages: vec![raw.clone()],
+        };
+        assert_eq!(
+            serde_json::to_value(data.validate().unwrap()).unwrap(),
+            serde_json::json!([raw])
+        );
+
+        for mutation in ["signature", "tool", "user", "system", "compressed", "bytes"] {
+            let mut message = assistant.clone();
+            match mutation {
+                "signature" => {
+                    message.reasoning_signature = Some("opaque-provider-signature".into())
+                }
+                "tool" => message.role = bamboo_domain::Role::Tool,
+                "user" => message.role = bamboo_domain::Role::User,
+                "system" => message.role = bamboo_domain::Role::System,
+                "compressed" => message.compressed = true,
+                "bytes" => message.reasoning = Some("🪷".repeat(LocalToolMessages::MAX_BYTES)),
+                _ => unreachable!(),
+            }
+            let changed = LocalToolMessages::Complete {
+                version: 1,
+                messages: vec![serde_json::to_value(&message).unwrap()],
+            };
+            assert!(changed.validate().is_err(), "{mutation}");
+        }
+    }
+
+    #[test]
+    fn initial_release_schema_is_closed_and_exact() {
+        let request = InitialInputReleaseRequest {
+            version: 1,
+            nonce: uuid::Uuid::new_v4().to_string(),
+            child_id: "child".into(),
+            parent_id: "parent".into(),
+            root_id: "parent".into(),
+            created_at: Utc::now(),
+            spawn_depth: 1,
+            project_id: None,
+            envelope_id: "input".into(),
+            generation: 1,
+            activation_run_id: "run".into(),
+            execution_epoch: 7,
+        };
+        let release = InitialInputRelease {
+            request: request.clone(),
+            expires_at: Utc::now() + chrono::Duration::seconds(1),
+        };
+        assert!(release.permits(&request, Utc::now()));
+        for change in [
+            "nonce",
+            "generation",
+            "execution_epoch",
+            "child_id",
+            "created_at",
+            "project_id",
+        ] {
+            let mut value = serde_json::to_value(&request).unwrap();
+            value[change] = match change {
+                "generation" | "execution_epoch" => serde_json::json!(2),
+                "created_at" => serde_json::json!("2020-01-01T00:00:00Z"),
+                _ => serde_json::json!("foreign"),
+            };
+            if let Ok(changed) = serde_json::from_value(value) {
+                assert!(!release.permits(&changed, Utc::now()), "{change}");
+            }
+        }
+        assert!(!release.permits(&request, release.expires_at));
+        let mut absent_project = serde_json::to_value(&request).unwrap();
+        absent_project.as_object_mut().unwrap().remove("project_id");
+        assert!(serde_json::from_value::<InitialInputReleaseRequest>(absent_project).is_err());
+        let bytes = serde_json::to_string(&request).unwrap();
+        let duplicate = bytes.replacen("{", "{\"nonce\":\"foreign\",", 1);
+        assert!(serde_json::from_str::<InitialInputReleaseRequest>(&duplicate).is_err());
+        let mut value = serde_json::to_value(InitialInputControl::Release { release }).unwrap();
+        value["text"] = "cannot become steer".into();
+        assert!(serde_json::from_value::<InitialInputControl>(value.clone()).is_err());
+        value.as_object_mut().unwrap().remove("text");
+        value["initial_input_control"] = "unknown".into();
+        assert!(serde_json::from_value::<InitialInputControl>(value).is_err());
+    }
+
+    #[test]
     fn parent_frames_round_trip() {
         for f in [
             ParentFrame::Run(RunSpec {
@@ -574,6 +1225,34 @@ mod tests {
     }
 
     #[test]
+    fn logical_creation_is_atomic_and_preserves_exact_birth() {
+        let legacy = serde_json::json!({"session_id":"child", "parent_session_id":"parent", "root_session_id":"root"});
+        let mut identity: LogicalSessionIdentity = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(identity.creation.is_none());
+        assert_eq!(serde_json::to_value(&identity).unwrap(), legacy);
+        identity.creation = Some(ChildCreationIdentity {
+            created_at: "2026-09-26T01:02:03.123456789Z".parse().unwrap(),
+            spawn_depth: 3,
+        });
+        let wire = serde_json::to_value(&identity).unwrap();
+        assert_eq!(
+            serde_json::from_value::<LogicalSessionIdentity>(wire.clone()).unwrap(),
+            identity
+        );
+        for creation in [
+            serde_json::json!({"created_at":"2026-09-26T01:02:03Z"}),
+            serde_json::json!({"spawn_depth":3}),
+            serde_json::json!({"created_at":"invalid", "spawn_depth":3}),
+            serde_json::json!({"created_at":"2026-09-26T01:02:03Z", "spawn_depth":-1}),
+            serde_json::json!({"created_at":"2026-09-26T01:02:03Z", "spawn_depth":3, "grant":true}),
+        ] {
+            let mut damaged = wire.clone();
+            damaged["creation"] = creation;
+            assert!(serde_json::from_value::<LogicalSessionIdentity>(damaged).is_err());
+        }
+    }
+
+    #[test]
     fn child_frames_round_trip() {
         let e = ChildFrame::Event {
             event: serde_json::json!({"type":"token","content":"hi"}),
@@ -582,6 +1261,7 @@ mod tests {
         let batch = ChildFrame::EventBatch {
             batch: ActorEventBatch {
                 logical_session: Some(LogicalSessionIdentity {
+                    creation: None,
                     session_id: "child".into(),
                     parent_session_id: Some("parent".into()),
                     root_session_id: "root".into(),
@@ -604,6 +1284,7 @@ mod tests {
             status: TerminalStatus::Completed,
             result: Some("done".into()),
             error: None,
+            final_event_watermark: None,
             transcript: Vec::new(),
         };
         assert_eq!(ChildFrame::from_text(&t.to_text()).unwrap(), t);
@@ -613,6 +1294,7 @@ mod tests {
             status: TerminalStatus::Suspended,
             result: None,
             error: None,
+            final_event_watermark: None,
             transcript: vec![serde_json::json!({"role":"assistant","content":"x"})],
         };
         assert_eq!(ChildFrame::from_text(&s.to_text()).unwrap(), s);
@@ -695,6 +1377,7 @@ mod tests {
             auto_approve_permissions: false,
             session_id: "child-1".into(),
             workspace_path: Some("/workspace/project".into()),
+            environment_lease: None,
             inherit_session_grants: false,
             policy: serde_json::json!({"enabled":true,"durable_rules":[]}),
         };
@@ -749,6 +1432,7 @@ mod tests {
             auto_approve_permissions: true,
             session_id: "partial-policy".to_string(),
             workspace_path: None,
+            environment_lease: None,
             inherit_session_grants: false,
             policy: serde_json::json!({}),
         };
@@ -814,6 +1498,7 @@ mod tests {
         let spec = RunSpec {
             assignment: "work".into(),
             logical_session: Some(LogicalSessionIdentity {
+                creation: None,
                 session_id: "child".into(),
                 parent_session_id: Some("parent".into()),
                 root_session_id: "root".into(),
@@ -873,6 +1558,32 @@ mod tests {
     }
 
     #[test]
+    fn strict_history_upgrade_preserves_bounded_token_coalescing() {
+        let spec: RunSpec = serde_json::from_value(serde_json::json!({
+            "assignment":"read", "execution_epoch":1
+        }))
+        .unwrap();
+        let mut batcher = ActorEventBatcher::for_run(&spec, None, None).with_durable_events(true);
+        for _ in 1..MAX_ACTOR_EVENT_BATCH_EVENTS {
+            assert!(batcher
+                .push(serde_json::json!({"type":"token","content":"x"}))
+                .is_empty());
+        }
+        let batch = batcher
+            .push(serde_json::json!({"type":"token","content":"x"}))
+            .pop()
+            .unwrap();
+        assert_eq!(batch.qos, ActorEventQos::Durable);
+        assert_eq!(batch.events.len(), MAX_ACTOR_EVENT_BATCH_EVENTS);
+        assert_eq!(
+            (batch.first_seq, batch.last_seq),
+            (1, MAX_ACTOR_EVENT_BATCH_EVENTS as u64)
+        );
+        assert!(batch.validate().is_ok());
+        assert!(!batcher.has_pending());
+    }
+
+    #[test]
     fn task_item_progress_delta_is_never_put_on_a_lossy_lane() {
         let event = serde_json::json!({
             "type": "task_list_item_progress",
@@ -885,3 +1596,6 @@ mod tests {
         assert_eq!(ActorEventQos::classify(&event), ActorEventQos::Durable);
     }
 }
+
+#[cfg(test)]
+mod watermark_tests;

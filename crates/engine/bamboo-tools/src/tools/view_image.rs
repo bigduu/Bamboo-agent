@@ -7,11 +7,13 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
 
+use super::parameter_schema;
 use super::read_tracker::{self, MAX_TRACKED_FILE_SIZE};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ViewImageArgs {
+    /// Absolute path to a local PNG, JPEG, GIF, or WebP image
     path: String,
 }
 
@@ -51,7 +53,7 @@ impl Tool for ViewImageTool {
     }
 
     fn description(&self) -> &str {
-        "View a local PNG, JPEG, GIF, or WebP image. Returns the image as base64 multimodal content; when hooks.image_fallback is enabled in vision mode, Bamboo uses the resolved vision model to replace it with a detailed description before the next model turn."
+        "View a local PNG, JPEG, GIF, or WebP image. Returns base64 multimodal content for the current model. Models explicitly configured without Vision reject this tool. Models with inherited capability retain the configured hooks.image_fallback behavior."
     }
 
     fn classify(&self, _args: &serde_json::Value) -> ToolClass {
@@ -59,17 +61,7 @@ impl Tool for ViewImageTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute path to a local PNG, JPEG, GIF, or WebP image"
-                }
-            },
-            "required": ["path"],
-            "additionalProperties": false
-        })
+        parameter_schema::for_arguments::<ViewImageArgs>()
     }
 
     async fn invoke(

@@ -197,7 +197,21 @@ async function state() {
   // Browser title/history CDP calls can block while a JavaScript dialog is
   // open. The synchronous page metadata still identifies the authoritative
   // tab and pending dialog without wedging the host command loop.
-  if (pendingDialog) return dialogState();
+  if (pendingDialog && activeTab()) return dialogState();
+  if (!activeTab()) {
+    return {
+      page_epoch: epoch,
+      active_tab_id: null,
+      url: '',
+      title: '',
+      frame_seq: frameSeq,
+      viewport: { width: 1000, height: 720 },
+      can_go_back: false,
+      can_go_forward: false,
+      tabs: [],
+      pending_dialog: null,
+    };
+  }
   return stableRead(async tab => {
     const viewport = tab.page.viewportSize();
     const title = await tab.page.title();
@@ -2599,12 +2613,12 @@ function adoptPage(target) {
   });
   target.on('close', () => {
     if (pendingDialog?.tabId === tab.id) expireDialog(pendingDialog);
+    const closedIndex = tabs.indexOf(tab);
     tabs = tabs.filter(candidate => candidate !== tab);
     if (activeTabId !== tab.id) return;
-    activeTabId = tabs.at(-1)?.id;
+    activeTabId = tabs[Math.min(closedIndex, tabs.length - 1)]?.id;
     if (!shuttingDown) {
       advanceEpoch();
-      if (!activeTabId) void context.newPage().catch(() => {});
     }
   });
   // A popup becomes the visible workbench tab. Explicit new tabs use this same
@@ -2739,7 +2753,20 @@ async function command(action, args = {}) {
         error.code = 'invalid_request';
         throw error;
       }
-      adoptPage(await context.newPage());
+      var targetUrl = args.url === undefined ? null : checkUrl(args.url);
+      var previousActiveTabId = activeTabId;
+      var createdPage = await context.newPage();
+      adoptPage(createdPage);
+      if (targetUrl) {
+        try {
+          await createdPage.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+        } catch (error) {
+          await createdPage.close().catch(() => {});
+          const previousTab = tabs.find(tab => tab.id === previousActiveTabId);
+          if (previousTab) activateTab(previousTab);
+          throw error;
+        }
+      }
       return state();
     case 'tab_activate': {
       checkEpoch(args);
@@ -2762,15 +2789,21 @@ async function command(action, args = {}) {
         error.code = 'invalid_request';
         throw error;
       }
-      // Keep a valid active view when the last tab is closed.
-      if (tabs.length === 1) adoptPage(await context.newPage());
       await tab.page.close();
       return state();
     }
     case 'navigate':
       checkEpoch(args);
-      var page = requireActiveTab().page;
-      await page.goto(checkUrl(args.url), { waitUntil: 'domcontentloaded', timeout: 20_000 });
+      var url = checkUrl(args.url);
+      var createdFirstPage = !activeTab();
+      var page = createdFirstPage ? await context.newPage() : requireActiveTab().page;
+      if (createdFirstPage) adoptPage(page);
+      try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+      } catch (error) {
+        if (createdFirstPage) await page.close().catch(() => {});
+        throw error;
+      }
       return state();
     case 'history':
       checkEpoch(args);
@@ -3090,13 +3123,10 @@ async function main() {
     }
     adoptPage(target);
   });
-  adoptPage(await context.newPage());
-  const initialCdp = await requireActiveTab().cdp;
-  if (!initialCdp) throw new Error('browser page session unavailable');
-  const targetInfo = await initialCdp.send('Target.getTargetInfo');
-  downloadContextId = targetInfo.targetInfo?.browserContextId;
-  if (!downloadContextId) throw new Error('browser context identity unavailable');
   downloadCdp = await browser.newBrowserCDPSession();
+  const { browserContextIds } = await downloadCdp.send('Target.getBrowserContexts');
+  downloadContextId = browserContextIds.length === 1 ? browserContextIds[0] : null;
+  if (!downloadContextId) throw new Error('browser context identity unavailable');
   downloadCdp.on('Browser.downloadWillBegin', onDownloadWillBegin);
   downloadCdp.on('Browser.downloadProgress', onDownloadProgress);
   await downloadCdp.send('Browser.setDownloadBehavior', {

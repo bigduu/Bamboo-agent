@@ -23,12 +23,14 @@ pub use bamboo_hooks::{
 #[derive(Clone)]
 pub struct HookRunner {
     dispatcher: bamboo_hooks::HookDispatcher,
+    plugin_root: Option<std::path::PathBuf>,
 }
 
 impl HookRunner {
     pub fn new() -> Self {
         Self {
             dispatcher: bamboo_hooks::HookDispatcher::new(),
+            plugin_root: None,
         }
     }
 
@@ -44,7 +46,67 @@ impl HookRunner {
         fallback_cwd: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
+            plugin_root: fallback_cwd.as_ref().map(|root| root.join("plugins")),
             dispatcher: self.dispatcher.with_lifecycle_config(config, fallback_cwd),
+        }
+    }
+
+    /// Record the exact accepted prompt from the server submission seam. The
+    /// shared loop consumes this once, so server and embedded runs cannot fire
+    /// portable UserPromptSubmit twice for the same admitted prompt.
+    pub fn mark_user_prompt_prechecked(session: &mut Session, prompt: &str) {
+        session.metadata.insert(
+            "runtime.plugin_prompt_prechecked".into(),
+            prompt_fingerprint(prompt),
+        );
+    }
+
+    /// Shared CLI/SDK fallback, before session preparation or provider calls.
+    /// Native submission hooks keep their existing server-only invocation.
+    pub(crate) async fn apply_portable_user_prompt(
+        &self,
+        session: &mut Session,
+        prompt: &str,
+    ) -> Result<String, AgentError> {
+        let prechecked = session.metadata.remove("runtime.plugin_prompt_prechecked");
+        if prechecked.as_deref() == Some(prompt_fingerprint(prompt).as_str()) {
+            return Ok(prompt.to_owned());
+        }
+        let Some(root) = &self.plugin_root else {
+            return Ok(prompt.to_owned());
+        };
+        let report = bamboo_hooks::portable::run(
+            root,
+            AgentHookPoint::BeforeSessionSetup,
+            &HookPayload::Prompt {
+                prompt: prompt.to_owned(),
+            },
+            session,
+        )
+        .await;
+        for error in &report.errors {
+            tracing::warn!(%error, "plugin prompt hook compatibility failure");
+        }
+        match report.decision {
+            HookResult::Deny { reason } | HookResult::Abort { reason } => {
+                return Err(AgentError::Tool(format!(
+                    "UserPromptSubmit hook rejected prompt: {reason}"
+                )));
+            }
+            _ => {}
+        }
+        let contexts = report
+            .contexts
+            .into_iter()
+            .map(|context| context.rendered_text())
+            .collect::<Vec<_>>();
+        if contexts.is_empty() {
+            Ok(prompt.to_owned())
+        } else {
+            Ok(format!(
+                "{prompt}\n\n<user_prompt_submit_context>\n{}\n</user_prompt_submit_context>",
+                contexts.join("\n\n---\n\n")
+            ))
         }
     }
 
@@ -60,8 +122,82 @@ impl HookRunner {
         runtime_state: &mut AgentRuntimeState,
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
     ) -> HookRunOutcome {
+        self.run_hooks_with_tool_input(point, payload, session, runtime_state, event_tx, None)
+            .await
+    }
+
+    pub async fn run_hooks_with_tool_input(
+        &self,
+        point: AgentHookPoint,
+        payload: &HookPayload,
+        session: &Session,
+        runtime_state: &mut AgentRuntimeState,
+        event_tx: Option<&mpsc::Sender<AgentEvent>>,
+        original_tool_input: Option<&serde_json::Value>,
+    ) -> HookRunOutcome {
+        self.run_hooks_with_inputs(
+            point,
+            payload,
+            session,
+            runtime_state,
+            event_tx,
+            bamboo_hooks::portable::PortableInputs {
+                original_tool_input,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn run_hooks_with_inputs(
+        &self,
+        point: AgentHookPoint,
+        payload: &HookPayload,
+        session: &Session,
+        runtime_state: &mut AgentRuntimeState,
+        event_tx: Option<&mpsc::Sender<AgentEvent>>,
+        inputs: bamboo_hooks::portable::PortableInputs<'_>,
+    ) -> HookRunOutcome {
         let report = self.dispatcher.run_hooks(point, payload, session).await;
-        record_dispatch_report(report, runtime_state, event_tx).await
+        let mut outcome = record_dispatch_report(report, runtime_state, event_tx).await;
+        if let Some(root) = &self.plugin_root {
+            if matches!(
+                outcome.decision,
+                HookResult::Continue | HookResult::Allow | HookResult::Mutated
+            ) {
+                let mut portable_payload = payload.clone();
+                if let Some(name) = inputs.resolved_tool_name {
+                    match &mut portable_payload {
+                        HookPayload::ToolExecution { tool_name, .. }
+                        | HookPayload::ToolResult { tool_name, .. } => *tool_name = name.to_owned(),
+                        _ => {}
+                    }
+                }
+                let plugin = bamboo_hooks::portable::run_with_inputs(
+                    root,
+                    point,
+                    &portable_payload,
+                    session,
+                    inputs.original_tool_input,
+                    inputs.final_assistant_content,
+                )
+                .await;
+                for error in plugin.errors {
+                    tracing::warn!(%error, "plugin hook compatibility failure");
+                    runtime_state.checkpoints.push(HookCheckpoint {
+                        hook_point: format!("plugin:{point:?}"),
+                        timestamp: Utc::now(),
+                        result: error.chars().take(1024).collect(),
+                        duration_ms: 0,
+                    });
+                }
+                if !matches!(plugin.decision, HookResult::Continue) {
+                    outcome.decision = plugin.decision;
+                }
+                outcome.plugin_contexts = plugin.contexts;
+            }
+        }
+        outcome
     }
 
     /// Run every matching hook while recording checkpoints/events, but never
@@ -86,6 +222,10 @@ impl HookRunner {
 
     pub fn has_hooks_for(&self, point: AgentHookPoint) -> bool {
         self.dispatcher.has_hooks_for(point)
+            || (self
+                .plugin_root
+                .as_ref()
+                .is_some_and(|root| bamboo_hooks::portable::has_active_hooks_for(root, point)))
     }
 
     pub fn len(&self) -> usize {
@@ -94,7 +234,22 @@ impl HookRunner {
 
     pub fn is_empty(&self) -> bool {
         self.dispatcher.is_empty()
+            && !self.plugin_root.as_ref().is_some_and(|root| {
+                [
+                    AgentHookPoint::BeforeSessionSetup,
+                    AgentHookPoint::BeforeToolExecution,
+                    AgentHookPoint::AfterToolExecution,
+                    AgentHookPoint::BeforeFinalize,
+                ]
+                .into_iter()
+                .any(|point| bamboo_hooks::portable::has_active_hooks_for(root, point))
+            })
     }
+}
+
+fn prompt_fingerprint(prompt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(prompt.as_bytes()))
 }
 
 async fn record_dispatch_report(
@@ -187,6 +342,7 @@ pub(crate) fn apply_hook_outcome(
     session: &mut Session,
     runtime_state: &mut AgentRuntimeState,
 ) -> Result<(), AgentError> {
+    inject_plugin_contexts(session, outcome.plugin_contexts);
     if matches!(point, AgentHookPoint::AfterSessionSetup) {
         runtime_state.hook_contexts.extend(
             outcome
@@ -232,11 +388,42 @@ pub(crate) fn apply_hook_outcome(
             HookRunOutcome {
                 decision: *result,
                 injected_contexts: vec![text],
+                plugin_contexts: vec![],
             },
             session,
             runtime_state,
         ),
     }
+}
+
+/// Stage bounded untrusted snapshots for the existing chronological context
+/// ledger. Do not insert messages into an unfinished assistant/tool group.
+pub(crate) fn inject_plugin_contexts(
+    session: &mut Session,
+    contexts: Vec<bamboo_hooks::portable::PluginContext>,
+) {
+    if contexts.is_empty() {
+        return;
+    }
+    let key = "runtime.plugin_hook_contexts";
+    let mut chunks: Vec<String> = session
+        .metadata
+        .get(key)
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_default();
+    chunks.extend(contexts.into_iter().map(|context| context.rendered_text()));
+    while chunks.iter().map(String::len).sum::<usize>() + chunks.len().saturating_sub(1) * 2
+        > bamboo_hooks::portable::PORTABLE_CONTEXT_BYTES
+    {
+        if chunks.is_empty() {
+            break;
+        }
+        chunks.remove(0);
+    }
+    session.metadata.insert(
+        key.into(),
+        serde_json::to_string(&chunks).expect("string serialization"),
+    );
 }
 
 pub(crate) fn inject_contexts(
@@ -551,5 +738,79 @@ mod tests {
 
         assert!(payloads.lock().unwrap().is_empty());
         assert!(session.agent_runtime_state.is_none());
+    }
+}
+
+#[cfg(test)]
+mod portable_context_tests {
+    use super::*;
+    #[test]
+    fn retained_plugin_snapshot_is_bounded_without_damaging_native_context() {
+        let mut session = Session::new("fixture", "model");
+        let mut state = AgentRuntimeState::new("run");
+        state.hook_contexts = vec!["native context".into()];
+        session.agent_runtime_state = Some(state);
+        for _ in 0..100 {
+            inject_plugin_contexts(
+                &mut session,
+                vec![bamboo_hooks::portable::PluginContext {
+                    source: "fixture@1.0.0:hooks.json:PreToolUse".into(),
+                    text: "x".repeat(200),
+                }],
+            );
+        }
+        let chunks: Vec<String> =
+            serde_json::from_str(&session.metadata["runtime.plugin_hook_contexts"]).unwrap();
+        assert!(chunks.join("\n\n").len() <= bamboo_hooks::portable::PORTABLE_CONTEXT_BYTES);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.starts_with("Plugin hook supplemental context")));
+        assert!(session.messages.is_empty());
+        let block =
+            crate::runtime::runner::session_setup::prompt_envelope::build_agent_hook_context_block(
+                &session,
+            )
+            .unwrap();
+        assert!(block.content.starts_with("native context"));
+    }
+    #[test]
+    fn plugin_context_is_chronological_sourced_and_compressible() {
+        let mut session = Session::new("test", "model");
+        let mut system = Message::system("host authority");
+        system.never_compress = true;
+        session.add_message(system);
+        session.add_message(Message::user("original prompt"));
+        inject_plugin_contexts(
+            &mut session,
+            vec![bamboo_hooks::portable::PluginContext {
+                source: "fixture@0.1.0:hooks.json:PreToolUse".into(),
+                text: "plugin content".into(),
+            }],
+        );
+        assert_eq!(session.messages[0].content, "host authority");
+        assert!(session.messages[0].never_compress);
+        assert_eq!(session.messages.len(), 2);
+        let block =
+            crate::runtime::runner::session_setup::prompt_envelope::build_agent_hook_context_block(
+                &session,
+            )
+            .unwrap();
+        assert!(block.content.contains("fixture@0.1.0"));
+        assert!(block.content.contains("untrusted"));
+        let event = bamboo_domain::ModelContextEvent {
+            id: "fixture".into(),
+            epoch: 0,
+            sequence: 0,
+            anchor_message_id: None,
+            block_type: block.block_type,
+            revision: 1,
+            supersedes_revision: None,
+            kind: bamboo_domain::ModelContextEventKind::Snapshot,
+            content_sha256: bamboo_domain::model_context_block_sha256(&block),
+            rendered_text: block.render_runtime_context_text(),
+        };
+        let message = event.render_message();
+        assert!(matches!(message.role, bamboo_agent_core::Role::User));
+        assert!(!message.never_compress);
     }
 }

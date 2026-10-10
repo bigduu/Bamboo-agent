@@ -21,16 +21,18 @@ pub mod runner_lifecycle;
 pub mod runner_state;
 pub mod session_events;
 pub mod spawn;
+pub mod visible_messages;
 
 pub use agent_spawn::{
     log_base_system_prompt_snapshot, reserve_session_execution, spawn_session_execution,
     SessionCompletionHook, SessionExecutionArgs, SessionExecutionOutcome,
     SessionExecutionReservation, SessionExecutionReserveOutcome,
 };
-pub use child_completion::{ChildCompletion, ChildCompletionHandler};
+pub use child_completion::{ChildCompletion, ChildCompletionHandler, ChildCompletionSource};
 pub use event_forwarder::{
     create_event_forwarder, create_event_forwarder_with_history_commit_barrier,
-    history_commit_barrier, AccountFeedInbox, HistoryCommitAcknowledger, HistoryCommitBarrier,
+    create_event_forwarder_with_root_actor, history_commit_barrier, AccountFeedInbox,
+    HistoryCommitAcknowledger, HistoryCommitBarrier,
 };
 pub use runner_lifecycle::{
     finalize_runner, finalize_runner_exact, reserve_runner_core, status_from_execution_result,
@@ -41,4 +43,8 @@ pub use session_events::{get_or_create_event_sender, SESSION_EVENT_CHANNEL_CAPAC
 pub use spawn::{
     ChildRunLaunchHook, ExternalChildRunner, SessionInboxRuntimeBinding, SpawnContext, SpawnJob,
     SpawnScheduler,
+};
+pub use visible_messages::{
+    VisibleAssistantMessage, VisibleMessageEvent, VisibleMessageEventKind, VisibleMessageSnapshot,
+    VisibleMessageStream,
 };

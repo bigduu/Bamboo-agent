@@ -12,6 +12,13 @@ use super::a2a_adapter::A2AExternalChildRunner;
 use super::actor_adapter::{ActorChildRunner, ChildApprovalReviewer, CodexRunTokenAuthority};
 use super::config::{parse_external_agents, ExternalAgentProtocol};
 
+/// Host-owned observation of its actual concrete tool surface at activation.
+/// The caller cannot submit a resolved ceiling through the public tool schema.
+#[async_trait]
+pub trait NativeToolCeilingSource: Send + Sync {
+    async fn observe(&self, session: &bamboo_domain::Session) -> Result<Vec<String>, String>;
+}
+
 fn codex_auth_mode_name(mode: bamboo_config::CodexAuthMode) -> String {
     match mode {
         bamboo_config::CodexAuthMode::Inherit => "inherit",
@@ -90,6 +97,23 @@ impl CompositeExternalChildRunner {
 
 #[async_trait]
 impl ExternalChildRunner for CompositeExternalChildRunner {
+    fn set_ticket_service(&self, service: Option<Arc<bamboo_tickets::TicketService>>) {
+        for runner in &self.runners {
+            runner.set_ticket_service(service.clone());
+        }
+    }
+
+    async fn validate_required_child_context_route(
+        &self,
+        session: &bamboo_agent_core::Session,
+    ) -> Result<(), String> {
+        for runner in &self.runners {
+            if runner.should_handle(session).await {
+                return runner.validate_required_child_context_route(session).await;
+            }
+        }
+        Err("required_child_context_unsupported: no matching registered worker route".into())
+    }
     async fn should_handle(&self, session: &bamboo_agent_core::Session) -> bool {
         for runner in &self.runners {
             if runner.should_handle(session).await {
@@ -118,6 +142,47 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
         ))
     }
 
+    async fn commit_durable_child_delivery(
+        &self,
+        session: &bamboo_agent_core::Session,
+        activation_run_id: &str,
+    ) -> Result<(), String> {
+        for runner in &self.runners {
+            runner
+                .commit_durable_child_delivery(session, activation_run_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn confirm_durable_child_delivery(
+        &self,
+        session: &bamboo_agent_core::Session,
+        activation_run_id: &str,
+        history_committed: bool,
+    ) -> Result<(), String> {
+        for runner in &self.runners {
+            runner
+                .confirm_durable_child_delivery(session, activation_run_id, history_committed)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn prepare_durable_child_delivery(
+        &self,
+        session: &bamboo_agent_core::Session,
+        activation_run_id: &str,
+    ) -> Result<bool, String> {
+        let mut prepared = false;
+        for runner in &self.runners {
+            prepared |= runner
+                .prepare_durable_child_delivery(session, activation_run_id)
+                .await?;
+        }
+        Ok(prepared)
+    }
+
     /// #68: fan the per-run escalation bridge out to every inner runner. The
     /// composite is what `build_external_child_runner` returns and what the
     /// worker retains, so without this forward the bind would hit the trait's
@@ -131,6 +196,27 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
     fn set_session_inbox_runtime(&self, binding: Option<SessionInboxRuntimeBinding>) {
         for runner in &self.runners {
             runner.set_session_inbox_runtime(binding.clone());
+        }
+    }
+
+    fn set_actor_directory_store(&self, store: Option<Arc<bamboo_storage::SessionStoreV2>>) {
+        for runner in &self.runners {
+            runner.set_actor_directory_store(store.clone());
+        }
+    }
+
+    fn set_canonical_subagent_tool(&self, tool: Option<Arc<dyn bamboo_agent_core::tools::Tool>>) {
+        for runner in &self.runners {
+            runner.set_canonical_subagent_tool(tool.clone());
+        }
+    }
+
+    fn set_actor_event_observer(
+        &self,
+        observer: Option<Arc<dyn super::actor_event_stream::ActorEventObserver>>,
+    ) {
+        for runner in &self.runners {
+            runner.set_actor_event_observer(observer.clone());
         }
     }
 }
@@ -188,6 +274,7 @@ pub fn build_external_child_runner_with_codex_tokens(
         approval_reviewer,
         permission_config,
         codex_run_tokens,
+        None,
     )
 }
 
@@ -209,6 +296,30 @@ pub fn build_external_child_runner_with_live_config_and_codex_tokens(
         approval_reviewer,
         permission_config,
         codex_run_tokens,
+        None,
+    )
+}
+
+/// The server binds this to the same Builtin Arc and complete base routing
+/// chain assembled for this AppState, before applying the Root role fence.
+#[allow(clippy::too_many_arguments)]
+pub fn build_external_child_runner_with_native_tool_ceiling(
+    config: &Config,
+    live_provider_config: Arc<tokio::sync::RwLock<Config>>,
+    approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
+    approval_reviewer: Option<Arc<dyn ChildApprovalReviewer>>,
+    permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
+    codex_run_tokens: Option<Arc<dyn CodexRunTokenAuthority>>,
+    native_tool_ceiling: Arc<dyn NativeToolCeilingSource>,
+) -> Arc<dyn ExternalChildRunner> {
+    build_external_child_runner_internal(
+        config,
+        Some(live_provider_config),
+        approval_registry,
+        approval_reviewer,
+        permission_config,
+        codex_run_tokens,
+        Some(native_tool_ceiling),
     )
 }
 
@@ -219,6 +330,7 @@ fn build_external_child_runner_internal(
     approval_reviewer: Option<Arc<dyn ChildApprovalReviewer>>,
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     codex_run_tokens: Option<Arc<dyn CodexRunTokenAuthority>>,
+    native_tool_ceiling: Option<Arc<dyn NativeToolCeilingSource>>,
 ) -> Arc<dyn ExternalChildRunner> {
     let agents = parse_external_agents(config);
 
@@ -234,6 +346,7 @@ fn build_external_child_runner_internal(
         permission_config.clone(),
         codex_run_tokens.clone(),
         live_provider_config.clone(),
+        native_tool_ceiling,
     ) {
         Ok(runner) => runners.push(runner),
         Err(e) => tracing::error!("local actor sub-agent runner unavailable: {e}"),
@@ -320,7 +433,8 @@ fn build_external_child_runner_internal(
                     .subagents()
                     .max_concurrent
                     .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
-            );
+            )
+            .with_max_spawn_depth(config.subagents().effective_max_spawn_depth());
             if let Some(registry) = approval_registry.clone() {
                 runner = runner.with_approval_registry(registry);
             }
@@ -404,6 +518,7 @@ fn build_local_actor_runner(
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     codex_run_tokens: Option<Arc<dyn CodexRunTokenAuthority>>,
     live_provider_config: Option<Arc<tokio::sync::RwLock<Config>>>,
+    native_tool_ceiling: Option<Arc<dyn NativeToolCeilingSource>>,
 ) -> Result<Arc<dyn ExternalChildRunner>, String> {
     let sub = config.subagents();
 
@@ -441,6 +556,8 @@ fn build_local_actor_runner(
         sub.max_concurrent
             .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
     )
+    .with_max_spawn_depth(sub.effective_max_spawn_depth())
+    .with_builtin_required_context_route(sub.worker_bin.is_none() && sub.worker_args.is_none())
     .with_remote_placements(resolve_remote_placements(
         &sub.remote_placements,
         &config.cluster_fabric.nodes,
@@ -453,7 +570,8 @@ fn build_local_actor_runner(
         endpoint: b.endpoint.clone(),
         token: b.token.clone(),
     }))
-    .with_codex_run_tokens(codex_run_tokens);
+    .with_codex_run_tokens(codex_run_tokens)
+    .with_native_tool_ceiling_source(native_tool_ceiling);
     if let Some(registry) = approval_registry {
         runner = runner.with_approval_registry(registry);
     }
@@ -516,34 +634,95 @@ fn subagent_executor_spec(
     })
 }
 
-/// Resolve config `schedulable_placements` into runner-ready handles (#181, P2b),
-/// keyed by role. Mirrors `resolve_remote_placements`: the bearer is read from
-/// `token_env` HERE (the raw token never rides the config) and is used for BOTH
-/// the registry query and the chosen worker's connect. If `token_env` is `Some`
-/// but the env var is UNSET, log an error and SKIP that placement so a misconfig
-/// fails SAFE to the local path rather than querying/connecting with no bearer. A
-/// placement with no `token_env` is tokenless (trusted/loopback link only).
-/// Duplicate roles: last one wins.
+fn valid_placement_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_placement_requirements(value: &bamboo_config::OperatorPlacementRequirements) -> bool {
+    valid_placement_identifier(&value.trust_zone)
+        && value
+            .workspace_label
+            .as_deref()
+            .is_none_or(valid_placement_identifier)
+        && value
+            .network_zone
+            .as_deref()
+            .is_none_or(valid_placement_identifier)
+        && value.required_tools.len() <= 256
+        && value
+            .required_tools
+            .iter()
+            .all(|tool| valid_placement_identifier(tool))
+}
+
+fn valid_scoped_broker_endpoint(value: &str) -> bool {
+    value.len() <= 2048
+        && url::Url::parse(value).is_ok_and(|url| {
+            url.scheme() == "wss"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+}
+
+fn resolved_broker_token(name: Option<&str>) -> Option<String> {
+    name.filter(|name| !name.is_empty() && name.len() <= 256)
+        .and_then(|name| std::env::var(name).ok())
+        .filter(|token| {
+            (32..=256).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_graphic())
+        })
+}
+
+/// Resolve every configured role, including invalid legacy entries. An explicit
+/// scheduled role must never silently fall through to Local.
 fn resolve_schedulable_placements(
     placements: &[bamboo_config::SchedulablePlacement],
     nodes: &[bamboo_config::cluster_fabric::Node],
 ) -> std::collections::HashMap<String, super::actor_adapter::ResolvedSchedulablePlacement> {
-    // Phase 3: a pool is just a bus role. The runner picks a live connected worker
-    // of that role via the bus presence query — no registry url / token / cert.
-    placements
-        .iter()
-        .map(|p| {
-            (
-                p.role.clone(),
-                super::actor_adapter::ResolvedSchedulablePlacement {
-                    pool: p.pool.clone(),
-                    // The badge shows the cluster node's own metadata: a node
-                    // deployed to serve this pool (its `deploy.default_role`).
-                    host_label: node_label_for_role(nodes, &p.pool),
-                },
-            )
-        })
-        .collect()
+    let mut out = std::collections::HashMap::new();
+    for p in placements {
+        let token = resolved_broker_token(p.token_env.as_deref());
+        let valid = valid_placement_identifier(&p.pool)
+            && valid_scoped_broker_endpoint(&p.registry_url)
+            && p.token_env.is_some()
+            && token.is_some()
+            && p.ca_cert_file.as_ref().is_some_and(|path| {
+                bamboo_broker::client_config_trusting_cert(std::path::Path::new(path)).is_ok()
+            })
+            && p.broker_parent.as_ref().is_some_and(|parent| {
+                valid_placement_identifier(&parent.parent_mailbox)
+                    && valid_placement_identifier(&parent.parent_role)
+            })
+            && p.placement_requirements
+                .as_ref()
+                .is_some_and(valid_placement_requirements);
+        let resolved = super::actor_adapter::ResolvedSchedulablePlacement {
+            pool: p.pool.clone(),
+            host_label: node_label_for_role(nodes, &p.pool),
+            endpoint: p.registry_url.clone(),
+            token: if valid { token } else { None },
+            ca_cert_file: p.ca_cert_file.as_ref().map(std::path::PathBuf::from),
+            broker_parent: if valid { p.broker_parent.clone() } else { None },
+            requirements: if valid {
+                p.placement_requirements.clone()
+            } else {
+                None
+            },
+        };
+        if out.insert(p.role.clone(), resolved).is_some() {
+            // Ambiguous authority is unavailable, regardless of entry order.
+            if let Some(route) = out.get_mut(&p.role) {
+                route.broker_parent = None;
+            }
+        }
+    }
+    out
 }
 
 /// Friendly display name for a cluster node whose worker serves `role`
@@ -595,73 +774,77 @@ fn node_display_name(n: &bamboo_config::cluster_fabric::Node) -> String {
     }
 }
 
-/// Resolve config `remote_placements` into runner-ready handles (#193), keyed by
-/// role. The bearer is read from `token_env` HERE (mirroring the A2A `auth_ref`
-/// handling at ~runtime.rs:142): if the env var is set use it; if `token_env` is
-/// `Some` but the var is UNSET, log an error and SKIP that placement so a
-/// misconfig fails SAFE to the local path rather than connecting to a remote
-/// worker with no bearer. A placement with no `token_env` connects tokenless
-/// (trusted/loopback link only). Duplicate roles: last one wins.
-/// Heuristic: does this endpoint reach off-box (so a missing bearer is a real
-/// exposure)? `wss://` is always public-grade; for `ws://` we flag any host that
-/// is not loopback/localhost.
-fn endpoint_looks_public(endpoint: &str) -> bool {
-    if endpoint.starts_with("wss://") {
-        return true;
-    }
-    let host = endpoint
-        .strip_prefix("ws://")
-        .unwrap_or(endpoint)
-        .split(['/', ':'])
-        .next()
-        .unwrap_or("");
-    !(host == "localhost" || host == "127.0.0.1" || host == "::1" || host.is_empty())
-}
-
+/// Resolve pinned remote placements. Broker peer selection is required to run;
+/// old direct-worker configurations remain visible but unavailable, without
+/// exposing their credentials or silently rerouting to Local.
 fn resolve_remote_placements(
     placements: &[bamboo_config::RemoteActorPlacement],
     nodes: &[bamboo_config::cluster_fabric::Node],
 ) -> std::collections::HashMap<String, super::actor_adapter::ResolvedRemotePlacement> {
     let mut out = std::collections::HashMap::new();
     for p in placements {
-        let token = match p.token_env.as_deref() {
-            Some(env_var) => match std::env::var(env_var) {
-                Ok(token) => Some(token),
-                Err(_) => {
-                    tracing::error!(
-                        "remote placement for role '{}' token_env '{}' is not set; \
-                         skipping (role falls back to local, NOT unauthenticated remote)",
-                        p.role,
-                        env_var
-                    );
-                    continue;
-                }
-            },
-            None => {
-                // A tokenless placement is only safe on a trusted link. Warn if
-                // it targets what looks like a public endpoint (wss:// or a
-                // non-loopback host) so an operator footgun is visible in logs.
-                if endpoint_looks_public(&p.endpoint) {
-                    tracing::warn!(
-                        "remote placement for role '{}' has no token_env but targets a \
-                         public-looking endpoint '{}'; work will be dispatched with NO bearer. \
-                         Set token_env (and use wss://) for any non-loopback worker.",
-                        p.role,
-                        p.endpoint
-                    );
-                }
-                None
-            }
-        };
+        let duplicate_strict = placements
+            .iter()
+            .any(|other| other.role == p.role && other.broker_peer.is_some())
+            && placements
+                .iter()
+                .filter(|other| other.role == p.role)
+                .count()
+                != 1;
+        if duplicate_strict {
+            out.insert(
+                p.role.clone(),
+                super::actor_adapter::ResolvedRemotePlacement {
+                    endpoint: String::new(),
+                    token: None,
+                    ca_cert_file: None,
+                    host_label: Some("remote".into()),
+                    broker_peer: Some(Err(())),
+                    requirements: None,
+                },
+            );
+            continue;
+        }
+        if let Some(peer) = &p.broker_peer {
+            let token = resolved_broker_token(p.token_env.as_deref());
+            let valid = peer.valid()
+                && valid_scoped_broker_endpoint(&p.endpoint)
+                && p.token_env.is_some()
+                && token.is_some()
+                && p.ca_cert_file.as_ref().is_some_and(|path| {
+                    bamboo_broker::client_config_trusting_cert(std::path::Path::new(path)).is_ok()
+                })
+                && p.placement_requirements
+                    .as_ref()
+                    .is_some_and(valid_placement_requirements);
+            out.insert(
+                p.role.clone(),
+                super::actor_adapter::ResolvedRemotePlacement {
+                    endpoint: p.endpoint.clone(),
+                    token: if valid { token } else { None },
+                    ca_cert_file: p.ca_cert_file.as_ref().map(std::path::PathBuf::from),
+                    host_label: Some("remote".into()),
+                    broker_peer: Some(if valid { Ok(peer.clone()) } else { Err(()) }),
+                    requirements: if valid {
+                        p.placement_requirements.clone()
+                    } else {
+                        None
+                    },
+                },
+            );
+            continue; // Invalid explicit routes remain selected, never Local fallback.
+        }
         out.insert(
             p.role.clone(),
             super::actor_adapter::ResolvedRemotePlacement {
                 endpoint: p.endpoint.clone(),
-                token,
+                token: None,
                 ca_cert_file: p.ca_cert_file.as_ref().map(std::path::PathBuf::from),
                 // Badge from the node's own metadata when the endpoint points at
                 // a known cluster node; else the endpoint host is used downstream.
                 host_label: node_label_for_endpoint(nodes, &p.endpoint),
+                broker_peer: Some(Err(())),
+                requirements: None,
             },
         );
     }
@@ -789,6 +972,57 @@ pub fn extract_provider_credentials(
 
 #[cfg(test)]
 mod codex_runtime_config_tests {
+    #[tokio::test]
+    async fn required_context_uses_registered_launch_snapshot_after_live_config_flip() {
+        let mut candidate = bamboo_agent_core::Session::new("preflight", "model");
+        candidate.metadata = super::super::config::resolve_runtime_metadata(
+            &bamboo_llm::Config::default(),
+            "worker",
+        );
+        candidate
+            .metadata
+            .insert("subagent_type".into(), "worker".into());
+        for kind in ["custom", "args", "codex", "remote"] {
+            let mut config = bamboo_llm::Config::default();
+            let sub = config.subagents_mut();
+            sub.broker = Some(bamboo_config::BrokerClientConfig {
+                endpoint: "ws://127.0.0.1:9998".into(),
+                token: "fixture".into(),
+                ..Default::default()
+            });
+            match kind {
+                "custom" => sub.worker_bin = Some("/bin/false".into()),
+                "args" => sub.worker_args = Some(vec!["subagent-worker".into()]),
+                "codex" => sub.executor = Some("codex".into()),
+                _ => sub
+                    .remote_placements
+                    .push(bamboo_config::RemoteActorPlacement {
+                        role: "worker".into(),
+                        endpoint: "ws://127.0.0.1:9999".into(),
+                        ..Default::default()
+                    }),
+            }
+            let live = std::sync::Arc::new(tokio::sync::RwLock::new(config.clone()));
+            let runner = super::build_external_child_runner_with_live_config_and_codex_tokens(
+                &config,
+                live.clone(),
+                None,
+                None,
+                None,
+                None,
+            );
+            *live.write().await = bamboo_llm::Config::default();
+            let error = runner
+                .validate_required_child_context_route(&candidate)
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("required_child_context_unsupported"),
+                "{kind}"
+            );
+        }
+    }
+
     use super::{
         codex_approval_policy_name, codex_auth_mode_name, codex_base_url, codex_mode_name,
         codex_sandbox_name, codex_wire_api_name, subagent_executor_spec,
@@ -1076,6 +1310,42 @@ mod placement_resolver_tests {
     };
     use bamboo_config::{RemoteActorPlacement, SchedulablePlacement};
 
+    #[test]
+    fn explicit_broker_route_retains_unavailable_selection_and_redacted_debug() {
+        let route = bamboo_config::RemoteBrokerPeer {
+            parent_mailbox: "host".into(),
+            worker_mailbox: "worker".into(),
+            parent_role: Some("host".into()),
+            worker_role: Some("worker".into()),
+        };
+        assert!(route.valid());
+        let mut invalid = route.clone();
+        invalid.worker_mailbox = "Worker".into();
+        assert!(!invalid.valid());
+        invalid.worker_mailbox = "../worker".into();
+        assert!(!invalid.valid());
+        let placement = RemoteActorPlacement {
+            role: "worker".into(),
+            endpoint: "ws://private.invalid".into(),
+            token_env: Some("BAMBOO_1431_MISSING_FIXTURE_TOKEN".into()),
+            ca_cert_file: None,
+            broker_peer: Some(route),
+            placement_requirements: None,
+        };
+        let parsed: RemoteActorPlacement =
+            serde_json::from_value(serde_json::to_value(&placement).unwrap()).unwrap();
+        assert_eq!(parsed, placement);
+        let resolved = resolve_remote_placements(&[placement], &[]);
+        let selected = &resolved["worker"];
+        assert!(matches!(selected.broker_peer, Some(Err(()))));
+        assert!(selected.token.is_none());
+        assert_eq!(selected.host_label.as_deref(), Some("remote"));
+        assert!(!format!("{selected:?}").contains("private.invalid"));
+        assert!(serde_json::from_value::<bamboo_config::RemoteBrokerPeer>(serde_json::json!({
+            "parent_mailbox":"host", "worker_mailbox":"worker", "parent_role":null, "worker_role":null,"credential":"secret"
+        })).is_err());
+    }
+
     fn ssh_node(id: &str, label: &str, host: &str, default_role: Option<&str>) -> Node {
         Node {
             id: id.into(),
@@ -1138,6 +1408,8 @@ mod placement_resolver_tests {
             out.get("explorer").unwrap().host_label.as_deref(),
             Some("mini")
         );
+        assert!(matches!(out["explorer"].broker_peer, Some(Err(()))));
+        assert!(out["explorer"].token.is_none());
     }
 
     #[test]

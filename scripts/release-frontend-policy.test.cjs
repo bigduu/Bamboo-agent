@@ -17,7 +17,7 @@ const {
 
 const ROOT = path.resolve(__dirname, "..");
 const LOTUS_NEXT_PACKAGE_NAME = "@bigduu/lotus-next";
-const LOTUS_NEXT_VERSION = "2026.9.22";
+const LOTUS_NEXT_VERSION = "2026.10.8";
 
 test("defaults releases and tag events to the exact locked Lotus Next artifact", () => {
   assert.deepEqual(resolveReleaseFrontend(), {
@@ -182,3 +182,52 @@ test("crate and Docker publishers share the fail-closed resolver contract", () =
     2,
   );
 });
+
+function publicationGuard(workflow) {
+  workflow = workflow.replace(/\r\n/g, "\n");
+  const guardName = "name: Require the exact accepted publication source";
+  const setupName = "name: Setup Node.js";
+  assert.ok(workflow.indexOf(guardName) >= 0 && workflow.indexOf(guardName) < workflow.indexOf(setupName), "The publication guard must precede dependency setup");
+  const match = workflow.match(/name: Require the exact accepted publication source\n[\s\S]*?        run: \|\n([\s\S]*?)(?=\n      - (?:&[\w-]+\n        )?name: Setup Node.js)/);
+  assert.ok(match, "The first publication guard must be executable before dependency or package work");
+  return match[1].split("\n").map((line) => line.replace(/^          /, "")).join("\n");
+}
+
+for (const [ending, newline] of [["LF", "\n"], ["CRLF", "\r\n"]]) {
+  test(`crate publication ${ending} guard rejects a moved, mismatched or dirty source before package work`, (t) => {
+    const workflow = fs.readFileSync(path.join(ROOT, ".github/workflows/publish-crate.yml"), "utf8").replace(/\r?\n/g, newline);
+    const guard = publicationGuard(workflow);
+    assert.throws(() => publicationGuard(workflow.replace("name: Require the exact accepted publication source", "name: Missing publication guard")), /publication guard must precede/);
+    const guardStart = workflow.indexOf("      - &manual-source");
+    const setupStart = workflow.indexOf("      - &manual-node");
+    const frontendStart = workflow.indexOf("      - &manual-frontend");
+    assert.ok(guardStart >= 0 && guardStart < setupStart && setupStart < frontendStart);
+    const moved = workflow.slice(0, guardStart) + workflow.slice(setupStart, frontendStart) + workflow.slice(guardStart, setupStart) + workflow.slice(frontendStart);
+    assert.throws(() => publicationGuard(moved), /publication guard must precede/);
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-publication-source-guard-"));
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+    const git = (args) => {
+      const result = spawnSync("git", args, { cwd: directory, encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim();
+    };
+    git(["init", "--quiet"]);
+    fs.writeFileSync(path.join(directory, "source.txt"), "accepted test fixture\n");
+    git(["add", "source.txt"]);
+    git(["-c", "user.name=release-guard-test", "-c", "user.email=release-guard-test@example.invalid", "commit", "--quiet", "-m", "source guard fixture"]);
+    const head = git(["rev-parse", "HEAD"]);
+    const check = (expected, workflowSha) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", guard], {
+      cwd: directory, encoding: "utf8", env: { ...process.env, EXPECTED_SOURCE_SHA: expected, GITHUB_SHA: workflowSha,
+        GITHUB_REF: "refs/tags/frozen-source-fixture", GITHUB_REF_PROTECTED: "false" },
+    });
+    assert.equal(check(head, head).status, 0, "Exact clean frozen-tag source is admitted without requiring a protected branch");
+    for (const [expected, workflowSha] of [["0".repeat(40), head], [head, "1".repeat(40)], ["HEAD", head], [head + "\npoison=true", head]]) {
+      assert.notEqual(check(expected, workflowSha).status, 0, "Unaccepted source or input must fail closed");
+    }
+    fs.writeFileSync(path.join(directory, "source.txt"), "changed source\n");
+    assert.notEqual(check(head, head).status, 0, "Tracked source changes must fail");
+    git(["checkout", "--", "source.txt"]);
+    fs.writeFileSync(path.join(directory, "extra.txt"), "untracked source\n");
+    assert.notEqual(check(head, head).status, 0, "Untracked source changes must fail");
+  });
+}

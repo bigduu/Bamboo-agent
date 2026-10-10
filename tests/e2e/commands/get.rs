@@ -2,25 +2,26 @@ use super::*;
 
 #[actix_web::test]
 async fn test_get_command_by_id_workflow() {
-    let state = crate::e2e::common::create_test_app().await;
-
-    // Create a test workflow file
-    let workflows_dir = state.app_data_dir.join("workflows");
-    tokio::fs::create_dir_all(&workflows_dir)
-        .await
-        .expect("Failed to create workflows dir");
-
-    let workflow_content = "# Test Workflow\n\nThis is a test workflow.";
-    let workflow_path = workflows_dir.join("test-workflow.md");
-    tokio::fs::write(&workflow_path, workflow_content)
-        .await
-        .expect("Failed to write workflow");
+    let state = crate::e2e::common::create_test_app_with_workflows().await;
 
     let app = test::init_service(App::new().app_data(state.clone()).route(
         "/v1/commands/{command_type}/{id}",
         web::get().to(command::get_command),
     ))
     .await;
+
+    let req = test::TestRequest::get()
+        .uri("/v1/commands/workflow/test-workflow")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_FOUND);
+
+    // Publish a new source after watcher startup; it cannot come from the initial snapshot.
+    let workflow_content = "# Test Workflow\n\nThis is a test workflow.";
+    let workflow_path = state.app_data_dir.join("workflows/test-workflow.md");
+    tokio::fs::write(&workflow_path, workflow_content)
+        .await
+        .expect("Failed to write workflow");
 
     let resp = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {

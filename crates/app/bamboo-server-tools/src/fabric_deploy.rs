@@ -884,6 +884,8 @@ impl FabricDeployer {
         self.registry.lock().await.insert(
             crate::registry_keys::node_key(node_id),
             Deployed {
+                actor: None,
+                activation: None,
                 env: placement_env(&node).to_string(),
                 handle,
             },
@@ -2406,6 +2408,8 @@ mod lifecycle_persistence_tests {
         fixture.registry.lock().await.insert(
             crate::registry_keys::node_key("n1"),
             Deployed {
+                actor: None,
+                activation: None,
                 env: "local".to_string(),
                 handle: bamboo_broker::DeployedAgent::from_parts("old-worker", child, None),
             },

@@ -10,7 +10,12 @@ impl McpServerManager {
     /// generation replaces the complete live catalog/runtime view.
     pub async fn reconcile_from_config(&self, config: &McpConfig) {
         if let Err(error) = self.reconcile_from_config_transactional(config).await {
-            error!("Failed to reconcile MCP configuration transactionally: {error}");
+            error!(
+                phase = "config_reconcile",
+                error_kind = error_kind(&error),
+                error_text_len = error_text_len(&error),
+                "Failed to reconcile MCP configuration transactionally"
+            );
         }
     }
 
@@ -82,7 +87,7 @@ impl McpServerManager {
                         effective_server_config(&runtime.config) != effective_server_config(desired)
                             || matches!(
                                 runtime.config.transport,
-                                TransportConfig::Sse(_) | TransportConfig::StreamableHttp(_)
+                                TransportConfig::StreamableHttp(_)
                             ) && runtime.proxy_fingerprint != desired_proxy_fingerprint
                     })
                     .unwrap_or(true);
@@ -193,7 +198,12 @@ impl McpServerManager {
     /// exposing a partial server-by-server prefix.
     pub async fn initialize_from_config(&self, config: &McpConfig) {
         if let Err(error) = self.reconcile_from_config_transactional(config).await {
-            error!("Failed to initialize MCP configuration: {error}");
+            error!(
+                phase = "config_initialize",
+                error_kind = error_kind(&error),
+                error_text_len = error_text_len(&error),
+                "Failed to initialize MCP configuration"
+            );
         }
     }
 }

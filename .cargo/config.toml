@@ -2,10 +2,31 @@
 # Release profile is untouched.
 
 [profile.dev]
+# Keep macOS unwind offsets within the compact-unwind range while preserving
+# unwinding and file:line backtraces in development and tests.
+opt-level = 1
 # Line tables keep file:line in backtraces at a fraction of full debuginfo size.
 debug = "line-tables-only"
 
 # Third-party dependencies get no debug info at all ("*" excludes workspace
 # members, so bamboo_* crates keep their line tables).
 [profile.dev.package."*"]
+# Preserve the existing dependency optimization; only workspace code needs the
+# unwind-size tuning above, avoiding a cold rebuild of all third-party crates.
+opt-level = 0
 debug = false
+
+# The server's monolithic lib-test needs more headroom below macOS's 16MiB
+# DWARF unwind-offset limit. Keep size optimization local to this crate.
+[profile.dev.package.bamboo-server]
+opt-level = "z"
+
+# Keep the full test suite's fast, unoptimized builds. The macOS link guard
+# explicitly selects the development profile to verify its unwind tables.
+[profile.test]
+opt-level = 0
+
+# Package overrides are inherited from dev and take precedence over the test
+# profile's opt-level, so explicitly retain unoptimized ordinary server tests.
+[profile.test.package.bamboo-server]
+opt-level = 0

@@ -299,6 +299,9 @@ pub struct AppState {
     /// Background scheduler for async sub-session spawning.
     pub spawn_scheduler: Arc<SpawnScheduler>,
 
+    /// One Host-owned Ticket authority; records survive disabling dispatch.
+    pub tickets: Arc<ticket_application::TicketApplication>,
+
     /// Coordinates child completion notifications into parent resume.
     pub child_completion_coordinator: Arc<bamboo_engine::ChildCompletionCoordinator>,
 
@@ -430,6 +433,9 @@ pub struct AppState {
     /// - sub-session forwarding (child -> parent)
     pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
 
+    /// Canonical, redacted Actor stream windows exist only for subscribed IDs.
+    pub(crate) actor_event_hub: Arc<actor_events::ActorEventHub>,
+
     /// Account-scoped durable change feed (powers `GET /api/v1/stream`).
     ///
     /// Unlike `session_event_senders`, this is a single account-wide sink: all
@@ -518,6 +524,7 @@ impl AppState {
     }
 }
 
+pub(crate) mod actor_events;
 mod agent_session_context;
 mod builder;
 mod config_runtime;
@@ -526,11 +533,18 @@ pub(crate) use config_runtime::ConfigSectionMutationError;
 pub(crate) use config_runtime::CredentialBackedResetCommit;
 pub mod init;
 pub mod parent_approval_reviewer;
+mod parent_permission_outcome;
+mod parent_permission_reconcile;
+pub(crate) use parent_permission_reconcile::pending_for_child as pending_permissions_for_child;
+mod parent_permission_request;
+mod parent_question_outcome;
+mod parent_question_reconcile;
 mod persistence;
 mod project_watcher;
 mod provider_api;
 pub mod resume_adapter;
 pub mod runner_lifecycle;
+mod wake_reconciler;
 // `pub` (not `pub(crate)`): `ScheduleContext::notification_relay` (a public
 // field of the public `schedule_app::ScheduleContext`) is typed
 // `session_events::NotificationRelayDeps`, so external callers that build a
@@ -539,6 +553,7 @@ pub(crate) mod mutation_idempotency;
 pub(crate) mod session_create_operations;
 pub mod session_events;
 mod session_loader;
+pub mod ticket_application;
 mod tools;
 pub mod watchers;
 

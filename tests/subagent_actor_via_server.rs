@@ -19,15 +19,16 @@ use bamboo_agent_core::storage::Storage as _;
 use bamboo_agent_core::tools::ToolExecutionContext;
 use bamboo_agent_core::{Role, Session};
 use bamboo_domain::session::tool_types::{FunctionCall, ToolCall};
-use bamboo_server::app_state::{AppState, MemoryStore};
+use bamboo_server::app_state::{AgentStatus, AppState, MemoryStore};
 use bamboo_server::tools::ToolSurface;
 use tempfile::TempDir;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn subagent_create_runs_actor_process_through_the_server() {
     let bamboo_bin = env!("CARGO_BIN_EXE_bamboo");
-    let home = TempDir::new().unwrap();
-    let fabric_dir = home.path().join("fabric");
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let fabric_dir = home.join("fabric");
 
     // The friendly config a user would write — plus expert worker_bin override
     // because inside a test the "current executable" is the test runner, not bamboo.
@@ -44,32 +45,32 @@ async fn subagent_create_runs_actor_process_through_the_server() {
         }
     });
     std::fs::write(
-        home.path().join("config.json"),
+        home.join("config.json"),
         serde_json::to_vec_pretty(&config).unwrap(),
     )
     .unwrap();
 
-    let state = AppState::new_with_memory_store(
-        home.path().to_path_buf(),
-        MemoryStore::new(home.path().join("jiandu")),
-    )
-    .await
-    .expect("app state boots");
+    let state =
+        AppState::new_with_memory_store(home.clone(), MemoryStore::new(home.join("jiandu")))
+            .await
+            .expect("app state boots");
 
     // A root session for the parent (workspace = the temp dir).
     let parent_id = "parent-actor-e2e";
     let mut parent = Session::new(parent_id, "claude-test");
     parent.title = "Actor e2e parent".into();
-    parent.workspace = Some(home.path().to_string_lossy().into_owned());
+    parent.workspace = Some(home.to_string_lossy().into_owned());
     state.storage.save_session(&parent).await.unwrap();
     state.session_store.save_session(&parent).await.unwrap();
 
-    // Invoke the SubAgent tool exactly as the LLM would.
+    // Invoke the real caller with an unknown legacy role: builtin worker
+    // intentionally requires the strict BambooRuntime route, not this Echo fixture.
     let tools = state.tool_factory.get(ToolSurface::Root);
     let args = serde_json::json!({
         "action": "create",
         "title": "Echo task",
         "responsibility": "echo the assignment",
+        "subagent_type": "legacy-echo-fixture",
         "prompt": "hello actor",
         "wait": false,
         "auto_run": true
@@ -107,6 +108,14 @@ async fn subagent_create_runs_actor_process_through_the_server() {
     let mut completed_child: Option<Session> = None;
     for _ in 0..300 {
         tokio::time::sleep(Duration::from_millis(200)).await;
+        // A full save publishes runtime.json before session.json. Observe the
+        // actual runner finalization (after history commit), then read history.
+        let finalized = state
+            .agent_runners
+            .read()
+            .await
+            .get(&child_id)
+            .is_some_and(|runner| matches!(runner.status, AgentStatus::Completed));
         if let Ok(Some(child)) = state.storage.load_session(&child_id).await {
             let status: HashMap<_, _> = child.metadata.clone().into_iter().collect();
             let runtime_status = child
@@ -115,6 +124,7 @@ async fn subagent_create_runs_actor_process_through_the_server() {
                 .and_then(|m| m.last_run_status.clone())
                 .or_else(|| status.get("last_run_status").cloned());
             match runtime_status.as_deref() {
+                Some("completed") if !finalized => continue,
                 Some("completed") => {
                     completed_child = Some(child);
                     break;
@@ -144,7 +154,10 @@ async fn subagent_create_runs_actor_process_through_the_server() {
         .rev()
         .find(|m| matches!(m.role, Role::Assistant))
         .map(|m| m.content.clone())
-        .expect("child session has the actor's assistant reply");
+        .unwrap_or_else(|| {
+            let retained = temp.keep();
+            panic!("child session has the actor's assistant reply; missing in finalized history at {retained:?}")
+        });
     assert!(
         reply.starts_with("echo:"),
         "expected echo result written back, got: {reply}"
@@ -176,8 +189,9 @@ async fn subagent_create_runs_actor_process_through_the_server() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_running_actor_child_through_the_server() {
     let bamboo_bin = env!("CARGO_BIN_EXE_bamboo");
-    let home = TempDir::new().unwrap();
-    let fabric_dir = home.path().join("fabric");
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let fabric_dir = home.join("fabric");
 
     let config = serde_json::json!({
         "provider": "anthropic",
@@ -191,21 +205,19 @@ async fn cancel_running_actor_child_through_the_server() {
         }
     });
     std::fs::write(
-        home.path().join("config.json"),
+        home.join("config.json"),
         serde_json::to_vec_pretty(&config).unwrap(),
     )
     .unwrap();
 
-    let state = AppState::new_with_memory_store(
-        home.path().to_path_buf(),
-        MemoryStore::new(home.path().join("jiandu")),
-    )
-    .await
-    .expect("app state boots");
+    let state =
+        AppState::new_with_memory_store(home.clone(), MemoryStore::new(home.join("jiandu")))
+            .await
+            .expect("app state boots");
 
     let parent_id = "parent-cancel-e2e";
     let mut parent = Session::new(parent_id, "claude-test");
-    parent.workspace = Some(home.path().to_string_lossy().into_owned());
+    parent.workspace = Some(home.to_string_lossy().into_owned());
     state.storage.save_session(&parent).await.unwrap();
     state.session_store.save_session(&parent).await.unwrap();
 
@@ -219,6 +231,7 @@ async fn cancel_running_actor_child_through_the_server() {
                 "action": "create",
                 "title": "Sleeper",
                 "responsibility": "sleep until cancelled",
+                "subagent_type": "legacy-echo-fixture",
                 // 60s cancellable sleep: the run stays open until we cancel.
                 "prompt": "__sleep_ms:60000 never reached",
                 "wait": false,

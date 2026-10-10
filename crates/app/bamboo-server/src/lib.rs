@@ -128,6 +128,9 @@ pub mod server;
 pub mod service_manager;
 pub mod services;
 pub mod session_app;
+mod skill_runtime;
+#[cfg(all(test, target_os = "macos"))]
+mod test_unwinding;
 pub mod tool_event_policy;
 pub mod tool_event_router;
 

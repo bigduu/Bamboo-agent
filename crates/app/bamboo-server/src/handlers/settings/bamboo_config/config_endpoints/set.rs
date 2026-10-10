@@ -79,6 +79,8 @@ pub async fn set_bamboo_config(
         let current = config.clone();
         let mut patch_obj = patch_obj;
         remove_unchanged_access_control_echo(&current, &mut patch_obj)?;
+        crate::handlers::settings::redaction::preserve_remote_broker_echo(&current, &mut patch_obj)
+            .map_err(|message| AppError::BadRequest(message.into()))?;
         config_manager::preserve_masked_provider_api_keys(&mut patch_obj, &current);
         config_manager::preserve_masked_notification_secrets(&mut patch_obj, &current);
         config_manager::preserve_masked_connect_secrets(&mut patch_obj, &current);

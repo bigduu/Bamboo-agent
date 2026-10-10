@@ -181,14 +181,36 @@ async fn browser_tab_routes_identify_the_active_dom_screenshot_and_frame() {
     .await;
     assert_eq!(opened.status(), StatusCode::OK);
     let opened: Value = test::read_body_json(opened).await;
-    let first_tab = opened["active_tab_id"].as_str().unwrap().to_string();
-    assert_eq!(opened["tabs"].as_array().unwrap().len(), 1);
+    assert!(opened["active_tab_id"].is_null());
+    assert!(opened["tabs"].as_array().unwrap().is_empty());
+    let invalid_url = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs"))
+            .set_json(json!({"expected_epoch":opened["page_epoch"],"url":"file:///tmp/secret"}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(invalid_url.status(), StatusCode::BAD_REQUEST);
+
+    let first = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs"))
+            .set_json(json!({"expected_epoch":opened["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first: Value = test::read_body_json(first).await;
+    let first_tab = first["active_tab_id"].as_str().unwrap().to_string();
+    assert_eq!(first["tabs"].as_array().unwrap().len(), 1);
 
     let created = test::call_service(
         &app,
         test::TestRequest::post()
             .uri(&format!("{base}/tabs"))
-            .set_json(json!({"expected_epoch":opened["page_epoch"]}))
+            .set_json(json!({"expected_epoch":first["page_epoch"]}))
             .to_request(),
     )
     .await;
@@ -336,7 +358,6 @@ async fn browser_frame_route_recovers_after_viewport_then_navigation() {
     .await;
     assert_eq!(opened.status(), StatusCode::OK);
     let opened: Value = test::read_body_json(opened).await;
-    let tab_id = opened["active_tab_id"].as_str().unwrap();
 
     let alpha = test::call_service(
         &app,
@@ -351,6 +372,7 @@ async fn browser_frame_route_recovers_after_viewport_then_navigation() {
     .await;
     assert_eq!(alpha.status(), StatusCode::OK);
     let alpha: Value = test::read_body_json(alpha).await;
+    let tab_id = alpha["active_tab_id"].as_str().unwrap();
     let alpha_frame = test::call_service(
         &app,
         test::TestRequest::get()
@@ -508,7 +530,6 @@ async fn browser_dialog_http_and_model_share_one_chat_without_cross_chat_respons
     .await;
     assert_eq!(opened.status(), StatusCode::OK);
     let opened: Value = test::read_body_json(opened).await;
-    let foreground_tab_id = opened["active_tab_id"].as_str().unwrap().to_string();
     let navigated = test::call_service(
         &app,
         test::TestRequest::post()
@@ -521,6 +542,7 @@ async fn browser_dialog_http_and_model_share_one_chat_without_cross_chat_respons
     .await;
     assert_eq!(navigated.status(), StatusCode::OK);
     let navigated: Value = test::read_body_json(navigated).await;
+    let foreground_tab_id = navigated["active_tab_id"].as_str().unwrap().to_string();
     let epoch = navigated["page_epoch"].as_u64().unwrap();
 
     let click = |epoch| {

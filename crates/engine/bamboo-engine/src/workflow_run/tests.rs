@@ -664,10 +664,16 @@ struct MockAgents;
 
 #[async_trait]
 impl AgentStepPort for MockAgents {
-    async fn resolve(&self, name: &str) -> Result<Option<NamedAgentSpec>, String> {
+    async fn resolve(
+        &self,
+        name: &str,
+        _session_id: &str,
+    ) -> Result<Option<NamedAgentSpec>, String> {
         Ok((name == "reviewer").then(|| NamedAgentSpec {
             name: name.to_string(),
             allowed_capabilities: BTreeSet::from(["read".to_string()]),
+            profile: None,
+            cost_supported: true,
         }))
     }
 
@@ -679,11 +685,15 @@ impl AgentStepPort for MockAgents {
         _effort: Option<&str>,
         _capabilities: &BTreeSet<String>,
         _session_id: &str,
+        _root_run_id: &str,
+        _cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<AgentStepResult, String> {
         Ok(AgentStepResult {
             output: json!({"reviewed": prompt}),
             tokens: 10,
-            cost_micros: 2,
+            cost_micros: Some(2),
+            attempt_id: None,
+            failure: None,
         })
     }
 }
@@ -692,11 +702,17 @@ struct CountingAgents(AtomicUsize);
 
 #[async_trait]
 impl AgentStepPort for CountingAgents {
-    async fn resolve(&self, name: &str) -> Result<Option<NamedAgentSpec>, String> {
+    async fn resolve(
+        &self,
+        name: &str,
+        _session_id: &str,
+    ) -> Result<Option<NamedAgentSpec>, String> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(Some(NamedAgentSpec {
             name: name.to_string(),
             allowed_capabilities: BTreeSet::from(["read".to_string()]),
+            profile: None,
+            cost_supported: true,
         }))
     }
 
@@ -708,11 +724,15 @@ impl AgentStepPort for CountingAgents {
         _effort: Option<&str>,
         _capabilities: &BTreeSet<String>,
         _session_id: &str,
+        _root_run_id: &str,
+        _cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<AgentStepResult, String> {
         Ok(AgentStepResult {
             output: prompt,
             tokens: 1,
-            cost_micros: 1,
+            cost_micros: Some(1),
+            attempt_id: None,
+            failure: None,
         })
     }
 }
@@ -945,6 +965,613 @@ fn request(definition: WorkflowRunDefinition, args: Value) -> StartWorkflowRun {
         workspace_trusted: true,
         allowed_capabilities: vec!["read".to_string()],
     }
+}
+
+fn choice_plan(
+    condition: ValueRef,
+    then_branch: WorkflowPlan,
+    else_branch: WorkflowPlan,
+) -> WorkflowPlan {
+    serde_json::from_value(json!({
+        "type":"choice", "condition":condition,
+        "then_branch":then_branch, "else_branch":else_branch
+    }))
+    .expect("Choice plan loads")
+}
+
+fn choice_leaf(step: &str) -> WorkflowPlan {
+    WorkflowPlan::Step {
+        step: step.to_string(),
+    }
+}
+
+#[derive(Default)]
+struct ChoiceRecordingTools {
+    calls: std::sync::Mutex<Vec<(String, Value)>>,
+    conditions: std::sync::Mutex<HashMap<i64, usize>>,
+    failures: AtomicUsize,
+}
+
+#[async_trait]
+impl ToolExecutor for ChoiceRecordingTools {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        let args: Value = serde_json::from_str(&call.function.arguments).unwrap();
+        self.calls
+            .lock()
+            .unwrap()
+            .push((call.function.name.clone(), args.clone()));
+        let output = match call.function.name.as_str() {
+            "choice-condition" => {
+                let row = args.as_i64().unwrap();
+                let mut conditions = self.conditions.lock().unwrap();
+                let attempts = conditions.entry(row).or_default();
+                let selected = row != 0 || *attempts == 0;
+                *attempts += 1;
+                json!(selected)
+            }
+            "choice-transient"
+                if args == json!(0) && self.failures.fetch_add(1, Ordering::SeqCst) == 0 =>
+            {
+                return Err(ToolError::Execution(
+                    "transient selected branch".to_string(),
+                ));
+            }
+            _ => args,
+        };
+        Ok(ToolResult::text(true, output.to_string()))
+    }
+
+    fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+        Vec::new()
+    }
+}
+
+fn choice_engine(
+    directory: &std::path::Path,
+    tools: Arc<ChoiceRecordingTools>,
+) -> Arc<WorkflowRunEngine> {
+    WorkflowRunEngine::new(
+        Arc::new(FileWorkflowRunRepository::new(directory.to_path_buf()).unwrap()),
+        tools,
+        Arc::new(MockAgents),
+        Arc::new(MockDefinitions::default()),
+        Arc::new(MockPolicy),
+        Arc::new(MockSecrets),
+        budgets(),
+    )
+}
+
+#[tokio::test]
+async fn workflow_choice_dispatches_only_selected_branch_and_sequence_continues() {
+    for approved in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ChoiceRecordingTools::default());
+        let engine = choice_engine(directory.path(), tools.clone());
+        let mut flow = definition(
+            vec![
+                tool_step("yes", "echo", json!({"selected":true})),
+                tool_step("no", "echo", json!({"selected":false})),
+                tool_step("after", "echo", json!({"after":true})),
+            ],
+            WorkflowPlan::Sequence {
+                nodes: vec![
+                    choice_plan(
+                        ValueRef::Args {
+                            pointer: "/approved".to_string(),
+                        },
+                        choice_leaf("yes"),
+                        choice_leaf("no"),
+                    ),
+                    choice_leaf("after"),
+                ],
+            },
+        );
+        flow.input_schema = json!({"type":"object","properties":{"approved":{"type":"boolean"}},"required":["approved"],"additionalProperties":false});
+        let pinned = flow.clone();
+        let result = engine
+            .run(request(flow, json!({"approved":approved})))
+            .await
+            .unwrap();
+        assert_eq!(result.status, WorkflowRunStatus::Succeeded);
+        assert_eq!(result.output, Some(json!({"after":true})));
+        assert_eq!(result.usage.steps, 2);
+        let (chosen, unchosen) = if approved {
+            ("yes", "no")
+        } else {
+            ("no", "yes")
+        };
+        assert_eq!(result.steps[chosen].status, WorkflowStepStatus::Succeeded);
+        let skipped = &result.steps[unchosen];
+        assert_eq!(skipped.status, WorkflowStepStatus::Skipped);
+        assert_eq!(skipped.attempts, 0);
+        assert!(skipped.output.is_none() && skipped.input_hash.is_empty());
+        assert_eq!(
+            tools.calls.lock().unwrap().as_slice(),
+            &[
+                ("echo".to_string(), json!({"selected":approved})),
+                ("echo".to_string(), json!({"after":true})),
+            ]
+        );
+        let progress = engine.progress(&result.run_id, 0).await.unwrap();
+        assert!(progress
+            .events
+            .windows(2)
+            .all(|pair| pair[1].sequence == pair[0].sequence + 1));
+        assert_eq!(
+            progress
+                .events
+                .iter()
+                .filter(
+                    |event| matches!(event.kind, WorkflowRunEventKind::StepSkipped { .. })
+                        && event.step_id.as_deref() == Some(unchosen)
+                )
+                .count(),
+            1
+        );
+        assert!(matches!(
+            progress.events.last().unwrap().kind,
+            WorkflowRunEventKind::RunSucceeded { .. }
+        ));
+        let reloaded = FileWorkflowRunRepository::new(directory.path().to_path_buf())
+            .unwrap()
+            .load(&result.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded, result);
+        assert_eq!(reloaded.definition, pinned);
+        assert_eq!(reloaded.definition_bundle.root(), Some(&pinned));
+    }
+}
+
+#[tokio::test]
+async fn workflow_choice_previous_boolean_output_selects_tool_or_agent() {
+    for approved in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ChoiceRecordingTools::default());
+        let engine = choice_engine(directory.path(), tools.clone());
+        let mut producer = tool_step("approved", "echo", json!(approved));
+        producer.output_schema = Some(json!({"type":"boolean"}));
+        let agent = WorkflowStepDefinition {
+            id: "agent".to_string(),
+            kind: WorkflowStepKind::Agent {
+                agent: "reviewer".to_string(),
+                prompt: json!({"selected":false}),
+                model: None,
+                effort: None,
+                capabilities: vec!["read".to_string()],
+                structured_output_attempts: 1,
+            },
+            failure: FailurePolicy::FailFast,
+            output_schema: None,
+        };
+        let flow = definition(
+            vec![
+                producer,
+                tool_step("tool", "echo", json!({"selected":true})),
+                agent,
+            ],
+            WorkflowPlan::Sequence {
+                nodes: vec![
+                    choice_leaf("approved"),
+                    choice_plan(
+                        ValueRef::Step {
+                            step: "approved".to_string(),
+                            pointer: String::new(),
+                        },
+                        choice_leaf("tool"),
+                        choice_leaf("agent"),
+                    ),
+                ],
+            },
+        );
+        let result = engine.run(request(flow, json!({}))).await.unwrap();
+        assert_eq!(result.status, WorkflowRunStatus::Succeeded);
+        assert_eq!(
+            result.output,
+            Some(if approved {
+                json!({"selected":true})
+            } else {
+                json!({"reviewed":{"selected":false}})
+            })
+        );
+        assert_eq!(result.usage.agents, u32::from(!approved));
+        assert_eq!(
+            tools.calls.lock().unwrap().len(),
+            if approved { 2 } else { 1 }
+        );
+        assert_eq!(
+            result.steps[if approved { "agent" } else { "tool" }].status,
+            WorkflowStepStatus::Skipped
+        );
+    }
+}
+
+#[tokio::test]
+async fn workflow_choice_missing_condition_dispatches_neither_branch() {
+    let directory = tempfile::tempdir().unwrap();
+    let tools = Arc::new(ChoiceRecordingTools::default());
+    let engine = choice_engine(directory.path(), tools.clone());
+    let mut flow = definition(
+        vec![
+            tool_step("yes", "echo", json!(true)),
+            tool_step("no", "echo", json!(false)),
+        ],
+        choice_plan(
+            ValueRef::Args {
+                pointer: "/approved".to_string(),
+            },
+            choice_leaf("yes"),
+            choice_leaf("no"),
+        ),
+    );
+    flow.input_schema = json!({"type":"object","properties":{"approved":{"type":"boolean"}},"additionalProperties":false});
+    let result = engine.run(request(flow, json!({}))).await.unwrap();
+    assert_eq!(result.status, WorkflowRunStatus::Failed);
+    assert_eq!(
+        result.failure.as_ref().unwrap().code,
+        WorkflowFailureCode::UnknownReference
+    );
+    assert!(tools.calls.lock().unwrap().is_empty());
+    assert_eq!(result.usage.steps, 0);
+}
+
+#[tokio::test]
+async fn workflow_choice_non_boolean_input_is_rejected_before_dispatch() {
+    let directory = tempfile::tempdir().unwrap();
+    let tools = Arc::new(ChoiceRecordingTools::default());
+    let engine = choice_engine(directory.path(), tools.clone());
+    let mut flow = definition(
+        vec![
+            tool_step("yes", "echo", json!(true)),
+            tool_step("no", "echo", json!(false)),
+        ],
+        choice_plan(
+            ValueRef::Args {
+                pointer: "/approved".to_string(),
+            },
+            choice_leaf("yes"),
+            choice_leaf("no"),
+        ),
+    );
+    flow.input_schema = json!({"type":"object","properties":{"approved":{"type":"boolean"}},"required":["approved"],"additionalProperties":false});
+    for value in [json!("false"), json!(0), Value::Null] {
+        assert!(matches!(
+            engine
+                .run(request(flow.clone(), json!({"approved":value})))
+                .await,
+            Err(WorkflowRunError::InvalidInput(_))
+        ));
+    }
+    assert!(tools.calls.lock().unwrap().is_empty());
+    assert!(engine.list_run_ids().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn workflow_choice_map_items_budget_counts_larger_branch() {
+    let directory = tempfile::tempdir().unwrap();
+    let tools = Arc::new(ChoiceRecordingTools::default());
+    let engine = choice_engine(directory.path(), tools.clone());
+    let mut flow = definition(
+        vec![
+            tool_step("first", "echo", json!("first")),
+            tool_step("yes", "echo", json!({"from":"item","name":"row"})),
+            tool_step("no", "echo", json!({"from":"item","name":"row"})),
+        ],
+        WorkflowPlan::Map {
+            source: ValueRef::Args {
+                pointer: "/rows".to_string(),
+            },
+            item: "row".to_string(),
+            body: Box::new(choice_plan(
+                ValueRef::Item {
+                    name: "row".to_string(),
+                    pointer: String::new(),
+                },
+                WorkflowPlan::Sequence {
+                    nodes: vec![choice_leaf("first"), choice_leaf("yes")],
+                },
+                choice_leaf("no"),
+            )),
+        },
+    );
+    flow.input_schema = json!({"type":"object","properties":{"rows":{"type":"array","items":{"type":"boolean"}}},"required":["rows"],"additionalProperties":false});
+    flow.budgets.max_steps = 4;
+    let result = engine
+        .run(request(flow.clone(), json!({"rows":[true,false]})))
+        .await
+        .unwrap();
+    assert_eq!(result.status, WorkflowRunStatus::Succeeded);
+    assert_eq!(result.output, Some(json!([true, false])));
+    assert_eq!(result.usage.steps, 3);
+    assert_eq!(
+        result.steps["no@root[0]"].status,
+        WorkflowStepStatus::Skipped
+    );
+    assert_eq!(
+        result.steps["yes@root[1]"].status,
+        WorkflowStepStatus::Skipped
+    );
+    assert_eq!(
+        result.steps["first@root[1]"].status,
+        WorkflowStepStatus::Skipped
+    );
+    let dispatched = tools.calls.lock().unwrap().len();
+    flow.budgets.max_steps = 3;
+    flow.budgets.max_agents = 3;
+    let limited = engine
+        .run(request(flow, json!({"rows":[true,false]})))
+        .await
+        .unwrap();
+    assert_eq!(
+        limited.failure.as_ref().unwrap().code,
+        WorkflowFailureCode::BudgetExceeded
+    );
+    assert_eq!(limited.usage.steps, 0);
+    assert_eq!(tools.calls.lock().unwrap().len(), dispatched);
+}
+
+#[tokio::test]
+async fn workflow_choice_retry_switch_clears_only_current_map_scope_outputs() {
+    let directory = tempfile::tempdir().unwrap();
+    let tools = Arc::new(ChoiceRecordingTools::default());
+    let engine = choice_engine(directory.path(), tools.clone());
+    let mut producer = tool_step(
+        "condition",
+        "choice-condition",
+        json!({"from":"item","name":"row"}),
+    );
+    producer.output_schema = Some(json!({"type":"boolean"}));
+    let flow = definition(
+        vec![
+            producer,
+            tool_step("mapped", "echo", json!({"from":"item","name":"value"})),
+            tool_step(
+                "transient",
+                "choice-transient",
+                json!({"from":"item","name":"row"}),
+            ),
+            tool_step("else", "echo", json!({"from":"item","name":"row"})),
+        ],
+        WorkflowPlan::Map {
+            source: ValueRef::Args {
+                pointer: "/items".to_string(),
+            },
+            item: "row".to_string(),
+            body: Box::new(WorkflowPlan::Retry {
+                max_attempts: 2,
+                delay_ms: 0,
+                node: Box::new(WorkflowPlan::Sequence {
+                    nodes: vec![
+                        choice_leaf("condition"),
+                        choice_plan(
+                            ValueRef::Step {
+                                step: "condition".to_string(),
+                                pointer: String::new(),
+                            },
+                            WorkflowPlan::Sequence {
+                                nodes: vec![
+                                    WorkflowPlan::Map {
+                                        source: ValueRef::Args {
+                                            pointer: "/items".to_string(),
+                                        },
+                                        item: "value".to_string(),
+                                        body: Box::new(choice_leaf("mapped")),
+                                    },
+                                    choice_leaf("transient"),
+                                ],
+                            },
+                            choice_leaf("else"),
+                        ),
+                    ],
+                }),
+            }),
+        },
+    );
+    let result = engine
+        .run(request(flow, json!({"items":[0,1]})))
+        .await
+        .unwrap();
+    assert_eq!(result.status, WorkflowRunStatus::Succeeded);
+    assert_eq!(result.output, Some(json!([0, 1])));
+    assert_eq!(result.usage.retries, 1);
+    assert_eq!(result.steps["condition@root[0]"].attempts, 2);
+    for index in 0..2 {
+        let skipped = &result.steps[&format!("mapped@root[0][{index}]")];
+        assert_eq!(skipped.status, WorkflowStepStatus::Skipped);
+        assert_eq!(skipped.attempts, 1);
+        assert!(skipped.output.is_none());
+        let sibling = &result.steps[&format!("mapped@root[1][{index}]")];
+        assert_eq!(sibling.status, WorkflowStepStatus::Succeeded);
+        assert_eq!(sibling.output, Some(json!(index)));
+    }
+    assert_eq!(
+        result.steps["transient@root[0]"].status,
+        WorkflowStepStatus::Skipped
+    );
+    assert!(result.steps["transient@root[0]"].output.is_none());
+    assert_eq!(
+        result.steps["else@root[0]"].status,
+        WorkflowStepStatus::Succeeded
+    );
+    assert_eq!(
+        result.steps["else@root[1]"].status,
+        WorkflowStepStatus::Skipped
+    );
+    let progress = engine.progress(&result.run_id, 0).await.unwrap();
+    assert!(progress
+        .events
+        .windows(2)
+        .all(|pair| pair[1].sequence == pair[0].sequence + 1));
+    for index in 0..2 {
+        let id = format!("mapped@root[0][{index}]");
+        assert!(progress
+            .events
+            .iter()
+            .any(|event| event.step_id.as_deref() == Some(id.as_str())
+                && matches!(event.kind, WorkflowRunEventKind::StepSkipped { .. })));
+    }
+}
+
+#[tokio::test]
+async fn workflow_choice_preflight_rejects_unselected_forbidden_branch() {
+    let directory = tempfile::tempdir().unwrap();
+    let tools = Arc::new(ChoiceRecordingTools::default());
+    let engine = choice_engine(directory.path(), tools.clone());
+    let mut denied = tool_step("denied", "echo", json!(false));
+    if let WorkflowStepKind::Tool { capabilities, .. } = &mut denied.kind {
+        *capabilities = vec!["write".to_string()];
+    }
+    let flow = definition(
+        vec![tool_step("yes", "echo", json!(true)), denied],
+        choice_plan(
+            ValueRef::Literal { value: json!(true) },
+            choice_leaf("yes"),
+            choice_leaf("denied"),
+        ),
+    );
+    assert!(matches!(
+        engine.run(request(flow, json!({}))).await,
+        Err(WorkflowRunError::Preflight(_))
+    ));
+    assert!(tools.calls.lock().unwrap().is_empty());
+    assert!(engine.list_run_ids().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn workflow_choice_parallel_cancellation_closes_selected_step() {
+    let directory = tempfile::tempdir().unwrap();
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let engine = WorkflowRunEngine::new(
+        Arc::new(FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap()),
+        Arc::new(GatedTools {
+            started: started.clone(),
+            release: Arc::new(tokio::sync::Notify::new()),
+        }),
+        Arc::new(MockAgents),
+        Arc::new(MockDefinitions::default()),
+        Arc::new(MockPolicy),
+        Arc::new(MockSecrets),
+        budgets(),
+    );
+    let flow = definition(
+        vec![
+            tool_step("selected", "gate", json!({})),
+            tool_step("unselected", "echo", json!({})),
+            tool_step("sibling", "echo", json!({})),
+        ],
+        WorkflowPlan::Parallel {
+            nodes: vec![
+                choice_plan(
+                    ValueRef::Literal { value: json!(true) },
+                    choice_leaf("selected"),
+                    choice_leaf("unselected"),
+                ),
+                choice_leaf("sibling"),
+            ],
+        },
+    );
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run(request(flow, json!({}))).await.unwrap() })
+    };
+    let permit = tokio::time::timeout(std::time::Duration::from_secs(10), started.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    permit.forget();
+    let run_id = engine.list_run_ids().await.unwrap().pop().unwrap();
+    engine.cancel(&run_id).await.unwrap();
+    let result = runner.await.unwrap();
+    assert_eq!(result.status, WorkflowRunStatus::Cancelled);
+    assert_eq!(
+        result.steps["selected"].status,
+        WorkflowStepStatus::Cancelled
+    );
+    assert_eq!(
+        result.steps["unselected"].status,
+        WorkflowStepStatus::Skipped
+    );
+    assert!(result.steps["unselected"].output.is_none());
+    assert!(!result.steps.values().any(|step| matches!(
+        step.status,
+        WorkflowStepStatus::Running | WorkflowStepStatus::Queued
+    )));
+    assert!(!engine
+        .progress(&run_id, 0)
+        .await
+        .unwrap()
+        .events
+        .iter()
+        .any(|event| matches!(event.kind, WorkflowRunEventKind::RunSucceeded { .. })));
+}
+
+#[tokio::test]
+async fn workflow_choice_recovery_retains_pinned_plan_without_false_completion() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository =
+        Arc::new(FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap());
+    let flow = definition(
+        vec![
+            tool_step("yes", "echo", json!(true)),
+            tool_step("no", "echo", json!(false)),
+        ],
+        choice_plan(
+            ValueRef::Literal { value: json!(true) },
+            choice_leaf("yes"),
+            choice_leaf("no"),
+        ),
+    );
+    let mut queued = snapshot("choice-recovery", WorkflowRunStatus::Queued, 1);
+    queued.definition = flow.clone();
+    queued.definition_bundle.definitions.insert(
+        WorkflowDefinitionBundle::key(&flow.id, flow.revision),
+        flow.clone(),
+    );
+    repository
+        .create(
+            &queued,
+            &run_event("choice-recovery", 1, WorkflowRunEventKind::RunQueued),
+        )
+        .await
+        .unwrap();
+    let mut running = queued;
+    running.status = WorkflowRunStatus::Running;
+    running.last_sequence = 2;
+    running.steps.insert(
+        "yes".to_string(),
+        WorkflowStepSnapshot {
+            id: "yes".to_string(),
+            status: WorkflowStepStatus::Running,
+            input_hash: String::new(),
+            output: None,
+            failure: None,
+            attempts: 1,
+        },
+    );
+    repository
+        .commit(
+            &running,
+            &run_event("choice-recovery", 2, WorkflowRunEventKind::RunStarted),
+        )
+        .await
+        .unwrap();
+    let engine = choice_engine(directory.path(), Arc::new(ChoiceRecordingTools::default()));
+    let recovered = engine.recover().await.unwrap().pop().unwrap();
+    assert_eq!(recovered.status, WorkflowRunStatus::Suspended);
+    assert_eq!(recovered.steps["yes"].status, WorkflowStepStatus::Suspended);
+    assert_eq!(recovered.definition, flow);
+    assert_eq!(recovered.definition_bundle, running.definition_bundle);
+    assert_eq!(
+        recovered.definition_bundle_hash,
+        running.definition_bundle_hash
+    );
+    assert!(!repository
+        .events_since("choice-recovery", 0)
+        .await
+        .unwrap()
+        .iter()
+        .any(|event| matches!(event.kind, WorkflowRunEventKind::RunSucceeded { .. })));
 }
 
 #[tokio::test]
@@ -2114,7 +2741,7 @@ async fn agent_and_actual_usage_limits_are_persisted_before_failure() {
         WorkflowFailureCode::BudgetExceeded
     );
     assert_eq!(failed.usage.tokens, 10);
-    assert_eq!(failed.usage.cost_micros, 2);
+    assert_eq!(failed.usage.cost_micros, Some(2));
     let persisted = engine.progress(&failed.run_id, 0).await.unwrap().snapshot;
     assert_eq!(persisted.usage, failed.usage);
 }
@@ -2125,10 +2752,16 @@ async fn zero_token_or_cost_budget_fails_before_agent_dispatch() {
 
     #[async_trait]
     impl AgentStepPort for ExecutionCountingAgents {
-        async fn resolve(&self, name: &str) -> Result<Option<NamedAgentSpec>, String> {
+        async fn resolve(
+            &self,
+            name: &str,
+            _session_id: &str,
+        ) -> Result<Option<NamedAgentSpec>, String> {
             Ok(Some(NamedAgentSpec {
                 name: name.to_string(),
                 allowed_capabilities: BTreeSet::from(["read".to_string()]),
+                profile: None,
+                cost_supported: true,
             }))
         }
 
@@ -2140,12 +2773,16 @@ async fn zero_token_or_cost_budget_fails_before_agent_dispatch() {
             _effort: Option<&str>,
             _capabilities: &BTreeSet<String>,
             _session_id: &str,
+            _root_run_id: &str,
+            _cancellation: tokio_util::sync::CancellationToken,
         ) -> Result<AgentStepResult, String> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(AgentStepResult {
                 output: json!({"unexpected": true}),
                 tokens: 1,
-                cost_micros: 1,
+                cost_micros: Some(1),
+                attempt_id: None,
+                failure: None,
             })
         }
     }
@@ -2191,7 +2828,7 @@ async fn zero_token_or_cost_budget_fails_before_agent_dispatch() {
             WorkflowFailureCode::BudgetExceeded
         );
         assert_eq!(failed.usage.tokens, 0);
-        assert_eq!(failed.usage.cost_micros, 0);
+        assert_eq!(failed.usage.cost_micros, Some(0));
     }
     assert_eq!(
         executions.load(Ordering::SeqCst),
@@ -2349,7 +2986,10 @@ async fn omitted_definition_usage_limits_inherit_server_ceilings() {
         failed.failure.as_ref().unwrap().code,
         WorkflowFailureCode::BudgetExceeded
     );
-    assert_eq!((failed.usage.tokens, failed.usage.cost_micros), (10, 2));
+    assert_eq!(
+        (failed.usage.tokens, failed.usage.cost_micros),
+        (10, Some(2))
+    );
 }
 
 #[tokio::test]
@@ -2540,4 +3180,1137 @@ async fn unowned_running_tool_is_killed_before_workflow_suspends() {
             .await,
         Err(WorkflowRunError::Preflight(_))
     ));
+}
+
+struct UnpricedWorkflowAgents {
+    calls: AtomicUsize,
+    fail: bool,
+}
+
+#[async_trait]
+impl AgentStepPort for UnpricedWorkflowAgents {
+    async fn resolve(
+        &self,
+        name: &str,
+        _session_id: &str,
+    ) -> Result<Option<NamedAgentSpec>, String> {
+        Ok(Some(NamedAgentSpec {
+            name: name.into(),
+            allowed_capabilities: BTreeSet::from(["read".into()]),
+            profile: None,
+            cost_supported: false,
+        }))
+    }
+    async fn execute(
+        &self,
+        _spec: &NamedAgentSpec,
+        _prompt: Value,
+        _model: Option<&str>,
+        _effort: Option<&str>,
+        _capabilities: &BTreeSet<String>,
+        _session_id: &str,
+        _root_run_id: &str,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<AgentStepResult, String> {
+        let index = self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(AgentStepResult {
+            output: if index == 0 {
+                json!("invalid")
+            } else {
+                json!({"ok":true})
+            },
+            tokens: if index == 0 { 17 } else { 23 },
+            cost_micros: None,
+            attempt_id: None,
+            failure: self.fail.then(|| WorkflowFailure {
+                code: WorkflowFailureCode::ExecutionFailed,
+                message: "child failed after provider usage".into(),
+                retryable: false,
+            }),
+        })
+    }
+}
+
+fn workflow_agent_step() -> WorkflowStepDefinition {
+    WorkflowStepDefinition {
+        id: "review".into(),
+        kind: WorkflowStepKind::Agent {
+            agent: "reviewer".into(),
+            prompt: json!({"from":"args","pointer":""}),
+            model: None,
+            effort: None,
+            capabilities: vec!["read".into()],
+            structured_output_attempts: 2,
+        },
+        failure: FailurePolicy::FailFast,
+        output_schema: Some(
+            json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}),
+        ),
+    }
+}
+
+fn unpriced_workflow_engine(
+    directory: &std::path::Path,
+    agents: Arc<dyn AgentStepPort>,
+) -> Arc<WorkflowRunEngine> {
+    let mut limits = budgets();
+    limits.max_cost_micros = None;
+    WorkflowRunEngine::new(
+        Arc::new(FileWorkflowRunRepository::new(directory.to_path_buf()).unwrap()),
+        Arc::new(MockTools),
+        agents,
+        Arc::new(MockDefinitions::default()),
+        Arc::new(MockPolicy),
+        Arc::new(MockSecrets),
+        limits,
+    )
+}
+
+#[tokio::test]
+async fn workflow_agent_unpriced_finite_money_is_rejected_before_dispatch() {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(UnpricedWorkflowAgents {
+        calls: AtomicUsize::new(0),
+        fail: false,
+    });
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    assert!(matches!(
+        engine.run(request(workflow, json!({}))).await,
+        Err(WorkflowRunError::UnsupportedMonetaryBudget)
+    ));
+    assert_eq!(agents.calls.load(Ordering::SeqCst), 0);
+    assert!(engine.list_run_ids().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn workflow_agent_unpriced_structured_retries_accumulate_usage_with_null_cost() {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(UnpricedWorkflowAgents {
+        calls: AtomicUsize::new(0),
+        fail: false,
+    });
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let mut workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    workflow.budgets.max_cost_micros = None;
+    let result = engine.run(request(workflow, json!({}))).await.unwrap();
+    assert_eq!(result.status, WorkflowRunStatus::Succeeded);
+    assert_eq!(result.usage.tokens, 40);
+    assert_eq!(result.usage.agents, 2);
+    assert_eq!(result.usage.cost_micros, None);
+    assert!(serde_json::to_value(&result.usage).unwrap()["cost_micros"].is_null());
+    assert_eq!(
+        engine
+            .progress(&result.run_id, 0)
+            .await
+            .unwrap()
+            .snapshot
+            .usage,
+        result.usage
+    );
+}
+
+#[tokio::test]
+async fn workflow_agent_unpriced_failed_attempt_retains_observed_usage() {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(UnpricedWorkflowAgents {
+        calls: AtomicUsize::new(0),
+        fail: true,
+    });
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let mut workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    workflow.budgets.max_cost_micros = None;
+    let result = engine.run(request(workflow, json!({}))).await.unwrap();
+    assert_eq!(result.status, WorkflowRunStatus::Failed);
+    assert_eq!(result.usage.tokens, 17);
+    assert_eq!(result.usage.cost_micros, None);
+    assert_eq!(agents.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn workflow_agent_unpriced_token_limit_is_accounted_after_provider_and_prevents_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(UnpricedWorkflowAgents {
+        calls: AtomicUsize::new(0),
+        fail: false,
+    });
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let mut workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    workflow.budgets.max_cost_micros = None;
+    workflow.budgets.max_tokens = Some(10);
+    let result = engine.run(request(workflow, json!({}))).await.unwrap();
+    assert_eq!(result.status, WorkflowRunStatus::Failed);
+    assert_eq!(
+        result.failure.unwrap().code,
+        WorkflowFailureCode::BudgetExceeded
+    );
+    assert_eq!(
+        result.usage.tokens, 17,
+        "provider completion can exceed cap; no next attempt is admitted"
+    );
+    assert_eq!(agents.calls.load(Ordering::SeqCst), 1);
+}
+
+struct DrainingWorkflowAgents {
+    started: tokio::sync::Semaphore,
+    stopped: tokio::sync::Semaphore,
+    cancellation: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    consumed: AtomicBool,
+    missing_usage: bool,
+}
+
+impl DrainingWorkflowAgents {
+    fn new(missing_usage: bool) -> Self {
+        Self {
+            started: tokio::sync::Semaphore::new(0),
+            stopped: tokio::sync::Semaphore::new(0),
+            cancellation: std::sync::Mutex::new(None),
+            consumed: AtomicBool::new(false),
+            missing_usage,
+        }
+    }
+}
+
+#[async_trait]
+impl AgentStepPort for DrainingWorkflowAgents {
+    async fn resolve(
+        &self,
+        name: &str,
+        _session_id: &str,
+    ) -> Result<Option<NamedAgentSpec>, String> {
+        Ok(Some(NamedAgentSpec {
+            name: name.into(),
+            allowed_capabilities: BTreeSet::from(["read".into()]),
+            profile: None,
+            cost_supported: false,
+        }))
+    }
+    async fn execute(
+        &self,
+        _spec: &NamedAgentSpec,
+        _prompt: Value,
+        _model: Option<&str>,
+        _effort: Option<&str>,
+        _capabilities: &BTreeSet<String>,
+        _session_id: &str,
+        _root_run_id: &str,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<AgentStepResult, String> {
+        *self.cancellation.lock().unwrap() = Some(cancellation.clone());
+        let _on_drop = cancellation.clone().drop_guard();
+        self.started.add_permits(1);
+        cancellation.cancelled().await;
+        let permit = self.stopped.acquire().await.unwrap();
+        permit.forget();
+        Err("cancelled attempt usage is consumed by drain".into())
+    }
+    async fn drain_cancelled(
+        &self,
+        _root_run_id: &str,
+    ) -> (Vec<Result<AgentStepResult, String>>, Option<String>) {
+        let token = self.cancellation.lock().unwrap().clone();
+        if !token.is_some_and(|token| token.is_cancelled()) {
+            return (vec![], None);
+        }
+        let permit = self.stopped.acquire().await.unwrap();
+        permit.forget();
+        if self.consumed.swap(true, Ordering::SeqCst) {
+            return (vec![], None);
+        }
+        (
+            vec![if self.missing_usage {
+                Err("cumulative token observation unavailable".into())
+            } else {
+                Ok(AgentStepResult {
+                    output: Value::Null,
+                    tokens: 17,
+                    cost_micros: None,
+                    attempt_id: None,
+                    failure: None,
+                })
+            }],
+            None,
+        )
+    }
+}
+
+#[tokio::test]
+async fn workflow_agent_cancel_waits_for_stop_and_retains_cancelled_usage() {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(DrainingWorkflowAgents::new(false));
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let mut workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    workflow.budgets.max_cost_micros = None;
+    let running = engine.start(request(workflow, json!({}))).await.unwrap();
+    agents.started.acquire().await.unwrap().forget();
+    let cancelling = {
+        let engine = engine.clone();
+        let id = running.run_id.clone();
+        tokio::spawn(async move { engine.cancel(&id).await })
+    };
+    tokio::task::yield_now().await;
+    assert_eq!(
+        engine
+            .progress(&running.run_id, 0)
+            .await
+            .unwrap()
+            .snapshot
+            .status,
+        WorkflowRunStatus::Running
+    );
+    assert!(!cancelling.is_finished());
+    agents.stopped.add_permits(8);
+    let cancelled = cancelling.await.unwrap().unwrap();
+    assert_eq!(cancelled.status, WorkflowRunStatus::Cancelled);
+    assert_eq!(cancelled.usage.tokens, 17);
+    assert_eq!(cancelled.usage.cost_micros, None);
+}
+
+#[tokio::test]
+async fn workflow_agent_wall_time_waits_for_child_stop_and_accounts_usage() {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(DrainingWorkflowAgents::new(false));
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let mut workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    workflow.budgets.max_cost_micros = None;
+    workflow.budgets.wall_time_ms = 10_000;
+    let running = engine.start(request(workflow, json!({}))).await.unwrap();
+    agents.started.acquire().await.unwrap().forget();
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_millis(10_000)).await;
+    let token = agents.cancellation.lock().unwrap().clone().unwrap();
+    token.cancelled().await;
+    assert_eq!(
+        engine
+            .progress(&running.run_id, 0)
+            .await
+            .unwrap()
+            .snapshot
+            .status,
+        WorkflowRunStatus::Running
+    );
+    agents.stopped.add_permits(8);
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let snapshot = engine.progress(&running.run_id, 0).await.unwrap().snapshot;
+            if snapshot.status.is_terminal() {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal.failure.unwrap().code,
+        WorkflowFailureCode::BudgetExceeded
+    );
+    assert_eq!(terminal.usage.tokens, 17);
+}
+
+#[tokio::test]
+async fn workflow_agent_stopped_missing_usage_fails_without_permanent_cleanup_pending() {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(DrainingWorkflowAgents::new(true));
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let mut workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    workflow.budgets.max_cost_micros = None;
+    let running = engine.start(request(workflow, json!({}))).await.unwrap();
+    agents.started.acquire().await.unwrap().forget();
+    let cancelling = {
+        let engine = engine.clone();
+        let id = running.run_id.clone();
+        tokio::spawn(async move { engine.cancel(&id).await })
+    };
+    tokio::task::yield_now().await;
+    agents.stopped.add_permits(8);
+    let failed = cancelling.await.unwrap().unwrap();
+    assert_eq!(failed.status, WorkflowRunStatus::Failed);
+    assert_eq!(
+        failed.failure.unwrap().code,
+        WorkflowFailureCode::ExecutionFailed
+    );
+    assert_eq!(failed.usage.cost_micros, None);
+}
+
+struct RetainedWorkflowAgents {
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    returned: tokio::sync::Semaphore,
+    retained: AtomicBool,
+}
+
+impl RetainedWorkflowAgents {
+    fn result() -> AgentStepResult {
+        AgentStepResult {
+            output: json!({"ok": true}),
+            tokens: 17,
+            cost_micros: None,
+            failure: None,
+            attempt_id: Some("retained-attempt".into()),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentStepPort for RetainedWorkflowAgents {
+    async fn resolve(
+        &self,
+        name: &str,
+        _session_id: &str,
+    ) -> Result<Option<NamedAgentSpec>, String> {
+        Ok(Some(NamedAgentSpec {
+            name: name.into(),
+            allowed_capabilities: BTreeSet::from(["read".into()]),
+            profile: None,
+            cost_supported: false,
+        }))
+    }
+    async fn execute(
+        &self,
+        _spec: &NamedAgentSpec,
+        _prompt: Value,
+        _model: Option<&str>,
+        _effort: Option<&str>,
+        _capabilities: &BTreeSet<String>,
+        _session_id: &str,
+        _root_run_id: &str,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<AgentStepResult, String> {
+        self.started.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        self.retained.store(true, Ordering::SeqCst);
+        self.returned.add_permits(1);
+        Ok(Self::result())
+    }
+    fn acknowledge_result(&self, _id: &str) -> bool {
+        self.retained.swap(false, Ordering::SeqCst)
+    }
+    async fn drain_cancelled(
+        &self,
+        _run: &str,
+    ) -> (Vec<Result<AgentStepResult, String>>, Option<String>) {
+        (
+            if self.retained.swap(false, Ordering::SeqCst) {
+                vec![Ok(Self::result())]
+            } else {
+                vec![]
+            },
+            None,
+        )
+    }
+}
+
+async fn workflow_agent_handoff_control(wall_timeout: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = Arc::new(RetainedWorkflowAgents {
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        returned: tokio::sync::Semaphore::new(0),
+        retained: AtomicBool::new(false),
+    });
+    let engine = unpriced_workflow_engine(directory.path(), agents.clone());
+    let mut workflow = definition(vec![workflow_agent_step()], choice_leaf("review"));
+    workflow.budgets.max_cost_micros = None;
+    let running = engine.start(request(workflow, json!({}))).await.unwrap();
+    agents.started.acquire().await.unwrap().forget();
+    let (active_ledger, cancellation) = engine.test_active_ledger(&running.run_id);
+    let ledger = active_ledger.lock().await;
+    agents.release.add_permits(1);
+    agents.returned.acquire().await.unwrap().forget();
+    // The result exists, but its handoff cannot commit while this ledger is held.
+    tokio::task::yield_now().await;
+    let cancel = if wall_timeout {
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        cancellation.cancelled().await;
+        None
+    } else {
+        let engine = engine.clone();
+        let id = running.run_id.clone();
+        let task = tokio::spawn(async move { engine.cancel(&id).await });
+        cancellation.cancelled().await;
+        Some(task)
+    };
+    drop(ledger);
+    if let Some(cancel) = cancel {
+        cancel.await.unwrap().unwrap();
+    }
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = engine.progress(&running.run_id, 0).await.unwrap().snapshot;
+            if snapshot.status.is_terminal() && !engine.is_run_active(&running.run_id) {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal.usage.tokens, 17,
+        "exactly one result handoff survives cancellation/drop"
+    );
+    assert_eq!(terminal.usage.cost_micros, None);
+    assert_eq!(
+        terminal.status,
+        if wall_timeout {
+            WorkflowRunStatus::Failed
+        } else {
+            WorkflowRunStatus::Cancelled
+        }
+    );
+    assert!(!agents.retained.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn workflow_agent_result_handoff_cancel_counts_once() {
+    workflow_agent_handoff_control(false).await;
+}
+
+#[tokio::test]
+async fn workflow_agent_result_handoff_timeout_retains_usage() {
+    workflow_agent_handoff_control(true).await;
+}
+
+fn completed_prefix_checkpoint(run_id: &str) -> WorkflowRunSnapshot {
+    use sha2::{Digest, Sha256};
+    let mut checkpoint = snapshot(run_id, WorkflowRunStatus::Suspended, 1);
+    let mut prefix = tool_step("prefix", "echo", json!({"from":"args"}));
+    prefix.output_schema = Some(
+        json!({"type":"object","required":["value"],"properties":{"value":{"type":"integer"}},"additionalProperties":false}),
+    );
+    checkpoint.definition = definition(
+        vec![
+            prefix,
+            tool_step("suffix", "echo", json!({"from":"step","step":"prefix"})),
+        ],
+        WorkflowPlan::Sequence {
+            nodes: vec![choice_leaf("prefix"), choice_leaf("suffix")],
+        },
+    );
+    checkpoint.definition_bundle.root_id = checkpoint.definition.id.clone();
+    checkpoint.definition_bundle.root_revision = checkpoint.definition.revision;
+    checkpoint.definition_bundle.definitions = BTreeMap::from([(
+        WorkflowDefinitionBundle::key(&checkpoint.definition.id, checkpoint.definition.revision),
+        checkpoint.definition.clone(),
+    )]);
+    checkpoint.definition_bundle_hash = hex::encode(Sha256::digest(
+        serde_json::to_vec(&checkpoint.definition_bundle).unwrap(),
+    ));
+    checkpoint.validated_args = json!({"value":42});
+    checkpoint.steps.insert(
+        "prefix".into(),
+        WorkflowStepSnapshot {
+            id: "prefix".into(),
+            status: WorkflowStepStatus::Succeeded,
+            input_hash: hex::encode(Sha256::digest(
+                serde_json::to_vec(&checkpoint.validated_args).unwrap(),
+            )),
+            output: Some(checkpoint.validated_args.clone()),
+            failure: None,
+            attempts: 1,
+        },
+    );
+    checkpoint.usage.steps = 1;
+    checkpoint.usage.tokens = 3;
+    checkpoint.usage.cost_micros = Some(5);
+    checkpoint.suspension = Some(WorkflowSuspensionContext::Recovery {
+        reason: "process restarted".into(),
+    });
+    checkpoint
+}
+
+async fn seed_completed_prefix(
+    repository: &dyn WorkflowRunRepository,
+    checkpoint: &WorkflowRunSnapshot,
+) {
+    repository
+        .create(
+            checkpoint,
+            &run_event(
+                &checkpoint.run_id,
+                checkpoint.last_sequence,
+                WorkflowRunEventKind::RunSuspended {
+                    reason: "process restarted".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+}
+
+async fn await_continuation(engine: &WorkflowRunEngine, run_id: &str) -> WorkflowProgress {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let progress = engine.progress(run_id, 0).await.unwrap();
+            if progress.snapshot.status.is_terminal() && !engine.is_run_active(run_id) {
+                return progress;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("continuation settles")
+}
+
+#[tokio::test]
+async fn completed_prefix_continuation_preserves_checkpoint_and_finalizes_complete_prefix() {
+    for complete in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let repository =
+            Arc::new(FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap());
+        let mut checkpoint = completed_prefix_checkpoint("completed-prefix");
+        if complete {
+            let mut suffix = checkpoint.steps["prefix"].clone();
+            suffix.id = "suffix".into();
+            checkpoint.steps.insert("suffix".into(), suffix);
+            checkpoint.usage.steps = 2;
+        }
+        seed_completed_prefix(repository.as_ref(), &checkpoint).await;
+        let engine = engine(directory.path(), MockDefinitions::default());
+        let started = engine
+            .continue_completed_prefix(
+                &checkpoint.run_id,
+                &checkpoint.session_id,
+                true,
+                vec!["read".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.run_id, checkpoint.run_id);
+        let progress = await_continuation(&engine, &checkpoint.run_id).await;
+        let saved = progress.snapshot;
+        assert_eq!(saved.status, WorkflowRunStatus::Succeeded);
+        assert_eq!(saved.output, Some(json!({"value":42})));
+        assert_eq!(saved.definition_bundle, checkpoint.definition_bundle);
+        assert_eq!(
+            saved.definition_bundle_hash,
+            checkpoint.definition_bundle_hash
+        );
+        assert_eq!(saved.validated_args, checkpoint.validated_args);
+        assert_eq!(saved.created_at, checkpoint.created_at);
+        assert_eq!(saved.steps["prefix"], checkpoint.steps["prefix"]);
+        assert_eq!(saved.usage.steps, 2);
+        assert_eq!(saved.usage.tokens, 3);
+        assert_eq!(saved.usage.cost_micros, Some(5));
+        assert_eq!(saved.steps["suffix"].attempts, 1);
+        assert!(!progress
+            .events
+            .iter()
+            .any(|event| event.step_id.as_deref() == Some("prefix")));
+        assert_eq!(
+            progress
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind, WorkflowRunEventKind::StepStarted))
+                .count(),
+            usize::from(!complete)
+        );
+        assert!(progress
+            .events
+            .windows(2)
+            .all(|pair| pair[1].sequence == pair[0].sequence + 1));
+        assert_eq!(engine.runtime_resource_counts(), (0, 0));
+    }
+}
+
+#[tokio::test]
+async fn completed_prefix_continuation_refuses_ambiguous_or_invalid_checkpoints_without_writes() {
+    type Mutation = fn(&mut WorkflowRunSnapshot);
+    let cases: &[(&str, Mutation)] = &[
+        ("running", |s| s.status = WorkflowRunStatus::Running),
+        ("terminal", |s| s.status = WorkflowRunStatus::Succeeded),
+        ("nested-run", |s| s.parent_run_id = Some("parent".into())),
+        ("approval", |s| {
+            s.suspension = Some(WorkflowSuspensionContext::ToolApproval {
+                step_id: "prefix".into(),
+                tool: "echo".into(),
+                tool_call_id: "call".into(),
+            })
+        }),
+        ("running-tool", |s| {
+            s.suspension = Some(WorkflowSuspensionContext::ToolRunning {
+                step_id: "prefix".into(),
+                tool: "echo".into(),
+                tool_call_id: "call".into(),
+                killed: true,
+            })
+        }),
+        ("empty-prefix", |s| {
+            s.steps.clear();
+            s.usage.steps = 0;
+        }),
+        ("missing-output", |s| {
+            s.steps.get_mut("prefix").unwrap().output = None
+        }),
+        ("bad-output", |s| {
+            s.steps.get_mut("prefix").unwrap().output = Some(json!({"value":"wrong-type"}))
+        }),
+        ("bad-input-hash", |s| {
+            s.steps.get_mut("prefix").unwrap().input_hash = "changed".into()
+        }),
+        ("extra-reservation", |s| s.usage.steps += 1),
+        ("entered-suffix", |s| {
+            let mut state = s.steps["prefix"].clone();
+            state.id = "suffix".into();
+            state.status = WorkflowStepStatus::Suspended;
+            s.steps.insert("suffix".into(), state);
+            s.usage.steps += 1;
+        }),
+        ("non-prefix-success", |s| {
+            let mut state = s.steps.remove("prefix").unwrap();
+            state.id = "suffix".into();
+            s.steps.insert("suffix".into(), state);
+        }),
+        ("extra-state", |s| {
+            let mut state = s.steps["prefix"].clone();
+            state.id = "unknown".into();
+            s.steps.insert("unknown".into(), state);
+        }),
+        ("changed-bundle", |s| {
+            s.definition_bundle.publication_revision += 1
+        }),
+        ("changed-schema", |s| s.definition.workflow_schema = 99),
+        ("nonflat", |s| {
+            s.definition.plan = WorkflowPlan::Parallel {
+                nodes: vec![choice_leaf("prefix"), choice_leaf("suffix")],
+            }
+        }),
+        ("agent", |s| {
+            let mut step = workflow_agent_step();
+            step.id = "suffix".into();
+            s.definition.steps[1] = step;
+        }),
+        ("mutating", |s| {
+            if let WorkflowStepKind::Tool { capabilities, .. } = &mut s.definition.steps[1].kind {
+                capabilities.push("write".into());
+            }
+        }),
+        ("steps-exhausted", |s| s.definition.budgets.max_steps = 1),
+        ("tokens-exceeded", |s| s.usage.tokens = 10001),
+        ("cost-exceeded", |s| s.usage.cost_micros = Some(10001)),
+        ("wall-time-exhausted", |s| {
+            s.created_at -= chrono::Duration::seconds(11)
+        }),
+    ];
+    for (label, mutate) in cases {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap();
+        let mut checkpoint = completed_prefix_checkpoint(label);
+        mutate(&mut checkpoint);
+        if *label != "changed-bundle" {
+            use sha2::{Digest, Sha256};
+            checkpoint.definition_bundle.definitions.insert(
+                WorkflowDefinitionBundle::key(
+                    &checkpoint.definition.id,
+                    checkpoint.definition.revision,
+                ),
+                checkpoint.definition.clone(),
+            );
+            checkpoint.definition_bundle_hash = hex::encode(Sha256::digest(
+                serde_json::to_vec(&checkpoint.definition_bundle).unwrap(),
+            ));
+        }
+        seed_completed_prefix(&repository, &checkpoint).await;
+        let engine = engine(directory.path(), MockDefinitions::default());
+        assert!(
+            engine
+                .continue_completed_prefix(label, &checkpoint.session_id, true, vec!["read".into()])
+                .await
+                .is_err(),
+            "{label}"
+        );
+        assert_eq!(
+            repository.load(label).await.unwrap().unwrap(),
+            checkpoint,
+            "{label}"
+        );
+        assert_eq!(
+            repository.events_since(label, 0).await.unwrap().len(),
+            1,
+            "{label}"
+        );
+        assert_eq!(engine.runtime_resource_counts(), (0, 0), "{label}");
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let repository = FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap();
+    let checkpoint = completed_prefix_checkpoint("session-policy");
+    seed_completed_prefix(&repository, &checkpoint).await;
+    let engine = engine(directory.path(), MockDefinitions::default());
+    assert!(matches!(
+        engine
+            .continue_completed_prefix("missing", &checkpoint.session_id, true, vec!["read".into()])
+            .await,
+        Err(WorkflowRunError::NotFound)
+    ));
+    assert!(matches!(
+        engine
+            .continue_completed_prefix(
+                &checkpoint.run_id,
+                "other-session",
+                true,
+                vec!["read".into()]
+            )
+            .await,
+        Err(WorkflowRunError::NotFound)
+    ));
+    assert!(engine
+        .continue_completed_prefix(
+            &checkpoint.run_id,
+            &checkpoint.session_id,
+            false,
+            vec!["read".into()]
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        repository.load(&checkpoint.run_id).await.unwrap().unwrap(),
+        checkpoint
+    );
+}
+
+struct RefuseContinuationCommit(FileWorkflowRunRepository);
+
+#[async_trait]
+impl WorkflowRunRepository for RefuseContinuationCommit {
+    async fn create(
+        &self,
+        snapshot: &WorkflowRunSnapshot,
+        event: &WorkflowRunEvent,
+    ) -> std::io::Result<()> {
+        self.0.create(snapshot, event).await
+    }
+    async fn commit(
+        &self,
+        snapshot: &WorkflowRunSnapshot,
+        event: &WorkflowRunEvent,
+    ) -> std::io::Result<()> {
+        if matches!(event.kind, WorkflowRunEventKind::RunStarted) {
+            return Err(std::io::Error::other(
+                "injected continuation commit refusal",
+            ));
+        }
+        self.0.commit(snapshot, event).await
+    }
+    async fn load(&self, run_id: &str) -> std::io::Result<Option<WorkflowRunSnapshot>> {
+        self.0.load(run_id).await
+    }
+    async fn events_since(
+        &self,
+        run_id: &str,
+        sequence: u64,
+    ) -> std::io::Result<Vec<WorkflowRunEvent>> {
+        self.0.events_since(run_id, sequence).await
+    }
+    async fn list_run_ids(&self) -> std::io::Result<Vec<String>> {
+        self.0.list_run_ids().await
+    }
+}
+
+#[tokio::test]
+async fn completed_prefix_continuation_commit_failure_dispatches_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = Arc::new(RefuseContinuationCommit(
+        FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap(),
+    ));
+    let checkpoint = completed_prefix_checkpoint("commit-failure");
+    seed_completed_prefix(repository.as_ref(), &checkpoint).await;
+    let tools = Arc::new(ContextRecordingTools::default());
+    let engine = WorkflowRunEngine::new(
+        repository.clone(),
+        tools.clone(),
+        Arc::new(MockAgents),
+        Arc::new(MockDefinitions::default()),
+        Arc::new(MockPolicy),
+        Arc::new(MockSecrets),
+        budgets(),
+    );
+    assert!(matches!(
+        engine
+            .continue_completed_prefix(
+                &checkpoint.run_id,
+                &checkpoint.session_id,
+                true,
+                vec!["read".into()]
+            )
+            .await,
+        Err(WorkflowRunError::Storage(_))
+    ));
+    assert_eq!(tools.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        repository.load(&checkpoint.run_id).await.unwrap().unwrap(),
+        checkpoint
+    );
+    assert_eq!(
+        repository
+            .events_since(&checkpoint.run_id, 0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(engine.runtime_resource_counts(), (0, 0));
+}
+
+struct ContinuationGateTools {
+    calls: AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait]
+impl ToolExecutor for ContinuationGateTools {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_one();
+        let _permit = self.release.acquire().await.unwrap();
+        Ok(ToolResult::text(true, call.function.arguments.clone()))
+    }
+    fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+        Vec::new()
+    }
+}
+
+#[tokio::test]
+async fn completed_prefix_concurrent_continuations_have_one_owner_and_cancel_keeps_usage() {
+    for round in 0..20 {
+        let directory = tempfile::tempdir().unwrap();
+        let repository =
+            Arc::new(FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap());
+        let checkpoint = completed_prefix_checkpoint(&format!("continue-race-{round}"));
+        seed_completed_prefix(repository.as_ref(), &checkpoint).await;
+        let tools = Arc::new(ContinuationGateTools {
+            calls: AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let engine = WorkflowRunEngine::new(
+            repository,
+            tools.clone(),
+            Arc::new(MockAgents),
+            Arc::new(MockDefinitions::default()),
+            Arc::new(MockPolicy),
+            Arc::new(MockSecrets),
+            budgets(),
+        );
+        let (left, right) = tokio::join!(
+            engine.continue_completed_prefix(
+                &checkpoint.run_id,
+                &checkpoint.session_id,
+                true,
+                vec!["read".into()]
+            ),
+            engine.continue_completed_prefix(
+                &checkpoint.run_id,
+                &checkpoint.session_id,
+                true,
+                vec!["read".into()]
+            ),
+        );
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(3), tools.entered.notified())
+            .await
+            .expect("suffix entered its explicit gate");
+        assert_eq!(tools.calls.load(Ordering::SeqCst), 1);
+        let cancelled = engine.cancel(&checkpoint.run_id).await.unwrap();
+        assert_eq!(cancelled.status, WorkflowRunStatus::Cancelled);
+        // Ordinary Tool cancellation keeps its existing lifecycle. Release the
+        // test Tool explicitly, then require its owner to drain without sleep.
+        tools.release.add_permits(1);
+        let progress = await_continuation(&engine, &checkpoint.run_id).await;
+        assert_eq!(
+            progress.snapshot.steps["prefix"],
+            checkpoint.steps["prefix"]
+        );
+        assert_eq!(progress.snapshot.usage.tokens, checkpoint.usage.tokens);
+        assert_eq!(
+            progress.snapshot.usage.cost_micros,
+            checkpoint.usage.cost_micros
+        );
+        assert_eq!(
+            progress
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind, WorkflowRunEventKind::RunStarted))
+                .count(),
+            1
+        );
+        assert!(!progress
+            .events
+            .iter()
+            .any(|event| event.step_id.as_deref() == Some("prefix")));
+        assert_eq!(tools.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+struct PausedInactiveCancellation {
+    repository: FileWorkflowRunRepository,
+    loads: AtomicUsize,
+    paused: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl WorkflowRunRepository for PausedInactiveCancellation {
+    async fn create(
+        &self,
+        snapshot: &WorkflowRunSnapshot,
+        event: &WorkflowRunEvent,
+    ) -> std::io::Result<()> {
+        self.repository.create(snapshot, event).await
+    }
+    async fn commit(
+        &self,
+        snapshot: &WorkflowRunSnapshot,
+        event: &WorkflowRunEvent,
+    ) -> std::io::Result<()> {
+        self.repository.commit(snapshot, event).await
+    }
+    async fn load(&self, run_id: &str) -> std::io::Result<Option<WorkflowRunSnapshot>> {
+        if self.loads.fetch_add(1, Ordering::SeqCst) == 1 {
+            self.paused.notify_one();
+            self.release.notified().await;
+        }
+        self.repository.load(run_id).await
+    }
+    async fn events_since(
+        &self,
+        run_id: &str,
+        since: u64,
+    ) -> std::io::Result<Vec<WorkflowRunEvent>> {
+        self.repository.events_since(run_id, since).await
+    }
+    async fn list_run_ids(&self) -> std::io::Result<Vec<String>> {
+        self.repository.list_run_ids().await
+    }
+}
+
+#[tokio::test]
+async fn completed_prefix_inactive_cancel_owns_admission_before_terminal_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = Arc::new(PausedInactiveCancellation {
+        repository: FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap(),
+        loads: AtomicUsize::new(0),
+        paused: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let checkpoint = completed_prefix_checkpoint("inactive-cancel-race");
+    seed_completed_prefix(repository.as_ref(), &checkpoint).await;
+    let tools = Arc::new(ContextRecordingTools::default());
+    let engine = WorkflowRunEngine::new(
+        repository.clone(),
+        tools.clone(),
+        Arc::new(MockAgents),
+        Arc::new(MockDefinitions::default()),
+        Arc::new(MockPolicy),
+        Arc::new(MockSecrets),
+        budgets(),
+    );
+    let cancellation = {
+        let engine = engine.clone();
+        let run_id = checkpoint.run_id.clone();
+        tokio::spawn(async move { engine.cancel(&run_id).await })
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        repository.paused.notified(),
+    )
+    .await
+    .unwrap();
+    assert!(engine.is_run_active(&checkpoint.run_id));
+    assert!(engine
+        .continue_completed_prefix(
+            &checkpoint.run_id,
+            &checkpoint.session_id,
+            true,
+            vec!["read".into()]
+        )
+        .await
+        .is_err());
+    assert_eq!(tools.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        repository
+            .repository
+            .load(&checkpoint.run_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        checkpoint
+    );
+    repository.release.notify_one();
+    let cancelled = tokio::time::timeout(std::time::Duration::from_secs(3), cancellation)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled.status, WorkflowRunStatus::Cancelled);
+    assert_eq!(cancelled.usage, checkpoint.usage);
+    assert_eq!(cancelled.steps, checkpoint.steps);
+    assert!(engine
+        .continue_completed_prefix(
+            &checkpoint.run_id,
+            &checkpoint.session_id,
+            true,
+            vec!["read".into()]
+        )
+        .await
+        .is_err());
+    assert_eq!(tools.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(engine.runtime_resource_counts(), (0, 0));
+}
+
+#[tokio::test]
+async fn completed_prefix_corrupt_saved_run_id_refuses_without_owner_or_other_run_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository =
+        Arc::new(FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap());
+    let first = completed_prefix_checkpoint("corrupt-requested-run");
+    let second = completed_prefix_checkpoint("unrelated-saved-run");
+    seed_completed_prefix(repository.as_ref(), &first).await;
+    seed_completed_prefix(repository.as_ref(), &second).await;
+    let path = directory.path().join(&first.run_id).join("snapshot.json");
+    let mut corrupt = first.clone();
+    corrupt.run_id = second.run_id.clone();
+    tokio::fs::write(&path, serde_json::to_vec(&corrupt).unwrap())
+        .await
+        .unwrap();
+    let watched = [
+        path,
+        directory.path().join(&first.run_id).join("journal.jsonl"),
+        directory.path().join(&second.run_id).join("snapshot.json"),
+        directory.path().join(&second.run_id).join("journal.jsonl"),
+    ];
+    let before = futures::future::join_all(watched.iter().map(tokio::fs::read))
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let tools = Arc::new(ContextRecordingTools::default());
+    let engine = WorkflowRunEngine::new(
+        repository,
+        tools.clone(),
+        Arc::new(MockAgents),
+        Arc::new(MockDefinitions::default()),
+        Arc::new(MockPolicy),
+        Arc::new(MockSecrets),
+        budgets(),
+    );
+    assert!(matches!(
+        engine
+            .continue_completed_prefix(&first.run_id, &first.session_id, true, vec!["read".into()])
+            .await,
+        Err(WorkflowRunError::NotFound)
+    ));
+    assert_eq!(tools.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(engine.runtime_resource_counts(), (0, 0));
+    let after = futures::future::join_all(watched.iter().map(tokio::fs::read))
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after, before,
+        "both runs' saved bytes must remain unchanged"
+    );
 }

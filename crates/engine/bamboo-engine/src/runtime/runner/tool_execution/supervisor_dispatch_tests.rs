@@ -117,6 +117,7 @@ async fn native_dispatch(
     let llm: Arc<dyn LLMProvider> = Arc::new(NoopProvider);
     let session_id = session.id.clone();
     let frame = crate::runtime::runner::round_frame::RoundFrame {
+        vision_support: true,
         session_id: &session_id,
         round_id: "supervisor-dispatch",
         turn: 0,
@@ -136,6 +137,7 @@ async fn native_dispatch(
         frame: &frame,
         session,
         runtime_state: &mut runtime,
+        policy_guard: &mut super::ToolPolicyGuard::default(),
         task_context: &mut task_context,
         compression_model_name: None,
         compression_model_provider: None,

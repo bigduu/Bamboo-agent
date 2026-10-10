@@ -1,8 +1,17 @@
 name: Publish Crate
+# BAMBOO_TRUSTED_PUBLICATION_POLICY_V1
 
 on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
+      expected_source_sha:
+        description: "Exact accepted source commit selected by the release train"
+        required: true
+        type: string
       version:
         description: "Override unified publish version (for example: 2026.3.11). Leave empty or 'latest' to use the root Cargo.toml version."
         required: false
@@ -30,28 +39,107 @@ on:
 permissions:
   contents: read
 
+# Manual trains and automatic main releases serialize every upload attempt.
+concurrency:
+  group: bamboo-crate-publication
+  queue: max
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  publish:
+  manual:
+    if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
     runs-on: ubuntu-latest
+    environment: bamboo-release
     steps:
-      - uses: actions/checkout@v7
+      - name: Authorize the trusted manual publication ref before checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import subprocess
 
-      - name: Setup Node.js
+          repository = os.environ["GITHUB_REPOSITORY"]
+          assert repository == "bigduu/Bamboo-agent"
+          assert os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+          source = os.environ["EXPECTED_SOURCE_SHA"]
+          assert re.fullmatch(r"[0-9a-f]{40}", source)
+          assert os.environ["GITHUB_SHA"] == source, "Dispatch must select the exact accepted source"
+          assert os.environ["GITHUB_WORKFLOW_SHA"] == source, "Publisher workflow and source must have the same identity"
+          ref = os.environ["GITHUB_REF"]
+          tag_ref = f"refs/tags/bamboo-release-source-{source}"
+          assert ref in {"refs/heads/dev", "refs/heads/main", tag_ref}, "Untrusted publication ref"
+          assert os.environ["GITHUB_REF_TYPE"] == ("tag" if ref == tag_ref else "branch")
+          assert os.environ["GITHUB_REF_PROTECTED"] == "true", "Publication ref must be protected"
+          assert os.environ["GITHUB_WORKFLOW_REF"] == f"{repository}/.github/workflows/publish-crate.yml@{ref}"
+
+          def api(route):
+              return json.loads(subprocess.check_output(["gh", "api", f"repos/{repository}/{route}"], text=True))
+
+          if ref == tag_ref:
+              reference = api(f"git/ref/tags/bamboo-release-source-{source}")
+              assert reference["ref"] == ref and reference["object"]["type"] == "tag", "An annotated source tag is required"
+              tag_sha = reference["object"]["sha"]
+              assert re.fullmatch(r"[0-9a-f]{40}", tag_sha)
+              tag = api(f"git/tags/{tag_sha}")
+              assert tag["sha"] == tag_sha and tag["tag"] == ref.removeprefix("refs/tags/")
+              assert tag["object"]["type"] == "commit" and tag["object"]["sha"] == source, "Source tag moved or does not peel directly to the accepted commit"
+
+          accepted = False
+          for name in ("dev", "main"):
+              branch = api(f"branches/{name}")
+              assert branch["name"] == name and branch["protected"] is True, "Publication source branches must be protected"
+              tip = branch["commit"]["sha"]
+              assert re.fullmatch(r"[0-9a-f]{40}", tip)
+              comparison = api(f"compare/{source}...{tip}")
+              if comparison["status"] in {"ahead", "identical"} and comparison["merge_base_commit"]["sha"] == source:
+                  accepted = True
+          assert accepted, "Publisher source must belong to protected dev/main history"
+          policy = api(f"contents/.github/workflows/publish-crate.yml?ref={source}")
+          assert policy["type"] == "file" and policy["path"] == ".github/workflows/publish-crate.yml" and policy["encoding"] == "base64"
+          content = base64.b64decode("".join(policy["content"].split()), validate=True).decode("utf-8")
+          assert "# BAMBOO_TRUSTED_PUBLICATION_POLICY_V1" in content, "Source predates the trusted publication policy"
+          PY
+
+      - &manual-checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - &manual-source
+        name: Require the exact accepted publication source
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+        run: |
+          [[ "${EXPECTED_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          test "${GITHUB_SHA}" = "${EXPECTED_SOURCE_SHA}"
+          test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA}"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - &manual-node
+        name: Setup Node.js
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
 
-      - name: Resolve exact release frontend
+      - &manual-frontend
+        name: Resolve exact release frontend
         id: frontend
         env:
           FRONTEND_PACKAGE: ${{ github.event.inputs.frontend_package || '@bigduu/lotus-next' }}
           FRONTEND_VERSION: ${{ github.event.inputs.lotus_version || 'from_lock' }}
         run: node scripts/release-frontend-policy.cjs
 
-      - name: Stage frontend package from npm
+      - &manual-stage
+        name: Stage frontend package from npm
         # The shared resolver selects the committed Lotus Next lock by default
         # and permits only one fixed legacy rollback. LOTUS_SOURCE=package
         # hard-fails when the exact package is missing, so a fetch failure can
@@ -79,168 +167,38 @@ jobs:
             exit 1
           fi
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - &manual-isolation
+        name: Install isolated Cargo publication entrypoint
+        # PATH also covers Cargo metadata launched by compute-publish-order.py.
+        run: node scripts/release-cargo-sandbox.cjs install
 
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          shared-key: bamboo-publish-crate-${{ runner.os }}
-          cache-on-failure: true
-
-      - name: Resolve publish version
+      - &manual-version
+        name: Resolve publish version
         id: version
-        shell: bash
+        env:
+          PUBLISH_VERSION: ${{ inputs.version }}
         run: |
-          set -euo pipefail
+          node - <<'JS'
+          const fs = require('node:fs')
+          const { assertManualVersion } = require('./scripts/crate-release.cjs')
+          const requested = process.env.PUBLISH_VERSION
+          const version = assertManualVersion(!requested || requested === 'latest'
+            ? fs.readFileSync('Cargo.toml', 'utf8').match(/^version = "([^"]+)"$/m)?.[1] : requested)
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\n`)
+          console.log(`Resolved manual version: ${version}`)
+          JS
 
-          if [ -n "${{ github.event.inputs.version }}" ] && [ "${{ github.event.inputs.version }}" != "latest" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            VERSION="$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')"
-          fi
-
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Resolved version: ${VERSION}"
-
-      - name: Refuse to publish the placeholder version
-        # Source ships 0.0.0 on purpose — it's obviously not a real version, so it
-        # can't silently ship. The release train passes the real date-based
-        # version; never publish the 0.0.0 placeholder.
-        if: steps.version.outputs.version == '0.0.0'
-        run: |
-          echo "::error::Bamboo version resolved to the 0.0.0 placeholder. Pass a version input (the release train provides one from the Zenith config)."
-          exit 1
-
-      - name: Prepare workspace manifests for publish
-        shell: bash
+      - &manual-stamp
+        name: Prepare workspace manifests for publish
         env:
           TARGET_VERSION: ${{ steps.version.outputs.version }}
+        run: python3 scripts/crate-release-lock.py stamp "${TARGET_VERSION}"
+
+      - &manual-lock
+        name: Refresh the temporary stamped publication lockfile
         run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import os
-          import re
-          import tomllib
-
-          root = Path(".")
-          target_version = os.environ["TARGET_VERSION"]
-          # crates live at crates/<category>/<crate>/Cargo.toml (two levels deep);
-          # the previous single-level glob matched nothing, so sub-crate manifests
-          # were never processed (path deps weren't versioned for publish).
-          manifest_paths = [root / "Cargo.toml", *sorted((root / "crates").glob("*/*/Cargo.toml"))]
-
-          workspace_crates = {}
-          for path in manifest_paths:
-              data = tomllib.loads(path.read_text())
-              package = data.get("package", {})
-              name = package.get("name")
-              if name:
-                  workspace_crates[name] = path
-
-          dependency_section_suffixes = (
-              ".dependencies",
-              ".dev-dependencies",
-              ".build-dependencies",
-          )
-
-          for path in manifest_paths:
-              lines = path.read_text().splitlines()
-              current_section = None
-              package_version_done = False
-
-              for idx, line in enumerate(lines):
-                  stripped = line.strip()
-
-                  match = re.match(r"^\[(.+)\]\s*$", stripped)
-                  if match:
-                      current_section = match.group(1)
-                      continue
-
-                  # Match the concrete version line under either [package] (a
-                  # crate that hardcodes its version) or [workspace.package] (the
-                  # single source members inherit via `version.workspace = true`).
-                  # Without the workspace.package case the date version reaches no
-                  # manifest and every crate publishes at the 0.0.0 placeholder.
-                  if (
-                      current_section in ("package", "workspace.package")
-                      and not package_version_done
-                      and re.match(r'^version\s*=\s*"[^"]+"\s*$', stripped)
-                  ):
-                      lines[idx] = re.sub(
-                          r'version\s*=\s*"[^"]+"',
-                          f'version = "{target_version}"',
-                          line,
-                          count=1,
-                      )
-                      package_version_done = True
-                      continue
-
-                  is_dependency_section = current_section in {
-                      "dependencies",
-                      "dev-dependencies",
-                      "build-dependencies",
-                  } or (
-                      current_section is not None
-                      and current_section.endswith(dependency_section_suffixes)
-                  )
-                  if not is_dependency_section:
-                      continue
-
-                  match = re.match(r'^(\s*)([A-Za-z0-9_-]+)\s*=\s*\{(.*)\}\s*$', line)
-                  if not match:
-                      continue
-
-                  indent, dep_name, body = match.groups()
-                  if dep_name not in workspace_crates or "path" not in body:
-                      continue
-
-                  if re.search(r'\bversion\s*=\s*"[^"]+"', body):
-                      updated_body = re.sub(
-                          r'\bversion\s*=\s*"[^"]+"',
-                          f'version = "{target_version}"',
-                          body,
-                      )
-                  else:
-                      updated_body = body.rstrip()
-                      if updated_body and not updated_body.rstrip().endswith(","):
-                          updated_body += ","
-                      updated_body += f' version = "{target_version}"'
-
-                  lines[idx] = f"{indent}{dep_name} = {{{updated_body}}}"
-
-              path.write_text("\n".join(lines) + "\n")
-          PY
-
-          echo "Prepared Bamboo workspace manifests for version ${TARGET_VERSION}"
-          git diff -- Cargo.toml crates/*/Cargo.toml
-
-      - name: Validate publish plan
-        if: github.event.inputs.dry_run == 'true'
-        shell: bash
-        env:
-          TARGET_VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-
-          cargo metadata --format-version 1 >/dev/null
-          cargo check --workspace --all-targets
-
-          cat <<EOF
-          Dry-run validation completed for Bamboo ${TARGET_VERSION}.
-
-          Note: internal Bamboo crates are published sequentially during the real release.
-          A dry run cannot fully emulate crates.io index propagation, so this step validates:
-          - manifest rewriting to ${TARGET_VERSION}
-          - workspace dependency resolution
-          - workspace buildability
-
-          Real publish order (computed from the dependency graph, exactly as
-          the publish step below computes it):
-          EOF
-          python3 scripts/compute-publish-order.py
+          cargo metadata --format-version 1 > /dev/null
+          python3 scripts/crate-release-lock.py
 
       - name: Publish to crates.io
         if: github.event.inputs.dry_run != 'true'
@@ -305,7 +263,7 @@ jobs:
             while [ "${attempt}" -le "${max_attempts}" ]; do
               echo "Publishing ${crate}@${TARGET_VERSION} (attempt ${attempt}/${max_attempts})"
               set +e
-              output="$(cargo publish --allow-dirty -p "${crate}" 2>&1)"
+              output="$(cargo publish --locked --allow-dirty -p "${crate}" 2>&1)"
               status=$?
               set -e
               echo "${output}"
@@ -365,3 +323,206 @@ jobs:
           done
 
           echo "Published Bamboo crates for version ${TARGET_VERSION}"
+
+  dry-run:
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+    runs-on: ubuntu-latest
+    # No Environment or publication credentials, including on feature refs.
+    env:
+      GH_TOKEN: ""
+      CARGO_REGISTRY_TOKEN: ""
+      BAMBOO_RELEASE_TOKEN: ""
+      BAMBOO_RELEASE_SIGNING_KEY: ""
+      BAMBOO_RELEASE_SIGNING_KEY_SHA256: ""
+    steps:
+      - *manual-checkout
+      - *manual-source
+      - *manual-node
+      - *manual-frontend
+      - *manual-stage
+      - *manual-isolation
+      - *manual-version
+      - *manual-stamp
+      - *manual-lock
+
+      - name: Validate publish plan
+        shell: bash
+        env:
+          TARGET_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          cargo metadata --format-version 1 >/dev/null
+          cargo check --locked --workspace --all-targets
+
+          cat <<EOF
+          Dry-run validation completed for Bamboo ${TARGET_VERSION}.
+
+          Note: internal Bamboo crates are published sequentially during the real release.
+          A dry run cannot fully emulate crates.io index propagation, so this step validates:
+          - manifest rewriting to ${TARGET_VERSION}
+          - workspace dependency resolution
+          - workspace buildability
+
+          Real publish order (computed from the dependency graph, exactly as
+          the publish step below computes it):
+          EOF
+          python3 scripts/compute-publish-order.py
+
+  automatic:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    environment: bamboo-release
+    permissions:
+      contents: write
+    steps:
+      - name: Authorize the exact source before checkout
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          assert repository == "bigduu/Bamboo-agent"
+          event_name = os.environ["GITHUB_EVENT_NAME"]
+          with open(os.environ["GITHUB_EVENT_PATH"]) as stream:
+              event = json.load(stream)
+          assert event_name == "workflow_run"
+          run = event["workflow_run"]
+          assert run["name"] == "CI"
+          assert run["event"] == "push" and run["conclusion"] == "success" and run["head_branch"] == "main"
+          assert run["repository"]["full_name"] == repository and run["head_repository"]["full_name"] == repository
+          source = run["head_sha"]
+          assert re.fullmatch(r"[0-9a-f]{40}", source)
+
+          assert os.environ["GITHUB_REF"] in {"refs/heads/dev", "refs/heads/main"}, "Publication workflow must run on dev or main"
+          assert os.environ["GITHUB_REF_PROTECTED"] == "true", "Publication workflow ref must be protected"
+          workflow_ref = os.environ["GITHUB_WORKFLOW_REF"]
+          assert workflow_ref in {f"{repository}/.github/workflows/publish-crate.yml@refs/heads/{name}" for name in ("dev", "main")}
+          workflow_source = os.environ["GITHUB_WORKFLOW_SHA"]
+          assert re.fullmatch(r"[0-9a-f]{40}", workflow_source)
+          def api(route):
+              return json.loads(subprocess.check_output(["gh", "api", f"repos/{repository}/{route}"], text=True))
+          tips = []
+          for name in ("dev", "main"):
+              branch = api(f"branches/{name}")
+              assert branch["name"] == name and branch["protected"] is True, "Publication source branches must be protected"
+              tip = branch["commit"]["sha"]
+              assert re.fullmatch(r"[0-9a-f]{40}", tip)
+              tips.append(tip)
+          for revision in {source, workflow_source}:
+              accepted = False
+              for tip in tips:
+                  comparison = api(f"compare/{revision}...{tip}")
+                  if comparison["status"] in {"ahead", "identical"} and comparison["merge_base_commit"]["sha"] == revision:
+                      accepted = True
+                      break
+              assert accepted, "Publication source and workflow must belong to protected dev/main history"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+              stream.write(f"revision={source}\n")
+          PY
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.source.outputs.revision }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify checkout matches the authorized source
+        env:
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+        run: |
+          test "$(git rev-parse HEAD)" = "${SOURCE_REVISION}"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Require the release policy in this source commit
+        # Pre-policy main CI cannot acquire the automatic publication authority.
+        run: test -f scripts/crate-release.cjs
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+
+      - name: Resolve exact release frontend
+        id: frontend
+        env:
+          FRONTEND_PACKAGE: "@bigduu/lotus-next"
+          FRONTEND_VERSION: "from_lock"
+        run: node scripts/release-frontend-policy.cjs
+
+      - name: Stage frontend package from npm
+        # The shared resolver selects the committed Lotus Next lock by default
+        # and permits only one fixed legacy rollback. LOTUS_SOURCE=package
+        # hard-fails when the exact package is missing, so a fetch failure can
+        # never silently fall back to committed or adjacent bytes.
+        env:
+          LOTUS_PACKAGE_NAME: ${{ steps.frontend.outputs.package_name }}
+          LOTUS_VERSION: ${{ steps.frontend.outputs.package_version }}
+          EXPECTED_FRONTEND_NAME: ${{ steps.frontend.outputs.frontend_name }}
+        run: |
+          set -euo pipefail
+          npm install --no-save --no-package-lock --ignore-scripts "${LOTUS_PACKAGE_NAME}@${LOTUS_VERSION}"
+          LOTUS_SOURCE=package node scripts/frontend-package.cjs stage
+          FRONTEND_PACKAGE_DIR="crates/app/bamboo-server/frontend_package"
+          test -f "${FRONTEND_PACKAGE_DIR}/lotus-frontend.zip"
+          test -f "${FRONTEND_PACKAGE_DIR}/frontend-manifest.json"
+          EMBEDDED_NAME="$(node -p "require('./${FRONTEND_PACKAGE_DIR}/frontend-manifest.json').frontend_name")"
+          EMBEDDED="$(node -p "require('./${FRONTEND_PACKAGE_DIR}/frontend-manifest.json').frontend_version")"
+          echo "Embedded frontend: ${EMBEDDED_NAME}@${EMBEDDED}"
+          if [ "${EMBEDDED_NAME}" != "${EXPECTED_FRONTEND_NAME}" ]; then
+            echo "::error::Embedded frontend ${EMBEDDED_NAME} does not match expected ${EXPECTED_FRONTEND_NAME}"
+            exit 1
+          fi
+          if [ "${EMBEDDED}" != "${LOTUS_VERSION}" ]; then
+            echo "::error::Embedded frontend version ${EMBEDDED} does not match resolved ${LOTUS_VERSION}"
+            exit 1
+          fi
+
+      - name: Install isolated Cargo publication entrypoint
+        # PATH also covers controller and Python metadata/package/publish calls.
+        run: node scripts/release-cargo-sandbox.cjs install
+
+      - name: Reserve or resume the exact release identity
+        id: version
+        env:
+          # Historical queued source can contain workflows different from the
+          # default dev branch. A release token with Workflows:write supports it.
+          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
+          BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
+          FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
+          FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
+        run: node scripts/crate-release.cjs plan
+
+      - name: Prepare workspace manifests for publish
+        env:
+          TARGET_VERSION: ${{ steps.version.outputs.version }}
+        run: python3 scripts/crate-release-lock.py stamp "${TARGET_VERSION}"
+
+      - name: Refresh the temporary stamped publication lockfile
+        run: |
+          cargo metadata --format-version 1 > /dev/null
+          python3 scripts/crate-release-lock.py
+
+      - name: Publish verified crates and complete the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
+          BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
+          FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
+          FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
+        run: node scripts/crate-release.cjs publish

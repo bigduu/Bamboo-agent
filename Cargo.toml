@@ -8,6 +8,7 @@ members = [
     "crates/infra/bamboo-config",
     "crates/infra/bamboo-llm",
     "crates/infra/bamboo-storage",
+    "crates/infra/bamboo-tickets",
     "crates/infra/bamboo-a2a",
     "crates/infra/bamboo-infrastructure",
     "crates/infra/bamboo-memory",
@@ -51,6 +52,7 @@ default-members = [
     "crates/infra/bamboo-config",
     "crates/infra/bamboo-llm",
     "crates/infra/bamboo-storage",
+    "crates/infra/bamboo-tickets",
     "crates/infra/bamboo-a2a",
     "crates/infra/bamboo-infrastructure",
     "crates/infra/bamboo-memory",
@@ -162,7 +164,7 @@ actix-web = { version = "4", default-features = false, features = [
     "ws",
 ] }
 actix-cors = "0.7"
-actix-files = "0.6"
+actix-files = "0.7"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -199,7 +201,7 @@ async-stream = "0.3"
 tokio-stream = "0.1"
 tokio-util = "0.7"
 eventsource-stream = "0.2"
-eventsource-client = "0.17"
+eventsource-client = "0.18"
 bytes = "1"
 
 # Concurrency utilities
@@ -238,11 +240,15 @@ windows-sys = { version = "0.61", features = ["Win32_System_Threading", "Win32_F
 name = "bamboo"
 path = "src/bin/bamboo.rs"
 
+[features]
+ticket-runtime-fixtures = ["bamboo-server/ticket-runtime-fixtures"]
+
 [dev-dependencies]
 async-trait = "0.1"
 tempfile = "3"
 wiremock = "0.6"
 tokio-test = "0.4"
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 mockall = "0.15"
 http = "1"
 actix-rt = "2"

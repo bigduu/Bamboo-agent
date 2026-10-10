@@ -8,7 +8,10 @@ use futures::stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{context_management_telemetry, execute_llm_stream, LlmStreamFrame};
+use super::{
+    context_management_telemetry, discard_latest_interrupted_assistant_output, execute_llm_stream,
+    LlmStreamFrame, INTERRUPTED_ASSISTANT_OUTPUT_KIND,
+};
 use bamboo_agent_core::agent::types::{ConversationSummary, TaskItem, TaskItemStatus, TaskList};
 use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
 use bamboo_agent_core::{
@@ -25,6 +28,27 @@ use bamboo_metrics::storage::MetricsStorage;
 use chrono::Utc;
 
 use super::super::PromptMemoryExposureFrame;
+
+#[test]
+fn interrupted_retry_rollback_returns_exact_removed_visible_message_id() {
+    let mut session = Session::new("retry-rollback", "model");
+    let mut interrupted = Message::assistant("partial visible text", None);
+    interrupted.id = "visible-attempt-1".to_string();
+    interrupted.metadata = Some(serde_json::json!({
+        "runtime_kind": INTERRUPTED_ASSISTANT_OUTPUT_KIND,
+    }));
+    session.add_message(interrupted.clone());
+
+    let removed = discard_latest_interrupted_assistant_output(&mut session, None);
+    assert_eq!(removed.as_deref(), Some("visible-attempt-1"));
+    assert!(session.messages.is_empty());
+
+    session.add_message(interrupted);
+    let protected =
+        discard_latest_interrupted_assistant_output(&mut session, Some("visible-attempt-1"));
+    assert!(protected.is_none());
+    assert_eq!(session.messages.len(), 1);
+}
 
 fn isolate_prompt_safe_env_cache() -> MutexGuard<'static, ()> {
     let guard = crate::runtime::tests::env_cache_lock_acquire();
@@ -453,6 +477,7 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
     )
@@ -494,8 +519,24 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
     let first = event_rx.recv().await.expect("budget event expected");
     assert!(matches!(first, AgentEvent::TokenBudgetUpdated { .. }));
 
-    let second = event_rx.recv().await.expect("token event expected");
-    assert!(matches!(second, AgentEvent::Token { .. }));
+    let second = event_rx
+        .recv()
+        .await
+        .expect("visible message identity expected");
+    let visible_message = stream_output
+        .visible_message
+        .as_ref()
+        .expect("visible token must carry a stable identity");
+    assert!(matches!(
+        second,
+        AgentEvent::VisibleMessageStart {
+            message_id,
+            created_at,
+        } if message_id == visible_message.message_id && created_at == visible_message.created_at
+    ));
+
+    let third = event_rx.recv().await.expect("token event expected");
+    assert!(matches!(third, AgentEvent::Token { content } if content == "hi"));
     assert_eq!(
         llm.requested_text_verbosity
             .lock()
@@ -601,6 +642,7 @@ async fn prompt_exposure_starts_only_after_successful_provider_bootstrap() {
                 reasoning_effort: None,
                 max_context_tokens: 400_000,
                 max_output_tokens: 128,
+                observation_progress_hint: None,
                 prompt_memory_exposure: Some(PromptMemoryExposureFrame {
                     round_id: &round_id,
                     provenance: &provenance,
@@ -706,6 +748,7 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            observation_progress_hint: None,
             prompt_memory_exposure: Some(PromptMemoryExposureFrame {
                 round_id,
                 provenance: &provenance,
@@ -758,6 +801,7 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            observation_progress_hint: None,
             prompt_memory_exposure: Some(PromptMemoryExposureFrame {
                 round_id,
                 provenance: &provenance,
@@ -781,7 +825,7 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
 }
 
 #[tokio::test]
-async fn append_safe_ledger_checkpoint_reprepares_from_merged_durable_suffix() {
+async fn observation_progress_checkpoint_reprepares_from_merged_durable_suffix() {
     struct ConcurrentAppendPersistence {
         durable: Mutex<Session>,
         saves: std::sync::atomic::AtomicUsize,
@@ -847,6 +891,7 @@ async fn append_safe_ledger_checkpoint_reprepares_from_merged_durable_suffix() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            observation_progress_hint: Some("request-only observation advice"),
             prompt_memory_exposure: None,
         },
     )
@@ -861,9 +906,95 @@ async fn append_safe_ledger_checkpoint_reprepares_from_merged_durable_suffix() {
         "the dispatched request must include the suffix merged by the append-safe checkpoint"
     );
     assert_eq!(
+        requested_messages
+            .iter()
+            .filter(|message| message.content == "request-only observation advice")
+            .count(),
+        1
+    );
+    assert!(session
+        .messages
+        .iter()
+        .all(|message| message.content != "request-only observation advice"));
+    assert_eq!(
         persistence.saves.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "the merged suffix needs one replacement ledger checkpoint before the rebuilt envelope stabilizes"
+    );
+}
+
+#[tokio::test]
+async fn observation_progress_over_budget_advice_is_dropped_before_dispatch() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("observation-progress-budget", "test-model");
+    session.add_message(Message::user("original request"));
+    let original_messages = session.messages.clone();
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), session.messages[0].clone()],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let mut expected = session.clone();
+    let baseline = super::build_request_envelope_reconciled(
+        &mut expected,
+        &prepared_context,
+        &config,
+        &[],
+        "test-model",
+    );
+    let baseline_usage = super::measure_request_usage(
+        &expected,
+        &baseline,
+        &ProviderVisibleToolFootprint::default(),
+    );
+    let advice = "request-only observation advice ".repeat(1_000);
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "observation-progress-budget",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: baseline_usage.input_tokens + 128,
+            max_output_tokens: 128,
+            observation_progress_hint: Some(&advice),
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("optional advice cannot reject an otherwise fitting request");
+    assert_eq!(
+        llm.ir_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(llm
+        .requested_messages
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|message| !message.content.contains("request-only observation advice")));
+    assert_eq!(
+        session.model_context_state, expected.model_context_state,
+        "the unsendable hint ledger candidate must be restored before rebuilding"
+    );
+    assert_eq!(
+        serde_json::to_value(&session.messages).unwrap(),
+        serde_json::to_value(&original_messages).unwrap()
     );
 }
 
@@ -1012,6 +1143,7 @@ async fn mock_responses_provider_captures_four_exact_prefix_final_bodies() {
                     reasoning_effort: None,
                     max_context_tokens: 400_000,
                     max_output_tokens: 128,
+                    observation_progress_hint: None,
                     prompt_memory_exposure: None,
                 },
             )
@@ -1126,6 +1258,7 @@ async fn explicit_activation_pending_suppresses_answer_tokens() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
     )
@@ -1539,6 +1672,7 @@ async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
     )
@@ -1659,6 +1793,7 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
     )
@@ -1763,6 +1898,7 @@ async fn final_ir_guard_rejects_unbudgeted_large_ledger_before_provider_dispatch
             reasoning_effort: None,
             max_context_tokens: 2_000,
             max_output_tokens: 200,
+            observation_progress_hint: None,
             prompt_memory_exposure: Some(PromptMemoryExposureFrame {
                 round_id,
                 provenance: &provenance,
@@ -1840,6 +1976,7 @@ async fn final_guard_rejects_an_oversized_provider_visible_schema_before_dispatc
             reasoning_effort: None,
             max_context_tokens: 1_000,
             max_output_tokens: 200,
+            observation_progress_hint: None,
             prompt_memory_exposure: Some(PromptMemoryExposureFrame {
                 round_id,
                 provenance: &provenance,
@@ -1992,6 +2129,7 @@ async fn projected_epoch_reseed_refits_and_dispatches_an_idempotent_request() {
         reasoning_effort: None,
         max_context_tokens: prepared.budget.max_context_tokens,
         max_output_tokens: prepared.budget.max_output_tokens,
+        observation_progress_hint: None,
         prompt_memory_exposure: None,
     };
     execute_llm_stream(
@@ -2433,6 +2571,7 @@ async fn execute_llm_stream_routes_normal_request_through_lanes_with_relocated_g
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
     )
@@ -2658,6 +2797,115 @@ fn workspace_prepared_context() -> PreparedContext {
         prompt_cached_tool_outputs: 0,
         prompt_cached_tool_tokens_saved: 0,
     }
+}
+
+#[test]
+fn selected_root_orchestration_prompt_is_provider_visible_on_start_and_resume_only() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("STABLE_GUIDE_MARKER".to_string());
+    let prepared = workspace_prepared_context();
+
+    let mut ordinary = Session::new("ordinary-root", "test-model");
+    let ordinary_envelope = super::build_request_envelope_reconciled(
+        &mut ordinary,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(ordinary_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .all(|message| !message.content.contains("context_type: root_orchestration")));
+
+    let mut root = Session::new("selected-root", "test-model");
+    root.set_root_orchestration_prompt_enabled(true);
+    let initial =
+        super::build_request_envelope_reconciled(&mut root, &prepared, &config, &[], "test-model");
+    assert_eq!(initial.ir.system_text, ordinary_envelope.ir.system_text);
+    assert_eq!(
+        message_shape(initial.ir.run(bamboo_llm::SegmentRole::StablePrefix)),
+        message_shape(
+            ordinary_envelope
+                .ir
+                .run(bamboo_llm::SegmentRole::StablePrefix)
+        ),
+        "the selected enhancement must not duplicate or move the tool schema"
+    );
+    let first_blocks = initial
+        .ir
+        .run(bamboo_llm::SegmentRole::ModelTranscript)
+        .iter()
+        .filter(|message| message.content.contains("context_type: root_orchestration"))
+        .collect::<Vec<_>>();
+    assert_eq!(first_blocks.len(), 1);
+    assert!(first_blocks[0]
+        .content
+        .contains("delegate a read-only Plan"));
+    assert!(first_blocks[0]
+        .content
+        .contains("Inspect authoritative child progress"));
+
+    let stored = serde_json::to_string(&root).expect("persist selected root");
+    let mut resumed: Session = serde_json::from_str(&stored).expect("reload selected root");
+    let mut resumed_prepared = workspace_prepared_context();
+    resumed_prepared.messages.push(Message::user("continue"));
+    let resumed_envelope = super::build_request_envelope_reconciled(
+        &mut resumed,
+        &resumed_prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(resumed_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .any(|message| message.content == "continue"));
+    assert!(resumed_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .any(|message| message.content == first_blocks[0].content));
+    assert_eq!(
+        resumed
+            .model_context_state
+            .as_ref()
+            .expect("durable context ledger")
+            .events
+            .iter()
+            .filter(|event| event.block_type == bamboo_domain::ContextBlockType::RootOrchestration)
+            .count(),
+        1,
+        "resuming must replay the one durable instruction, not append a duplicate"
+    );
+
+    resumed.set_root_orchestration_prompt_enabled(false);
+    let disabled = super::build_request_envelope_reconciled(
+        &mut resumed,
+        &resumed_prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(disabled.prefix_epoch > initial.prefix_epoch);
+    assert!(disabled
+        .ir
+        .body_chat()
+        .iter()
+        .all(|message| !message.content.contains("context_type: root_orchestration")));
+
+    let mut child = Session::new_child_of("child", &resumed, "test-model", "child");
+    child.set_root_orchestration_prompt_enabled(true);
+    let child_envelope =
+        super::build_request_envelope_reconciled(&mut child, &prepared, &config, &[], "test-model");
+    assert!(child_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .all(|message| !message.content.contains("context_type: root_orchestration")));
 }
 
 #[test]
@@ -3733,6 +3981,7 @@ async fn execute_llm_stream_ignores_previous_response_id_under_stateless_store_p
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
     )
@@ -3898,6 +4147,7 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
     )
@@ -3995,6 +4245,7 @@ async fn execute_llm_stream_includes_plan_mode_and_runtime_volatile_blocks() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
     )
@@ -4083,6 +4334,7 @@ async fn execute_llm_stream_sends_full_request_with_summary_when_compression_is_
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
     )
@@ -4185,6 +4437,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
     )
@@ -4296,6 +4549,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot_instance_p
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
     )
@@ -4499,6 +4753,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         before_tools.as_ref(),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
     );
     let before_wire = serde_json::to_string(&serde_json::json!({
         "messages":before.ir.flatten(),"tools":before_tools.as_ref()
@@ -4529,6 +4784,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         loaded_tools.as_ref(),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::Progressive,
+        None,
     );
     let duplicate_wire = serde_json::to_vec(&serde_json::json!({
         "messages":duplicate.ir.flatten(),"tools":loaded_tools.as_ref()
@@ -4541,6 +4797,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         loaded_tools.as_ref(),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
     );
     let after_messages = after.ir.flatten();
     assert_eq!(
@@ -4579,6 +4836,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         loaded_tools.as_ref(),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
     );
     assert_eq!(
         resumed_request
@@ -4598,6 +4856,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         &[],
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
     );
     assert!(disabled
         .ir
@@ -4616,6 +4875,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         loaded_tools.as_ref(),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::StickyFallback,
+        None,
     );
     assert!(sticky
         .ir
@@ -4637,6 +4897,7 @@ fn legacy_browser_history_projection_requires_a_canonical_result() {
         &[browser],
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
     );
     assert!(envelope
         .ir
@@ -4686,6 +4947,7 @@ fn legacy_browser_history_projection_preserves_other_discovery_results() {
         &[browser],
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
     );
     let transcript = envelope.ir.flatten();
     assert!(transcript.iter().any(|message| {
@@ -4769,6 +5031,7 @@ async fn legacy_browser_dispatch_sends_acknowledgement_and_retains_durable_defin
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
     )

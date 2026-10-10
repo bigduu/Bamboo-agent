@@ -45,10 +45,19 @@ impl OverlayToolExecutor {
             // Browser calls can carry typed input or in-memory file bytes, and
             // browser_eval can carry page source. A repaired preview must not
             // reach logs, including for namespaced calls resolved here.
-            let private_browser = ["browser", "browser_eval"]
-                .iter()
-                .any(|name| self.overlay.name().eq_ignore_ascii_case(name));
-            let warning_for_log = if private_browser {
+            let private_arguments = [
+                "browser",
+                "browser_eval",
+                "work_overview",
+                "work_search",
+                "work_inspect",
+                "work_changes",
+                "work_update",
+                "work_dispatch",
+            ]
+            .iter()
+            .any(|name| self.overlay.name().eq_ignore_ascii_case(name));
+            let warning_for_log = if private_arguments {
                 "[redacted]"
             } else {
                 warning.as_str()
@@ -213,6 +222,14 @@ impl ToolExecutor for OverlayToolExecutor {
         self.base
             .check_permissions_for_resolved(call, execution_name, args, ctx)
             .await
+    }
+
+    fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+        if name == self.overlay.name() {
+            Some(self)
+        } else {
+            self.base.exact_tool_owner(name)
+        }
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {

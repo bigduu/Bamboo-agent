@@ -1,4 +1,4 @@
-use actix_web::{web, HttpRequest, HttpResponse};
+use actix_web::{web, HttpRequest, HttpResponse, ResponseError};
 
 use super::image_fallback::resolve_image_fallback;
 use super::{ExecuteRequest, ExecuteSyncInfo, ExecuteSyncReason};
@@ -28,6 +28,15 @@ pub async fn handler(
     req: web::Json<ExecuteRequest>,
 ) -> HttpResponse {
     let session_id = path.into_inner();
+    if let Err(error) = crate::handlers::agent::tickets::require_supervisor_owner(
+        &state,
+        &http_request,
+        &session_id,
+    )
+    .await
+    {
+        return crate::handlers::agent::tickets::TicketHttpError::from(error).error_response();
+    }
     let prepared = match crate::app_state::mutation_idempotency::prepare(
         &http_request,
         "execute",
@@ -35,7 +44,7 @@ pub async fn handler(
         &*req,
     ) {
         Ok(prepared) => prepared,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Some(prepared) = prepared else {
         return handle_execute(state, session_id, req).await;
@@ -65,6 +74,13 @@ pub async fn handle_execute(
         crate::handlers::agent::events::begin_execute_startup(state.get_ref(), &session_id);
     // Bind rejection rollback to the exact turn observed by this request. A
     // delayed failure from turn A must never poison a newer turn B.
+    drop(startup_lock);
+    let admission = match state.admit_chat_for_execute(&session_id).await {
+        Ok(admission) => admission,
+        Err(response) => return *response,
+    };
+    let untrusted_inputs = admission.inputs;
+    let native_main = admission.native_main;
     let startup_turn_id = state
         .storage
         .load_session(&session_id)
@@ -72,7 +88,6 @@ pub async fn handle_execute(
         .ok()
         .flatten()
         .and_then(|session| crate::handlers::agent::events::startup_work_id(&session));
-    drop(startup_lock);
     tracing::debug!(
         "[{}] Execute requested: model={:?}, model_ref={:?}, reasoning_effort={:?}, has_client_sync={}",
         session_id,
@@ -255,6 +270,9 @@ pub async fn handle_execute(
                     session,
                     startup_guard: &mut startup_guard,
                     startup_turn_id: startup_turn_id.clone(),
+                    untrusted_inputs,
+                    native_main,
+                    generate_title: admission.generate_title,
                     effective_model,
                     effective_reasoning_effort,
                     model_source,

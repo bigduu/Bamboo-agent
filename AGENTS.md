@@ -12,6 +12,18 @@ Jiandu owns canonical persistence, derived indexes, lexical recall, and Dream sn
 
 ## Pull Request Review
 
+### Bamboo #791 integration exception
+
+For the #791 multi-agent epic, the user's 2026-09-28 delivery instruction takes
+precedence over the per-Issue PR and review steps below. Inventory all related
+PR heads and existing work first, then merge implemented work into one local
+integration baseline. Review integration changes locally and use focused checks
+while assembling it. Run the complete affected regression once after the
+baseline is ready, then submit one PR to `dev` and satisfy its required GitHub
+checks. Do not request or wait for GitHub Codex PR review for this epic. Close
+superseded component PRs and clean only safely merged worktrees after the final
+integration is accepted. Preserve dirty or uncertain worktrees.
+
 - Every non-draft pull request that enters review must have a Codex review for
   its current head and base. If no current review is already running or complete,
   add a pull-request comment whose entire body is `@codex review`; do not rely
