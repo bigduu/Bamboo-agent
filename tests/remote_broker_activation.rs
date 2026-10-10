@@ -44,7 +44,15 @@ fn diagnostic_tail(path: &Path) -> String {
         file.seek(SeekFrom::Start(len.saturating_sub(4096)))?;
         let mut bytes = Vec::new();
         file.take(4096).read_to_end(&mut bytes)?;
-        Ok(diagnostic_text(&String::from_utf8_lossy(&bytes)))
+        let tail = if len > 4096 {
+            bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(&[][..], |newline| &bytes[newline + 1..])
+        } else {
+            &bytes
+        };
+        Ok(diagnostic_text(&String::from_utf8_lossy(tail)))
     };
     match read() {
         Ok(tail) => tail,
