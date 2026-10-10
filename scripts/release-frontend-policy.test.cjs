@@ -185,9 +185,10 @@ test("crate and Docker publishers share the fail-closed resolver contract", () =
 
 test("crate publication rejects a moved, mismatched or dirty source before package work", (t) => {
   const workflow = fs.readFileSync(path.join(ROOT, ".github/workflows/publish-crate.yml"), "utf8");
-  const guardName = "- name: Require the exact accepted publication source";
-  assert.ok(workflow.indexOf(guardName) < workflow.indexOf("- name: Setup Node.js"));
-  const match = workflow.match(/- name: Require the exact accepted publication source\n[\s\S]*?        run: \|\n([\s\S]*?)(?=\n      - name: Setup Node.js)/);
+  const guardName = "name: Require the exact accepted publication source";
+  const setupName = "name: Setup Node.js";
+  assert.ok(workflow.indexOf(guardName) >= 0 && workflow.indexOf(guardName) < workflow.indexOf(setupName));
+  const match = workflow.match(/name: Require the exact accepted publication source\n[\s\S]*?        run: \|\n([\s\S]*?)(?=\n      - (?:&[\w-]+\n        )?name: Setup Node.js)/);
   assert.ok(match, "The first publication guard must be executable before dependency or package work");
   const guard = match[1].split("\n").map((line) => line.replace(/^          /, "")).join("\n");
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-publication-source-guard-"));

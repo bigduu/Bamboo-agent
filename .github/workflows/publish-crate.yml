@@ -1,4 +1,5 @@
 name: Publish Crate
+# BAMBOO_TRUSTED_PUBLICATION_POLICY_V1
 
 on:
   workflow_run:
@@ -49,14 +50,72 @@ env:
 
 jobs:
   manual:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
     runs-on: ubuntu-latest
+    environment: bamboo-release
     steps:
-      - uses: actions/checkout@v7
+      - name: Authorize the trusted manual publication ref before checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import subprocess
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          assert repository == "bigduu/Bamboo-agent"
+          assert os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+          source = os.environ["EXPECTED_SOURCE_SHA"]
+          assert re.fullmatch(r"[0-9a-f]{40}", source)
+          assert os.environ["GITHUB_SHA"] == source, "Dispatch must select the exact accepted source"
+          assert os.environ["GITHUB_WORKFLOW_SHA"] == source, "Publisher workflow and source must have the same identity"
+          ref = os.environ["GITHUB_REF"]
+          tag_ref = f"refs/tags/bamboo-release-source-{source}"
+          assert ref in {"refs/heads/dev", "refs/heads/main", tag_ref}, "Untrusted publication ref"
+          assert os.environ["GITHUB_REF_TYPE"] == ("tag" if ref == tag_ref else "branch")
+          assert os.environ["GITHUB_REF_PROTECTED"] == "true", "Publication ref must be protected"
+          assert os.environ["GITHUB_WORKFLOW_REF"] == f"{repository}/.github/workflows/publish-crate.yml@{ref}"
+
+          def api(route):
+              return json.loads(subprocess.check_output(["gh", "api", f"repos/{repository}/{route}"], text=True))
+
+          if ref == tag_ref:
+              reference = api(f"git/ref/tags/bamboo-release-source-{source}")
+              assert reference["ref"] == ref and reference["object"]["type"] == "tag", "An annotated source tag is required"
+              tag_sha = reference["object"]["sha"]
+              assert re.fullmatch(r"[0-9a-f]{40}", tag_sha)
+              tag = api(f"git/tags/{tag_sha}")
+              assert tag["sha"] == tag_sha and tag["tag"] == ref.removeprefix("refs/tags/")
+              assert tag["object"]["type"] == "commit" and tag["object"]["sha"] == source, "Source tag moved or does not peel directly to the accepted commit"
+
+          accepted = False
+          for name in ("dev", "main"):
+              branch = api(f"branches/{name}")
+              assert branch["name"] == name and branch["protected"] is True, "Publication source branches must be protected"
+              tip = branch["commit"]["sha"]
+              assert re.fullmatch(r"[0-9a-f]{40}", tip)
+              comparison = api(f"compare/{source}...{tip}")
+              if comparison["status"] in {"ahead", "identical"} and comparison["merge_base_commit"]["sha"] == source:
+                  accepted = True
+          assert accepted, "Publisher source must belong to protected dev/main history"
+          policy = api(f"contents/.github/workflows/publish-crate.yml?ref={source}")
+          assert policy["type"] == "file" and policy["path"] == ".github/workflows/publish-crate.yml" and policy["encoding"] == "base64"
+          content = base64.b64decode("".join(policy["content"].split()), validate=True).decode("utf-8")
+          assert "# BAMBOO_TRUSTED_PUBLICATION_POLICY_V1" in content, "Source predates the trusted publication policy"
+          PY
+
+      - &manual-checkout
+        uses: actions/checkout@v7
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Require the exact accepted publication source
+      - &manual-source
+        name: Require the exact accepted publication source
         env:
           EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
         run: |
@@ -65,19 +124,22 @@ jobs:
           test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA}"
           test -z "$(git status --porcelain --untracked-files=all)"
 
-      - name: Setup Node.js
+      - &manual-node
+        name: Setup Node.js
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
 
-      - name: Resolve exact release frontend
+      - &manual-frontend
+        name: Resolve exact release frontend
         id: frontend
         env:
           FRONTEND_PACKAGE: ${{ github.event.inputs.frontend_package || '@bigduu/lotus-next' }}
           FRONTEND_VERSION: ${{ github.event.inputs.lotus_version || 'from_lock' }}
         run: node scripts/release-frontend-policy.cjs
 
-      - name: Stage frontend package from npm
+      - &manual-stage
+        name: Stage frontend package from npm
         # The shared resolver selects the committed Lotus Next lock by default
         # and permits only one fixed legacy rollback. LOTUS_SOURCE=package
         # hard-fails when the exact package is missing, so a fetch failure can
@@ -105,11 +167,13 @@ jobs:
             exit 1
           fi
 
-      - name: Install isolated Cargo publication entrypoint
+      - &manual-isolation
+        name: Install isolated Cargo publication entrypoint
         # PATH also covers Cargo metadata launched by compute-publish-order.py.
         run: node scripts/release-cargo-sandbox.cjs install
 
-      - name: Resolve publish version
+      - &manual-version
+        name: Resolve publish version
         id: version
         env:
           PUBLISH_VERSION: ${{ inputs.version }}
@@ -124,40 +188,17 @@ jobs:
           console.log(`Resolved manual version: ${version}`)
           JS
 
-      - name: Prepare workspace manifests for publish
+      - &manual-stamp
+        name: Prepare workspace manifests for publish
         env:
           TARGET_VERSION: ${{ steps.version.outputs.version }}
         run: python3 scripts/crate-release-lock.py stamp "${TARGET_VERSION}"
 
-      - name: Refresh the temporary stamped publication lockfile
+      - &manual-lock
+        name: Refresh the temporary stamped publication lockfile
         run: |
           cargo metadata --format-version 1 > /dev/null
           python3 scripts/crate-release-lock.py
-
-      - name: Validate publish plan
-        if: github.event.inputs.dry_run == 'true'
-        shell: bash
-        env:
-          TARGET_VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-
-          cargo metadata --format-version 1 >/dev/null
-          cargo check --locked --workspace --all-targets
-
-          cat <<EOF
-          Dry-run validation completed for Bamboo ${TARGET_VERSION}.
-
-          Note: internal Bamboo crates are published sequentially during the real release.
-          A dry run cannot fully emulate crates.io index propagation, so this step validates:
-          - manifest rewriting to ${TARGET_VERSION}
-          - workspace dependency resolution
-          - workspace buildability
-
-          Real publish order (computed from the dependency graph, exactly as
-          the publish step below computes it):
-          EOF
-          python3 scripts/compute-publish-order.py
 
       - name: Publish to crates.io
         if: github.event.inputs.dry_run != 'true'
@@ -282,6 +323,51 @@ jobs:
           done
 
           echo "Published Bamboo crates for version ${TARGET_VERSION}"
+
+  dry-run:
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+    runs-on: ubuntu-latest
+    # No Environment or publication credentials, including on feature refs.
+    env:
+      GH_TOKEN: ""
+      CARGO_REGISTRY_TOKEN: ""
+      BAMBOO_RELEASE_TOKEN: ""
+      BAMBOO_RELEASE_SIGNING_KEY: ""
+      BAMBOO_RELEASE_SIGNING_KEY_SHA256: ""
+    steps:
+      - *manual-checkout
+      - *manual-source
+      - *manual-node
+      - *manual-frontend
+      - *manual-stage
+      - *manual-isolation
+      - *manual-version
+      - *manual-stamp
+      - *manual-lock
+
+      - name: Validate publish plan
+        shell: bash
+        env:
+          TARGET_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          cargo metadata --format-version 1 >/dev/null
+          cargo check --locked --workspace --all-targets
+
+          cat <<EOF
+          Dry-run validation completed for Bamboo ${TARGET_VERSION}.
+
+          Note: internal Bamboo crates are published sequentially during the real release.
+          A dry run cannot fully emulate crates.io index propagation, so this step validates:
+          - manifest rewriting to ${TARGET_VERSION}
+          - workspace dependency resolution
+          - workspace buildability
+
+          Real publish order (computed from the dependency graph, exactly as
+          the publish step below computes it):
+          EOF
+          python3 scripts/compute-publish-order.py
 
   automatic:
     if: >-
