@@ -161,6 +161,21 @@ test("promotion retains required checks without repeating platform coverage", ()
   )
 })
 
+test("all-feature E2E tests retain the workspace test thread stack contract", () => {
+  const steps = job("e2e-test").split(/(?=^      - )/mu)
+  const matches = steps.filter((step) =>
+    step.startsWith("      - name: Run all-feature library and integration tests\n"),
+  )
+  assert.equal(matches.length, 1, "the all-feature E2E step must appear exactly once")
+  const [step] = matches
+  assert.deepEqual(
+    [...step.matchAll(/^        run: (.*)$/gmu)].map((match) => match[1]),
+    ["cargo test --locked --all-features --lib --tests"],
+  )
+  assert.match(step, /^        env:\n          RUST_MIN_STACK: "8388608"$/mu)
+  assert.doesNotMatch(step, /^        (?:if|continue-on-error):/mu)
+})
+
 test("PR caches are reusable while open and scoped cleanup runs on close", () => {
   assert.match(
     job("test"),
