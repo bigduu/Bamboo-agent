@@ -17,7 +17,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -30,8 +30,47 @@ const HOST: &str = "remote-host-opaque-credential-000000001";
 const WORKER: &str = "remote-worker-opaque-credential-0000001";
 const OBSERVER: &str = "remote-observer-opaque-credential-00001";
 const ROLE: &str = "legacy-remote-native";
-struct Process(Child);
+fn diagnostic_text(value: &str) -> String {
+    let mut value = value.to_owned();
+    for credential in [HOST, WORKER, OBSERVER] {
+        value = value.replace(credential, "[redacted fixture credential]");
+    }
+    value.chars().take(2048).collect()
+}
+fn diagnostic_tail(path: &Path) -> String {
+    let read = || -> std::io::Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        file.seek(SeekFrom::Start(len.saturating_sub(4096)))?;
+        let mut bytes = Vec::new();
+        file.take(4096).read_to_end(&mut bytes)?;
+        let tail = if len > 4096 {
+            bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(&[][..], |newline| &bytes[newline + 1..])
+        } else {
+            &bytes
+        };
+        Ok(diagnostic_text(&String::from_utf8_lossy(tail)))
+    };
+    match read() {
+        Ok(tail) => tail,
+        Err(error) => format!("unavailable: {error}"),
+    }
+}
+struct Process(Child, PathBuf);
 impl Process {
+    fn diagnostic(&mut self) -> String {
+        format!(
+            "pid={} exit={:?} log={} stdout={:?} stderr={:?}",
+            self.0.id(),
+            self.0.try_wait(),
+            self.1.display(),
+            diagnostic_tail(&self.1),
+            diagnostic_tail(&self.1.with_extension("stderr")),
+        )
+    }
     fn stop(&mut self) {
         self.0.kill().unwrap();
         self.0.wait().unwrap();
@@ -72,7 +111,7 @@ fn spawn(mut c: Command, input: Option<String>, log: &Path) -> Process {
             .write_all(input.as_bytes())
             .unwrap();
     }
-    Process(child)
+    Process(child, log.to_path_buf())
 }
 fn address() -> String {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -972,7 +1011,7 @@ async fn fixture() {
         .arg(&cert)
         .arg("--key")
         .arg(&key);
-    let _broker = spawn(c, Some(policy.to_string()), &data.join("broker.log"));
+    let mut _broker = spawn(c, Some(policy.to_string()), &data.join("broker.log"));
     let p = web::Data::new(Probe {
         data: data.clone(),
         ids: Mutex::new(vec![]),
@@ -1045,9 +1084,10 @@ async fn fixture() {
             .into_owned(),
     );
     replacement_spec.workspace = Some(replacement_workspace.to_string_lossy().into_owned());
+    let mut last_connect_error = None;
     let mut observer = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let Ok(c) = BrokerClient::connect_with_tls(
+            match BrokerClient::connect_with_tls(
                 &url,
                 AgentRef {
                     session_id: "remote-parent".into(),
@@ -1058,13 +1098,19 @@ async fn fixture() {
             )
             .await
             {
-                break c;
+                Ok(client) => break client,
+                Err(error) => last_connect_error = Some(diagnostic_text(&error.to_string())),
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|error| {
+        panic!(
+            "original broker TLS deadline: {error}; last_connect_error={last_connect_error:?}; {}",
+            _broker.diagnostic()
+        )
+    });
     // A scoped old Worker can subscribe but has no lease capability. The Host
     // rejects it at placement, before it can receive a Run or call a provider.
     let mut legacy_worker = BrokerClient::connect_with_tls(
@@ -1303,10 +1349,24 @@ async fn fixture() {
     // turn exercises replacement admission; retry below still covers its failed Run.
     turn(&client, &base, &p, 4, 0).await;
     let mismatched = wait_child_after(&data, &child_id, "error", mismatched_requested_at).await;
-    assert!(mismatched
-        .last_run_error()
-        .unwrap_or_default()
-        .contains("remote_environment_checkout_not_clean"));
+    assert!(
+        mismatched
+            .last_run_error()
+            .unwrap_or_default()
+            .contains("remote_environment_checkout_not_clean"),
+        "replacement checkout rejection: Child={} parent={:?} root={} generation={} run={:?} status={:?} error={:?} calls={} host={} worker={} broker={}",
+        mismatched.id,
+        mismatched.parent_session_id,
+        mismatched.root_session_id,
+        mismatched.child_launch_generation(),
+        mismatched.agent_runtime_state.as_ref().map(|state| &state.run_id),
+        mismatched.last_run_status(),
+        diagnostic_text(&mismatched.last_run_error().unwrap_or_default()),
+        p.calls.load(Ordering::SeqCst),
+        h.diagnostic(),
+        resident.diagnostic(),
+        _broker.diagnostic(),
+    );
     assert_eq!(
         p.calls.load(Ordering::SeqCst),
         3,

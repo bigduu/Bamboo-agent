@@ -6,7 +6,7 @@
 //! reserve the runner, persist + cache, kick auto-title-gen, resolve the
 //! session-effective provider/area models, and spawn the agent loop.
 //!
-//! Behavior is identical to the prior inline branch — this is a pure extraction.
+//! Image validation uses the routed provider before runner reservation.
 
 use actix_web::{web, HttpResponse};
 use std::collections::BTreeSet;
@@ -38,6 +38,7 @@ pub(super) struct ReadyExecution<'a> {
     pub startup_turn_id: Option<String>,
     pub untrusted_inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
     pub generate_title: bool,
+    pub native_main: bool,
     pub effective_model: String,
     pub effective_reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
     pub model_source: &'static str,
@@ -122,6 +123,32 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         None
     };
 
+    // Consult the same provider/model that will execute this session. A legacy
+    // Error fallback must not reject explicitly supported native image input.
+    let vision_provider = match provider_override.as_ref() {
+        Some(provider) => provider.clone(),
+        None => state.provider.read().await.clone(),
+    };
+    let vision_override = vision_provider
+        .vision_support_override(&ready.effective_model)
+        .await;
+    if let Err(error) = bamboo_engine::session_app::execute::validate_image_fallback_for_session(
+        &session,
+        image_fallback.as_ref(),
+        &ready.effective_model,
+        vision_override,
+    ) {
+        super::fail_pending_startup(
+            state,
+            session_id,
+            ready.startup_turn_id.as_deref(),
+            &error,
+            &mut *ready.startup_guard,
+        )
+        .await;
+        return bad_request_error_response(error);
+    }
+
     // #74: re-derive the "no interactive human approver" posture per
     // user-initiated execute, OVERWRITING the session's persisted flag (see
     // `apply_no_human_approver`). Done before the `merge_save_runtime` persist
@@ -162,6 +189,33 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             "error": crate::error::error_value(error.to_string())
         }));
     }
+    let native_binding = if ready.native_main && crate::skill_runtime::ordinary_main(&session) {
+        match crate::skill_runtime::bind_execution(
+            state.clone(),
+            &session,
+            &execution_reservation,
+            state.tools_for(crate::tools::ToolSurface::Root),
+        ) {
+            Ok(binding) => Some(binding),
+            Err(error) => {
+                execution_reservation.abandon().await;
+                super::fail_pending_startup(
+                    state,
+                    session_id,
+                    ready.startup_turn_id.as_deref(),
+                    &error.to_string(),
+                    ready.startup_guard,
+                )
+                .await;
+                return HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                    "status": "rejected", "session_id": session_id,
+                    "error": crate::error::error_value(error.to_string())
+                }));
+            }
+        }
+    } else {
+        None
+    };
     let execution_persistence = execution_reservation.execution_persistence();
 
     // The reservation owns this exact turn now. Moving the owned marker out of
@@ -283,7 +337,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         app_data_dir: Some(state.app_data_dir.clone()),
         run_budget: ready.run_budget,
     }
-    .spawn_with_inputs(ready.untrusted_inputs);
+    .spawn_with_native_inputs(ready.untrusted_inputs, native_binding);
 
     started_response(session_id, sync_info, run_id)
 }

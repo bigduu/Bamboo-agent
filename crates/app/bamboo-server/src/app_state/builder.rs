@@ -1075,6 +1075,38 @@ impl AppState {
             .set_root_tools(tools.clone())
             .await;
 
+        let tool_factory =
+            crate::tools::ToolSurfaceFactory::new(base_tools, tools_with_task, tools);
+
+        let session_repo = bamboo_engine::SessionRepository::new(
+            sessions.clone(),
+            storage.clone(),
+            persistence.clone(),
+        )
+        .with_root_actor_directory(session_store.clone());
+
+        let skill_producer = crate::skill_runtime::ServerMainSkillProducer::new(
+            skill_manager.clone(),
+            config.clone(),
+            session_repo.clone(),
+            project_store.clone(),
+            storage.clone(),
+            permission_checker.clone(),
+            tool_factory.clone(),
+        )
+        .with_runners(agent_runners.clone())
+        .with_root_observer(child_completion_coordinator.root_tool_surface_observer());
+        child_completion_coordinator.set_reserved_root_execution_adapter(Arc::new(
+            move |agent, session, reservation, tools| {
+                if !crate::skill_runtime::ordinary_main(session) {
+                    return Ok((agent, tools));
+                }
+                skill_producer
+                    .bind(agent, session, reservation, tools)
+                    .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))
+            },
+        ));
+
         // Resolve expired, canonical direct-parent forced asks before any
         // SessionInbox reactivation can admit an old parent request. A restart
         // cannot restore the previous process's live approval scope, so this
@@ -1120,16 +1152,6 @@ impl AppState {
                 "started durable SessionInbox wake reconciliation"
             );
         }
-
-        let tool_factory =
-            crate::tools::ToolSurfaceFactory::new(base_tools, tools_with_task, tools);
-
-        let session_repo = bamboo_engine::SessionRepository::new(
-            sessions.clone(),
-            storage.clone(),
-            persistence.clone(),
-        )
-        .with_root_actor_directory(session_store.clone());
 
         // bamboo-connect (#452 / epic #447): drives bamboo sessions from IM
         // platforms (Telegram first). Fully inert when `config.connect.platforms`

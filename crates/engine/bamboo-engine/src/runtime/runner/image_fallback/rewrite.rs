@@ -21,6 +21,19 @@ pub(super) async fn apply_image_fallback_to_llm_messages(
     #[cfg(not(windows))]
     let _ = attachment_reader;
 
+    // Preflight the actual fallback target before rewriting any messages or
+    // dispatching image bytes. Missing overrides retain default-on support.
+    if fallback.mode == ImageFallbackMode::Vision && messages.iter().any(has_image_parts) {
+        if let Some(llm) = llm {
+            let vision_model = fallback.vision_model.as_deref().unwrap_or("gpt-4o");
+            if !llm.supports_vision(vision_model).await {
+                return Err(AgentError::LLM(format!(
+                    "Vision fallback model '{vision_model}' does not support Vision; image history was preserved and no fallback request was sent. Select a Vision-capable fallback model or enable supports_vision for it in provider settings."
+                )));
+            }
+        }
+    }
+
     for message in messages.iter_mut() {
         if !has_image_parts(message) {
             continue;

@@ -80,6 +80,7 @@ pub async fn handle_execute(
         Err(response) => return *response,
     };
     let untrusted_inputs = admission.inputs;
+    let native_main = admission.native_main;
     let startup_turn_id = state
         .storage
         .load_session(&session_id)
@@ -270,6 +271,7 @@ pub async fn handle_execute(
                     startup_guard: &mut startup_guard,
                     startup_turn_id: startup_turn_id.clone(),
                     untrusted_inputs,
+                    native_main,
                     generate_title: admission.generate_title,
                     effective_model,
                     effective_reasoning_effort,

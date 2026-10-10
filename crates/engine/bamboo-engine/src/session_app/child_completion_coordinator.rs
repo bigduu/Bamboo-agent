@@ -744,6 +744,22 @@ fn guardian_resume_message(completion: &ChildCompletion, verdict: &GuardianVerdi
     message
 }
 
+/// Observe the existing registered Root surface without retaining its owner.
+pub type RootToolSurfaceObserver = Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, Option<Arc<dyn ToolExecutor>>> + Send + Sync,
+>;
+
+pub type ReservedRootExecutionAdapter = Arc<
+    dyn Fn(
+            Arc<Agent>,
+            &Session,
+            &SessionExecutionReservation,
+            Arc<dyn ToolExecutor>,
+        ) -> Result<(Arc<Agent>, Arc<dyn ToolExecutor>), bamboo_agent_core::AgentError>
+        + Send
+        + Sync,
+>;
+
 #[derive(Clone)]
 pub struct ChildCompletionCoordinator {
     storage: Arc<dyn Storage>,
@@ -759,6 +775,7 @@ pub struct ChildCompletionCoordinator {
     account_feed_inbox: Option<crate::execution::AccountFeedInbox>,
     root_account_sink: Option<Arc<crate::events::AccountEventSink>>,
     root_tools: Arc<RwLock<Option<Arc<dyn ToolExecutor>>>>,
+    reserved_root_adapter: Arc<StdRwLock<Option<ReservedRootExecutionAdapter>>>,
     /// Late-bound guardian reviewer spawner, set post-construction by the server
     /// (mirrors `root_tools`). Re-injected into resumed runs so a guardian's
     /// reject→fix verdict can be re-reviewed across the suspend/resume boundary.
@@ -803,9 +820,31 @@ impl ChildCompletionCoordinator {
             account_feed_inbox,
             root_account_sink: None,
             root_tools: Arc::new(RwLock::new(None)),
+            reserved_root_adapter: Arc::new(StdRwLock::new(None)),
             guardian_spawner: Arc::new(RwLock::new(None)),
             spawn_scheduler: Arc::new(RwLock::new(Weak::new())),
         }
+    }
+
+    /// Register a host producer at the existing genuine reserved Root seam.
+    /// This is optional; independent workers and embeddings retain None.
+    pub fn set_reserved_root_execution_adapter(&self, adapter: ReservedRootExecutionAdapter) {
+        *self
+            .reserved_root_adapter
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(adapter);
+    }
+
+    pub fn root_tool_surface_observer(&self) -> RootToolSurfaceObserver {
+        let source = Arc::downgrade(&self.root_tools);
+        Arc::new(move || {
+            let source = source.clone();
+            Box::pin(async move {
+                let source = source.upgrade()?;
+                let current = source.read().await.clone();
+                current
+            })
+        })
     }
 
     pub async fn set_root_tools(&self, tools: Arc<dyn ToolExecutor>) {
@@ -1645,6 +1684,29 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             return;
         };
 
+        let adapter = self
+            .reserved_root_adapter
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let (agent, root_tools) = if let Some(adapter) = adapter {
+            match adapter(
+                self.agent.clone(),
+                &session,
+                &execution_reservation,
+                root_tools,
+            ) {
+                Ok(bound) => bound,
+                Err(error) => {
+                    tracing::error!(%session_id, %error, "registered Root execution producer rejected resume");
+                    execution_reservation.abandon().await;
+                    return;
+                }
+            }
+        } else {
+            (self.agent.clone(), root_tools)
+        };
+
         let config_snapshot = self.config.read().await.clone();
         let model = session.model.clone();
         let session_model_ref = session_effective_model_ref(&session);
@@ -1781,7 +1843,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
 
         consume_pending_clarification_resume(&mut session);
         spawn_session_execution(SessionExecutionArgs {
-            agent: self.agent.clone(),
+            agent,
             session_id,
             session,
             execution_reservation,

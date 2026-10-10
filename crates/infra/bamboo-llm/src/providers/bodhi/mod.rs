@@ -313,6 +313,7 @@ impl BodhiProvider {
             AnthropicStreamState,
         };
 
+        crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
         let max_tokens = max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
         let reasoning_effort = reasoning_effort_for_required_tool(reasoning_effort, required_tool);
         let budget_reasoning_effort =
@@ -412,6 +413,7 @@ impl BodhiProvider {
             GeminiStreamState,
         };
 
+        crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
         let messages_vec: Vec<Message> = messages.to_vec();
         let mut request: GeminiRequest = messages_vec.to_provider()?;
 
