@@ -984,6 +984,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn subagent_permission_classification_matches_real_facade_routes() {
+        use bamboo_tools::permission::check_permissions;
+
+        for args in [
+            json!({"message":"Do the task"}),
+            json!({"intent":"chat", "role":"explorer", "message":"Do the task"}),
+            json!({"target":"child", "message":"Continue the task"}),
+            json!({"intent":"control", "target":"child", "message":" cancel "}),
+            json!({"intent":"control", "target":"child", "message":" retry "}),
+            json!({"intent":"inspect"}),
+            json!({"intent":"inspect", "target":"child", "message":"diagnostics"}),
+            json!({"intent":"inspect", "message":"forced_permission_audit"}),
+            json!({"intent":"ask_parent", "message":"Which option?"}),
+            json!({"reply_to":"request_123", "message":"Use option A"}),
+            json!({"reply_to":"request_123", "message":"approve_once"}),
+            json!({"reply_to":"request_123", "message":"deny"}),
+        ] {
+            for sentinel in [None, Some(json!("")), Some(Value::Null)] {
+                let mut args = args.clone();
+                if let Some(sentinel) = sentinel {
+                    for field in ["target", "role", "reply_to"] {
+                        if args.get(field).is_none() {
+                            args[field] = sentinel.clone();
+                        }
+                    }
+                }
+                let normalized = normalize(args.clone()).expect("valid compact call");
+                let expected = match normalized.projection {
+                    Some(
+                        Projection::ParentQuestionAsk
+                        | Projection::ParentRequestReply
+                        | Projection::ForcedPermissionAudit,
+                    ) => None,
+                    _ => check_permissions("SubAgent", &normalized.args).unwrap(),
+                };
+                assert_eq!(
+                    check_permissions("SubAgent", &args).unwrap(),
+                    expected,
+                    "pre-invoke classification must match the actual route: {args}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn provider_empty_optional_fields_do_not_become_parent_replies() {
         let message = "  Audit Bamboo worktrees.\nPreserve the full assignment.  ";
         let captured = normalize(json!({

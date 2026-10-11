@@ -155,6 +155,25 @@ fn record_stop_metadata(session: &mut Session, proof: &ConfirmedTaskStop) {
     }
 }
 
+fn reconcile_question_handoff(session: &mut Session, previous_request: Option<&str>) {
+    let issued_here = session
+        .metadata
+        .get(bamboo_domain::PARENT_QUESTION_REQUEST_KEY)
+        .is_some_and(|request| Some(request.as_str()) != previous_request);
+    if issued_here {
+        // Preserve this run's handoff even if a fast parent answer already
+        // cleared pending_question before the Agent returned.
+        session.metadata.insert(
+            "runtime.actor_parent_question_handoff".into(),
+            "true".into(),
+        );
+    } else {
+        session
+            .metadata
+            .remove("runtime.actor_parent_question_handoff");
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
@@ -609,6 +628,11 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         }
         if let Some(plan) = ticket_plan { request = request.ticket_worker_plan(plan); }
         let mut owned_session = session.clone();
+        // The question fact survives its answer for replay/deduplication. The
+        // handoff is only for the run that issued that fact, not every later
+        // run that happens to retain it in canonical history.
+        let parent_question_at_start = owned_session.metadata.get(bamboo_domain::PARENT_QUESTION_REQUEST_KEY).cloned();
+        owned_session.metadata.remove("runtime.actor_parent_question_handoff");
         owned_session.metadata.remove(bamboo_subagent::proto::WORKFLOW_TERMINAL_OBSERVATION_KEY);
         owned_session.metadata.remove(bamboo_subagent::proto::WORKFLOW_USAGE_OBSERVATION_KEY);
         owned_session
@@ -648,6 +672,11 @@ impl ExternalChildRunner for LocalTaskChildRunner {
                         local_event_tx.send(AgentEvent::PermissionPostureActivated { session_id: owned_session.id.clone(), policy_revision: audit.policy_revision, requested_mode: audit.resolution.requested.as_str().to_owned(), effective_mode: audit.resolution.effective.as_str().to_owned(), executor_mapping: audit.executor_mapping }).await.map_err(failure)?;
                     }
                     drop(local_event_tx);
+                    // This owned execution has now taken over the admitted
+                    // resume. Mirror the normal Root execution seam: retained
+                    // answer/retry handoff markers are not future pending work.
+                    // Do not consume them while queued or during preparation.
+                    crate::session_app::execute::consume_pending_clarification_resume(&mut owned_session);
                     agent.execute(&mut owned_session, request.build()).await
                 })),
             )
@@ -673,9 +702,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
                 Ok(Err(error)) => result = Err(failure(format!("local event publication failed: {error}"))),
                 Err(error) => { drained = Err(std::io::Error::other(format!("local event owner panicked: {error}"))); result = Err(failure(error)); },
             }
-            if owned_session.metadata.contains_key(bamboo_domain::PARENT_QUESTION_REQUEST_KEY) {
-                owned_session.metadata.insert("runtime.actor_parent_question_handoff".into(), "true".into());
-            }
+            reconcile_question_handoff(&mut owned_session, parent_question_at_start.as_deref());
             ExecutionOutput {
                 session: owned_session,
                 result,
@@ -1005,3 +1032,43 @@ mod tool_policy;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod question_handoff_tests {
+    use super::*;
+
+    #[test]
+    fn answered_question_fact_does_not_suspend_successor_run() {
+        let mut session = Session::new("child", "model");
+        session.metadata.insert(
+            bamboo_domain::PARENT_QUESTION_REQUEST_KEY.into(),
+            "durable-question".into(),
+        );
+        session.metadata.insert(
+            "runtime.actor_parent_question_handoff".into(),
+            "true".into(),
+        );
+        reconcile_question_handoff(&mut session, Some("durable-question"));
+        assert!(!session
+            .metadata
+            .contains_key("runtime.actor_parent_question_handoff"));
+    }
+
+    #[test]
+    fn newly_issued_question_keeps_handoff_after_fast_answer() {
+        let mut session = Session::new("child", "model");
+        session.metadata.insert(
+            bamboo_domain::PARENT_QUESTION_REQUEST_KEY.into(),
+            "durable-question".into(),
+        );
+        assert!(session.pending_question.is_none());
+        reconcile_question_handoff(&mut session, None);
+        assert_eq!(
+            session
+                .metadata
+                .get("runtime.actor_parent_question_handoff")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+}

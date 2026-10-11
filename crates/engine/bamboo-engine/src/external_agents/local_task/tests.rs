@@ -15,6 +15,9 @@ use tokio::sync::{broadcast, oneshot, RwLock};
 const MODEL: &str = "local-test-model";
 const WAIT: Duration = Duration::from_secs(15);
 
+#[cfg(unix)]
+mod owned_bash_publication;
+
 struct EmptyTools;
 #[async_trait]
 impl ToolExecutor for EmptyTools {
@@ -156,6 +159,25 @@ impl Harness {
         provider: Arc<dyn LLMProvider>,
         max_concurrent: usize,
     ) -> Self {
+        Self::open_with_tools(
+            home,
+            parent_id,
+            provider,
+            max_concurrent,
+            Arc::new(EmptyTools),
+            Arc::new(EmptyCeiling),
+        )
+        .await
+    }
+
+    async fn open_with_tools(
+        home: &std::path::Path,
+        parent_id: &str,
+        provider: Arc<dyn LLMProvider>,
+        max_concurrent: usize,
+        tools: Arc<dyn ToolExecutor>,
+        ceiling: Arc<dyn NativeToolCeilingSource>,
+    ) -> Self {
         let store = Arc::new(
             bamboo_storage::SessionStoreV2::new(home.to_path_buf())
                 .await
@@ -175,7 +197,6 @@ impl Harness {
             inbox.clone(),
             activation,
         ));
-        let tools: Arc<dyn ToolExecutor> = Arc::new(EmptyTools);
         let mut config_value = Config::default();
         config_value.provider = "local-test".into();
         config_value.subagents_mut().max_concurrent = Some(max_concurrent);
@@ -190,7 +211,7 @@ impl Harness {
         ));
         let runner = Arc::new(LocalTaskChildRunner::new(
             &config_value,
-            Some(Arc::new(EmptyCeiling)),
+            Some(ceiling),
             None,
         ));
         let config = Arc::new(RwLock::new(config_value));
@@ -452,7 +473,15 @@ async fn production_local_task_completes_in_host_and_commits_history_before_pare
     let mut control = ProviderControl::new();
     let mut harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 2).await;
     let child = harness.child("single", "single native task").await;
-    let mut events = harness.child_events(&child).await;
+    // A common observation bus records the actual publication order, rather
+    // than comparing two receivers after asynchronous storage reads. Neither
+    // the production publishers nor the canonical persistence are replaced.
+    let mut events = {
+        let mut senders = harness.ctx.session_event_senders.write().await;
+        let sender = senders[&harness.parent.id].clone();
+        senders.insert(child.id.clone(), sender.clone());
+        sender.subscribe()
+    };
     harness.launch(&child).await.unwrap();
     let call = control.next().await;
     assert_eq!(call.process_id, std::process::id());
@@ -464,6 +493,28 @@ async fn production_local_task_completes_in_host_and_commits_history_before_pare
         ActorActivationStatus::Running
     );
     call.complete("native result");
+    tokio::time::timeout(WAIT, async {
+        let mut complete = false;
+        let mut committed = false;
+        loop {
+            match events.recv().await.unwrap() {
+                AgentEvent::Complete { .. } => complete = true,
+                AgentEvent::SessionHistoryCommitted { session_id } => {
+                    assert_eq!(session_id, child.id);
+                    assert!(complete, "Agent end must precede durable history publication");
+                    committed = true;
+                }
+                AgentEvent::SubAgentCompleted { child_session_id, .. } => {
+                    assert_eq!(child_session_id, child.id);
+                    assert!(committed, "history commit barrier must precede parent completion on the same publication sequence");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("ordered production completion publication");
     let (id, status, error) = harness.completion().await;
     assert_eq!(id, child.id);
     assert_eq!(status, "completed", "{error:?}");
@@ -480,26 +531,6 @@ async fn production_local_task_completes_in_host_and_commits_history_before_pare
     assert_eq!(
         source.result(&saved, &harness.parent).as_deref(),
         Some("native result")
-    );
-    let mut complete = false;
-    let mut committed = false;
-    while let Ok(event) = events.try_recv() {
-        match event {
-            AgentEvent::Complete { .. } => complete = true,
-            AgentEvent::SessionHistoryCommitted { session_id } => {
-                assert_eq!(session_id, child.id);
-                assert!(
-                    complete,
-                    "Agent end must precede durable history publication"
-                );
-                committed = true;
-            }
-            _ => {}
-        }
-    }
-    assert!(
-        committed,
-        "history commit barrier must precede parent completion"
     );
     let root = harness
         .store
@@ -575,6 +606,7 @@ async fn production_local_task_cancellation_waits_for_owned_execution_and_persis
     let mut control = ProviderControl::new();
     let mut harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 1).await;
     let child = harness.child("cancel", "cancel this native task").await;
+    let mut events = harness.child_events(&child).await;
     harness.launch(&child).await.unwrap();
     let call = control.next().await;
     let cancel = harness.ctx.agent_runners.read().await[&child.id]
@@ -589,8 +621,179 @@ async fn production_local_task_cancellation_waits_for_owned_execution_and_persis
     let (id, status, error) = harness.completion().await;
     assert_eq!(id, child.id);
     assert_eq!(status, "cancelled", "{error:?}");
-    harness.assert_terminal(&child, "cancelled").await;
+    let stopped = harness.assert_terminal(&child, "cancelled").await;
+    assert!(stopped
+        .messages
+        .iter()
+        .all(|message| !message.content.contains("late response")));
+    let root = harness
+        .store
+        .load_session(&harness.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(root
+        .messages
+        .iter()
+        .all(|message| !message.content.contains("late response")));
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !serde_json::to_string(&event)
+                .unwrap()
+                .contains("late response"),
+            "cancelled provider output must not leak into observable Child events"
+        );
+    }
     assert_eq!(control.provider.active.load(Ordering::SeqCst), 0);
+    harness.runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn production_local_task_natural_completion_wins_late_cancel_without_poisoning_successor() {
+    let home = tempfile::tempdir().unwrap();
+    let mut control = ProviderControl::new();
+    let mut harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 1).await;
+    let child = harness
+        .child("completion-wins", "finish before late cancellation")
+        .await;
+    let mut events = harness.child_events(&child).await;
+    harness.launch(&child).await.unwrap();
+    let call = control.next().await;
+    let run_id = harness.router.current_run_id(&child.id).await.unwrap();
+    let execution = harness.runner.execution(&child, &run_id).unwrap();
+    let cancel = harness.ctx.agent_runners.read().await[&child.id]
+        .cancel_token
+        .clone();
+
+    // Hold a real owned task at the drain boundary. This makes publication
+    // remain pending after the actual Agent Complete event without sleeping,
+    // replacing the runner, or manufacturing any stop/completion proof.
+    let (release_drain, drain_gate) = oneshot::channel();
+    let drained_task = execution
+        .resources
+        .spawn_owned(async move {
+            drain_gate.await.unwrap();
+        })
+        .unwrap();
+    call.complete("natural completion won");
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if matches!(events.recv().await.unwrap(), AgentEvent::Complete { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("real Agent completion boundary");
+    assert_eq!(
+        harness.router.current_run_id(&child.id).await.as_deref(),
+        Some(run_id.as_str())
+    );
+    assert!(
+        lock(&execution.stop).is_none(),
+        "publication still awaits the owned drain task"
+    );
+    cancel.cancel();
+    while let Ok(event) = harness.parent_events.try_recv() {
+        assert!(
+            !matches!(event, AgentEvent::SubAgentCompleted { .. }),
+            "late cancel cannot publish before the actual owned resource joins"
+        );
+    }
+    release_drain.send(()).unwrap();
+    tokio::time::timeout(WAIT, drained_task)
+        .await
+        .unwrap()
+        .unwrap();
+    let (id, status, error) = harness.completion().await;
+    assert_eq!(id, child.id);
+    assert_eq!(status, "completed", "{error:?}");
+    let first = harness.assert_terminal(&child, "completed").await;
+    assert_eq!(
+        first
+            .messages
+            .iter()
+            .filter(|m| m.content == "natural completion won")
+            .count(),
+        1
+    );
+    let first_source =
+        crate::execution::ChildCompletionSource::from_committed_session(&first).unwrap();
+    assert_eq!(first_source.activation_run_id, run_id);
+    assert_eq!(
+        first_source.result(&first, &harness.parent).as_deref(),
+        Some("natural completion won")
+    );
+
+    // A subsequent real Inbox activation of the same logical Child must get a
+    // fresh cancellation domain, preserve its previous answer, and finish once.
+    let envelope =
+        SessionMessageEnvelope::user_input(&child.id, "successor after late cancellation");
+    let admission = harness.messenger.admit(envelope.clone()).await.unwrap();
+    harness
+        .messenger
+        .prepare_activation(&admission)
+        .await
+        .unwrap();
+    harness
+        .router
+        .reconcile_wake(&child.id, chrono::Utc::now())
+        .await
+        .unwrap();
+    let successor = control.next().await;
+    assert!(successor.sees("natural completion won"));
+    assert_eq!(
+        successor
+            .messages
+            .iter()
+            .filter(|m| m.id == envelope.id.as_str())
+            .count(),
+        1
+    );
+    cancel.cancel();
+    successor.complete("successor unaffected");
+    let (id, status, error) = harness.completion().await;
+    assert_eq!(id, child.id);
+    assert_eq!(status, "completed", "{error:?}");
+    let final_child = harness.assert_terminal(&child, "completed").await;
+    for text in ["natural completion won", "successor unaffected"] {
+        assert_eq!(
+            final_child
+                .messages
+                .iter()
+                .filter(|m| m.content == text)
+                .count(),
+            1
+        );
+    }
+    let source =
+        crate::execution::ChildCompletionSource::from_committed_session(&final_child).unwrap();
+    assert_ne!(source.activation_run_id, first_source.activation_run_id);
+    assert_eq!(
+        source.result(&final_child, &harness.parent).as_deref(),
+        Some("successor unaffected")
+    );
+    assert_eq!(
+        harness
+            .store
+            .inspect_actor(&child.id)
+            .await
+            .unwrap()
+            .actor
+            .current_attempt,
+        2
+    );
+    assert_eq!(harness.inbox.inspect(&child.id).await.unwrap().pending, 0);
+    while let Ok(event) = harness.parent_events.try_recv() {
+        assert!(
+            !matches!(event, AgentEvent::SubAgentCompleted { .. }),
+            "no duplicate terminal publication"
+        );
+    }
+    assert!(matches!(
+        control.calls.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
     harness.runner.shutdown().await.unwrap();
 }
 

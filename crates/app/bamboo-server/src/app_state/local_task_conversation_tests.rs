@@ -145,45 +145,87 @@ fn question_from_messages(messages: &[Message]) -> ParentQuestion {
     questions.into_iter().next().unwrap()
 }
 
-async fn wait_until_finished(state: &AppState, parent_id: &str, child_id: &str) {
-    tokio::time::timeout(WAIT, async {
-        loop {
-            let parent = state
-                .storage
-                .load_session(parent_id)
-                .await
-                .unwrap()
-                .unwrap();
-            let child = state.storage.load_session(child_id).await.unwrap().unwrap();
-            let runners_done = {
-                let runners = state.agent_runners.read().await;
-                [parent_id, child_id].into_iter().all(|id| {
-                    runners
-                        .get(id)
-                        .is_some_and(|runner| !matches!(runner.status, AgentStatus::Running))
-                })
-            };
-            if parent.last_run_status().as_deref() == Some("completed")
-                && child.last_run_status().as_deref() == Some("completed")
-                && runners_done
-                && state
-                    .session_activation_router
-                    .current_run_id(parent_id)
+async fn wait_until_finished(
+    state: &AppState,
+    parent_id: &str,
+    child_id: &str,
+    requests: &mut mpsc::UnboundedReceiver<Request>,
+) {
+    let result =
+        tokio::time::timeout(WAIT, async {
+            let mut completion_resume_seen = false;
+            loop {
+                if let Ok(request) = requests.try_recv() {
+                    assert!(
+                        !request.is_child(),
+                        "answered Child must not be launched again"
+                    );
+                    assert!(
+                        !completion_resume_seen,
+                        "one Child terminal fact must resume Root at most once"
+                    );
+                    assert!(request.messages.iter().any(|message| {
+                    message.content.contains(CHILD_RESULT)
+                        && message.metadata.as_ref()
+                            .and_then(|metadata| metadata.get("runtime_kind"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("child_completion_resume")
+                }), "additional Root reasoning must consume the real canonical Child completion");
+                    completion_resume_seen = true;
+                    // Root finalization may legitimately wait for the answered
+                    // Child to finish. Drive only its proven completion wake.
+                    request.complete(ROOT_RESULT);
+                }
+                let parent = state
+                    .storage
+                    .load_session(parent_id)
                     .await
-                    .is_none()
-                && state
-                    .session_activation_router
-                    .current_run_id(child_id)
-                    .await
-                    .is_none()
-            {
-                break;
+                    .unwrap()
+                    .unwrap();
+                let child = state.storage.load_session(child_id).await.unwrap().unwrap();
+                let runners_done = {
+                    let runners = state.agent_runners.read().await;
+                    [parent_id, child_id].into_iter().all(|id| {
+                        runners
+                            .get(id)
+                            .is_some_and(|runner| !matches!(runner.status, AgentStatus::Running))
+                    })
+                };
+                if parent.last_run_status().as_deref() == Some("completed")
+                    && child.last_run_status().as_deref() == Some("completed")
+                    && runners_done
+                    && state
+                        .session_activation_router
+                        .current_run_id(parent_id)
+                        .await
+                        .is_none()
+                    && state
+                        .session_activation_router
+                        .current_run_id(child_id)
+                        .await
+                        .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        })
+        .await;
+    if result.is_err() {
+        for id in [parent_id, child_id] {
+            let session = state.storage.load_session(id).await.unwrap().unwrap();
+            eprintln!(
+                "unfinished {id}: status={:?}, error={:?}, metadata={:?}, router={:?}, runner={:?}, actor={:?}, inbox={:?}, messages={:?}",
+                session.last_run_status(), session.last_run_error(), session.metadata,
+                state.session_activation_router.current_run_id(id).await,
+                state.agent_runners.read().await.get(id).map(|runner| &runner.status),
+                state.session_store.inspect_actor(id).await,
+                state.session_inbox.inspect(id).await,
+                session.messages.iter().filter(|message| message.role == Role::Tool || message.role == Role::Assistant).collect::<Vec<_>>()
+            );
         }
-    })
-    .await
-    .expect("both real executions must finish their durable publication and router handoff");
+        panic!("both real executions must finish their durable publication and router handoff");
+    }
 }
 
 #[tokio::test]
@@ -272,7 +314,15 @@ async fn native_child_real_subagent_question_parent_reply_and_inbox_resume_witho
     // emitted by the actual Child tool and its canonical writer.
     let root_reply = next_request(&mut requests, &state, &parent_id, &child_id).await;
     assert_eq!(root_reply.process_id, std::process::id());
-    assert!(!root_reply.is_child());
+    assert!(
+        !root_reply.is_child(),
+        "Child continued instead of suspending for its parent; tool results: {:?}",
+        root_reply
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .collect::<Vec<_>>()
+    );
     let question = question_from_messages(&root_reply.messages);
     assert_eq!(question.question, QUESTION);
     assert_eq!(question.tool_call_id, ASK_CALL);
@@ -375,7 +425,7 @@ async fn native_child_real_subagent_question_parent_reply_and_inbox_resume_witho
         }
     }
     assert!(child_resumed && root_finished);
-    wait_until_finished(&state, &parent_id, &child_id).await;
+    wait_until_finished(&state, &parent_id, &child_id, &mut requests).await;
 
     let saved_parent = state
         .storage
@@ -401,6 +451,12 @@ async fn native_child_real_subagent_question_parent_reply_and_inbox_resume_witho
     );
     assert!(saved_child.pending_question.is_none());
     assert!(!saved_child.metadata.contains_key("runtime.suspend_reason"));
+    assert!(!saved_child
+        .metadata
+        .contains_key("clarification_resume_pending"));
+    assert!(!saved_child
+        .metadata
+        .contains_key("execute.startup_handoff_at"));
     assert_eq!(
         saved_child
             .messages
@@ -479,4 +535,219 @@ async fn native_child_real_subagent_question_parent_reply_and_inbox_resume_witho
     tokio::time::timeout(WAIT, state.shutdown())
         .await
         .expect("native question runtime shutdown");
+}
+
+async fn installed_root_subagent(
+    state: &AppState,
+    parent_id: &str,
+    call_id: &str,
+    args: serde_json::Value,
+) -> serde_json::Value {
+    use bamboo_agent_core::tools::{ToolExecutionContext, ToolOutcome};
+    let call = ToolCall {
+        id: call_id.into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "SubAgent".into(),
+            arguments: args.to_string(),
+        },
+    };
+    let mut ctx = ToolExecutionContext::none(&call.id);
+    ctx.session_id = Some(parent_id);
+    ctx.root_session_id = Some(parent_id);
+    let outcome = tokio::time::timeout(
+        WAIT,
+        state
+            .tools_for(crate::tools::ToolSurface::Root)
+            .execute_with_context_outcome(&call, ctx),
+    )
+    .await
+    .expect("installed SubAgent call must settle")
+    .expect("installed SubAgent call must succeed");
+    let ToolOutcome::Completed(result) = outcome else {
+        panic!("compact SubAgent must return its canonical synchronous receipt");
+    };
+    assert!(result.success, "{}", result.result);
+    serde_json::from_str(&result.result).expect("compact SubAgent receipt")
+}
+
+#[tokio::test]
+async fn native_subagent_installed_root_surface_creates_inspects_and_cancels_real_child() {
+    let home = tempfile::tempdir().unwrap();
+    let (send, mut requests) = mpsc::unbounded_channel();
+    let provider = Arc::new(ConversationProvider { requests: send });
+    let mut config = Config::from_data_dir(Some(home.path().to_path_buf()));
+    config.provider = PROVIDER.into();
+    config.subagents_mut().max_concurrent = Some(1);
+    let state = AppState::new_with_provider(home.path().to_path_buf(), config, provider.clone())
+        .await
+        .unwrap();
+    state.provider_registry.replace_with(ProviderRegistry::new(
+        HashMap::from([(PROVIDER.into(), provider as Arc<dyn LLMProvider>)]),
+        PROVIDER.into(),
+    ));
+    let project = state
+        .project_store
+        .create("Native SubAgent entry", None)
+        .unwrap();
+    let workspace = home.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace = std::fs::canonicalize(workspace).unwrap();
+    let parent_id = format!("local-entry-root-{}", uuid::Uuid::new_v4());
+    let mut parent = Session::new(&parent_id, MODEL);
+    parent.model_ref = Some(ProviderModelRef::new(PROVIDER, MODEL));
+    parent.set_provider_name(PROVIDER);
+    parent.set_project_id_meta(project.id.to_string());
+    parent.workspace = Some(workspace.to_string_lossy().into());
+    parent.set_workspace_path_meta(workspace.to_string_lossy());
+    parent.title_generated = true;
+    parent.add_message(Message::user("Create, inspect, then cancel one child."));
+    state.storage.save_session(&parent).await.unwrap();
+    // This fixture explicitly authorizes exactly its Root lifecycle actions.
+    // Inspect and direct-parent question/reply are not create permissions, and
+    // neither permissions nor bypass flags are widened for the native Child.
+    use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
+    for (kind, resource) in [
+        (PermissionType::ExecuteCommand, "SubAgent create"),
+        (PermissionType::WriteFile, "SubAgent cancel"),
+    ] {
+        state
+            .permission_checker
+            .permission_config()
+            .unwrap()
+            .grant_typed_scoped_session_permission(
+                &parent_id,
+                kind,
+                PermissionMatcher {
+                    id: format!("native-entry-{resource}"),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: resource.into(),
+                },
+            )
+            .unwrap();
+    }
+
+    // Only the Root is a fixture. The installed facade, canonical adapter,
+    // admission scheduler and native backend own the Child's entire lifecycle.
+    let created = installed_root_subagent(
+        &state,
+        &parent_id,
+        "native-entry-create",
+        json!({"intent":"chat", "message":CHILD_INPUT}),
+    )
+    .await;
+    let child_id = created["actor_id"].as_str().unwrap().to_owned();
+    assert_eq!(created["observed_status"], "running_in_background");
+    let child_call = next_request(&mut requests, &state, &parent_id, &child_id).await;
+    assert_eq!(child_call.process_id, std::process::id());
+    assert!(
+        child_call
+            .messages
+            .iter()
+            .any(|message| message.content.contains(CHILD_INPUT)),
+        "real SubAgent creation must preserve the assignment in its rendered Child prompt"
+    );
+    let running = state
+        .storage
+        .load_session(&child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.kind, bamboo_domain::SessionKind::Child);
+    assert_eq!(
+        running.parent_session_id.as_deref(),
+        Some(parent_id.as_str())
+    );
+    assert_eq!(running.parent_created_at, Some(parent.created_at));
+    assert_eq!(running.root_session_id, parent_id);
+    assert_eq!(running.project_id_meta(), parent.project_id_meta());
+    assert_eq!(running.workspace_path_meta(), parent.workspace_path_meta());
+    assert_eq!(running.metadata["assignment_prompt"], CHILD_INPUT);
+    assert_eq!(running.last_run_status().as_deref(), Some("running"));
+    let active = state.session_store.inspect_actor(&child_id).await.unwrap();
+    assert_eq!(
+        active.activation.unwrap().status,
+        ActorActivationStatus::Running
+    );
+
+    let inspected = installed_root_subagent(
+        &state,
+        &parent_id,
+        "native-entry-inspect",
+        json!({"intent":"inspect", "target":child_id, "message":"overview"}),
+    )
+    .await;
+    assert_eq!(inspected["actor_id"], child_id);
+    assert_eq!(inspected["observed_status"], "running");
+    let cancelled = installed_root_subagent(
+        &state,
+        &parent_id,
+        "native-entry-cancel",
+        json!({"intent":"control", "target":child_id, "message":"cancel"}),
+    )
+    .await;
+    assert_eq!(cancelled["actor_id"], child_id);
+    assert_eq!(cancelled["observed_status"], "cancelled");
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let saved = state
+                .storage
+                .load_session(&child_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if saved.last_run_status().as_deref() == Some("cancelled")
+                && state
+                    .session_activation_router
+                    .current_run_id(&child_id)
+                    .await
+                    .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("real cancellation must finish canonical publication and router release");
+    assert!(
+        child_call.reply.is_closed(),
+        "cancel must drop the active provider future"
+    );
+    drop(child_call);
+    let stopped = state
+        .storage
+        .load_session(&child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.created_at, running.created_at);
+    assert_eq!(stopped.metadata["runtime.local_task.state"], "stopped");
+    uuid::Uuid::parse_str(&stopped.metadata["runtime.local_task.instance"]).unwrap();
+    let actor = state.session_store.inspect_actor(&child_id).await.unwrap();
+    let activation = actor.activation.unwrap();
+    assert_eq!(activation.status, ActorActivationStatus::Cancelled);
+    assert!(activation.finished_at.is_some());
+    assert!(activation.placement_ref.is_none());
+    let source: bamboo_engine::execution::ChildCompletionSource =
+        serde_json::from_str(&stopped.metadata["runtime.child_completion_source_v1"]).unwrap();
+    assert_eq!(source.activation_run_id, activation.run_id);
+    assert_eq!(source.child_created_at, stopped.created_at);
+    assert_eq!(source.status, "cancelled");
+    assert!(matches!(
+        requests.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(state.embedded_broker.is_none());
+    assert!(state.health_monitor.is_none());
+    assert!(state
+        .process_registry
+        .get_running_processes()
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!home.path().join("broker").exists());
+    assert!(!home.path().join("broker.json").exists());
+    assert!(!home.path().join("subagents").exists());
+    tokio::time::timeout(WAIT, state.shutdown()).await.unwrap();
 }

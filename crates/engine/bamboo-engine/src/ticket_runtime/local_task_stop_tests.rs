@@ -429,3 +429,6 @@ async fn legacy_pid_stop_receipt_still_replays_without_task_metadata() {
     assert!(snapshot.assignments[&f.spec.assignment_id].process_stopped);
     assert_eq!(snapshot.submissions.len(), 1);
 }
+
+#[path = "local_task_stop_tests/sdk_publication.rs"]
+mod sdk_publication;
