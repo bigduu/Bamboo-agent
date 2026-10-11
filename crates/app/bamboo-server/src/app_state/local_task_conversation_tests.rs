@@ -757,3 +757,296 @@ async fn native_subagent_installed_root_surface_creates_inspects_and_cancels_rea
     assert!(!home.path().join("subagents").exists());
     tokio::time::timeout(WAIT, state.shutdown()).await.unwrap();
 }
+
+async fn settled_native_root(state: &AppState, parent_id: &str, status: &str) -> Session {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let parent = state
+                .storage
+                .load_session(parent_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if parent.last_run_status().as_deref() == Some(status)
+                && state
+                    .session_activation_router
+                    .current_run_id(parent_id)
+                    .await
+                    .is_none()
+            {
+                return parent;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("real Root must durably settle and release its activation")
+}
+
+fn native_child_outcomes(messages: &[Message], child_id: &str) -> Vec<SessionMessageEnvelope> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            let marker = message.metadata.as_ref()?.get("session_message")?;
+            let envelope: SessionMessageEnvelope = serde_json::from_value(marker.clone()).ok()?;
+            if matches!(&envelope.body, bamboo_domain::SessionMessageBody::ChildOutcome(outcome)
+            if outcome.child_session_id == child_id)
+            {
+                assert!(bamboo_domain::is_matching_session_message(
+                    message, &envelope
+                ));
+                Some(envelope)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn native_fast_child_wakes_root_for_real_feedback_and_preserves_all_wait_for_slow_child() {
+    const FAST: &str = "Native incremental fast assignment.";
+    const SLOW: &str = "Native incremental slow assignment.";
+    const FAST_RESULT: &str = "Native fast child has independently finished.";
+    const SLOW_RESULT: &str = "Native slow child finished after the real parent feedback.";
+    const FEEDBACK: &str = "Use the fast child's result in your remaining work.";
+    const FEEDBACK_CALL: &str = "native-incremental-root-feedback";
+    let home = tempfile::tempdir().unwrap();
+    let (send, mut requests) = mpsc::unbounded_channel();
+    let provider = Arc::new(ConversationProvider { requests: send });
+    let mut config = Config::from_data_dir(Some(home.path().to_path_buf()));
+    config.provider = PROVIDER.into();
+    config.subagents_mut().max_concurrent = Some(2);
+    let state = AppState::new_with_provider(home.path().to_path_buf(), config, provider.clone())
+        .await
+        .unwrap();
+    state.provider_registry.replace_with(ProviderRegistry::new(
+        HashMap::from([(PROVIDER.into(), provider as Arc<dyn LLMProvider>)]),
+        PROVIDER.into(),
+    ));
+    let project = state
+        .project_store
+        .create("Native incremental All wait", None)
+        .unwrap();
+    let workspace = home.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace = std::fs::canonicalize(workspace).unwrap();
+    let parent_id = format!("native-incremental-root-{}", uuid::Uuid::new_v4());
+    let mut parent = Session::new(&parent_id, MODEL);
+    parent.model_ref = Some(ProviderModelRef::new(PROVIDER, MODEL));
+    parent.set_provider_name(PROVIDER);
+    parent.set_project_id_meta(project.id.to_string());
+    parent.workspace = Some(workspace.to_string_lossy().into());
+    parent.set_workspace_path_meta(workspace.to_string_lossy());
+    parent.title_generated = true;
+    parent.add_message(Message::user(
+        "Coordinate both children and preserve unfinished work.",
+    ));
+    state.storage.save_session(&parent).await.unwrap();
+    use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
+    for resource in ["SubAgent create", "SubAgent send_message"] {
+        state
+            .permission_checker
+            .permission_config()
+            .unwrap()
+            .grant_typed_scoped_session_permission(
+                &parent_id,
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: format!("native-incremental-{resource}"),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: resource.into(),
+                },
+            )
+            .unwrap();
+    }
+    // Only Root is seeded. Both Children, terminal seals, outcomes and ACKs
+    // come from the installed facade, native backend and canonical writers.
+    let fast = installed_root_subagent(
+        &state,
+        &parent_id,
+        "native-incremental-create-fast",
+        json!({"intent":"chat","message":FAST}),
+    )
+    .await;
+    let slow = installed_root_subagent(
+        &state,
+        &parent_id,
+        "native-incremental-create-slow",
+        json!({"intent":"chat","message":SLOW}),
+    )
+    .await;
+    let fast_id = fast["actor_id"].as_str().unwrap();
+    let slow_id = slow["actor_id"].as_str().unwrap();
+    let mut fast_call = None;
+    let mut slow_call = None;
+    for _ in 0..2 {
+        let request = next_request(&mut requests, &state, &parent_id, slow_id).await;
+        assert_eq!(request.process_id, std::process::id());
+        if request
+            .messages
+            .iter()
+            .any(|message| message.content.contains(FAST))
+        {
+            assert!(fast_call.replace(request).is_none());
+        } else {
+            assert!(request
+                .messages
+                .iter()
+                .any(|message| message.content.contains(SLOW)));
+            assert!(slow_call.replace(request).is_none());
+        }
+    }
+    let fast_call = fast_call.unwrap();
+    let slow_call = slow_call.unwrap();
+    state
+        .session_messenger
+        .send(SessionMessageEnvelope::user_input(
+            &parent_id,
+            "Wait for both running children.",
+        ))
+        .await
+        .unwrap();
+    let root = next_request(&mut requests, &state, &parent_id, slow_id).await;
+    assert_eq!(root.process_id, std::process::id());
+    root.complete("Both native children are still working.");
+    let waiting = settled_native_root(&state, &parent_id, "suspended").await;
+    let original_wait = waiting
+        .agent_runtime_state
+        .unwrap()
+        .waiting_for_children
+        .unwrap();
+    assert_eq!(original_wait.wait_for, bamboo_domain::ChildWaitPolicy::All);
+    assert_eq!(original_wait.child_session_ids.len(), 2);
+    assert!(original_wait
+        .child_session_ids
+        .contains(&fast_id.to_owned()));
+    assert!(original_wait
+        .child_session_ids
+        .contains(&slow_id.to_owned()));
+
+    fast_call.complete(FAST_RESULT);
+    let root = next_request(&mut requests, &state, &parent_id, slow_id).await;
+    assert_eq!(root.process_id, std::process::id());
+    let fast_outcomes = native_child_outcomes(&root.messages, fast_id);
+    assert_eq!(fast_outcomes.len(), 1);
+    assert!(root
+        .messages
+        .iter()
+        .any(|message| message.content.contains(FAST_RESULT)));
+    assert!(native_child_outcomes(&root.messages, slow_id).is_empty());
+    assert!(state
+        .session_inbox
+        .was_admitted(&parent_id, &fast_outcomes[0].id)
+        .await
+        .unwrap());
+    assert!(
+        !slow_call.reply.is_closed(),
+        "slow execution must still be inside its real provider call"
+    );
+    root.subagent(
+        FEEDBACK_CALL,
+        json!({"intent":"chat","target":slow_id,"message":FEEDBACK}),
+    );
+    let root = next_request(&mut requests, &state, &parent_id, slow_id).await;
+    let feedback = root
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == Role::Tool && message.tool_call_id.as_deref() == Some(FEEDBACK_CALL)
+        })
+        .unwrap();
+    assert_eq!(feedback.tool_success, Some(true), "{}", feedback.content);
+    assert!(feedback.content.contains(slow_id), "{}", feedback.content);
+    root.complete("Fast result processed; the slow child must continue.");
+    let suspended = settled_native_root(&state, &parent_id, "suspended").await;
+    assert_eq!(suspended.agent_runtime_state.unwrap().waiting_for_children.as_ref(), Some(&original_wait), "incremental reasoning must preserve the exact policy, deadline, timestamp and originating call");
+    assert!(!slow_call.reply.is_closed());
+    let slow_actor = state.session_store.inspect_actor(slow_id).await.unwrap();
+    assert_eq!(
+        slow_actor.activation.unwrap().status,
+        ActorActivationStatus::Running
+    );
+    assert!(matches!(
+        requests.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    slow_call.complete("Slow child reaches its next feedback boundary.");
+    let slow_continued = next_request(&mut requests, &state, &parent_id, slow_id).await;
+    assert_eq!(slow_continued.process_id, std::process::id());
+    assert!(slow_continued
+        .messages
+        .iter()
+        .any(|message| message.content.contains(SLOW)));
+    assert_eq!(
+        slow_continued
+            .messages
+            .iter()
+            .filter(|message| message.content == FEEDBACK)
+            .count(),
+        1
+    );
+    slow_continued.complete(SLOW_RESULT);
+    let root = next_request(&mut requests, &state, &parent_id, slow_id).await;
+    assert_eq!(native_child_outcomes(&root.messages, fast_id).len(), 1);
+    assert_eq!(native_child_outcomes(&root.messages, slow_id).len(), 1);
+    assert!(root
+        .messages
+        .iter()
+        .any(|message| message.content.contains(SLOW_RESULT)));
+    root.complete("Both native children were handled incrementally.");
+    let completed = settled_native_root(&state, &parent_id, "completed").await;
+    assert!(completed
+        .agent_runtime_state
+        .as_ref()
+        .unwrap()
+        .waiting_for_children
+        .is_none());
+    for id in [fast_id, slow_id] {
+        let outcomes = native_child_outcomes(&completed.messages, id);
+        assert_eq!(outcomes.len(), 1);
+        assert!(state
+            .session_inbox
+            .was_admitted(&parent_id, &outcomes[0].id)
+            .await
+            .unwrap());
+        let saved = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(saved.last_run_status().as_deref(), Some("completed"));
+        assert_eq!(saved.metadata["runtime.local_task.state"], "stopped");
+        uuid::Uuid::parse_str(&saved.metadata["runtime.local_task.instance"]).unwrap();
+        let activation = state
+            .session_store
+            .inspect_actor(id)
+            .await
+            .unwrap()
+            .activation
+            .unwrap();
+        assert_eq!(activation.status, ActorActivationStatus::Succeeded);
+        assert!(activation.placement_ref.is_none());
+        let source: bamboo_engine::execution::ChildCompletionSource =
+            serde_json::from_str(&saved.metadata["runtime.child_completion_source_v1"]).unwrap();
+        assert_eq!(source.activation_run_id, activation.run_id);
+        assert_eq!(source.child_created_at, saved.created_at);
+    }
+    for id in [parent_id.as_str(), fast_id, slow_id] {
+        let backlog = state.session_inbox.inspect(id).await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 0);
+    }
+    assert!(matches!(
+        requests.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(state.embedded_broker.is_none());
+    assert!(state.health_monitor.is_none());
+    assert!(state
+        .process_registry
+        .get_running_processes()
+        .await
+        .unwrap()
+        .is_empty());
+    for name in ["broker", "broker.json", "subagents"] {
+        assert!(!home.path().join(name).exists());
+    }
+    tokio::time::timeout(WAIT, state.shutdown()).await.unwrap();
+}

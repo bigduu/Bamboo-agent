@@ -501,6 +501,23 @@ impl SessionMessenger {
             .map_err(SessionMessengerError::Inbox)
     }
 
+    /// Authorize one staged delivery, preserving its immutable delivery
+    /// intent and every sibling's existing execution permission.
+    pub async fn prepare_message_activation(
+        &self,
+        admission: &SessionMessengerAdmission,
+        policy: SessionActivationPolicy,
+    ) -> Result<(), SessionMessengerError> {
+        self.inbox
+            .mark_message_activation_eligible(
+                &admission.target_session_id,
+                &admission.delivery,
+                policy,
+            )
+            .await
+            .map_err(SessionMessengerError::Inbox)
+    }
+
     pub async fn send(
         &self,
         envelope: SessionMessageEnvelope,

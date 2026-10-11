@@ -75,8 +75,26 @@ impl SessionInboxPort for InboxProbe {
         envelope: &SessionMessageEnvelope,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         let receipt = self.inner.deliver(envelope).await?;
-        self.delivered.lock().unwrap().push(envelope.clone());
+        // Retried callbacks may call deliver again after the wait was cleared.
+        // Count canonical inbox identities rather than idempotent delivery calls.
+        let mut delivered = self.delivered.lock().unwrap();
+        if !delivered.iter().any(|previous| previous.id == receipt.id) {
+            delivered.push(envelope.clone());
+        }
         Ok(receipt)
+    }
+    async fn existing_staged_delivery(
+        &self,
+        envelope: &SessionMessageEnvelope,
+    ) -> Result<Option<SessionInboxReceipt>, SessionInboxError> {
+        self.inner.existing_staged_delivery(envelope).await
+    }
+    async fn pending_child_outcomes(
+        &self,
+        target: &str,
+        child: &str,
+    ) -> Result<Vec<SessionMessageEnvelope>, SessionInboxError> {
+        self.inner.pending_child_outcomes(target, child).await
     }
     async fn mark_activation_eligible(
         &self,
@@ -86,6 +104,16 @@ impl SessionInboxPort for InboxProbe {
     ) -> Result<(), SessionInboxError> {
         self.inner
             .mark_activation_eligible(target, generation, policy)
+            .await
+    }
+    async fn mark_message_activation_eligible(
+        &self,
+        target: &str,
+        receipt: &SessionInboxReceipt,
+        policy: SessionActivationPolicy,
+    ) -> Result<(), SessionInboxError> {
+        self.inner
+            .mark_message_activation_eligible(target, receipt, policy)
             .await
     }
     async fn coordinator_activation_generation(

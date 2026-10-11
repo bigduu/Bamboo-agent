@@ -1118,6 +1118,9 @@ pub struct SessionInboxWakeCandidate {
     pub generation: u64,
     pub activation_policy: SessionActivationPolicy,
     pub coordinator_generation: u64,
+    /// Independent per-message coordinator grant, even when an older delivery
+    /// is already covered by a broader prefix. This is not the delivery intent.
+    pub coordinator_message_policy: Option<SessionActivationPolicy>,
     pub lease_epoch: Option<u64>,
     /// Durable lease expiry, retry deadline, or manual retry time that made
     /// this incarnation claimable. None means an unleased delivery.
@@ -1127,6 +1130,8 @@ pub struct SessionInboxWakeCandidate {
 /// Computed under the same queue lock as `claim_owned`. Staged and dead-letter
 /// items are omitted; `next_due_at` is the earliest eligible lease transition
 /// skipped during the ordered scan, including when a later item is ready now.
+/// Ready, explicit coordinator Interrupt grants take precedence over other
+/// candidates; candidates within either class retain delivery order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionInboxWakeReadiness {
     pub ready: Option<SessionInboxWakeCandidate>,
@@ -1402,6 +1407,25 @@ pub trait SessionInboxPort: Send + Sync {
         envelope: &SessionMessageEnvelope,
     ) -> Result<SessionInboxReceipt, SessionInboxError>;
 
+    /// Inspect an exact staged delivery, including its permanent ACK receipt,
+    /// without creating a new delivery or changing activation permission.
+    async fn existing_staged_delivery(
+        &self,
+        _envelope: &SessionMessageEnvelope,
+    ) -> Result<Option<SessionInboxReceipt>, SessionInboxError> {
+        Ok(None)
+    }
+
+    /// Read pending canonical child outcomes, including claimed inputs, without
+    /// granting activation. Callers must independently verify outcome sources.
+    async fn pending_child_outcomes(
+        &self,
+        _target_session_id: &str,
+        _child_session_id: &str,
+    ) -> Result<Vec<SessionMessageEnvelope>, SessionInboxError> {
+        Ok(Vec::new())
+    }
+
     /// Check the caller's cancellation gate at the durable inbox publication
     /// point. Backends without an integrated commit fence fail closed.
     async fn deliver_with_gate(
@@ -1454,6 +1478,21 @@ pub trait SessionInboxPort: Send + Sync {
         generation: u64,
         policy: SessionActivationPolicy,
     ) -> Result<(), SessionInboxError>;
+
+    /// Grant execution permission to one exact admitted delivery without
+    /// authorizing any other queue item or changing its original delivery
+    /// intent. Grants are monotonic, durable and idempotent, including after
+    /// ACK; an acknowledged item must never become pending again.
+    async fn mark_message_activation_eligible(
+        &self,
+        _target_session_id: &str,
+        _receipt: &SessionInboxReceipt,
+        _policy: SessionActivationPolicy,
+    ) -> Result<(), SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "per-message SessionInbox activation is unsupported".into(),
+        ))
+    }
 
     /// Read the coordinator prefix independently from immediate per-message
     /// permission. Legacy backends have no immediate intent and need no hole

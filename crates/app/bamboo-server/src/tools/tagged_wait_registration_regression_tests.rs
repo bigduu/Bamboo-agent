@@ -343,7 +343,8 @@ async fn terminal_before_registration(policy: ChildWaitPolicy, explicit: bool) {
         .await
     });
     barrier.entered.notified().await;
-    // Terminal A commits and its sole real callback returns with no Parent wait.
+    // Terminal A commits and its sole real callback notifies without a Parent
+    // wait. Registration must still avoid arming an already-terminal child.
     coordinator
         .on_child_completed(sealed_completion(&h).await)
         .await;
@@ -353,9 +354,9 @@ async fn terminal_before_registration(policy: ChildWaitPolicy, explicit: bool) {
             .await
             .unwrap()
             .pending,
-        0
+        1
     );
-    assert_eq!(h.activation.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(h.activation.calls.load(Ordering::SeqCst), 1);
     barrier.release.notify_one();
     let outcome = task.await.unwrap().unwrap();
     eprintln!("#1312 terminal window tool outcome={outcome:?}; explicit={explicit}");
@@ -526,7 +527,11 @@ async fn stale_completion(policy: ChildWaitPolicy, independent: bool) {
                 waiting(&parent).expect("All must keep B's committed wait while B is running");
             assert!(wait.child_session_ids.contains(&"proof-child-b".into()));
             assert_eq!(wait.registered_at, first_arm.registered_at);
-            assert_eq!(h.activation.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                h.activation.calls.load(Ordering::SeqCst),
+                1,
+                "A's partial result must wake the parent without releasing B's wait"
+            );
         }
         ChildWaitPolicy::Any => {
             assert!(
@@ -701,7 +706,11 @@ async fn genuinely_later_arm_survives(policy: ChildWaitPolicy) {
     task.await.unwrap();
     let after = settled_views(&h, "later B-only arm after stale A CAS").await;
     assert_eq!(waiting(&after), waiting(&before));
-    assert_eq!(h.activation.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        h.activation.calls.load(Ordering::SeqCst),
+        1,
+        "A's sealed result notifies without releasing the genuinely later B-only wait"
+    );
 }
 
 #[tokio::test]
@@ -877,6 +886,7 @@ async fn independent_store_terminal_sibling_absent_from_index_is_still_admitted(
         .on_child_completed(sealed_completion_for(&h, "proof-child-b").await)
         .await;
     assert!(waiting(&settled_views(&h, "B terminal while A remains running").await).is_some());
+    assert_eq!(h.activation.calls.load(Ordering::SeqCst), 1);
     let storage: Arc<dyn Storage> = stale;
     let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
     let second = coordinator_with_storage(&h, storage, persistence).await;
@@ -885,7 +895,7 @@ async fn independent_store_terminal_sibling_absent_from_index_is_still_admitted(
         &settled_views(&h, "stale independent index admits both sealed outcomes").await
     )
     .is_none());
-    assert_eq!(h.activation.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(h.activation.calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         h.session_inbox
             .inspect(&h.parent_session_id)

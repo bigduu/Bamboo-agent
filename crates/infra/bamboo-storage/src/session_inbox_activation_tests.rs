@@ -73,6 +73,81 @@ fn staged_bash() -> SessionMessageEnvelope {
 }
 
 #[tokio::test]
+async fn pending_child_lookup_keeps_permissions_and_excludes_acknowledged_outcomes() {
+    let (_temp, _store, inbox) = fixture().await;
+    let child = staged_child();
+    let receipt = inbox.deliver(&child).await.unwrap();
+    let mut other = staged_child();
+    if let SessionMessageBody::ChildOutcome(outcome) = &mut other.body {
+        outcome.child_session_id = "other-child".into();
+    }
+    inbox.deliver(&other).await.unwrap();
+    inbox.deliver(&staged_bash()).await.unwrap();
+    let before = inbox.inspect("parent").await.unwrap();
+    assert_eq!(
+        inbox
+            .pending_child_outcomes("parent", "child")
+            .await
+            .unwrap(),
+        vec![child.clone()]
+    );
+    assert!(inbox
+        .pending_child_outcomes("parent", "missing")
+        .await
+        .unwrap()
+        .is_empty());
+    let after = inbox.inspect("parent").await.unwrap();
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.coordinator_generation, 0);
+    assert_eq!(after.activation_generation, 0);
+    assert!(inbox.claim("parent", 128).await.unwrap().is_empty());
+
+    inbox
+        .mark_message_activation_eligible(
+            "parent",
+            &receipt,
+            SessionActivationPolicy::InterruptSpecificWait,
+        )
+        .await
+        .unwrap();
+    let claim = inbox.claim("parent", 128).await.unwrap().remove(0);
+    let dir = inbox.inbox_dir("parent").await.unwrap();
+    let path = dir.join("cur").join(&claim.claim_id);
+    let transport = tokio::fs::read(&path).await.unwrap();
+    assert_eq!(
+        inbox
+            .pending_child_outcomes("parent", "child")
+            .await
+            .unwrap(),
+        vec![child]
+    );
+    assert_eq!(tokio::fs::read(&path).await.unwrap(), transport);
+    inbox.ack("parent", &claim).await.unwrap();
+    assert!(inbox
+        .pending_child_outcomes("parent", "child")
+        .await
+        .unwrap()
+        .is_empty());
+
+    // An ACK can survive a crash before cur removal. Lookup remains read-only
+    // and must not return that already consumed canonical envelope.
+    tokio::fs::write(&path, &transport).await.unwrap();
+    assert!(inbox
+        .pending_child_outcomes("parent", "child")
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(tokio::fs::read(&path).await.unwrap(), transport);
+    let malformed = dir.join("new").join("malformed.json");
+    tokio::fs::write(&malformed, b"unchanged").await.unwrap();
+    assert!(inbox
+        .pending_child_outcomes("parent", "child")
+        .await
+        .is_err());
+    assert_eq!(tokio::fs::read(&malformed).await.unwrap(), b"unchanged");
+}
+
+#[tokio::test]
 async fn immediate_restart_recovery_never_promotes_staged_child_or_bash_siblings() {
     for policy in [
         SessionActivationPolicy::RespectSpecificWait,
@@ -535,4 +610,264 @@ async fn immediate_pretty_transport_bound_rejects_before_message_publication() {
     let backlog = inbox.inspect("parent").await.unwrap();
     assert_eq!(backlog.pending + backlog.claimed, 0);
     assert!(!backlog.activation_pending());
+}
+
+#[tokio::test]
+async fn exact_promotion_survives_restart_without_releasing_staged_siblings_or_changing_retries() {
+    for original in [None, Some(SessionActivationPolicy::RespectSpecificWait)] {
+        let (temp, _store, inbox) = fixture().await;
+        inbox.deliver(&staged_bash()).await.unwrap();
+        let child = staged_child();
+        let receipt = match original {
+            Some(policy) => {
+                inbox
+                    .deliver_with_activation_intent(&child, policy, None)
+                    .await
+            }
+            None => inbox.deliver(&child).await,
+        }
+        .unwrap();
+        if original.is_none() {
+            assert_eq!(
+                inbox.existing_staged_delivery(&child).await.unwrap(),
+                Some(receipt.clone())
+            );
+            assert!(inbox
+                .existing_staged_delivery(&staged_child())
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                inbox.inspect("parent").await.unwrap().generation,
+                receipt.generation
+            );
+            let mut mismatch = child.clone();
+            mismatch.body = staged_child().body;
+            if let SessionMessageBody::ChildOutcome(outcome) = &mut mismatch.body {
+                outcome.result = Some("changed result".into());
+            }
+            assert!(inbox.existing_staged_delivery(&mismatch).await.is_err());
+        }
+        inbox.deliver(&staged_bash()).await.unwrap();
+        for policy in [
+            SessionActivationPolicy::RespectSpecificWait,
+            SessionActivationPolicy::InterruptSpecificWait,
+            SessionActivationPolicy::RespectSpecificWait,
+        ] {
+            inbox
+                .mark_message_activation_eligible("parent", &receipt, policy)
+                .await
+                .unwrap();
+        }
+        let restarted = reopen(&temp).await;
+        let backlog = restarted.inspect("parent").await.unwrap();
+        assert_eq!(backlog.coordinator_generation, 0);
+        assert_eq!(backlog.activation_generation, receipt.generation);
+        assert!(
+            backlog.interrupt_pending(),
+            "a later Respect cannot downgrade the grant"
+        );
+        let retry = match original {
+            Some(policy) => {
+                restarted
+                    .deliver_with_activation_intent(&child, policy, None)
+                    .await
+            }
+            None => restarted.deliver(&child).await,
+        }
+        .unwrap();
+        assert_eq!(retry, receipt);
+        assert!(
+            restarted
+                .deliver_with_activation_intent(
+                    &child,
+                    SessionActivationPolicy::InterruptSpecificWait,
+                    None
+                )
+                .await
+                .is_err(),
+            "promotion must not rewrite immutable delivery intent"
+        );
+        let claims = restarted.claim("parent", 128).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].envelope, child);
+        assert_eq!(
+            claims[0].activation_policy,
+            SessionActivationPolicy::InterruptSpecificWait
+        );
+        restarted.ack("parent", &claims[0]).await.unwrap();
+        let after_ack = reopen(&temp).await;
+        if original.is_none() {
+            assert_eq!(
+                after_ack.existing_staged_delivery(&child).await.unwrap(),
+                Some(receipt.clone())
+            );
+        }
+        after_ack
+            .mark_message_activation_eligible(
+                "parent",
+                &receipt,
+                SessionActivationPolicy::InterruptSpecificWait,
+            )
+            .await
+            .unwrap();
+        let retry = match original {
+            Some(policy) => {
+                after_ack
+                    .deliver_with_activation_intent(&child, policy, None)
+                    .await
+            }
+            None => after_ack.deliver(&child).await,
+        }
+        .unwrap();
+        assert_eq!(retry, receipt);
+        let backlog = after_ack.inspect("parent").await.unwrap();
+        assert_eq!(backlog.pending, 2);
+        assert_eq!(backlog.claimed, 0);
+        assert!(
+            !backlog.activation_pending(),
+            "ACK promotion must not resurrect work"
+        );
+        let mut wrong = receipt.clone();
+        wrong.generation += 1;
+        assert!(after_ack
+            .mark_message_activation_eligible(
+                "parent",
+                &wrong,
+                SessionActivationPolicy::InterruptSpecificWait
+            )
+            .await
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn exact_promotion_preserves_owned_claim_identity_and_ack_across_restart() {
+    for before_claim in [false, true] {
+        let (temp, _store, inbox) = fixture().await;
+        let child = staged_child();
+        let receipt = inbox.deliver(&child).await.unwrap();
+        inbox
+            .mark_message_activation_eligible(
+                "parent",
+                &receipt,
+                SessionActivationPolicy::RespectSpecificWait,
+            )
+            .await
+            .unwrap();
+        if before_claim {
+            inbox
+                .mark_message_activation_eligible(
+                    "parent",
+                    &receipt,
+                    SessionActivationPolicy::InterruptSpecificWait,
+                )
+                .await
+                .unwrap();
+        }
+        let request = bamboo_domain::SessionInboxLeaseRequest {
+            consumer: bamboo_domain::SessionInboxConsumerId::new(),
+            now: Utc::now(),
+            duration: chrono::Duration::minutes(5),
+        };
+        let claim = inbox
+            .claim_owned("parent", 1, None, &request)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            claim.claim.activation_policy,
+            if before_claim {
+                SessionActivationPolicy::InterruptSpecificWait
+            } else {
+                SessionActivationPolicy::RespectSpecificWait
+            }
+        );
+        let restarted = reopen(&temp).await;
+        restarted
+            .mark_message_activation_eligible(
+                "parent",
+                &receipt,
+                SessionActivationPolicy::InterruptSpecificWait,
+            )
+            .await
+            .unwrap();
+        assert!(restarted
+            .inspect("parent")
+            .await
+            .unwrap()
+            .interrupt_pending());
+        assert_eq!(restarted.deliver(&child).await.unwrap(), receipt);
+        let repeated = restarted
+            .claim_owned("parent", 1, None, &request)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            repeated, claim,
+            "promotion must not invalidate an existing lease"
+        );
+        restarted
+            .ack_owned("parent", &claim, request.now)
+            .await
+            .unwrap();
+        restarted
+            .mark_message_activation_eligible(
+                "parent",
+                &receipt,
+                SessionActivationPolicy::InterruptSpecificWait,
+            )
+            .await
+            .unwrap();
+        assert!(!restarted
+            .inspect("parent")
+            .await
+            .unwrap()
+            .activation_pending());
+    }
+}
+
+#[tokio::test]
+async fn exact_promotion_rejects_wrong_pending_identity_and_cancelled_deliveries() {
+    let (_temp, _store, inbox) = fixture().await;
+    let child = staged_child();
+    let receipt = inbox.deliver(&child).await.unwrap();
+    inbox.deliver(&staged_bash()).await.unwrap();
+    for wrong in [
+        SessionInboxReceipt {
+            id: receipt.id.clone(),
+            generation: receipt.generation + 1,
+        },
+        SessionInboxReceipt {
+            id: SessionMessageId::new(),
+            generation: receipt.generation,
+        },
+        SessionInboxReceipt {
+            id: receipt.id.clone(),
+            generation: 0,
+        },
+    ] {
+        assert!(inbox
+            .mark_message_activation_eligible(
+                "parent",
+                &wrong,
+                SessionActivationPolicy::InterruptSpecificWait
+            )
+            .await
+            .is_err());
+    }
+    assert!(!inbox.inspect("parent").await.unwrap().activation_pending());
+    let mut guidance = SessionMessageEnvelope::user_input("parent", "withdrawn");
+    guidance.correlation_id = Some("session-guidance".into());
+    let cancelled = inbox.deliver(&guidance).await.unwrap();
+    assert!(inbox.cancel_guidance("parent", &guidance.id).await.unwrap());
+    assert!(inbox
+        .mark_message_activation_eligible(
+            "parent",
+            &cancelled,
+            SessionActivationPolicy::InterruptSpecificWait
+        )
+        .await
+        .is_err());
+    assert!(!inbox.inspect("parent").await.unwrap().activation_pending());
 }

@@ -103,10 +103,18 @@ pub(crate) fn apply_transition(
     runtime_only: bool,
 ) -> io::Result<()> {
     let mut state = runtime(latest);
+    let before = runtime(expected);
     let desired = runtime(updated);
     state.waiting_for_children = desired.waiting_for_children;
-    state.status = desired.status;
-    state.suspension = desired.suspension;
+    // A partial Guardian outcome can update only its verdict while another
+    // activation opens the parent's reasoning gate. Apply the coordinator's
+    // actual changes, rather than restoring its older runner snapshot.
+    if desired.status != before.status {
+        state.status = desired.status;
+    }
+    if desired.suspension != before.suspension {
+        state.suspension = desired.suspension;
+    }
     write_runtime(latest, state)?;
     for key in ["runtime.suspend_reason", "guardian.state"] {
         if updated.metadata.get(key) != expected.metadata.get(key) {
@@ -131,6 +139,62 @@ pub(crate) fn apply_transition(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod incremental_wait_tests {
+    use super::*;
+    use bamboo_domain::{AgentStatusState, SuspensionState};
+
+    #[tokio::test]
+    async fn partial_guardian_verdict_preserves_concurrently_activated_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStoreV2::new(temp.path().into()).await.unwrap();
+        let mut expected = Session::new("partial-guardian-parent", "model");
+        let mut state = AgentRuntimeState::new("waiting-run");
+        state.status = AgentStatusState::Suspended;
+        let original = WaitingForChildrenState::for_children(
+            vec!["guardian".into(), "slow-child".into()],
+            ChildWaitPolicy::All,
+            Utc::now(),
+        );
+        state.waiting_for_children = Some(original.clone());
+        state.suspension = Some(SuspensionState {
+            reason: "waiting_for_children".into(),
+            suspended_at: Utc::now(),
+            resumable: true,
+            hook_point: Some("ChildCompletion".into()),
+        });
+        write_runtime(&mut expected, state).unwrap();
+        store.save_session(&expected).await.unwrap();
+
+        let mut activated = expected.clone();
+        let mut running = runtime(&activated);
+        running.run_id = "new-parent-owner".into();
+        running.status = AgentStatusState::Running;
+        running.suspension = None;
+        write_runtime(&mut activated, running).unwrap();
+        store.save_session(&activated).await.unwrap();
+
+        let mut verdict = expected.clone();
+        verdict
+            .metadata
+            .insert("guardian.state".into(), "approved".into());
+        assert!(store
+            .compare_exchange_child_wait(&expected, &mut verdict, true, Arc::new(|_| {}),)
+            .await
+            .unwrap());
+        let saved = store.load_session(&expected.id).await.unwrap().unwrap();
+        let state = runtime(&saved);
+        assert_eq!(state.run_id, "new-parent-owner");
+        assert_eq!(state.status, AgentStatusState::Running);
+        assert!(state.suspension.is_none());
+        assert_eq!(state.waiting_for_children, Some(original));
+        assert_eq!(
+            saved.metadata.get("guardian.state").map(String::as_str),
+            Some("approved")
+        );
+    }
 }
 
 impl SessionStoreV2 {

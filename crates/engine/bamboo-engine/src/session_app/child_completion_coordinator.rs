@@ -1,8 +1,8 @@
 //! Child-session completion coordinator.
 //!
 //! Receives terminal child runner notifications from `bamboo-engine`, updates
-//! durable parent wait state, and resumes the parent when the configured wait
-//! policy is satisfied.
+//! durable parent wait state, and notifies the parent of each terminal outcome.
+//! The configured wait policy independently decides when its wait is released.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock, Weak};
@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use bamboo_domain::poison::PoisonRecover;
 use bamboo_domain::{
-    AgentHookPoint, HookPayload, HookToolOutcome, SessionChildOutcome, SessionMessageBody,
-    SessionMessageContent, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
-    SessionMessageSource, SessionProviderMessage,
+    AgentHookPoint, HookPayload, HookToolOutcome, SessionActivationPolicy, SessionChildOutcome,
+    SessionMessageBody, SessionMessageContent, SessionMessageEnvelope, SessionMessageId,
+    SessionMessageKind, SessionMessageSource, SessionProviderMessage,
 };
 
 use crate::execution::{
@@ -34,7 +34,7 @@ use bamboo_agent_core::{
     AgentEvent, BashCompletionInfo, BashCompletionSink, Message, Role, Session, SessionKind,
 };
 use bamboo_domain::session::runtime_state::{
-    AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForChildrenState,
+    AgentRuntimeState, AgentStatusState, ChildWaitPolicy, WaitingForChildrenState,
 };
 use bamboo_llm::{Config, ProviderModelRouter, ProviderRegistry};
 use bamboo_storage::LockedSessionStore;
@@ -173,6 +173,34 @@ fn child_completion_envelope(
     envelope
 }
 
+fn child_completion_id(
+    completion: &ChildCompletion,
+    wait_registered_at: chrono::DateTime<Utc>,
+    result: Option<&str>,
+    legacy_wait_identity: bool,
+) -> SessionMessageId {
+    fn identity(value: Option<&str>) -> serde_json::Value {
+        match value {
+            Some(value) if value.len() > CHILD_COMPLETION_INLINE_FIELD_BYTES => serde_json::json!({
+                "oversized": true, "utf8_bytes": value.len(),
+                "sha256": hex::encode(Sha256::digest(value.as_bytes())),
+            }),
+            value => serde_json::json!(value),
+        }
+    }
+    SessionMessageId::stable(
+        "session_child_completion",
+        &serde_json::json!({
+            "parent_session_id": completion.parent_session_id,
+            "child_session_id": completion.child_session_id,
+            "status": completion.status,
+            "error": identity(completion.error.as_deref()), "result": identity(result),
+            "wait_registered_at": (legacy_wait_identity || completion.source.is_none()).then_some(wait_registered_at),
+            "terminal_source": completion.source,
+        }),
+    )
+}
+
 fn build_child_completion_envelope(
     completion: &ChildCompletion,
     wait_registered_at: chrono::DateTime<Utc>,
@@ -239,9 +267,9 @@ fn build_child_completion_envelope(
         (Some(summary), identity)
     }
 
-    let (stored_result, result_identity) =
+    let (stored_result, _) =
         bounded_terminal_field("result", &completion.child_session_id, result, compact);
-    let (stored_error, error_identity) = bounded_terminal_field(
+    let (stored_error, _) = bounded_terminal_field(
         "error",
         &completion.child_session_id,
         completion.error.as_deref(),
@@ -291,6 +319,7 @@ fn build_child_completion_envelope(
                 "child_status",
                 "child_final_response_included",
                 "child_completion_source",
+                "child_completion_source_sha256",
                 "guardian_approved",
             ] {
                 if let Some(value) = original.and_then(|metadata| metadata.get(key)) {
@@ -328,17 +357,10 @@ fn build_child_completion_envelope(
         error: stored_error,
         provider_message: Some(session_provider_message(&bounded_provider_message)),
     });
-    let semantic = serde_json::json!({
-        "parent_session_id": completion.parent_session_id,
-        "child_session_id": completion.child_session_id,
-        "status": completion.status,
-        "error": error_identity,
-        "result": result_identity,
-        "wait_registered_at": wait_registered_at,
-        "terminal_source": completion.source,
-    });
     SessionMessageEnvelope {
-        id: SessionMessageId::stable("session_child_completion", &semantic),
+        // A committed source keeps one identity across wait release and re-arm.
+        // Synthetic recovery completions remain tied to their authorizing wait.
+        id: child_completion_id(completion, wait_registered_at, result, false),
         source: SessionMessageSource::Runtime {
             subsystem: "child_completion_coordinator".to_string(),
         },
@@ -634,6 +656,14 @@ fn sealed_child_report(
     Some(project_child_report(report, observation))
 }
 
+fn child_completion_source_sha256(completion: &ChildCompletion) -> Option<String> {
+    completion.source.as_ref().map(|source| {
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(source).expect("sealed Child source serializes"),
+        ))
+    })
+}
+
 fn typed_child_resume_message(
     completion: &ChildCompletion,
     remaining_children: usize,
@@ -655,6 +685,7 @@ fn typed_child_resume_message(
         "child_session_id":completion.child_session_id,"child_status":completion.status,
         "child_final_response_included":projection["available"] == true,
         "child_typed_result_included":true,
+        "child_completion_source_sha256":child_completion_source_sha256(completion),
     }));
     message.never_compress = false;
     message
@@ -934,6 +965,108 @@ impl ChildCompletionCoordinator {
             tracing::warn!(session_id = %session.id, %error, "failed to persist session");
         }
     }
+
+    async fn reuse_legacy_child_delivery(
+        &self,
+        envelope: &mut SessionMessageEnvelope,
+        completion: &ChildCompletion,
+        wait: Option<&WaitingForChildrenState>,
+        result: Option<&str>,
+    ) -> Result<(), bamboo_domain::SessionInboxError> {
+        if let (Some(wait), Some(inbox), Some(_)) =
+            (wait, self.agent.session_inbox(), completion.source.as_ref())
+        {
+            let mut legacy = envelope.clone();
+            legacy.id = child_completion_id(completion, wait.registered_at, result, true);
+            if inbox.existing_staged_delivery(&legacy).await?.is_some() {
+                *envelope = legacy;
+            }
+        }
+        Ok(())
+    }
+
+    async fn legacy_child_delivery(
+        &self,
+        parent: &Session,
+        completion: &ChildCompletion,
+    ) -> Result<Option<(SessionMessageEnvelope, bool)>, bamboo_domain::SessionInboxError> {
+        let (Some(source), Some(inbox)) = (completion.source.as_ref(), self.agent.session_inbox())
+        else {
+            return Ok(None);
+        };
+        let source_sha256 = child_completion_source_sha256(completion);
+        let source = serde_json::to_value(source).expect("sealed Child source serializes");
+        let matches_source = |message: &Message, envelope: &SessionMessageEnvelope| {
+            if !matches!(&envelope.source, SessionMessageSource::Runtime { subsystem }
+                if subsystem == "child_completion_coordinator")
+                || envelope.target_session_id != parent.id
+                || !matches!(&envelope.body, SessionMessageBody::ChildOutcome(outcome)
+                    if outcome.child_session_id == completion.child_session_id && outcome.status == completion.status)
+                || !bamboo_domain::is_matching_session_message(message, envelope)
+            {
+                return false;
+            }
+            let Some(metadata) = message.metadata.as_ref() else {
+                return false;
+            };
+            // Old typed deliveries predate source metadata. Only a bounded,
+            // available projection carries enough proof to match its generation.
+            // Unavailable historical projections without a source are not guessed.
+            let typed_source = message
+                .content
+                .split_once("\n\nChild typed result:\n")
+                .and_then(|(_, text)| text.lines().next())
+                .filter(|line| line.len() <= 8192)
+                .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .and_then(|projection| {
+                    projection
+                        .get("host_observation")?
+                        .get("terminal_source")
+                        .cloned()
+                });
+            metadata.get("child_completion_source") == Some(&source)
+                || source_sha256.as_ref().is_some_and(|digest| {
+                    metadata
+                        .get("child_completion_source_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(digest.as_str())
+                })
+                || typed_source.as_ref() == Some(&source)
+        };
+        for message in &parent.messages {
+            let Some(marker) = message
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("session_message"))
+            else {
+                continue;
+            };
+            let Ok(envelope) = serde_json::from_value::<SessionMessageEnvelope>(marker.clone())
+            else {
+                continue;
+            };
+            if matches_source(message, &envelope)
+                && inbox.was_admitted(&parent.id, &envelope.id).await?
+            {
+                return Ok(Some((envelope, true)));
+            }
+        }
+        // An old writer may have cleared its wait after staging this exact
+        // source, before a reasoning turn committed and ACKed its presentation.
+        // Reuse that pending envelope rather than inventing a second event ID.
+        for envelope in inbox
+            .pending_child_outcomes(&parent.id, &completion.child_session_id)
+            .await?
+        {
+            if envelope
+                .to_provider_message()
+                .is_ok_and(|message| matches_source(&message, &envelope))
+            {
+                return Ok(Some((envelope, false)));
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[async_trait]
@@ -964,7 +1097,7 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
         let per_parent = session_resume_lock(&completion.parent_session_id);
         let _per_parent_guard = per_parent.lock().await;
 
-        let (parent, should_resume, messenger, child_admission) = loop {
+        let (parent, should_resume, messenger, child_admission, child_admissions) = loop {
             let Some(mut parent) = self.load_session(&completion.parent_session_id).await else {
                 tracing::warn!(
                     parent_session_id = %completion.parent_session_id,
@@ -995,11 +1128,11 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             let mut should_resume = false;
             let mut remaining_children = 0usize;
             let active_wait = runtime_state.waiting_for_children.clone();
-            if active_wait.as_ref().is_none_or(|wait| {
-                !wait
-                    .child_session_ids
+            let tracked_wait = active_wait.as_ref().is_some_and(|wait| {
+                wait.child_session_ids
                     .contains(&completion.child_session_id)
-            }) {
+            });
+            if !tracked_wait {
                 // Registration owns the physical writer while it fresh-checks
                 // Child terminality. Our no-wait decision must use that same
                 // boundary, so a callback cannot disappear before its arm lands.
@@ -1015,7 +1148,8 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                     .await
                 {
                     Ok(false) => continue,
-                    Ok(true) => return,
+                    Ok(true) if completion.source.is_none() => return,
+                    Ok(true) => {}
                     Err(error) => {
                         tracing::warn!(parent_session_id = %parent.id, %error,
                             "child completion could not settle no-wait observation");
@@ -1053,13 +1187,14 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                     .iter()
                     .filter(|id| !completed_child_ids.iter().any(|completed| completed == *id))
                     .count();
-                should_resume = wait_policy_satisfied(
-                    wait.wait_for,
-                    &wait.child_session_ids,
-                    &completed_child_ids,
-                    &completion.child_session_id,
-                    &completion.status,
-                );
+                should_resume = tracked_wait
+                    && wait_policy_satisfied(
+                        wait.wait_for,
+                        &wait.child_session_ids,
+                        &completed_child_ids,
+                        &completion.child_session_id,
+                        &completion.status,
+                    );
             }
 
             // READ-SIDE OWNERSHIP GUARD (issue #546): `SubAgent.wait` ids are
@@ -1134,6 +1269,27 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                     return;
                 }
             }
+            if !tracked_wait
+                && crate::ticket_runtime::is_independent_ticket_child(
+                    self.storage.as_ref(),
+                    &parent,
+                    &completion.child_session_id,
+                )
+                .await
+            {
+                return;
+            }
+            let previous_delivery = match self.legacy_child_delivery(&parent, &completion).await {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    tracing::warn!(parent_session_id = %parent.id, %error,
+                        "cannot verify historical Child delivery; leaving replay recoverable");
+                    return;
+                }
+            };
+            let previously_admitted = previous_delivery
+                .as_ref()
+                .is_some_and(|(_, admitted)| *admitted);
             let child_final_response = loaded_child
                 .as_ref()
                 .and_then(|child| completion.source.as_ref()?.result(child, &parent));
@@ -1141,7 +1297,7 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             // admission. The typed body carries its content/parts and safe runtime
             // metadata, so the canonical path is semantically identical to the
             // rolling-upgrade transcript fallback.
-            let guardian_resume = if should_resume {
+            let guardian_resume = if completion.source.is_some() || should_resume {
                 let reviewed_round = runtime_state.round.current_round;
                 loaded_child.as_ref().and_then(|child| {
                 if child.subagent_type().as_deref() != Some("guardian") {
@@ -1160,6 +1316,12 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                         "guardian completion does not match recorded guardian_child_id; using generic resume"
                     );
                     return None;
+                }
+                if guardian_state.phase.is_reviewed() {
+                    // Replaying the same sealed completion must not mutate a
+                    // newer reasoning round or repeat the control transition.
+                    return guardian_state.last_verdict.as_ref()
+                        .map(|verdict| guardian_resume_message(&completion, verdict));
                 }
                 // This IS the guardian we dispatched, so we MUST advance the
                 // phase out of `Pending` — otherwise the next terminal gate's
@@ -1203,6 +1365,18 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             } else {
                 None
             };
+            let guardian_control_changed = parent.metadata.get("guardian.state")
+                != expected_parent.metadata.get("guardian.state");
+            // A permanent receipt suppresses another notification, but it does
+            // not prove that the corresponding Guardian verdict was committed.
+            if previously_admitted && !should_resume && !guardian_control_changed {
+                return;
+            }
+            let activation_policy = if should_resume || guardian_control_changed {
+                SessionActivationPolicy::RespectSpecificWait
+            } else {
+                SessionActivationPolicy::InterruptSpecificWait
+            };
             let mut typed_result = loaded_child
                 .as_ref()
                 .and_then(|child| sealed_child_report(&completion, child, &parent));
@@ -1231,18 +1405,17 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                 return;
             }
 
-            // Stage the typed child outcome before clearing any durable wait. A
-            // crash after this admission leaves the parent suspended with an
-            // inspectable envelope; only a durably committed policy transition
-            // below is allowed to activate it.
+            // Notification permission belongs to this exact outcome, not the
+            // whole queue prefix or the parent's wait release. A parent may
+            // reason on this result while its unfinished wait remains armed.
             let messenger = self.agent.session_messenger().cloned();
-            let mut child_admission = if let (Some(wait), Some(messenger)) =
-                (active_wait.as_ref(), messenger.as_ref())
-            {
+            let mut child_admission = if let Some(messenger) = messenger.as_ref() {
                 let mut envelope = child_completion_envelope(
                     &completion,
-                    wait.registered_at,
-                    child_final_response,
+                    active_wait
+                        .as_ref()
+                        .map_or(completion.completed_at, |wait| wait.registered_at),
+                    child_final_response.clone(),
                     &resume_message,
                 );
                 if let Some(run_id) = self
@@ -1268,8 +1441,60 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                         return;
                     }
                 }
+                if let Some((previous, _)) = previous_delivery.as_ref() {
+                    envelope = previous.clone();
+                } else if let Err(error) = self
+                    .reuse_legacy_child_delivery(
+                        &mut envelope,
+                        &completion,
+                        active_wait.as_ref(),
+                        child_final_response.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(parent_session_id = %parent.id, %error,
+                        "cannot verify existing Child delivery; leaving wait armed");
+                    return;
+                }
                 match messenger.admit(envelope).await {
-                    Ok(admission) => Some(admission),
+                    Ok(admission) => {
+                        if !should_resume && !guardian_control_changed {
+                            let mut observed = expected_parent.clone();
+                            match self
+                                .persistence
+                                .compare_exchange_child_wait_and_publish(
+                                    &expected_parent,
+                                    &mut observed,
+                                    true,
+                                    Arc::new(|_| {}),
+                                )
+                                .await
+                            {
+                                Ok(false) => continue,
+                                Ok(true) => {}
+                                Err(error) => {
+                                    tracing::warn!(parent_session_id = %parent.id, %error,
+                                        "partial Child delivery lost its parent authority; leaving staged outcome inert");
+                                    return;
+                                }
+                            }
+                        }
+                        // A partial Guardian verdict must commit before any
+                        // reasoning owner can consume its presentation. Its
+                        // still-armed wait lets the watchdog recover this gap.
+                        if should_resume || !guardian_control_changed {
+                            if let Err(error) = messenger
+                                .prepare_message_activation(&admission, activation_policy)
+                                .await
+                            {
+                                tracing::warn!(parent_session_id = %completion.parent_session_id,
+                                    child_session_id = %completion.child_session_id, %error,
+                                    "child outcome notification permission failed; leaving wait armed");
+                                return;
+                            }
+                        }
+                        Some(admission)
+                    }
                     Err(error) => {
                         tracing::warn!(
                             parent_session_id = %completion.parent_session_id,
@@ -1283,6 +1508,8 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             } else {
                 None
             };
+
+            let mut child_admissions = child_admission.iter().cloned().collect::<Vec<_>>();
 
             // The durable Child index can reach terminal state before its
             // completion callback acquires this parent lock. Clearing an already
@@ -1386,7 +1613,7 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                         let mut envelope = child_completion_envelope(
                             &sibling_completion,
                             wait.registered_at,
-                            result,
+                            result.clone(),
                             &presentation,
                         );
                         if let Some(run_id) = parent_run_id.as_ref() {
@@ -1405,11 +1632,48 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                                 return;
                             }
                         }
+                        let previous_delivery = match self
+                            .legacy_child_delivery(&parent, &sibling_completion)
+                            .await
+                        {
+                            Ok(delivery) => delivery,
+                            Err(error) => {
+                                tracing::warn!(%child_id, %error,
+                                    "cannot verify historical sibling delivery; leaving wait armed");
+                                return;
+                            }
+                        };
+                        if let Some((previous, _)) = previous_delivery {
+                            envelope = previous;
+                        } else if let Err(error) = self
+                            .reuse_legacy_child_delivery(
+                                &mut envelope,
+                                &sibling_completion,
+                                Some(wait),
+                                result.as_deref(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(%child_id, %error,
+                                "cannot verify existing sibling delivery; leaving wait armed");
+                            return;
+                        }
                         match messenger.admit(envelope).await {
                             Ok(admission) => {
-                                // Preparing the highest generation authorizes the
-                                // whole staged prefix while RespectSpecificWait
-                                // keeps it inert until the wait save succeeds.
+                                if let Err(error) = messenger
+                                    .prepare_message_activation(
+                                        &admission,
+                                        SessionActivationPolicy::RespectSpecificWait,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(%child_id, %error,
+                                        "terminal sibling notification permission failed; leaving wait armed");
+                                    return;
+                                }
+                                child_admissions.push(admission.clone());
+                                // Keep every permission separately, while one
+                                // request coalesces the batch's activation.
                                 if child_admission.as_ref().is_none_or(|current| {
                                     admission.delivery.generation > current.delivery.generation
                                 }) {
@@ -1425,20 +1689,11 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                 }
             }
 
-            if should_resume {
-                if let (Some(messenger), Some(admission)) =
-                    (messenger.as_ref(), child_admission.as_ref())
-                {
-                    if let Err(error) = messenger.prepare_activation(admission).await {
-                        tracing::warn!(
-                            parent_session_id = %completion.parent_session_id,
-                            child_session_id = %completion.child_session_id,
-                            %error,
-                            "child outcome activation watermark failed; leaving parent wait armed"
-                        );
-                        return;
-                    }
-                }
+            // Partial notifications do not own status/suspension writes. In
+            // particular, do not stamp Suspended over a parent already reasoning
+            // on an earlier result. The original wait is left byte-for-byte intact.
+            if !should_resume && !guardian_control_changed && child_admission.is_some() {
+                break (parent, true, messenger, child_admission, child_admissions);
             }
 
             if should_resume {
@@ -1453,14 +1708,6 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                     // reasoning boundary.
                     parent.add_message(resume_message);
                 }
-            } else if runtime_state.waiting_for_children.is_some() {
-                runtime_state.status = AgentStatusState::Suspended;
-                runtime_state.suspension = Some(SuspensionState {
-                    reason: "waiting_for_children".to_string(),
-                    suspended_at: Utc::now(),
-                    resumable: true,
-                    hook_point: Some("ChildCompletion".to_string()),
-                });
             }
 
             parent.updated_at = Utc::now();
@@ -1542,7 +1789,15 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                     // stayed the same. Reload and recompute; never replay a clear.
                     continue;
                 }
-                Ok(true) => break (parent, should_resume, messenger, child_admission),
+                Ok(true) => {
+                    break (
+                        parent,
+                        should_resume || (guardian_control_changed && !previously_admitted),
+                        messenger,
+                        child_admission,
+                        child_admissions,
+                    )
+                }
                 Err(error) => {
                     tracing::warn!(parent_session_id = %completion.parent_session_id,
                     child_session_id = %completion.child_session_id, %error,
@@ -1561,6 +1816,22 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
 
         if should_resume {
             if let (Some(messenger), Some(admission)) = (messenger, child_admission) {
+                // Control transitions have now committed. Upgrade each exact
+                // outcome, including a lower generation below an ACKed sibling,
+                // so a concurrently rearmed wait cannot suppress this batch.
+                for outcome in &child_admissions {
+                    if let Err(error) = messenger
+                        .prepare_message_activation(
+                            outcome,
+                            SessionActivationPolicy::InterruptSpecificWait,
+                        )
+                        .await
+                    {
+                        tracing::warn!(parent_session_id = %resume_parent_id, %error,
+                            "child control transition committed but notification permission failed");
+                        return;
+                    }
+                }
                 if let Err(error) = messenger.activate_prepared(&admission).await {
                     tracing::warn!(
                         parent_session_id = %resume_parent_id,
@@ -2905,16 +3176,6 @@ fn completion_child_is_owned(reported_parent: &str, child_parent_linkage: Option
     child_parent_linkage == Some(reported_parent)
 }
 
-/// Pick which terminal child's completion to replay when the wait is already
-/// satisfied but the parent is still suspended (lost wake). Prefer an
-/// error-like child so a `FirstError` policy re-evaluates truthfully.
-fn select_replay_child(terminal: &[(String, String)]) -> Option<&(String, String)> {
-    terminal
-        .iter()
-        .find(|(_, status)| is_error_like(status))
-        .or_else(|| terminal.last())
-}
-
 fn child_wait_watchdog_resume_message(body: String) -> Message {
     let mut message = Message::user(body);
     message.metadata = Some(serde_json::json!({
@@ -3338,56 +3599,45 @@ impl ChildCompletionCoordinator {
             return;
         }
 
-        // No dead children — but if the terminal set ALREADY satisfies the
-        // policy, the original wake was lost (clobbered resume / retry budget
-        // exhausted / completion raced the wait registration). Replay one real
-        // completion through the canonical path; `on_child_completed` is
-        // idempotent for an already-cleared wait.
-        let terminal_ids: Vec<String> = terminal.iter().map(|(id, _)| id.clone()).collect();
-        if let Some((child_id, status)) = select_replay_child(&terminal) {
-            if wait_policy_satisfied(
-                wait.wait_for,
-                &wait.child_session_ids,
-                &terminal_ids,
-                child_id,
+        // A lost callback must not hide one ready result behind an unfinished
+        // All wait. Replay every observed terminal generation through the same
+        // source/ownership checks and permanent Inbox receipts as the push path.
+        // Error-like outcomes go first so FirstError releases promptly.
+        terminal.sort_by_key(|(_, status)| !is_error_like(status));
+        for (child_id, status) in terminal {
+            tracing::debug!(
+                %parent_session_id,
+                child_session_id = %child_id,
+                "child-wait watchdog: replaying terminal child outcome"
+            );
+            let control_plane = self.load_control_plane(&child_id).await;
+            let mut completion = ChildCompletion {
+                parent_session_id: parent_session_id.into(),
+                child_session_id: child_id.clone(),
                 status,
-            ) {
-                tracing::warn!(
-                    %parent_session_id,
-                    child_session_id = %child_id,
-                    "child-wait watchdog: wait already satisfied but parent still suspended \
-                     (lost wake); replaying the completion"
-                );
-                let control_plane = self.load_control_plane(child_id).await;
-                let mut completion = ChildCompletion {
-                    parent_session_id: parent_session_id.into(),
-                    child_session_id: child_id.clone(),
-                    status: status.clone(),
-                    error: control_plane.as_ref().and_then(Session::last_run_error),
-                    completed_at: Utc::now(),
-                    source: None,
+                error: control_plane.as_ref().and_then(Session::last_run_error),
+                completed_at: Utc::now(),
+                source: None,
+            };
+            // Lost callbacks replay the committed source, not a synthetic
+            // latest answer. Check ownership before loading any transcript.
+            if control_plane
+                .as_ref()
+                .is_some_and(|child| child.parent_session_id.as_deref() == Some(parent_session_id))
+            {
+                let Ok(Some(child)) = self.storage.load_session(&child_id).await else {
+                    continue;
                 };
-                // Lost callbacks replay the committed source, not a synthetic
-                // latest answer. Check ownership before loading any transcript.
-                if control_plane.as_ref().is_some_and(|child| {
-                    child.parent_session_id.as_deref() == Some(parent_session_id)
-                }) {
-                    let Ok(Some(child)) = self.storage.load_session(child_id).await else {
-                        return;
-                    };
-                    completion.source = ChildCompletionSource::from_committed_session(&child)
-                        .filter(|source| source.matches_completion(&completion));
-                    if ChildCompletionSource::has_source_record(&child)
-                        && completion.source.is_none()
-                    {
-                        tracing::warn!(%child_id,
+                completion.source = ChildCompletionSource::from_committed_session(&child)
+                    .filter(|source| source.matches_completion(&completion));
+                if ChildCompletionSource::has_source_record(&child) && completion.source.is_none() {
+                    tracing::warn!(%child_id,
                             "unavailable committed replay source; leaving wait armed");
-                        return;
-                    }
-                    completion.completed_at = child.updated_at;
+                    continue;
                 }
-                self.publish_completion(completion).await;
+                completion.completed_at = child.updated_at;
             }
+            self.publish_completion(completion).await;
         }
     }
 
@@ -3586,6 +3836,7 @@ impl ChildCompletionCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bamboo_domain::session::runtime_state::SuspensionState;
 
     #[test]
     fn skill_request_child_provider_constructor_keeps_data_absent_and_rejects_injection() {
@@ -4463,6 +4714,626 @@ mod tests {
         store.save_session(&parent).await.unwrap();
     }
 
+    async fn save_completion_test_child(
+        store: &bamboo_storage::SessionStoreV2,
+        parent_id: &str,
+        child_id: &str,
+        status: &str,
+    ) -> ChildCompletion {
+        let mut child = store
+            .load_session(child_id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| Session::new_child(child_id, parent_id, "model", "Child"));
+        child.add_message(Message::assistant(format!("result-{child_id}"), None));
+        child.set_last_run_status(status);
+        save_sourced_test_child(store, &child).await;
+        ChildCompletion {
+            parent_session_id: parent_id.into(),
+            child_session_id: child_id.into(),
+            status: status.into(),
+            error: None,
+            completed_at: child.updated_at,
+            source: test_child_source(store, child_id).await,
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_all_outcome_preserves_wait_and_active_parent_control_state() {
+        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+        let parent_id = "incremental-parent";
+        save_waiting_test_parent(
+            &store,
+            parent_id,
+            vec!["ready-child".into(), "slow-child".into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let mut parent = store.load_session(parent_id).await.unwrap().unwrap();
+        let mut runtime = read_runtime_state(&parent);
+        runtime.status = AgentStatusState::Running;
+        runtime.suspension = None;
+        parent.metadata.remove("runtime.suspend_reason");
+        write_runtime_state(&mut parent, &runtime);
+        store.save_session(&parent).await.unwrap();
+        let ready = save_completion_test_child(&store, parent_id, "ready-child", "completed").await;
+        save_completion_test_child(&store, parent_id, "slow-child", "running").await;
+
+        coordinator.on_child_completed(ready.clone()).await;
+        let after = store.load_session(parent_id).await.unwrap().unwrap();
+        assert_eq!(read_runtime_state(&after), runtime);
+        assert_eq!(after.updated_at, parent.updated_at);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        let backlog = inbox.inspect(parent_id).await.unwrap();
+        assert!(backlog.interrupt_pending());
+        assert_eq!(backlog.coordinator_generation, 0, "no blanket prefix grant");
+        let claims = inbox.claim(parent_id, 8).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        inbox.ack(parent_id, &claims[0]).await.unwrap();
+
+        coordinator.on_child_completed(ready).await;
+        assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 0);
+        let slow = save_completion_test_child(&store, parent_id, "slow-child", "completed").await;
+        coordinator.on_child_completed(slow).await;
+        assert!(
+            read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
+                .waiting_for_children
+                .is_none()
+        );
+        let claims = inbox.claim(parent_id, 8).await.unwrap();
+        assert_eq!(
+            claims.len(),
+            1,
+            "the acknowledged first result is not repeated at wait release"
+        );
+        let SessionMessageBody::ChildOutcome(outcome) = &claims[0].envelope.body else {
+            panic!("child outcome");
+        };
+        assert_eq!(outcome.child_session_id, "slow-child");
+    }
+
+    #[tokio::test]
+    async fn incremental_completions_during_owner_exit_share_one_successor() {
+        let (_temp, store, inbox, coordinator, reservations, launches) =
+            completion_inbox_fixture().await;
+        let parent_id = "handoff-parent";
+        save_waiting_test_parent(
+            &store,
+            parent_id,
+            vec![
+                "handoff-a".into(),
+                "handoff-b".into(),
+                "handoff-slow".into(),
+            ],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let a = save_completion_test_child(&store, parent_id, "handoff-a", "completed").await;
+        let b = save_completion_test_child(&store, parent_id, "handoff-b", "completed").await;
+        save_completion_test_child(&store, parent_id, "handoff-slow", "running").await;
+        let router = coordinator.agent.activation_router().unwrap();
+        router.set_inbox(inbox.clone());
+        let mut owner = router
+            .register_run(parent_id, "old-parent-run")
+            .await
+            .unwrap();
+
+        coordinator.on_child_completed(a.clone()).await;
+        assert!(inbox
+            .claim_for_turn(parent_id, 8, Some("old-parent-run"))
+            .await
+            .unwrap()
+            .is_empty());
+        owner.begin_finalization().await;
+        coordinator.on_child_completed(b.clone()).await;
+        assert_eq!(reservations.load(Ordering::SeqCst), 0);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        owner.finish(0).await.unwrap();
+        assert_eq!(reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        let successor = router.current_run_id(parent_id).await.unwrap();
+        let claims = inbox
+            .claim_for_turn(parent_id, 8, Some(&successor))
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 2);
+        for claim in &claims {
+            inbox.ack(parent_id, claim).await.unwrap();
+        }
+        tokio::join!(
+            coordinator.on_child_completed(a),
+            coordinator.on_child_completed(b)
+        );
+        assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 0);
+        assert_eq!(reservations.load(Ordering::SeqCst), 1);
+        assert!(
+            read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
+                .waiting_for_children
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_watchdog_replays_each_ready_child_before_all_wait_is_satisfied() {
+        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+        let parent_id = "cold-incremental-parent";
+        save_waiting_test_parent(
+            &store,
+            parent_id,
+            vec!["cold-a".into(), "cold-b".into(), "cold-slow".into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let mut parent = store.load_session(parent_id).await.unwrap().unwrap();
+        let mut runtime = read_runtime_state(&parent);
+        runtime.waiting_for_children.as_mut().unwrap().registered_at -=
+            chrono::Duration::seconds(61);
+        write_runtime_state(&mut parent, &runtime);
+        store.save_session(&parent).await.unwrap();
+        save_completion_test_child(&store, parent_id, "cold-a", "completed").await;
+        save_completion_test_child(&store, parent_id, "cold-b", "completed").await;
+        save_completion_test_child(&store, parent_id, "cold-slow", "running").await;
+
+        let wait = runtime.waiting_for_children.unwrap();
+        coordinator.sweep_child_wait(parent_id, wait.clone()).await;
+        let reopened = bamboo_storage::FileSessionInbox::new(store.clone(), Default::default());
+        let backlog = reopened.inspect(parent_id).await.unwrap();
+        assert_eq!(backlog.pending, 2);
+        assert!(backlog.interrupt_pending());
+        assert_eq!(backlog.coordinator_generation, 0);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        let claims = reopened.claim(parent_id, 8).await.unwrap();
+        assert_eq!(claims.len(), 2);
+        for claim in &claims {
+            reopened.ack(parent_id, claim).await.unwrap();
+        }
+        coordinator.sweep_child_wait(parent_id, wait).await;
+        assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 0);
+        assert!(
+            read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
+                .waiting_for_children
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn any_wait_delivers_a_late_direct_child_without_repeating_the_first_outcome() {
+        let (_temp, store, inbox, coordinator, _, _) = completion_inbox_fixture().await;
+        let parent_id = "any-incremental-parent";
+        save_waiting_test_parent(
+            &store,
+            parent_id,
+            vec!["any-first".into(), "any-late".into()],
+            ChildWaitPolicy::Any,
+        )
+        .await;
+        let first = save_completion_test_child(&store, parent_id, "any-first", "completed").await;
+        save_completion_test_child(&store, parent_id, "any-late", "running").await;
+        coordinator.on_child_completed(first.clone()).await;
+        assert!(
+            read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
+                .waiting_for_children
+                .is_none()
+        );
+        let first_claims = inbox.claim(parent_id, 8).await.unwrap();
+        assert_eq!(first_claims.len(), 1);
+        inbox.ack(parent_id, &first_claims[0]).await.unwrap();
+
+        let late = save_completion_test_child(&store, parent_id, "any-late", "completed").await;
+        coordinator.on_child_completed(late.clone()).await;
+        coordinator.on_child_completed(first).await;
+        coordinator.on_child_completed(late).await;
+        let claims = inbox.claim(parent_id, 8).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        let SessionMessageBody::ChildOutcome(outcome) = &claims[0].envelope.body else {
+            panic!("child outcome");
+        };
+        assert_eq!(outcome.child_session_id, "any-late");
+        assert!(
+            read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
+                .waiting_for_children
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_batch_upgrades_lower_pending_outcome_below_an_acknowledged_sibling() {
+        let (_temp, store, inbox, coordinator, _, _) = completion_inbox_fixture().await;
+        let parent_id = "terminal-batch-parent";
+        save_waiting_test_parent(
+            &store,
+            parent_id,
+            vec!["batch-low".into(), "batch-high".into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let mut parent = store.load_session(parent_id).await.unwrap().unwrap();
+        let wait = read_runtime_state(&parent).waiting_for_children.unwrap();
+        let low = save_completion_test_child(&store, parent_id, "batch-low", "completed").await;
+        let high = save_completion_test_child(&store, parent_id, "batch-high", "completed").await;
+        let mut receipts = Vec::new();
+        for completion in [&low, &high] {
+            let result = format!("result-{}", completion.child_session_id);
+            let presentation = runtime_resume_message(completion, 0, Some(&result));
+            let envelope = child_completion_envelope(
+                completion,
+                wait.registered_at,
+                Some(result),
+                &presentation,
+            );
+            receipts.push(inbox.deliver(&envelope).await.unwrap());
+        }
+        inbox
+            .mark_message_activation_eligible(
+                parent_id,
+                &receipts[1],
+                SessionActivationPolicy::InterruptSpecificWait,
+            )
+            .await
+            .unwrap();
+        let claims = inbox.claim(parent_id, 8).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].generation, receipts[1].generation);
+        parent.add_message(claims[0].envelope.to_provider_message().unwrap());
+        store.save_session(&parent).await.unwrap();
+        inbox.ack(parent_id, &claims[0]).await.unwrap();
+
+        coordinator.on_child_completed(low).await;
+        let mut rearmed = store.load_session(parent_id).await.unwrap().unwrap();
+        let mut runtime = read_runtime_state(&rearmed);
+        assert!(runtime.waiting_for_children.is_none());
+        let new_wait = WaitingForChildrenState::for_children(
+            vec!["next-slow-child".into()],
+            ChildWaitPolicy::All,
+            Utc::now(),
+        );
+        runtime.waiting_for_children = Some(new_wait.clone());
+        runtime.status = AgentStatusState::Suspended;
+        write_runtime_state(&mut rearmed, &runtime);
+        store.save_session(&rearmed).await.unwrap();
+        let backlog = inbox.inspect(parent_id).await.unwrap();
+        assert_eq!(backlog.pending, 1);
+        assert!(
+            backlog.interrupt_pending(),
+            "the low generation has its own grant"
+        );
+        let (prepared, ready) = prepare_session_inbox_activation(
+            &coordinator.persistence,
+            parent_id,
+            backlog.interrupt_pending(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(ready);
+        assert_eq!(
+            read_runtime_state(&prepared).waiting_for_children,
+            Some(new_wait)
+        );
+        let claims = inbox.claim(parent_id, 8).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].generation, receipts[0].generation);
+    }
+
+    #[tokio::test]
+    async fn large_legal_typed_source_falls_back_within_the_delivery_budget() {
+        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+        let parent_id = "large-source-parent";
+        let child_id = "large-source-child";
+        save_waiting_test_parent(
+            &store,
+            parent_id,
+            vec![child_id.into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let mut parent = store.load_session(parent_id).await.unwrap().unwrap();
+        parent.add_message(Message::user("required original source"));
+        store.save_session(&parent).await.unwrap();
+        let mut child = typed_test_child(&parent, child_id, &typed_test_report().to_string());
+        let source = ChildCompletionSource::from_committed_session(&child).unwrap();
+        let run_length =
+            3900 - serde_json::to_vec(&source).unwrap().len() + source.activation_run_id.len();
+        ChildCompletionSource::prepare(&mut child, &"r".repeat(run_length), &Default::default());
+        let completion = typed_test_completion(&child);
+        let source_bytes = serde_json::to_vec(completion.source.as_ref().unwrap())
+            .unwrap()
+            .len();
+        assert!((3800..=4096).contains(&source_bytes));
+        store.save_session(&child).await.unwrap();
+
+        coordinator.on_child_completed(completion).await;
+        let claims = inbox.claim(parent_id, 8).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert!(fits_child_result_budget(&claims[0].envelope));
+        let message = claims[0].envelope.to_provider_message().unwrap();
+        assert!(fits_child_result_budget(&message));
+        assert!(message.content.contains("result_budget_exceeded"));
+    }
+
+    #[tokio::test]
+    async fn upgrade_promotes_one_existing_legacy_partial_delivery_without_a_second_id() {
+        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+        let parent_id = "legacy-partial-parent";
+        save_waiting_test_parent(
+            &store,
+            parent_id,
+            vec!["legacy-ready".into(), "legacy-slow".into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let completion =
+            save_completion_test_child(&store, parent_id, "legacy-ready", "completed").await;
+        save_completion_test_child(&store, parent_id, "legacy-slow", "running").await;
+        let parent = store.load_session(parent_id).await.unwrap().unwrap();
+        let wait = read_runtime_state(&parent).waiting_for_children.unwrap();
+        let result = "result-legacy-ready";
+        let presentation = runtime_resume_message(&completion, 1, Some(result));
+        let mut legacy = child_completion_envelope(
+            &completion,
+            wait.registered_at,
+            Some(result.into()),
+            &presentation,
+        );
+        legacy.id = child_completion_id(&completion, wait.registered_at, Some(result), true);
+        let receipt = inbox.deliver(&legacy).await.unwrap();
+        assert!(!inbox.inspect(parent_id).await.unwrap().activation_pending());
+
+        coordinator.on_child_completed(completion.clone()).await;
+        coordinator.on_child_completed(completion).await;
+        let claims = inbox.claim(parent_id, 8).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].envelope.id, legacy.id);
+        assert_eq!(claims[0].generation, receipt.generation);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
+                .waiting_for_children
+                .as_ref(),
+            Some(&wait)
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_keeps_admitted_legacy_raw_guardian_and_typed_sources_deduplicated_without_a_wait(
+    ) {
+        for presentation_kind in ["raw", "guardian", "typed", "typed_unavailable_digest"] {
+            let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+            let parent_id = "legacy-admitted-parent";
+            let child_id = "legacy-admitted-child";
+            let mut parent = Session::new(parent_id, "model");
+            parent.add_message(Message::user("required original source"));
+            store.save_session(&parent).await.unwrap();
+            let completion = if presentation_kind.starts_with("typed") {
+                let child = typed_test_child(&parent, child_id, &typed_test_report().to_string());
+                store.save_session(&child).await.unwrap();
+                typed_test_completion(&child)
+            } else {
+                save_completion_test_child(&store, parent_id, child_id, "completed").await
+            };
+            let child = store.load_session(child_id).await.unwrap().unwrap();
+            let result = completion.source.as_ref().unwrap().result(&child, &parent);
+            let mut projection = sealed_child_report(&completion, &child, &parent);
+            if presentation_kind == "typed_unavailable_digest" {
+                projection = Some(unavailable_child_result(
+                    "typed_result",
+                    "result_budget_exceeded",
+                ));
+            }
+            let mut presentation = match presentation_kind {
+                "guardian" => guardian_resume_message(&completion, &GuardianVerdict::approved()),
+                "typed" | "typed_unavailable_digest" => {
+                    typed_child_resume_message(&completion, 0, projection.as_ref().unwrap())
+                }
+                _ => runtime_resume_message(&completion, 0, result.as_deref()),
+            };
+            if presentation_kind == "typed" {
+                presentation
+                    .metadata
+                    .as_mut()
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("child_completion_source_sha256");
+            }
+            let old_wait = Utc::now() - chrono::Duration::minutes(2);
+            let mut legacy =
+                child_completion_envelope(&completion, old_wait, result.clone(), &presentation);
+            legacy.id = child_completion_id(&completion, old_wait, result.as_deref(), true);
+            if let Some(projection) = projection.as_mut() {
+                assert!(bound_typed_child_delivery(
+                    &mut legacy,
+                    &mut presentation,
+                    projection,
+                    &completion,
+                    0
+                ));
+            }
+            let receipt = inbox.deliver(&legacy).await.unwrap();
+            inbox
+                .mark_message_activation_eligible(
+                    parent_id,
+                    &receipt,
+                    SessionActivationPolicy::InterruptSpecificWait,
+                )
+                .await
+                .unwrap();
+            let claims = inbox.claim(parent_id, 1).await.unwrap();
+            parent.add_message(claims[0].envelope.to_provider_message().unwrap());
+            store.save_session(&parent).await.unwrap();
+            inbox.ack(parent_id, &claims[0]).await.unwrap();
+
+            coordinator.on_child_completed(completion).await;
+            assert_eq!(
+                inbox.inspect(parent_id).await.unwrap().generation,
+                receipt.generation,
+                "{presentation_kind}"
+            );
+            assert_eq!(
+                inbox.inspect(parent_id).await.unwrap().pending,
+                0,
+                "{presentation_kind}"
+            );
+            assert_eq!(launches.load(Ordering::SeqCst), 0, "{presentation_kind}");
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_reuses_a_pending_legacy_source_after_its_wait_was_cleared() {
+        for (arm, acked) in [
+            ("none", false),
+            ("partial", false),
+            ("terminal", false),
+            ("terminal", true),
+        ] {
+            let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+            let parent_id = "legacy-pending-parent";
+            let child_id = "legacy-pending-child";
+            let mut parent = Session::new(parent_id, "model");
+            store.save_session(&parent).await.unwrap();
+            let completion =
+                save_completion_test_child(&store, parent_id, child_id, "completed").await;
+            let result = "result-legacy-pending-child";
+            let presentation = runtime_resume_message(&completion, 0, Some(result));
+            let old_wait = Utc::now() - chrono::Duration::minutes(2);
+            let mut legacy = child_completion_envelope(
+                &completion,
+                old_wait,
+                Some(result.into()),
+                &presentation,
+            );
+            legacy.id = child_completion_id(&completion, old_wait, Some(result), true);
+            let receipt = inbox.deliver(&legacy).await.unwrap();
+            inbox
+                .mark_message_activation_eligible(
+                    parent_id,
+                    &receipt,
+                    SessionActivationPolicy::RespectSpecificWait,
+                )
+                .await
+                .unwrap();
+            if acked {
+                let claims = inbox.claim(parent_id, 1).await.unwrap();
+                parent.add_message(claims[0].envelope.to_provider_message().unwrap());
+                store.save_session(&parent).await.unwrap();
+                inbox.ack(parent_id, &claims[0]).await.unwrap();
+            }
+            let new_wait = if arm != "none" {
+                let mut ids = vec![child_id.into()];
+                if arm == "partial" {
+                    ids.push("legacy-pending-slow".into());
+                    save_completion_test_child(&store, parent_id, "legacy-pending-slow", "running")
+                        .await;
+                }
+                let wait =
+                    WaitingForChildrenState::for_children(ids, ChildWaitPolicy::All, Utc::now());
+                let mut runtime = read_runtime_state(&parent);
+                runtime.waiting_for_children = Some(wait.clone());
+                runtime.status = AgentStatusState::Suspended;
+                write_runtime_state(&mut parent, &runtime);
+                store.save_session(&parent).await.unwrap();
+                Some(wait)
+            } else {
+                None
+            };
+
+            coordinator.on_child_completed(completion.clone()).await;
+            coordinator.on_child_completed(completion).await;
+            let backlog = inbox.inspect(parent_id).await.unwrap();
+            assert_eq!(
+                backlog.generation, receipt.generation,
+                "{arm}, acked={acked}"
+            );
+            assert_eq!(backlog.pending, usize::from(!acked), "{arm}, acked={acked}");
+            assert_eq!(backlog.interrupt_pending(), !acked, "{arm}, acked={acked}");
+            assert_eq!(
+                launches.load(Ordering::SeqCst),
+                usize::from(!acked),
+                "{arm}, acked={acked}"
+            );
+            let wait = read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
+                .waiting_for_children;
+            assert_eq!(wait, if arm == "partial" { new_wait } else { None });
+            let claims = inbox.claim(parent_id, 8).await.unwrap();
+            assert_eq!(claims.len(), usize::from(!acked));
+            if !acked {
+                assert_eq!(claims[0].envelope.id, legacy.id);
+                assert_eq!(claims[0].generation, receipt.generation);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_legacy_guardian_source_still_commits_a_pending_verdict() {
+        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+        let parent_id = "legacy-pending-guardian-parent";
+        let child_id = "legacy-pending-guardian-child";
+        let mut parent = Session::new(parent_id, "model");
+        let mut guardian = crate::runtime::guardian_state::ensure_guardian_state(&parent);
+        guardian.record_spawn(child_id);
+        write_guardian_state(&mut parent, guardian);
+        store.save_session(&parent).await.unwrap();
+        let verdict = GuardianVerdict::approved();
+        let mut child = Session::new_child(child_id, parent_id, "model", "Guardian");
+        child.set_subagent_type("guardian");
+        child.add_message(Message::assistant(
+            serde_json::to_string(&verdict).unwrap(),
+            None,
+        ));
+        child.set_last_run_status("completed");
+        save_sourced_test_child(&store, &child).await;
+        let completion = ChildCompletion {
+            parent_session_id: parent_id.into(),
+            child_session_id: child_id.into(),
+            status: "completed".into(),
+            error: None,
+            completed_at: child.updated_at,
+            source: test_child_source(&store, child_id).await,
+        };
+        let result = serde_json::to_string(&verdict).unwrap();
+        let old_wait = Utc::now() - chrono::Duration::minutes(2);
+        let presentation = guardian_resume_message(&completion, &verdict);
+        let mut legacy =
+            child_completion_envelope(&completion, old_wait, Some(result.clone()), &presentation);
+        legacy.id = child_completion_id(&completion, old_wait, Some(&result), true);
+        let receipt = inbox.deliver(&legacy).await.unwrap();
+        inbox
+            .mark_message_activation_eligible(
+                parent_id,
+                &receipt,
+                SessionActivationPolicy::InterruptSpecificWait,
+            )
+            .await
+            .unwrap();
+        let claims = inbox.claim(parent_id, 1).await.unwrap();
+        parent.add_message(claims[0].envelope.to_provider_message().unwrap());
+        store.save_session(&parent).await.unwrap();
+        inbox.ack(parent_id, &claims[0]).await.unwrap();
+
+        coordinator.on_child_completed(completion.clone()).await;
+        let saved = store.load_session(parent_id).await.unwrap().unwrap();
+        let guardian = read_guardian_state(&saved).unwrap();
+        assert!(guardian.phase.is_reviewed());
+        assert!(guardian.last_approved());
+        assert_eq!(guardian.review_count, 1);
+        let saved_guardian = saved.metadata["guardian.state"].clone();
+        coordinator.on_child_completed(completion).await;
+        assert_eq!(
+            store
+                .load_session(parent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata["guardian.state"],
+            saved_guardian
+        );
+        let backlog = inbox.inspect(parent_id).await.unwrap();
+        assert_eq!(backlog.generation, receipt.generation);
+        assert_eq!(backlog.pending, 0);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn terminal_index_ahead_of_callbacks_preserves_every_waited_child_outcome() {
         for partial_first in [false, true] {
@@ -4507,7 +5378,7 @@ mod tests {
                         .is_some()
                 );
                 assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 1);
-                assert_eq!(launches.load(Ordering::SeqCst), 0);
+                assert_eq!(launches.load(Ordering::SeqCst), 1);
                 for id in &ids[1..] {
                     let mut child = store.load_session(id).await.unwrap().unwrap();
                     child.set_last_run_status("completed");
@@ -4828,7 +5699,7 @@ mod tests {
             }
             coordinator.on_child_completed(completion).await;
             assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 1);
-            assert_eq!(launches.load(Ordering::SeqCst), 0);
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
             assert!(
                 read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
                     .waiting_for_children
@@ -4854,7 +5725,7 @@ mod tests {
                 2,
                 "sibling completion cannot restage mutated A as a neutral outcome"
             );
-            assert_eq!(launches.load(Ordering::SeqCst), 0);
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
             assert!(
                 read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
                     .waiting_for_children
@@ -4863,7 +5734,7 @@ mod tests {
             assert_eq!(
                 inbox.inspect(parent_id).await.unwrap().claimed,
                 0,
-                "partial outcomes remain inert until the wait is durably released"
+                "stale replay does not create another claim or reasoning owner"
             );
         }
     }
@@ -4975,7 +5846,12 @@ mod tests {
             AgentStatusState::Suspended
         );
         assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 1);
-        assert!(!inbox.inspect(parent_id).await.unwrap().activation_pending());
+        let backlog = inbox.inspect(parent_id).await.unwrap();
+        assert!(backlog.activation_pending());
+        assert!(
+            !backlog.interrupt_pending(),
+            "failed wait transition is still respected"
+        );
         assert_eq!(reservations.load(Ordering::SeqCst), 0);
         assert_eq!(launches.load(Ordering::SeqCst), 0);
     }
@@ -5054,27 +5930,6 @@ mod tests {
         assert!(!completion_child_is_owned("parent-1", Some("parent-2")));
         // Root/unparented session, or a nonexistent id (linkage None).
         assert!(!completion_child_is_owned("parent-1", None));
-    }
-
-    #[test]
-    fn replay_child_prefers_error_like_for_first_error_policy() {
-        let terminal = vec![
-            ("c-ok".to_string(), "completed".to_string()),
-            ("c-err".to_string(), "timeout".to_string()),
-            ("c-late".to_string(), "completed".to_string()),
-        ];
-        let (id, status) = select_replay_child(&terminal).expect("non-empty");
-        assert_eq!(id, "c-err");
-        assert_eq!(status, "timeout");
-
-        let all_ok = vec![
-            ("c-1".to_string(), "completed".to_string()),
-            ("c-2".to_string(), "completed".to_string()),
-        ];
-        let (id, _) = select_replay_child(&all_ok).expect("non-empty");
-        assert_eq!(id, "c-2");
-
-        assert!(select_replay_child(&[]).is_none());
     }
 
     #[test]
