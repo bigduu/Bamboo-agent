@@ -319,8 +319,9 @@ pub(crate) async fn terminal_event_if_ready(
     session_id: &str,
     runner_status: Option<AgentStatus>,
 ) -> Option<AgentEvent> {
-    let running_sessions = running_session_ids(&*state.agent_runners.read().await);
-    terminal_event_for_snapshot(state, session_id, runner_status, &running_sessions).await
+    // This caller owns no runner guard. Observe descendants at the final
+    // decision, after canonical Inbox/Main and watched-root reads, not here.
+    terminal_event_for_snapshot(state, session_id, runner_status, None).await
 }
 
 /// The caller owns the runner read guard and must not recursively acquire it:
@@ -334,7 +335,7 @@ pub(crate) async fn terminal_event_with_locked_runners(
         state,
         session_id,
         runners.get(session_id).map(|runner| runner.status.clone()),
-        &running_session_ids(runners),
+        Some(&running_session_ids(runners)),
     )
     .await
 }
@@ -343,7 +344,7 @@ async fn terminal_event_for_snapshot(
     state: &web::Data<AppState>,
     session_id: &str,
     runner_status: Option<AgentStatus>,
-    running_sessions: &[String],
+    locked_running_sessions: Option<&[String]>,
 ) -> Option<AgentEvent> {
     // A slow but legitimate execute may outlive the durable handoff grace
     // before it can reserve a runner. Its RAII owner wins until every
@@ -449,7 +450,7 @@ async fn terminal_event_for_snapshot(
         );
         return None;
     }
-    if has_running_child_in_snapshot(state, session_id, running_sessions).await {
+    if has_running_child_with_snapshot(state, session_id, locked_running_sessions).await {
         tracing::debug!(
             "[{}] terminal_event_if_ready -> None (running child session) -> LIVE stream",
             session_id,
@@ -654,8 +655,7 @@ fn terminal_failure_is_authoritative(
 /// to the old direct-child check, because a direct child's `root_session_id`
 /// equals the root's.
 pub(crate) async fn has_running_child(state: &web::Data<AppState>, session_id: &str) -> bool {
-    let running_sessions = running_session_ids(&*state.agent_runners.read().await);
-    has_running_child_in_snapshot(state, session_id, &running_sessions).await
+    has_running_child_with_snapshot(state, session_id, None).await
 }
 
 fn running_session_ids(
@@ -668,10 +668,10 @@ fn running_session_ids(
         .collect()
 }
 
-async fn has_running_child_in_snapshot(
+async fn has_running_child_with_snapshot(
     state: &web::Data<AppState>,
     session_id: &str,
-    running_sessions: &[String],
+    locked_running_sessions: Option<&[String]>,
 ) -> bool {
     let watched_root = state
         .session_store
@@ -679,6 +679,13 @@ async fn has_running_child_in_snapshot(
         .await
         .map(|entry| entry.root_session_id)
         .unwrap_or_else(|| session_id.to_string());
+    // Unlocked SSE/live callers must see children that started during earlier
+    // storage/index awaits. Only the WS terminal caller holding the runner
+    // guard may reuse its snapshot; it must not recursively acquire that lock.
+    let running_sessions = match locked_running_sessions {
+        Some(snapshot) => std::borrow::Cow::Borrowed(snapshot),
+        None => std::borrow::Cow::Owned(running_session_ids(&*state.agent_runners.read().await)),
+    };
     for running_session_id in running_sessions
         .iter()
         .filter(|id| id.as_str() != session_id)

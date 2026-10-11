@@ -138,8 +138,122 @@ pub async fn handler(
 mod tests {
     use super::*;
     use actix_web::Responder;
-    use bamboo_agent_core::{Message, Session};
+    use bamboo_agent_core::{AgentEvent, Message, Session};
+    use bamboo_domain::Storage;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
+
+    struct MainReadBarrier {
+        inner: Arc<dyn Storage>,
+        session_id: String,
+        armed: AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for MainReadBarrier {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.inner.save_session(session).await
+        }
+
+        async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+            let session = self.inner.load_session(id).await?;
+            if id == self.session_id && self.armed.swap(false, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(session)
+        }
+
+        async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(id).await
+        }
+    }
+
+    #[actix_web::test]
+    async fn descendant_starting_during_main_read_keeps_sse_receiver_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let root_id = "sse-child-admission-root";
+        let child_id = "sse-child-admission-child";
+        let mut root = Session::new(root_id, "test-model");
+        root.add_message(Message::assistant("parent already finished", None));
+        app.save_session(&mut root).await;
+        let mut child = Session::new_child(child_id, root_id, "test-model", "child");
+        app.save_session(&mut child).await;
+        let barrier = Arc::new(MainReadBarrier {
+            inner: app.storage.clone(),
+            session_id: root_id.into(),
+            armed: AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        app.storage = barrier.clone();
+        let state = web::Data::new(app);
+        let sender = state.get_session_event_sender(root_id).await;
+        let request = actix_web::test::TestRequest::get().to_http_request();
+        let subscribe = handler(
+            state.clone(),
+            web::Path::from(root_id.to_string()),
+            web::Query(EventsQuery::default()),
+            request.clone(),
+        );
+        let start_child = async {
+            barrier.entered.notified().await;
+            let mut runner = crate::app_state::AgentRunner::new();
+            runner.status = AgentStatus::Running;
+            state
+                .agent_runners
+                .write()
+                .await
+                .insert(child_id.into(), runner);
+            // The handler has already subscribed. Its eventual response must
+            // keep that receiver, including progress buffered during Main I/O.
+            sender
+                .send(AgentEvent::Token {
+                    content: "exact-child-progress".into(),
+                })
+                .unwrap();
+            barrier.release.notify_one();
+        };
+        let (response, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(subscribe, start_child)
+        })
+        .await
+        .expect("Main-read barrier completes without a timing race");
+
+        state
+            .agent_runners
+            .write()
+            .await
+            .get_mut(child_id)
+            .unwrap()
+            .status = AgentStatus::Completed;
+        sender
+            .send(AgentEvent::Complete {
+                usage: Default::default(),
+            })
+            .unwrap();
+        let response = response.respond_to(&request);
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(2),
+            actix_web::body::to_bytes(response.into_body()),
+        )
+        .await
+        .expect("finished child closes the live SSE stream");
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(_) => panic!("read SSE body"),
+        };
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("exact-child-progress"),
+            "descendant progress was discarded: {body}"
+        );
+        assert_eq!(body.matches("[DONE]").count(), 1, "{body}");
+    }
 
     #[actix_web::test]
     async fn expired_startup_admission_waits_for_locked_live_reconcile() {
