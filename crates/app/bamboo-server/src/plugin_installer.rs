@@ -1554,6 +1554,7 @@ fn resolved_directory_contains(directory: &ResolvedDirectory, path: &ResolvedDir
     }
 }
 
+#[cfg(windows)]
 fn ascii_directory_contains(directory: &Path, path: &Path) -> bool {
     let mut parts = path.components();
     directory.components().all(|component| {
