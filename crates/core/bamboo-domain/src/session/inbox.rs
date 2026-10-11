@@ -1527,12 +1527,15 @@ pub trait SessionInboxPort: Send + Sync {
     /// lifetimes and their current tree/Project membership remain valid.
     /// Retain the existing lifecycle authority through the durable receipt,
     /// binding this message's InterruptSpecificWait intent in the same commit.
+    /// For a reply, revalidate the observed received envelope against the current
+    /// canonical source transcript under the same retained authority locks.
     /// Observations are not grants; unsupported backends must fail closed.
     async fn deliver_peer_message(
         &self,
         _envelope: &SessionMessageEnvelope,
         _source: &super::ActorSession,
         _target: &super::ActorSession,
+        _reply_to: Option<&SessionMessageEnvelope>,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         Err(SessionInboxError::Storage(
             "lifetime-fenced peer SessionInbox admission is unsupported".into(),
