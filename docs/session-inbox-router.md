@@ -28,6 +28,12 @@ an authorized target. Reply derives the recipient and thread from an exact,
 canonical peer message already saved in the caller's transcript. A guessed id
 or a provider-supplied metadata object cannot authorize a reply.
 
+Delivery retains both observed Session birth identities through the existing
+lifecycle-locked Inbox commit. Deleting and recreating either participant with
+the same public id rejects the stale send or reply. Custom Inbox backends must
+implement this atomic peer admission capability; unsupported backends reject
+peer sends rather than falling back to an unfenced delivery path.
+
 Use one stable `operation_id` per logical send or reply. Retry an uncertain
 delivery with the same operation id and identical arguments; changing the
 message or reply edge under that id fails closed. Message text is limited to
