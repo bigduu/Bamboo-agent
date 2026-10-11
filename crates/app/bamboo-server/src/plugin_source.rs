@@ -185,7 +185,6 @@
 //! so shared server state has no preflight-to-swap race.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use bamboo_config::PluginTrustConfig;
 use bamboo_plugin::manifest::Platform;
@@ -1875,11 +1874,11 @@ async fn fetch_manifest_bundle(
         http_client_no_redirects()
     };
 
-    let bytes = download_bytes(client, url, MAX_DOWNLOAD_BYTES).await?;
+    let bytes = download_bytes(&client, url, MAX_DOWNLOAD_BYTES).await?;
 
     // Layer 2: signature — a valid signature is a STRONGER integrity +
     // authenticity guarantee than a pasted checksum (see layer 3 below).
-    let signed_by = fetch_and_verify_signature(client, url, &bytes, &trust.trusted_keys).await;
+    let signed_by = fetch_and_verify_signature(&client, url, &bytes, &trust.trusted_keys).await;
     if signed_by.is_none() {
         if !allow_unsigned {
             return Err(PluginError::UnsignedOrUntrustedSignature(format!(
@@ -2039,12 +2038,8 @@ async fn fetch_and_place_artifact(
     // flag exists for it — see this function's docs) — the downloaded bytes
     // are always cryptographically authenticated here, so redirects are
     // always safe to follow for this fetch.
-    let bytes = download_bytes(
-        http_client_following_redirects(),
-        &artifact.url,
-        MAX_DOWNLOAD_BYTES,
-    )
-    .await?;
+    let client = http_client_following_redirects();
+    let bytes = download_bytes(&client, &artifact.url, MAX_DOWNLOAD_BYTES).await?;
     let actual_sha256 = sha256_hex(&bytes);
     if !actual_sha256.eq_ignore_ascii_case(&artifact.sha256) {
         return Err(PluginError::ArtifactVerificationFailed(format!(
@@ -2122,17 +2117,16 @@ async fn move_file(source: &Path, dest: &Path) -> PluginResult<()> {
 /// refuses on a bad result regardless — this is what lets the default
 /// official-signed-via-CDN flow (GitHub Releases 302-redirecting to
 /// `objects.githubusercontent.com`) and the checksummed flow keep working.
-/// Reuses the workspace's pinned (native-tls) `reqwest` — never construct a
-/// second client/connector here (see `notify_sinks::ntfy`'s identical
-/// pattern).
-fn http_client_following_redirects() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .build()
-            .expect("a reqwest client with only a redirect policy set always builds")
-    })
+/// Uses the workspace's pinned native-TLS `reqwest`. The fetch transaction
+/// owns the client, so its pooled connection dispatchers stay on the runtime
+/// performing that transaction. A process-global pool can otherwise reuse a
+/// connection from another runtime that shuts down during the signature fetch.
+/// The manifest and signature still reuse one client within the transaction.
+fn http_client_following_redirects() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .expect("a reqwest client with only a redirect policy set always builds")
 }
 
 /// Client used whenever NEITHER a signature nor a checksum will authenticate
@@ -2143,14 +2137,11 @@ fn http_client_following_redirects() -> &'static reqwest::Client {
 /// as the sole control. Redirects are disabled so a server that tries to
 /// redirect is refused outright (see [`download_bytes`]) rather than quietly
 /// followed — the approved host must serve the bytes directly.
-fn http_client_no_redirects() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("a reqwest client with only a redirect policy set always builds")
-    })
+fn http_client_no_redirects() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("a reqwest client with only a redirect policy set always builds")
 }
 
 /// Hard ceiling on any single plugin download (manifest, bundle, or binary
