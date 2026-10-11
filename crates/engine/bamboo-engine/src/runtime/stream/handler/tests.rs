@@ -120,6 +120,111 @@ async fn finalized_browser_arguments_hide_private_invalid_json_in_logs() {
     }
 }
 
+async fn finalized_tool_warnings(name: &str, arguments: &str) -> Vec<String> {
+    let stream = build_stream(vec![
+        Ok(LLMChunk::ToolCalls(vec![ToolCall {
+            id: "call_stream_preview".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }])),
+        Ok(LLMChunk::Done),
+    ]);
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(8);
+    let warnings = FinalizerWarnings::default();
+    let recorded = warnings.events.clone();
+    let output = {
+        let _guard = tracing::subscriber::set_default(warnings);
+        consume_llm_stream(
+            stream,
+            &event_tx,
+            &CancellationToken::new(),
+            "stream-preview-test",
+        )
+        .await
+        .expect("argument diagnostics must not reject the stream")
+    };
+    assert_eq!(output.tool_calls.len(), 1);
+    let call = &output.tool_calls[0];
+    assert_eq!(call.id, "call_stream_preview");
+    assert_eq!(call.tool_type, "function");
+    assert_eq!(call.function.name, name);
+    assert_eq!(call.function.arguments, arguments);
+    let events = recorded.lock().unwrap().clone();
+    events
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn finalized_peer_arguments_hide_private_invalid_json_in_logs() {
+    for arguments in [
+        r#"{"action":"send","target_session_id":"peer-route-sentinel","operation_id":"peer-op-sentinel","message":"peer-body-sentinel"#,
+        r#"{"action":"reply","reply_to":"peer-route-sentinel","operation_id":"peer-op-sentinel","message":"peer-body-sentinel"#,
+    ] {
+        assert!(serde_json::from_str::<serde_json::Value>(arguments).is_err());
+        assert!(arguments.chars().count() < 180);
+        for name in [
+            "session_message",
+            "SESSION_MESSAGE",
+            "default::session_message",
+            " namespace::SESSION_MESSAGE ",
+        ] {
+            let warnings = finalized_tool_warnings(name, arguments).await;
+            assert_eq!(warnings.len(), 1, "{name}: {warnings:?}");
+            let warning = &warnings[0];
+            assert!(warning.contains("Finalized tool call has invalid JSON arguments"));
+            assert!(warning.contains("call_stream_preview"));
+            assert!(warning.contains(&format!("args_len={}", arguments.len())));
+            // Keep the diagnostic while excluding every private argument field.
+            // This assertion fails on the unmodified finalizer.
+            for sentinel in [
+                "peer-body-sentinel",
+                "peer-route-sentinel",
+                "peer-op-sentinel",
+            ] {
+                assert!(!warning.contains(sentinel), "{name}: {warning}");
+            }
+            assert!(warning.contains("args_preview=\"[redacted]\""));
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn finalized_valid_peer_arguments_preserve_output_without_invalid_json_warning() {
+    for arguments in [
+        r#"{"action":"send","target_session_id":"peer-route-sentinel","operation_id":"peer-op-sentinel","message":"peer-body-sentinel"}"#,
+        r#"{"action":"reply","reply_to":"peer-route-sentinel","operation_id":"peer-op-sentinel","message":"peer-body-sentinel"}"#,
+    ] {
+        assert!(serde_json::from_str::<serde_json::Value>(arguments).is_ok());
+        for name in ["session_message", "default::SESSION_MESSAGE"] {
+            let warnings = finalized_tool_warnings(name, arguments).await;
+            assert!(warnings.is_empty(), "{name}: {warnings:?}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn finalized_ordinary_arguments_keep_bounded_unicode_and_escaped_preview() {
+    let prefix = "界".repeat(178);
+    let arguments = format!("{prefix}\n\rtail-only-sentinel");
+    let expected = format!("args_preview=\"{prefix}\\n\\r...\"");
+    // An MCP name that merely ends in the peer tool's name stays distinct.
+    for name in ["Bash", "mcp__peer__session_message"] {
+        let warnings = finalized_tool_warnings(name, &arguments).await;
+        assert_eq!(warnings.len(), 1, "{name}: {warnings:?}");
+        let warning = &warnings[0];
+        assert!(warning.contains(&expected), "{name}: {warning}");
+        assert!(!warning.contains("tail-only-sentinel"), "{name}: {warning}");
+        assert!(!warning.contains("[redacted]"), "{name}: {warning}");
+        assert!(!warning.contains('\n') && !warning.contains('\r'));
+
+        let warnings = finalized_tool_warnings(name, "ordinary\n\r").await;
+        assert_eq!(warnings.len(), 1, "{name}: {warnings:?}");
+        assert!(warnings[0].contains("args_preview=\"ordinary\\n\\r\""));
+    }
+}
+
 #[tokio::test]
 async fn consume_llm_stream_accumulates_tokens_and_tool_calls() {
     let stream = build_stream(vec![
