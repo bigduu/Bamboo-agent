@@ -123,6 +123,7 @@ jobs:
           path: |
             /tmp/bamboo-1481-ticket-lifecycle-*/host/host.log
             /tmp/bamboo-1481-ticket-lifecycle-*/host/question-readiness.json
+            /tmp/bamboo-1754-required-packet-*/host.log
           if-no-files-found: ignore
           retention-days: 7
 
