@@ -29,14 +29,16 @@ fn artifact() -> AppArtifact {
 }
 
 async fn state(dir: &Path) -> web::Data<AppState> {
-    web::Data::new(
-        AppState::new_with_memory_store(
-            dir.join("bamboo"),
-            bamboo_memory::memory_store::MemoryStore::new(dir.join("isolated-memory")),
-        )
-        .await
-        .unwrap(),
+    let mut state = AppState::new_with_memory_store(
+        dir.join("bamboo"),
+        bamboo_memory::memory_store::MemoryStore::new(dir.join("isolated-memory")),
     )
+    .await
+    .unwrap();
+    // These transport/provenance fixtures deliberately own in-memory config;
+    // unrelated live reload must not replace it or start fake MCP commands.
+    state.stop_config_watcher_for_test();
+    web::Data::new(state)
 }
 
 async fn save(state: &AppState, entry: InstalledPlugin) {
@@ -544,27 +546,27 @@ async fn legacy_requires_known_legacy_receipt_and_actual_app_rejection() {
     )
     .await;
     assert_eq!(
-        run_cli(&command, &[], Duration::from_secs(1), true)
+        run_cli(&command, &[], STATUS_TIMEOUT, true)
             .await
             .unwrap_err(),
         "legacy_cli_unavailable"
     );
     assert_eq!(
-        run_cli(&command, &[], Duration::from_secs(1), false)
+        run_cli(&command, &[], STATUS_TIMEOUT, false)
             .await
             .unwrap_err(),
         "invalid_report"
     );
     script(&command, "printf 'not JSON'; exit 0").await;
     assert_eq!(
-        run_cli(&command, &[], Duration::from_secs(1), true)
+        run_cli(&command, &[], STATUS_TIMEOUT, true)
             .await
             .unwrap_err(),
         "invalid_report"
     );
     tokio::fs::remove_file(&command).await.unwrap();
     assert_eq!(
-        run_cli(&command, &[], Duration::from_secs(1), true)
+        run_cli(&command, &[], STATUS_TIMEOUT, true)
             .await
             .unwrap_err(),
         "status_failed"
@@ -585,7 +587,7 @@ async fn malformed_inconsistent_or_permission_claiming_reports_are_rejected() {
     ] {
         script(&command, &format!("printf '%s\\n' '{report}'")).await;
         assert_eq!(
-            run_cli(&command, &[], Duration::from_secs(1), false)
+            run_cli(&command, &[], STATUS_TIMEOUT, false)
                 .await
                 .unwrap_err(),
             "invalid_report"
@@ -593,7 +595,7 @@ async fn malformed_inconsistent_or_permission_claiming_reports_are_rejected() {
     }
     script(&command, &format!("printf '%s\\n' '{}'; exit 1", missing())).await;
     assert_eq!(
-        run_cli(&command, &[], Duration::from_secs(1), false)
+        run_cli(&command, &[], STATUS_TIMEOUT, false)
             .await
             .unwrap_err(),
         "invalid_report"
@@ -607,7 +609,7 @@ async fn output_limits_and_timeout_clean_up_the_owned_process_group() {
     let command = dir.path().join("nova");
     script(&command,"while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done").await;
     assert_eq!(
-        run_cli(&command, &[], Duration::from_secs(1), false)
+        run_cli(&command, &[], STATUS_TIMEOUT, false)
             .await
             .unwrap_err(),
         "invalid_report"
