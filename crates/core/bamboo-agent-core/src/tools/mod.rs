@@ -199,6 +199,9 @@ pub fn plan_mode_allows_tool(tool_name: &str) -> bool {
             "request_permissions",
             "archive_context",
             "compact_context",
+            // This mixed-action tool checks Plan posture itself: target
+            // discovery is read-only, while send/reply remain forbidden.
+            "session_message",
         ]
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(tool_name))
@@ -228,6 +231,13 @@ mod tests {
     #[test]
     fn classify_write_as_mutating() {
         assert_eq!(classify_tool("Write"), ToolMutability::Mutating);
+    }
+
+    #[test]
+    fn session_message_plan_entry_keeps_mutating_name_classification() {
+        assert!(plan_mode_allows_tool("session_message"));
+        assert_eq!(classify_tool("session_message"), ToolMutability::Mutating);
+        assert!(!plan_mode_allows_tool("session_control"));
     }
 
     #[test]
