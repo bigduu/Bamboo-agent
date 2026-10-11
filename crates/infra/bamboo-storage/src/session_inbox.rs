@@ -34,6 +34,7 @@ const INTERRUPT_GENERATION_FILE: &str = "interrupt-generation";
 const ADMITTED_DIR: &str = "admitted";
 const OPERATION_LOCK_FILE: &str = ".session-inbox.lock";
 const ACTIVATION_INTENT_KEY: &str = "session_inbox_activation_intent";
+const COORDINATOR_INTENT_KEY: &str = "session_inbox_coordinator_activation_intent";
 const MAX_INTENT_TRANSPORT_BYTES: usize = 32 * 1024 * 1024;
 
 #[path = "session_inbox_owned.rs"]
@@ -598,7 +599,14 @@ impl FileSessionInbox {
     fn activation_intent(
         body: &serde_json::Value,
     ) -> Result<Option<SessionInboxActivationIntent>, SessionInboxError> {
-        let Some(raw) = body.get(ACTIVATION_INTENT_KEY) else {
+        Self::activation_intent_field(body, ACTIVATION_INTENT_KEY)
+    }
+
+    fn activation_intent_field(
+        body: &serde_json::Value,
+        key: &str,
+    ) -> Result<Option<SessionInboxActivationIntent>, SessionInboxError> {
+        let Some(raw) = body.get(key) else {
             return Ok(None);
         };
         let intent: SessionInboxActivationIntent =
@@ -607,6 +615,24 @@ impl FileSessionInbox {
             })?;
         intent.policy()?;
         Ok(Some(intent))
+    }
+
+    /// Coordinator promotion is separate from immutable delivery intent, so
+    /// a staged producer can retry its original envelope before or after ACK.
+    fn message_activation_intent(
+        body: &serde_json::Value,
+    ) -> Result<Option<SessionInboxActivationIntent>, SessionInboxError> {
+        let original = Self::activation_intent(body)?;
+        let coordinator = Self::activation_intent_field(body, COORDINATOR_INTENT_KEY)?;
+        if [original, coordinator].into_iter().flatten().any(|intent| {
+            intent.policy().ok() == Some(SessionActivationPolicy::InterruptSpecificWait)
+        }) {
+            Ok(Some(SessionInboxActivationIntent::new(
+                SessionActivationPolicy::InterruptSpecificWait,
+            )))
+        } else {
+            Ok(original.or(coordinator))
+        }
     }
 
     /// An immediate grant applies to one message, never an earlier sibling.
@@ -693,7 +719,7 @@ impl FileSessionInbox {
         if wrapper.kind != InboxKind::SessionEnvelope {
             return Ok(None);
         }
-        let intent = Self::activation_intent(&wrapper.body)?;
+        let intent = Self::message_activation_intent(&wrapper.body)?;
         if intent.is_some() && !versioned {
             return Err(SessionInboxError::InvalidClaim(
                 "activation intent requires its v2 watermark".into(),
@@ -775,7 +801,7 @@ impl FileSessionInbox {
         dir: &Path,
         queue: &str,
     ) -> Result<Vec<(u64, String, PathBuf)>, SessionInboxError> {
-        Self::queue_entries(dir, queue, None).await
+        Self::queue_entries(dir, queue, None, true).await
     }
 
     async fn owned_queue_entries(
@@ -783,13 +809,14 @@ impl FileSessionInbox {
         queue: &str,
         filesystem: &OwnedFilesystem,
     ) -> Result<Vec<(u64, String, PathBuf)>, SessionInboxError> {
-        Self::queue_entries(dir, queue, Some(filesystem)).await
+        Self::queue_entries(dir, queue, Some(filesystem), true).await
     }
 
     async fn queue_entries(
         dir: &Path,
         queue: &str,
         filesystem: Option<&OwnedFilesystem>,
+        quarantine_malformed: bool,
     ) -> Result<Vec<(u64, String, PathBuf)>, SessionInboxError> {
         let queue_dir = dir.join(queue);
         let mut reader = match tokio::fs::read_dir(&queue_dir).await {
@@ -815,6 +842,7 @@ impl FileSessionInbox {
             }
             match Self::claim_generation(&name) {
                 Ok(generation) => valid.push((generation, name, entry.path())),
+                Err(error) if !quarantine_malformed => return Err(error),
                 Err(error) => match filesystem {
                     Some(filesystem) => {
                         filesystem
@@ -1134,6 +1162,8 @@ impl FileSessionInbox {
             )));
         }
         let intent = Self::activation_intent(&wrapper.body)?;
+        let coordinator_intent =
+            Self::activation_intent_field(&wrapper.body, COORDINATOR_INTENT_KEY)?;
         let persisted: SessionMessageEnvelope =
             serde_json::from_value(wrapper.body).map_err(|error| {
                 SessionInboxError::InvalidClaim(format!(
@@ -1174,6 +1204,12 @@ impl FileSessionInbox {
         if let Some(intent) = intent {
             receipt.as_object_mut().expect("receipt object").insert(
                 ACTIVATION_INTENT_KEY.into(),
+                serde_json::to_value(intent).expect("activation intent serialization"),
+            );
+        }
+        if let Some(intent) = coordinator_intent {
+            receipt.as_object_mut().expect("receipt object").insert(
+                COORDINATOR_INTENT_KEY.into(),
                 serde_json::to_value(intent).expect("activation intent serialization"),
             );
         }
@@ -1377,6 +1413,26 @@ impl SessionInboxPort for FileSessionInbox {
         .await
     }
 
+    async fn existing_staged_delivery(
+        &self,
+        envelope: &SessionMessageEnvelope,
+    ) -> Result<Option<SessionInboxReceipt>, SessionInboxError> {
+        envelope
+            .validate()
+            .map_err(|error| SessionInboxError::InvalidClaim(error.to_string()))?;
+        let (dir, filesystem) = self.owned_filesystem(&envelope.target_session_id).await?;
+        Self::existing_receipt(&dir, envelope, None, &filesystem).await
+    }
+
+    async fn pending_child_outcomes(
+        &self,
+        target_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<Vec<SessionMessageEnvelope>, SessionInboxError> {
+        self.pending_child_outcomes_impl(target_session_id, child_session_id)
+            .await
+    }
+
     async fn deliver_with_gate(
         &self,
         envelope: &SessionMessageEnvelope,
@@ -1483,6 +1539,23 @@ impl SessionInboxPort for FileSessionInbox {
             Self::write_activation_watermark(&dir, generation, versioned, &filesystem).await?;
         }
         Ok(())
+    }
+
+    async fn mark_message_activation_eligible(
+        &self,
+        target_session_id: &str,
+        receipt: &SessionInboxReceipt,
+        policy: SessionActivationPolicy,
+    ) -> Result<(), SessionInboxError> {
+        let inbox = self.clone();
+        let target = target_session_id.to_owned();
+        let receipt = receipt.clone();
+        owned::complete_owned(async move {
+            inbox
+                .mark_message_activation_eligible_impl(&target, &receipt, policy)
+                .await
+        })
+        .await
     }
 
     async fn coordinator_activation_generation(

@@ -1680,6 +1680,10 @@ async fn stage_into(
                 )));
             }
 
+            // Artifact paths depend on manifest fields. Validate them before
+            // downloading or placing any executable.
+            fetched.manifest.validate()?;
+
             // Binary-artifact verification stays as defense in depth (see
             // the module docs) — its own sha256, declared inside the
             // now-verified manifest, is checked in

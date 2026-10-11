@@ -1186,8 +1186,9 @@ async fn suspend_to_wait_for_children(
 ///
 /// Returns `Some` suspend outcome (with the durable wait persisted) when it
 /// engages, or `None` to let the run complete normally. No-ops when there is no
-/// storage, no active children, or an untagged wait is already registered.
-/// An inherited tool wait is freshly observed even when its children finished.
+/// storage or no active children and no inherited wait. Every inherited wait is
+/// freshly observed even when its children finished, including an untagged
+/// safety-net wait retained after an incremental child-completion wake.
 async fn maybe_suspend_for_orphaned_children(
     session: &mut Session,
     config: &AgentLoopConfig,
@@ -1204,13 +1205,7 @@ async fn maybe_suspend_for_orphaned_children(
         // wait before this Run can be reported terminal.
         return Ok(None);
     }
-    let inherited_tool_wait = runtime_state
-        .waiting_for_children
-        .as_ref()
-        .is_some_and(|wait| wait.registered_by_tool_call_id.is_some());
-    if runtime_state.waiting_for_children.is_some() && !inherited_tool_wait {
-        return Ok(None);
-    }
+    let inherited_wait = runtime_state.waiting_for_children.is_some();
     let Some(storage) = config.storage.as_ref() else {
         return Ok(None);
     };
@@ -1231,7 +1226,7 @@ async fn maybe_suspend_for_orphaned_children(
         .filter(|(_, status)| !status.as_deref().is_some_and(is_terminal_child_status))
         .map(|(id, _)| id)
         .collect();
-    if !inherited_tool_wait {
+    if !inherited_wait {
         let mut ordinary = Vec::with_capacity(active.len());
         for child_id in active {
             if !crate::ticket_runtime::is_independent_ticket_child(
@@ -1246,7 +1241,7 @@ async fn maybe_suspend_for_orphaned_children(
         }
         active = ordinary;
     }
-    if active.is_empty() && !inherited_tool_wait {
+    if active.is_empty() && !inherited_wait {
         return Ok(None);
     }
     active.sort();
@@ -1258,7 +1253,7 @@ async fn maybe_suspend_for_orphaned_children(
     let durable = storage.load_session(&session.id).await.map_err(|_| {
         AgentError::Tool("parent wait observation failed; refusing to replace its wait".into())
     })?;
-    if inherited_tool_wait && durable.is_none() {
+    if inherited_wait && durable.is_none() {
         return Err(AgentError::Tool(
             "parent wait observation failed; current session is missing".into(),
         ));
@@ -1288,7 +1283,7 @@ async fn maybe_suspend_for_orphaned_children(
         }
     }
 
-    if inherited_tool_wait {
+    if inherited_wait {
         // A completed Any/FirstError wait can leave another child active.
         // Its clear is final: do not grant that child a new six-hour wait.
         runtime_state.waiting_for_children = None;
@@ -3553,10 +3548,54 @@ async fn run_pipeline_inner(
                 // Safety net: if the model is about to finish but left background
                 // children running without waiting on them, suspend instead of
                 // completing so their results are collected.
+                let inherited_untagged_wait = state
+                    .runtime_state
+                    .waiting_for_children
+                    .as_ref()
+                    .is_some_and(|wait| wait.registered_by_tool_call_id.is_none());
                 match maybe_suspend_for_orphaned_children(session, config, &mut state.runtime_state)
                     .await
                 {
                     Ok(Some(suspend)) => {
+                        if inherited_untagged_wait {
+                            // This safety-net wait can also survive a real user
+                            // input. Keep its answer as an intermediate message
+                            // while the remaining children still prevent Complete.
+                            let reasoning = (!stream_output.reasoning_content.trim().is_empty())
+                                .then_some(stream_output.reasoning_content);
+                            let reasoning_signature = reasoning
+                                .as_ref()
+                                .and_then(|_| stream_output.reasoning_signature.clone());
+                            let message = assistant_with_visible_identity(
+                                Message::assistant_with_reasoning(
+                                    stream_output.content,
+                                    None,
+                                    reasoning,
+                                )
+                                .with_reasoning_signature(reasoning_signature),
+                                stream_output.visible_message,
+                            );
+                            let buffered_message = config
+                                .features_final_evidence_check
+                                .then(|| message.clone());
+                            let mut native_items = Some(stream_output.provider_transcript_items);
+                            if let Err(error) =
+                                commit_assistant_message(session, message, &mut native_items)
+                            {
+                                terminal_error = Some(error);
+                                break;
+                            }
+                            if let Some(message) = buffered_message.as_ref() {
+                                publish_buffered_message(event_tx, message).await;
+                            }
+                            record_no_tool_calls_round_completed(
+                                state.metrics_collector.as_ref(),
+                                &round_id,
+                                &state.session_id,
+                                session,
+                                round_activity.token_usage(),
+                            );
+                        }
                         turn_outcome = Some(suspend);
                         break;
                     }
@@ -10790,30 +10829,282 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn safety_net_noop_when_already_waiting() {
-        // A model that DID call wait already has waiting_for_children set; the
-        // safety net must not touch it (and must not even query storage).
+    async fn safety_net_resuspends_existing_untagged_wait_before_terminal_gates() {
+        // An incremental child outcome can interrupt a safety-net wait. Restore
+        // its durable lease before the final-answer and guardian gates run.
         let storage: Arc<dyn Storage> = Arc::new(ChildIndexStorage {
             inner: Arc::new(TestStorage::default()),
             children: vec![("x".into(), Some("running".into()))],
         });
-        let config = config_with_storage(storage);
+        let config = config_with_storage(storage.clone());
         let mut session = Session::new("parent-waiting", "model");
         let mut runtime_state = AgentRuntimeState::new("parent-waiting");
-        runtime_state.waiting_for_children = Some(super::WaitingForChildrenState {
+        let wait = super::WaitingForChildrenState {
             child_session_ids: vec!["x".into()],
             wait_for: super::ChildWaitPolicy::All,
-            registered_at: chrono::Utc::now(),
+            registered_at: chrono::Utc::now() - chrono::Duration::minutes(5),
             timeout_at: None,
             registered_by_tool_call_id: None,
-        });
+        };
+        runtime_state.waiting_for_children = Some(wait.clone());
+        session.agent_runtime_state = Some(runtime_state.clone());
+        storage.save_session(&session).await.unwrap();
 
-        assert!(
+        let outcome =
             maybe_suspend_for_orphaned_children(&mut session, &config, &mut runtime_state)
                 .await
                 .unwrap()
-                .is_none()
+                .expect("remaining inherited child wait suspends the reasoning turn");
+        assert!(outcome.should_break && !outcome.sent_complete);
+        assert_eq!(runtime_state.waiting_for_children.as_ref(), Some(&wait));
+        assert_eq!(
+            session
+                .metadata
+                .get("runtime.suspend_reason")
+                .map(String::as_str),
+            Some("waiting_for_children")
         );
+    }
+
+    struct PartialChildWorkProvider {
+        calls: AtomicUsize,
+        outcome_seen: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for PartialChildWorkProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.outcome_seen.store(
+                    messages
+                        .iter()
+                        .any(|message| message.content == "fast child outcome"),
+                    Ordering::SeqCst,
+                );
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::ToolCalls(vec![
+                        activation_call(
+                            "partial-message",
+                            "SubAgent",
+                            r#"{"action":"send_message","child_session_id":"slow-child","message":"Use the fast child finding"}"#,
+                        ),
+                        activation_call(
+                            "partial-cancel",
+                            "SubAgent",
+                            r#"{"action":"cancel","child_session_id":"obsolete-child"}"#,
+                        ),
+                        activation_call(
+                            "partial-create",
+                            "SubAgent",
+                            r#"{"action":"create","prompt":"Verify the fast child finding","wait":false}"#,
+                        ),
+                    ])),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+            for (id, action) in [
+                ("partial-message", "send_message"),
+                ("partial-cancel", "cancel"),
+                ("partial-create", "create"),
+            ] {
+                assert!(
+                    messages.iter().any(|message| {
+                        message.tool_call_id.as_deref() == Some(id)
+                            && message.content.contains(&format!("handled {action}"))
+                    }),
+                    "tool feedback for {action} reaches the next reasoning round"
+                );
+            }
+            let native = |author, payload| {
+                Ok(LLMChunk::ProviderTranscriptItem(
+                    bamboo_domain::ProviderTranscriptItem::try_from_payload(
+                        bamboo_domain::ProviderFamily::OpenAi,
+                        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                        bamboo_domain::ProviderTranscriptOrigin::Provider,
+                        author,
+                        payload,
+                    )
+                    .unwrap(),
+                ))
+            };
+            Ok(Box::pin(stream::iter(vec![
+                native(
+                    bamboo_domain::ProviderTranscriptAuthor::Model,
+                    serde_json::json!({
+                        "type":"tool_search_call","id":"partial-native-search","execution":"server",
+                        "call_id":"partial-search","status":"completed","arguments":{"paths":["children"]}
+                    }),
+                ),
+                native(
+                    bamboo_domain::ProviderTranscriptAuthor::ToolResult,
+                    serde_json::json!({
+                        "type":"tool_search_output","id":"partial-native-search-result","execution":"server",
+                        "call_id":"partial-search","status":"completed","tools":[]
+                    }),
+                ),
+                native(
+                    bamboo_domain::ProviderTranscriptAuthor::Model,
+                    serde_json::json!({
+                        "type":"message","id":"partial-native-reply","role":"assistant","status":"completed",
+                        "content":[{"type":"output_text","text":"continued after child","annotations":[]}]
+                    }),
+                ),
+                Ok(LLMChunk::ReasoningToken("remaining child work".into())),
+                Ok(LLMChunk::ReasoningSignature(
+                    "partial-reasoning-signature".into(),
+                )),
+                Ok(LLMChunk::Token("continued after child".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[derive(Default)]
+    struct PartialChildWorkExecutor(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for PartialChildWorkExecutor {
+        async fn execute(
+            &self,
+            call: &bamboo_agent_core::tools::ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<bamboo_agent_core::tools::ToolResult>
+        {
+            let arguments: serde_json::Value =
+                serde_json::from_str(&call.function.arguments).unwrap();
+            let action = arguments["action"].as_str().unwrap();
+            self.0.lock().unwrap().push(action.into());
+            Ok(bamboo_agent_core::tools::ToolResult::text(
+                true,
+                format!("handled {action}"),
+            ))
+        }
+
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            vec![loading_test_schema("SubAgent")]
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_child_outcome_can_drive_tool_work_before_resuspending_exact_inherited_wait() {
+        for (tagged, buffered) in [true, false].into_iter().flat_map(|tagged| {
+            [false, true]
+                .into_iter()
+                .map(move |buffered| (tagged, buffered))
+        }) {
+            let storage: Arc<dyn Storage> = Arc::new(ChildIndexStorage {
+                inner: Arc::new(TestStorage::default()),
+                children: vec![("slow-child".into(), Some("running".into()))],
+            });
+            let mut config = config_with_storage(storage.clone());
+            config.model_name = Some("model".into());
+            config.prompt_memory_flags = delegation_loop_config().prompt_memory_flags;
+            config.features_final_evidence_check = buffered;
+            let mut session = Session::new("partial-parent", "model");
+            let mut outcome = Message::user("fast child outcome");
+            outcome.metadata = Some(serde_json::json!({
+                "runtime_kind": "child_completion_resume"
+            }));
+            session.add_message(outcome);
+            let mut state = e2e_loop_state(&session.id);
+            let mut wait = WaitingForChildrenState::for_children(
+                vec!["fast-child".into(), "slow-child".into()],
+                ChildWaitPolicy::All,
+                Utc::now() - chrono::Duration::minutes(5),
+            );
+            wait.registered_by_tool_call_id = tagged.then(|| "original-wait-call".into());
+            state.runtime_state.waiting_for_children = Some(wait.clone());
+            session.agent_runtime_state = Some(state.runtime_state.clone());
+            storage.save_session(&session).await.unwrap();
+            let provider = Arc::new(PartialChildWorkProvider {
+                calls: AtomicUsize::new(0),
+                outcome_seen: AtomicBool::new(false),
+            });
+            let tools = Arc::new(PartialChildWorkExecutor::default());
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+
+            let sent_complete = super::run_pipeline(
+                &mut session,
+                &tx,
+                provider.clone(),
+                tools.clone(),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await
+            .expect("partial child reasoning turn runs without waiting for the slow child");
+
+            assert!(provider.outcome_seen.load(Ordering::SeqCst));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            let mut actions = tools.0.lock().unwrap().clone();
+            actions.sort();
+            assert_eq!(actions, vec!["cancel", "create", "send_message"]);
+            assert!(
+                !sent_complete,
+                "remaining child work bypasses terminal gates"
+            );
+            assert_eq!(state.runtime_state.status, AgentStatusState::Suspended);
+            assert_eq!(
+                state.runtime_state.waiting_for_children.as_ref(),
+                Some(&wait)
+            );
+            let replies: Vec<_> = session
+                .messages
+                .iter()
+                .filter(|message| message.content == "continued after child")
+                .collect();
+            assert_eq!(replies.len(), usize::from(!tagged));
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                assert!(
+                    !matches!(event, AgentEvent::Complete { .. }),
+                    "an inherited wait must not publish Complete"
+                );
+                events.push(event);
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::Token { content } if content == "continued after child"))
+                    .count(),
+                usize::from(!buffered || !tagged),
+                "the untagged reply is published once in either streaming mode"
+            );
+            if let Some(reply) = replies.first() {
+                assert_eq!(reply.reasoning.as_deref(), Some("remaining child work"));
+                assert_eq!(
+                    reply.reasoning_signature.as_deref(),
+                    Some("partial-reasoning-signature")
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, AgentEvent::VisibleMessageStart { message_id, created_at } if message_id == &reply.id && *created_at == reply.created_at))
+                        .count(),
+                    1,
+                    "persistence retains the published reply identity"
+                );
+                let boundary = session
+                    .provider_transcript
+                    .active_provider_boundary_sha256()
+                    .unwrap();
+                let groups = session.provider_transcript.replayable_groups(
+                    bamboo_domain::ProviderFamily::OpenAi,
+                    bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                    boundary,
+                );
+                assert_eq!(groups.len(), 1);
+                assert_eq!(groups[0].anchor_message_id(), reply.id);
+                assert_eq!(groups[0].items().len(), 3);
+                assert_eq!(groups[0].items()[2].payload()["id"], "partial-native-reply");
+            }
+        }
     }
 
     struct InterruptedWaitStorage {
@@ -10847,11 +11138,15 @@ mod tests {
 
     #[tokio::test]
     async fn interrupted_wait_restores_exact_value_without_save_and_completion_wins() {
-        for policy in [
-            ChildWaitPolicy::All,
-            ChildWaitPolicy::Any,
-            ChildWaitPolicy::FirstError,
-        ] {
+        for (tagged, policy) in [true, false].into_iter().flat_map(|tagged| {
+            [
+                ChildWaitPolicy::All,
+                ChildWaitPolicy::Any,
+                ChildWaitPolicy::FirstError,
+            ]
+            .into_iter()
+            .map(move |policy| (tagged, policy))
+        }) {
             let inner = Arc::new(TestStorage::default());
             let mut parent = Session::new("interrupted-parent", "model");
             let registered_at = Utc::now() - chrono::Duration::minutes(5);
@@ -10866,7 +11161,7 @@ mod tests {
                         Some(registered_at + chrono::Duration::minutes(10))
                     }
                 },
-                registered_by_tool_call_id: Some("original-subagent-call".into()),
+                registered_by_tool_call_id: tagged.then(|| "original-subagent-call".into()),
             };
             let mut durable_runtime = AgentRuntimeState::new("original-parent-run");
             durable_runtime.status = AgentStatusState::Suspended;
@@ -10880,13 +11175,18 @@ mod tests {
             });
             let config = config_with_storage(storage.clone());
             let mut runtime = AgentRuntimeState::new("interrupt-reasoning-run");
+            runtime.waiting_for_children = Some(wait.clone());
             parent.agent_runtime_state = Some(runtime.clone());
             let outcome = maybe_suspend_for_orphaned_children(&mut parent, &config, &mut runtime)
                 .await
                 .unwrap()
                 .unwrap();
             assert!(outcome.should_break && !outcome.sent_complete);
-            assert_eq!(runtime.waiting_for_children.as_ref(), Some(&wait));
+            assert_eq!(
+                runtime.waiting_for_children.as_ref(),
+                Some(&wait),
+                "tagged={tagged}, policy={policy:?}"
+            );
             assert_eq!(
                 parent
                     .agent_runtime_state
@@ -11020,21 +11320,24 @@ mod tests {
             assert_eq!(runtime, original_runtime);
             assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
 
-            // An already registered live wait preserves the old no-read path.
-            runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
-                vec!["child-running".into()],
-                ChildWaitPolicy::All,
-                Utc::now(),
-            ));
-            let live_wait = runtime.waiting_for_children.clone();
-            assert!(
-                maybe_suspend_for_orphaned_children(&mut parent, &config, &mut runtime)
+            // Neither tagged nor untagged inherited waits can bypass a failed
+            // observation and continue into terminal completion gates.
+            for tagged in [true, false] {
+                let mut live_wait = WaitingForChildrenState::for_children(
+                    vec!["child-running".into()],
+                    ChildWaitPolicy::All,
+                    Utc::now(),
+                );
+                live_wait.registered_by_tool_call_id = tagged.then(|| "wait-call".into());
+                runtime.waiting_for_children = Some(live_wait.clone());
+                let error = maybe_suspend_for_orphaned_children(&mut parent, &config, &mut runtime)
                     .await
-                    .unwrap()
-                    .is_none()
-            );
-            assert_eq!(runtime.waiting_for_children, live_wait);
-            assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
+                    .err()
+                    .expect("inherited wait observation must fail closed");
+                assert!(matches!(error, AgentError::Tool(_)));
+                assert_eq!(runtime.waiting_for_children.as_ref(), Some(&live_wait));
+                assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
+            }
         }
     }
 
