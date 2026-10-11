@@ -640,6 +640,20 @@ fn actor_tree_session_projection(session: &Session) -> serde_json::Value {
         "project_id": session.project_id_meta(),
         "authority_identity": session.authority_identity,
         "root_tool_authority_revision": session.root_tool_authority_revision,
+        // Narrow diagnostic evidence changes wake existing at1 subscribers.
+        // No private payload, resource instance or query-time expiry is a
+        // public event; this tuple is only an internal equality comparison.
+        "local_task": [
+            session.metadata.get("runtime.local_task.state"),
+            session.metadata.get("runtime.local_task.run_id"),
+            session.metadata.get("runtime.local_task.child_birth"),
+            session.metadata.get("runtime.local_task.observed_at"),
+            session.metadata.get("runtime.local_task.reason"),
+            session.metadata.get("runtime.local_task.instance"),
+            session.metadata.get("runtime.kind"),
+            session.metadata.get("external.agent_id"),
+            session.metadata.get("external.protocol"),
+        ],
     })
 }
 

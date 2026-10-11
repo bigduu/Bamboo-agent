@@ -5,8 +5,9 @@ use super::*;
 use bamboo_agent_core::tools::{ToolCall, ToolError, ToolResult, ToolSchema};
 use bamboo_agent_core::{Message, Role};
 use bamboo_domain::{
-    ActorActivationStatus, ActorLogicalState, SessionActivationPort, SessionInboxPort,
-    SessionMessageEnvelope,
+    ActorActivationStatus, ActorLogicalState, ActorSnapshotLimits, ActorSnapshotPort,
+    ActorSnapshotPrincipal, PublicLocalTaskReason, PublicLocalTaskState, SessionActivationPort,
+    SessionInboxPort, SessionMessageEnvelope,
 };
 use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
 use std::sync::atomic::AtomicUsize;
@@ -397,6 +398,13 @@ impl Harness {
         let instance = &saved.metadata["runtime.local_task.instance"];
         uuid::Uuid::parse_str(instance)
             .expect("only a joined task/resource drain stamps a stop instance");
+        assert_eq!(
+            saved.metadata["runtime.local_task.child_birth"],
+            child.created_at.to_rfc3339()
+        );
+        chrono::DateTime::parse_from_rfc3339(&saved.metadata["runtime.local_task.observed_at"])
+            .unwrap();
+        assert!(!saved.metadata.contains_key("runtime.local_task.reason"));
         let actor = reopened.inspect_actor(&child.id).await.unwrap();
         assert!(actor.actor.matches_session(&saved));
         assert_eq!(actor.actor.ancestor_observations.len(), 1);
@@ -742,6 +750,23 @@ async fn production_local_task_natural_completion_wins_late_cancel_without_poiso
         .unwrap();
     let successor = control.next().await;
     assert!(successor.sees("natural completion won"));
+    let running = harness
+        .store
+        .load_session(&child.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.metadata["runtime.local_task.state"], "running");
+    assert_ne!(running.metadata["runtime.local_task.run_id"], run_id);
+    assert_eq!(
+        running.metadata["runtime.local_task.child_birth"],
+        child.created_at.to_rfc3339()
+    );
+    assert!(
+        !running.metadata.contains_key("runtime.local_task.instance"),
+        "a successor must not inherit an older stop proof"
+    );
+    assert!(!running.metadata.contains_key("runtime.local_task.reason"));
     assert_eq!(
         successor
             .messages
@@ -803,6 +828,7 @@ async fn production_local_task_panic_quarantines_unknown_stop_and_preserves_heal
     let mut control = ProviderControl::new();
     let mut harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 2).await;
     let child = harness.child("panic", "panic inside native task").await;
+    let admission_before = harness.runner.admission.available_permits();
     let mut child_events = harness.child_events(&child).await;
     harness.launch(&child).await.unwrap();
     let call = control.next().await;
@@ -841,12 +867,80 @@ async fn production_local_task_panic_quarantines_unknown_stop_and_preserves_heal
         .is_some_and(|error| error.contains("unknown")));
     assert!(crate::execution::ChildCompletionSource::from_committed_session(&saved).is_none());
     assert!(!saved.metadata.contains_key("runtime.local_task.instance"));
-    assert_ne!(
+    assert_eq!(
         saved
             .metadata
             .get("runtime.local_task.state")
             .map(String::as_str),
-        Some("stopped")
+        Some("stop_unconfirmed")
+    );
+    assert_eq!(saved.metadata["runtime.local_task.run_id"], run_id);
+    assert_eq!(
+        saved.metadata["runtime.local_task.child_birth"],
+        child.created_at.to_rfc3339()
+    );
+    assert_eq!(
+        saved.metadata["runtime.local_task.reason"],
+        "execution_stop_unconfirmed"
+    );
+    chrono::DateTime::parse_from_rfc3339(&saved.metadata["runtime.local_task.observed_at"])
+        .unwrap();
+    let reopened = bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let cold = reopened.load_session(&child.id).await.unwrap().unwrap();
+    for key in LOCAL_TASK_OBSERVATION_KEYS {
+        assert_eq!(
+            saved.metadata.get(key),
+            cold.metadata.get(key),
+            "diagnostic must survive a cold canonical read"
+        );
+    }
+    let snapshot = reopened
+        .actor_subtree_snapshot_v2(
+            ActorSnapshotPrincipal::host_owner(),
+            &harness.parent.id,
+            &harness.parent.id,
+            ActorSnapshotLimits::default(),
+        )
+        .await
+        .unwrap();
+    let node = snapshot
+        .nodes
+        .iter()
+        .find(|node| node.actor.actor_id == child.id)
+        .unwrap();
+    let diagnostic = node
+        .local_task
+        .as_ref()
+        .expect("the production panic must reach the cold read-only projection");
+    assert_eq!(diagnostic.state, PublicLocalTaskState::StopUnconfirmed);
+    assert_eq!(
+        diagnostic.reason,
+        Some(PublicLocalTaskReason::ExecutionStopUnconfirmed)
+    );
+    assert_eq!(
+        diagnostic.observed_at.unwrap().to_rfc3339(),
+        saved.metadata["runtime.local_task.observed_at"]
+    );
+    assert_eq!(
+        node.actor.activation.as_ref().unwrap().status,
+        ActorActivationStatus::Running
+    );
+    assert!(
+        diagnostic.lease_expires_at.unwrap() > chrono::Utc::now(),
+        "explicit unknown is visible even while its exact Actor lease remains valid"
+    );
+    let repeated = execution.persist_stop_unconfirmed().await.unwrap();
+    assert_eq!(
+        repeated.metadata["runtime.local_task.observed_at"],
+        saved.metadata["runtime.local_task.observed_at"],
+        "replay must retain the first evidence timestamp"
+    );
+    assert_eq!(
+        harness.runner.admission.available_permits(),
+        admission_before - 1,
+        "a quarantined coordinator exiting must not release admission"
     );
     assert!(lock(&execution.stop).is_none());
     assert_eq!(
@@ -1032,9 +1126,13 @@ async fn production_local_restart_rejects_unknown_stop_without_relaunch_or_false
     let mut child = original
         .child("unknown", "must not replay an unproven task")
         .await;
-    child
-        .metadata
-        .insert("runtime.local_task.state".into(), "running".into());
+    let child_birth = child.created_at;
+    record_local_task_observation(
+        &mut child,
+        "unproven-before-restart",
+        child_birth,
+        "running",
+    );
     child.set_last_run_status("running");
     original.store.save_session(&child).await.unwrap();
     original.store.ensure_actor(&child.id).await.unwrap();
@@ -1484,4 +1582,290 @@ async fn local_shutdown_keeps_harvested_panic_and_wakes_both_finish_and_shutdown
         ActorActivationStatus::Cancelled
     );
     registration.finish(0).await.unwrap();
+}
+
+#[tokio::test]
+async fn local_unstarted_cleanup_failure_records_durable_unknown_stop() {
+    let home = tempfile::tempdir().unwrap();
+    let control = ProviderControl::new();
+    let harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 1).await;
+    let child = harness
+        .child("unstarted-unknown", "never enters Agent")
+        .await;
+    let run_id = "accepted-unstarted-cleanup-failure";
+    let registration = harness
+        .router
+        .register_run(&child.id, run_id)
+        .await
+        .unwrap();
+    harness
+        .runner
+        .prepare_child_execution(&child, run_id, CancellationToken::new())
+        .await
+        .unwrap();
+    let execution = harness.runner.execution(&child, run_id).unwrap();
+    execution
+        .resources
+        .record_unconfirmed("owned setup resource stop cannot be confirmed");
+    assert!(harness
+        .runner
+        .abandon_child_execution(&child, run_id)
+        .await
+        .is_err());
+    let cold = bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let saved = cold.load_session(&child.id).await.unwrap().unwrap();
+    assert_eq!(
+        saved.metadata["runtime.local_task.state"],
+        "stop_unconfirmed"
+    );
+    assert_eq!(saved.metadata["runtime.local_task.run_id"], run_id);
+    assert_eq!(
+        saved.metadata["runtime.local_task.child_birth"],
+        child.created_at.to_rfc3339()
+    );
+    assert_eq!(
+        saved.metadata["runtime.local_task.reason"],
+        "execution_stop_unconfirmed"
+    );
+    assert!(!saved.metadata.contains_key("runtime.local_task.instance"));
+    assert!(lock(&execution.stop).is_none());
+    assert!(execution.task.lock().await.is_none());
+    registration.quarantine().await;
+    assert!(harness
+        .runner
+        .shutdown()
+        .await
+        .unwrap_err()
+        .contains("unconfirmed"));
+}
+
+#[tokio::test]
+async fn local_coordinator_abort_joins_agent_and_late_writer_before_unknown_observation() {
+    let home = tempfile::tempdir().unwrap();
+    let mut control = ProviderControl::new();
+    let harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 1).await;
+    let mut child = harness
+        .child("coordinator-abort", "enter the real Agent provider")
+        .await;
+    let run_id = "actual-coordinator-aborted-during-agent";
+    let registration = harness
+        .router
+        .register_run(&child.id, run_id)
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    harness
+        .runner
+        .prepare_child_execution(&child, run_id, cancel.clone())
+        .await
+        .unwrap();
+    let execution = harness.runner.execution(&child, run_id).unwrap();
+    child
+        .agent_runtime_state
+        .get_or_insert_with(Default::default)
+        .run_id = run_id.into();
+    execution
+        .persistence
+        .checkpoint_runtime_session(&mut child)
+        .await
+        .unwrap();
+    let admission_during = harness.runner.admission.available_permits();
+    let (events, mut event_rx) = mpsc::channel(256);
+    let event_drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+    let coordinator = {
+        let runner = harness.runner.clone();
+        let mut child = child.clone();
+        let job = SpawnJob {
+            parent_session_id: harness.parent.id.clone(),
+            child_session_id: child.id.clone(),
+            model: MODEL.into(),
+            disabled_tools: None,
+        };
+        tokio::spawn(async move {
+            let _ = runner
+                .execute_external_child(&mut child, &job, events, cancel)
+                .await;
+        })
+    };
+    let abort = coordinator.abort_handle();
+    harness
+        .runner
+        .track_child_task(&child.id, run_id, coordinator);
+    let _actual_provider_call = control.next().await;
+    let mut stale = execution
+        .persistence
+        .load_runtime_control_plane(&child.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stale.metadata["runtime.local_task.state"], "running");
+    let (release_write, write_released) = oneshot::channel();
+    let persistence = execution.persistence.clone();
+    let late_write = execution
+        .resources
+        .spawn_owned(async move {
+            write_released.await.unwrap();
+            // A real registered resource still owns the old Running control plane.
+            // It must finish writing before the supervisor's final observation.
+            persistence
+                .save_runtime_control_plane(&mut stale)
+                .await
+                .unwrap();
+        })
+        .unwrap();
+    abort.abort();
+    tokio::time::timeout(WAIT, execution.cancel.cancelled())
+        .await
+        .unwrap();
+    // The coordinator is already joined before it cancels this token. The
+    // supervisor must now own the actual Agent join mutex while the gated
+    // resource keeps that Agent unfinished. An implementation that only
+    // signals cancellation never acquires this ownership and fails here.
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if execution.task.try_lock().is_err() {
+                break;
+            }
+            assert!(
+                lock(&harness.runner.coordinators)
+                    .iter()
+                    .any(|task| !task.is_finished()),
+                "supervisor exited without joining the surviving Agent writer"
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervisor must take ownership of the Agent join before recording unknown");
+    let before_release = execution
+        .persistence
+        .load_runtime_control_plane(&child.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        before_release.metadata["runtime.local_task.state"], "running",
+        "unknown cannot be finalized while the old writer remains active"
+    );
+    assert!(
+        lock(&harness.runner.coordinators)
+            .iter()
+            .any(|task| !task.is_finished()),
+        "cancel is not evidence that the separate Agent/resource writer has exited"
+    );
+    assert_eq!(
+        harness.runner.admission.available_permits(),
+        admission_during
+    );
+    assert!(lock(&execution.stop).is_none());
+    release_write.send(()).unwrap();
+    tokio::time::timeout(WAIT, late_write)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(WAIT, async {
+        while !lock(&harness.runner.coordinators)
+            .iter()
+            .all(|task| task.is_finished())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(WAIT, event_drain)
+        .await
+        .unwrap()
+        .unwrap();
+    let cold = bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let saved = cold.load_session(&child.id).await.unwrap().unwrap();
+    assert_eq!(
+        saved.metadata["runtime.local_task.state"],
+        "stop_unconfirmed"
+    );
+    assert_eq!(saved.metadata["runtime.local_task.run_id"], run_id);
+    assert!(!saved.metadata.contains_key("runtime.local_task.instance"));
+    assert!(crate::execution::ChildCompletionSource::from_committed_session(&saved).is_none());
+    assert!(execution.task.lock().await.is_none());
+    assert!(lock(&execution.stop).is_none());
+    assert_eq!(
+        harness.runner.admission.available_permits(),
+        admission_during
+    );
+    registration.quarantine().await;
+    assert!(harness.runner.shutdown().await.is_err());
+}
+
+#[tokio::test]
+async fn local_confirmed_stop_without_publication_keeps_admission_after_coordinator_exit() {
+    let home = tempfile::tempdir().unwrap();
+    let control = ProviderControl::new();
+    let harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 1).await;
+    let child = harness
+        .child("unpublished-stop", "unused accepted setup input")
+        .await;
+    let run_id = "stopped-unpublished-coordinator";
+    let registration = harness
+        .router
+        .register_run(&child.id, run_id)
+        .await
+        .unwrap();
+    let before = harness.runner.admission.available_permits();
+    harness
+        .runner
+        .prepare_child_execution(&child, run_id, CancellationToken::new())
+        .await
+        .unwrap();
+    let execution = harness.runner.execution(&child, run_id).unwrap();
+    let coordinator = {
+        let runner = harness.runner.clone();
+        let execution = execution.clone();
+        let child = child.clone();
+        tokio::spawn(async move {
+            let stopped =
+                checkpoint_unstarted_cancellation(&runner, &execution, child, run_id).await;
+            assert!(runner
+                .finish_child_execution(&stopped, run_id, false)
+                .await
+                .is_err());
+        })
+    };
+    assert!(harness
+        .runner
+        .track_child_task(&child.id, run_id, coordinator)
+        .is_none());
+    tokio::time::timeout(WAIT, async {
+        while !lock(&harness.runner.coordinators)
+            .iter()
+            .all(|task| task.is_finished())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        lock(&execution.stop).is_some(),
+        "the no-work execution actually drained"
+    );
+    assert!(!execution.finalized.load(Ordering::Acquire));
+    assert_eq!(harness.runner.admission.available_permits(), before - 1);
+    let saved = harness
+        .store
+        .load_session(&child.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        saved.metadata["runtime.local_task.state"], "stopped",
+        "failed publication must not erase confirmed physical stop"
+    );
+    assert!(!saved.metadata.contains_key("runtime.local_task.reason"));
+    assert!(crate::execution::ChildCompletionSource::from_committed_session(&saved).is_none());
+    registration.quarantine().await;
+    harness.runner.shutdown().await.unwrap();
 }

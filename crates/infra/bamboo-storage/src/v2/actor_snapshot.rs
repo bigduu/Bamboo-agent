@@ -5,8 +5,13 @@ use super::SessionStoreV2;
 use async_trait::async_trait;
 use bamboo_domain::{
     ActorSnapshotError as Error, ActorSnapshotLimits, ActorSnapshotPort, ActorSnapshotPrincipal,
-    PublicActorSubtreeSnapshot,
+    PublicActorSubtreeSnapshot, PublicActorSubtreeSnapshotV2,
 };
+
+enum Snapshot {
+    V1(PublicActorSubtreeSnapshot),
+    V2(PublicActorSubtreeSnapshotV2),
+}
 
 #[async_trait]
 impl ActorSnapshotPort for SessionStoreV2 {
@@ -17,6 +22,41 @@ impl ActorSnapshotPort for SessionStoreV2 {
         subtree_id: &str,
         limits: ActorSnapshotLimits,
     ) -> Result<PublicActorSubtreeSnapshot, Error> {
+        match self
+            .read_actor_snapshot(principal, root_id, subtree_id, limits, false)
+            .await?
+        {
+            Snapshot::V1(snapshot) => Ok(snapshot),
+            Snapshot::V2(_) => Err(Error::StorageUnavailable),
+        }
+    }
+
+    async fn actor_subtree_snapshot_v2(
+        &self,
+        principal: ActorSnapshotPrincipal,
+        root_id: &str,
+        subtree_id: &str,
+        limits: ActorSnapshotLimits,
+    ) -> Result<PublicActorSubtreeSnapshotV2, Error> {
+        match self
+            .read_actor_snapshot(principal, root_id, subtree_id, limits, true)
+            .await?
+        {
+            Snapshot::V2(snapshot) => Ok(snapshot),
+            Snapshot::V1(_) => Err(Error::StorageUnavailable),
+        }
+    }
+}
+
+impl SessionStoreV2 {
+    async fn read_actor_snapshot(
+        &self,
+        principal: ActorSnapshotPrincipal,
+        root_id: &str,
+        subtree_id: &str,
+        limits: ActorSnapshotLimits,
+        v2: bool,
+    ) -> Result<Snapshot, Error> {
         if !limits.is_bounded() {
             return Err(Error::BudgetExceeded);
         }
@@ -42,14 +82,14 @@ impl ActorSnapshotPort for SessionStoreV2 {
                 // A cancelled HTTP future cannot release these guards while
                 // spawn_blocking is still reading durable authority.
                 let _guards = (lifecycle, transactions);
-                supported::read_snapshot(&home, &principal, &root, &subtree, limits)
+                supported::read_snapshot(&home, &principal, &root, &subtree, limits, v2)
             })
             .await
             .map_err(|_| Error::StorageUnavailable)?
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
-            let _ = (principal, root_id, subtree_id);
+            let _ = (principal, root_id, subtree_id, v2);
             Err(Error::UnsupportedAuthority)
         }
     }
@@ -100,10 +140,13 @@ mod supported {
     };
     use super::*;
     use bamboo_domain::{
-        ActorAncestorObservation, ActorDirectoryEntry, ActorLogicalState, ActorSnapshotAuthority,
-        PublicActorActivation, PublicActorRevision, PublicActorSnapshotNode,
-        RootModeOperationReceipt, Session, SessionAuthorityIdentity, SessionKind,
-        SupervisorManagementState, ACTOR_DIRECTORY_SCHEMA_VERSION, ACTOR_SNAPSHOT_SCHEMA_VERSION,
+        ActorAncestorObservation, ActorDirectoryEntry, ActorLogicalState, ActorPlacementClass,
+        ActorPlacementIntent, ActorSnapshotAuthority, PublicActorActivation, PublicActorRevision,
+        PublicActorSnapshotNode, PublicActorSnapshotNodeV2, PublicLocalTaskObservation,
+        PublicLocalTaskReason, PublicLocalTaskState, RootModeOperationReceipt, Session,
+        SessionAuthorityIdentity, SessionKind, SupervisorManagementState,
+        ACTOR_DIRECTORY_SCHEMA_VERSION, ACTOR_SNAPSHOT_SCHEMA_VERSION,
+        ACTOR_SNAPSHOT_V2_SCHEMA_VERSION,
     };
     use chrono::{DateTime, Utc};
     use serde::{de::DeserializeOwned, Deserialize};
@@ -158,7 +201,7 @@ mod supported {
         }
         let sessions = home.child(OsStr::new("sessions"))?.ok_or(Error::NotFound)?;
         let root_dir = sessions.child(OsStr::new(root))?.ok_or(Error::NotFound)?;
-        let source = read_source(&root_dir, root, root, true, &mut budget)?;
+        let source = read_source(&root_dir, root, root, true, &mut budget, false)?;
         if let Some(revocations) = home.child(OsStr::new(".root-revocations"))? {
             if let Some(bytes) = revocations.read(&format!("{root}.json"), 4096, &mut budget)? {
                 let evidence = decode::<Revocation>(&bytes)?;
@@ -249,6 +292,113 @@ mod supported {
     struct Source {
         session: Session,
         row: Option<ActorDirectoryEntry>,
+        local_task: Option<LocalTaskMetadata>,
+    }
+
+    /// Parsed only for v2, from the same bounded sidecar bytes as Identity.
+    /// Unrelated private metadata is skipped, and malformed diagnostics are
+    /// suppressed rather than changing v1 parsing or granting partial evidence.
+    #[derive(Default, Deserialize)]
+    struct LocalTaskMetadata {
+        #[serde(rename = "runtime.local_task.state")]
+        state: Option<String>,
+        #[serde(rename = "runtime.local_task.run_id")]
+        run_id: Option<String>,
+        #[serde(rename = "runtime.local_task.child_birth")]
+        child_birth: Option<DateTime<Utc>>,
+        #[serde(rename = "runtime.local_task.observed_at")]
+        observed_at: Option<DateTime<Utc>>,
+        #[serde(rename = "runtime.local_task.reason")]
+        reason: Option<String>,
+        #[serde(rename = "runtime.local_task.instance")]
+        instance: Option<Uuid>,
+        #[serde(rename = "runtime.kind")]
+        runtime_kind: Option<String>,
+        #[serde(rename = "external.agent_id")]
+        agent_id: Option<String>,
+        #[serde(rename = "external.protocol")]
+        protocol: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct LocalTaskSidecar {
+        #[serde(default)]
+        metadata: LocalTaskMetadata,
+    }
+
+    fn local_task_observation(
+        source: &Source,
+        now: DateTime<Utc>,
+    ) -> Option<PublicLocalTaskObservation> {
+        if source.session.kind != SessionKind::Child
+            || !source.session.authority_identity.is_ordinary()
+        {
+            return None;
+        }
+        let row = source.row.as_ref()?;
+        let activation = row.activation.as_ref()?;
+        let evidence = source.local_task.as_ref()?;
+        if row.actor.placement_intent != Some(ActorPlacementIntent::Local)
+            || activation
+                .placement_ref
+                .as_ref()
+                .is_some_and(|p| p.class != ActorPlacementClass::Local)
+            || evidence.run_id.as_deref() != Some(activation.run_id.as_str())
+            || evidence.child_birth != Some(source.session.created_at)
+            || evidence
+                .agent_id
+                .as_deref()
+                .is_some_and(|id| id != "local-actor")
+            || evidence
+                .protocol
+                .as_deref()
+                .is_some_and(|protocol| protocol != "actor")
+            || evidence
+                .runtime_kind
+                .as_deref()
+                .is_some_and(|kind| kind != "external")
+        {
+            return None;
+        }
+        let observed_at = evidence.observed_at?;
+        if observed_at < source.session.created_at {
+            return None;
+        }
+        if evidence.state.as_deref() == Some("running")
+            && (evidence.instance.is_some()
+                || row.actor.state != ActorLogicalState::Active
+                || !activation.status.is_live())
+        {
+            return None;
+        }
+        let (state, reason, observed_at) =
+            match (evidence.state.as_deref(), evidence.reason.as_deref()) {
+                (Some("stopped"), None) if evidence.instance.is_some() => {
+                    (PublicLocalTaskState::Stopped, None, observed_at)
+                }
+                (Some("stop_unconfirmed"), Some("execution_stop_unconfirmed"))
+                    if evidence.instance.is_none() =>
+                {
+                    (
+                        PublicLocalTaskState::StopUnconfirmed,
+                        Some(PublicLocalTaskReason::ExecutionStopUnconfirmed),
+                        observed_at,
+                    )
+                }
+                (Some("running"), None) if activation.lease_expires_at <= now => (
+                    PublicLocalTaskState::StopUnconfirmed,
+                    Some(PublicLocalTaskReason::LeaseExpiredWithoutStop),
+                    activation.lease_expires_at,
+                ),
+                (Some("running"), None) => (PublicLocalTaskState::Running, None, observed_at),
+                _ => return None,
+            };
+        Some(PublicLocalTaskObservation {
+            state,
+            reason,
+            observed_at: Some(observed_at),
+            lease_expires_at: Some(activation.lease_expires_at),
+        })
     }
 
     fn live_fence_matches(source: &Source, fence: &bamboo_domain::ActorActivationFence) -> bool {
@@ -276,6 +426,7 @@ mod supported {
         root: &str,
         is_root: bool,
         budget: &mut ReadBudget,
+        v2: bool,
     ) -> Result<Source, Error> {
         let bytes = directory
             .read_main_section(budget)?
@@ -283,10 +434,20 @@ mod supported {
         let main = super::super::compact_main::decode_v1_section(&bytes, budget.limits.file_bytes)
             .map_err(|_| Error::InconsistentAuthority)?
             .into_snapshot_session();
-        let side = directory
-            .read(RUNTIME_SIDECAR_FILE, budget.limits.file_bytes, budget)?
-            .map(|bytes| decode::<Identity>(&bytes).map(Identity::session))
+        let side_bytes = directory.read(RUNTIME_SIDECAR_FILE, budget.limits.file_bytes, budget)?;
+        let side = side_bytes
+            .as_ref()
+            .map(|bytes| decode::<Identity>(bytes).map(Identity::session))
             .transpose()?;
+        let local_task = if v2 {
+            side_bytes.as_ref().and_then(|bytes| {
+                serde_json::from_slice::<LocalTaskSidecar>(bytes)
+                    .ok()
+                    .map(|side| side.metadata)
+            })
+        } else {
+            None
+        };
         if main.id != id
             || main.kind
                 != if is_root {
@@ -368,7 +529,11 @@ mod supported {
             }
             _ => return Err(Error::InconsistentAuthority),
         };
-        Ok(Source { session, row })
+        Ok(Source {
+            session,
+            row,
+            local_task,
+        })
     }
 
     fn lineage<'a>(
@@ -440,7 +605,8 @@ mod supported {
         root: &str,
         subtree: &str,
         limits: ActorSnapshotLimits,
-    ) -> Result<PublicActorSubtreeSnapshot, Error> {
+        v2: bool,
+    ) -> Result<Snapshot, Error> {
         let home = Directory::open_absolute(home)?;
         let mut budget = ReadBudget::new(limits);
         // Any pending journal makes a coherent view unavailable. Stop at first
@@ -461,7 +627,7 @@ mod supported {
         if let ActorSnapshotAuthority::LiveActor(fence) = principal.authority() {
             selector(&fence.actor_id).map_err(|_| Error::UnauthorizedScope)?;
             let source = if fence.actor_id == root {
-                read_source(&root_dir, root, root, true, &mut budget)?
+                read_source(&root_dir, root, root, true, &mut budget, v2)?
             } else {
                 if limits.nodes < 2 {
                     return Err(Error::BudgetExceeded);
@@ -471,7 +637,7 @@ mod supported {
                     .ok_or(Error::UnauthorizedScope)?
                     .child(OsStr::new(&fence.actor_id))?
                     .ok_or(Error::UnauthorizedScope)?;
-                read_source(&directory, &fence.actor_id, root, false, &mut budget)?
+                read_source(&directory, &fence.actor_id, root, false, &mut budget, v2)?
             };
             if !live_fence_matches(&source, fence) {
                 return Err(Error::UnauthorizedScope);
@@ -481,7 +647,7 @@ mod supported {
         if !sources.contains_key(root) {
             sources.insert(
                 root.to_owned(),
-                read_source(&root_dir, root, root, true, &mut budget)?,
+                read_source(&root_dir, root, root, true, &mut budget, v2)?,
             );
         }
         if let Some(revocations) = home.child(OsStr::new(".root-revocations"))? {
@@ -509,7 +675,7 @@ mod supported {
                     return Err(Error::BudgetExceeded);
                 }
                 let dir = children.child(&name)?.ok_or(Error::InconsistentAuthority)?;
-                let source = read_source(&dir, id, root, false, &mut budget)?;
+                let source = read_source(&dir, id, root, false, &mut budget, v2)?;
                 if sources.insert(id.to_owned(), source).is_some() {
                     return Err(Error::InconsistentAuthority);
                 }
@@ -551,6 +717,11 @@ mod supported {
                 return Err(Error::UnauthorizedScope);
             }
         }
+        // One diagnostic observation time after bounded I/O and authorization.
+        // Authorization above deliberately rechecks its own fresh clock: this
+        // view clock cannot extend an expired caller's authority. Expiry here
+        // is derived only; neither the canonical row nor cursor is changed.
+        let now = Utc::now();
         let mut nodes = Vec::new();
         for (id, source) in &sources {
             if id != subtree
@@ -589,6 +760,62 @@ mod supported {
         // later successful publication restores matching canonical identity.
         let stream_cursor = cursor_for_root(&root_dir, &sources[root].session, &mut budget)?
             .map(|(cursor, _revision)| cursor);
+        if v2 {
+            let nodes: Vec<_> = nodes
+                .into_iter()
+                .map(|actor| {
+                    let local_task = local_task_observation(&sources[&actor.actor_id], now);
+                    PublicActorSnapshotNodeV2 { actor, local_task }
+                })
+                .collect();
+            let refresh_after_ms = nodes
+                .iter()
+                .filter_map(|node| {
+                    let observation = node.local_task.as_ref()?;
+                    (observation.state == PublicLocalTaskState::Running)
+                        .then_some(observation.lease_expires_at?)
+                })
+                .min()
+                .and_then(|deadline| {
+                    let remaining = (deadline - now).to_std().ok()?;
+                    let millis = remaining.as_millis()
+                        + u128::from(remaining.subsec_nanos() % 1_000_000 != 0);
+                    u32::try_from(millis.max(1000))
+                        .ok()
+                        .filter(|ms| *ms <= i32::MAX as u32)
+                });
+            let mut snapshot = PublicActorSubtreeSnapshotV2 {
+                schema_version: ACTOR_SNAPSHOT_V2_SCHEMA_VERSION,
+                root_actor_id: root.to_owned(),
+                subtree_actor_id: subtree.to_owned(),
+                snapshot_id: String::new(),
+                stream_cursor: None,
+                refresh_after_ms: None,
+                nodes,
+            };
+            // Both transport coordinates are excluded from identity. Account
+            // for their exact serialized growth so the final wire stays inside
+            // the same response ceiling, including with a one-byte margin.
+            let cursor_growth = stream_cursor
+                .as_ref()
+                .map_or(0, |cursor| cursor.len().saturating_sub(2));
+            let refresh_growth =
+                refresh_after_ms.map_or(0, |ms| ms.to_string().len().saturating_sub(4));
+            let mut writer = BoundedDigest {
+                digest: Sha256::new(),
+                bytes: 0,
+                max: limits
+                    .response_bytes
+                    .saturating_sub(68)
+                    .saturating_sub(cursor_growth)
+                    .saturating_sub(refresh_growth),
+            };
+            serde_json::to_writer(&mut writer, &snapshot).map_err(|_| Error::BudgetExceeded)?;
+            snapshot.snapshot_id = format!("as2-{:x}", writer.digest.finalize());
+            snapshot.stream_cursor = stream_cursor;
+            snapshot.refresh_after_ms = refresh_after_ms;
+            return Ok(Snapshot::V2(snapshot));
+        }
         let mut snapshot = PublicActorSubtreeSnapshot {
             schema_version: ACTOR_SNAPSHOT_SCHEMA_VERSION,
             root_actor_id: root.to_owned(),
@@ -616,7 +843,7 @@ mod supported {
         serde_json::to_writer(&mut writer, &snapshot).map_err(|_| Error::BudgetExceeded)?;
         snapshot.snapshot_id = format!("as1-{:x}", writer.digest.finalize());
         snapshot.stream_cursor = stream_cursor;
-        Ok(snapshot)
+        Ok(Snapshot::V1(snapshot))
     }
 
     #[cfg(test)]

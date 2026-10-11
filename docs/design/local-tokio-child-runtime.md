@@ -83,6 +83,41 @@ previously stopped generation. A `running` local generation without a confirmed
 stop remains blocked even after its Actor lease expires; it requires explicit
 reconciliation rather than guessing that physical work ended.
 
+Unknown stop observations are persisted by the same current Child writer,
+bound to its run and birth, with a stable first-observed timestamp. They never
+mint a stop receipt or release admission. If a coordinator exits before its
+separate Agent task, the supervisor cancels and joins that task and drains its
+owned resources before writing the final observation, so a late runtime write
+cannot replace it with an older `running` marker. Failed diagnostic persistence
+is reported and does not unlock the quarantined execution.
+
+## Read-only stop diagnostics
+
+Actor subtree snapshots keep the existing version 1 shape by default. Clients
+can request `application/vnd.bamboo.actor-snapshot.v2+json` in `Accept`, with
+`application/json` as their version 1 fallback. Version 2 uses a separate `as2-`
+snapshot identity; both versions vary by `Accept`. The `at1` stream cursor keeps
+its existing refresh semantics and grants no execution or recovery authority.
+
+Version 2 adds only a nullable `local_task` observation to each node: a static
+state/reason and observation/lease timestamps. It contains no private run,
+resource instance, owner, PID, path, or error text. Only a current ordinary
+native Child with matching durable birth and activation is eligible. A valid
+stopped instance takes precedence over an expired lease; resource stop alone
+does not imply business completion or cancellation. An explicit unconfirmed
+stop remains visible even while the Host renews its Actor lease. A matching
+live `running` observation whose lease expires is instead shown as
+`lease_expired_without_stop`; generic or remote Actor lease expiry is not
+classified as native unknown stop.
+
+The optional `refresh_after_ms` is a one-shot transport hint for the earliest
+remaining native lease deadline, not a polling mandate or part of snapshot
+identity. The complete delay is bounded by the browser-safe timeout range;
+stable expired evidence does not create a busy refresh loop. Query-time expiry
+does not mutate storage or advance its cursor. Lotus accepts both strict wire
+versions, preserves canonical business outcomes, and shows unconfirmed stops
+without offering a forged success or automatic takeover.
+
 The adjacent draft-publication, parent-wait rollback receipt and interrupted
 steering journals tracked by #1328, #1330 and #1331 remain separate work. Their
 current generic action paths are not presented as fixed by this backend.

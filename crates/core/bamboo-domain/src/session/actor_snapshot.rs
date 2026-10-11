@@ -9,6 +9,8 @@ use super::{
 };
 
 pub const ACTOR_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const ACTOR_SNAPSHOT_V2_SCHEMA_VERSION: u32 = 2;
+pub const ACTOR_SNAPSHOT_V2_MEDIA_TYPE: &str = "application/vnd.bamboo.actor-snapshot.v2+json";
 
 /// Constructed by trusted host/runtime code, never decoded from a public request.
 /// A selector or a Session ID alone cannot confer actor authority.
@@ -123,6 +125,55 @@ pub struct PublicActorSubtreeSnapshot {
     pub nodes: Vec<PublicActorSnapshotNode>,
 }
 
+/// Execution-resource observations only. These never replace canonical actor
+/// state or prove business completion, cancellation, or recovery eligibility.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicLocalTaskState {
+    Running,
+    Stopped,
+    StopUnconfirmed,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicLocalTaskReason {
+    ExecutionStopUnconfirmed,
+    LeaseExpiredWithoutStop,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct PublicLocalTaskObservation {
+    pub state: PublicLocalTaskState,
+    pub reason: Option<PublicLocalTaskReason>,
+    pub observed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Separate opt-in wire shape: adding diagnostics must not alter v1 bodies or
+/// identities. Only whitelisted observations appear here, never private proof.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct PublicActorSnapshotNodeV2 {
+    #[serde(flatten)]
+    pub actor: PublicActorSnapshotNode,
+    pub local_task: Option<PublicLocalTaskObservation>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct PublicActorSubtreeSnapshotV2 {
+    pub schema_version: u32,
+    pub root_actor_id: String,
+    pub subtree_actor_id: String,
+    /// Equality identity in the separate as2 namespace, never ordering authority.
+    pub snapshot_id: String,
+    pub stream_cursor: Option<String>,
+    /// Transport-only refresh hint, excluded from snapshot identity. A present
+    /// value is the remaining deadline delay in 1000..=2147483647 ms. Deadlines
+    /// beyond the browser-safe timeout range have no hint.
+    pub refresh_after_ms: Option<u32>,
+    pub nodes: Vec<PublicActorSnapshotNodeV2>,
+}
+
 /// Static diagnostic codes carry no paths, private authority, or source contents.
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -156,4 +207,14 @@ pub trait ActorSnapshotPort: Send + Sync {
         subtree_id: &str,
         limits: ActorSnapshotLimits,
     ) -> Result<PublicActorSubtreeSnapshot, ActorSnapshotError>;
+
+    async fn actor_subtree_snapshot_v2(
+        &self,
+        _principal: ActorSnapshotPrincipal,
+        _root_id: &str,
+        _subtree_id: &str,
+        _limits: ActorSnapshotLimits,
+    ) -> Result<PublicActorSubtreeSnapshotV2, ActorSnapshotError> {
+        Err(ActorSnapshotError::UnsupportedAuthority)
+    }
 }

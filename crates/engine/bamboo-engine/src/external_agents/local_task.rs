@@ -91,6 +91,7 @@ struct Execution {
     resources: bamboo_tools::LocalTaskResources,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<ExecutionOutput>>>,
     stop: Mutex<Option<ConfirmedTaskStop>>,
+    finalized: AtomicBool,
     launch: Mutex<LaunchState>,
     admission: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
     slot: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
@@ -100,6 +101,64 @@ struct Execution {
 }
 
 impl Execution {
+    async fn persist_stop_unconfirmed(&self) -> Result<Session, String> {
+        // The same birth/fence-bound writer owns this narrow observation. A
+        // task panic must never checkpoint its partially mutated transcript.
+        let mut current = self
+            .persistence
+            .load_runtime_control_plane(&self.owner.fence.actor_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("Child missing while recording unconfirmed stop")?;
+        let same_observation = current
+            .metadata
+            .get("runtime.local_task.state")
+            .map(String::as_str)
+            == Some("stop_unconfirmed")
+            && current.metadata.get("runtime.local_task.run_id") == Some(&self.owner.fence.run_id)
+            && current.metadata.get("runtime.local_task.child_birth")
+                == Some(&self.owner.created_at.to_rfc3339())
+            && current
+                .metadata
+                .get("runtime.local_task.reason")
+                .map(String::as_str)
+                == Some("execution_stop_unconfirmed")
+            && current
+                .metadata
+                .get("runtime.local_task.observed_at")
+                .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok());
+        if !same_observation {
+            record_local_task_observation(
+                &mut current,
+                &self.owner.fence.run_id,
+                self.owner.created_at,
+                "stop_unconfirmed",
+            );
+            current.metadata.insert(
+                "runtime.local_task.reason".into(),
+                "execution_stop_unconfirmed".into(),
+            );
+        }
+        current.metadata.remove("runtime.local_task.instance");
+        self.persistence
+            .save_runtime_control_plane(&mut current)
+            .await
+            .map_err(|e| e.to_string())?;
+        let readback = self
+            .persistence
+            .load_runtime_control_plane(&self.owner.fence.actor_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("Child missing after unconfirmed-stop checkpoint")?;
+        if LOCAL_TASK_OBSERVATION_KEYS
+            .iter()
+            .any(|key| current.metadata.get(*key) != readback.metadata.get(*key))
+        {
+            return Err("unconfirmed-stop checkpoint readback differs".into());
+        }
+        Ok(readback)
+    }
+
     async fn wait_for_handoff(&self) {
         let mut handoff = self.launch_handoff.subscribe();
         while !*handoff.borrow_and_update() {
@@ -132,10 +191,55 @@ pub struct LocalTaskChildRunner {
 fn failure(error: impl std::fmt::Display) -> AgentError {
     AgentError::LLM(format!("local task backend: {error}"))
 }
-fn record_stop_metadata(session: &mut Session, proof: &ConfirmedTaskStop) {
+const LOCAL_TASK_OBSERVATION_KEYS: [&str; 6] = [
+    "runtime.local_task.state",
+    "runtime.local_task.run_id",
+    "runtime.local_task.child_birth",
+    "runtime.local_task.observed_at",
+    "runtime.local_task.reason",
+    "runtime.local_task.instance",
+];
+
+fn record_local_task_observation(
+    session: &mut Session,
+    run_id: &str,
+    child_birth: chrono::DateTime<chrono::Utc>,
+    state: &str,
+) {
+    for key in LOCAL_TASK_OBSERVATION_KEYS {
+        session.metadata.remove(key);
+    }
     session
         .metadata
-        .insert("runtime.local_task.state".into(), "stopped".into());
+        .insert("runtime.local_task.state".into(), state.into());
+    session
+        .metadata
+        .insert("runtime.local_task.run_id".into(), run_id.into());
+    session.metadata.insert(
+        "runtime.local_task.child_birth".into(),
+        child_birth.to_rfc3339(),
+    );
+    session.metadata.insert(
+        "runtime.local_task.observed_at".into(),
+        chrono::Utc::now().to_rfc3339(),
+    );
+}
+
+fn copy_local_task_observation(from: &Session, to: &mut Session) {
+    for key in LOCAL_TASK_OBSERVATION_KEYS {
+        match from.metadata.get(key) {
+            Some(value) => {
+                to.metadata.insert(key.into(), value.clone());
+            }
+            None => {
+                to.metadata.remove(key);
+            }
+        }
+    }
+}
+
+fn record_stop_metadata(session: &mut Session, proof: &ConfirmedTaskStop) {
+    record_local_task_observation(session, &proof.run_id, proof.child_birth, "stopped");
     session.metadata.insert(
         "runtime.local_task.instance".into(),
         proof.instance_id.to_string(),
@@ -523,6 +627,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
             ),
             task: tokio::sync::Mutex::new(None),
             stop: Mutex::new(None),
+            finalized: AtomicBool::new(false),
             launch: Mutex::new(LaunchState::Queued),
             admission: Mutex::new(Some(admission)),
             slot: Mutex::new(None),
@@ -636,9 +741,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         owned_session.metadata.remove("runtime.actor_parent_question_handoff");
         owned_session.metadata.remove(bamboo_subagent::proto::WORKFLOW_TERMINAL_OBSERVATION_KEY);
         owned_session.metadata.remove(bamboo_subagent::proto::WORKFLOW_USAGE_OBSERVATION_KEY);
-        owned_session
-            .metadata
-            .insert("runtime.local_task.state".into(), "running".into());
+        record_local_task_observation(&mut owned_session, &run_id, execution.owner.created_at, "running");
         execution
             .persistence
             .checkpoint_runtime_session(&mut owned_session)
@@ -762,27 +865,42 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         }.await;
         // No-work stop is proved by permanently closing the launch gate and
         // draining the resource domain, never by inventing a PID or a task join.
-        let unstarted = *lock(&execution.launch) == LaunchState::Preparing;
-        if unstarted {
-            self.stop_unstarted(&execution, session, &run_id)
-                .await
-                .map_err(failure)?;
+        let result = async {
+            let unstarted = *lock(&execution.launch) == LaunchState::Preparing;
+            if unstarted {
+                self.stop_unstarted(&execution, session, &run_id)
+                    .await
+                    .map_err(failure)?;
+            }
+            if unstarted
+                && crate::ticket_runtime::read_dispatch(session)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|d| d.receipt.is_some())
+            {
+                let proof = lock(&execution.stop)
+                    .clone()
+                    .ok_or_else(|| failure("local stop proof missing"))?;
+                if let Some(tickets) = tickets {
+                    crate::ticket_runtime::checkpoint_owned_task_stop(
+                        &tickets, &binding, session, &run_id, &proof, false,
+                    )
+                    .await
+                    .map_err(failure)?;
+                }
+            }
+            result
         }
-        if unstarted
-            && crate::ticket_runtime::read_dispatch(session)
-                .ok()
-                .flatten()
-                .is_some_and(|d| d.receipt.is_some())
-        {
-            let proof = lock(&execution.stop)
-                .clone()
-                .ok_or_else(|| failure("local stop proof missing"))?;
-            if let Some(tickets) = tickets {
-                crate::ticket_runtime::checkpoint_owned_task_stop(
-                    &tickets, &binding, session, &run_id, &proof, false,
-                )
-                .await
-                .map_err(failure)?;
+        .await;
+        if result.is_err() && lock(&execution.stop).is_none() {
+            match execution.persist_stop_unconfirmed().await {
+                Ok(observed) => copy_local_task_observation(&observed, session),
+                Err(error) => {
+                    return Err(failure(format!(
+                        "{}; unconfirmed-stop observation was not durably confirmed: {error}",
+                        result.unwrap_err()
+                    )))
+                }
             }
         }
         result
@@ -793,8 +911,14 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         execution.cancel.cancel();
         execution.launch_handoff.send_replace(true);
         let mut stopped = session.clone();
-        self.stop_unstarted(&execution, &mut stopped, run_id)
-            .await?;
+        if let Err(error) = self.stop_unstarted(&execution, &mut stopped, run_id).await {
+            return match execution.persist_stop_unconfirmed().await {
+                Ok(_) => Err(error),
+                Err(checkpoint) => Err(format!(
+                    "{error}; unconfirmed-stop observation was not durably confirmed: {checkpoint}"
+                )),
+            };
+        }
         stopped.set_last_run_status("error");
         stopped.set_last_run_error("initial local Child checkpoint failed");
         execution
@@ -828,9 +952,45 @@ impl ExternalChildRunner for LocalTaskChildRunner {
             // The retained supervisor owns and joins the actual coordinator;
             // completed permits are returned without waiting for a later spawn.
             let permit = lock(&execution.admission).take();
+            let retained_execution = execution.clone();
             let supervisor = tokio::spawn(async move {
-                let _permit = permit;
-                handle.await.map_err(|error| error.to_string())
+                let mut result = handle.await.map_err(|error| error.to_string());
+                if !retained_execution.finalized.load(Ordering::Acquire) {
+                    // A coordinator exiting does not make an unconfirmed or
+                    // unpublished execution eligible for replacement.
+                    if let Some(permit) = permit {
+                        *lock(&retained_execution.admission) = Some(permit);
+                    }
+                    if lock(&retained_execution.stop).is_none() {
+                        retained_execution.cancel.cancel();
+                        // The coordinator may have unwound while its separate
+                        // Agent task still owned a canonical writer. Cancellation
+                        // alone does not stop those writes: join that task and
+                        // all registered resources before recording the final
+                        // unknown observation. This recovery does not mint a
+                        // normal execution/publication stop receipt.
+                        let mut orphaned_task = retained_execution.task.lock().await;
+                        if let Some(task) = orphaned_task.take() {
+                            if let Err(error) = task.await {
+                                retained_execution.resources.record_unconfirmed(format!(
+                                    "orphaned Agent task join failed: {error}"
+                                ));
+                            }
+                        }
+                        drop(orphaned_task);
+                        let _ = retained_execution.resources.close_and_drain().await;
+                        if let Err(error) = retained_execution.persist_stop_unconfirmed().await {
+                            result = Err(format!(
+                                "{}unconfirmed-stop observation was not durably confirmed: {error}",
+                                result
+                                    .err()
+                                    .map(|error| format!("{error}; "))
+                                    .unwrap_or_default()
+                            ));
+                        }
+                    }
+                }
+                result
             });
             let mut handles = lock(&self.coordinators);
             let mut pending = Vec::with_capacity(handles.len() + 1);
@@ -964,6 +1124,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
             .map_err(|e| e.to_string())?;
         lock(&execution.slot).take();
         lock(&self.executions).remove(&session.id);
+        execution.finalized.store(true, Ordering::Release);
         Ok(())
     }
     async fn shutdown(&self) -> Result<(), String> {
