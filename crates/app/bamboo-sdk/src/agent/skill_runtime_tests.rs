@@ -900,7 +900,7 @@ async fn sdk_defaults_ultra_keeps_exact_registered_authority_intersection_and_de
         .iter()
         .map(|name| (*name).to_owned())
         .collect::<BTreeSet<_>>();
-    assert_eq!(canonical.len(), 15);
+    assert_eq!(canonical.len(), 16);
     let expected = agent
         .inner
         .default_tools()
@@ -926,7 +926,7 @@ async fn sdk_defaults_ultra_keeps_exact_registered_authority_intersection_and_de
         .unwrap();
     let trace = provider.0.lock().unwrap();
     let actual = trace[0].1.iter().cloned().collect::<BTreeSet<_>>();
-    assert_eq!(actual, expected, "Ultra must preserve the exact actually registered subset of canonical 15; no fake SDK-only registrations");
+    assert_eq!(actual, expected, "Ultra must preserve the exact actually registered subset of the canonical set; no fake SDK-only registrations");
     assert!(!actual.contains("skills_list") && !actual.contains("skills_read"));
     assert!(!trace[0]
         .0
