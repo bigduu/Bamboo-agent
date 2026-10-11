@@ -128,8 +128,10 @@ async fn partial_queued_ingress_emits_every_committed_message_before_retry() {
     use bamboo_agent_core::AgentEvent;
     use std::collections::BTreeSet;
     let home = tempfile::tempdir().unwrap();
+    // This fixture owns legacy batch admission. Background recovery would
+    // activate the same Root and hand its Inbox to a different owned consumer.
     let state = web::Data::new(
-        crate::AppState::new(home.path().to_path_buf())
+        crate::AppState::new_for_legacy_queued_ingress_test(home.path().to_path_buf())
             .await
             .unwrap(),
     );
