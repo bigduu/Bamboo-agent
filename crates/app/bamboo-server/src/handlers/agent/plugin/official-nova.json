@@ -1,0 +1,16 @@
+{
+  "connectors": [
+    {
+      "version": "0.3.0",
+      "bundle_url": "https://github.com/bigduu/Nova/releases/download/v0.3.0/nova-plugin-v0.3.0.tar.gz",
+      "bundle_sha256": "85f36853a3a69c7e2268f6db35becde352649758822fb5277bc97413d083b371",
+      "manifest_sha256": "1654ed08def2d28b9d1443022519fec10a609d94bf464d565d7904d6e4586f00",
+      "executable_sha256": {
+        "macos": "2112f2a0e69943aff7caab92b3169ec2a3cc06d6fbe89cc0e717e8f9b0f11b0f",
+        "windows": "ade4415ae0b6859f3257277b4024d2d6df8b5d87820b679db22814c6d8f6676e"
+      },
+      "legacy_cli": true
+    }
+  ],
+  "app": null
+}

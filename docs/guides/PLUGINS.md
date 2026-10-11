@@ -121,6 +121,54 @@ as an overlapping memory root.
 On macOS, missing path components with only ASCII case differences are treated
 as potentially overlapping until their real filesystem identity is established.
 
+## Nova.app setup
+
+`GET /api/v1/plugins/nova/app` passively reports host support, the verified
+connector, its structured app-setup capability, the app report and installation
+availability. macOS Apple Silicon and Intel use the separate app. Windows uses
+the packaged MCP server directly (`app_not_required`); Linux is unsupported.
+The server never searches `PATH` or launches an app while inspecting status.
+
+Only an installed official connector with accepted source, publisher trust,
+manifest and executable digests can run `app status`. A known older connector
+that actually rejects the app command reports `legacy_cli_unavailable`.
+Malformed output, process failure and timeout report `invalid_report`,
+`status_failed` and `status_timeout` respectively, with no inferred app state.
+`app.success: true` with `app.state: "missing"` means the query succeeded.
+Neither an installed app nor an MCP connection proves privacy permissions;
+`desktop_readiness` remains `not_tested`.
+
+`POST /api/v1/plugins/nova/app/install` is an explicit user action. Send `{}` or
+the exact `artifact_id` returned by the current status response. The server
+selects the immutable reviewed release archive, downloads it into a private
+bounded temporary directory, verifies SHA-256 and runs only the verified
+package-owned CLI:
+
+```text
+<absolute managed nova> app install --archive <private zip> --sha256 <accepted hash> --local-sign
+```
+
+Caller commands, paths, URLs, destination, force and trust-bypass flags are
+rejected. Existing apps are not overwritten. Managed bytes, trust and passive
+app status are checked again after download. Success requires a fresh structured
+status confirming the matching version, local self signature and connector
+compatibility. A lost HTTP response does not cancel the bounded owned operation;
+refresh status before retrying.
+
+The downloaded development archive is ad-hoc signed (`artifact.signing:
+"ad_hoc"`). Installation explicitly creates or reuses a stable local signing
+identity (`artifact.install_mode: "local_self_signed"`); it is not an Apple
+Developer ID or notarized distribution. Follow the reported manual guidance
+for an abnormal or partial keychain identity. Setup does not launch Nova.app or
+grant Accessibility or Screen Recording permission. Open the app and grant
+permissions yourself after installation.
+
+`desktop_server_id` is returned only when the installed manifest, registration
+record and live configuration prove the exact desktop `nova` stdio command and
+`["mcp"]` arguments. Reconnect only that returned ID when the user requests it;
+never reconnect every `nova*` server or the separate Chrome DevTools connector.
+An unpublished or unaccepted archive leaves installation unavailable.
+
 ## List, update, remove
 
 ```bash
