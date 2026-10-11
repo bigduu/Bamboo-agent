@@ -43,6 +43,7 @@ fn parse_warning_log_details<'a>(
 ) -> (String, &'a str) {
     if execution_name.eq_ignore_ascii_case("browser")
         || execution_name.eq_ignore_ascii_case("browser_eval")
+        || execution_name.eq_ignore_ascii_case("session_message")
         || [
             "work_overview",
             "work_search",
@@ -2970,6 +2971,14 @@ mod hook_tests {
                 r#"{"action":"type","text":"private browser input"#,
             ),
             ("browser_eval", r#"{"code":"private page source"#),
+            (
+                "session_message",
+                r#"{"action":"send","message":"private peer message"#,
+            ),
+            (
+                "SESSION_MESSAGE",
+                r#"{"action":"reply","message":"private peer reply"#,
+            ),
             (
                 "work_update",
                 r#"{"operations":[{"objective":"private work instructions"#,
