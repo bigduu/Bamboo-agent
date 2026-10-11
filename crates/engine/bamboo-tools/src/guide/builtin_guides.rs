@@ -121,6 +121,37 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "First identify candidate files, then use Read or scoped content mode.",
             )],
         )),
+        "exec_command" => Some(guide(
+            "exec_command",
+            ToolCategory::CommandExecution,
+            "Run terminal commands (build/test/git/npm/docker/gh). yield_time_ms waits up to 250–30000 ms (default 10000). Fast commands return output and exit_code directly; longer commands return status=running and session_id. Continue work or pull incremental output and final status with write_stdin; completion is not injected as a user message and does not wake the model automatically. Output is bounded by max_output_tokens (default 2000, maximum 8192); output_omitted_bytes reports discarded output.",
+            "Do not use for file reads/edits/search when Read/Edit/Write/Glob/Grep can handle it, or shell echo/printf to communicate with the user. Do not expect a completion notification or use legacy BashOutput for an exec session. interactive=true supplies a stdin pipe, not a PTY; terminal-only programs may not work.",
+            &["write_stdin"],
+            vec![example(
+                "Start tests with a short initial wait",
+                json!({"cmd":"cargo test","yield_time_ms":1000,"max_output_tokens":2000}),
+                "Inspect exit_code when completed; save a returned session_id and poll with write_stdin when running.",
+            )],
+        )),
+        "write_stdin" => Some(guide(
+            "write_stdin",
+            ToolCategory::CommandExecution,
+            "Pull output and completion from an exec_command session owned by this conversation. Use chars=\"\" to wait/poll; yield_time_ms is bounded to 250–30000 ms (default 10000). Running results retain session_id; final results omit it and include exit_code when available. Output is incremental and bounded by max_output_tokens (default 2000, maximum 8192); output_omitted_bytes reports discarded bytes. For interactive=true sessions, nonempty chars writes exact bytes to the stdin pipe; include your own newline and use eof=true to close stdin. A lone Ctrl-C (\\u0003) stops the process.",
+            "Do not use a conversation ID or legacy Bash ID as session_id. Do not poll a finished session or wait for an automatic completion message. Input requires an interactive stdin pipe and does not provide PTY terminal behavior.",
+            &["exec_command"],
+            vec![
+                example(
+                    "Pull a command's next output and exit status",
+                    json!({"session_id":"<session_id-from-exec_command>","chars":"","yield_time_ms":1000}),
+                    "Repeat while status=running; a nonzero exit_code is a command outcome to inspect.",
+                ),
+                example(
+                    "Answer an interactive prompt and close input",
+                    json!({"session_id":"<session_id-from-exec_command>","chars":"yes\n","eof":true}),
+                    "The command must have been started with interactive=true; bytes are sent exactly as supplied.",
+                ),
+            ],
+        )),
         "Bash" => Some(guide(
             "Bash",
             ToolCategory::CommandExecution,
@@ -659,6 +690,20 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn exec_guides_teach_pull_results() {
+        let exec = builtin_guide_spec("exec_command").unwrap();
+        assert!(exec.when_to_use.contains("session_id"));
+        assert!(exec.when_to_use.contains("not injected as a user message"));
+        assert!(exec.when_to_use.contains("output_omitted_bytes"));
+        assert!(exec.when_not_to_use.contains("stdin pipe, not a PTY"));
+        assert!(exec.examples[0].parameters.get("cmd").is_some());
+        let poll = builtin_guide_spec("write_stdin").unwrap();
+        assert!(poll.when_to_use.contains("final results omit it"));
+        assert!(poll.when_to_use.contains("include your own newline"));
+        assert_eq!(poll.examples[0].parameters["chars"], "");
     }
 
     #[test]

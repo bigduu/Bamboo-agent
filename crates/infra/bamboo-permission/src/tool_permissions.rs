@@ -13,6 +13,19 @@ use crate::{PermissionContext, PermissionError, PermissionType};
 
 const DELETE_COMMANDS: [&str; 7] = ["rm", "rmdir", "del", "erase", "unlink", "rd", "remove-item"];
 
+/// The executable bytes for either shell API. Keep policy extraction separate
+/// from callable identity: exec_command has its own schema and execution path.
+pub(crate) fn shell_command<'a>(tool_name: &str, args: &'a Value) -> Option<&'a str> {
+    let key = if tool_name.eq_ignore_ascii_case("Bash") {
+        "command"
+    } else if tool_name.eq_ignore_ascii_case("exec_command") {
+        "cmd"
+    } else {
+        return None;
+    };
+    args.get(key).and_then(Value::as_str)
+}
+
 /// Maximum number of independent permission contexts that can be carried by
 /// one proactive request. This matches the bounded replay ledger so every
 /// schema-valid request can eventually complete.
@@ -530,8 +543,14 @@ pub fn check_permissions(
                 format!("Notebook edit: {}", path),
             )]))
         }
-        "Bash" => {
-            let command = required_string_arg(args, "command")?.trim();
+        "Bash" | "exec_command" => {
+            let command = shell_command(tool_name, args)
+                .ok_or_else(|| {
+                    PermissionError::CheckFailed(
+                        "Missing or invalid shell command parameter".into(),
+                    )
+                })?
+                .trim();
             if command.is_empty() {
                 return Err(PermissionError::CheckFailed(
                     "Missing or invalid 'command' parameter".to_string(),
@@ -671,6 +690,14 @@ pub fn check_permissions(
                 _ => None,
             };
             Ok(write_contexts)
+        }
+        "write_stdin" => {
+            let session_id = required_string_arg(args, "session_id")?;
+            Ok(Some(vec![PermissionContext::new(
+                PermissionType::TerminalSession,
+                session_id,
+                format!("Read or interact with shell session: {}", session_id),
+            )]))
         }
         "BashInput" => {
             let bash_id = required_string_arg(args, "bash_id")?;
@@ -3010,6 +3037,54 @@ mod tests {
         let contexts = check_permissions("apply_patch", &args).unwrap().unwrap();
         assert_eq!(contexts.len(), 1);
         assert_eq!(contexts[0].permission_type, PermissionType::WriteFile);
+    }
+
+    #[test]
+    fn exec_command_preserves_bash_permission_contexts() {
+        for command in [
+            "cargo test",
+            "rm -rf /tmp/a",
+            "eval 'cat /etc/passwd'",
+            "echo ${HOME}",
+        ] {
+            let legacy = check_permissions("Bash", &json!({"command":command}))
+                .unwrap()
+                .unwrap();
+            let current = check_permissions("exec_command", &json!({"cmd":command}))
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.len(), 1);
+            assert_eq!(current[0].permission_type, legacy[0].permission_type);
+            assert_eq!(current[0].resource, legacy[0].resource);
+            assert_eq!(
+                current[0].operation_description,
+                legacy[0].operation_description
+            );
+        }
+        for args in [
+            json!({}),
+            json!({"cmd":" "}),
+            json!({"command":"cargo test"}),
+            json!({"cmd":7}),
+        ] {
+            assert!(check_permissions("exec_command", &args).is_err());
+        }
+    }
+
+    #[test]
+    fn write_stdin_requires_terminal_session_permission_for_poll_and_input() {
+        for chars in ["", "yes\n", "\u{3}"] {
+            let contexts = check_permissions(
+                "write_stdin",
+                &json!({"session_id":"exec-owned", "chars":chars}),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(contexts.len(), 1);
+            assert_eq!(contexts[0].permission_type, PermissionType::TerminalSession);
+            assert_eq!(contexts[0].resource, "exec-owned");
+        }
+        assert!(check_permissions("write_stdin", &json!({"chars":""})).is_err());
     }
 
     #[test]

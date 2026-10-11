@@ -61,7 +61,12 @@ pub const CORE_TOOL_NAMES: [&str; 12] = [
 ];
 
 /// Host protocol helpers that must not enter model catalogs or discovery.
-pub const HOST_ONLY_TOOL_NAMES: [&str; 2] = ["Workspace", "request_permissions"];
+pub const HOST_ONLY_TOOL_NAMES: [&str; 4] = [
+    "Workspace",
+    "request_permissions",
+    "exec_command",
+    "write_stdin",
+];
 
 /// Examples whose deferred status is part of the public migration contract.
 pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 6] = [
