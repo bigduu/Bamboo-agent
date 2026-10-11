@@ -139,6 +139,9 @@ pub(crate) enum InboxAuthority {
     Supervisor {
         _guard: crate::v2::SupervisorFollowupGuard,
     },
+    Peer {
+        _guard: crate::v2::PeerDeliveryGuard,
+    },
 }
 struct OwnedScope {
     _process: OwnedMutexGuard<()>,
@@ -484,7 +487,10 @@ impl FileSessionInbox {
         target: &str,
         authority: InboxAuthority,
     ) -> Result<(PathBuf, OwnedFilesystem), SessionInboxError> {
-        let dir = self.inbox_dir(target).await?;
+        let dir = match &authority {
+            InboxAuthority::Peer { _guard } => _guard.inbox_dir.clone(),
+            _ => self.inbox_dir(target).await?,
+        };
         let process = self.lock_process(&dir).await;
         let scope = Arc::new(OwnedScope {
             _process: process,
