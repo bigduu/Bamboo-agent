@@ -59,6 +59,10 @@ impl Drop for SynchronousLaunchGuard {
 use crate::parent_request_reply::{
     ParentRequestMessageReceipt, ParentRequestReplyPort, ParentRequestReplyState,
 };
+#[cfg(feature = "test-utils")]
+#[path = "sub_agent_test_diagnostics.rs"]
+pub mod test_diagnostics;
+
 use crate::sub_agent_facade::{self as facade, Projection};
 use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_domain::session::runtime_state::ChildWaitPolicy;
@@ -698,6 +702,8 @@ impl Tool for SubAgentTool {
         args: serde_json::Value,
         ctx: ToolCtx,
     ) -> Result<ToolOutcome, ToolError> {
+        #[cfg(feature = "test-utils")]
+        let diagnostic = test_diagnostics::capture(&ctx);
         let host_args = args.clone();
         let normalized = facade::normalize(args)?;
         let args = normalized.args;
@@ -886,15 +892,21 @@ impl Tool for SubAgentTool {
                 ToolError::Execution(format!("SubAgent launch owner failed: {error}"))
             })?;
             cancel_on_drop.armed = false;
+            #[cfg(feature = "test-utils")]
+            test_diagnostics::record(&diagnostic, &result);
             return facade::finish(projection, result);
         }
         if action == Some("cancel") {
             let result = self.invoke_cancel(args, ctx).await;
+            #[cfg(feature = "test-utils")]
+            test_diagnostics::record(&diagnostic, &result);
             return facade::finish(projection, result);
         }
         let result = self
             .invoke_inner(args, ctx, None, projection.is_some())
             .await;
+        #[cfg(feature = "test-utils")]
+        test_diagnostics::record(&diagnostic, &result);
         facade::finish(projection, result)
     }
 }

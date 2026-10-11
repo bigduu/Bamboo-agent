@@ -555,6 +555,7 @@ async fn installed_root_subagent(
     let mut ctx = ToolExecutionContext::none(&call.id);
     ctx.session_id = Some(parent_id);
     ctx.root_session_id = Some(parent_id);
+    let diagnostic = bamboo_server_tools::sub_agent::test_diagnostics::install(parent_id, call_id);
     let outcome = tokio::time::timeout(
         WAIT,
         state
@@ -563,7 +564,12 @@ async fn installed_root_subagent(
     )
     .await
     .expect("installed SubAgent call must settle")
-    .expect("installed SubAgent call must succeed");
+    .unwrap_or_else(|error| {
+        panic!(
+            "installed SubAgent call failed: {error}; private test diagnostic: {:?}",
+            diagnostic.take()
+        )
+    });
     let ToolOutcome::Completed(result) = outcome else {
         panic!("compact SubAgent must return its canonical synchronous receipt");
     };
