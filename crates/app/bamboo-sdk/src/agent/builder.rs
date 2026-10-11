@@ -462,7 +462,9 @@ impl AgentBuilder {
     /// [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir). The
     /// same inbox, router, and messenger are then installed on every execution
     /// created by this agent. Call order relative to defaults assembly does not
-    /// matter.
+    /// matter. The default tool surface also gains `session_message`; explicit
+    /// `tools`, `no_tools`, and `default_tools` selections retain their exact
+    /// surface and are never expanded by this delivery configuration.
     ///
     /// The caller must bind a real
     /// [`bamboo_engine::SessionActivationSpawner`] to `activation_router`
@@ -694,6 +696,7 @@ impl AgentBuilder {
     /// `instruction` and `model` are carried onto the `Agent` for
     /// [`Agent::run`](super::Agent::run).
     pub fn build(mut self) -> Result<Agent, SdkError> {
+        let mut session_messenger = None;
         if let Some((limits, activation_router)) = self.session_delivery.take() {
             let session_store = self
                 .session_store
@@ -716,6 +719,7 @@ impl AgentBuilder {
                 inbox.clone(),
                 activation,
             ));
+            session_messenger = Some(messenger.clone());
             self.inner = self
                 .inner
                 .session_inbox(inbox)
@@ -782,6 +786,11 @@ impl AgentBuilder {
                     .map_err(|error| SdkError::Build(error.to_string()))?;
                 builtin_tools
                     .register_tool(bamboo_server_tools::ProjectTool::new(sessions, projects))
+                    .map_err(|error| SdkError::Build(error.to_string()))?;
+            }
+            if let Some(messenger) = session_messenger {
+                builtin_tools
+                    .register_tool(bamboo_server_tools::SessionMessageTool::new(messenger))
                     .map_err(|error| SdkError::Build(error.to_string()))?;
             }
             if let (Some(manager), Some(sessions), Some(projects)) = (
@@ -1303,6 +1312,103 @@ mod tests {
         assert!(Arc::ptr_eq(messenger.inbox(), runtime_inbox));
         let activation: Arc<dyn bamboo_domain::SessionActivationPort> = router;
         assert!(Arc::ptr_eq(messenger.activation(), &activation));
+
+        let tools = agent.inner.default_tools();
+        assert!(tools.owns_exact_tool("session_message"));
+        assert_eq!(
+            tools
+                .list_tools()
+                .iter()
+                .filter(|schema| schema.function.name == "session_message")
+                .count(),
+            1
+        );
+        let mut session = agent.new_session("sdk-peer-tools").unwrap();
+        session.add_message(Message::user("tool discovery"));
+        agent.storage().save_session(&session).await.unwrap();
+        for action in ["list_targets", "send", "reply"] {
+            let call = ToolCall {
+                id: format!("sdk-peer-{action}"),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "session_message".into(),
+                    arguments: match action {
+                        "send" => serde_json::json!({"action": action, "target_session_id": "unknown", "operation_id": "blocked-send", "message": "blocked"}),
+                        "reply" => serde_json::json!({"action": action, "reply_to": "unknown", "operation_id": "blocked-reply", "message": "blocked"}),
+                        _ => serde_json::json!({"action": action}),
+                    }.to_string(),
+                },
+            };
+            let mut ctx = execution_context(&session.id, &call.id);
+            ctx.plan_read_only = true;
+            ctx.bypass_permissions = true;
+            ctx.auto_approve_permissions = true;
+            let result = tools.execute_with_context(&call, ctx).await;
+            if action == "list_targets" {
+                let result = result.unwrap();
+                assert!(result.success);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&result.result).unwrap(),
+                    serde_json::json!({"targets": [], "truncated": false})
+                );
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_delivery_preserves_explicit_tool_policy_and_missing_delivery_is_unavailable() {
+        let defaults = build_with_tool_policy(|builder| builder).await;
+        assert!(!defaults
+            .inner
+            .default_tools()
+            .owns_exact_tool("session_message"));
+        let call = ToolCall {
+            id: "sdk-missing-peer-plane".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "session_message".into(),
+                arguments: serde_json::json!({"action": "list_targets"}).to_string(),
+            },
+        };
+        assert!(defaults.inner.default_tools().execute(&call).await.is_err());
+
+        for policy in ["no_tools", "empty_tools", "selected", "executor"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_test_config(tmp.path());
+            let builder = AgentBuilder::new()
+                .session_delivery(bamboo_engine::SessionActivationRouter::new())
+                .with_defaults_for_data_dir(tmp.path().to_path_buf())
+                .await
+                .unwrap();
+            let builder = match policy {
+                "no_tools" => builder.no_tools(),
+                "empty_tools" => builder.tools(std::iter::empty::<Arc<dyn Tool>>()),
+                "selected" => builder.tools([super::super::BuiltinTool::Read.tool()]),
+                _ => builder.default_tools(Arc::new(
+                    bamboo_tools::BuiltinToolExecutor::with_registry(ToolRegistry::new()),
+                )),
+            };
+            let agent = builder.build().unwrap();
+            assert!(agent.session_messenger().is_some());
+            let tools = agent.inner.default_tools();
+            assert!(!tools.owns_exact_tool("session_message"), "{policy}");
+            let names: Vec<_> = tools
+                .list_tools()
+                .into_iter()
+                .map(|schema| schema.function.name)
+                .collect();
+            assert_eq!(
+                names,
+                if policy == "selected" {
+                    vec!["Read"]
+                } else {
+                    vec![]
+                },
+                "{policy}"
+            );
+        }
     }
 
     #[tokio::test]
