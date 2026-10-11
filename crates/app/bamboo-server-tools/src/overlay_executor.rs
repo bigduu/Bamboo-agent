@@ -48,6 +48,7 @@ impl OverlayToolExecutor {
             let private_arguments = [
                 "browser",
                 "browser_eval",
+                "session_message",
                 "work_overview",
                 "work_search",
                 "work_inspect",
@@ -1157,14 +1158,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_eval_overlay_reparse_warning_hides_page_source_and_url() {
+    async fn private_overlay_reparse_warning_hides_page_source_and_peer_text() {
         let raw = r#"{"code":"private-page-source","expected_url":"https://example.test/?token=private-query","expected_epoch":1"#;
-        for name in ["browser_eval", "default::browser_eval"] {
+        for (tool_name, name, raw, field, private_text) in [
+            (
+                "browser_eval",
+                "browser_eval",
+                raw,
+                "code",
+                "private-page-source",
+            ),
+            (
+                "browser_eval",
+                "default::browser_eval",
+                raw,
+                "code",
+                "private-page-source",
+            ),
+            (
+                "session_message",
+                "session_message",
+                r#"{"action":"send","message":"private-peer-text""#,
+                "message",
+                "private-peer-text",
+            ),
+            (
+                "session_message",
+                "default::session_message",
+                r#"{"action":"send","message":"private-peer-text""#,
+                "message",
+                "private-peer-text",
+            ),
+        ] {
             let seen = std::sync::Arc::new(StdMutex::new(None));
             let overlay = OverlayToolExecutor::new(
                 std::sync::Arc::new(BaseExecutor),
                 std::sync::Arc::new(ArgsRecordingOverlayTool {
-                    name: "browser_eval",
+                    name: tool_name,
                     seen: seen.clone(),
                 }),
             );
@@ -1178,13 +1208,10 @@ mod tests {
                     .await
                     .expect("repaired overlay call should run");
             }
-            assert_eq!(
-                seen.lock().unwrap().as_ref().unwrap()["code"],
-                "private-page-source"
-            );
+            assert_eq!(seen.lock().unwrap().as_ref().unwrap()[field], private_text);
             let event = events.lock().unwrap().join("\n");
             assert!(event.contains("warning=[redacted]"), "{event}");
-            assert!(!event.contains("private-page-source"), "{event}");
+            assert!(!event.contains(private_text), "{event}");
             assert!(!event.contains("private-query"), "{event}");
         }
     }
