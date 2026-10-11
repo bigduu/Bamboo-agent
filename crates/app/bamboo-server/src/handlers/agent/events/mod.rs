@@ -20,9 +20,12 @@ pub(crate) use subscription::subscribe_with_runner_snapshot;
 pub(crate) use terminal::{
     begin_execute_startup, clear_pending_turn, execute_startup_is_in_flight, has_running_child,
     mark_pending_turn, reconcile_abandoned_startup, startup_reconcile_delay, startup_work_id,
-    terminal_event_if_ready, transition_startup_failure_if_owned, ExecuteStartupGuard,
+    terminal_event_with_locked_runners, transition_startup_failure_if_owned, ExecuteStartupGuard,
     StartupFailureTarget,
 };
+
+#[cfg(test)]
+pub(crate) use terminal::terminal_event_if_ready;
 
 #[cfg(test)]
 mod tests;

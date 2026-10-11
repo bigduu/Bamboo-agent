@@ -319,15 +319,58 @@ pub(crate) async fn terminal_event_if_ready(
     session_id: &str,
     runner_status: Option<AgentStatus>,
 ) -> Option<AgentEvent> {
+    let running_sessions = running_session_ids(&*state.agent_runners.read().await);
+    terminal_event_for_snapshot(state, session_id, runner_status, &running_sessions).await
+}
+
+/// The caller owns the runner read guard and must not recursively acquire it:
+/// Tokio's writer-fair lock can deadlock behind a queued publisher.
+pub(crate) async fn terminal_event_with_locked_runners(
+    state: &web::Data<AppState>,
+    session_id: &str,
+    runners: &std::collections::HashMap<String, crate::app_state::AgentRunner>,
+) -> Option<AgentEvent> {
+    terminal_event_for_snapshot(
+        state,
+        session_id,
+        runners.get(session_id).map(|runner| runner.status.clone()),
+        &running_session_ids(runners),
+    )
+    .await
+}
+
+async fn terminal_event_for_snapshot(
+    state: &web::Data<AppState>,
+    session_id: &str,
+    runner_status: Option<AgentStatus>,
+    running_sessions: &[String],
+) -> Option<AgentEvent> {
     // A slow but legitimate execute may outlive the durable handoff grace
     // before it can reserve a runner. Its RAII owner wins until every
     // overlapping handler returns; a crash naturally drops the whole AppState.
     if execute_startup_is_in_flight(state.get_ref(), session_id) {
         return None;
     }
+    // Native Chat ACKs a canonical Inbox item before its consumer appends the
+    // User to Main or reserves a runner. Pending/claimed *eligible* work is
+    // newer than any terminal history. This is a read, never an activation or
+    // authority grant; staged coordinator outcomes alone do not hold us open.
+    // Read Inbox before Main: a consumer that drains the item must checkpoint
+    // its User before ACK, so the following Main read covers that handoff.
+    match state.session_inbox.inspect(session_id).await {
+        Ok(backlog) if !backlog.activation_pending() => {}
+        Ok(_) => return None,
+        Err(error) => {
+            // Unavailable/invalid canonical queue state is not proof of completion.
+            tracing::debug!(%session_id, %error, "terminal admission cannot inspect canonical Inbox");
+            return None;
+        }
+    }
     let session = match state.storage.load_session(session_id).await {
         Ok(Some(session)) => Some(session),
-        _ => None,
+        // A stale terminal runner cannot establish canonical completion when
+        // Main is missing/unreadable. Keep live rather than inventing success.
+        _ => return None,
     };
 
     // Diagnostic snapshot of the inputs that decide terminal-vs-live. This is the
@@ -406,7 +449,7 @@ pub(crate) async fn terminal_event_if_ready(
         );
         return None;
     }
-    if has_running_child(state, session_id).await {
+    if has_running_child_in_snapshot(state, session_id, running_sessions).await {
         tracing::debug!(
             "[{}] terminal_event_if_ready -> None (running child session) -> LIVE stream",
             session_id,
@@ -450,7 +493,13 @@ pub(super) fn session_has_terminal_evidence(
     let Some(session) = session else {
         return false;
     };
-    if !session.messages.is_empty() {
+    // System-only Main is initialization, not evidence of completed user work.
+    // Explicit terminal runner/runtime evidence still wins even with no history.
+    if session
+        .messages
+        .iter()
+        .any(|message| !matches!(message.role, Role::System))
+    {
         return true;
     }
     session.agent_runtime_state.as_ref().is_some_and(|runtime| {
@@ -605,29 +654,38 @@ fn terminal_failure_is_authoritative(
 /// to the old direct-child check, because a direct child's `root_session_id`
 /// equals the root's.
 pub(crate) async fn has_running_child(state: &web::Data<AppState>, session_id: &str) -> bool {
-    // The tree root the watched session belongs to (a Root is its own root).
+    let running_sessions = running_session_ids(&*state.agent_runners.read().await);
+    has_running_child_in_snapshot(state, session_id, &running_sessions).await
+}
+
+fn running_session_ids(
+    runners: &std::collections::HashMap<String, crate::app_state::AgentRunner>,
+) -> Vec<String> {
+    runners
+        .iter()
+        .filter(|(_, runner)| matches!(runner.status, AgentStatus::Running))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+async fn has_running_child_in_snapshot(
+    state: &web::Data<AppState>,
+    session_id: &str,
+    running_sessions: &[String],
+) -> bool {
     let watched_root = state
         .session_store
         .get_index_entry(session_id)
         .await
         .map(|entry| entry.root_session_id)
         .unwrap_or_else(|| session_id.to_string());
-
-    let running_session_ids: Vec<String> = {
-        let runners = state.agent_runners.read().await;
-        runners
-            .iter()
-            .filter(|(running_id, runner)| {
-                matches!(runner.status, AgentStatus::Running) && running_id.as_str() != session_id
-            })
-            .map(|(running_id, _)| running_id.clone())
-            .collect()
-    };
-
-    for running_session_id in running_session_ids {
+    for running_session_id in running_sessions
+        .iter()
+        .filter(|id| id.as_str() != session_id)
+    {
         let Some(entry) = state
             .session_store
-            .get_index_entry(&running_session_id)
+            .get_index_entry(running_session_id)
             .await
         else {
             continue;
@@ -698,6 +756,137 @@ mod tests {
         );
         state.save_session(&mut session).await;
         (dir, state)
+    }
+
+    #[actix_web::test]
+    async fn native_inbox_activation_prevents_terminal_for_fresh_and_completed_main() {
+        use bamboo_domain::{SessionActivationPolicy, SessionMessageEnvelope};
+        for completed in [false, true] {
+            let id = if completed {
+                "native-after-complete"
+            } else {
+                "native-fresh-main"
+            };
+            let mut session = Session::new(id, "test-model");
+            session.add_message(Message::system("initialized"));
+            if completed {
+                session.add_message(Message::assistant("previous response", None));
+            }
+            let (_dir, state) = state_with_session(session).await;
+            let envelope = SessionMessageEnvelope::user_input(id, "new input");
+            state
+                .session_inbox
+                .deliver_with_activation_intent(
+                    &envelope,
+                    SessionActivationPolicy::RespectSpecificWait,
+                    None,
+                )
+                .await
+                .unwrap();
+            // An old Completed/Error/Cancelled runner must not beat new work.
+            for status in [
+                None,
+                Some(AgentStatus::Completed),
+                Some(AgentStatus::Cancelled),
+                Some(AgentStatus::Error("old".into())),
+            ] {
+                assert!(terminal_event_if_ready(&state, id, status).await.is_none());
+            }
+            assert!(state
+                .session_inbox
+                .inspect(id)
+                .await
+                .unwrap()
+                .activation_pending());
+            let claims = state.session_inbox.claim(id, 1).await.unwrap();
+            assert_eq!(claims.len(), 1);
+            assert_eq!(state.session_inbox.inspect(id).await.unwrap().claimed, 1);
+            assert!(
+                terminal_event_if_ready(&state, id, Some(AgentStatus::Completed))
+                    .await
+                    .is_none(),
+                "claiming without checkpoint/ACK must retain pending activation"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn staged_inbox_without_activation_does_not_hide_genuine_completion() {
+        use bamboo_domain::SessionMessageEnvelope;
+        let mut session = Session::new("staged-no-work", "test-model");
+        session.add_message(Message::assistant("done", None));
+        let (_dir, state) = state_with_session(session).await;
+        state
+            .session_inbox
+            .deliver(&SessionMessageEnvelope::user_input(
+                "staged-no-work",
+                "staged",
+            ))
+            .await
+            .unwrap();
+        assert!(!state
+            .session_inbox
+            .inspect("staged-no-work")
+            .await
+            .unwrap()
+            .activation_pending());
+        assert!(matches!(
+            terminal_event_if_ready(&state, "staged-no-work", None).await,
+            Some(AgentEvent::Complete { .. })
+        ));
+    }
+
+    #[actix_web::test]
+    async fn terminal_admission_observes_other_inbox_instance_and_fails_closed_on_invalid_target() {
+        use bamboo_domain::{SessionActivationPolicy, SessionInboxPort, SessionMessageEnvelope};
+        let mut session = Session::new("independent-inbox-writer", "test-model");
+        session.add_message(Message::assistant("done", None));
+        let (_dir, state) = state_with_session(session).await;
+        let other =
+            bamboo_storage::FileSessionInbox::new(state.session_store.clone(), Default::default());
+        other
+            .deliver_with_activation_intent(
+                &SessionMessageEnvelope::user_input("independent-inbox-writer", "next"),
+                SessionActivationPolicy::RespectSpecificWait,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            terminal_event_if_ready(&state, "independent-inbox-writer", None)
+                .await
+                .is_none()
+        );
+        assert!(
+            terminal_event_if_ready(&state, "invalid-target", Some(AgentStatus::Completed))
+                .await
+                .is_none()
+        );
+    }
+
+    #[actix_web::test]
+    async fn corrupt_canonical_main_cannot_replay_stale_completed_runner() {
+        let id = "terminal-corrupt-main";
+        let mut session = Session::new(id, "test-model");
+        session.add_message(Message::assistant("old completed response", None));
+        let (dir, state) = state_with_session(session).await;
+        assert!(
+            terminal_event_if_ready(&state, id, Some(AgentStatus::Completed))
+                .await
+                .is_some()
+        );
+        tokio::fs::write(
+            dir.path().join("sessions").join(id).join("session.json"),
+            b"invalid canonical Main",
+        )
+        .await
+        .unwrap();
+        assert!(state.storage.load_session(id).await.is_err());
+        assert!(
+            terminal_event_if_ready(&state, id, Some(AgentStatus::Completed))
+                .await
+                .is_none()
+        );
     }
 
     fn expire_startup_handoff(session: &mut Session) {

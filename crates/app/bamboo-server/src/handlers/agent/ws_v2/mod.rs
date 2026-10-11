@@ -79,8 +79,8 @@ use self::envelope::{
     Encoding, OutFrame,
 };
 use self::forwarders::{
-    spawn_actor_forwarder, spawn_actor_tree_forwarder, spawn_agent_forwarder,
-    spawn_agent_terminal_forwarder, spawn_feed_forwarder, spawn_message_forwarder, OutboundTx,
+    spawn_actor_forwarder, spawn_actor_tree_forwarder, spawn_agent_forwarder, spawn_feed_forwarder,
+    spawn_message_forwarder, OutboundTx,
 };
 use crate::app_state::AppState;
 use crate::handlers::agent::events::MAX_BATCH_MS;
@@ -836,48 +836,12 @@ async fn subscribe(
                 .map(|runner| runner.last_critical_events.clone())
                 .unwrap_or_default();
 
-            // Match the v1 SSE late-subscribe contract. A session that
-            // completed while this socket was half-open must replay cached
-            // state and a synthesized terminal exactly once, rather than open
-            // a live receiver that will never publish another event.
+            // The initial snapshot only selects a terminal-replay candidate.
+            // The forwarder revalidates canonical Inbox/Main and live ownership
+            // under the native Chat persistence guard immediately before enqueue.
+            // If admission changed, it keeps this same receiver and tails live.
             let runner_status = runner_snapshot.as_ref().map(|runner| runner.status.clone());
-            if can_attempt_terminal_replay(runner_status.as_ref(), &receiver) {
-                if let Some(terminal_event) =
-                    crate::handlers::agent::events::terminal_event_if_ready(
-                        state,
-                        &sid,
-                        runner_status.clone(),
-                    )
-                    .await
-                {
-                    // Storage and descendant checks above are asynchronous. A
-                    // new runner can be reserved while they run, before it has
-                    // emitted its first broadcast event. Re-read the runner so
-                    // that Pending/Running wins over the stale terminal
-                    // snapshot even while the receiver is still empty.
-                    // We subscribed before the async storage/child checks. If a
-                    // live event arrived meanwhile, preserve its ordering by
-                    // handing the still-buffered receiver to the live forwarder
-                    // instead of sending a synthetic terminal ahead of it.
-                    if current_runner_allows_terminal_replay(state, &sid, &receiver).await {
-                        return finish_subscribe(
-                            forwarders,
-                            queues,
-                            ch,
-                            out_rx,
-                            spawn_agent_terminal_forwarder(
-                                out_tx,
-                                encoding,
-                                ch.to_string(),
-                                budget_event_to_replay,
-                                critical_events_to_replay,
-                                terminal_event,
-                            ),
-                            since,
-                        );
-                    }
-                }
-            }
+            let replay_terminal = can_attempt_terminal_replay(runner_status.as_ref(), &receiver);
 
             spawn_agent_forwarder(
                 state.clone(),
@@ -889,6 +853,7 @@ async fn subscribe(
                 budget_event_to_replay,
                 critical_events_to_replay,
                 batch_ms,
+                replay_terminal,
             )
         }
         Channel::Actor(actor_id) => {
@@ -1008,22 +973,6 @@ fn can_attempt_terminal_replay(
             | Some(crate::app_state::AgentStatus::Cancelled)
             | Some(crate::app_state::AgentStatus::Error(_))
     ) && receiver.is_empty()
-}
-
-/// Re-read the runner after asynchronous terminal checks. This is deliberately
-/// a separate helper so the subscribe race can be covered without relying on
-/// scheduler timing: a runner reserved during storage I/O must invalidate the
-/// stale terminal snapshot before the one-shot forwarder is installed.
-async fn current_runner_allows_terminal_replay(
-    state: &web::Data<AppState>,
-    session_id: &str,
-    receiver: &tokio::sync::broadcast::Receiver<bamboo_agent_core::AgentEvent>,
-) -> bool {
-    let current_runner_status = {
-        let runners = state.agent_runners.read().await;
-        runners.get(session_id).map(|runner| runner.status.clone())
-    };
-    can_attempt_terminal_replay(current_runner_status.as_ref(), receiver)
 }
 
 fn finish_subscribe(
@@ -1483,30 +1432,6 @@ mod tests {
             Some(&crate::app_state::AgentStatus::Running),
             &rx,
         ));
-    }
-
-    #[actix_web::test]
-    async fn current_runner_reread_blocks_stale_terminal_snapshot() {
-        let (state, _cred, _token) = app_state_with_device().await;
-        let (_tx, rx) = tokio::sync::broadcast::channel(4);
-        let session_id = "runner-reserved-during-terminal-check";
-
-        assert!(
-            current_runner_allows_terminal_replay(&state, session_id, &rx).await,
-            "the initial no-runner snapshot permits a terminal check"
-        );
-
-        {
-            let mut runners = state.agent_runners.write().await;
-            let mut runner = crate::app_state::AgentRunner::new();
-            runner.status = crate::app_state::AgentStatus::Running;
-            runners.insert(session_id.to_string(), runner);
-        }
-
-        assert!(
-            !current_runner_allows_terminal_replay(&state, session_id, &rx).await,
-            "the post-await re-read must observe the newly Running runner"
-        );
     }
 
     #[actix_web::test]

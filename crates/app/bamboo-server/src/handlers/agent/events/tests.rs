@@ -122,3 +122,20 @@ fn terminal_evidence_rejects_unstarted_session_but_accepts_completed_history() {
         Some(&AgentStatus::Completed),
     ));
 }
+
+#[test]
+fn system_only_main_requires_explicit_terminal_evidence() {
+    let mut session = Session::new("system-only", "test-model");
+    session.add_message(Message::system("initial prompt"));
+    assert!(!session_has_terminal_evidence(Some(&session), None));
+    for status in [
+        AgentStatusState::Completed,
+        AgentStatusState::Cancelled,
+        AgentStatusState::Failed,
+    ] {
+        let mut runtime = AgentRuntimeState::new("finished-run");
+        runtime.status = status;
+        session.agent_runtime_state = Some(runtime);
+        assert!(session_has_terminal_evidence(Some(&session), None));
+    }
+}
