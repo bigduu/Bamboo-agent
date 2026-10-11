@@ -64,6 +64,7 @@ async fn run_message_summary(
         config,
         "test-model",
         "message-summary-1827",
+        &[],
         &noop_llm(),
         &budget,
         None,

@@ -551,6 +551,36 @@ pub(in crate::runtime::runner) fn effective_tool_schemas<'a>(
     )
 }
 
+/// Per-request continuation handles, derived only from the current registry.
+/// Reserved exact spellings retain their host-trusted lexical contract; schemas
+/// do not attest implementation provenance and qualified shadows are distinct.
+pub(super) fn build_exec_session_continuation_context_block(
+    session: &Session,
+    tool_schemas: &[ToolSchema],
+) -> Option<ContextBlock> {
+    if !session.allows_model_tool_execution("write_stdin")
+        || !effective_tool_schemas(session, tool_schemas)
+            .iter()
+            .any(|schema| schema.function.name == "write_stdin")
+    {
+        return None;
+    }
+    let ids = bamboo_tools::tools::bash_runtime::uncollected_polled_shells_for_session(&session.id);
+    if ids.is_empty() {
+        return None;
+    }
+    Some(ContextBlock::new(
+        ContextBlockType::RecoverySnapshot,
+        ContextBlockPriority::Critical,
+        ContextBlockStability::RoundDynamic,
+        "Shell sessions awaiting a terminal result",
+        format!(
+            "Call write_stdin with each session_id below and empty chars to retrieve its terminal result. Continue polling while the tool result includes session_id.\nSession IDs: {}",
+            serde_json::to_string(&ids).expect("shell session IDs are serializable"),
+        ),
+    ))
+}
+
 fn legacy_browser_results_for_projection(
     session: &Session,
     tool_schemas: &[ToolSchema],
@@ -983,6 +1013,13 @@ fn build_request_envelope_reconciled_for_loading_mode(
         cache_scope_sha256,
         prepared_context.truncation_occurred,
     );
+    let mut model_transcript = ledger.transcript;
+    if let Some(block) = build_exec_session_continuation_context_block(session, tool_schemas) {
+        // This snapshot is current request context, never a second durable
+        // handle inventory. Keeping it outside the ledger also removes every
+        // stale ID from the next request as soon as its terminal poll consumes it.
+        model_transcript.push(block.render_runtime_context_message());
+    }
 
     // The single canonical request: stable prefix followed by one chronological
     // model transcript. Legacy lanes remain supported by PromptIR for external
@@ -1004,7 +1041,7 @@ fn build_request_envelope_reconciled_for_loading_mode(
         system_blocks,
         segments: vec![
             Segment::new(SegmentRole::StablePrefix, stable_prefix_messages),
-            Segment::new(SegmentRole::ModelTranscript, ledger.transcript),
+            Segment::new(SegmentRole::ModelTranscript, model_transcript),
         ],
         provider_transcript_groups,
         cache: cache_plan,
