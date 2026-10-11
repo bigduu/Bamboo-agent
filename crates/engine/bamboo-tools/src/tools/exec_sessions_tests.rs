@@ -377,6 +377,147 @@ mod process_tests {
     }
 
     #[tokio::test]
+    async fn broken_stdin_during_descendant_pipe_drain_keeps_short_yield_and_final_outcome() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let release = directory.path().join("release");
+        let pid_file = directory.path().join("descendant.pid");
+        struct Cleanup(PathBuf, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, b"release");
+                if let Ok(pid) = std::fs::read_to_string(&self.1) {
+                    if let Ok(pid) = pid.trim().parse::<i32>() {
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
+                    }
+                }
+            }
+        }
+        let _cleanup = Cleanup(release.clone(), pid_file.clone());
+        let first = start(
+            format!(
+                "sleep 30 </dev/null & printf '%s' $! > '{}'; \
+                 while [ ! -f '{}' ]; do sleep 0.01; done; printf final; exit 7",
+                pid_file.display(),
+                release.display()
+            ),
+            "broken-stdin-drain-exec",
+            true,
+        )
+        .await;
+        let id = first["session_id"].as_str().unwrap();
+        let shell = bash_runtime::get_shell(id).unwrap();
+        let state = shell.polled.as_ref().unwrap();
+        std::fs::write(release, b"release").unwrap();
+        timeout(Duration::from_secs(1), async {
+            while !state.process_exited() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!state.is_complete().await);
+        // The real parent has exited and the descendant has no stdin reader;
+        // its inherited output pipes keep completion unpublished for two seconds.
+        let error = shell.write_stdin("probe", false).await.unwrap_err();
+        assert!(error.contains("Failed to write to stdin"), "{error}");
+        let yielded = payload(
+            timeout(
+                Duration::from_secs(1),
+                WriteStdinTool::new().invoke(
+                    json!({"session_id":id,"chars":"late input","yield_time_ms":250}),
+                    context("broken-stdin-drain-exec"),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+        assert_eq!(yielded["status"], "running");
+        assert_eq!(yielded["session_id"], id);
+        let last = timeout(Duration::from_secs(5), poll(id, "broken-stdin-drain-exec"))
+            .await
+            .unwrap();
+        assert_eq!(last["status"], "error");
+        assert_eq!(last["exit_code"], 7);
+        assert!(last["error"]
+            .as_str()
+            .unwrap()
+            .contains("captured output is incomplete"));
+        assert!(last.get("session_id").is_none());
+        assert_eq!(
+            format!(
+                "{}{}{}",
+                first["output"].as_str().unwrap(),
+                yielded["output"].as_str().unwrap(),
+                last["output"].as_str().unwrap()
+            ),
+            "final"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_stdin_errors_stay_errors_and_do_not_consume_unread_output() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let release = directory.path().join("release");
+        let finish = directory.path().join("finish");
+        struct Release(PathBuf, PathBuf);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, b"release");
+                let _ = std::fs::write(&self.1, b"finish");
+            }
+        }
+        let _release = Release(release.clone(), finish.clone());
+        let first = start(
+            format!(
+                "while [ ! -f '{}' ]; do sleep 0.01; done; printf unread; \
+                 while [ ! -f '{}' ]; do sleep 0.01; done; printf done",
+                release.display(),
+                finish.display()
+            ),
+            "live-stdin-error-exec",
+            false,
+        )
+        .await;
+        let id = first["session_id"].as_str().unwrap();
+        let shell = bash_runtime::get_shell(id).unwrap();
+        let state = shell.polled.as_ref().unwrap();
+        std::fs::write(release, b"release").unwrap();
+        timeout(Duration::from_secs(1), async {
+            while state.output.lock().await.bytes != b"unread" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let error = timeout(
+            Duration::from_secs(1),
+            WriteStdinTool::new().invoke(
+                json!({"session_id":id,"chars":"not accepted","yield_time_ms":250}),
+                context("live-stdin-error-exec"),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            matches!(error, ToolError::Execution(message) if message.contains("no interactive stdin"))
+        );
+        assert!(!state.process_exited());
+        assert!(!state.is_complete().await);
+        assert_eq!(state.output.lock().await.bytes, b"unread");
+        std::fs::write(finish, b"finish").unwrap();
+        let last = poll(id, "live-stdin-error-exec").await;
+        assert_eq!(last["status"], "completed");
+        assert_eq!(last["exit_code"], 0);
+        assert_eq!(last["output"], "unreaddone");
+    }
+
+    #[tokio::test]
     async fn interactive_bytes_and_eof_finish_without_implicit_newline() {
         let _environment = environment();
         let first = start("cat".into(), "interactive-exec", true).await;

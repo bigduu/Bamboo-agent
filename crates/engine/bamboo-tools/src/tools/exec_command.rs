@@ -4,6 +4,7 @@ use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
@@ -31,6 +32,9 @@ struct CapturedOutput {
 pub(crate) struct PolledShellState {
     output: Mutex<CapturedOutput>,
     completed: Notify,
+    // A reaped parent may still have descendants holding its output pipes.
+    // This observation does not publish a terminal capture result.
+    process_exited: AtomicBool,
     capture_stop: watch::Sender<bool>,
     pub(crate) interaction: Mutex<()>,
     _permit: OwnedSemaphorePermit,
@@ -47,6 +51,7 @@ impl PolledShellState {
         Ok(Arc::new(Self {
             output: Mutex::new(CapturedOutput::default()),
             completed: Notify::new(),
+            process_exited: AtomicBool::new(false),
             capture_stop: watch::channel(false).0,
             interaction: Mutex::new(()),
             _permit: permit,
@@ -86,7 +91,15 @@ impl PolledShellState {
         self.completed.notify_waiters();
     }
 
-    async fn wait(&self, yield_time_ms: u64) {
+    pub(super) fn mark_process_exited(&self) {
+        self.process_exited.store(true, Ordering::Release);
+    }
+
+    pub(super) fn process_exited(&self) -> bool {
+        self.process_exited.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn wait(&self, yield_time_ms: u64) {
         let notified = self.completed.notified();
         tokio::pin!(notified);
         // Register before observing completion: even an immediate child exit

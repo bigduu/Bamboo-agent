@@ -74,25 +74,24 @@ impl Tool for WriteStdinTool {
         // Serialize writes and the implicit output cursor, including callers
         // that already obtained an Arc while another poll was completing.
         let _interaction = state.interaction.lock().await;
+        let mut wait_ms = yield_duration(parsed.yield_time_ms);
         if parsed.chars == "\u{3}" {
             shell.kill().await.map_err(ToolError::Execution)?;
         } else if !parsed.chars.is_empty() {
             if let Err(error) = shell.write_stdin(&parsed.chars, false).await {
-                // The process can exit between yielding its handle and this
-                // write. Its final output remains the useful result.
-                if !state.is_complete().await {
+                // A failed write may race process exit or output-pump drain.
+                // Wait once without consuming output, then keep polling an
+                // observed exit even if its captured result is not final yet.
+                state.wait(wait_ms).await;
+                if !state.is_complete().await && !state.process_exited() {
                     return Err(ToolError::Execution(error));
                 }
+                wait_ms = 0;
             }
         }
         if parsed.eof {
             shell.close_stdin().await;
         }
-        Ok(poll_result(
-            &shell,
-            yield_duration(parsed.yield_time_ms),
-            parsed.max_output_tokens,
-        )
-        .await)
+        Ok(poll_result(&shell, wait_ms, parsed.max_output_tokens).await)
     }
 }

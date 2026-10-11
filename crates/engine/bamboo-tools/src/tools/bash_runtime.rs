@@ -443,6 +443,11 @@ fn spawn_completion_poll(
                 child.wait().await
             }
         };
+        if wait_result.is_ok() {
+            if let Some((state, _)) = &polled {
+                state.mark_process_exited();
+            }
+        }
         let wait_error = wait_result.as_ref().err().map(ToString::to_string);
         let (status_str, exit_code_value) = match wait_result {
             Ok(status) => {
