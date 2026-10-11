@@ -1523,6 +1523,22 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    /// Admit one threaded peer message only while both observed Session
+    /// lifetimes and their current tree/Project membership remain valid.
+    /// Retain the existing lifecycle authority through the durable receipt,
+    /// binding this message's InterruptSpecificWait intent in the same commit.
+    /// Observations are not grants; unsupported backends must fail closed.
+    async fn deliver_peer_message(
+        &self,
+        _envelope: &SessionMessageEnvelope,
+        _source: &super::ActorSession,
+        _target: &super::ActorSession,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "lifetime-fenced peer SessionInbox admission is unsupported".into(),
+        ))
+    }
+
     /// Admit one typed Supervisor peer message while retaining canonical
     /// incarnation, relationship, Project and target lifetime authority locks
     /// through the inbox receipt. An earlier link observation is not a grant.
