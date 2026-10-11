@@ -1235,6 +1235,7 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
             "Plan",
             "Task",
             "session_history_current",
+            "session_message",
             "work_overview",
             "work_search",
             "work_inspect",
