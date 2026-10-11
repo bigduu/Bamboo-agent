@@ -116,8 +116,10 @@ Setup and installation refuse an equal or nested root with
 creating a store. If a later server selects a root inside an installed Jiandu
 connector, removal also refuses before changing capabilities, provenance or
 files. Select an independent memory root before retrying; this check never moves
-memory automatically. Sibling roots and roots containing the connector directory
-remain allowed because removing the connector does not remove those roots.
+memory automatically. Sibling directories and a shared ancestor do not count
+as an overlapping memory root.
+On macOS, missing path components with only ASCII case differences are treated
+as potentially overlapping until their real filesystem identity is established.
 
 ## List, update, remove
 

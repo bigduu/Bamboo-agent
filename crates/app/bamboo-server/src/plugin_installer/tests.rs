@@ -71,7 +71,7 @@ async fn jiandu_memory_paths_allow_missing_siblings_and_ancestors_but_not_overla
     ] {
         let resolved_memory = super::canonical_future_directory(&memory).await.unwrap();
         assert_eq!(
-            super::directory_contains(&resolved_plugin, &resolved_memory),
+            super::resolved_directory_contains(&resolved_plugin, &resolved_memory),
             overlap,
             "{memory:?}"
         );
@@ -106,12 +106,50 @@ async fn jiandu_memory_path_aliases_resolve_and_dangling_aliases_fail_closed() {
     let nested = super::canonical_future_directory(&alias.join("future/store"))
         .await
         .unwrap();
-    assert!(super::directory_contains(&resolved_plugin, &nested));
+    assert!(super::resolved_directory_contains(
+        &resolved_plugin,
+        &nested
+    ));
     let dangling = dir.path().join("dangling");
     std::os::unix::fs::symlink(dir.path().join("absent"), &dangling).unwrap();
     assert!(super::canonical_future_directory(&dangling.join("child"))
         .await
         .is_err());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn jiandu_future_case_aliases_are_refused_before_directory_activation() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("plugins/jiandu");
+    let memory = dir.path().join("PLUGINS/JIANDU/future-store");
+    let resolved_plugin = super::canonical_future_directory(&plugin).await.unwrap();
+    let resolved_memory = super::canonical_future_directory(&memory).await.unwrap();
+    assert!(super::resolved_directory_contains(
+        &resolved_plugin,
+        &resolved_memory
+    ));
+    assert!(!plugin.exists() && !memory.exists());
+    let data_dir = dir.path().join("bamboo");
+    let (_state, installer) =
+        jiandu_installer_with_root(&data_dir, data_dir.join("plugins/JIANDU/future-store")).await;
+    assert_eq!(
+        installer
+            .jiandu_memory_path_reason(&data_dir.join("plugins/jiandu"))
+            .await,
+        Some("memory_root_overlaps_plugin")
+    );
+    // A missing child must not erase an already established distinction
+    // between existing prefixes on a case-sensitive volume.
+    let plugin = super::ResolvedDirectory {
+        path: PathBuf::from("/owned/Case/jiandu"),
+        existing_components: Path::new("/owned/Case/jiandu").components().count(),
+    };
+    let separate = super::ResolvedDirectory {
+        path: PathBuf::from("/owned/CASE/jiandu/future-store"),
+        existing_components: Path::new("/owned/CASE/jiandu").components().count(),
+    };
+    assert!(!super::resolved_directory_contains(&plugin, &separate));
 }
 
 #[cfg(windows)]

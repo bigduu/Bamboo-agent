@@ -250,7 +250,7 @@ impl ServerPluginInstaller {
         let memory = canonical_future_directory(&self.state.memory_store.data_dir()).await;
         let plugin = canonical_future_directory(plugin_dir).await;
         match (memory, plugin) {
-            (Ok(memory), Ok(plugin)) if directory_contains(&plugin, &memory) => {
+            (Ok(memory), Ok(plugin)) if resolved_directory_contains(&plugin, &memory) => {
                 Some("memory_root_overlaps_plugin")
             }
             (Ok(_), Ok(_)) => None,
@@ -1485,7 +1485,13 @@ impl PluginInstaller for ServerPluginInstaller {
 /// Canonicalize the nearest existing directory, then append only normal
 /// missing components. A fresh store/connector need not exist yet; dangling
 /// aliases, non-directories, relative paths and other IO uncertainty fail closed.
-async fn canonical_future_directory(path: &Path) -> std::io::Result<PathBuf> {
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedDirectory {
+    path: PathBuf,
+    existing_components: usize,
+}
+
+async fn canonical_future_directory(path: &Path) -> std::io::Result<ResolvedDirectory> {
     use std::path::Component;
 
     if !path.is_absolute() {
@@ -1500,10 +1506,14 @@ async fn canonical_future_directory(path: &Path) -> std::io::Result<PathBuf> {
                 if !fs::metadata(&resolved).await?.is_dir() {
                     return Err(std::io::Error::other("path is not a directory"));
                 }
+                let existing_components = resolved.components().count();
                 for component in missing.into_iter().rev() {
                     resolved.push(component);
                 }
-                return Ok(resolved);
+                return Ok(ResolvedDirectory {
+                    path: resolved,
+                    existing_components,
+                });
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let Some(Component::Normal(component)) = ancestor.components().next_back() else {
@@ -1517,19 +1527,50 @@ async fn canonical_future_directory(path: &Path) -> std::io::Result<PathBuf> {
     }
 }
 
+fn resolved_directory_contains(directory: &ResolvedDirectory, path: &ResolvedDirectory) -> bool {
+    if directory_contains(&directory.path, &path.path) {
+        return true;
+    }
+    // Missing ASCII tails cannot establish case-sensitive independence on
+    // macOS. Existing canonical prefixes still establish distinct directories
+    // on a case-sensitive volume, even if a later child is missing.
+    cfg!(target_os = "macos") && {
+        let mut parts = path.path.components();
+        directory
+            .path
+            .components()
+            .enumerate()
+            .all(|(index, component)| {
+                parts.next().is_some_and(|part| {
+                    part == component
+                        || ((index >= directory.existing_components
+                            || index >= path.existing_components)
+                            && part
+                                .as_os_str()
+                                .as_encoded_bytes()
+                                .eq_ignore_ascii_case(component.as_os_str().as_encoded_bytes()))
+                })
+            })
+    }
+}
+
+fn ascii_directory_contains(directory: &Path, path: &Path) -> bool {
+    let mut parts = path.components();
+    directory.components().all(|component| {
+        parts.next().is_some_and(|part| {
+            part.as_os_str()
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(component.as_os_str().as_encoded_bytes())
+        })
+    })
+}
+
 fn directory_contains(directory: &Path, path: &Path) -> bool {
     #[cfg(windows)]
     {
         // Canonical existing prefixes have resolved spelling. Missing suffixes
         // include our ASCII managed names, which remain case-insensitive on Windows.
-        let mut parts = path.components();
-        directory.components().all(|component| {
-            parts.next().is_some_and(|part| {
-                part.as_os_str()
-                    .as_encoded_bytes()
-                    .eq_ignore_ascii_case(component.as_os_str().as_encoded_bytes())
-            })
-        })
+        ascii_directory_contains(directory, path)
     }
     #[cfg(not(windows))]
     path.starts_with(directory)
