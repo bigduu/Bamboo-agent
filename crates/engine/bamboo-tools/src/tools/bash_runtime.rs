@@ -731,6 +731,23 @@ pub fn remove_shell(id: &str) -> Option<Arc<ShellSession>> {
     sessions().remove(id).map(|(_, value)| value)
 }
 
+/// Current pull-session handles whose terminal result has not been consumed.
+///
+/// Include exited sessions: only a terminal `poll_result` removes their handle
+/// (apart from the existing cache TTL). The exec-session capacity bounds this
+/// snapshot; do not truncate it or infer process state from registry presence.
+/// This observes the existing registry without reading output or advancing a
+/// cursor, and intentionally excludes legacy Bash sessions.
+pub fn uncollected_polled_shells_for_session(session_id: &str) -> Vec<String> {
+    let mut ids = sessions()
+        .iter()
+        .filter(|entry| entry.polled.is_some() && entry.session_id.as_deref() == Some(session_id))
+        .map(|entry| entry.id.clone())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
+}
+
 /// Returns the ids of background shells owned by `session_id` that are still
 /// running (issue #84, phase 2a). Mirrors the sync `get_shell`/`remove_shell`
 /// helpers over the global registry — not async because the registry is a sync

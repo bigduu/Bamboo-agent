@@ -1476,6 +1476,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
     config: &AgentLoopConfig,
     model_name: &str,
     session_id: &str,
+    tool_schemas: &[ToolSchema],
     llm: &Arc<dyn LLMProvider>,
     budget: &TokenBudget,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
@@ -1641,7 +1642,15 @@ async fn maybe_apply_summary_context_compression_with_budget(
         .iter()
         .fold(0u32, |total, block| {
             total.saturating_add(counter.count_message(&block.render_runtime_context_message()))
-        });
+        })
+        .saturating_add(
+            super::stream_execution::build_exec_session_continuation_context_block(
+                session,
+                tool_schemas,
+            )
+            .map(|block| counter.count_message(&block.render_runtime_context_message()))
+            .unwrap_or(0),
+        );
     let build_candidate = if message_summary {
         build_message_summary_candidate_plan_with_fixed_tokens
     } else {
@@ -2201,6 +2210,7 @@ pub(super) async fn maybe_apply_host_context_compression(
             config,
             model_name,
             session_id,
+            tool_schemas,
             llm,
             &budget,
             event_tx,
@@ -2224,6 +2234,7 @@ pub(super) async fn maybe_apply_host_context_compression(
         config,
         model_name,
         session_id,
+        tool_schemas,
         llm,
         &budget,
         event_tx,
@@ -2361,6 +2372,7 @@ pub(crate) async fn force_overflow_context_recovery(
         config,
         model_name,
         session_id,
+        tool_schemas,
         llm,
         &budget,
         event_tx,
@@ -2505,7 +2517,16 @@ pub(super) async fn prepare_round_context(
             }
             ocr_cache::maybe_cache_ocr_results(session, config, session_id).await;
             let fallback_applied = maybe_apply_summary_context_compression_with_budget(
-                session, config, model_name, session_id, llm, &budget, event_tx, "pre-turn", None,
+                session,
+                config,
+                model_name,
+                session_id,
+                tool_schemas,
+                llm,
+                &budget,
+                event_tx,
+                "pre-turn",
+                None,
             )
             .await?;
             if !fallback_applied {
@@ -2588,6 +2609,7 @@ pub(super) async fn prepare_round_context(
                         config,
                         model_name,
                         session_id,
+                        tool_schemas,
                         llm,
                         &budget,
                         event_tx,
@@ -2609,7 +2631,16 @@ pub(super) async fn prepare_round_context(
             }
         }
     } else if maybe_apply_summary_context_compression_with_budget(
-        session, config, model_name, session_id, llm, &budget, event_tx, "pre-turn", None,
+        session,
+        config,
+        model_name,
+        session_id,
+        tool_schemas,
+        llm,
+        &budget,
+        event_tx,
+        "pre-turn",
+        None,
     )
     .await?
     {

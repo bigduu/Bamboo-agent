@@ -2,7 +2,7 @@
 //!
 //! These functions compose the tool executor chain:
 //! ```text
-//! base_tools (builtin + MCP + memory + skills + context controls + legacy self-only
+//! base_tools (builtin + MCP + memory + session messaging + skills + context controls + legacy self-only
 //!             session_history + exact self-only session_history_current)
 //!   └─> root_tools (base + Plan + SubAgent + scheduler + full legacy session_history)
 //! ```
@@ -46,6 +46,7 @@ pub(super) fn build_base_tools(
     workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
     tool_event_publisher: Arc<dyn ToolEventPublisher>,
     memory_store: bamboo_memory::memory_store::MemoryStore,
+    session_messenger: Arc<bamboo_engine::SessionMessenger>,
 ) -> (
     Arc<dyn ToolExecutor>,
     Arc<dyn bamboo_engine::external_agents::runtime::NativeToolCeilingSource>,
@@ -118,6 +119,14 @@ pub(super) fn build_base_tools(
         with_project,
         memory_tool,
     ));
+    // One logical-session delivery plane serves Root, Child, nested Child and
+    // scheduled/headless executions through their shared Base tool surface.
+    let with_messages: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
+        with_memory,
+        Arc::new(bamboo_server_tools::SessionMessageTool::new(
+            session_messenger,
+        )),
+    ));
 
     // `ledger` sits in the base layer (not root-only) so headless reminder
     // sessions fired by the schedule manager can read and transition the very
@@ -129,7 +138,7 @@ pub(super) fn build_base_tools(
             .with_project_store(project_store.clone()),
     );
     let with_ledger: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        with_memory,
+        with_messages,
         ledger_tool,
     ));
 
@@ -626,6 +635,117 @@ mod native_ceiling_tests {
             .await
             .unwrap()
             .contains(&"Write".into()));
+    }
+}
+
+#[cfg(test)]
+mod session_message_assembly_tests {
+    use super::*;
+    use bamboo_agent_core::tools::{FunctionCall, Tool, ToolMutability};
+    use bamboo_agent_core::{Session, ToolCall, ToolExecutionContext};
+    use serde_json::json;
+
+    fn call(action: &str) -> ToolCall {
+        ToolCall {
+            id: format!("installed-peer-{action}"),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "session_message".into(),
+                arguments: match action {
+                    "send" => json!({"action": action, "target_session_id": "peer-child", "operation_id": "blocked-send", "message": "must not enqueue"}),
+                    "reply" => json!({"action": action, "reply_to": "unreceived", "operation_id": "blocked-reply", "message": "must not enqueue"}),
+                    _ => json!({"action": action}),
+                }.to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn installed_peer_tool_is_shared_across_surfaces_and_preserves_read_only_posture() {
+        let home = tempfile::tempdir().unwrap();
+        let state = super::super::AppState::new_with_provider(
+            home.path().to_path_buf(),
+            Config::default(),
+            Arc::new(super::super::UnconfiguredProvider {
+                message: "tool assembly must not call a model".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut root = Session::new("peer-root", "model");
+        root.set_root_orchestration_only(true).unwrap();
+        assert!(root.allows_model_tool_execution("session_message"));
+        let mut child = Session::new_child_of("peer-child", &root, "model", "Child");
+        let mut nested = Session::new_child_of("peer-nested", &child, "model", "Nested");
+        for session in [&mut root, &mut child, &mut nested] {
+            state.session_repo.save(session).await.unwrap();
+        }
+        let expected =
+            bamboo_server_tools::SessionMessageTool::new(state.session_messenger.clone())
+                .to_schema();
+        assert_eq!(
+            bamboo_domain::capability_loading_class_for_reference("session_message"),
+            bamboo_domain::CapabilityLoadingClass::Deferred
+        );
+        assert!(Arc::ptr_eq(
+            state.agent.default_tools(),
+            &state.tools_for(crate::tools::ToolSurface::Base)
+        ));
+        for (surface, session) in [
+            (crate::tools::ToolSurface::Base, &root),
+            (crate::tools::ToolSurface::Root, &root),
+            (crate::tools::ToolSurface::Child, &child),
+            (crate::tools::ToolSurface::Child, &nested),
+            (crate::tools::ToolSurface::WithTask, &child),
+        ] {
+            let tools = state.tools_for(surface);
+            assert!(tools.owns_exact_tool("session_message"));
+            let schemas = tools.list_tools();
+            let matching: Vec<_> = schemas
+                .iter()
+                .filter(|schema| schema.function.name == "session_message")
+                .collect();
+            assert_eq!(matching.len(), 1, "{surface:?}");
+            assert_eq!(
+                serde_json::to_value(matching[0]).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            for action in ["list_targets", "send", "reply"] {
+                let call = call(action);
+                assert_eq!(
+                    tools.call_parallel_classification(&call),
+                    if action == "list_targets" {
+                        (ToolMutability::ReadOnly, true)
+                    } else {
+                        (ToolMutability::Mutating, false)
+                    }
+                );
+                let mut ctx = ToolExecutionContext::none(&call.id);
+                ctx.session_id = Some(&session.id);
+                ctx.root_session_id = Some(&session.root_session_id);
+                ctx.plan_read_only = true;
+                ctx.bypass_permissions = true;
+                ctx.auto_approve_permissions = true;
+                let result = tools.execute_with_context(&call, ctx).await;
+                if action == "list_targets" {
+                    let result = result.unwrap();
+                    assert!(result.success);
+                    let listing: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+                    assert_eq!(listing["truncated"], false);
+                    let targets = listing["targets"].as_array().unwrap();
+                    assert_eq!(targets.len(), 2);
+                    assert!(targets
+                        .iter()
+                        .all(|target| target["session_id"] != session.id));
+                } else {
+                    assert!(result.is_err(), "{surface:?} {action}");
+                }
+            }
+        }
+        for session in [&root, &child, &nested] {
+            let inbox = state.session_inbox.inspect(&session.id).await.unwrap();
+            assert_eq!(inbox.pending + inbox.claimed, 0);
+        }
     }
 }
 

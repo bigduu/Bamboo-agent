@@ -1503,6 +1503,56 @@ impl SessionInboxPort for FileSessionInbox {
         .await
     }
 
+    async fn deliver_peer_message(
+        &self,
+        envelope: &SessionMessageEnvelope,
+        source: &bamboo_domain::ActorSession,
+        target: &bamboo_domain::ActorSession,
+        reply_to: Option<&SessionMessageEnvelope>,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        let reply_route_matches = match (&envelope.in_reply_to, reply_to) {
+            (None, None) => true,
+            (Some(id), Some(proof)) => {
+                id == &proof.id
+                    && proof.kind == bamboo_domain::SessionMessageKind::PeerMessage
+                    && proof.thread_id.is_some()
+                    && proof.thread_id == envelope.thread_id
+                    && proof.target_session_id == source.actor_id
+                    && proof.source
+                        == (SessionMessageSource::Session {
+                            session_id: target.actor_id.clone(),
+                        })
+            }
+            _ => false,
+        };
+        if !reply_route_matches
+            || envelope.source
+                != (SessionMessageSource::Session {
+                    session_id: source.actor_id.clone(),
+                })
+            || envelope.target_session_id != target.actor_id
+            || envelope.kind != bamboo_domain::SessionMessageKind::PeerMessage
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "peer delivery identity differs from its observations".into(),
+            ));
+        }
+        let authority = self
+            .sessions
+            .lock_peer_delivery(source, target, reply_to)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        self.deliver_with_lifecycle_held(
+            envelope,
+            InboxAuthority::Peer { _guard: authority },
+            None,
+            Some(SessionInboxActivationIntent::new(
+                SessionActivationPolicy::InterruptSpecificWait,
+            )),
+        )
+        .await
+    }
+
     async fn mark_activation_eligible(
         &self,
         target_session_id: &str,

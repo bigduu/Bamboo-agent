@@ -1277,6 +1277,32 @@ pub fn check_permissions(
                 "session_control followup: continue an existing independent Root",
             )]))
         }
+        "session_message" => {
+            // Match the tool's exact serde action names. Messaging can activate
+            // another Session, so only target discovery is permission-free.
+            let action = required_string_arg(args, "action")?;
+            let description = match action {
+                "list_targets" => return Ok(None),
+                "send" => {
+                    "session_message send: deliver a peer message and request receiver activation"
+                }
+                "reply" => {
+                    "session_message reply: deliver a peer reply and request receiver activation"
+                }
+                _ => {
+                    return Err(PermissionError::CheckFailed(
+                        "unsupported session_message action".into(),
+                    ));
+                }
+            };
+            // A permission context describes the operation, never peer text or
+            // private target, reply, or operation identifiers.
+            Ok(Some(vec![PermissionContext::new(
+                PermissionType::ExecuteCommand,
+                format!("session_message {action}"),
+                description,
+            )]))
+        }
         // Read-only: session_inspector (list / get_meta / read_messages), the
         // legacy session_history viewer, and exact self-only current history
         // never mutate or spin up compute. #395.
@@ -3029,6 +3055,93 @@ mod tests {
             contexts.is_none(),
             "notify must be auto-approved (ungated) by design"
         );
+    }
+
+    #[test]
+    fn session_message_send_and_reply_require_private_execution_contexts() {
+        for (action, route_field, private_route) in [
+            ("send", "target_session_id", "private-peer-target"),
+            ("reply", "reply_to", "private-received-message-id"),
+        ] {
+            let mut args = json!({
+                "action": action,
+                "operation_id": "private-operation-id",
+                "message": "private peer message body"
+            });
+            args[route_field] = json!(private_route);
+            let contexts = check_permissions("session_message", &args)
+                .unwrap()
+                .expect("peer delivery must enter the execution permission gate");
+            assert_eq!(contexts.len(), 1);
+            let context = &contexts[0];
+            assert_eq!(context.permission_type, PermissionType::ExecuteCommand);
+            assert_eq!(context.resource, format!("session_message {action}"));
+            assert_eq!(
+                context.operation_description,
+                match action {
+                    "send" => "session_message send: deliver a peer message and request receiver activation",
+                    _ => "session_message reply: deliver a peer reply and request receiver activation",
+                }
+            );
+            for private in [
+                "private-peer-target",
+                "private-received-message-id",
+                "private-operation-id",
+                "private peer message body",
+            ] {
+                assert!(!context.resource.contains(private));
+                assert!(!context.operation_description.contains(private));
+            }
+
+            let mut changed = args;
+            changed[route_field] = json!("another-private-route");
+            changed["operation_id"] = json!("another-private-operation");
+            changed["message"] = json!("another private body");
+            let changed = check_permissions("session_message", &changed)
+                .unwrap()
+                .unwrap();
+            assert_eq!(changed[0].resource, context.resource);
+            assert_eq!(
+                changed[0].operation_description,
+                context.operation_description
+            );
+        }
+    }
+
+    #[test]
+    fn session_message_target_discovery_is_permission_free() {
+        assert!(
+            check_permissions("session_message", &json!({"action": "list_targets"}))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn session_message_malformed_actions_fail_closed() {
+        for args in [
+            Value::Null,
+            json!([]),
+            json!({}),
+            json!({"action": null}),
+            json!({"action": 1}),
+            json!({"action": true}),
+            json!({"action": []}),
+            json!({"action": {}}),
+            json!({"action": ""}),
+            json!({"action": "private-unknown-action"}),
+            json!({"action": "SEND"}),
+            json!({"action": "Reply"}),
+            json!({"action": "LIST_TARGETS"}),
+            json!({"action": " send"}),
+            json!({"action": "reply "}),
+            json!({"action": " list_targets "}),
+        ] {
+            let error = check_permissions("session_message", &args)
+                .expect_err("only the tool's exact action names can be classified");
+            assert!(matches!(error, PermissionError::CheckFailed(_)));
+            assert!(!error.to_string().contains("private-unknown-action"));
+        }
     }
 
     #[test]
