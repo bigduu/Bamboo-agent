@@ -1293,6 +1293,231 @@ async fn valid_signature_from_a_trusted_key_verifies_and_supersedes_the_checksum
     staged.commit().await;
 }
 
+// A pooled HTTP connection is driven by the runtime that created it, even
+// when a request using that connection is polled by a different runtime.
+fn assert_signed_staging_survives_another_runtime_shutdown(allow_unsigned: bool) {
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    // These bounds guard deadlocks; channel/gate events establish ordering.
+    const GUARD: Duration = Duration::from_secs(30);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let manifest_body = hello_manifest_json("hello-plugin");
+    let signing_key = test_signing_key(7);
+    let signature = hex::encode(signing_key.sign(manifest_body.as_bytes()).to_bytes());
+    let trust = PluginTrustConfig {
+        trusted_hosts: Vec::new(),
+        trusted_keys: vec![trusted_key_for("test-key", &signing_key)],
+        enforcement: PluginTrustEnforcement::Strict,
+    };
+    let (signature_received_tx, signature_received_rx) = mpsc::channel();
+    let response_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let responder_gate = Arc::clone(&response_gate);
+    // Keep a dedicated server alive throughout both client runtimes. Its
+    // own runtime cannot disappear or be recycled when runtime A exits.
+    let server = runtime.block_on(async {
+        let server = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/plugin.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string(manifest_body.clone()),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/plugin.json.sig"))
+            .respond_with(move |_: &wiremock::Request| {
+                let _ = signature_received_tx.send(());
+                let (lock, ready) = &*responder_gate;
+                let (released, _) = ready
+                    .wait_timeout_while(lock.lock().unwrap(), GUARD, |released| !*released)
+                    .unwrap();
+                if *released {
+                    wiremock::ResponseTemplate::new(200).set_body_string(signature.clone())
+                } else {
+                    wiremock::ResponseTemplate::new(503)
+                }
+            })
+            .mount(&server)
+            .await;
+        server
+    });
+    let url = format!("{}/plugin.json", server.uri());
+    let warm_url = url.clone();
+    let (warm_tx, warm_rx) = mpsc::channel();
+    let (stop_a_tx, stop_a_rx) = tokio::sync::oneshot::channel();
+    let runtime_a = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let client = if allow_unsigned {
+                http_client_no_redirects()
+            } else {
+                http_client_following_redirects()
+            };
+            let warm = tokio::time::timeout(
+                GUARD,
+                download_bytes(&client, &warm_url, MAX_DOWNLOAD_BYTES),
+            )
+            .await;
+            let warmed = matches!(warm, Ok(Ok(ref bytes)) if bytes == manifest_body.as_bytes());
+            let _ = warm_tx.send(warmed);
+            if warmed {
+                let _ = stop_a_rx.await;
+            }
+        });
+        // Returning drops the runtime, including its connection driver.
+    });
+    let warmed = warm_rx.recv_timeout(GUARD);
+    if !matches!(warmed, Ok(true)) {
+        let _ = stop_a_tx.send(());
+        let stopped = runtime_a.join();
+        assert!(stopped.is_ok(), "warm-up runtime panicked");
+        panic!("manifest warm-up failed: {warmed:?}");
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let stage_url = url.clone();
+    let runtime_b = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                GUARD,
+                stage_plugin_source(
+                    url_input_full(&stage_url, None, allow_unsigned, true, allow_unsigned),
+                    &plugins_root,
+                    &trust,
+                ),
+            )
+            .await
+        })
+    });
+    let signature_received = signature_received_rx.recv_timeout(GUARD);
+    let _ = stop_a_tx.send(());
+    let stopped_a = runtime_a.join();
+    // Release even on a worker failure, before joining B or asserting.
+    let (lock, ready) = &*response_gate;
+    *lock.lock().unwrap() = true;
+    ready.notify_all();
+    let staged = runtime_b.join();
+
+    assert!(stopped_a.is_ok(), "runtime A panicked");
+    assert!(
+        signature_received.is_ok(),
+        "staging must reach the signature request before runtime A exits"
+    );
+    let staged = staged
+        .expect("staging runtime panicked")
+        .expect("staging exceeded the deadlock guard")
+        .expect("a trusted signature must survive another runtime shutting down");
+    assert_eq!(staged.manifest.id, "hello-plugin");
+    assert_eq!(
+        staged.source,
+        PluginSource::Url {
+            url,
+            sha256: None,
+            allow_unverified: allow_unsigned,
+            allow_untrusted_host: true,
+            allow_unsigned,
+            signed_by: Some("test-key".to_string()),
+            insecure: false,
+        }
+    );
+    let requests = runtime.block_on(server.received_requests()).unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.url.path())
+            .collect::<Vec<_>>(),
+        ["/plugin.json", "/plugin.json", "/plugin.json.sig"],
+        "warm-up and staging must make exactly the intended requests"
+    );
+    runtime.block_on(staged.commit());
+}
+
+#[test]
+fn signed_staging_survives_another_runtime_shutdown_with_redirects() {
+    assert_signed_staging_survives_another_runtime_shutdown(false);
+}
+
+#[test]
+fn signed_staging_survives_another_runtime_shutdown_without_redirects() {
+    assert_signed_staging_survives_another_runtime_shutdown(true);
+}
+
+#[tokio::test]
+async fn malformed_tampered_and_oversized_signatures_are_refused() {
+    let manifest_body = hello_manifest_json("hello-plugin");
+    let signing_key = test_signing_key(7);
+    let valid_signature = hex::encode(signing_key.sign(manifest_body.as_bytes()).to_bytes());
+    let oversized_signature = format!(
+        "{valid_signature}{}",
+        " ".repeat(MAX_SIGNATURE_DOWNLOAD_BYTES as usize)
+    );
+    assert_eq!(oversized_signature.trim(), valid_signature);
+    assert!(oversized_signature.len() > MAX_SIGNATURE_DOWNLOAD_BYTES as usize);
+    let cases = [
+        ("invalid UTF-8", vec![0xff]),
+        ("non-hex", b"not a hex signature".to_vec()),
+        ("wrong length", hex::encode([0_u8; 63]).into_bytes()),
+        (
+            "tampered manifest",
+            hex::encode(signing_key.sign(b"tampered manifest").to_bytes()).into_bytes(),
+        ),
+        (
+            "valid signature exceeding the cap",
+            oversized_signature.into_bytes(),
+        ),
+    ];
+    let trust = PluginTrustConfig {
+        trusted_hosts: Vec::new(),
+        trusted_keys: vec![trusted_key_for("test-key", &signing_key)],
+        enforcement: PluginTrustEnforcement::Strict,
+    };
+    for (case, signature) in cases {
+        let server = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/plugin.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string(manifest_body.clone()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/plugin.json.sig"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(signature))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let plugins_root = root.path().join("plugins");
+        let url = format!("{}/plugin.json", server.uri());
+        let error = stage_plugin_source(
+            url_input_full(&url, None, false, true, false),
+            &plugins_root,
+            &trust,
+        )
+        .await
+        .expect_err(case);
+        assert!(
+            matches!(error, PluginError::UnsignedOrUntrustedSignature(_)),
+            "{case}: expected UnsignedOrUntrustedSignature, got {error:?}"
+        );
+        assert!(!plugins_root.join("hello-plugin").exists(), "{case}");
+        assert_single_rejected_staging(&plugins_root, case).await;
+    }
+}
+
 #[tokio::test]
 async fn absent_signature_is_refused_with_unsigned_or_untrusted_signature() {
     let server = wiremock::MockServer::start().await;
