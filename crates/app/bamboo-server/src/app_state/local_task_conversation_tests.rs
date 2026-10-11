@@ -822,13 +822,16 @@ async fn native_fast_child_wakes_root_for_real_feedback_and_preserves_all_wait_f
     const SLOW_RESULT: &str = "Native slow child finished after the real parent feedback.";
     const FEEDBACK: &str = "Use the fast child's result in your remaining work.";
     const FEEDBACK_CALL: &str = "native-incremental-root-feedback";
+    const SLOW_INSPECT_CALL: &str = "native-incremental-slow-round-boundary";
     let home = tempfile::tempdir().unwrap();
+    // Profile discovery rejects symlink ancestors; macOS temporary /var is one.
+    let data_home = std::fs::canonicalize(home.path()).unwrap();
     let (send, mut requests) = mpsc::unbounded_channel();
     let provider = Arc::new(ConversationProvider { requests: send });
-    let mut config = Config::from_data_dir(Some(home.path().to_path_buf()));
+    let mut config = Config::from_data_dir(Some(data_home.clone()));
     config.provider = PROVIDER.into();
     config.subagents_mut().max_concurrent = Some(2);
-    let state = AppState::new_with_provider(home.path().to_path_buf(), config, provider.clone())
+    let state = AppState::new_with_provider(data_home, config, provider.clone())
         .await
         .unwrap();
     state.provider_registry.replace_with(ProviderRegistry::new(
@@ -983,13 +986,34 @@ async fn native_fast_child_wakes_root_for_real_feedback_and_preserves_all_wait_f
         Err(mpsc::error::TryRecvError::Empty)
     ));
 
-    slow_call.complete("Slow child reaches its next feedback boundary.");
+    // A real read-only tool round gives the running child a safe boundary to
+    // consume guidance. Complete would end its task instead of taking a round.
+    slow_call.subagent(
+        SLOW_INSPECT_CALL,
+        json!({"intent":"inspect","message":"tree"}),
+    );
     let slow_continued = next_request(&mut requests, &state, &parent_id, slow_id).await;
     assert_eq!(slow_continued.process_id, std::process::id());
-    assert!(slow_continued
+    assert!(
+        slow_continued
+            .messages
+            .iter()
+            .any(|message| message.content.contains(SLOW)),
+        "the slow child must continue after its real inspection"
+    );
+    let inspection = slow_continued
         .messages
         .iter()
-        .any(|message| message.content.contains(SLOW)));
+        .find(|message| {
+            message.role == Role::Tool && message.tool_call_id.as_deref() == Some(SLOW_INSPECT_CALL)
+        })
+        .unwrap();
+    assert_eq!(
+        inspection.tool_success,
+        Some(true),
+        "{}",
+        inspection.content
+    );
     assert_eq!(
         slow_continued
             .messages
