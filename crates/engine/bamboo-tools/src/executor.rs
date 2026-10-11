@@ -13,9 +13,10 @@ use bamboo_domain::{canonical_tool_name, resolve_tool_reference_name};
 use crate::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
 use crate::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::tools::{
-    BashInputTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, GetFileInfoTool, GlobTool,
-    GrepTool, KillShellTool, ReadTool, RequestPermissionsTool, SessionNoteTool, SleepTool,
-    TaskTool, ToolRegistry, UpdateGoalTool, ViewImageTool, WebFetchTool, WorkspaceTool, WriteTool,
+    BashInputTool, BashOutputTool, BashTool, EditTool, ExecCommandTool, ExitPlanModeTool,
+    GetFileInfoTool, GlobTool, GrepTool, KillShellTool, ReadTool, RequestPermissionsTool,
+    SessionNoteTool, SleepTool, TaskTool, ToolRegistry, UpdateGoalTool, ViewImageTool,
+    WebFetchTool, WorkspaceTool, WriteStdinTool, WriteTool,
 };
 use bamboo_llm::Config;
 use bamboo_plugin_protocol::{
@@ -330,6 +331,10 @@ impl BuiltinToolExecutor {
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, BashTool::new()) {
             framework_tools.insert(name, tool);
         }
+        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, ExecCommandTool::new()) {
+            framework_tools.insert(name, tool);
+        }
+        let _ = registry.register(WriteStdinTool::new());
         let _ = registry.register(BashInputTool::new());
         let _ = registry.register(BashOutputTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, EditTool::new()) {
@@ -527,7 +532,7 @@ impl BuiltinToolExecutor {
         // safely merely by dropping its future. Custom/plugin tools stay inline:
         // their private task-local capability scopes must not be lost.
         let owned_resources = crate::LocalTaskResources::current().filter(|_| {
-            matches!(execution_name, "Write" | "Edit" | "Bash")
+            matches!(execution_name, "Write" | "Edit" | "Bash" | "exec_command")
                 && self.is_framework_builtin_instance(execution_name, &tool)
         });
         let outcome = if let Some(resources) = owned_resources {
@@ -1183,13 +1188,21 @@ impl BuiltinToolExecutorBuilder {
 
     /// Registers a specific command tool by name
     pub fn with_command_tool(mut self, name: &str) -> Result<Self, ToolError> {
-        if name == "Bash" {
-            let (name, tool) =
-                BuiltinToolExecutor::register_tracked_builtin(&self.registry, BashTool::new())?;
+        if name == "Bash" || name == "exec_command" {
+            let (name, tool) = if name == "Bash" {
+                BuiltinToolExecutor::register_tracked_builtin(&self.registry, BashTool::new())?
+            } else {
+                BuiltinToolExecutor::register_tracked_builtin(
+                    &self.registry,
+                    ExecCommandTool::new(),
+                )?
+            };
             self.framework_builtin_tools.insert(name, tool);
             return Ok(self);
         }
         match name {
+            "write_stdin" => self.registry.register(WriteStdinTool::new()),
+            "BashInput" => self.registry.register(BashInputTool::new()),
             "BashOutput" => self.registry.register(BashOutputTool::new()),
             "KillShell" => self.registry.register(KillShellTool::new()),
             "Task" => self.registry.register(TaskTool::new()),
@@ -1963,6 +1976,9 @@ mod tests {
                 json!({"file_path": "/tmp/par_cls.txt", "content": "y"}),
             ),
             ("Bash", json!({"command": "echo hi"})),
+            ("exec_command", json!({"cmd": "echo hi"})),
+            ("write_stdin", json!({"session_id": "exec", "chars": ""})),
+            ("write_stdin", json!({"session_id": "exec", "chars": "y\n"})),
             ("Workspace", json!({})),
             ("Workspace", json!({"path": "/tmp"})),
         ];
@@ -3403,6 +3419,74 @@ mod tests {
             matches!(result, Err(ToolError::Execution(ref message)) if message.contains("explicit policy")),
             "explicit delete deny must beat bypass: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_session_tools_preserve_plan_and_read_only_hard_boundaries() {
+        let readonly = Arc::new(crate::permission::ReadOnlyCommandChecker::new(Arc::new(
+            crate::permission::AllowAllPermissionChecker,
+        )));
+        let restricted = BuiltinToolExecutorBuilder::new()
+            .with_default_tools()
+            .with_permission_checker(readonly)
+            .build();
+        let ordinary = BuiltinToolExecutor::new();
+        for (name, args) in [
+            ("exec_command", json!({"cmd":"cargo test"})),
+            ("write_stdin", json!({"session_id":"exec", "chars":""})),
+            ("write_stdin", json!({"session_id":"exec", "chars":"yes\n"})),
+        ] {
+            let call = make_tool_call(name, args);
+            for (bypass, auto) in [(false, false), (true, false), (false, true)] {
+                let mut ctx = ToolExecutionContext::none(&call.id);
+                ctx.bypass_permissions = bypass;
+                ctx.auto_approve_permissions = auto;
+                let denied = restricted
+                    .check_permissions_for_exact(&call, name, &ctx)
+                    .await;
+                assert!(
+                    matches!(denied, Err(ToolError::Execution(ref message)) if message.contains("Read-only child")),
+                    "{name}: {denied:?}"
+                );
+                ctx.plan_read_only = true;
+                let denied = ordinary
+                    .check_permissions_for_exact(&call, name, &ctx)
+                    .await;
+                assert!(
+                    matches!(denied, Err(ToolError::Execution(ref message)) if message.contains("Plan mode")),
+                    "{name}: {denied:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_command_preserves_explicit_delete_deny_under_auto_and_bypass() {
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config.add_rule(crate::permission::PermissionRule::new(
+            crate::permission::PermissionType::DeleteOperation,
+            "rm child-to-preserve",
+            false,
+        ));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_default_tools()
+            .with_permission_checker(Arc::new(crate::permission::ConfigPermissionChecker::new(
+                config,
+            )))
+            .build();
+        let call = make_tool_call("exec_command", json!({"cmd":"rm child-to-preserve"}));
+        for (bypass, auto) in [(false, false), (true, false), (false, true)] {
+            let mut ctx = ToolExecutionContext::none(&call.id);
+            ctx.bypass_permissions = bypass;
+            ctx.auto_approve_permissions = auto;
+            let denied = executor
+                .check_permissions_for_exact(&call, "exec_command", &ctx)
+                .await;
+            assert!(
+                matches!(denied, Err(ToolError::Execution(ref message)) if message.contains("explicit policy")),
+                "{denied:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -13,6 +13,19 @@ use crate::{PermissionContext, PermissionError, PermissionType};
 
 const DELETE_COMMANDS: [&str; 7] = ["rm", "rmdir", "del", "erase", "unlink", "rd", "remove-item"];
 
+/// The executable bytes for either shell API. Keep policy extraction separate
+/// from callable identity: exec_command has its own schema and execution path.
+pub(crate) fn shell_command<'a>(tool_name: &str, args: &'a Value) -> Option<&'a str> {
+    let key = if tool_name.eq_ignore_ascii_case("Bash") {
+        "command"
+    } else if tool_name.eq_ignore_ascii_case("exec_command") {
+        "cmd"
+    } else {
+        return None;
+    };
+    args.get(key).and_then(Value::as_str)
+}
+
 /// Maximum number of independent permission contexts that can be carried by
 /// one proactive request. This matches the bounded replay ledger so every
 /// schema-valid request can eventually complete.
@@ -530,8 +543,14 @@ pub fn check_permissions(
                 format!("Notebook edit: {}", path),
             )]))
         }
-        "Bash" => {
-            let command = required_string_arg(args, "command")?.trim();
+        "Bash" | "exec_command" => {
+            let command = shell_command(tool_name, args)
+                .ok_or_else(|| {
+                    PermissionError::CheckFailed(
+                        "Missing or invalid shell command parameter".into(),
+                    )
+                })?
+                .trim();
             if command.is_empty() {
                 return Err(PermissionError::CheckFailed(
                     "Missing or invalid 'command' parameter".to_string(),
@@ -671,6 +690,14 @@ pub fn check_permissions(
                 _ => None,
             };
             Ok(write_contexts)
+        }
+        "write_stdin" => {
+            let session_id = required_string_arg(args, "session_id")?;
+            Ok(Some(vec![PermissionContext::new(
+                PermissionType::TerminalSession,
+                session_id,
+                format!("Read or interact with shell session: {}", session_id),
+            )]))
         }
         "BashInput" => {
             let bash_id = required_string_arg(args, "bash_id")?;
@@ -3010,6 +3037,150 @@ mod tests {
         let contexts = check_permissions("apply_patch", &args).unwrap().unwrap();
         assert_eq!(contexts.len(), 1);
         assert_eq!(contexts[0].permission_type, PermissionType::WriteFile);
+    }
+
+    #[test]
+    fn exec_command_allow_rules_do_not_grant_legacy_bash_authority() {
+        let legacy_args = json!({"command":"rm -rf .", "workdir":"/"});
+        let exec_args = json!({"cmd":"rm -rf .", "workdir":"/"});
+        for rule in ["exec_command", "exec_command(rm -rf .)"] {
+            let allowed = [rule.to_owned()];
+            assert_eq!(
+                check_tool_rules("exec_command", &exec_args, &allowed, &[]),
+                Some(true)
+            );
+            assert_eq!(
+                check_tool_rules("Bash", &legacy_args, &allowed, &[]),
+                None,
+                "{rule} must not grant legacy Bash's wider workdir scope"
+            );
+        }
+        for rule in ["Bash", "Bash(rm -rf .)"] {
+            let allowed = [rule.to_owned()];
+            assert_eq!(
+                check_tool_rules("exec_command", &exec_args, &allowed, &[]),
+                Some(true)
+            );
+            assert_eq!(
+                check_tool_rules("Bash", &legacy_args, &allowed, &[]),
+                Some(true)
+            );
+        }
+        for denied in ["Bash(rm -rf .)", "exec_command(rm -rf .)"] {
+            let denied = [denied.to_owned()];
+            let allowed = ["Bash".to_owned(), "exec_command".to_owned()];
+            assert_eq!(
+                check_tool_rules("Bash", &legacy_args, &allowed, &denied),
+                Some(false)
+            );
+            assert_eq!(
+                check_tool_rules("exec_command", &exec_args, &allowed, &denied),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn write_stdin_default_eof_cannot_bypass_exact_legacy_input_deny() {
+        let input = json!({"bash_id":"exec-owned", "input":"yes\n", "append_newline":false});
+        let denied = [format!("BashInput({input})")];
+        for args in [
+            json!({"session_id":"exec-owned", "chars":"yes\n"}),
+            json!({"session_id":"exec-owned", "chars":"yes\n", "eof":false}),
+            json!({"session_id":"exec-owned", "chars":"yes\n", "eof":false, "yield_time_ms":1000, "max_output_tokens":100}),
+        ] {
+            assert_eq!(
+                check_tool_rules("write_stdin", &args, &["BashInput".into()], &denied),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn write_stdin_output_restrictions_apply_to_combined_input_and_kill() {
+        let denied = ["BashOutput(exec-owned)".into()];
+        let allowed = ["write_stdin".into()];
+        for args in [
+            json!({"session_id":"exec-owned", "chars":"yes\n"}),
+            json!({"session_id":"exec-owned", "eof":true}),
+            json!({"session_id":"exec-owned", "chars":"\u{3}"}),
+        ] {
+            assert_eq!(
+                check_tool_rules("write_stdin", &args, &allowed, &denied),
+                Some(false)
+            );
+            assert_eq!(
+                check_tool_rules("write_stdin", &args, &denied, &[]),
+                None,
+                "an output grant must not grant input or termination"
+            );
+        }
+        assert_eq!(
+            check_tool_rules(
+                "write_stdin",
+                &json!({"session_id":"exec-owned", "chars":""}),
+                &denied,
+                &[]
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            check_tool_rules(
+                "write_stdin",
+                &json!({"session_id":"other-session", "chars":"yes\n"}),
+                &allowed,
+                &denied
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn exec_command_preserves_bash_permission_contexts() {
+        for command in [
+            "cargo test",
+            "rm -rf /tmp/a",
+            "eval 'cat /etc/passwd'",
+            "echo ${HOME}",
+        ] {
+            let legacy = check_permissions("Bash", &json!({"command":command}))
+                .unwrap()
+                .unwrap();
+            let current = check_permissions("exec_command", &json!({"cmd":command}))
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.len(), 1);
+            assert_eq!(current[0].permission_type, legacy[0].permission_type);
+            assert_eq!(current[0].resource, legacy[0].resource);
+            assert_eq!(
+                current[0].operation_description,
+                legacy[0].operation_description
+            );
+        }
+        for args in [
+            json!({}),
+            json!({"cmd":" "}),
+            json!({"command":"cargo test"}),
+            json!({"cmd":7}),
+        ] {
+            assert!(check_permissions("exec_command", &args).is_err());
+        }
+    }
+
+    #[test]
+    fn write_stdin_requires_terminal_session_permission_for_poll_and_input() {
+        for chars in ["", "yes\n", "\u{3}"] {
+            let contexts = check_permissions(
+                "write_stdin",
+                &json!({"session_id":"exec-owned", "chars":chars}),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(contexts.len(), 1);
+            assert_eq!(contexts[0].permission_type, PermissionType::TerminalSession);
+            assert_eq!(contexts[0].resource, "exec-owned");
+        }
+        assert!(check_permissions("write_stdin", &json!({"chars":""})).is_err());
     }
 
     #[test]

@@ -103,6 +103,8 @@ pub enum BuiltinTool {
     Bash,
     BashInput,
     BashOutput,
+    ExecCommand,
+    WriteStdin,
     Edit,
     ExitPlanMode,
     GetFileInfo,
@@ -123,10 +125,12 @@ pub enum BuiltinTool {
 
 impl BuiltinTool {
     /// Every built-in tool, in the canonical order of [`BUILTIN_TOOL_NAMES`].
-    pub const ALL: [BuiltinTool; 19] = [
+    pub const ALL: [BuiltinTool; 21] = [
         BuiltinTool::Bash,
         BuiltinTool::BashInput,
         BuiltinTool::BashOutput,
+        BuiltinTool::ExecCommand,
+        BuiltinTool::WriteStdin,
         BuiltinTool::Edit,
         BuiltinTool::ExitPlanMode,
         BuiltinTool::GetFileInfo,
@@ -151,6 +155,8 @@ impl BuiltinTool {
             BuiltinTool::Bash => "Bash",
             BuiltinTool::BashInput => "BashInput",
             BuiltinTool::BashOutput => "BashOutput",
+            BuiltinTool::ExecCommand => "exec_command",
+            BuiltinTool::WriteStdin => "write_stdin",
             BuiltinTool::Edit => "Edit",
             BuiltinTool::ExitPlanMode => "ExitPlanMode",
             BuiltinTool::GetFileInfo => "GetFileInfo",
@@ -244,6 +250,21 @@ mod tests {
             assert_eq!(BuiltinTool::from_name(tool.name()), Some(tool));
         }
         assert_eq!(BuiltinTool::from_name("NotARealTool"), None);
+    }
+
+    #[test]
+    fn exec_session_catalog_preserves_legacy_shell_variants() {
+        for (name, variant) in [
+            ("exec_command", BuiltinTool::ExecCommand),
+            ("write_stdin", BuiltinTool::WriteStdin),
+            ("Bash", BuiltinTool::Bash),
+            ("BashInput", BuiltinTool::BashInput),
+            ("BashOutput", BuiltinTool::BashOutput),
+            ("KillShell", BuiltinTool::KillShell),
+        ] {
+            assert_eq!(BuiltinTool::from_name(name), Some(variant));
+            assert_eq!(variant.tool().name(), name);
+        }
     }
 
     #[test]

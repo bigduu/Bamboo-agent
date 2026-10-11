@@ -86,7 +86,7 @@ impl PermissionRuleSet {
             }
         }
         for rule in &self.parsed_allow {
-            if rule.matches_tool_call(tool_name, args) {
+            if rule.matches_tool_call_for_allow(tool_name, args) {
                 return Some(true);
             }
         }

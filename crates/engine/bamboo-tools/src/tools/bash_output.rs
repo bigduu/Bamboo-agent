@@ -73,9 +73,11 @@ impl Tool for BashOutputTool {
         let parsed: BashOutputArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid BashOutput args: {}", e)))?;
 
-        let shell = bash_runtime::get_shell(parsed.bash_id.trim()).ok_or_else(|| {
-            ToolError::Execution(format!("Background shell '{}' not found", parsed.bash_id))
-        })?;
+        let shell = bash_runtime::get_shell(parsed.bash_id.trim())
+            .filter(|shell| !shell.is_model_polled())
+            .ok_or_else(|| {
+                ToolError::Execution(format!("Background shell '{}' not found", parsed.bash_id))
+            })?;
 
         let regex = parsed
             .filter
