@@ -1,6 +1,17 @@
 {
   "connectors": [
     {
+      "version": "0.3.1",
+      "bundle_url": "https://github.com/bigduu/Nova/releases/download/v0.3.1/nova-plugin-v0.3.1.tar.gz",
+      "bundle_sha256": "445d4d95acfa8d23549ce58716d4944dd83267145461c5f02ec8ba48cb3c30cc",
+      "manifest_sha256": "b5d0e3f6d318194e7b89aeb10e3439b071184eea3280725e1d226d7be244e10f",
+      "executable_sha256": {
+        "macos": "bab6acf79990bada4f309f92cbe1f1dc4228ad03643b0df7d5333f3cb11bc0a0",
+        "windows": "7a252a5c44c007fee1fbb6ea428d7c4aa61a0d2c5a6d6219eefe8905b33db76b"
+      },
+      "legacy_cli": false
+    },
+    {
       "version": "0.3.0",
       "bundle_url": "https://github.com/bigduu/Nova/releases/download/v0.3.0/nova-plugin-v0.3.0.tar.gz",
       "bundle_sha256": "85f36853a3a69c7e2268f6db35becde352649758822fb5277bc97413d083b371",
@@ -12,5 +23,13 @@
       "legacy_cli": true
     }
   ],
-  "app": null
+  "app": {
+    "artifact_id": "nova-v0.3.1-universal-apple-darwin-development-app",
+    "version": "0.3.1",
+    "url": "https://github.com/bigduu/Nova/releases/download/v0.3.1/nova-v0.3.1-universal-apple-darwin-development-app.zip",
+    "sha256": "d8f970f45656ae7ed2d47a49b2c409f13e6d79d1d52a11dea83be555aafc17b6",
+    "signing": "ad_hoc",
+    "install_mode": "local_ad_hoc",
+    "development": true
+  }
 }
