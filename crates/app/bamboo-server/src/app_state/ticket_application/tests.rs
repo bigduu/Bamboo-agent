@@ -1695,9 +1695,16 @@ async fn native_result_startup_recovers_before_any_provider_or_child_activation(
     let mut f = NativeResultFixture::new().await;
     f.app.service.take();
     let provider = Arc::new(NoExecution::default());
+    let mut startup_config = config(false).read().await.clone();
+    // The new Supervisor is also an AutoDream candidate. Isolate that unrelated
+    // background model call while retaining the real startup recovery paths.
+    startup_config
+        .memory_mut()
+        .get_or_insert_with(Default::default)
+        .auto_dream_enabled = false;
     let state = crate::AppState::new_with_provider(
         f.root.path().to_path_buf(),
-        config(false).read().await.clone(),
+        startup_config,
         provider.clone(),
     )
     .await
