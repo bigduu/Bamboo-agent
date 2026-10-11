@@ -148,7 +148,7 @@ enum FileEndpoint {
     Remote(HostBridge),
     Local {
         service: Arc<TicketService>,
-        child: Session,
+        child: Box<Session>,
         run_id: String,
         ceiling: Vec<String>,
     },
@@ -198,7 +198,7 @@ impl FileEndpoint {
             } => {
                 let resources = self.local_resources()?.expect("checked local endpoint");
                 let service = service.clone();
-                let child = child.clone();
+                let child = child.as_ref().clone();
                 let run_id = run_id.clone();
                 let ceiling = ceiling.clone();
                 let call_id = call_id.to_string();
@@ -420,7 +420,7 @@ impl LocalFileExecutor {
                 inner,
                 endpoint: FileEndpoint::Local {
                     service,
-                    child: canonical_child_snapshot,
+                    child: Box::new(canonical_child_snapshot),
                     run_id,
                     ceiling: ceiling.to_vec(),
                 },

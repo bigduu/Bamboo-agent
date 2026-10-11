@@ -892,18 +892,20 @@ impl ExternalChildRunner for LocalTaskChildRunner {
             result
         }
         .await;
-        if result.is_err() && lock(&execution.stop).is_none() {
-            match execution.persist_stop_unconfirmed().await {
-                Ok(observed) => copy_local_task_observation(&observed, session),
-                Err(error) => {
-                    return Err(failure(format!(
-                        "{}; unconfirmed-stop observation was not durably confirmed: {error}",
-                        result.unwrap_err()
-                    )))
+        match result {
+            Err(error) if lock(&execution.stop).is_none() => {
+                match execution.persist_stop_unconfirmed().await {
+                    Ok(observed) => {
+                        copy_local_task_observation(&observed, session);
+                        Err(error)
+                    }
+                    Err(checkpoint) => Err(failure(format!(
+                        "{error}; unconfirmed-stop observation was not durably confirmed: {checkpoint}"
+                    ))),
                 }
             }
+            result => result,
         }
-        result
     }
 
     async fn abandon_child_execution(&self, session: &Session, run_id: &str) -> Result<(), String> {

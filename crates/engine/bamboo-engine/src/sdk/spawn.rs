@@ -592,11 +592,13 @@ async fn run_child_spawn_inner(
                 } else if let Some(router) = ctx.agent.activation_router() {
                     router.begin_finalization(&session.id, &run_id).await;
                 }
-                let failure = Err(bamboo_agent_core::AgentError::LLM(format!(
+                let error = bamboo_agent_core::AgentError::LLM(format!(
                     "local Child startup outcome unknown: checkpoint failed: {error}; cleanup unconfirmed: {cleanup_error}"
-                )));
+                ));
+                let message = error.to_string();
+                let failure = Err(error);
                 finalize_runner_exact(&ctx.agent_runners, &session.id, &run_id, &failure).await;
-                return Err(failure.unwrap_err().to_string());
+                return Err(message);
             }
             return Err(format!(
                 "Local Child running checkpoint failed before launch: {error}"
