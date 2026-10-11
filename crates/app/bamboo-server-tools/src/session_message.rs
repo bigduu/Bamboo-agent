@@ -180,11 +180,15 @@ fn delivery_outcome(
 mod tests {
     use super::*;
     use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::{FunctionCall, ToolCall, ToolExecutionContext, ToolExecutor};
     use bamboo_domain::{
         Session, SessionActivationDisposition, SessionActivationError, SessionActivationPort,
         SessionInboxLimits, SessionInboxPort, SessionMessageSource,
     };
     use bamboo_storage::{FileSessionInbox, SessionStoreV2};
+    use bamboo_tools::permission::{
+        ConfigPermissionChecker, PermissionConfig, PermissionRule, PermissionType,
+    };
     use tokio::sync::Mutex;
 
     #[derive(Default)]
@@ -271,6 +275,160 @@ mod tests {
                 "message": "Compare your findings with mine."
             })
         }
+
+        fn permission_overlay(&self, config: Arc<PermissionConfig>) -> crate::OverlayToolExecutor {
+            crate::OverlayToolExecutor::new(
+                Arc::new(bamboo_tools::BuiltinToolExecutor::new_with_permissions(
+                    Arc::new(ConfigPermissionChecker::new(config)),
+                )),
+                Arc::new(SessionMessageTool::new(Arc::new(SessionMessenger::new(
+                    self.store.clone(),
+                    self.inbox.clone(),
+                    self.activation.clone(),
+                )))),
+            )
+        }
+
+        async fn assert_no_peer_effects(&self) {
+            assert!(self.activation.requests.lock().await.is_empty());
+            for session in [&self.sender, &self.recipient] {
+                let backlog = self.inbox.inspect(&session.id).await.unwrap();
+                assert_eq!(backlog.pending, 0);
+                assert_eq!(backlog.generation, 0);
+            }
+        }
+    }
+
+    fn peer_call(action: &str, fixture: &Fixture) -> ToolCall {
+        let args = if action == "send" {
+            fixture.send()
+        } else {
+            json!({"action":"reply", "reply_to":"private-received-id",
+                "operation_id":"private-operation", "message":"private-message"})
+        };
+        ToolCall {
+            id: format!("permission-{action}"),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "default::session_message".into(),
+                arguments: args.to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_execute_deny_blocks_send_and_reply_even_with_bypass_or_auto() {
+        for action in ["send", "reply"] {
+            let fixture = Fixture::new(false).await;
+            let config = Arc::new(PermissionConfig::new());
+            config.add_rule(PermissionRule::new(
+                PermissionType::ExecuteCommand,
+                format!("session_message {action}"),
+                false,
+            ));
+            let overlay = fixture.permission_overlay(config);
+            let call = peer_call(action, &fixture);
+            for auto in [false, true] {
+                let mut ctx = ToolExecutionContext::none(&call.id);
+                ctx.session_id = Some(&fixture.sender.id);
+                ctx.bypass_permissions = !auto;
+                ctx.auto_approve_permissions = auto;
+                let error = overlay.execute_with_context(&call, ctx).await.unwrap_err();
+                assert!(
+                    matches!(error, ToolError::Execution(ref message) if message.contains("explicit policy")),
+                    "{error:?}"
+                );
+            }
+            let discovery = ToolCall {
+                function: FunctionCall {
+                    name: "session_message".into(),
+                    arguments: json!({"action":"list_targets"}).to_string(),
+                },
+                ..call
+            };
+            let mut ctx = ToolExecutionContext::none(&discovery.id);
+            ctx.session_id = Some(&fixture.sender.id);
+            assert!(
+                overlay
+                    .execute_with_context(&discovery, ctx)
+                    .await
+                    .unwrap()
+                    .success
+            );
+            fixture.assert_no_peer_effects().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_execute_ask_pauses_before_admission_and_redacts_approval_events() {
+        for action in ["send", "reply"] {
+            let fixture = Fixture::new(false).await;
+            let config = Arc::new(PermissionConfig::new());
+            config.set_ask_rules(["session_message(*)".into()]);
+            let overlay = fixture.permission_overlay(config);
+            let call = peer_call(action, &fixture);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+            let mut ctx = ToolExecutionContext::none(&call.id);
+            ctx.session_id = Some(&fixture.sender.id);
+            ctx.event_tx = Some(&tx);
+            let result = overlay.execute_with_context(&call, ctx).await.unwrap();
+            assert_eq!(
+                result.display_preference.as_deref(),
+                Some("request_permissions")
+            );
+            let payload: Value = serde_json::from_str(&result.result).unwrap();
+            assert_eq!(payload["status"], "awaiting_permission_approval");
+            assert_eq!(
+                payload["permission_request"]["resource"],
+                format!("session_message {action}")
+            );
+            assert!(!result.result.contains("private-"));
+            let event = rx.recv().await.unwrap();
+            assert!(
+                matches!(event, bamboo_agent_core::AgentEvent::ToolApprovalRequested { parameters, .. } if parameters == json!({"action":action}))
+            );
+            let mut headless = ToolExecutionContext::none(&call.id);
+            headless.session_id = Some(&fixture.sender.id);
+            let error = overlay
+                .execute_with_context(&call, headless)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ToolError::Execution(ref message) if message.contains("approval required")),
+                "{error:?}"
+            );
+            fixture.assert_no_peer_effects().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_execute_allow_uses_the_existing_direct_delivery_path() {
+        let fixture = Fixture::new(false).await;
+        let config = Arc::new(PermissionConfig::new());
+        config.add_rule(PermissionRule::new(
+            PermissionType::ExecuteCommand,
+            "session_message send",
+            true,
+        ));
+        let overlay = fixture.permission_overlay(config);
+        let call = peer_call("send", &fixture);
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.session_id = Some(&fixture.sender.id);
+        let result = overlay.execute_with_context(&call, ctx).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.result).unwrap()["admitted"],
+            true
+        );
+        assert_eq!(
+            fixture
+                .inbox
+                .inspect(&fixture.recipient.id)
+                .await
+                .unwrap()
+                .pending,
+            1
+        );
+        assert_eq!(fixture.activation.requests.lock().await.len(), 1);
     }
 
     fn result_json(outcome: ToolOutcome) -> Value {
