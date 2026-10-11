@@ -874,4 +874,34 @@ mod tests {
             .unwrap();
         assert_eq!(second.status(), "completed");
     }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn local_task_resources_darwin_held_zombie_group_can_finalize() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("exit 0")
+            .process_group(0)
+            .kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        let mut leader = GroupLeader { child, pid };
+        tokio::time::timeout(Duration::from_secs(5), wait_without_reaping(pid))
+            .await
+            .unwrap()
+            .unwrap();
+        // The owned, unreaped leader pins this exact PGID. Darwin excludes
+        // zombies from killpg permission checks, even for their real parent.
+        let raw_result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+        let raw_error = io::Error::last_os_error();
+        let signal_result = signal_group(pid);
+        let status = leader.child.wait().await.unwrap();
+        eprintln!("owned held-zombie PGID={pid} raw_signal={raw_result} raw_errno={:?} owner_signal={signal_result:?} reaped={status}", raw_error.raw_os_error());
+        assert_eq!(raw_result, -1);
+        assert_eq!(raw_error.raw_os_error(), Some(libc::EPERM));
+        assert!(status.success());
+        signal_result.expect("a positively verified zombie-only owned group is already stopped");
+        drain_group(pid).await.unwrap();
+    }
 }
