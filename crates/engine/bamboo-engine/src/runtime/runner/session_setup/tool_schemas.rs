@@ -215,6 +215,12 @@ fn resolve_catalog_with_activation(
         .iter()
         .filter_map(|reference| {
             resolve_tool_reference_name(reference, |name| by_execution_name.contains_key(name))
+                .or_else(|| {
+                    // Positive ceilings may omit the old host route. Only an
+                    // exact reserved legacy name gains this denial fallback.
+                    bamboo_domain::legacy_shell_replacement(reference.trim())
+                        .map(|_| reference.trim().to_owned())
+                })
         })
         .flat_map(|name| {
             let replacement = bamboo_domain::legacy_shell_replacement(&name).map(str::to_owned);
@@ -406,6 +412,44 @@ mod live_disabled_tests {
         config.disabled_tools = BTreeSet::from(["vendor::Bash".into()]);
         assert!(present(&config, "exec_command"));
         assert!(present(&config, "write_stdin"));
+    }
+
+    struct CanonicalShellTools;
+    #[async_trait::async_trait]
+    impl ToolExecutor for CanonicalShellTools {
+        async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+            unreachable!("catalog projection only")
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            ["exec_command", "write_stdin", "vendor::Bash"]
+                .into_iter()
+                .map(schema)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn exact_legacy_denials_constrain_a_canonical_only_catalog() {
+        let tools = CanonicalShellTools;
+        let session = Session::new("canonical-shell-policy", "m");
+        for (denied, exec_allowed, stdin_allowed, foreign_allowed) in [
+            ("Bash", false, true, true),
+            ("BashInput", true, false, true),
+            ("BashOutput", true, false, true),
+            ("KillShell", true, false, true),
+            ("vendor::Bash", true, true, false),
+            ("default::Bash", true, true, true),
+            ("unregistered::Bash", true, true, true),
+        ] {
+            let mut config = AgentLoopConfig::default();
+            config.disabled_tools = BTreeSet::from([denied.to_owned()]);
+            let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
+            let present = |name| catalog.iter().any(|entry| entry.execution_name() == name);
+            assert_eq!(present("exec_command"), exec_allowed, "{denied}");
+            assert_eq!(present("write_stdin"), stdin_allowed, "{denied}");
+            assert_eq!(present("vendor::Bash"), foreign_allowed, "{denied}");
+        }
     }
 
     #[test]

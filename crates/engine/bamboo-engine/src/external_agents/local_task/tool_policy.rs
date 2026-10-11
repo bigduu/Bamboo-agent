@@ -45,6 +45,12 @@ impl LocalChildTools {
             // an unavailable exact foreign::Read must never fall through to Read.
             if let Some(name) = bamboo_domain::resolve_tool_reference_name(&denied, |name| {
                 name == "SubAgent" || inner.owns_exact_tool(name)
+            })
+            .or_else(|| {
+                // A positive ceiling can omit the old host route. Keep exact
+                // reserved legacy denials without guessing foreign suffixes.
+                bamboo_domain::legacy_shell_replacement(denied.trim())
+                    .map(|_| denied.trim().to_owned())
             }) {
                 subagent_denied |= name == "SubAgent";
                 allowed.remove(&name);
@@ -308,6 +314,7 @@ mod tests {
 
     #[derive(Default)]
     struct Base {
+        names: Option<&'static [&'static str]>,
         executions: AtomicUsize,
         gates: AtomicUsize,
         deny: AtomicBool,
@@ -357,7 +364,8 @@ mod tests {
             }
         }
         fn list_tools(&self) -> Vec<ToolSchema> {
-            NAMES
+            self.names
+                .unwrap_or(NAMES)
                 .iter()
                 .map(|name| {
                     serde_json::from_value(json!({"type":"function", "function": {
@@ -367,7 +375,10 @@ mod tests {
                 .collect()
         }
         fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
-            NAMES.contains(&name).then_some(self as &dyn ToolExecutor)
+            self.names
+                .unwrap_or(NAMES)
+                .contains(&name)
+                .then_some(self as &dyn ToolExecutor)
         }
     }
     fn completed() -> ToolOutcome {
@@ -528,6 +539,42 @@ mod tests {
         let tools = f.tools(&f.child, NAMES, &["foreign::Bash".into()]);
         assert!(tools.owns_exact_tool("exec_command"));
         assert!(tools.owns_exact_tool("write_stdin"));
+    }
+
+    #[tokio::test]
+    async fn exact_legacy_denials_constrain_a_canonical_only_child_ceiling() {
+        const PAIR_ONLY: &[&str] = &["exec_command", "write_stdin", "vendor::Bash"];
+        let mut f = Fixture::new().await;
+        f.base = Arc::new(Base {
+            names: Some(PAIR_ONLY),
+            ..Default::default()
+        });
+        for (denied, exec_allowed, stdin_allowed, foreign_allowed) in [
+            ("Bash", false, true, true),
+            ("BashInput", true, false, true),
+            ("BashOutput", true, false, true),
+            ("KillShell", true, false, true),
+            ("vendor::Bash", true, true, false),
+            ("default::Bash", true, true, true),
+            ("unregistered::Bash", true, true, true),
+        ] {
+            let tools = f.tools(&f.child, PAIR_ONLY, &[denied.to_owned()]);
+            assert_eq!(
+                tools.owns_exact_tool("exec_command"),
+                exec_allowed,
+                "{denied}"
+            );
+            assert_eq!(
+                tools.owns_exact_tool("write_stdin"),
+                stdin_allowed,
+                "{denied}"
+            );
+            assert_eq!(
+                tools.owns_exact_tool("vendor::Bash"),
+                foreign_allowed,
+                "{denied}"
+            );
+        }
     }
 
     #[tokio::test]

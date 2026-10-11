@@ -75,8 +75,30 @@ impl HookDispatcher {
         payload: &HookPayload,
         session: &Session,
     ) -> HookDispatchReport {
-        self.run_hooks_with_control(point, payload, session, true)
+        self.run_hooks_with_control(point, payload, session, true, None, None)
             .await
+    }
+
+    /// Preserve the original native hook payload while allowing a resolved
+    /// builtin shell identity and its legacy projection as fallback matches.
+    /// Foreign identities are never normalized by this compatibility seam.
+    pub async fn run_hooks_with_resolved_shell(
+        &self,
+        point: AgentHookPoint,
+        payload: &HookPayload,
+        session: &Session,
+        resolved_tool_name: Option<&str>,
+        original_tool_input: Option<&serde_json::Value>,
+    ) -> HookDispatchReport {
+        self.run_hooks_with_control(
+            point,
+            payload,
+            session,
+            true,
+            resolved_tool_name,
+            original_tool_input,
+        )
+        .await
     }
 
     /// Run all matching handlers without allowing a control decision to
@@ -87,7 +109,7 @@ impl HookDispatcher {
         payload: &HookPayload,
         session: &Session,
     ) -> HookDispatchReport {
-        self.run_hooks_with_control(point, payload, session, false)
+        self.run_hooks_with_control(point, payload, session, false, None, None)
             .await
     }
 
@@ -97,18 +119,43 @@ impl HookDispatcher {
         payload: &HookPayload,
         session: &Session,
         honor_control_decisions: bool,
+        resolved_tool_name: Option<&str>,
+        original_tool_input: Option<&serde_json::Value>,
     ) -> HookDispatchReport {
         let mut report = HookDispatchReport::default();
-        let legacy = crate::shell_compatibility::legacy_shell_projection(payload, session, None);
+        let resolved_shell = resolved_tool_name
+            .filter(|name| matches!(*name, "exec_command" | "write_stdin"))
+            .and_then(|name| {
+                let mut resolved = payload.clone();
+                match &mut resolved {
+                    HookPayload::ToolExecution { tool_name, .. }
+                    | HookPayload::ToolResult { tool_name, .. } => {
+                        *tool_name = name.to_owned();
+                        Some(resolved)
+                    }
+                    _ => None,
+                }
+            });
+        let legacy = crate::shell_compatibility::legacy_shell_projection(
+            resolved_shell.as_ref().unwrap_or(payload),
+            session,
+            original_tool_input,
+        );
 
         for hook in &self.hooks {
             if hook.point() != point {
                 continue;
             }
-            // A wildcard or new-name hook sees the actual call exactly once.
-            // Only old-name matchers receive the compatibility projection.
+            // Original-name and wildcard matchers keep the actual spelling.
+            // Each handler runs once, using shell compatibility only when its
+            // primary matcher did not match the original call.
             let selected_payload = if hook.matches(payload) {
                 payload
+            } else if let Some(resolved) = resolved_shell
+                .as_ref()
+                .filter(|resolved| hook.matches(resolved))
+            {
+                resolved
             } else if let Some(projected) = legacy
                 .as_ref()
                 .filter(|legacy| hook.matches(&legacy.payload))
@@ -265,6 +312,85 @@ mod tests {
                 matches!(&seen[3], HookPayload::ToolExecution { tool_name, parsed_args, .. }
                 if tool_name == "Bash" && parsed_args["command"] == "cargo test" && parsed_args.get("cmd").is_none())
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_shell_aliases_preserve_primary_spelling_and_run_fallbacks_once() {
+        for (alias, resolved, legacy, input) in [
+            (
+                "default::exec_command",
+                "exec_command",
+                "Bash",
+                json!({"cmd":"cargo test"}),
+            ),
+            (
+                "default::write_stdin",
+                "write_stdin",
+                "BashInput",
+                json!({"session_id":"exec", "chars":"yes\n"}),
+            ),
+        ] {
+            for (point, payload) in [
+                (
+                    AgentHookPoint::BeforeToolExecution,
+                    HookPayload::ToolExecution {
+                        tool_name: alias.into(),
+                        tool_call_id: "alias-call".into(),
+                        parsed_args: input.clone(),
+                    },
+                ),
+                (
+                    AgentHookPoint::AfterToolExecution,
+                    HookPayload::ToolResult {
+                        tool_name: alias.into(),
+                        tool_call_id: "alias-call".into(),
+                        outcome: bamboo_domain::HookToolOutcome {
+                            success: true,
+                            result: Some("done".into()),
+                            error: None,
+                            needs_human: false,
+                            duration_ms: 1,
+                        },
+                    },
+                ),
+            ] {
+                let mut dispatcher = HookDispatcher::new();
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                for matcher in [
+                    format!("^{alias}$"),
+                    ".*".into(),
+                    format!("^({alias}|{resolved}|{legacy})$"),
+                    format!("^{resolved}$"),
+                    format!("^{legacy}$"),
+                ] {
+                    dispatcher.register(Arc::new(RecordingHook {
+                        point,
+                        matcher: regex::Regex::new(&matcher).unwrap(),
+                        seen: seen.clone(),
+                        result: HookResult::Continue,
+                    }));
+                }
+                let report = dispatcher
+                    .run_hooks_with_resolved_shell(
+                        point,
+                        &payload,
+                        &Session::new("test", "model"),
+                        Some(resolved),
+                        Some(&input),
+                    )
+                    .await;
+                assert_eq!(report.executions.len(), 5);
+                let seen = seen.lock().unwrap();
+                assert_eq!(&seen[..3], &[payload.clone(), payload.clone(), payload]);
+                let name = |payload: &HookPayload| match payload {
+                    HookPayload::ToolExecution { tool_name, .. }
+                    | HookPayload::ToolResult { tool_name, .. } => tool_name.clone(),
+                    _ => panic!("expected tool payload"),
+                };
+                assert_eq!(name(&seen[3]), resolved);
+                assert_eq!(name(&seen[4]), legacy);
+            }
         }
     }
 

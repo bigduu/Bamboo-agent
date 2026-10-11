@@ -160,27 +160,32 @@ impl HookRunner {
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
         inputs: bamboo_hooks::portable::PortableInputs<'_>,
     ) -> HookRunOutcome {
-        let mut resolved_payload = payload.clone();
-        if let Some(name) = inputs.resolved_tool_name {
-            match &mut resolved_payload {
-                HookPayload::ToolExecution { tool_name, .. }
-                | HookPayload::ToolResult { tool_name, .. } => *tool_name = name.to_owned(),
-                _ => {}
-            }
-        }
-        let report =
-            local_resources::run(self.dispatcher.run_hooks(point, &resolved_payload, session))
-                .await;
+        let report = local_resources::run(self.dispatcher.run_hooks_with_resolved_shell(
+            point,
+            payload,
+            session,
+            inputs.resolved_tool_name,
+            inputs.original_tool_input,
+        ))
+        .await;
         let mut outcome = record_dispatch_report(report, runtime_state, event_tx).await;
         if let Some(root) = &self.plugin_root {
             if matches!(
                 outcome.decision,
                 HookResult::Continue | HookResult::Allow | HookResult::Mutated
             ) {
+                let mut portable_payload = payload.clone();
+                if let Some(name) = inputs.resolved_tool_name {
+                    match &mut portable_payload {
+                        HookPayload::ToolExecution { tool_name, .. }
+                        | HookPayload::ToolResult { tool_name, .. } => *tool_name = name.to_owned(),
+                        _ => {}
+                    }
+                }
                 let plugin = local_resources::run(bamboo_hooks::portable::run_with_inputs(
                     root,
                     point,
-                    &resolved_payload,
+                    &portable_payload,
                     session,
                     inputs.original_tool_input,
                     inputs.final_assistant_content,
@@ -681,6 +686,71 @@ mod tests {
                     HookPayload::ToolResult { tool_name, .. } => assert_eq!(tool_name, legacy),
                     _ => panic!("expected tool hook payload"),
                 }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_non_shell_aliases_preserve_native_matchers_and_payloads() {
+        for alias in ["read_file", "default::Read"] {
+            for (point, payload) in [
+                (
+                    AgentHookPoint::BeforeToolExecution,
+                    HookPayload::ToolExecution {
+                        tool_name: alias.into(),
+                        tool_call_id: "read-alias".into(),
+                        parsed_args: serde_json::json!({"path":"input.txt"}),
+                    },
+                ),
+                (
+                    AgentHookPoint::AfterToolExecution,
+                    HookPayload::ToolResult {
+                        tool_name: alias.into(),
+                        tool_call_id: "read-alias".into(),
+                        outcome: bamboo_domain::HookToolOutcome {
+                            success: true,
+                            result: Some("file contents".into()),
+                            error: None,
+                            needs_human: false,
+                            duration_ms: 1,
+                        },
+                    },
+                ),
+            ] {
+                let mut runner = HookRunner::new();
+                let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+                runner.register(Arc::new(ToolNameHook {
+                    point,
+                    name: "Read".into(),
+                    seen: seen.clone(),
+                    result: HookResult::Deny {
+                        reason: "must not newly match the resolved name".into(),
+                    },
+                }));
+                let expected = HookResult::Deny {
+                    reason: "original alias policy".into(),
+                };
+                runner.register(Arc::new(ToolNameHook {
+                    point,
+                    name: alias.into(),
+                    seen: seen.clone(),
+                    result: expected.clone(),
+                }));
+                let outcome = runner
+                    .run_hooks_with_inputs(
+                        point,
+                        &payload,
+                        &test_session(),
+                        &mut AgentRuntimeState::new("read-alias-run"),
+                        None,
+                        bamboo_hooks::portable::PortableInputs {
+                            resolved_tool_name: Some("Read"),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                assert_eq!(outcome.decision, expected);
+                assert_eq!(*seen.lock().unwrap(), vec![payload]);
             }
         }
     }
