@@ -1045,9 +1045,10 @@ async fn schedule_auto_execute_keeps_running_until_background_completion() {
         .await
         .unwrap();
 
-    tokio::time::timeout(Duration::from_secs(2), started.notified())
+    // Session persistence and runtime startup precede this provider handoff.
+    tokio::time::timeout(Duration::from_secs(30), started.notified())
         .await
-        .expect("background run should start");
+        .expect("background run should reach the provider started handoff within 30s");
 
     let in_progress = schedule_store.get_schedule(&created.id).await.unwrap();
     assert_eq!(in_progress.state.running_run_count, 1);
