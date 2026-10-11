@@ -3548,10 +3548,54 @@ async fn run_pipeline_inner(
                 // Safety net: if the model is about to finish but left background
                 // children running without waiting on them, suspend instead of
                 // completing so their results are collected.
+                let inherited_untagged_wait = state
+                    .runtime_state
+                    .waiting_for_children
+                    .as_ref()
+                    .is_some_and(|wait| wait.registered_by_tool_call_id.is_none());
                 match maybe_suspend_for_orphaned_children(session, config, &mut state.runtime_state)
                     .await
                 {
                     Ok(Some(suspend)) => {
+                        if inherited_untagged_wait {
+                            // This safety-net wait can also survive a real user
+                            // input. Keep its answer as an intermediate message
+                            // while the remaining children still prevent Complete.
+                            let reasoning = (!stream_output.reasoning_content.trim().is_empty())
+                                .then_some(stream_output.reasoning_content);
+                            let reasoning_signature = reasoning
+                                .as_ref()
+                                .and_then(|_| stream_output.reasoning_signature.clone());
+                            let message = assistant_with_visible_identity(
+                                Message::assistant_with_reasoning(
+                                    stream_output.content,
+                                    None,
+                                    reasoning,
+                                )
+                                .with_reasoning_signature(reasoning_signature),
+                                stream_output.visible_message,
+                            );
+                            let buffered_message = config
+                                .features_final_evidence_check
+                                .then(|| message.clone());
+                            let mut native_items = Some(stream_output.provider_transcript_items);
+                            if let Err(error) =
+                                commit_assistant_message(session, message, &mut native_items)
+                            {
+                                terminal_error = Some(error);
+                                break;
+                            }
+                            if let Some(message) = buffered_message.as_ref() {
+                                publish_buffered_message(event_tx, message).await;
+                            }
+                            record_no_tool_calls_round_completed(
+                                state.metrics_collector.as_ref(),
+                                &round_id,
+                                &state.session_id,
+                                session,
+                                round_activity.token_usage(),
+                            );
+                        }
                         turn_outcome = Some(suspend);
                         break;
                     }
@@ -10878,6 +10922,21 @@ mod tests {
                 );
             }
             Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ProviderTranscriptItem(
+                    bamboo_domain::ProviderTranscriptItem::try_from_payload(
+                        bamboo_domain::ProviderFamily::OpenAi,
+                        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                        bamboo_domain::ProviderTranscriptOrigin::Provider,
+                        bamboo_domain::ProviderTranscriptAuthor::Model,
+                        serde_json::json!({
+                            "type":"message","id":"partial-native-reply","role":"assistant","status":"completed",
+                            "content":[{"type":"output_text","text":"continued after child","annotations":[]}]
+                        }),
+                    )
+                    .unwrap(),
+                )),
+                Ok(LLMChunk::ReasoningToken("remaining child work".into())),
+                Ok(LLMChunk::ReasoningSignature("partial-reasoning-signature".into())),
                 Ok(LLMChunk::Token("continued after child".into())),
                 Ok(LLMChunk::Done),
             ])))
@@ -10911,7 +10970,11 @@ mod tests {
 
     #[tokio::test]
     async fn partial_child_outcome_can_drive_tool_work_before_resuspending_exact_inherited_wait() {
-        for tagged in [true, false] {
+        for (tagged, buffered) in [true, false].into_iter().flat_map(|tagged| {
+            [false, true]
+                .into_iter()
+                .map(move |buffered| (tagged, buffered))
+        }) {
             let storage: Arc<dyn Storage> = Arc::new(ChildIndexStorage {
                 inner: Arc::new(TestStorage::default()),
                 children: vec![("slow-child".into(), Some("running".into()))],
@@ -10919,6 +10982,7 @@ mod tests {
             let mut config = config_with_storage(storage.clone());
             config.model_name = Some("model".into());
             config.prompt_memory_flags = delegation_loop_config().prompt_memory_flags;
+            config.features_final_evidence_check = buffered;
             let mut session = Session::new("partial-parent", "model");
             let mut outcome = Message::user("fast child outcome");
             outcome.metadata = Some(serde_json::json!({
@@ -10940,7 +11004,7 @@ mod tests {
                 outcome_seen: AtomicBool::new(false),
             });
             let tools = Arc::new(PartialChildWorkExecutor::default());
-            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
 
             let sent_complete = super::run_pipeline(
                 &mut session,
@@ -10968,10 +11032,55 @@ mod tests {
                 state.runtime_state.waiting_for_children.as_ref(),
                 Some(&wait)
             );
-            assert!(session
+            let replies: Vec<_> = session
                 .messages
                 .iter()
-                .all(|message| { message.content != "continued after child" }));
+                .filter(|message| message.content == "continued after child")
+                .collect();
+            assert_eq!(replies.len(), usize::from(!tagged));
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                assert!(
+                    !matches!(event, AgentEvent::Complete { .. }),
+                    "an inherited wait must not publish Complete"
+                );
+                events.push(event);
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::Token { content } if content == "continued after child"))
+                    .count(),
+                usize::from(!buffered || !tagged),
+                "the untagged reply is published once in either streaming mode"
+            );
+            if let Some(reply) = replies.first() {
+                assert_eq!(reply.reasoning.as_deref(), Some("remaining child work"));
+                assert_eq!(
+                    reply.reasoning_signature.as_deref(),
+                    Some("partial-reasoning-signature")
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, AgentEvent::VisibleMessageStart { message_id, created_at } if message_id == &reply.id && *created_at == reply.created_at))
+                        .count(),
+                    1,
+                    "persistence retains the published reply identity"
+                );
+                let boundary = session
+                    .provider_transcript
+                    .active_provider_boundary_sha256()
+                    .unwrap();
+                let groups = session.provider_transcript.replayable_groups(
+                    bamboo_domain::ProviderFamily::OpenAi,
+                    bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                    boundary,
+                );
+                assert_eq!(groups.len(), 1);
+                assert_eq!(groups[0].anchor_message_id(), reply.id);
+                assert_eq!(groups[0].items()[0].payload()["id"], "partial-native-reply");
+            }
         }
     }
 
