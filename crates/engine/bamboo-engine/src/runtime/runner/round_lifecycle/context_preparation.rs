@@ -14,14 +14,15 @@ use bamboo_agent_core::{
 use bamboo_compression::{
     active_messages_for_budget, apply_compression_plan, apply_retrieval_window_plan_with_trigger,
     build_forced_compression_candidate_plan_with_fixed_tokens,
+    build_message_summary_candidate_plan_with_fixed_tokens,
     build_retrieval_window_candidate_plan_with_token_accounting,
     build_retrieval_window_critical_overflow_plan_with_token_accounting,
     effective_retrieval_window_target_tokens,
     estimate_context_compression_exposure_with_fixed_tokens,
     estimate_prompt_cache_savings_with_fixed_tokens, finalize_compression_candidate_plan,
-    prepare_hybrid_context_with_fixed_tokens, PreparedContext, RetrievalWindowPlanError,
-    RetrievalWindowPolicy, RetrievalWindowTokenAccounting, TiktokenTokenCounter, TokenBudget,
-    TokenCounter,
+    prepare_hybrid_context_with_fixed_tokens, CompressionPlan, CompressionPlanError,
+    PreparedContext, RetrievalWindowPlanError, RetrievalWindowPolicy,
+    RetrievalWindowTokenAccounting, TiktokenTokenCounter, TokenBudget, TokenCounter,
 };
 use bamboo_config::{
     ContextManagementConfig, ContextManagementFallbackStrategy, ContextManagementStrategy,
@@ -577,10 +578,16 @@ fn emit_context_pressure_notification(
             "Context window filling up (~{pct:.0}%). Consider using compact_context \
              to compress older conversation history before auto-compression triggers."
         ),
+        (ContextManagementStrategy::MessageSummary, _) => format!(
+            "Context window filling up (~{pct:.0}%). Message-summary compression will summarize \
+             historical user and assistant text and discard completed tool context. Use \
+             compact_context to request this at a task boundary."
+        ),
     };
 
     let strategy_label = match strategy {
         ContextManagementStrategy::Summary => "summary",
+        ContextManagementStrategy::MessageSummary => "message_summary",
         ContextManagementStrategy::RetrievalWindow => "retrieval_window",
     };
     let dedup_key = format!("{strategy_label}:{level}");
@@ -1475,6 +1482,8 @@ async fn maybe_apply_summary_context_compression_with_budget(
     phase_label: &str,
     forced_trigger_type: Option<CompressionTriggerType>,
 ) -> Result<bool, AgentError> {
+    let message_summary =
+        config.context_management.strategy == ContextManagementStrategy::MessageSummary;
     let counter = TiktokenTokenCounter::default();
     let ledger_usage = enforce_model_context_ledger_retention(session, budget, &counter);
     let exposure = estimate_context_compression_exposure_with_fixed_tokens(
@@ -1538,7 +1547,11 @@ async fn maybe_apply_summary_context_compression_with_budget(
     // For auto-triggered (non-critical, non-manual) compression, try lightweight
     // prompt section degradation first. If a section can be stripped, skip the
     // expensive LLM summarization pass entirely.
-    if host_auto_requested && !critical_fallback_requested && !manual_requested && !forced_requested
+    if !message_summary
+        && host_auto_requested
+        && !critical_fallback_requested
+        && !manual_requested
+        && !forced_requested
     {
         if let Some(degraded) = degrade_prompt_context_sections_for_overflow(session) {
             tracing::info!(
@@ -1555,7 +1568,11 @@ async fn maybe_apply_summary_context_compression_with_budget(
     // Microcompact-first: estimate how many tokens prompt cache compaction would save.
     // If projected usage drops below the trigger threshold, skip LLM summarization —
     // the cheaper prompt-side compaction in prepare_hybrid_context will handle it.
-    if host_auto_requested && !critical_fallback_requested && !manual_requested && !forced_requested
+    if !message_summary
+        && host_auto_requested
+        && !critical_fallback_requested
+        && !manual_requested
+        && !forced_requested
     {
         let summary_tokens = session
             .conversation_summary
@@ -1605,7 +1622,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
         .filter(|message| !message.compressed)
         .filter(|message| !matches!(message.role, Role::System))
         .count();
-    if active_non_system_count < 3 {
+    if !message_summary && active_non_system_count < 3 {
         tracing::warn!(
             "[{}] {} context compression skipped: usage={:.1}%, auto_threshold={:.1}%, critical_threshold={}%, not enough active messages ({})",
             session_id,
@@ -1618,22 +1635,6 @@ async fn maybe_apply_summary_context_compression_with_budget(
         return Ok(false);
     }
 
-    let Some(summary_model) = config
-        .summarization_model_name
-        .as_deref()
-        .or(config.background_model_name.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        tracing::warn!(
-            "[{}] {} context compression skipped: no summarization/background model configured",
-            session_id,
-            phase_label,
-        );
-        emit_context_compression_status(event_tx, phase_label, "skipped_no_background_model").await;
-        return Ok(false);
-    };
-
     let compression_context_blocks =
         build_compression_context_blocks(session, config.app_data_dir.as_deref());
     let additional_fixed_tokens = compression_context_blocks
@@ -1641,7 +1642,12 @@ async fn maybe_apply_summary_context_compression_with_budget(
         .fold(0u32, |total, block| {
             total.saturating_add(counter.count_message(&block.render_runtime_context_message()))
         });
-    let candidate = match build_forced_compression_candidate_plan_with_fixed_tokens(
+    let build_candidate = if message_summary {
+        build_message_summary_candidate_plan_with_fixed_tokens
+    } else {
+        build_forced_compression_candidate_plan_with_fixed_tokens
+    };
+    let candidate = match build_candidate(
         session,
         model_name,
         Some(budget),
@@ -1650,6 +1656,16 @@ async fn maybe_apply_summary_context_compression_with_budget(
         additional_fixed_tokens,
     ) {
         Ok(candidate) => candidate,
+        Err(CompressionPlanError::MessageSummaryToolProtocol { reason }) => {
+            tracing::debug!(
+                session_id,
+                phase_label,
+                reason,
+                "Message summary deferred until tool protocol is complete and compressible"
+            );
+            emit_context_compression_status(event_tx, phase_label, "deferred_tool_protocol").await;
+            return Ok(false);
+        }
         Err(reason) => {
             tracing::warn!(
                 "[{}] {} context compression pass {} candidate planning failed before summarization: {}",
@@ -1664,6 +1680,77 @@ async fn maybe_apply_summary_context_compression_with_budget(
         }
     };
     let messages = candidate.messages_to_summarize.clone();
+
+    // A completed tool-only exchange needs no model call. Keep only a previous
+    // summary proven to have the same prose-only source policy.
+    if message_summary && messages.is_empty() {
+        let summary = if candidate.merge_existing_summary {
+            session
+                .conversation_summary
+                .as_ref()
+                .map(|summary| summary.content.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let mut plan = finalize_compression_candidate_plan(session, candidate, summary)
+            .map_err(|error| AgentError::Budget(error.to_string()))?;
+        plan.logical_pass_id = Some(logical_pass_id);
+        let changed = commit_message_summary_plan(session, config, &plan).await?;
+        if changed > 0 {
+            emit_context_compression_status(event_tx, phase_label, "completed").await;
+            let tokens_saved = archived_message_tokens_saved(session, &plan);
+            let trigger_label = match &plan.trigger_type {
+                CompressionTriggerType::Auto => "auto",
+                CompressionTriggerType::Manual => "manual",
+                CompressionTriggerType::CriticalOverflow => "critical",
+            };
+            if let Some(tx) = event_tx {
+                let _ = tx
+                    .send(AgentEvent::ContextSummarized {
+                        summary: session
+                            .conversation_summary
+                            .as_ref()
+                            .map(|summary| summary.content.chars().take(200).collect())
+                            .unwrap_or_default(),
+                        messages_summarized: changed,
+                        tokens_saved,
+                        usage_before_percent: usage_percent,
+                        usage_after_percent: plan.active_usage_after_percent,
+                        trigger_type: trigger_label.to_string(),
+                    })
+                    .await;
+            }
+            if let Some(collector) = config.metrics_collector.as_ref() {
+                collector.context_compressed(
+                    session_id,
+                    session
+                        .agent_runtime_state
+                        .as_ref()
+                        .and_then(|state| state.round.last_round_id.clone())
+                        .unwrap_or_else(|| session_id.to_string()),
+                    changed as u32,
+                    tokens_saved,
+                    usage_percent,
+                    plan.active_usage_after_percent,
+                    trigger_label,
+                    0,
+                );
+            }
+        }
+        return Ok(changed > 0);
+    }
+
+    let Some(summary_model) = config
+        .summarization_model_name
+        .as_deref()
+        .or(config.background_model_name.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        emit_context_compression_status(event_tx, phase_label, "skipped_no_background_model").await;
+        return Ok(false);
+    };
 
     let mut hook_compression_instructions = Vec::new();
     if config
@@ -1697,7 +1784,9 @@ async fn maybe_apply_summary_context_compression_with_budget(
                 event_tx,
             )
             .await;
-        hook_compression_instructions = hook_outcome.injected_contexts;
+        if !message_summary {
+            hook_compression_instructions = hook_outcome.injected_contexts;
+        }
         session.agent_runtime_state = Some(hook_runtime_state);
     }
 
@@ -1706,6 +1795,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
     let existing_summary = session
         .conversation_summary
         .as_ref()
+        .filter(|_| candidate.merge_existing_summary)
         .map(|summary| summary.content.clone());
     let base_instructions = session
         .compression_instructions
@@ -1715,10 +1805,12 @@ async fn maybe_apply_summary_context_compression_with_budget(
         .filter(|v| !v.is_empty())
         .map(String::from);
 
-    // Manual compression instructions from compact_context tool take priority.
+    // Legacy summary honors compact_context instructions. MessageSummary
+    // discards tool arguments, including this out-of-band copy of them.
     let compression_instructions = session
         .force_manual_compression
         .as_deref()
+        .filter(|_| !message_summary)
         .filter(|v| !v.trim().is_empty())
         .map(String::from)
         .or(base_instructions);
@@ -1755,7 +1847,11 @@ async fn maybe_apply_summary_context_compression_with_budget(
         None,
     )
     .with_heuristic_fallback_on_error(false)
-    .with_context_blocks(compression_context_blocks)
+    .with_context_blocks(if message_summary {
+        Vec::new()
+    } else {
+        compression_context_blocks
+    })
     .with_custom_instructions(compression_instructions)
     .with_summary_mode(if existing_summary.is_some() {
         crate::llm_summarizer::SummaryMode::IncrementalMerge
@@ -1837,7 +1933,11 @@ async fn maybe_apply_summary_context_compression_with_budget(
     plan.model_used = Some(summary_model.to_string());
     plan.latency_ms = latency_ms;
 
-    let compressed_count = apply_compression_plan(session, plan.clone());
+    let compressed_count = if message_summary {
+        commit_message_summary_plan(session, config, &plan).await?
+    } else {
+        apply_compression_plan(session, plan.clone())
+    };
     if compressed_count == 0 {
         tracing::warn!(
             "[{}] {} context compression attempted (usage={:.1}%) but did not archive messages",
@@ -1849,7 +1949,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
         return Ok(false);
     }
 
-    if let Some(persistence) = config.persistence.as_ref() {
+    if let Some(persistence) = config.persistence.as_ref().filter(|_| !message_summary) {
         if let Err(error) = persistence.save_runtime_session(session).await {
             tracing::warn!(
                 "[{}] Failed to persist forced context compression result: {}",
@@ -1872,8 +1972,13 @@ async fn maybe_apply_summary_context_compression_with_budget(
     emit_context_compression_status(event_tx, phase_label, "completed").await;
 
     let saved_counter = TiktokenTokenCounter::default();
-    let original_tokens = saved_counter.count_messages(&plan.messages_to_summarize);
-    let tokens_saved = original_tokens.saturating_sub(plan.summary_tokens);
+    let tokens_saved = if message_summary {
+        archived_message_tokens_saved(session, &plan)
+    } else {
+        saved_counter
+            .count_messages(&plan.messages_to_summarize)
+            .saturating_sub(plan.summary_tokens)
+    };
 
     if let Some(tx) = event_tx {
         let trigger_label = match trigger_type {
@@ -1930,6 +2035,55 @@ async fn maybe_apply_summary_context_compression_with_budget(
     // Clear manual compression flag after successful compression.
     session.force_manual_compression = None;
     Ok(true)
+}
+
+fn archived_message_tokens_saved(session: &Session, plan: &CompressionPlan) -> u32 {
+    let ids = plan.compressed_message_ids.iter().collect::<HashSet<_>>();
+    let originals = session
+        .messages
+        .iter()
+        .filter(|message| ids.contains(&message.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    TiktokenTokenCounter::default()
+        .count_messages(&originals)
+        .saturating_sub(plan.summary_tokens)
+}
+
+/// Publish this lossy projection through the existing archive checkpoint.
+/// The canonical transcript remains intact; only archive flags and the summary
+/// change, and stale provider continuations cannot replay discarded tool items.
+async fn commit_message_summary_plan(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    plan: &CompressionPlan,
+) -> Result<usize, AgentError> {
+    let mut staged = session.clone();
+    let changed = apply_compression_plan(&mut staged, plan.clone());
+    if changed == 0 {
+        return Ok(0);
+    }
+    staged.metadata.remove("responses.previous_response_id");
+    staged.force_manual_compression = None;
+    if let Some(persistence) = config.persistence.as_ref() {
+        let outcome = persistence
+            .checkpoint_retrieval_window(session, &mut staged)
+            .await
+            .map_err(|error| {
+                AgentError::Budget(format!(
+                    "message-summary checkpoint failed before publication: {error}"
+                ))
+            })?;
+        if outcome == RetrievalWindowCheckpointOutcome::Rebased {
+            // A concurrent durable change invalidates both source selection and
+            // the generated summary. Publish the uncompressed rebase and let the
+            // next natural trigger plan from it, rather than archive stale data.
+            *session = staged;
+            return Ok(0);
+        }
+    }
+    *session = staged;
+    Ok(changed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2097,7 +2251,11 @@ pub(crate) async fn force_overflow_context_recovery(
         ));
     }
     let degraded_sections =
-        if config.context_management.strategy == ContextManagementStrategy::RetrievalWindow {
+        if config.context_management.strategy == ContextManagementStrategy::MessageSummary {
+            // This mode commits one prose-only boundary; do not first mutate
+            // the System prompt outside that checkpoint.
+            Vec::new()
+        } else if config.context_management.strategy == ContextManagementStrategy::RetrievalWindow {
             checkpoint_retrieval_overflow_prompt_degradation(session, config).await?
         } else {
             degrade_prompt_context_sections_for_overflow(session)
