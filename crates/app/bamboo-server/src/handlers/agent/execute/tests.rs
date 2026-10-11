@@ -254,6 +254,20 @@ mod execution_input_http {
         ) -> Result<bamboo_domain::SessionInboxReceipt, bamboo_domain::SessionInboxError> {
             self.inner.deliver(e).await
         }
+        async fn existing_staged_delivery(
+            &self,
+            envelope: &SessionMessageEnvelope,
+        ) -> Result<Option<bamboo_domain::SessionInboxReceipt>, bamboo_domain::SessionInboxError>
+        {
+            self.inner.existing_staged_delivery(envelope).await
+        }
+        async fn pending_child_outcomes(
+            &self,
+            target: &str,
+            child: &str,
+        ) -> Result<Vec<SessionMessageEnvelope>, bamboo_domain::SessionInboxError> {
+            self.inner.pending_child_outcomes(target, child).await
+        }
         async fn mark_activation_eligible(
             &self,
             id: &str,
@@ -261,6 +275,16 @@ mod execution_input_http {
             p: bamboo_domain::SessionActivationPolicy,
         ) -> Result<(), bamboo_domain::SessionInboxError> {
             self.inner.mark_activation_eligible(id, g, p).await
+        }
+        async fn mark_message_activation_eligible(
+            &self,
+            id: &str,
+            receipt: &bamboo_domain::SessionInboxReceipt,
+            policy: bamboo_domain::SessionActivationPolicy,
+        ) -> Result<(), bamboo_domain::SessionInboxError> {
+            self.inner
+                .mark_message_activation_eligible(id, receipt, policy)
+                .await
         }
         async fn claim(
             &self,

@@ -694,6 +694,159 @@ impl FileSessionInbox {
         Self::decode_owned_wrapper(&bytes)
     }
 
+    pub(super) async fn pending_child_outcomes_impl(
+        &self,
+        target: &str,
+        child: &str,
+    ) -> Result<Vec<SessionMessageEnvelope>, SessionInboxError> {
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
+        let (_, versioned) = Self::read_activation_watermark(&dir).await?;
+        let mut entries = Self::queue_entries(&dir, "new", Some(&filesystem), false).await?;
+        entries.extend(Self::queue_entries(&dir, "cur", Some(&filesystem), false).await?);
+        entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        let mut result = Vec::new();
+        for (generation, _, path) in entries {
+            let (wrapper, lease) = self.read_owned_transport(&path).await?;
+            if wrapper.kind != InboxKind::SessionEnvelope
+                || (lease.is_some() && !Self::owned_enabled(&dir).await?)
+            {
+                return Err(invalid("invalid Inbox child lookup transport"));
+            }
+            let intent = Self::activation_intent(&wrapper.body)?;
+            if Self::message_activation_intent(&wrapper.body)?.is_some() && !versioned {
+                return Err(invalid("activation intent requires its v2 watermark"));
+            }
+            let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body)
+                .map_err(|_| invalid("invalid Inbox child lookup envelope"))?;
+            envelope
+                .validate()
+                .map_err(|_| invalid("invalid Inbox child lookup envelope"))?;
+            if envelope.target_session_id != target {
+                return Err(invalid("Inbox target mismatch"));
+            }
+            if !matches!(&envelope.body, bamboo_domain::SessionMessageBody::ChildOutcome(outcome)
+                if outcome.child_session_id == child)
+            {
+                continue;
+            }
+            if let Some(receipt) = Self::admitted_receipt(&dir, &envelope).await? {
+                if receipt.delivery.generation != generation
+                    || receipt.intent != intent
+                    || !StoredLease::same_optional_identity(receipt.lease.as_ref(), lease.as_ref())
+                {
+                    return Err(invalid("Inbox terminal lease mismatch"));
+                }
+                continue;
+            }
+            result.push(envelope);
+        }
+        Ok(result)
+    }
+
+    pub(super) async fn mark_message_activation_eligible_impl(
+        &self,
+        target: &str,
+        receipt: &SessionInboxReceipt,
+        policy: SessionActivationPolicy,
+    ) -> Result<(), SessionInboxError> {
+        #[cfg(test)]
+        let _scope_drop = ScopeDrop(self.owned_scope_drop.clone());
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
+        if receipt.generation == 0 {
+            return Err(invalid(
+                "message activation requires a delivered generation",
+            ));
+        }
+        // A permanent receipt wins even when cur still exists after an ACK
+        // crash. Promotion must never create work over that terminal proof.
+        match tokio::fs::read(Self::admitted_path(&dir, &receipt.id)).await {
+            Ok(bytes) => {
+                let terminal: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|_| invalid("invalid Inbox admitted receipt"))?;
+                return if terminal["id"].as_str() == Some(receipt.id.as_str())
+                    && terminal["generation"].as_u64() == Some(receipt.generation)
+                {
+                    Ok(())
+                } else {
+                    Err(invalid("message activation receipt identity mismatch"))
+                };
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(SessionInboxError::Storage(error.to_string())),
+        }
+        for queue in ["new", "cur"] {
+            for (generation, _, path) in Self::owned_queue_entries(&dir, queue, &filesystem).await?
+            {
+                if generation != receipt.generation {
+                    continue;
+                }
+                let (mut wrapper, lease) = self.read_owned_transport(&path).await?;
+                if wrapper.kind != InboxKind::SessionEnvelope
+                    || (lease.is_some() && !Self::owned_enabled(&dir).await?)
+                {
+                    return Err(invalid("invalid Inbox activation transport"));
+                }
+                let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())
+                    .map_err(|_| invalid("invalid Inbox activation envelope"))?;
+                envelope
+                    .validate()
+                    .map_err(|_| invalid("invalid Inbox activation envelope"))?;
+                if envelope.id != receipt.id || envelope.target_session_id != target {
+                    continue;
+                }
+                let current = Self::message_activation_intent(&wrapper.body)?;
+                let (prefix, versioned) = Self::read_activation_watermark(&dir).await?;
+                if current.is_some() && !versioned {
+                    return Err(invalid("activation intent requires its v2 watermark"));
+                }
+                if current.is_some_and(|intent| {
+                    intent.policy().ok().is_some_and(|current| {
+                        current == policy
+                            || current == SessionActivationPolicy::InterruptSpecificWait
+                    })
+                }) {
+                    return Ok(());
+                }
+                wrapper
+                    .body
+                    .as_object_mut()
+                    .ok_or_else(|| invalid("invalid Inbox activation envelope"))?
+                    .insert(
+                        COORDINATOR_INTENT_KEY.into(),
+                        serde_json::to_value(SessionInboxActivationIntent::new(policy))
+                            .map_err(|_| invalid("encode Inbox activation intent"))?,
+                    );
+                if !versioned {
+                    // Fence legacy readers before a per-message permission is
+                    // published. Preserve the existing prefix exactly.
+                    Self::write_activation_watermark(&dir, prefix, true, &filesystem).await?;
+                }
+                // Keep an existing lease's policy and identity pinned. A live
+                // consumer's original claim/ACK remains valid after promotion.
+                return match lease {
+                    Some(lease) => {
+                        self.write_owned_transport(&path, &wrapper, &lease, &filesystem)
+                            .await
+                    }
+                    None => {
+                        let bytes = serde_json::to_vec_pretty(&wrapper)
+                            .map_err(|_| invalid("encode Inbox activation transport"))?;
+                        if bytes.len() > self.max_transport_bytes() {
+                            return Err(invalid("Inbox activation transport exceeds byte limit"));
+                        }
+                        filesystem
+                            .write(&path, &bytes)
+                            .await
+                            .map_err(|error| SessionInboxError::Storage(error.to_string()))
+                    }
+                };
+            }
+        }
+        Err(invalid(
+            "message activation receipt is not pending or admitted",
+        ))
+    }
+
     async fn write_owned_transport(
         &self,
         path: &Path,
@@ -798,7 +951,8 @@ impl FileSessionInbox {
             }
             let (wrapper, stored) = self.read_owned_transport(&path).await?;
             let intent = Self::activation_intent(&wrapper.body)?;
-            if !Self::eligible(generation, prefix, intent) {
+            let activation = Self::message_activation_intent(&wrapper.body)?;
+            if !Self::eligible(generation, prefix, activation) {
                 continue;
             }
             let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())
@@ -864,7 +1018,7 @@ impl FileSessionInbox {
                     policy: match previous.as_ref() {
                         Some(lease) => lease.policy,
                         None => Self::effective_activation_policy(
-                            generation, prefix, interrupt, intent,
+                            generation, prefix, interrupt, activation,
                         )?,
                     },
                     token: SessionInboxLeaseToken {
@@ -1001,11 +1155,16 @@ impl FileSessionInbox {
             Self::decode_owned_wrapper(&read(&dir.join("cur").join(&claim.claim.claim_id))?)?;
         let stored = stored.ok_or_else(|| invalid("Inbox lease missing"))?;
         let intent = Self::activation_intent(&wrapper.body)?;
+        let activation_intent = Self::message_activation_intent(&wrapper.body)?;
         if !stored.same_identity(&claim.lease)
             || stored.policy != claim.claim.activation_policy
             || stored.token.expires_at <= now
             || Self::owned_name(claim.claim.generation, &stored.token) != claim.claim.claim_id
-            || !Self::eligible(claim.claim.generation, activation.generation, intent)
+            || !Self::eligible(
+                claim.claim.generation,
+                activation.generation,
+                activation_intent,
+            )
         {
             return Err(invalid("Inbox claim lost, expired or ineligible"));
         }
@@ -1511,7 +1670,8 @@ impl FileSessionInbox {
         for (generation, _, path) in entries {
             let (wrapper, stored) = self.read_owned_transport(&path).await?;
             let intent = Self::activation_intent(&wrapper.body)?;
-            if !Self::eligible(generation, prefix, intent) {
+            let activation = Self::message_activation_intent(&wrapper.body)?;
+            if !Self::eligible(generation, prefix, activation) {
                 continue;
             }
             let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())
@@ -1549,7 +1709,7 @@ impl FileSessionInbox {
                     (lease.policy, Some(lease.token.epoch), Some(ready_after))
                 }
                 None => (
-                    Self::effective_activation_policy(generation, prefix, interrupt, intent)?,
+                    Self::effective_activation_policy(generation, prefix, interrupt, activation)?,
                     None,
                     None,
                 ),
@@ -1558,15 +1718,30 @@ impl FileSessionInbox {
                 result.next_due_at = Some(result.next_due_at.map_or(due, |old| old.min(due)));
                 continue;
             }
-            result.ready = Some(SessionInboxWakeCandidate {
+            let candidate = SessionInboxWakeCandidate {
                 id: envelope.id,
                 generation,
                 activation_policy: policy,
                 coordinator_generation: prefix,
+                coordinator_message_policy: Self::activation_intent_field(
+                    &wrapper.body,
+                    COORDINATOR_INTENT_KEY,
+                )?
+                .map(|intent| intent.policy())
+                .transpose()?,
                 lease_epoch,
                 ready_after,
-            });
-            break;
+            };
+            // An older Respect item can remain blocked by a specific wait.
+            // Prefer an exact coordinator Interrupt for this wake hint while
+            // leaving the consumer's ordered claim protocol unchanged.
+            if candidate.coordinator_message_policy
+                == Some(SessionActivationPolicy::InterruptSpecificWait)
+            {
+                result.ready = Some(candidate);
+                break;
+            }
+            result.ready.get_or_insert(candidate);
         }
         Ok(result)
     }

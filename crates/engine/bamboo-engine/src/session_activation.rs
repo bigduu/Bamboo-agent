@@ -413,7 +413,12 @@ pub struct SessionActivationRouter {
     states: Arc<Mutex<HashMap<String, TargetActivationState>>>,
     spawner: Arc<RwLock<Option<Arc<dyn SessionActivationSpawner>>>>,
     inbox: Arc<StdRwLock<Option<Arc<dyn SessionInboxPort>>>>,
+    #[cfg(test)]
+    terminal_inspection_pause: Arc<Mutex<Option<TerminalInspectionPause>>>,
 }
+
+#[cfg(test)]
+type TerminalInspectionPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
 type AbortCleanup =
     Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + 'static>;
@@ -642,6 +647,68 @@ impl SessionActivationRouter {
             (left, right) => left.or(right),
         };
         Ok(result)
+    }
+
+    /// A precise grant can open a delivery below an already dispatched high
+    /// watermark. Use the existing bounded recovery handshake for that hole;
+    /// ordinary same-generation leftovers keep their existing retry cadence.
+    async fn reconcile_older_message(
+        &self,
+        target: &str,
+    ) -> Result<Option<SessionActivationDisposition>, SessionActivationError> {
+        let high = self
+            .states
+            .lock()
+            .await
+            .get(target)
+            .map_or(0, |state| state.last_dispatched_generation);
+        self.reconcile_message_below(target, high).await
+    }
+
+    async fn reconcile_message_below(
+        &self,
+        target: &str,
+        high: u64,
+    ) -> Result<Option<SessionActivationDisposition>, SessionActivationError> {
+        if high == 0 {
+            return Ok(None);
+        }
+        let inbox = self
+            .inbox
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(inbox) = inbox else {
+            return Ok(None);
+        };
+        let now = Utc::now();
+        let candidate = inbox
+            .inspect_wake_readiness(target, now)
+            .await
+            .map_err(inbox_activation_error)?
+            .ready;
+        match candidate.filter(|candidate| {
+            candidate.generation < high
+                // Only an explicit coordinator upgrade opens this older hole.
+                // A prefix may already cover the delivery at Respect policy.
+                && candidate.coordinator_message_policy
+                    == Some(bamboo_domain::SessionActivationPolicy::InterruptSpecificWait)
+        }) {
+            Some(candidate) => self
+                .request_recovery_activation(target, candidate, now)
+                .await
+                .map(|result| result.disposition),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_after_terminal_inspection(&self) {
+        let pause = self.terminal_inspection_pause.lock().await.take();
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
     }
 
     async fn request_recovery_activation(
@@ -927,7 +994,9 @@ impl SessionActivationRouter {
             None => (0, 0),
         };
 
-        let reservation_to_dispatch = {
+        #[cfg(test)]
+        self.pause_after_terminal_inspection().await;
+        let (reservation_to_dispatch, previous_high) = {
             let mut states = self.states.lock().await;
             let Some(state) = states.get_mut(target_session_id) else {
                 return;
@@ -938,6 +1007,7 @@ impl SessionActivationRouter {
                 return;
             }
             state.latest_generation = state.latest_generation.max(durable_generation);
+            let previous_high = state.last_dispatched_generation;
             state.owner = None;
             state.owner_completion_epoch = state.owner_completion_epoch.wrapping_add(1);
             if (state.latest_generation > state.last_dispatched_generation
@@ -946,7 +1016,7 @@ impl SessionActivationRouter {
             {
                 let generation = state.latest_generation;
                 let token = reserve_activation_token(state);
-                Some((generation, token))
+                (Some((generation, token)), previous_high)
             } else {
                 if state.latest_generation == 0
                     && !state.activation_reserved
@@ -955,7 +1025,7 @@ impl SessionActivationRouter {
                 {
                     states.remove(target_session_id);
                 }
-                None
+                (None, previous_high)
             }
         };
 
@@ -970,6 +1040,17 @@ impl SessionActivationRouter {
                     %error,
                     "failed to reserve successor for abandoned SessionInbox owner"
                 );
+            }
+        } else {
+            // A precise grant can race the pre-lock inspection while the
+            // producer still observes this owner as finalizing. Re-read after
+            // releasing the owner even when that earlier snapshot was empty.
+            if let Err(error) = self
+                .reconcile_message_below(target_session_id, previous_high)
+                .await
+            {
+                tracing::warn!(%target_session_id, %error,
+                    "failed to reconcile older eligible message after abandoned owner");
             }
         }
     }
@@ -999,9 +1080,12 @@ impl SessionActivationRouter {
             ),
             None => None,
         };
-        let reservation_to_dispatch = {
+        #[cfg(test)]
+        self.pause_after_terminal_inspection().await;
+        let (reservation_to_dispatch, previous_high) = {
             let mut states = self.states.lock().await;
             let state = states.entry(target_session_id.to_string()).or_default();
+            let previous_high = state.last_dispatched_generation;
             if state
                 .owner
                 .as_ref()
@@ -1030,7 +1114,7 @@ impl SessionActivationRouter {
             {
                 let generation = state.latest_generation;
                 let token = reserve_activation_token(state);
-                Some((generation, token))
+                (Some((generation, token)), previous_high)
             } else {
                 // Both execution paths drop their safe-point receiver before
                 // calling finish_finalization. Once the durable cursor has
@@ -1045,7 +1129,7 @@ impl SessionActivationRouter {
                 {
                     states.remove(target_session_id);
                 }
-                None
+                (None, previous_high)
             }
         };
 
@@ -1054,7 +1138,12 @@ impl SessionActivationRouter {
                 .dispatch_reserved(target_session_id, generation, token)
                 .await
                 .map(Some),
-            None => Ok(None),
+            // Keep the prior high even if the empty pre-lock snapshot allowed
+            // state eviction. A late older grant still needs its one successor.
+            None => {
+                self.reconcile_message_below(target_session_id, previous_high)
+                    .await
+            }
         }
     }
 
@@ -1322,7 +1411,13 @@ impl SessionActivationPort for SessionActivationRouter {
                 if inbox_generation <= state.last_dispatched_generation
                     && released_prefix <= state.last_dispatched_coordinator_generation
                 {
-                    return Ok(SessionActivationDisposition::ActivationCoalesced);
+                    drop(states);
+                    return self
+                        .reconcile_older_message(target_session_id)
+                        .await
+                        .map(|result| {
+                            result.unwrap_or(SessionActivationDisposition::ActivationCoalesced)
+                        });
                 }
                 if state.activation_reserved {
                     (Some(state.activation_epoch.subscribe()), None)
@@ -1510,7 +1605,41 @@ mod tests {
             Session, SessionActivationPolicy, SessionInboxLimits, SessionMessageEnvelope, Storage,
         };
         use bamboo_storage::{FileSessionInbox, SessionStoreV2};
-        for release_during_finalization in [false, true] {
+        async fn release(
+            inbox: &FileSessionInbox,
+            receipt: &bamboo_domain::SessionInboxReceipt,
+            precise: bool,
+        ) {
+            if precise {
+                inbox
+                    .mark_message_activation_eligible(
+                        "parent",
+                        receipt,
+                        SessionActivationPolicy::InterruptSpecificWait,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    inbox
+                        .coordinator_activation_generation("parent")
+                        .await
+                        .unwrap(),
+                    0
+                );
+            } else {
+                inbox
+                    .mark_activation_eligible(
+                        "parent",
+                        receipt.generation,
+                        SessionActivationPolicy::RespectSpecificWait,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        for (release_during_finalization, precise) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let temp = tempfile::TempDir::new().unwrap();
             let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
             store
@@ -1559,14 +1688,7 @@ mod tests {
             let mut registration = router.register_run("parent", "run-1").await.unwrap();
             registration.begin_finalization().await;
             if release_during_finalization {
-                restarted
-                    .mark_activation_eligible(
-                        "parent",
-                        first.generation,
-                        SessionActivationPolicy::RespectSpecificWait,
-                    )
-                    .await
-                    .unwrap();
+                release(&restarted, &first, precise).await;
                 assert_eq!(
                     router
                         .request_activation("parent", first.generation)
@@ -1580,14 +1702,7 @@ mod tests {
                 );
             } else {
                 assert_eq!(registration.finish(second.generation).await.unwrap(), None);
-                restarted
-                    .mark_activation_eligible(
-                        "parent",
-                        first.generation,
-                        SessionActivationPolicy::RespectSpecificWait,
-                    )
-                    .await
-                    .unwrap();
+                release(&restarted, &first, precise).await;
                 assert_eq!(
                     router
                         .request_activation("parent", first.generation)
@@ -1614,6 +1729,235 @@ mod tests {
             );
             assert_eq!(spawner.reservations.load(Ordering::SeqCst), 2);
             restarted.ack("parent", &claims[0]).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn precise_older_interrupt_below_released_prefix_reaches_one_successor() {
+        use bamboo_domain::{
+            Session, SessionActivationPolicy, SessionInboxLimits, SessionMessageEnvelope, Storage,
+        };
+        use bamboo_storage::{FileSessionInbox, SessionStoreV2};
+        for with_older_sibling in [false, true] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+            store
+                .save_session(&Session::new("parent", "model"))
+                .await
+                .unwrap();
+            let inbox = Arc::new(FileSessionInbox::new(store, SessionInboxLimits::default()));
+            let sibling = if with_older_sibling {
+                Some(
+                    inbox
+                        .deliver(&SessionMessageEnvelope::user_input(
+                            "parent",
+                            "older Respect sibling",
+                        ))
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let older = inbox
+                .deliver(&SessionMessageEnvelope::user_input("parent", "older child"))
+                .await
+                .unwrap();
+            let newer = inbox
+                .deliver(&SessionMessageEnvelope::user_input("parent", "newer Bash"))
+                .await
+                .unwrap();
+            inbox
+                .mark_activation_eligible(
+                    "parent",
+                    newer.generation,
+                    SessionActivationPolicy::RespectSpecificWait,
+                )
+                .await
+                .unwrap();
+            let router = SessionActivationRouter::new();
+            router.set_inbox(inbox.clone());
+            let spawner = spawner();
+            router.set_spawner(spawner.clone()).await;
+            router
+                .request_activation("parent", newer.generation)
+                .await
+                .unwrap();
+            let claims = inbox.claim("parent", 128).await.unwrap();
+            assert_eq!(claims.len(), 2 + usize::from(with_older_sibling));
+            let older_claim = claims
+                .iter()
+                .find(|claim| claim.envelope.id == older.id)
+                .unwrap();
+            assert_eq!(older_claim.generation, older.generation);
+            assert_eq!(
+                older_claim.activation_policy,
+                SessionActivationPolicy::RespectSpecificWait
+            );
+            let newer_claim = claims
+                .iter()
+                .find(|claim| claim.envelope.id == newer.id)
+                .unwrap();
+            inbox.ack("parent", newer_claim).await.unwrap();
+            let mut owner = router.register_run("parent", "run-1").await.unwrap();
+            owner.begin_finalization().await;
+            assert_eq!(owner.finish(newer.generation).await.unwrap(), None);
+            assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+
+            inbox
+                .mark_message_activation_eligible(
+                    "parent",
+                    &older,
+                    SessionActivationPolicy::InterruptSpecificWait,
+                )
+                .await
+                .unwrap();
+            let candidate = inbox
+                .inspect_wake_readiness("parent", Utc::now())
+                .await
+                .unwrap()
+                .ready
+                .unwrap();
+            assert_eq!(candidate.coordinator_generation, newer.generation);
+            assert_eq!(
+                candidate.id, older.id,
+                "a Respect sibling cannot obscure the precise wake"
+            );
+            assert_eq!(
+                candidate.coordinator_message_policy,
+                Some(SessionActivationPolicy::InterruptSpecificWait)
+            );
+            assert_eq!(
+                router
+                    .request_activation("parent", older.generation)
+                    .await
+                    .unwrap(),
+                SessionActivationDisposition::ActivationReserved
+            );
+            assert_eq!(spawner.reservations.load(Ordering::SeqCst), 2);
+            // Leaving the same exact item pending must retain bounded recovery.
+            let mut successor = router.register_run("parent", "run-2").await.unwrap();
+            successor.begin_finalization().await;
+            assert_eq!(successor.finish(newer.generation).await.unwrap(), None);
+            assert_eq!(
+                router
+                    .request_activation("parent", older.generation)
+                    .await
+                    .unwrap(),
+                SessionActivationDisposition::ActivationCoalesced
+            );
+            assert_eq!(spawner.reservations.load(Ordering::SeqCst), 2);
+            inbox.ack("parent", older_claim).await.unwrap();
+            if let Some(sibling) = sibling {
+                let claim = claims
+                    .iter()
+                    .find(|claim| claim.envelope.id == sibling.id)
+                    .unwrap();
+                inbox.ack("parent", claim).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn precise_older_grant_after_terminal_inspection_reaches_one_successor() {
+        use bamboo_domain::{
+            Session, SessionActivationPolicy, SessionInboxLimits, SessionMessageEnvelope, Storage,
+        };
+        use bamboo_storage::{FileSessionInbox, SessionStoreV2};
+        for abandon in [false, true] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+            store
+                .save_session(&Session::new("parent", "model"))
+                .await
+                .unwrap();
+            let inbox = Arc::new(FileSessionInbox::new(store, SessionInboxLimits::default()));
+            let older = inbox
+                .deliver(&SessionMessageEnvelope::user_input(
+                    "parent",
+                    "staged child",
+                ))
+                .await
+                .unwrap();
+            let newer = inbox
+                .deliver_with_activation_intent(
+                    &SessionMessageEnvelope::user_input("parent", "newer user input"),
+                    SessionActivationPolicy::InterruptSpecificWait,
+                    None,
+                )
+                .await
+                .unwrap();
+            let router = SessionActivationRouter::new();
+            router.set_inbox(inbox.clone());
+            let spawner = spawner();
+            router.set_spawner(spawner.clone()).await;
+            router
+                .request_activation("parent", newer.generation)
+                .await
+                .unwrap();
+            let claims = inbox.claim("parent", 128).await.unwrap();
+            assert_eq!(claims.len(), 1);
+            inbox.ack("parent", &claims[0]).await.unwrap();
+
+            let mut owner = router.register_run("parent", "run-1").await.unwrap();
+            owner.begin_finalization().await;
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            *router.terminal_inspection_pause.lock().await =
+                Some((entered.clone(), release.clone()));
+            let finalizing = tokio::spawn(async move {
+                if abandon {
+                    owner.abandon().await;
+                    None
+                } else {
+                    owner.finish(newer.generation).await.unwrap()
+                }
+            });
+            entered.notified().await;
+            assert!(!inbox.inspect("parent").await.unwrap().activation_pending());
+            inbox
+                .mark_message_activation_eligible(
+                    "parent",
+                    &older,
+                    SessionActivationPolicy::InterruptSpecificWait,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                router
+                    .request_activation("parent", older.generation)
+                    .await
+                    .unwrap(),
+                SessionActivationDisposition::ActivationCoalesced
+            );
+            release.notify_one();
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), finalizing)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                outcome,
+                (!abandon).then_some(SessionActivationDisposition::ActivationReserved)
+            );
+            assert_eq!(spawner.reservations.load(Ordering::SeqCst), 2);
+            assert!(router.owns_run("parent", "run-2").await);
+
+            // Leave the newly processed item pending to prove the raced grant
+            // does not repeatedly restart a poisoned successor.
+            let claims = inbox.claim("parent", 128).await.unwrap();
+            assert_eq!(claims.len(), 1);
+            let mut successor = router.register_run("parent", "run-2").await.unwrap();
+            successor.begin_finalization().await;
+            assert_eq!(successor.finish(2).await.unwrap(), None);
+            assert_eq!(
+                router
+                    .request_activation("parent", older.generation)
+                    .await
+                    .unwrap(),
+                SessionActivationDisposition::ActivationCoalesced
+            );
+            assert_eq!(spawner.reservations.load(Ordering::SeqCst), 2);
+            inbox.ack("parent", &claims[0]).await.unwrap();
         }
     }
 
@@ -1665,6 +2009,17 @@ mod tests {
 
     #[async_trait]
     impl SessionInboxPort for BlockingInspectInbox {
+        async fn inspect_wake_readiness(
+            &self,
+            _target_session_id: &str,
+            _now: DateTime<Utc>,
+        ) -> Result<bamboo_domain::SessionInboxWakeReadiness, bamboo_domain::SessionInboxError>
+        {
+            // This double models only coordinator-prefix work, never a
+            // separately promoted per-message delivery below that prefix.
+            Ok(bamboo_domain::SessionInboxWakeReadiness::default())
+        }
+
         async fn coordinator_activation_generation(
             &self,
             _target_session_id: &str,
