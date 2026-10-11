@@ -1024,6 +1024,36 @@ fn start(data: &Path, port: u16) -> Host {
     start_with_static_dir(data, port, None)
 }
 
+fn fixture_host_log_tail(data: &Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    const LIMIT: u64 = 16 * 1024;
+    let read_tail = || -> std::io::Result<Vec<u8>> {
+        let mut file = std::fs::File::open(data.join("host.log"))?;
+        let length = file.metadata()?.len();
+        file.seek(SeekFrom::Start(length.saturating_sub(LIMIT)))?;
+        let mut tail = Vec::new();
+        file.take(LIMIT).read_to_end(&mut tail)?;
+        Ok(tail)
+    };
+    match read_tail() {
+        Ok(tail) => String::from_utf8_lossy(&tail).into_owned(),
+        Err(error) => format!("fixture Host log unavailable: {error}"),
+    }
+}
+
+#[test]
+fn fixture_host_log_tail_is_bounded_and_preserves_latest_diagnostic() {
+    let data = tempfile::tempdir().unwrap();
+    let mut bytes = b"discarded-startup-prefix".to_vec();
+    bytes.extend(vec![b'x'; 32 * 1024]);
+    bytes.extend(b"\nfixture-owned startup failure\n");
+    std::fs::write(data.path().join("host.log"), bytes).unwrap();
+    let tail = fixture_host_log_tail(data.path());
+    assert_eq!(tail.len(), 16 * 1024);
+    assert!(!tail.contains("discarded-startup-prefix"));
+    assert!(tail.ends_with("fixture-owned startup failure\n"));
+}
+
 fn start_with_static_dir(data: &Path, port: u16, static_dir: Option<&Path>) -> Host {
     let mut log = std::fs::OpenOptions::new()
         .create(true)
@@ -2527,7 +2557,12 @@ async fn root_catalog_fixture() {
         .unwrap();
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            assert!(host.0.try_wait().unwrap().is_none(), "actual Host exited");
+            if let Some(status) = host.0.try_wait().unwrap() {
+                panic!(
+                    "actual Root catalog Host exited before health: {status:?}; fixture log tail:\n{}",
+                    fixture_host_log_tail(&data)
+                );
+            }
             if client
                 .get(format!("{base}/health"))
                 .send()
