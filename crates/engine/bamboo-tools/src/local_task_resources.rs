@@ -524,27 +524,32 @@ impl Drop for GroupLeader {
 #[cfg(unix)]
 async fn wait_without_reaping(pid: u32) -> io::Result<()> {
     loop {
-        // SAFETY: waitid initializes siginfo; WNOWAIT retains the owned leader
-        // as a zombie, preventing PID/PGID reuse before the group signal.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if result != 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
+        // Keep siginfo's platform-specific raw pointers out of the async state.
+        // Only the plain observation crosses the following await.
+        let exited = {
+            // SAFETY: waitid initializes siginfo; WNOWAIT retains the owned leader
+            // as a zombie, preventing PID/PGID reuse before the group signal.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-        // SAFETY: a successful waitid initialized the SIGCHLD fields. Zero PID
-        // means no state change with WNOHANG.
-        if unsafe { info.si_pid() } != 0 {
+            // SAFETY: a successful waitid initialized the SIGCHLD fields. Zero
+            // PID means no state change with WNOHANG.
+            unsafe { info.si_pid() != 0 }
+        };
+        if exited {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
