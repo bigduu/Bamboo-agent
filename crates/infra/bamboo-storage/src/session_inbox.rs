@@ -1508,11 +1508,28 @@ impl SessionInboxPort for FileSessionInbox {
         envelope: &SessionMessageEnvelope,
         source: &bamboo_domain::ActorSession,
         target: &bamboo_domain::ActorSession,
+        reply_to: Option<&SessionMessageEnvelope>,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
-        if envelope.source
-            != (SessionMessageSource::Session {
-                session_id: source.actor_id.clone(),
-            })
+        let reply_route_matches = match (&envelope.in_reply_to, reply_to) {
+            (None, None) => true,
+            (Some(id), Some(proof)) => {
+                id == &proof.id
+                    && proof.kind == bamboo_domain::SessionMessageKind::PeerMessage
+                    && proof.thread_id.is_some()
+                    && proof.thread_id == envelope.thread_id
+                    && proof.target_session_id == source.actor_id
+                    && proof.source
+                        == (SessionMessageSource::Session {
+                            session_id: target.actor_id.clone(),
+                        })
+            }
+            _ => false,
+        };
+        if !reply_route_matches
+            || envelope.source
+                != (SessionMessageSource::Session {
+                    session_id: source.actor_id.clone(),
+                })
             || envelope.target_session_id != target.actor_id
             || envelope.kind != bamboo_domain::SessionMessageKind::PeerMessage
         {
@@ -1522,7 +1539,7 @@ impl SessionInboxPort for FileSessionInbox {
         }
         let authority = self
             .sessions
-            .lock_peer_delivery(source, target)
+            .lock_peer_delivery(source, target, reply_to)
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
         self.deliver_with_lifecycle_held(
