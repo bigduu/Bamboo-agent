@@ -131,16 +131,17 @@ pub struct ChildSessionRuntimeState {
     pub completed_ids: Vec<String>,
 }
 
-/// Parent wait policy for child-session orchestration.
+/// When to release a parent wait. Individual child outcomes may open a
+/// reasoning turn while an unfinished wait remains armed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ChildWaitPolicy {
-    /// Resume the parent when every tracked child reaches a terminal state.
+    /// Release the wait when every tracked child reaches a terminal state.
     #[default]
     All,
-    /// Resume the parent when any tracked child reaches a terminal state.
+    /// Release the wait when any tracked child reaches a terminal state.
     Any,
-    /// Resume the parent immediately on error/timeout/cancelled, otherwise wait
+    /// Release the wait immediately on error/timeout/cancelled, otherwise wait
     /// for all children to complete successfully.
     FirstError,
 }

@@ -153,9 +153,10 @@ enum SubAgentArgs {
     Wait {
         #[serde(default)]
         child_session_ids: Option<Vec<String>>,
-        /// Wait policy: `all` (default) resumes when every tracked child is
-        /// terminal; `any` resumes on the first; `first_error` resumes early on
-        /// any error/timeout/cancel.
+        /// Wait release policy: `all` (default) retains the wait until every
+        /// tracked child is terminal; `any` releases on the first;
+        /// `first_error` releases early on any error/timeout/cancel. Each child
+        /// outcome can wake the parent to reason while an unfinished wait stays armed.
         #[serde(default)]
         wait_for: Option<ChildWaitPolicy>,
     },
@@ -1676,7 +1677,7 @@ impl SubAgentTool {
                 let note = if should_wait {
                     "Child session queued (typically 30-120 seconds); the parent is suspended until it finishes. Use send_message (not create) to correct a child in place."
                 } else if should_auto_run {
-                    "Child session is running in the background (typically 30-120 seconds). Spawn any other children you need, then call action=wait once to suspend until they finish. Use send_message (not create) to correct a child in place."
+                    "Child session is running in the background (typically 30-120 seconds). Spawn any other children you need, then call action=wait once. Each completion wakes you to process its result while unfinished children remain tracked. Use send_message to correct a child in place."
                 } else {
                     "Child session created (not started). Use action=run to start it. Use send_message (not create) to correct a child in place."
                 };
@@ -1805,6 +1806,7 @@ impl SubAgentTool {
                     "already_terminal_child_ids": dropped_ids,
                     "wait_for": policy.as_str(),
                     "waiting_on": count,
+                    "note": "Each completed child wakes the parent to process its result. Unfinished children remain tracked until the wait release policy is satisfied.",
                 }))
             }
             SubAgentArgs::List => {
