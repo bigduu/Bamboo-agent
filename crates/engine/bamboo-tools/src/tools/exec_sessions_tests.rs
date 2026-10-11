@@ -371,7 +371,10 @@ mod process_tests {
                 .unwrap(),
         );
         assert_eq!(sink.0.load(Ordering::SeqCst), 0);
-        assert!(event_rx.try_recv().is_err());
+        assert!(timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
