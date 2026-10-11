@@ -719,15 +719,21 @@ impl FileSessionInbox {
             {
                 return Err(invalid("invalid Inbox child lookup transport"));
             }
+            // This read-only search supplies reuse evidence, not admission.
+            // An unrelated invalid body cannot supply that evidence and must
+            // remain untouched for the normal consumer's corruption handling.
+            let Ok(envelope) =
+                serde_json::from_value::<SessionMessageEnvelope>(wrapper.body.clone())
+            else {
+                continue;
+            };
+            if envelope.validate().is_err() {
+                continue;
+            }
             let intent = Self::activation_intent(&wrapper.body)?;
             if Self::message_activation_intent(&wrapper.body)?.is_some() && !versioned {
                 return Err(invalid("activation intent requires its v2 watermark"));
             }
-            let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body)
-                .map_err(|_| invalid("invalid Inbox child lookup envelope"))?;
-            envelope
-                .validate()
-                .map_err(|_| invalid("invalid Inbox child lookup envelope"))?;
             if envelope.target_session_id != target {
                 return Err(invalid("Inbox target mismatch"));
             }

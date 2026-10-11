@@ -4739,6 +4739,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unrelated_invalid_pending_body_does_not_block_incremental_child_activation() {
+        for queue in ["new", "cur"] {
+            let (_temp, store, inbox, coordinator, reservations, launches) =
+                completion_inbox_fixture().await;
+            let parent_id = "invalid-pending-parent";
+            save_waiting_test_parent(
+                &store,
+                parent_id,
+                vec!["invalid-pending-fast".into(), "invalid-pending-slow".into()],
+                ChildWaitPolicy::All,
+            )
+            .await;
+            let before = read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap());
+            let fast =
+                save_completion_test_child(&store, parent_id, "invalid-pending-fast", "completed")
+                    .await;
+            save_completion_test_child(&store, parent_id, "invalid-pending-slow", "running").await;
+
+            let mut unrelated = SessionMessageEnvelope::user_input(parent_id, "unrelated bash");
+            unrelated.source = SessionMessageSource::Runtime {
+                subsystem: "bash".into(),
+            };
+            unrelated.kind = SessionMessageKind::RuntimeInstruction;
+            unrelated.body =
+                SessionMessageBody::RuntimeInstruction(bamboo_domain::SessionRuntimeInstruction {
+                    instruction: "bash_completion".into(),
+                    content: Some(bamboo_domain::SessionMessageContent::text("unrelated bash")),
+                    data: None,
+                    provider_message: None,
+                });
+            inbox.deliver(&unrelated).await.unwrap();
+            let dir = store
+                .bamboo_home_dir()
+                .join(store.resolve_rel_path(parent_id).await.unwrap())
+                .join("inbox");
+            let staged = tokio::fs::read_dir(dir.join("new"))
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .unwrap()
+                .path();
+            let mut transport: serde_json::Value =
+                serde_json::from_slice(&tokio::fs::read(&staged).await.unwrap()).unwrap();
+            transport["body"] = serde_json::json!({"not": "an envelope"});
+            let invalid_bytes = serde_json::to_vec(&transport).unwrap();
+            tokio::fs::write(&staged, &invalid_bytes).await.unwrap();
+            let invalid_path = if queue == "cur" {
+                let destination = dir.join("cur").join(staged.file_name().unwrap());
+                tokio::fs::create_dir_all(dir.join("cur")).await.unwrap();
+                tokio::fs::rename(&staged, &destination).await.unwrap();
+                destination
+            } else {
+                staged
+            };
+
+            coordinator.on_child_completed(fast.clone()).await;
+            let outcomes = inbox
+                .pending_child_outcomes(parent_id, "invalid-pending-fast")
+                .await
+                .unwrap();
+            assert_eq!(outcomes.len(), 1);
+            assert!(fits_child_result_budget(&outcomes[0]));
+            let after = read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap());
+            assert_eq!(after, before, "All wait and suspension remain armed");
+            assert_eq!(reservations.load(Ordering::SeqCst), 1);
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+            let backlog = inbox.inspect(parent_id).await.unwrap();
+            assert!(backlog.interrupt_pending());
+            assert_eq!(backlog.coordinator_generation, 0);
+            let ready = inbox
+                .inspect_wake_readiness(parent_id, Utc::now())
+                .await
+                .unwrap()
+                .ready
+                .unwrap();
+            assert_eq!(ready.id, outcomes[0].id);
+            assert_eq!(
+                ready.activation_policy,
+                SessionActivationPolicy::InterruptSpecificWait
+            );
+            assert_eq!(tokio::fs::read(&invalid_path).await.unwrap(), invalid_bytes);
+            assert!(!inbox.was_admitted(parent_id, &unrelated.id).await.unwrap());
+
+            let claims = inbox.claim(parent_id, 8).await.unwrap();
+            assert_eq!(claims.len(), 1);
+            assert_eq!(claims[0].envelope.id, outcomes[0].id);
+            inbox.ack(parent_id, &claims[0]).await.unwrap();
+            coordinator.on_child_completed(fast).await;
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+            assert!(!inbox.was_admitted(parent_id, &unrelated.id).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
     async fn partial_all_outcome_preserves_wait_and_active_parent_control_state() {
         let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
         let parent_id = "incremental-parent";
