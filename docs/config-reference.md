@@ -77,7 +77,7 @@ default. The full field list of `Config`:
 | `access_control` | `Option<AccessControlConfig>` | Password gate for the HTTP API/UI (`password_enabled`, hashed+salted). |
 | `features` | `FeatureFlags` | Incremental rollout toggles, off by default. `final_evidence_check` enables the single final-answer check described below. |
 | `stream_timeout` | `StreamTimeoutConfig` | Independent transport, first-semantic, and midstream-semantic watchdog deadlines. See below. |
-| `context_management` | `ContextManagementConfig` | Selects legacy summary compression or the opt-in exact-history retrieval window. See below. |
+| `context_management` | `ContextManagementConfig` | Selects conversation summary, prose-only message summary, or the opt-in exact-history retrieval window. See below. |
 | `memory` | `Option<MemoryConfig>` | Memory/auto-dream/gardener settings. See below. |
 | `subagents` | `SubagentsConfig` | Sub-agent execution + the `claude_code` executor. See below. |
 | `cluster_fabric` | `ClusterFabricConfig` | Operator-managed remote nodes for deploying `broker-agent` workers over SSH; empty by default. SSH secrets encrypted at rest. |
@@ -286,7 +286,9 @@ not recommended.
 
 `context_management` defaults to `{"strategy":"summary"}`. Missing
 configuration therefore keeps the existing model-generated conversation
-summary behavior. The alternative `retrieval_window` strategy keeps exact raw
+summary behavior. The `message_summary` strategy summarizes historical user and
+assistant prose while discarding completed tool exchanges from the next model
+context. The `retrieval_window` strategy keeps exact raw
 messages in the Session store, removes eligible older complete turns only from
 the active provider window, and directs the model to
 `session_history_current` when it needs earlier evidence.
@@ -308,12 +310,42 @@ the active provider window, and directs the model to
 
 | Field | Default | What it does |
 |---|---|---|
-| `strategy` | `summary` | `summary` preserves the current summarizer path; `retrieval_window` enables exact-history archival at the ordinary pre-turn pressure boundary. |
+| `strategy` | `summary` | `summary` preserves the current summarizer path; `message_summary` summarizes historical user/assistant prose and removes completed tool exchanges from the active model view; `retrieval_window` enables exact-history archival at the ordinary pre-turn pressure boundary. |
 | `retrieval_window.min_recent_user_turns` | `3` | Minimum newest complete user-anchored turns that remain active. Must be greater than zero. |
 | `retrieval_window.trigger_usage_ratio` | `0.80` | Provider-prepared input ratio that starts automatic archival. |
 | `retrieval_window.target_usage_ratio` | `0.60` | Post-archive target ratio. Validation requires `0.01 <= target < trigger <= 1` because the planner uses whole percentages. |
 | `retrieval_window.history_tool_required` | `true` | Must remain `true` in this release. Bamboo fails before archival unless the effective callable catalog contains `session_history_current`. |
 | `retrieval_window.fallback_strategy` | `none` | `none` fails closed when retrieval archival is unavailable. `summary` explicitly opts into the legacy summarizer fallback. |
+
+To select message summaries:
+
+```json
+{
+  "context_management": {
+    "strategy": "message_summary"
+  }
+}
+```
+
+`message_summary` uses only the `content` text of historical user and assistant
+messages as summary source. It excludes tool-call names, arguments, IDs, tool
+outputs, reasoning, and image/OCR fields. An assistant message that also made
+tool calls can still contribute its prose; its tool fields do not enter the
+summary. The latest user request remains verbatim in the next model context.
+All completed tool exchanges are removed from that active view, including
+recent or skill-related exchanges. Original messages remain in durable Session
+history; compression does not delete them.
+
+Automatic pressure checks and `compact_context` use the selected message-summary
+mode. Its `compact_context.instructions` argument is ignored so tool parameters
+cannot re-enter the summary through custom instructions. Incomplete tool chains
+defer compression until their results are complete.
+When switching a Session with an existing mixed-message summary, Bamboo rebuilds
+from the durable user/assistant prose rather than merging the old summary's tool
+details. The default stays `summary`; selecting `message_summary` requires an
+explicit configuration change through the Bamboo configuration API, file, or a
+compatible Lotus context-management settings page. Older Lotus builds with a
+two-option switch do not expose this third strategy.
 
 Retrieval-window commits require runtime persistence and are checkpointed before
 the archived state is published or a provider request is sent. The checkpoint
@@ -325,9 +357,10 @@ for a Session that already has a conversation summary is rejected immediately;
 start a new Session or explicitly retain summary fallback. This first runtime
 slice supports automatic pre-turn archival, explicit model-requested archival
 through the argument-free `archive_context` tool, and critical overflow
-recovery through the same summary-free boundary. `compact_context` remains a
-summary-specific control: under `retrieval_window`, it fails closed unless
-`fallback_strategy: "summary"` explicitly opts into the legacy summarizer.
+recovery through the same summary-free boundary. `compact_context` uses the
+selected `summary` or `message_summary` mode: under `retrieval_window`, it fails
+closed unless `fallback_strategy: "summary"` explicitly opts into the legacy
+summarizer.
 Manual requests that are already at or below the target are durably consumed as
 no-ops so they do not loop after restart. Failed archive checkpoints remain
 retryable and never publish partially archived state.

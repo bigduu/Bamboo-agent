@@ -1544,7 +1544,9 @@ pub fn is_host_trusted(url: &str, trusted_hosts: &[String]) -> bool {
 
 /// Host strategy used when the active model context approaches its input limit.
 ///
-/// `Summary` remains the compatibility default. `RetrievalWindow` is opt-in and
+/// `Summary` remains the compatibility default. `MessageSummary` summarizes only
+/// historical user/assistant prose and removes completed tool exchanges from the
+/// active model view. `RetrievalWindow` is opt-in and
 /// archives old exact messages only after the runtime has verified that the
 /// current-session history capability is callable and the boundary can be
 /// durably checkpointed.
@@ -1553,6 +1555,7 @@ pub fn is_host_trusted(url: &str, trusted_hosts: &[String]) -> bool {
 pub enum ContextManagementStrategy {
     #[default]
     Summary,
+    MessageSummary,
     RetrievalWindow,
 }
 
@@ -5920,6 +5923,40 @@ mod tests {
         assert_eq!(
             persisted["context_management"]["strategy"],
             "retrieval_window"
+        );
+    }
+
+    #[test]
+    fn message_summary_context_management_round_trips_without_changing_defaults() {
+        let root: ConfigRoot = serde_json::from_value(serde_json::json!({
+            "context_management": {
+                "strategy": "message_summary"
+            }
+        }))
+        .unwrap();
+        let values = ConfigValues::from(root);
+        assert_eq!(
+            values.context_management.strategy,
+            ContextManagementStrategy::MessageSummary
+        );
+        assert_eq!(
+            values.context_management.retrieval_window,
+            RetrievalWindowContextConfig::default()
+        );
+
+        let persisted = serde_json::to_value(ConfigRoot::from(values)).unwrap();
+        assert_eq!(
+            persisted["context_management"]["strategy"],
+            "message_summary"
+        );
+        let reloaded: ConfigRoot = serde_json::from_value(persisted).unwrap();
+        assert_eq!(
+            ConfigValues::from(reloaded).context_management.strategy,
+            ContextManagementStrategy::MessageSummary
+        );
+        assert_eq!(
+            ContextManagementConfig::default().strategy,
+            ContextManagementStrategy::Summary
         );
     }
 
