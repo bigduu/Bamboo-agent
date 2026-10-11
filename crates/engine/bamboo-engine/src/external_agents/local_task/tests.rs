@@ -825,8 +825,12 @@ async fn production_local_task_natural_completion_wins_late_cancel_without_poiso
 #[tokio::test]
 async fn production_local_task_panic_quarantines_unknown_stop_and_preserves_healthy_sibling() {
     let home = tempfile::tempdir().unwrap();
+    // Snapshot authority is rooted in a physical directory capability. macOS
+    // tempfile paths can contain the /var alias; use the same canonical root
+    // for the live Host and the independently reopened read-only projection.
+    let physical_home = home.path().canonicalize().unwrap();
     let mut control = ProviderControl::new();
-    let mut harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 2).await;
+    let mut harness = Harness::open(&physical_home, &root_id(), control.provider.clone(), 2).await;
     let child = harness.child("panic", "panic inside native task").await;
     let admission_before = harness.runner.admission.available_permits();
     let mut child_events = harness.child_events(&child).await;
@@ -885,7 +889,7 @@ async fn production_local_task_panic_quarantines_unknown_stop_and_preserves_heal
     );
     chrono::DateTime::parse_from_rfc3339(&saved.metadata["runtime.local_task.observed_at"])
         .unwrap();
-    let reopened = bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+    let reopened = bamboo_storage::SessionStoreV2::new(physical_home)
         .await
         .unwrap();
     let cold = reopened.load_session(&child.id).await.unwrap().unwrap();

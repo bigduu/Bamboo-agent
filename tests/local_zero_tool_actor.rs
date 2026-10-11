@@ -3042,12 +3042,10 @@ fn message_only_root_result(root: &bamboo_domain::Session, completed: bool) -> V
         .map(|m| m.content.as_str())
         .collect();
     if completed {
-        let mut expected = Vec::new();
-        if replies.first() == Some(&"F2_ROOT_DELEGATION_DONE") {
-            expected.push("F2_ROOT_DELEGATION_DONE");
-        }
-        expected.push("F2_ROOT_CHILD_RESULT_DONE");
-        assert_eq!(replies, expected);
+        // The first no-tool candidate establishes the implicit Child wait.
+        // pipeline's orphan-Child gate does not commit that candidate; only a
+        // later inherited wait may retain an intermediate assistant message.
+        assert_eq!(replies, ["F2_ROOT_CHILD_RESULT_DONE"]);
         assert!(message_only_child_outcome(root).is_some());
     } else {
         assert!(replies.is_empty());
@@ -3323,6 +3321,11 @@ async fn message_only_fixture(
         )
     });
     let result = message_only_root_result(&parent, false);
+    // A real second provider round reached the initial orphan-Child gate, but
+    // its final candidate is absent from the canonical transcript at this cut.
+    assert_eq!(probe.progress_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.root_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.outcome_calls.load(Ordering::SeqCst), 0);
     let id = result["actor_id"].as_str().unwrap().to_owned();
     let wait = parent
         .agent_runtime_state
@@ -3522,9 +3525,9 @@ async fn message_only_fixture(
     .unwrap();
     assert_eq!(message_only_root_result(&parent_completed, true), result);
     let progress_calls = probe.progress_calls.load(Ordering::SeqCst);
-    assert!(progress_calls <= 1);
+    assert_eq!(progress_calls, 1);
     assert_eq!(probe.outcome_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(probe.root_calls.load(Ordering::SeqCst), 2 + progress_calls);
+    assert_eq!(probe.root_calls.load(Ordering::SeqCst), 3);
     assert_eq!(
         parent_completed
             .messages
@@ -3534,7 +3537,8 @@ async fn message_only_fixture(
                     && message.content == "F2_ROOT_DELEGATION_DONE"
             })
             .count(),
-        progress_calls
+        0,
+        "initial implicit-wait candidate must never become a canonical reply"
     );
     assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
     let index_store = SessionStoreV2::new(data.clone()).await.unwrap();
