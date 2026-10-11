@@ -10921,22 +10921,44 @@ mod tests {
                     "tool feedback for {action} reaches the next reasoning round"
                 );
             }
-            Ok(Box::pin(stream::iter(vec![
+            let native = |author, payload| {
                 Ok(LLMChunk::ProviderTranscriptItem(
                     bamboo_domain::ProviderTranscriptItem::try_from_payload(
                         bamboo_domain::ProviderFamily::OpenAi,
                         bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
                         bamboo_domain::ProviderTranscriptOrigin::Provider,
-                        bamboo_domain::ProviderTranscriptAuthor::Model,
-                        serde_json::json!({
-                            "type":"message","id":"partial-native-reply","role":"assistant","status":"completed",
-                            "content":[{"type":"output_text","text":"continued after child","annotations":[]}]
-                        }),
+                        author,
+                        payload,
                     )
                     .unwrap(),
-                )),
+                ))
+            };
+            Ok(Box::pin(stream::iter(vec![
+                native(
+                    bamboo_domain::ProviderTranscriptAuthor::Model,
+                    serde_json::json!({
+                        "type":"tool_search_call","id":"partial-native-search","execution":"server",
+                        "call_id":"partial-search","status":"completed","arguments":{"paths":["children"]}
+                    }),
+                ),
+                native(
+                    bamboo_domain::ProviderTranscriptAuthor::ToolResult,
+                    serde_json::json!({
+                        "type":"tool_search_output","id":"partial-native-search-result","execution":"server",
+                        "call_id":"partial-search","status":"completed","tools":[]
+                    }),
+                ),
+                native(
+                    bamboo_domain::ProviderTranscriptAuthor::Model,
+                    serde_json::json!({
+                        "type":"message","id":"partial-native-reply","role":"assistant","status":"completed",
+                        "content":[{"type":"output_text","text":"continued after child","annotations":[]}]
+                    }),
+                ),
                 Ok(LLMChunk::ReasoningToken("remaining child work".into())),
-                Ok(LLMChunk::ReasoningSignature("partial-reasoning-signature".into())),
+                Ok(LLMChunk::ReasoningSignature(
+                    "partial-reasoning-signature".into(),
+                )),
                 Ok(LLMChunk::Token("continued after child".into())),
                 Ok(LLMChunk::Done),
             ])))
@@ -11079,7 +11101,8 @@ mod tests {
                 );
                 assert_eq!(groups.len(), 1);
                 assert_eq!(groups[0].anchor_message_id(), reply.id);
-                assert_eq!(groups[0].items()[0].payload()["id"], "partial-native-reply");
+                assert_eq!(groups[0].items().len(), 3);
+                assert_eq!(groups[0].items()[2].payload()["id"], "partial-native-reply");
             }
         }
     }
