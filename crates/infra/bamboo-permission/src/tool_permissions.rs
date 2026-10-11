@@ -1182,16 +1182,13 @@ pub fn check_permissions(
             }
         }
         "SubAgent" => {
-            // Legacy calls omit `action` and mean `create`; the tool defaults it
-            // that way INSIDE `invoke`, which runs AFTER this gate — so default it
-            // here too rather than hard-failing on a missing field (that would
-            // abort a legacy call before it reaches the tool). #395.
-            let action = args
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("create")
-                .trim()
-                .to_ascii_lowercase();
+            // This gate runs before the compact facade normalizes its intent.
+            // Classify the resulting operation, not every missing `action` as
+            // a legacy create. Canonical lineage/request checks still run in
+            // the tool for parent questions, replies and inspections.
+            let Some(action) = subagent_permission_action(args)? else {
+                return Ok(None);
+            };
             match action.as_str() {
                 // Spawn / run / drive a child agent = independent compute + full toolset.
                 "create" | "run" | "send_message" => Ok(Some(vec![PermissionContext::new(
@@ -1270,6 +1267,74 @@ pub fn check_permissions(
         "notify" => Ok(None),
         _ => Ok(None),
     }
+}
+
+fn subagent_permission_action(args: &Value) -> Result<Option<String>, PermissionError> {
+    let invalid = || PermissionError::CheckFailed("Invalid SubAgent routing arguments".into());
+    if !args.is_object() {
+        return Err(invalid());
+    }
+    // Mirror sub_agent_facade::normalize's legacy/compact boundary before
+    // treating provider-generated empty optional fields as omitted.
+    let compact_fields = ["intent", "target", "role", "reply_to"]
+        .iter()
+        .any(|key| args.get(key).is_some());
+    if args.get("action").is_some() || (!compact_fields && args.get("prompt").is_some()) {
+        if compact_fields {
+            return Err(invalid());
+        }
+        return Ok(Some(
+            args.get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("create")
+                .trim()
+                .to_ascii_lowercase(),
+        ));
+    }
+    let intent = match args.get("intent") {
+        None => "chat",
+        Some(value) => value.as_str().ok_or_else(invalid)?,
+    };
+    for field in ["target", "role", "reply_to"] {
+        if args
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return Err(invalid());
+        }
+    }
+    let present = |field| {
+        args.get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    };
+    let has_target = present("target");
+    let has_role = present("role");
+    if present("reply_to") {
+        return if intent == "chat" && !has_target && !has_role {
+            Ok(None)
+        } else {
+            Err(invalid())
+        };
+    }
+    if has_role && (intent != "chat" || has_target) {
+        return Err(invalid());
+    }
+    let action = match intent {
+        "chat" if has_target => "send_message",
+        "chat" => "create",
+        "inspect" => return Ok(None),
+        "ask_parent" if !has_target => return Ok(None),
+        "control" if has_target => {
+            match args.get("message").and_then(Value::as_str).map(str::trim) {
+                Some("cancel") => "cancel",
+                Some("retry") => "run",
+                _ => return Err(invalid()),
+            }
+        }
+        _ => return Err(invalid()),
+    };
+    Ok(Some(action.into()))
 }
 
 fn parse_requested_permission_type(value: &str) -> Option<PermissionType> {
@@ -2792,6 +2857,102 @@ mod tests {
         let del = json!({"action": "delete", "session_id": "c1"});
         let contexts = check_permissions("SubAgent", &del).unwrap().unwrap();
         assert_eq!(contexts[0].permission_type, PermissionType::DeleteOperation);
+    }
+
+    #[test]
+    fn subagent_compact_intents_gate_the_exact_operation() {
+        for (args, permission_type, resource) in [
+            (
+                json!({"message":"Do the task"}),
+                PermissionType::ExecuteCommand,
+                "SubAgent create",
+            ),
+            (
+                json!({"intent":"chat", "role":"explorer", "message":"Do the task"}),
+                PermissionType::ExecuteCommand,
+                "SubAgent create",
+            ),
+            (
+                json!({"target":"child", "message":"Continue the task"}),
+                PermissionType::ExecuteCommand,
+                "SubAgent send_message",
+            ),
+            (
+                json!({"intent":"control", "target":"child", "message":" cancel "}),
+                PermissionType::WriteFile,
+                "SubAgent cancel",
+            ),
+            (
+                json!({"intent":"control", "target":"child", "message":" retry "}),
+                PermissionType::ExecuteCommand,
+                "SubAgent run",
+            ),
+        ] {
+            for sentinel in [json!(""), Value::Null] {
+                let mut args = args.clone();
+                for field in ["target", "role", "reply_to"] {
+                    if args.get(field).is_none() {
+                        args[field] = sentinel.clone();
+                    }
+                }
+                let contexts = check_permissions("SubAgent", &args)
+                    .unwrap()
+                    .expect("compact child mutation must be permission gated");
+                assert_eq!(contexts.len(), 1, "{args}");
+                assert_eq!(contexts[0].permission_type, permission_type, "{args}");
+                assert_eq!(contexts[0].resource, resource, "{args}");
+            }
+        }
+    }
+
+    #[test]
+    fn subagent_compact_questions_replies_and_inspections_stay_ungated() {
+        for args in [
+            json!({"intent":"ask_parent", "message":"Which option?"}),
+            json!({"reply_to":"request_123", "message":"Use option A"}),
+            json!({"intent":"chat", "reply_to":"request_123", "message":"approve_once"}),
+            json!({"reply_to":"request_123", "message":"deny"}),
+            json!({"intent":"inspect"}),
+            json!({"intent":"inspect", "message":"forced_permission_audit"}),
+            json!({"intent":"inspect", "target":"child", "message":"diagnostics"}),
+        ] {
+            for sentinel in [json!(""), Value::Null] {
+                let mut args = args.clone();
+                for field in ["target", "role", "reply_to"] {
+                    if args.get(field).is_none() {
+                        args[field] = sentinel.clone();
+                    }
+                }
+                assert!(
+                    check_permissions("SubAgent", &args).unwrap().is_none(),
+                    "{args} must not require permission to create a child"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subagent_compact_invalid_routing_fails_closed() {
+        for args in [
+            json!(null),
+            json!({"action":"create", "intent":"inspect"}),
+            json!({"action":"list", "target":"", "reply_to":null}),
+            json!({"intent":null, "message":"task"}),
+            json!({"intent":"INSPECT"}),
+            json!({"intent":"unknown"}),
+            json!({"intent":"ask_parent", "target":"child", "message":"Which option?"}),
+            json!({"intent":"inspect", "role":"explorer"}),
+            json!({"target":"child", "role":"explorer", "message":"task"}),
+            json!({"target":false, "message":"task"}),
+            json!({"reply_to":false, "message":"task"}),
+            json!({"intent":"inspect", "reply_to":"request_123"}),
+            json!({"reply_to":"request_123", "target":"child", "message":"deny"}),
+            json!({"reply_to":"request_123", "role":"explorer", "message":"deny"}),
+            json!({"intent":"control", "message":"retry"}),
+            json!({"intent":"control", "target":"child", "message":"delete"}),
+        ] {
+            assert!(check_permissions("SubAgent", &args).is_err(), "{args}");
+        }
     }
 
     #[test]

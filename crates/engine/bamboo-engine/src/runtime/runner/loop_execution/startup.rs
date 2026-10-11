@@ -166,11 +166,32 @@ pub(super) async fn initialize_loop_state(
         .agent_runtime_state
         .as_ref()
         .is_some_and(|previous| matches!(previous.status, AgentStatusState::Suspended));
-    let mut runtime_state = AgentRuntimeState::new(
-        config
+    let local_resources = bamboo_tools::LocalTaskResources::current();
+    if let Some(resources) = &local_resources {
+        let owner = resources.identity();
+        if owner.session_id != session.id
+            || owner.child_birth != session.created_at
+            || session.kind != bamboo_domain::SessionKind::Child
+        {
+            return Err(bamboo_agent_core::AgentError::LLM(
+                "local execution resource identity does not match canonical Child".into(),
+            ));
+        }
+        if config
             .ticket_worker_plan
             .as_ref()
-            .map(|plan| plan.run_id())
+            .is_some_and(|plan| plan.run_id() != owner.run_id)
+        {
+            return Err(bamboo_agent_core::AgentError::LLM(
+                "local Ticket execution run identity changed".into(),
+            ));
+        }
+    }
+    let mut runtime_state = AgentRuntimeState::new(
+        local_resources
+            .as_ref()
+            .map(|scope| scope.identity().run_id.as_str())
+            .or_else(|| config.ticket_worker_plan.as_ref().map(|plan| plan.run_id()))
             .unwrap_or(&session_id),
     );
     // Permission mode is a per-session sticky posture (set via PATCH /sessions
@@ -530,6 +551,38 @@ mod tests {
 
         assert_eq!(first.summarization_model_name.as_deref(), Some("sum-1"));
         assert_eq!(second.summarization_model_name.as_deref(), Some("sum-2"));
+    }
+
+    #[tokio::test]
+    async fn native_startup_uses_exact_owned_run_and_rejects_foreign_session() {
+        let parent = Session::new("native-startup-parent", "model");
+        let mut child = Session::new_child_of("native-startup-child", &parent, "model", "task");
+        let resources =
+            bamboo_tools::LocalTaskResources::new(&child.id, "canonical-run", child.created_at);
+        let config = AgentLoopConfig::default();
+        let tools = SuccessfulLoadSkill::default();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let state = resources
+            .scope(initialize_loop_state(&mut child, "", &config, &tools, &tx))
+            .await
+            .unwrap();
+        assert_eq!(state.runtime_state.run_id, "canonical-run");
+        assert_eq!(
+            child.agent_runtime_state.as_ref().unwrap().run_id,
+            "canonical-run"
+        );
+        let mut foreign = Session::new_child_of("foreign-native-child", &parent, "model", "task");
+        assert!(resources
+            .scope(initialize_loop_state(
+                &mut foreign,
+                "",
+                &config,
+                &tools,
+                &tx
+            ))
+            .await
+            .is_err());
+        resources.close_and_drain().await.unwrap();
     }
 
     #[tokio::test]

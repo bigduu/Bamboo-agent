@@ -8,7 +8,11 @@ use bamboo_domain::{ActorDirectoryEntry, ActorLogicalState, SessionAuthorityConf
 pub(super) struct DefaultWriterGuards {
     pub(super) root_mode_context: Option<super::root_context::RootModeContextWrite>,
     pub(super) root_actor: Option<super::root_actor_runtime::RootActorWriteProof>,
+    pub(super) child_actor: Option<super::child_actor_runtime::ChildActorWriteProof>,
+    pub(super) child_input: Option<super::child_actor_runtime::ChildActorInputProof>,
     pub(super) root_origin: Option<super::root_actor_runtime::RootActorWriteProof>,
+    pub(super) parent_question_answer:
+        Option<super::parent_question_answer_proof::ParentQuestionAnswerProof>,
     pub(super) input: Option<super::root_actor_input::RootActorInputProof>,
     pub(super) _input_filesystem: Option<crate::session_inbox::OwnedFilesystem>,
     pub(crate) physical: Arc<DefaultWriterPhysicalGuards>,
@@ -56,7 +60,10 @@ impl DefaultWriterGuards {
         Arc::new(Self {
             root_mode_context: None,
             root_actor,
+            child_actor: None,
+            child_input: None,
             root_origin: None,
+            parent_question_answer: None,
             input: None,
             _input_filesystem: None,
             physical: Arc::new(DefaultWriterPhysicalGuards {
@@ -77,7 +84,10 @@ impl DefaultWriterGuards {
         Arc::new(Self {
             root_mode_context: None,
             root_actor: None,
+            child_actor: None,
+            child_input: None,
             root_origin: None,
+            parent_question_answer: None,
             input: None,
             _input_filesystem: None,
             physical: Arc::new(DefaultWriterPhysicalGuards {
@@ -370,7 +380,10 @@ impl SessionStoreV2 {
         let path = path.to_path_buf();
         let root_mode_context = guards.root_mode_context.clone();
         let root_actor = guards.root_actor.clone();
+        let child_actor = guards.child_actor.clone();
+        let child_input = guards.child_input.clone();
         let root_origin = guards.root_origin.clone();
+        let parent_question_answer = guards.parent_question_answer.clone();
         let input = guards.input.clone();
         #[cfg(test)]
         let hook = self.default_write_hook.lock().unwrap().clone();
@@ -387,8 +400,17 @@ impl SessionStoreV2 {
                     if let Some(proof) = &root_actor {
                         proof.validate()?;
                     }
+                    if let Some(proof) = &child_actor {
+                        proof.validate()?;
+                    }
+                    if let Some(proof) = &child_input {
+                        proof.validate(false)?;
+                    }
                     if let Some(proof) = &root_origin {
                         proof.validate()?;
+                    }
+                    if let Some(proof) = &parent_question_answer {
+                        proof.validate_publication()?;
                     }
                     if let Some(proof) = &input {
                         proof.validate(false)?;

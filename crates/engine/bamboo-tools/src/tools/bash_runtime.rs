@@ -1,3 +1,4 @@
+use crate::local_task_resources::{LocalTaskResources, ManagedBashChild, ResourceTask};
 use bamboo_agent_core::{AgentEvent, BashCompletionInfo, BashCompletionSink};
 use bamboo_infrastructure::process::{
     build_command_environment, decode_process_line_lossy, hide_window_for_tokio_command,
@@ -256,22 +257,19 @@ pub async fn spawn_background(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child = cmd
-        .spawn()
+    let mut child = ManagedBashChild::spawn(&mut cmd)
         .map_err(|e| format!("Failed to spawn background shell: {}", e))?;
 
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| "Failed to capture shell stdout".to_string())?;
     let stderr = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| "Failed to capture shell stderr".to_string())?;
     // Only take (and store) the stdin handle when spawned interactive; a
     // non-interactive child never has a stdin pipe to take.
     let stdin_handle = if interactive {
-        child.stdin.take()
+        child.take_stdin()
     } else {
         None
     };
@@ -299,20 +297,24 @@ pub async fn spawn_background(
     let stdout_pump = {
         let output = output.clone();
         let base_index = base_index.clone();
-        tokio::spawn(async move {
+        ResourceTask::spawn(async move {
             pump_stream_lines("stdout", stdout, output, base_index).await;
         })
+        .map_err(|error| error.to_string())?
     };
 
     let stderr_pump = {
         let output = output.clone();
         let base_index = base_index.clone();
-        tokio::spawn(async move {
+        ResourceTask::spawn(async move {
             pump_stream_lines("stderr", stderr, output, base_index).await;
         })
+        .map_err(|error| error.to_string())?
     };
 
-    spawn_completion_poll(
+    // Publish the cache entry before a fast completion can remove it.
+    sessions().insert(shell_id.clone(), session.clone());
+    if let Err(error) = spawn_completion_poll(
         child,
         kill_notify,
         shell_id.clone(),
@@ -324,9 +326,10 @@ pub async fn spawn_background(
         event_tx,
         bash_completion_sink,
         vec![stdout_pump, stderr_pump],
-    );
-
-    sessions().insert(shell_id, session.clone());
+    ) {
+        sessions().remove(&shell_id);
+        return Err(error);
+    }
     Ok(session)
 }
 
@@ -339,7 +342,7 @@ pub async fn spawn_background(
 /// (issue #84, phase 2d + Phase 2b follow-up).
 #[allow(clippy::too_many_arguments)]
 fn spawn_completion_poll(
-    mut child: Child,
+    mut child: ManagedBashChild,
     kill_notify: Arc<Notify>,
     shell_id: String,
     command: String,
@@ -352,14 +355,15 @@ fn spawn_completion_poll(
     // Stdout/stderr pump task handles. Awaited (bounded) before reading the
     // completion tail so it reflects the fully-drained output — observing exit
     // can race the pumps that are still flushing the final lines.
-    pump_handles: Vec<tokio::task::JoinHandle<()>>,
-) {
+    pump_handles: Vec<ResourceTask<()>>,
+) -> Result<(), String> {
     let session_id_for_gc = shell_id.clone();
     let bash_id_for_event = shell_id.clone();
     let bash_id_for_sink = shell_id;
     let command_for_event = command.clone();
     let command_for_sink = command;
-    tokio::spawn(async move {
+    let owned = LocalTaskResources::current().is_some();
+    ResourceTask::spawn(async move {
         // Event-driven exit detection: await the process directly (`child.wait()`
         // is OS-notified via tokio's process driver — no polling). A kill request
         // (`kill_notify`, fired by `ShellSession::kill`) races the natural exit via
@@ -423,11 +427,21 @@ fn spawn_completion_poll(
         // no loop to notify). The sink hands off to a detached task, so this call
         // is cheap. It is best-effort and idempotent with the durable end-of-turn
         // suspend/poll backstop, which still runs.
+        let mut pump_handles = Some(pump_handles);
+        if owned {
+            for handle in pump_handles.take().unwrap_or_default() {
+                if let Err(error) = handle.join().await {
+                    if let Some(scope) = LocalTaskResources::current() {
+                        scope.record_unconfirmed(error.to_string());
+                    }
+                }
+            }
+        }
         if let (Some(sink), Some(session_id)) = (bash_completion_sink, session_id) {
             // Wait (bounded) for the pumps to reach EOF so the tail is complete;
             // the child's pipes close on exit, so this is the fast common case.
-            for handle in pump_handles {
-                let _ = timeout(Duration::from_secs(1), handle).await;
+            for handle in pump_handles.take().unwrap_or_default() {
+                let _ = timeout(Duration::from_secs(1), handle.join()).await;
             }
             let output_tail = output_tail(&output).await;
             sink.on_bash_completed(BashCompletionInfo {
@@ -440,9 +454,16 @@ fn spawn_completion_poll(
             });
         }
 
-        sleep(Duration::from_secs(COMPLETED_SESSION_TTL_SECS)).await;
-        let _ = remove_shell(&session_id_for_gc);
-    });
+        if owned {
+            // Resource finalization must not wait for a display-cache TTL.
+            let _ = remove_shell(&session_id_for_gc);
+        } else {
+            sleep(Duration::from_secs(COMPLETED_SESSION_TTL_SECS)).await;
+            let _ = remove_shell(&session_id_for_gc);
+        }
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 /// Join the last [`COMPLETION_TAIL_LINES`] captured lines into a byte-bounded
@@ -475,6 +496,39 @@ async fn output_tail(output: &Arc<Mutex<Vec<String>>>) -> String {
 #[allow(clippy::too_many_arguments)]
 pub async fn adopt_running_child(
     child: Child,
+    stdout_reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    stderr_reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    seeded_stdout_lines: Vec<String>,
+    seeded_stderr_lines: Vec<String>,
+    command: &str,
+    session_id: Option<String>,
+    environment: CommandEnvironmentDiagnostics,
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
+    bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
+) -> Result<Arc<ShellSession>, String> {
+    if LocalTaskResources::current().is_some() {
+        return Err(
+            "local task cannot adopt a process without its original ownership handle".into(),
+        );
+    }
+    adopt_managed_child(
+        child.into(),
+        stdout_reader,
+        stderr_reader,
+        seeded_stdout_lines,
+        seeded_stderr_lines,
+        command,
+        session_id,
+        environment,
+        event_tx,
+        bash_completion_sink,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn adopt_managed_child(
+    child: ManagedBashChild,
     stdout_reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     stderr_reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     seeded_stdout_lines: Vec<String>,
@@ -522,19 +576,23 @@ pub async fn adopt_running_child(
     let stdout_pump = {
         let output = output.clone();
         let base_index = base_index.clone();
-        tokio::spawn(async move {
+        ResourceTask::spawn(async move {
             pump_stream_lines("stdout", stdout_reader, output, base_index).await;
         })
+        .map_err(|error| error.to_string())?
     };
     let stderr_pump = {
         let output = output.clone();
         let base_index = base_index.clone();
-        tokio::spawn(async move {
+        ResourceTask::spawn(async move {
             pump_stream_lines("stderr", stderr_reader, output, base_index).await;
         })
+        .map_err(|error| error.to_string())?
     };
 
-    spawn_completion_poll(
+    // Publish the cache entry before a fast completion can remove it.
+    sessions().insert(shell_id.clone(), session.clone());
+    if let Err(error) = spawn_completion_poll(
         child,
         kill_notify,
         shell_id.clone(),
@@ -546,9 +604,10 @@ pub async fn adopt_running_child(
         event_tx,
         bash_completion_sink,
         vec![stdout_pump, stderr_pump],
-    );
-
-    sessions().insert(shell_id, session.clone());
+    ) {
+        sessions().remove(&shell_id);
+        return Err(error);
+    }
     Ok(session)
 }
 

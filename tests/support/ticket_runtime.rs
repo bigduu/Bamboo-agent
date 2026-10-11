@@ -513,6 +513,17 @@ impl Fixture {
         Self::with_fault(None).await
     }
     pub async fn with_fault(fault: Option<(&str, &str)>) -> Self {
+        Self::with_backend(fault, false).await
+    }
+    /// Physical Worker-PID fixtures explicitly select the retained process
+    /// backend. Ordinary Ticket fixtures continue to exercise native tasks.
+    pub async fn legacy_worker() -> Self {
+        Self::legacy_worker_with_fault(None).await
+    }
+    pub async fn legacy_worker_with_fault(fault: Option<(&str, &str)>) -> Self {
+        Self::with_backend(fault, true).await
+    }
+    async fn with_backend(fault: Option<(&str, &str)>, legacy_worker: bool) -> Self {
         let temp = tempfile::Builder::new()
             .prefix("bamboo-1481-ticket-lifecycle-")
             .tempdir_in("/tmp")
@@ -545,13 +556,16 @@ impl Fixture {
         let running = server.run();
         let provider_handle = running.handle();
         actix_web::rt::spawn(running);
-        let synthetic_config =
-            serde_json::to_vec(&json!({"provider":"openai","setup":{"completed":true},
+        let mut synthetic_config = json!({"provider":"openai","setup":{"completed":true},
         "features":{"provider_model_ref":true,"ticket_mutation":true,"ticket_dispatch":true},
         "providers":{"openai":{"api_key":"fixture","base_url":url,"model":"ticket-model"}},
         "defaults":{"chat":{"provider":"openai","model":"ticket-model"}},
-        "subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":5}}))
-            .unwrap();
+        "subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":5}});
+        if legacy_worker {
+            synthetic_config["subagents"]["worker_bin"] = json!(env!("CARGO_BIN_EXE_bamboo"));
+            synthetic_config["subagents"]["worker_args"] = json!(["subagent-worker"]);
+        }
+        let synthetic_config = serde_json::to_vec(&synthetic_config).unwrap();
         std::fs::write(data.join("config.json"), &synthetic_config).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();

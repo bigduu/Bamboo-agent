@@ -1934,3 +1934,697 @@ async fn compact_large_root_mode_and_supervisor_keep_existing_committed_proof_ch
         std::fs::write(&proof, original).unwrap();
     }
 }
+
+// v2 is deliberately opt-in. These fixtures use the real Child runtime write
+// boundary, and the view still reads only its existing bounded capabilities.
+impl Fixture {
+    async fn snapshot_v2(
+        &self,
+        subtree: &str,
+        limits: ActorSnapshotLimits,
+    ) -> Result<bamboo_domain::PublicActorSubtreeSnapshotV2, Error> {
+        self.store
+            .actor_subtree_snapshot_v2(
+                ActorSnapshotPrincipal::host_owner(),
+                &self.root.id,
+                subtree,
+                limits,
+            )
+            .await
+    }
+
+    async fn activate_local(&self, child: &Session, lifetime: chrono::Duration) -> ActorActivation {
+        self.store.ensure_actor(&child.id).await.unwrap();
+        self.store
+            .bind_control_plane(
+                &child.id,
+                bamboo_domain::ActorControlPlaneBinding {
+                    policy_revision: None,
+                    placement_intent: Some(bamboo_domain::ActorPlacementIntent::Local),
+                },
+            )
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let activation = self
+            .store
+            .claim_activation(&ActorActivationClaim {
+                actor_id: child.id.clone(),
+                run_id: "PRIVATE-NATIVE-RUN".into(),
+                lease_owner: "PRIVATE-NATIVE-HOST".into(),
+                lease_expires_at: now + lifetime,
+                inbox_generation: 0,
+                placement_ref: None,
+                now,
+            })
+            .await
+            .unwrap();
+        self.store
+            .start_activation(&activation.fence(), Utc::now())
+            .await
+            .unwrap()
+    }
+
+    async fn local_checkpoint(
+        &self,
+        child: &mut Session,
+        activation: &ActorActivation,
+        state: &str,
+    ) {
+        for (key, value) in [
+            ("runtime.local_task.state", state.to_string()),
+            ("runtime.local_task.run_id", activation.run_id.clone()),
+            (
+                "runtime.local_task.child_birth",
+                child.created_at.to_rfc3339(),
+            ),
+            ("runtime.local_task.observed_at", Utc::now().to_rfc3339()),
+            ("runtime.kind", "external".into()),
+            ("external.agent_id", "local-actor".into()),
+            ("external.protocol", "actor".into()),
+        ] {
+            child.metadata.insert(key.into(), value);
+        }
+        child.metadata.remove("runtime.local_task.reason");
+        child.metadata.remove("runtime.local_task.instance");
+        if state == "stop_unconfirmed" {
+            child.metadata.insert(
+                "runtime.local_task.reason".into(),
+                "execution_stop_unconfirmed".into(),
+            );
+        } else if state == "stopped" {
+            child.metadata.insert(
+                "runtime.local_task.instance".into(),
+                uuid::Uuid::new_v4().to_string(),
+            );
+        }
+        let owner =
+            bamboo_domain::ChildActorRuntimeWrite::from_session(activation.fence(), child).unwrap();
+        self.store
+            .save_child_actor_runtime(bamboo_domain::ChildActorRuntimeSave {
+                owner: &owner,
+                session: child,
+                runtime_only: true,
+                inherited: None,
+                finalized_wait: None,
+                input: None,
+                publish: Arc::new(|_| {}),
+            })
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn snapshot_v2_diagnostics_are_sidecar_only_private_and_leave_v1_exact() {
+    use bamboo_domain::{PublicLocalTaskReason as Reason, PublicLocalTaskState as State};
+    let f = Fixture::new().await;
+    let mut child = f.child("native-diagnostic-child", &f.root).await;
+    let activation = f.activate_local(&child, chrono::Duration::minutes(5)).await;
+    let old = f
+        .snapshot(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    let main = fs::read(f.directory(&child.id).join("session.json"))
+        .await
+        .unwrap();
+    f.local_checkpoint(&mut child, &activation, "running").await;
+    let running = f
+        .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(running.schema_version, 2);
+    assert!(running.snapshot_id.starts_with("as2-"));
+    assert!((30001..=300000).contains(&running.refresh_after_ms.unwrap()));
+    let observation = running.nodes[0].local_task.as_ref().unwrap();
+    assert_eq!(observation.state, State::Running);
+    assert_eq!(observation.reason, None);
+    assert_eq!(
+        observation.lease_expires_at,
+        Some(activation.lease_expires_at)
+    );
+    assert_eq!(
+        observation.observed_at.unwrap().to_rfc3339(),
+        child.metadata["runtime.local_task.observed_at"]
+    );
+    assert_eq!(
+        fs::read(f.directory(&child.id).join("session.json"))
+            .await
+            .unwrap(),
+        main
+    );
+    let current_v1 = f
+        .snapshot(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(old.snapshot_id, current_v1.snapshot_id);
+    assert_eq!(old.nodes, current_v1.nodes);
+    assert_ne!(old.stream_cursor, current_v1.stream_cursor);
+    let mut old_wire = serde_json::to_value(&old).unwrap();
+    old_wire["stream_cursor"] = serde_json::json!(current_v1.stream_cursor);
+    assert_eq!(old_wire, serde_json::to_value(&current_v1).unwrap());
+    assert_eq!(running.nodes[0].actor, current_v1.nodes[0]);
+
+    f.local_checkpoint(&mut child, &activation, "stop_unconfirmed")
+        .await;
+    let unknown = f
+        .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert_ne!(running.stream_cursor, unknown.stream_cursor);
+    assert_ne!(running.snapshot_id, unknown.snapshot_id);
+    assert_eq!(unknown.refresh_after_ms, None);
+    let observation = unknown.nodes[0].local_task.as_ref().unwrap();
+    assert_eq!(observation.state, State::StopUnconfirmed);
+    assert_eq!(observation.reason, Some(Reason::ExecutionStopUnconfirmed));
+    assert_eq!(
+        unknown.nodes[0].actor.activation.as_ref().unwrap().status,
+        bamboo_domain::ActorActivationStatus::Running
+    );
+    assert_eq!(
+        unknown.nodes[0].actor.revision.session_metadata_version,
+        child.metadata_version
+    );
+    assert_eq!(
+        unknown.nodes[0].actor.revision,
+        running.nodes[0].actor.revision
+    );
+
+    f.local_checkpoint(&mut child, &activation, "stopped").await;
+    // The stop proof must remain visible even when its actual lease expired.
+    f.edit(&child.id, "actor-authority.json", |v| {
+        v["activation"]["lease_expires_at"] =
+            serde_json::json!(Utc::now() - chrono::Duration::seconds(1))
+    })
+    .await;
+    let before_read = durable_tree(&f.home);
+    let stopped = f
+        .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    let observation = stopped.nodes[0].local_task.as_ref().unwrap();
+    assert_eq!(observation.state, State::Stopped);
+    assert_eq!(observation.reason, None);
+    assert_eq!(
+        stopped.nodes[0].actor.activation.as_ref().unwrap().status,
+        bamboo_domain::ActorActivationStatus::Running
+    );
+    assert_eq!(
+        stopped.nodes[0].actor.logical_state,
+        Some(ActorLogicalState::Active)
+    );
+    assert_eq!(durable_tree(&f.home), before_read);
+    let wire = serde_json::to_string(&stopped).unwrap();
+    for private in [
+        "PRIVATE",
+        "instance",
+        "run_id",
+        "child_birth",
+        "runtime.",
+        "external.",
+        "lease_owner",
+        "lease_epoch",
+        "messages",
+    ] {
+        assert!(!wire.contains(private), "leaked {private}");
+    }
+    let json = serde_json::to_value(&stopped).unwrap();
+    assert_eq!(json["nodes"][0].as_object().unwrap().len(), 11);
+    assert_eq!(json["nodes"][0]["local_task"].as_object().unwrap().len(), 4);
+    assert!(json["nodes"][0].get("actor").is_none());
+}
+
+#[tokio::test]
+async fn snapshot_v2_expiry_changes_only_derived_identity_and_rearms_remaining_running() {
+    use bamboo_domain::{PublicLocalTaskReason as Reason, PublicLocalTaskState as State};
+    let f = Fixture::new().await;
+    let mut soon = f.child("expires-first", &f.root).await;
+    let mut later = f.child("expires-later", &f.root).await;
+    let long = f.activate_local(&later, chrono::Duration::minutes(5)).await;
+    f.local_checkpoint(&mut later, &long, "running").await;
+    let short = f.activate_local(&soon, chrono::Duration::seconds(5)).await;
+    f.local_checkpoint(&mut soon, &short, "running").await;
+    let first = f
+        .snapshot_v2(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert!((1000..=5000).contains(&first.refresh_after_ms.unwrap()));
+    let v1 = f
+        .snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    let durable = durable_tree(&f.home);
+    let wait = (short.lease_expires_at - Utc::now())
+        .to_std()
+        .unwrap_or_default();
+    tokio::time::sleep(wait + Duration::from_millis(20)).await;
+    let expired = f
+        .snapshot_v2(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(first.stream_cursor, expired.stream_cursor);
+    assert_ne!(first.snapshot_id, expired.snapshot_id);
+    assert!((30001..=300000).contains(&expired.refresh_after_ms.unwrap()));
+    let observation = expired
+        .nodes
+        .iter()
+        .find(|n| n.actor.actor_id == soon.id)
+        .unwrap()
+        .local_task
+        .as_ref()
+        .unwrap();
+    assert_eq!(observation.state, State::StopUnconfirmed);
+    assert_eq!(observation.reason, Some(Reason::LeaseExpiredWithoutStop));
+    assert_eq!(observation.observed_at, Some(short.lease_expires_at));
+    assert_eq!(observation.lease_expires_at, Some(short.lease_expires_at));
+    let repeated = f
+        .snapshot_v2(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(expired.snapshot_id, repeated.snapshot_id);
+    assert_eq!(expired.stream_cursor, repeated.stream_cursor);
+    assert_eq!(expired.nodes, repeated.nodes);
+    assert_eq!(
+        v1,
+        f.snapshot(&f.root.id, ActorSnapshotLimits::default())
+            .await
+            .unwrap()
+    );
+    assert_eq!(durable_tree(&f.home), durable);
+}
+
+#[tokio::test]
+async fn snapshot_v2_suppresses_stale_malformed_foreign_and_root_diagnostics() {
+    let f = Fixture::new().await;
+    let mut child = f.child("invalid-diagnostic-child", &f.root).await;
+    let activation = f.activate_local(&child, chrono::Duration::minutes(5)).await;
+    f.local_checkpoint(&mut child, &activation, "stopped").await;
+    let side_path = f.directory(&child.id).join(RUNTIME_SIDECAR_FILE);
+    let original = fs::read(&side_path).await.unwrap();
+    let baseline = f
+        .snapshot(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    for (key, value) in [
+        (
+            "runtime.local_task.run_id",
+            serde_json::json!("PRIVATE-OLD-RUN"),
+        ),
+        (
+            "runtime.local_task.child_birth",
+            serde_json::json!(child.created_at - chrono::Duration::seconds(1)),
+        ),
+        (
+            "runtime.local_task.child_birth",
+            serde_json::json!("not-a-date"),
+        ),
+        (
+            "runtime.local_task.observed_at",
+            serde_json::json!("private-invalid-time"),
+        ),
+        (
+            "runtime.local_task.state",
+            serde_json::json!({"private": "malformed"}),
+        ),
+        ("runtime.local_task.state", serde_json::json!("completed")),
+        (
+            "runtime.local_task.instance",
+            serde_json::json!("private-invalid-uuid"),
+        ),
+        ("runtime.local_task.instance", serde_json::Value::Null),
+        (
+            "runtime.local_task.reason",
+            serde_json::json!("private-error-text"),
+        ),
+        ("external.agent_id", serde_json::json!("remote-agent")),
+        ("external.protocol", serde_json::json!("a2a_jsonrpc")),
+        ("runtime.kind", serde_json::json!("foreign")),
+    ] {
+        fs::write(&side_path, &original).await.unwrap();
+        f.edit(&child.id, RUNTIME_SIDECAR_FILE, |v| {
+            v["metadata"][key] = value
+        })
+        .await;
+        let before = durable_tree(&f.home);
+        let diagnostic = f
+            .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+            .await
+            .unwrap();
+        assert!(diagnostic.nodes[0].local_task.is_none(), "accepted {key}");
+        assert_eq!(diagnostic.refresh_after_ms, None);
+        assert_eq!(
+            baseline,
+            f.snapshot(&child.id, ActorSnapshotLimits::default())
+                .await
+                .unwrap(),
+            "v1 changed for {key}"
+        );
+        assert_eq!(before, durable_tree(&f.home));
+    }
+    fs::write(&side_path, &original).await.unwrap();
+    let row_path = f.directory(&child.id).join("actor-authority.json");
+    let row = fs::read(&row_path).await.unwrap();
+    for placement in [
+        serde_json::json!("remote"),
+        serde_json::json!("docker"),
+        serde_json::json!("ssh"),
+    ] {
+        f.edit(&child.id, "actor-authority.json", |v| {
+            v["activation"]["placement_ref"] =
+                serde_json::json!({"class": placement, "lease_id": "PRIVATE-REMOTE-LEASE", "slot_epoch": 1})
+        })
+        .await;
+        assert!(f
+            .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+            .await
+            .unwrap()
+            .nodes[0]
+            .local_task
+            .is_none());
+    }
+    fs::write(row_path, row).await.unwrap();
+    f.edit(&child.id, "actor-authority.json", |v| {
+        v["actor"]["placement_intent"] = serde_json::Value::Null
+    })
+    .await;
+    assert!(f
+        .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap()
+        .nodes[0]
+        .local_task
+        .is_none());
+    // A Root with otherwise exact local proof still cannot become a Child task.
+    let root_activation = f
+        .activate_local(&f.root, chrono::Duration::minutes(5))
+        .await;
+    f.edit(&f.root.id, RUNTIME_SIDECAR_FILE, |v| {
+        v["metadata"]["runtime.local_task.state"] = "running".into();
+        v["metadata"]["runtime.local_task.run_id"] = root_activation.run_id.clone().into();
+        v["metadata"]["runtime.local_task.child_birth"] = serde_json::json!(f.root.created_at);
+        v["metadata"]["runtime.local_task.observed_at"] = serde_json::json!(Utc::now());
+    })
+    .await;
+    assert!(f
+        .snapshot_v2(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap()
+        .nodes[0]
+        .local_task
+        .is_none());
+}
+
+#[tokio::test]
+async fn snapshot_v2_preserves_read_and_exact_wire_budgets() {
+    let f = Fixture::new().await;
+    let mut child = f.child("bounded-diagnostic-child", &f.root).await;
+    let activation = f.activate_local(&child, chrono::Duration::minutes(5)).await;
+    f.local_checkpoint(&mut child, &activation, "running").await;
+    let snapshot = f
+        .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    let size = serde_json::to_vec(&snapshot).unwrap().len();
+    assert_eq!(
+        f.snapshot_v2(
+            &child.id,
+            ActorSnapshotLimits {
+                response_bytes: size,
+                ..Default::default()
+            }
+        )
+        .await
+        .unwrap()
+        .snapshot_id,
+        snapshot.snapshot_id
+    );
+    assert_eq!(
+        f.snapshot_v2(
+            &child.id,
+            ActorSnapshotLimits {
+                response_bytes: size - 1,
+                ..Default::default()
+            }
+        )
+        .await
+        .unwrap_err(),
+        Error::BudgetExceeded
+    );
+    for limits in [
+        ActorSnapshotLimits {
+            file_reads: 1,
+            ..Default::default()
+        },
+        ActorSnapshotLimits {
+            aggregate_read_bytes: 1,
+            ..Default::default()
+        },
+        ActorSnapshotLimits {
+            file_bytes: 1,
+            ..Default::default()
+        },
+        ActorSnapshotLimits {
+            nodes: 1,
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            f.snapshot_v2(&child.id, limits).await.unwrap_err(),
+            Error::BudgetExceeded
+        );
+    }
+    let runtime = f.directory(&child.id).join(RUNTIME_SIDECAR_FILE);
+    let outside = f.home.join("outside-runtime.json");
+    fs::rename(&runtime, &outside).await.unwrap();
+    symlink(&outside, &runtime).unwrap();
+    assert!(f
+        .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn snapshot_v1_keeps_golden_identity_and_exact_wire_shape() {
+    let f = Fixture::new().await;
+    let snapshot = f
+        .snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.snapshot_id,
+        "as1-e5acd22dec72bfe4fd36dd4481a6637f84c817784f2b4cbca05c9a1227d9d96f"
+    );
+    let wire = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(wire.as_object().unwrap().len(), 6);
+    assert_eq!(wire["nodes"][0].as_object().unwrap().len(), 10);
+    assert!(wire.get("refresh_after_ms").is_none());
+    assert!(wire["nodes"][0].get("local_task").is_none());
+    assert_eq!(snapshot.nodes[0].revision.session_metadata_version, 0);
+}
+
+#[tokio::test]
+async fn snapshot_v2_running_requires_live_owner_and_refresh_is_transport_only() {
+    let f = Fixture::new().await;
+    let mut child = f.child("native-refresh-child", &f.root).await;
+    let activation = f
+        .activate_local(&child, chrono::Duration::seconds(45))
+        .await;
+    f.local_checkpoint(&mut child, &activation, "running").await;
+    let first = f
+        .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert!((30001..=45000).contains(&first.refresh_after_ms.unwrap()));
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let later = f
+        .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert!(later.refresh_after_ms.unwrap() < first.refresh_after_ms.unwrap());
+    assert_eq!(later.snapshot_id, first.snapshot_id);
+    assert_eq!(later.stream_cursor, first.stream_cursor);
+    let row_path = f.directory(&child.id).join("actor-authority.json");
+    let row = fs::read(&row_path).await.unwrap();
+    for (status, logical) in [
+        ("succeeded", "cold"),
+        ("cancelled", "cold"),
+        ("failed", "failed"),
+        ("cancelled", "retired"),
+    ] {
+        fs::write(&row_path, &row).await.unwrap();
+        f.edit(&child.id, "actor-authority.json", |v| {
+            v["activation"]["status"] = status.into();
+            v["actor"]["state"] = logical.into();
+            v["activation"]["finished_at"] = serde_json::json!(Utc::now());
+            v["activation"]["lease_expires_at"] =
+                serde_json::json!(Utc::now() - chrono::Duration::seconds(1));
+        })
+        .await;
+        let snapshot = f
+            .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+            .await
+            .unwrap();
+        assert!(
+            snapshot.nodes[0].local_task.is_none(),
+            "terminal {status}/{logical} cannot appear running or expired-unknown"
+        );
+        assert_eq!(snapshot.refresh_after_ms, None);
+    }
+    fs::write(&row_path, &row).await.unwrap();
+    f.edit(&child.id, "actor-authority.json", |v| {
+        v["activation"]["lease_expires_at"] =
+            serde_json::json!(Utc::now() + chrono::Duration::days(30));
+    })
+    .await;
+    let too_far = f
+        .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(too_far.refresh_after_ms, None);
+    assert_eq!(
+        too_far.nodes[0].local_task.as_ref().unwrap().state,
+        bamboo_domain::PublicLocalTaskState::Running
+    );
+    fs::write(&row_path, &row).await.unwrap();
+    f.local_checkpoint(&mut child, &activation, "stop_unconfirmed")
+        .await;
+    f.edit(&child.id, RUNTIME_SIDECAR_FILE, |v| {
+        v["metadata"]["runtime.local_task.instance"] = uuid::Uuid::new_v4().to_string().into();
+    })
+    .await;
+    assert!(f
+        .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap()
+        .nodes[0]
+        .local_task
+        .is_none());
+}
+
+#[tokio::test]
+async fn snapshot_v2_and_v1_recheck_live_authority_after_slow_physical_read() {
+    async fn crossed_deadline(v2: bool, host_owner: bool) {
+        let f = Fixture::new().await;
+        let mut child = f.child("authority-expiry-child", &f.root).await;
+        let activation = f.activate_local(&child, chrono::Duration::seconds(5)).await;
+        f.local_checkpoint(&mut child, &activation, "running").await;
+        // A Child caller is proven before the Root Main is opened. Pause that
+        // later real read so its otherwise-valid authority expires in flight.
+        let hook = MainReadHook::install(&f.directory(&f.root.id).join("session.json"), true);
+        let _release = ReleaseMain(hook.clone());
+        let principal = if host_owner {
+            ActorSnapshotPrincipal::host_owner()
+        } else {
+            ActorSnapshotPrincipal::live_actor(activation.fence())
+        };
+        let store = f.store.clone();
+        let root_id = f.root.id.clone();
+        let child_id = child.id.clone();
+        let reader = tokio::spawn(async move {
+            if v2 {
+                store
+                    .actor_subtree_snapshot_v2(
+                        principal,
+                        &root_id,
+                        &child_id,
+                        ActorSnapshotLimits::default(),
+                    )
+                    .await
+                    .map(|snapshot| {
+                        snapshot.nodes[0]
+                            .local_task
+                            .as_ref()
+                            .map(|observation| observation.state)
+                    })
+            } else {
+                store
+                    .actor_subtree_snapshot(
+                        principal,
+                        &root_id,
+                        &child_id,
+                        ActorSnapshotLimits::default(),
+                    )
+                    .await
+                    .map(|_| None)
+            }
+        });
+        let opened = hook.clone();
+        tokio::task::spawn_blocking(move || opened.entered())
+            .await
+            .unwrap();
+        assert_snapshot_physical_guards_held(&f.home);
+        let before = durable_tree(&f.home);
+        let wait = (activation.lease_expires_at - Utc::now())
+            .to_std()
+            .unwrap_or_default();
+        tokio::time::sleep(wait + Duration::from_millis(20)).await;
+        hook.release();
+        let result = reader.await.unwrap();
+        if host_owner {
+            // Diagnostic time is captured after the read, so a slow read must
+            // not return a running observation from its obsolete start time.
+            assert_eq!(
+                result.unwrap(),
+                Some(bamboo_domain::PublicLocalTaskState::StopUnconfirmed)
+            );
+        } else {
+            assert_eq!(result.unwrap_err(), Error::UnauthorizedScope);
+        }
+        assert_eq!(before, durable_tree(&f.home));
+    }
+    tokio::join!(
+        crossed_deadline(false, false),
+        crossed_deadline(true, false),
+        crossed_deadline(true, true)
+    );
+}
+
+#[tokio::test]
+async fn snapshot_v2_explicit_unknown_survives_retirement_without_physical_stop_proof() {
+    use bamboo_domain::{ActorActivationStatus, PublicLocalTaskReason, PublicLocalTaskState};
+    let f = Fixture::new().await;
+    let mut child = f.child("retired-unknown-child", &f.root).await;
+    let activation = f.activate_local(&child, chrono::Duration::minutes(5)).await;
+    f.local_checkpoint(&mut child, &activation, "stop_unconfirmed")
+        .await;
+    let before = f
+        .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    // This real control-plane operation cancels/retires authority. It neither
+    // joins a native task nor drains resources, so cannot prove physical stop.
+    let retired = f.store.retire_actor(&child.id, Utc::now()).await.unwrap();
+    assert_eq!(retired.actor.state, ActorLogicalState::Retired);
+    assert_eq!(
+        retired.activation.as_ref().unwrap().status,
+        ActorActivationStatus::Cancelled
+    );
+    let durable = durable_tree(&f.home);
+    let snapshot = f
+        .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    let node = &snapshot.nodes[0];
+    assert_eq!(node.actor.logical_state, Some(ActorLogicalState::Retired));
+    assert_eq!(
+        node.actor.activation.as_ref().unwrap().status,
+        ActorActivationStatus::Cancelled
+    );
+    let observation = node.local_task.as_ref().unwrap();
+    assert_eq!(observation.state, PublicLocalTaskState::StopUnconfirmed);
+    assert_eq!(
+        observation.reason,
+        Some(PublicLocalTaskReason::ExecutionStopUnconfirmed)
+    );
+    assert_eq!(
+        observation.observed_at,
+        before.nodes[0].local_task.as_ref().unwrap().observed_at
+    );
+    assert_eq!(snapshot.refresh_after_ms, None);
+    assert_ne!(snapshot.stream_cursor, before.stream_cursor);
+    assert_eq!(
+        node.actor.revision.session_metadata_version,
+        child.metadata_version
+    );
+    assert_eq!(durable_tree(&f.home), durable);
+}

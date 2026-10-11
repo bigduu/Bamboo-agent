@@ -1936,7 +1936,7 @@ fn spawn_task_evaluation_request(
     // drops the in-flight LLM request future at the first await point (`None`)
     // instead of running the evaluation — and its late `TaskListUpdated` event —
     // to completion (issue #347). `biased` checks cancellation first.
-    let join_handle = tokio::spawn(async move {
+    let join_handle = bamboo_tools::local_task_resources::spawn_cancellable(async move {
         tokio::select! {
             biased;
             _ = cancel_token.cancelled() => None,

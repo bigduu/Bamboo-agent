@@ -33,6 +33,9 @@
 //! Bare [`Storage::save_session`] is reserved for first-write paths (e.g. new
 //! session creation) where there is no prior on-disk copy to merge against.
 
+#[path = "session_merge_child_actor.rs"]
+mod child_actor;
+
 use std::sync::Arc;
 
 use bamboo_domain::session::types::Session;
@@ -86,7 +89,7 @@ const ACTOR_PARENT_QUESTION_HANDOFF_KEY: &str = "runtime.actor_parent_question_h
 /// and a direct-parent answer that may have followed it, own the transcript
 /// and question control plane. Reconcile under the same lock as the final save
 /// so an old runner cannot erase the question or undo a fast answer.
-fn adopt_durable_actor_parent_question_handoff(
+pub(crate) fn adopt_durable_actor_parent_question_handoff(
     session: &mut Session,
     durable: &Session,
 ) -> std::io::Result<()> {
@@ -556,6 +559,11 @@ fn unconditional_task_patch_would_regress(
 pub struct LockedSessionStore {
     storage: Arc<dyn Storage>,
     inherited_child_wait: Option<bamboo_domain::InheritedChildWait>,
+    child_actor_writer: Option<(
+        bamboo_domain::ChildActorRuntimeWrite,
+        Arc<dyn bamboo_domain::ActorDirectoryPort>,
+        bamboo_domain::RootActorRuntimePublisher,
+    )>,
     root_actor_writer: Option<(
         bamboo_domain::RootActorRuntimeWrite,
         bamboo_domain::RootActorRuntimePublisher,
@@ -613,6 +621,7 @@ impl LockedSessionStore {
             storage,
             inherited_child_wait: None,
             root_actor_writer: None,
+            child_actor_writer: None,
             locks: Arc::new(DashMap::new()),
             task_pair_transaction_lock: Arc::new(Mutex::new(())),
         }
@@ -635,6 +644,7 @@ impl LockedSessionStore {
             storage: self.storage.clone(),
             inherited_child_wait: self.inherited_child_wait.clone(),
             root_actor_writer: Some((owner, publish)),
+            child_actor_writer: None,
             locks: self.locks.clone(),
             task_pair_transaction_lock: self.task_pair_transaction_lock.clone(),
         })
@@ -647,6 +657,7 @@ impl LockedSessionStore {
             storage: self.storage.clone(),
             inherited_child_wait: Some(inherited),
             root_actor_writer: self.root_actor_writer.clone(),
+            child_actor_writer: self.child_actor_writer.clone(),
             locks: self.locks.clone(),
             task_pair_transaction_lock: self.task_pair_transaction_lock.clone(),
         }
@@ -666,6 +677,11 @@ impl LockedSessionStore {
         session: &mut Session,
         runtime_only: bool,
     ) -> std::io::Result<()> {
+        if self.child_actor_writer.is_some() {
+            return self
+                .save_child_snapshot(session, runtime_only, None, None)
+                .await;
+        }
         if let Some(inherited) = self.inherited_for_session(session) {
             self.storage
                 .save_runtime_with_inherited_child_wait(
@@ -766,7 +782,10 @@ impl LockedSessionStore {
             if let Some(provenance) = self.inherited_for_session(session) {
                 provenance.validate_session(session)?;
             }
-            let result = if inherited.is_none() && self.inherited_for_session(session).is_some() {
+            let result = if self.child_actor_writer.is_some() {
+                self.save_child_snapshot(session, false, input.cloned(), inherited)
+                    .await
+            } else if inherited.is_none() && self.inherited_for_session(session).is_some() {
                 self.storage
                     .save_runtime_with_inherited_child_wait(
                         session,
@@ -2145,6 +2164,16 @@ impl LockedSessionStore {
 /// not define a separate adapter layer for the same behavior.
 #[async_trait::async_trait]
 impl RuntimeSessionPersistence for LockedSessionStore {
+    async fn admit_root_inbox(
+        &self,
+        session: &mut Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        active_run_id: Option<&str>,
+    ) -> std::io::Result<Option<bamboo_domain::RootInboxAdmission>> {
+        self.admit_owned_child_inbox(session, inbox, active_run_id)
+            .await
+    }
+
     fn inherited_child_wait(&self) -> Option<bamboo_domain::InheritedChildWait> {
         self.inherited_child_wait.clone()
     }
@@ -2201,7 +2230,7 @@ impl RuntimeSessionPersistence for LockedSessionStore {
         &self,
         session_id: &str,
     ) -> std::io::Result<Option<Session>> {
-        self.storage.load_runtime_control_plane(session_id).await
+        self.load_child_runtime_control_plane(session_id).await
     }
 
     async fn update_task_list_control_plane(
@@ -2295,7 +2324,11 @@ impl RuntimeSessionPersistence for LockedSessionStore {
     }
 
     async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
-        self.storage.load_session(session_id).await
+        self.validate_child_runtime_read(session_id).await?;
+        let session = self.storage.load_session(session_id).await?;
+        self.validate_child_runtime_readback(session_id, session.as_ref())
+            .await?;
+        Ok(session)
     }
 
     async fn clear_legacy_pending_messages(

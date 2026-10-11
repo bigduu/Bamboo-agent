@@ -183,6 +183,7 @@ ticket-runtime-fixtures = ["bamboo-tickets/test-utils"]
 test-utils = ["bamboo-config/test-utils"]
 
 [dev-dependencies]
+bamboo-server-tools = { path = "../bamboo-server-tools", features = ["test-utils"] }
 wiremock = "0.6"
 tokio-test = "0.4"
 mockall = "0.15"

@@ -224,6 +224,26 @@ impl ChildSessionAdapter {
                 ChildSessionError::Execution("Workflow child stop readback unavailable".into())
             })?
             .ok_or_else(|| ChildSessionError::NotFound(id.into()))?;
+        // A local task can leave a truthful error while its physical stop is
+        // still unknown. Registry terminality or an expired lease alone must
+        // never authorize stop-then-deliver steering or Workflow replacement.
+        let local_state = child.metadata.get("runtime.local_task.state");
+        let actor =
+            bamboo_domain::ActorDirectoryPort::inspect_actor(self.session_store.as_ref(), id).await;
+        if local_state.is_some_and(|state| state != "stopped")
+            || actor
+                .as_ref()
+                .ok()
+                .and_then(|entry| entry.activation.as_ref())
+                .is_some_and(|activation| {
+                    activation.lease_owner.starts_with("host-task-") && activation.status.is_live()
+                })
+            || (local_state.is_some() && actor.is_err())
+        {
+            return Err(ChildSessionError::Execution(
+                "local Child physical stop is unconfirmed; replacement is blocked".into(),
+            ));
+        }
         if child
             .metadata
             .get(bamboo_subagent::proto::WORKFLOW_USAGE_REQUESTED_KEY)

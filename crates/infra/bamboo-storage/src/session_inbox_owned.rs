@@ -467,6 +467,13 @@ impl FileSessionInbox {
                 .await
                 .map_err(|error| SessionInboxError::Storage(error.to_string()));
         }
+        if let Some(owner) = &self.child_owner {
+            return self
+                .sessions
+                .child_owned_inbox_filesystem(self, target, owner)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()));
+        }
         let lifecycle = self.lock_lifecycle().await?;
         self.filesystem_with_authority(target, InboxAuthority::Lifecycle { _guard: lifecycle })
             .await
@@ -918,13 +925,22 @@ impl FileSessionInbox {
         run: Option<&str>,
         request: &SessionInboxLeaseRequest,
     ) -> Result<Vec<SessionInboxOwnedClaim>, SessionInboxError> {
+        if self
+            .child_owner
+            .as_ref()
+            .is_some_and(|owner| run != Some(owner.fence.run_id.as_str()))
+        {
+            return Err(invalid(
+                "Child Inbox run differs from its execution capability",
+            ));
+        }
         let expires_at = request.expires_at()?;
         #[cfg(test)]
         let _scope_drop = ScopeDrop(self.owned_scope_drop.clone());
         let (dir, filesystem) = self.owned_filesystem(target).await?;
         let filesystem = self.root_lease_filesystem(filesystem, expires_at)?;
         let actual_request;
-        let request = if self.root_owner.is_some() {
+        let request = if self.root_owner.is_some() || self.child_owner.is_some() {
             let now = Utc::now();
             actual_request = SessionInboxLeaseRequest {
                 consumer: request.consumer.clone(),
@@ -981,6 +997,10 @@ impl FileSessionInbox {
                 let terminal_filesystem = if let Some(owner) = &self.root_owner {
                     let proof = self.sessions.root_inbox_terminal_check(owner, &envelope);
                     filesystem.clone().with_check(proof)
+                } else if let Some(owner) = &self.child_owner {
+                    filesystem
+                        .clone()
+                        .with_check(self.sessions.child_inbox_terminal_check(owner, &envelope))
                 } else {
                     filesystem.clone()
                 };
@@ -1245,12 +1265,12 @@ impl FileSessionInbox {
         let _scope_drop = ScopeDrop(self.owned_scope_drop.clone());
         let (dir, filesystem) = self.owned_filesystem(target).await?;
         let filesystem = self.root_lease_filesystem(filesystem, expires_at)?;
-        let filesystem = if self.root_owner.is_some() {
+        let filesystem = if self.root_owner.is_some() || self.child_owner.is_some() {
             self.exact_claim_filesystem(filesystem, &dir, target, claim, false)
         } else {
             filesystem
         };
-        let now = if self.root_owner.is_some() {
+        let now = if self.root_owner.is_some() || self.child_owner.is_some() {
             Utc::now()
         } else {
             request.now
@@ -1322,6 +1342,11 @@ impl FileSessionInbox {
                 self.sessions
                     .root_inbox_terminal_check(owner, &claim.claim.envelope),
             )
+        } else if let Some(owner) = &self.child_owner {
+            filesystem.with_check(
+                self.sessions
+                    .child_inbox_terminal_check(owner, &claim.claim.envelope),
+            )
         } else {
             filesystem
         };
@@ -1337,12 +1362,12 @@ impl FileSessionInbox {
         now: DateTime<Utc>,
         filesystem: OwnedFilesystem,
     ) -> Result<(), SessionInboxError> {
-        let filesystem = if self.root_owner.is_some() {
+        let filesystem = if self.root_owner.is_some() || self.child_owner.is_some() {
             self.exact_claim_filesystem(filesystem, dir, target, claim, true)
         } else {
             filesystem
         };
-        let now = if self.root_owner.is_some() {
+        let now = if self.root_owner.is_some() || self.child_owner.is_some() {
             Utc::now()
         } else {
             now
@@ -1372,6 +1397,8 @@ impl FileSessionInbox {
     ) -> Result<OwnedFilesystem, SessionInboxError> {
         Ok(if let Some(owner) = &self.root_owner {
             filesystem.with_check(self.sessions.root_inbox_lease_check(owner, deadline))
+        } else if let Some(owner) = &self.child_owner {
+            filesystem.with_check(self.sessions.child_inbox_lease_check(owner, deadline))
         } else {
             filesystem
         })

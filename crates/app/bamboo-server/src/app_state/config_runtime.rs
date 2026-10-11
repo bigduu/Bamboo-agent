@@ -6794,17 +6794,11 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn config_update_preserves_runtime_broker() {
+    async fn config_update_keeps_native_backend_brokerless() {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
-        let expected = state
-            .config
-            .read()
-            .await
-            .subagents()
-            .broker
-            .clone()
-            .expect("AppState embeds a runtime broker");
+        assert!(state.embedded_broker.is_none());
+        assert!(state.config.read().await.subagents().broker.is_none());
 
         let updated = state
             .update_config(
@@ -6817,11 +6811,29 @@ for line in sys.stdin:
             .await
             .unwrap();
 
-        assert_eq!(updated.subagents().broker.as_ref(), Some(&expected));
-        assert_eq!(
-            state.config.read().await.subagents().broker.as_ref(),
-            Some(&expected)
-        );
+        assert!(updated.subagents().broker.is_none());
+        assert!(state.config.read().await.subagents().broker.is_none());
+        assert!(state.embedded_broker.is_none());
+        state.shutdown().await;
+    }
+
+    #[test]
+    fn preserve_runtime_broker_keeps_legacy_injected_broker() {
+        let broker = bamboo_config::BrokerClientConfig {
+            endpoint: "ws://127.0.0.1:41001".to_string(),
+            token: "legacy-fixture".to_string(),
+            token_encrypted: None,
+            credential_ref: None,
+            configured: false,
+        };
+        let mut previous = Config::default();
+        previous.subagents_mut().broker = Some(broker.clone());
+        let mut incoming = Config::default();
+        assert!(incoming.subagents().broker.is_none());
+
+        preserve_runtime_broker(&mut incoming, &previous);
+
+        assert_eq!(incoming.subagents().broker.as_ref(), Some(&broker));
     }
 
     #[test]
