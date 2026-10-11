@@ -535,6 +535,7 @@ impl AppState {
             workspace_resolver.clone(),
             tool_event_publisher.clone(),
             memory_store.clone(),
+            session_messenger.clone(),
         );
 
         // The workflow engine executes against the base tool surface. The
