@@ -234,6 +234,19 @@ impl HostNativeToolCeiling {
             self.base.owns_exact_tool(name)
         })
     }
+
+    fn resolve_disabled(&self, reference: &str) -> Vec<String> {
+        let Some(name) = self.resolve(reference) else {
+            return Vec::new();
+        };
+        let mut names = vec![name.clone()];
+        if name == "Bash" {
+            names.extend(["exec_command".into(), "write_stdin".into()]);
+        } else if let Some(replacement) = bamboo_domain::legacy_shell_replacement(&name) {
+            names.push(replacement.into());
+        }
+        names
+    }
 }
 
 #[async_trait::async_trait]
@@ -270,7 +283,7 @@ impl bamboo_engine::external_agents::runtime::NativeToolCeilingSource for HostNa
         let disabled = self.config.read().await.disabled_tool_references();
         let disabled: std::collections::BTreeSet<_> = disabled
             .iter()
-            .filter_map(|reference| self.resolve(reference))
+            .flat_map(|reference| self.resolve_disabled(reference))
             .collect();
         for name in bamboo_subagent::proto::NativeToolCeiling::NAMES {
             if self.base.owns_exact_tool(name) && self.base.exact_tool_owner(name).is_none() {
@@ -292,7 +305,7 @@ impl bamboo_engine::external_agents::runtime::NativeToolCeilingSource for HostNa
             .transpose()?
             .unwrap_or_default()
             .iter()
-            .filter_map(|name| self.resolve(name))
+            .flat_map(|name| self.resolve_disabled(name))
             .collect();
         let ticket_child = session
             .metadata
@@ -526,11 +539,22 @@ mod native_ceiling_tests {
     }
 
     #[tokio::test]
-    async fn ticket_ceiling_selects_only_host_builtin_task_and_legacy_keeps_five_tools() {
+    async fn ticket_ceiling_selects_only_host_builtin_task_and_shells_stay_outside_ticket_scope() {
         let home = tempfile::tempdir().unwrap();
         let mut source = source(home.path());
         let mut child = bamboo_domain::Session::new_child("ticket-child", "root", "", "");
-        assert_eq!(source.observe(&child).await.unwrap().len(), 5);
+        assert_eq!(
+            source.observe(&child).await.unwrap(),
+            [
+                "Bash",
+                "Edit",
+                "Glob",
+                "Read",
+                "Write",
+                "exec_command",
+                "write_stdin"
+            ]
+        );
         child.metadata.insert(
             bamboo_engine::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
             "assignment".into(),
@@ -544,6 +568,78 @@ mod native_ceiling_tests {
         source.base = source.builtin.clone();
         source.config.write().await.tools.disabled = vec!["Task".into()];
         assert!(source.observe(&child).await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn native_ceiling_preserves_exact_frozen_profile_grants() {
+        use sha2::{Digest, Sha256};
+        let home = tempfile::tempdir().unwrap();
+        let source = source(home.path());
+        let parent = bamboo_domain::Session::new("profile-parent", "model");
+        for (tools, read_only) in [
+            (vec!["Bash"], false),
+            (vec!["exec_command", "write_stdin"], false),
+            (vec!["Glob", "Read"], true),
+        ] {
+            let mut child =
+                bamboo_domain::Session::new_child_of("profile-child", &parent, "model", "role");
+            child
+                .agent_runtime_state
+                .get_or_insert_with(Default::default)
+                .read_only = read_only;
+            let prompt = "frozen selected role";
+            child
+                .metadata
+                .insert("base_system_prompt".into(), prompt.into());
+            child.add_message(bamboo_domain::Message::system(prompt));
+            child.metadata.insert(
+                bamboo_engine::session_app::child_session::named_profile::NAMED_PROFILE_BINDING_KEY
+                    .into(),
+                json!({
+                    "version": 1, "name": "role", "source": "global", "project_id": null,
+                    "scope_project_id": null, "revision": "0".repeat(64),
+                    "child_id": child.id, "child_created_at": child.created_at,
+                    "parent_id": parent.id, "root_id": child.root_session_id,
+                    "model": child.model, "model_ref": child.model_ref, "read_only": read_only,
+                    "prompt_sha256": hex::encode(Sha256::digest(prompt.as_bytes())), "tools": tools,
+                })
+                .to_string(),
+            );
+            assert_eq!(source.observe(&child).await.unwrap(), tools);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_shell_denials_cover_polled_native_sessions_without_suffix_matching() {
+        let home = tempfile::tempdir().unwrap();
+        let mut source = source(home.path());
+        let mut child = bamboo_domain::Session::new_child("denied-child", "root", "", "");
+        for reference in ["Bash", "default::execute_command"] {
+            child.metadata.insert(
+                "disabled_tools".into(),
+                serde_json::to_string(&[reference]).unwrap(),
+            );
+            assert_eq!(
+                source.observe(&child).await.unwrap(),
+                ["Edit", "Glob", "Read", "Write"]
+            );
+        }
+        child
+            .metadata
+            .insert("disabled_tools".into(), "[\"BashOutput\"]".into());
+        let tools = source.observe(&child).await.unwrap();
+        assert!(tools.contains(&"exec_command".into()));
+        assert!(!tools.contains(&"write_stdin".into()));
+
+        source.base = Arc::new(crate::tools::OverlayToolExecutor::new(
+            source.base.clone(),
+            Arc::new(Foreign("vendor::Bash")),
+        ));
+        child
+            .metadata
+            .insert("disabled_tools".into(), "[\"vendor::Bash\"]".into());
+        let tools = source.observe(&child).await.unwrap();
+        assert!(tools.contains(&"exec_command".into()));
+        assert!(tools.contains(&"write_stdin".into()));
     }
     #[tokio::test]
     async fn native_owner_uses_complete_composite_overlay_exact_before_alias_and_config() {
@@ -600,7 +696,7 @@ mod native_ceiling_tests {
             .unwrap();
         let mut foreign = source.projects.create("foreign fixture", None).unwrap();
         session.set_project_id_meta(project.id.as_str());
-        assert_eq!(source.observe(&session).await.unwrap().len(), 5);
+        assert_eq!(source.observe(&session).await.unwrap().len(), 7);
         session
             .metadata
             .insert("project_id".into(), "another-project".into());
