@@ -840,6 +840,159 @@ fn current_platform_key() -> &'static str {
     }
 }
 
+async fn assert_url_manifest_rejected_before_artifact_fetch(
+    absolute_id: bool,
+    archive_bundle: bool,
+) {
+    let server = wiremock::MockServer::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let existing_dir = plugins_root.join("hello-plugin");
+    write_hello_plugin_dir(&existing_dir, "hello-plugin").await;
+    let registry_path = plugins_root.join("installed.json");
+    InstalledPlugins {
+        plugins: vec![InstalledPlugin {
+            id: "hello-plugin".to_string(),
+            version: "0.1.0".to_string(),
+            source: PluginSource::LocalDir {
+                path: existing_dir.clone(),
+            },
+            plugin_dir: existing_dir.clone(),
+            installed_at: Utc::now(),
+            status: PluginInstallStatus::Installed,
+            registered: Default::default(),
+        }],
+    }
+    .save(&registry_path)
+    .await
+    .unwrap();
+    let protected_paths = [
+        registry_path,
+        existing_dir.join("plugin.json"),
+        existing_dir.join("skills/hello-world/SKILL.md"),
+    ];
+    let mut protected_bytes = Vec::new();
+    for path in &protected_paths {
+        protected_bytes.push(tokio::fs::read(path).await.unwrap());
+    }
+
+    // Only this fixture-owned file is outside plugins_root. With an absolute
+    // id, the old artifact path joins select this same file as source and
+    // destination, then chmod it before the late manifest validation fails.
+    let sentinel_id = root.path().join("outside-victim");
+    let sentinel = if cfg!(target_os = "windows") {
+        PathBuf::from(format!("{}.exe", sentinel_id.display()))
+    } else {
+        sentinel_id.clone()
+    };
+    let sentinel_bytes = b"existing file outside the plugin installation";
+    tokio::fs::write(&sentinel, sentinel_bytes).await.unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+    }
+    let invalid_id = if absolute_id {
+        sentinel_id.to_str().unwrap().to_string()
+    } else {
+        "../outside-victim".to_string()
+    };
+    let artifact_bytes = build_targz(&[]);
+    let manifest_body = manifest_with_artifact(
+        &invalid_id,
+        current_platform_key(),
+        &sha256_hex_of(&artifact_bytes),
+        &format!("{}/artifact.tar.gz", server.uri()),
+    );
+    let (bundle_path, bundle_bytes) = if archive_bundle {
+        (
+            "/bundle.tar.gz",
+            build_targz(&[("plugin.json", manifest_body.as_bytes())]),
+        )
+    } else {
+        ("/plugin.json", manifest_body.into_bytes())
+    };
+    let bundle_sha256 = sha256_hex_of(&bundle_bytes);
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(bundle_path))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(bundle_bytes))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/artifact.tar.gz"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(artifact_bytes))
+        .mount(&server)
+        .await;
+
+    let error = stage_plugin_source(
+        url_input(
+            &format!("{}{bundle_path}", server.uri()),
+            Some(&bundle_sha256),
+            false,
+        ),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+    )
+    .await
+    .expect_err("an invalid plugin id must be refused");
+    assert!(
+        matches!(error, PluginError::InvalidManifest(_)),
+        "{error:?}"
+    );
+    let received = server.received_requests().await.unwrap();
+    let artifact_requests = received
+        .iter()
+        .filter(|request| request.url.path() == "/artifact.tar.gz")
+        .count();
+    assert_eq!(tokio::fs::read(&sentinel).await.unwrap(), sentinel_bytes);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            tokio::fs::metadata(&sentinel)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "invalid id changed an external file's mode; artifact requests: {artifact_requests}, error: {error}"
+        );
+    }
+    assert_eq!(
+        artifact_requests, 0,
+        "invalid manifest downloaded an artifact"
+    );
+    assert!(
+        matches!(&error, PluginError::InvalidManifest(message) if message.contains("invalid plugin id")),
+        "expected plugin ID validation, got: {error}"
+    );
+    for (path, expected) in protected_paths.iter().zip(protected_bytes) {
+        assert_eq!(tokio::fs::read(path).await.unwrap(), expected);
+    }
+    let names = plugin_root_entry_names(&plugins_root).await;
+    assert_eq!(names.len(), 3, "only inert staging may be added: {names:?}");
+    assert!(names
+        .iter()
+        .any(|name| name.starts_with(".rejected-staging-")));
+}
+
+#[tokio::test]
+async fn url_manifest_with_absolute_id_is_rejected_before_artifact_fetch() {
+    for archive_bundle in [false, true] {
+        assert_url_manifest_rejected_before_artifact_fetch(true, archive_bundle).await;
+    }
+}
+
+#[tokio::test]
+async fn url_manifest_with_traversal_id_is_rejected_before_artifact_fetch() {
+    for archive_bundle in [false, true] {
+        assert_url_manifest_rejected_before_artifact_fetch(false, archive_bundle).await;
+    }
+}
+
 #[tokio::test]
 async fn fetches_verifies_and_places_platform_artifact_binary() {
     let server = wiremock::MockServer::start().await;
@@ -895,6 +1048,10 @@ async fn fetches_verifies_and_places_platform_artifact_binary() {
         "binary should be placed at {:?}",
         expected_bin
     );
+    assert_eq!(
+        tokio::fs::read(&expected_bin).await.unwrap(),
+        b"#!/bin/sh\necho hi\n"
+    );
 
     #[cfg(unix)]
     {
@@ -903,7 +1060,11 @@ async fn fetches_verifies_and_places_platform_artifact_binary() {
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(mode & 0o111, 0o111, "binary should be executable");
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "binary should have executable permissions"
+        );
     }
 
     // Provenance records the verified BUNDLE sha256, not the binary
