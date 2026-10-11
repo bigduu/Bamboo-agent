@@ -5247,9 +5247,12 @@ mod tests {
             );
             assert_eq!(backlog.pending, usize::from(!acked), "{arm}, acked={acked}");
             assert_eq!(backlog.interrupt_pending(), !acked, "{arm}, acked={acked}");
+            // Clearing a fresh terminal arm still requests activation. This
+            // counting adapter reserves unconditionally; the production adapter
+            // rechecks the Inbox and returns NoWork for an ACK-only receipt.
             assert_eq!(
                 launches.load(Ordering::SeqCst),
-                usize::from(!acked),
+                usize::from(!acked || arm == "terminal"),
                 "{arm}, acked={acked}"
             );
             let wait = read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
