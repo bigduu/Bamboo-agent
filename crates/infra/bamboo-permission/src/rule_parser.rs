@@ -205,12 +205,35 @@ impl ParsedRule {
     /// assert!(!rule.matches_tool_call("Bash", &json!({"command": "cargo build"})));
     /// ```
     pub fn matches_tool_call(&self, tool_name: &str, args: &Value) -> bool {
+        self.matches_tool_call_with_restrictions(tool_name, args, true)
+    }
+
+    /// Legacy shell grants can authorize the narrower replacement API, but
+    /// replacement grants must not authorize legacy Bash's wider workdir scope.
+    pub(crate) fn matches_tool_call_for_allow(&self, tool_name: &str, args: &Value) -> bool {
+        if self.tool_name.eq_ignore_ascii_case("exec_command")
+            && tool_name.eq_ignore_ascii_case("Bash")
+        {
+            return false;
+        }
+        self.matches_tool_call_with_restrictions(tool_name, args, false)
+    }
+
+    fn matches_tool_call_with_restrictions(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        restrictive: bool,
+    ) -> bool {
         // Preserve old operation-specific always-ask rules when the model uses
         // the combined continuation API. Do not let an input rule match a poll
-        // or a kill rule match ordinary stdin bytes.
+        // or a kill rule match ordinary stdin bytes. Every continuation also
+        // reads output, so output restrictions apply to input and kill calls.
         if tool_name.eq_ignore_ascii_case("write_stdin") {
             let chars = args.get("chars").and_then(Value::as_str).unwrap_or("");
-            let legacy_name = if chars == "\u{3}" {
+            let legacy_name = if restrictive && self.tool_name.eq_ignore_ascii_case("BashOutput") {
+                "BashOutput"
+            } else if chars == "\u{3}" {
                 "KillShell"
             } else if !chars.is_empty() || args.get("eof").and_then(Value::as_bool) == Some(true) {
                 "BashInput"
@@ -227,9 +250,16 @@ impl ParsedRule {
                 projected.remove("chars");
                 projected.remove("yield_time_ms");
                 projected.remove("max_output_tokens");
+                if projected.get("eof") == Some(&Value::Bool(false)) {
+                    projected.remove("eof");
+                }
                 projected.insert("input".into(), Value::String(chars.to_owned()));
                 projected.insert("append_newline".into(), Value::Bool(false));
-                return self.matches_tool_call(legacy_name, &Value::Object(projected));
+                return self.matches_tool_call_with_restrictions(
+                    legacy_name,
+                    &Value::Object(projected),
+                    restrictive,
+                );
             }
         }
         // Case-insensitive tool name match
@@ -474,6 +504,11 @@ mod tests {
                 json!({"bash_id":"exec-owned", "input":"yes\n", "append_newline":false}),
             ),
             (
+                json!({"session_id":"exec-owned", "chars":"yes\n", "eof":false}),
+                "BashInput",
+                json!({"bash_id":"exec-owned", "input":"yes\n", "append_newline":false}),
+            ),
+            (
                 json!({"session_id":"exec-owned", "eof":true}),
                 "BashInput",
                 json!({"bash_id":"exec-owned", "input":"", "append_newline":false, "eof":true}),
@@ -498,6 +533,10 @@ mod tests {
             for other in ["BashInput", "BashOutput", "KillShell"] {
                 assert_eq!(
                     ParsedRule::parse(other).matches_tool_call("write_stdin", &args),
+                    other == legacy_name || other == "BashOutput"
+                );
+                assert_eq!(
+                    ParsedRule::parse(other).matches_tool_call_for_allow("write_stdin", &args),
                     other == legacy_name
                 );
             }

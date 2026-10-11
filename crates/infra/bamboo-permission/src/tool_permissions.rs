@@ -3040,6 +3040,102 @@ mod tests {
     }
 
     #[test]
+    fn exec_command_allow_rules_do_not_grant_legacy_bash_authority() {
+        let legacy_args = json!({"command":"rm -rf .", "workdir":"/"});
+        let exec_args = json!({"cmd":"rm -rf .", "workdir":"/"});
+        for rule in ["exec_command", "exec_command(rm -rf .)"] {
+            let allowed = [rule.to_owned()];
+            assert_eq!(
+                check_tool_rules("exec_command", &exec_args, &allowed, &[]),
+                Some(true)
+            );
+            assert_eq!(
+                check_tool_rules("Bash", &legacy_args, &allowed, &[]),
+                None,
+                "{rule} must not grant legacy Bash's wider workdir scope"
+            );
+        }
+        for rule in ["Bash", "Bash(rm -rf .)"] {
+            let allowed = [rule.to_owned()];
+            assert_eq!(
+                check_tool_rules("exec_command", &exec_args, &allowed, &[]),
+                Some(true)
+            );
+            assert_eq!(
+                check_tool_rules("Bash", &legacy_args, &allowed, &[]),
+                Some(true)
+            );
+        }
+        for denied in ["Bash(rm -rf .)", "exec_command(rm -rf .)"] {
+            let denied = [denied.to_owned()];
+            let allowed = ["Bash".to_owned(), "exec_command".to_owned()];
+            assert_eq!(
+                check_tool_rules("Bash", &legacy_args, &allowed, &denied),
+                Some(false)
+            );
+            assert_eq!(
+                check_tool_rules("exec_command", &exec_args, &allowed, &denied),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn write_stdin_default_eof_cannot_bypass_exact_legacy_input_deny() {
+        let input = json!({"bash_id":"exec-owned", "input":"yes\n", "append_newline":false});
+        let denied = [format!("BashInput({input})")];
+        for args in [
+            json!({"session_id":"exec-owned", "chars":"yes\n"}),
+            json!({"session_id":"exec-owned", "chars":"yes\n", "eof":false}),
+            json!({"session_id":"exec-owned", "chars":"yes\n", "eof":false, "yield_time_ms":1000, "max_output_tokens":100}),
+        ] {
+            assert_eq!(
+                check_tool_rules("write_stdin", &args, &["BashInput".into()], &denied),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn write_stdin_output_restrictions_apply_to_combined_input_and_kill() {
+        let denied = ["BashOutput(exec-owned)".into()];
+        let allowed = ["write_stdin".into()];
+        for args in [
+            json!({"session_id":"exec-owned", "chars":"yes\n"}),
+            json!({"session_id":"exec-owned", "eof":true}),
+            json!({"session_id":"exec-owned", "chars":"\u{3}"}),
+        ] {
+            assert_eq!(
+                check_tool_rules("write_stdin", &args, &allowed, &denied),
+                Some(false)
+            );
+            assert_eq!(
+                check_tool_rules("write_stdin", &args, &denied, &[]),
+                None,
+                "an output grant must not grant input or termination"
+            );
+        }
+        assert_eq!(
+            check_tool_rules(
+                "write_stdin",
+                &json!({"session_id":"exec-owned", "chars":""}),
+                &denied,
+                &[]
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            check_tool_rules(
+                "write_stdin",
+                &json!({"session_id":"other-session", "chars":"yes\n"}),
+                &allowed,
+                &denied
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn exec_command_preserves_bash_permission_contexts() {
         for command in [
             "cargo test",

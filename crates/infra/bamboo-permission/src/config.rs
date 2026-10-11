@@ -3227,11 +3227,27 @@ mod integration_tests {
                 serde_json::json!({"session_id":"exec-owned", "chars":"yes\n"}),
             ),
             (
+                vec![format!("BashInput({input})")],
+                serde_json::json!({"session_id":"exec-owned", "chars":"yes\n", "eof":false}),
+            ),
+            (
                 vec!["BashInput".into()],
                 serde_json::json!({"session_id":"exec-owned", "eof":true}),
             ),
             (
                 vec!["KillShell".into(), "KillShell(exec-*)".into()],
+                serde_json::json!({"session_id":"exec-owned", "chars":"\u{3}"}),
+            ),
+            (
+                vec!["BashOutput(exec-owned)".into()],
+                serde_json::json!({"session_id":"exec-owned", "chars":"yes\n"}),
+            ),
+            (
+                vec!["BashOutput(exec-owned)".into()],
+                serde_json::json!({"session_id":"exec-owned", "eof":true}),
+            ),
+            (
+                vec!["BashOutput(exec-owned)".into()],
                 serde_json::json!({"session_id":"exec-owned", "chars":"\u{3}"}),
             ),
         ] {
