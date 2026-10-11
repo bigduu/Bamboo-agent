@@ -315,6 +315,11 @@ impl AppState {
             )
             .await,
         );
+        // Native completion can outlive a Host exit at Ticket HEAD publication.
+        // Recover its durable result before any startup path can admit work.
+        if let Err(error) = tickets.reconcile_completed_native_results().await {
+            tracing::warn!(%error, "failed to reconcile completed native Ticket results on startup");
+        }
 
         // Build one coherent configured-default/root provider pair. The process
         // globals below intentionally remain first-registration-wins, while
