@@ -3,7 +3,7 @@
 //! The only simulated component is a loopback HTTP model provider. This proves
 //! a Host SessionMessenger idle-Child reservation; it does not claim coverage
 //! of the nested Worker's private SessionMessenger assembly. Linux /proc gives
-//! independent PID/PPID evidence that both requests use the real worker binary,
+//! independent PID/PPID evidence that both Child requests use the real worker binary,
 //! rather than the default native Tokio backend or a mocked ExternalChildRunner.
 #![cfg(target_os = "linux")]
 
@@ -31,29 +31,133 @@ use tokio::sync::Notify;
 
 const WAIT: Duration = Duration::from_secs(45);
 const MODEL: &str = "legacy-local-test";
+const PARENT_MODEL: &str = "legacy-local-parent-test";
 const PARENT: &str = "legacy-idle-parent";
 const INITIAL: &str = "LEGACY_INITIAL: return one plain answer without tools";
 const FOLLOWUP: &str = "LEGACY_FOLLOWUP: continue this same Child without tools";
 const REPLIES: [&str; 2] = ["LEGACY_FIRST_COMPLETED", "LEGACY_RESUME_COMPLETED"];
+const PARENT_ACK: &str = "LEGACY_PARENT_ACK: received the Child result";
 
 #[derive(Default)]
 struct ProviderProbe {
     requests: Mutex<Vec<Value>>,
+    child_requests: Mutex<Vec<Value>>,
+    parent_requests: Mutex<Vec<Value>>,
+    parent_consumed: Mutex<[bool; 2]>,
+    parent_notifications: Mutex<Vec<(usize, String)>>,
+    unexpected_requests: Mutex<Vec<Value>>,
+    child_id: Mutex<Option<String>>,
     entered: Notify,
     released: AtomicUsize,
     release: Notify,
 }
 
+fn plain_response(id: &str, reply: &str) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("text/event-stream")
+        .body(format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"id":id,"object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{"content":reply},"finish_reason":"stop"}]})
+        ))
+}
+
+fn unexpected_request(probe: &ProviderProbe, body: &Value, reason: &str) -> HttpResponse {
+    // Only synthetic fixture data is logged. Keep unexpected callers visible
+    // rather than silently filtering them out of the exact Child-call proof.
+    eprintln!("unexpected legacy fixture provider request ({reason}): {body}");
+    probe.unexpected_requests.lock().unwrap().push(body.clone());
+    HttpResponse::BadRequest().body("unexpected legacy fixture provider request")
+}
+
 async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>) -> HttpResponse {
+    let body = body.into_inner();
+    probe.requests.lock().unwrap().push(body.clone());
+    let messages = body["messages"].as_array();
+    if messages.is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["role"] == "system"
+                && message["content"].as_str().is_some_and(|content| {
+                    content.contains("Bamboo's background Dream consolidator")
+                })
+        })
+    }) {
+        return unexpected_request(&probe, &body, "background Dream call");
+    }
+    if body["model"] == PARENT_MODEL {
+        // Incremental Child outcomes can legitimately wake an idle parent even
+        // when create used wait=false. Historical notifications alone must not
+        // authorize another request: inspect only inputs after the last ACK.
+        let child_id = probe.child_id.lock().unwrap().clone();
+        let (Some(child_id), Some(messages)) = (child_id, messages) else {
+            return unexpected_request(&probe, &body, "unrecognized parent call");
+        };
+        let prefix = format!(
+            "Runtime notification: child session `{child_id}` finished with status `completed`."
+        );
+        let last_ack = messages.iter().rposition(|message| {
+            message["role"] == "assistant" && message["content"] == PARENT_ACK
+        });
+        let mut fresh = Vec::new();
+        let mut initial_seen = false;
+        for message in &messages[last_ack.map_or(0, |index| index + 1)..] {
+            if message["role"] == "system" {
+                continue;
+            }
+            if last_ack.is_none()
+                && !initial_seen
+                && fresh.is_empty()
+                && message["role"] == "user"
+                && message["content"] == INITIAL
+            {
+                initial_seen = true;
+                continue;
+            }
+            let content = message["content"].as_str().unwrap_or_default();
+            let outcome = REPLIES
+                .iter()
+                .position(|reply| content.contains(&format!("Child final response:\n{reply}\n\n")));
+            if message["role"] != "user" || !content.starts_with(&prefix) || outcome.is_none() {
+                return unexpected_request(&probe, &body, "unknown new parent input");
+            }
+            fresh.push((outcome.unwrap(), content.to_string()));
+        }
+        if fresh.is_empty() {
+            return unexpected_request(&probe, &body, "replay-only parent call");
+        }
+        {
+            let mut consumed = probe.parent_consumed.lock().unwrap();
+            let mut next = *consumed;
+            for (outcome, _) in &fresh {
+                if next[*outcome] {
+                    return unexpected_request(&probe, &body, "repeated parent outcome");
+                }
+                next[*outcome] = true;
+            }
+            *consumed = next;
+        }
+        probe.parent_notifications.lock().unwrap().extend(fresh);
+        let index = {
+            let mut requests = probe.parent_requests.lock().unwrap();
+            let index = requests.len();
+            requests.push(body);
+            index
+        };
+        eprintln!("accepted legacy fixture parent notification request {index}");
+        return plain_response(&format!("legacy-parent-{index}"), PARENT_ACK);
+    }
+    if body["model"] != MODEL {
+        return unexpected_request(&probe, &body, "unknown model");
+    }
     let index = {
-        let mut requests = probe.requests.lock().unwrap();
+        let mut requests = probe.child_requests.lock().unwrap();
         let index = requests.len();
-        requests.push(body.into_inner());
+        requests.push(body.clone());
         index
     };
     probe.entered.notify_one();
     let Some(reply) = REPLIES.get(index) else {
-        return HttpResponse::BadRequest().body("unexpected extra legacy provider request");
+        return unexpected_request(&probe, &body, "extra Child call");
     };
     // These are actual HTTP requests made by the actual Worker. Neither a
     // reservation alone nor a fast failure can satisfy this deterministic gate.
@@ -64,20 +168,14 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
         }
         wake.await;
     }
-    HttpResponse::Ok()
-        .content_type("text/event-stream")
-        .body(format!(
-            "data: {}\n\ndata: [DONE]\n\n",
-            json!({"id":format!("legacy-local-{index}"),"object":"chat.completion.chunk",
-                "choices":[{"index":0,"delta":{"content":reply},"finish_reason":"stop"}]})
-        ))
+    plain_response(&format!("legacy-local-{index}"), reply)
 }
 
 async fn provider_entered(probe: &ProviderProbe, count: usize, state: &AppState, id: &str) {
     let observed = tokio::time::timeout(WAIT, async {
         loop {
             let wake = probe.entered.notified();
-            if probe.requests.lock().unwrap().len() >= count {
+            if probe.child_requests.lock().unwrap().len() >= count {
                 break;
             }
             wake.await;
@@ -92,7 +190,7 @@ async fn provider_entered(probe: &ProviderProbe, count: usize, state: &AppState,
             child.last_run_error()
         );
     }
-    let requests = probe.requests.lock().unwrap();
+    let requests = probe.child_requests.lock().unwrap();
     assert_eq!(
         requests.len(),
         count,
@@ -243,6 +341,119 @@ async fn wait_completed(state: &AppState, home: &Path, id: &str, run_id: &str) -
     .expect("legacy terminal, canonical source, released router and ACKed Run must converge")
 }
 
+fn parent_outcome(
+    parent: &Session,
+    child: &Session,
+    run_id: &str,
+) -> Option<(usize, SessionMessageEnvelope)> {
+    let source: Value = serde_json::from_str(
+        child
+            .metadata
+            .get("runtime.child_completion_source_v1")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(source["activation_run_id"], run_id);
+    let matches: Vec<_> = parent
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("child_completion_source"))
+                == Some(&source)
+        })
+        .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    assert_eq!(
+        matches.len(),
+        1,
+        "one canonical Parent outcome per Child seal"
+    );
+    let (index, message) = matches[0];
+    let envelope: SessionMessageEnvelope =
+        serde_json::from_value(message.metadata.as_ref().unwrap()["session_message"].clone())
+            .unwrap();
+    assert_eq!(envelope.target_session_id, PARENT);
+    assert_eq!(envelope.kind, SessionMessageKind::ChildOutcome);
+    assert_eq!(
+        envelope.source,
+        SessionMessageSource::Runtime {
+            subsystem: "child_completion_coordinator".into()
+        }
+    );
+    let SessionMessageBody::ChildOutcome(outcome) = &envelope.body else {
+        panic!("Parent completion must retain its typed ChildOutcome")
+    };
+    assert_eq!(outcome.child_session_id, child.id);
+    assert_eq!(outcome.status, "completed");
+    assert!(outcome.error.is_none());
+    let final_message = child
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant)
+        .unwrap();
+    assert_eq!(
+        outcome.result.as_deref(),
+        Some(final_message.content.as_str())
+    );
+    assert_eq!(
+        outcome.provider_message.as_ref().unwrap().metadata["child_completion_source"],
+        source
+    );
+    assert!(bamboo_domain::is_matching_session_message(
+        message, &envelope
+    ));
+    assert!(parent
+        .session_inbox_admission()
+        .unwrap()
+        .contains(&envelope.id));
+    Some((index, envelope))
+}
+
+async fn wait_parent_settled(
+    state: &AppState,
+    probe: &ProviderProbe,
+    child: &Session,
+    run_id: &str,
+) -> Session {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            {
+                let unexpected = probe.unexpected_requests.lock().unwrap();
+                assert!(unexpected.is_empty(), "unexpected requests: {unexpected:#?}");
+            }
+            let parent = state.storage.load_session(PARENT).await.unwrap().unwrap();
+            if matches!(parent.last_run_status().as_deref(), Some("error" | "timeout" | "cancelled")) {
+                panic!("Parent notification run failed: {:?}", parent.last_run_error());
+            }
+            if let Some((index, envelope)) = parent_outcome(&parent, child, run_id) {
+                let acknowledged = state.session_inbox.was_admitted(PARENT, &envelope.id).await.unwrap();
+                let inbox = state.session_inbox.inspect(PARENT).await.unwrap();
+                let completed = state.agent_runners.read().await.get(PARENT)
+                    .is_some_and(|runner| matches!(runner.status, AgentStatus::Completed));
+                let idle = state.session_activation_router.current_run_id(PARENT).await.is_none();
+                let answered = parent.messages[index + 1..].iter()
+                    .any(|message| message.role == Role::Assistant && message.content == PARENT_ACK);
+                if acknowledged && completed && idle && answered
+                    && parent.last_run_status().as_deref() == Some("completed")
+                    && (inbox.pending, inbox.claimed) == (0, 0)
+                    && !inbox.activation_pending()
+                    && probe.parent_consumed.lock().unwrap()[1]
+                {
+                    return parent;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("final Child outcome, canonical Parent ACK and idle Root must converge before provider shutdown")
+}
+
 #[test]
 fn explicit_local_legacy_child_idle_resume_reserves_once_and_acks_one_input() {
     // AppState's debug future is larger than libtest's default thread stack.
@@ -280,7 +491,9 @@ async fn run_fixture() {
             .route("/v1/chat/completions", web::post().to(model_response))
             .route(
                 "/v1/models",
-                web::get().to(|| async { HttpResponse::Ok().json(json!({"data":[{"id":MODEL}]})) }),
+                web::get().to(|| async {
+                    HttpResponse::Ok().json(json!({"data":[{"id":MODEL},{"id":PARENT_MODEL}]}))
+                }),
             )
     })
     .workers(1)
@@ -293,8 +506,8 @@ async fn run_fixture() {
     std::fs::write(home.join("config.json"), serde_json::to_vec(&json!({
         "provider":"openai",
         "features":{"provider_model_ref":true},
-        "providers":{"openai":{"api_key":"local-fixture-only","base_url":base_url,"model":MODEL}},
-        "defaults":{"chat":{"provider":"openai","model":MODEL}},
+        "providers":{"openai":{"api_key":"local-fixture-only","base_url":base_url,"model":PARENT_MODEL}},
+        "defaults":{"chat":{"provider":"openai","model":PARENT_MODEL}},
         "subagents":{"runtime":"actor","executor":"bamboo_runtime",
             "worker_bin":env!("CARGO_BIN_EXE_bamboo"),"worker_args":["subagent-worker"],
             "fabric_dir":home.join("fabric"),"max_concurrent":1}
@@ -318,8 +531,8 @@ async fn run_fixture() {
         .project_store
         .create("Local legacy idle resume", None)
         .unwrap();
-    let mut parent = Session::new(PARENT, MODEL);
-    parent.model_ref = Some(ProviderModelRef::new("openai", MODEL));
+    let mut parent = Session::new(PARENT, PARENT_MODEL);
+    parent.model_ref = Some(ProviderModelRef::new("openai", PARENT_MODEL));
     parent.set_provider_name("openai");
     parent.set_project_id_meta(project.id.to_string());
     parent.workspace = Some(home.to_string_lossy().into_owned());
@@ -358,6 +571,7 @@ async fn run_fixture() {
                 // A compatibility role deliberately uses ordinary legacy history;
                 // this is not the separately restricted named plain Actor mode.
                 "subagent_type":"legacy-idle-resume-fixture","prompt":INITIAL,
+                "model":format!("openai:{MODEL}"),
                 "wait":false,"auto_run":true
             })
             .to_string(),
@@ -378,6 +592,7 @@ async fn run_fixture() {
     assert!(result.success, "create failed: {}", result.result);
     let payload: Value = serde_json::from_str(&result.result).unwrap();
     let child_id = payload["child_session_id"].as_str().unwrap();
+    *probe.child_id.lock().unwrap() = Some(child_id.to_string());
     provider_entered(&probe, 1, &state, child_id).await;
     let workers = owned_worker_pids();
     assert_eq!(
@@ -499,7 +714,7 @@ async fn run_fixture() {
             && !permission.auto_approve_permissions
             && !permission.inherit_session_grants
     );
-    let request = probe.requests.lock().unwrap()[1].clone();
+    let request = probe.child_requests.lock().unwrap()[1].clone();
     assert_eq!(
         request["messages"]
             .as_array()
@@ -547,7 +762,7 @@ async fn run_fixture() {
         "duplicate wake publishes no second Run"
     );
     assert_eq!(
-        probe.requests.lock().unwrap().len(),
+        probe.child_requests.lock().unwrap().len(),
         2,
         "one initial plus one resumed provider call"
     );
@@ -637,7 +852,7 @@ async fn run_fixture() {
         .await
         .is_none());
     assert!(pending_runs(&home, child_id).is_empty());
-    assert_eq!(probe.requests.lock().unwrap().len(), 2);
+    assert_eq!(probe.child_requests.lock().unwrap().len(), 2);
     assert_eq!(
         state
             .agent_runners
@@ -652,6 +867,51 @@ async fn run_fixture() {
         serde_json::to_value(state.permission_section.snapshot().data.as_ref()).unwrap(),
         policy_before
     );
+    // The SDK can release the Child router before publishing its Parent
+    // callback. Observe the final exact source through the Root checkpoint and
+    // receipt, and let its real reasoning owner settle before stopping HTTP.
+    let parent = wait_parent_settled(&state, &probe, &completed, &resumed_run_id).await;
+    let notifications = probe.parent_notifications.lock().unwrap().clone();
+    for (outcome, text) in notifications {
+        let (child, run_id) = match outcome {
+            0 => (&first, first_run_id.as_str()),
+            1 => (&completed, resumed_run_id.as_str()),
+            _ => unreachable!(),
+        };
+        let (index, envelope) = parent_outcome(&parent, child, run_id).expect(
+            "accepted provider notification must have exact canonical envelope/source proof",
+        );
+        assert_eq!(parent.messages[index].content, text);
+        assert!(state
+            .session_inbox
+            .was_admitted(PARENT, &envelope.id)
+            .await
+            .unwrap());
+    }
     state.shutdown().await;
     server_handle.stop(true).await;
+    let child_requests = probe.child_requests.lock().unwrap();
+    let parent_requests = probe.parent_requests.lock().unwrap();
+    let unexpected_requests = probe.unexpected_requests.lock().unwrap();
+    let requests = probe.requests.lock().unwrap();
+    eprintln!(
+        "legacy fixture provider requests classified: Child={}, parent={}, unexpected={}",
+        child_requests.len(),
+        parent_requests.len(),
+        unexpected_requests.len()
+    );
+    assert_eq!(
+        child_requests.len(),
+        2,
+        "Child requests: {child_requests:#?}"
+    );
+    assert!(
+        unexpected_requests.is_empty(),
+        "unclassified provider calls: {unexpected_requests:#?}"
+    );
+    assert_eq!(
+        requests.len(),
+        child_requests.len() + parent_requests.len(),
+        "every provider call must have an explicit fixture owner: {requests:#?}"
+    );
 }

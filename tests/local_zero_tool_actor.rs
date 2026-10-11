@@ -1,5 +1,5 @@
-//! Real serve/SubAgent/Host with an explicitly selected same-source legacy Worker.
-//! Only the provider is simulated; native brokerless routing is tested separately.
+//! Real serve/SubAgent/Host with explicit legacy Worker and native Tokio fixtures.
+//! Only the provider is simulated; native Tokio fixtures never select a Worker.
 //! Explicit Ultra + a normally selected deny-all profile opts in; no manual claim.
 #![cfg(unix)]
 use actix_web::{web, App, HttpResponse, HttpServer};
@@ -2813,7 +2813,10 @@ impl Drop for ActorBrowserFixture {
 
 struct MessageOnlyProbe {
     browser: bool,
+    data: PathBuf,
     root_calls: AtomicUsize,
+    progress_calls: AtomicUsize,
+    outcome_calls: AtomicUsize,
     child_calls: AtomicUsize,
     child_ready: AtomicBool,
     release_child: AtomicBool,
@@ -2866,7 +2869,6 @@ async fn message_only_provider(
                 "tool_calls",
             )
         } else {
-            assert!(round <= 2, "Root only delegates and reports progress");
             let results: Vec<_> = body["messages"]
                 .as_array()
                 .unwrap()
@@ -2877,8 +2879,33 @@ async fn message_only_provider(
             let result: Value =
                 serde_json::from_str(results[0]["content"].as_str().unwrap()).unwrap();
             assert_eq!(result["observed_status"], "running_in_background");
-            assert!(result["actor_id"].as_str().is_some_and(|id| !id.is_empty()));
-            (json!({"content":"F2_ROOT_DELEGATION_DONE"}), "stop")
+            assert_eq!(result.as_object().unwrap().len(), 2);
+            let child_id = result["actor_id"].as_str().unwrap();
+            assert!(!child_id.is_empty() && child_id != "plain-root");
+            let store = SessionStoreV2::new(probe.data.clone()).await.unwrap();
+            let root = store.load_session("plain-root").await.unwrap().unwrap();
+            let provider_outcomes = message_only_child_outcome(&root).map_or(0, |(message, _)| {
+                body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|m| m["role"] == "user" && m["content"] == message.content)
+                    .count()
+            });
+            assert!(provider_outcomes <= 1);
+            if provider_outcomes == 1 {
+                // Provider text alone is not authority: bind it to the unique
+                // admitted canonical ChildOutcome and its committed SDK seal.
+                let child = store.load_session(child_id).await.unwrap().unwrap();
+                let actor = store.inspect_actor(child_id).await.unwrap();
+                assert_message_only_child_outcome(&root, &child, &actor.activation.unwrap().run_id);
+                assert_eq!(probe.outcome_calls.fetch_add(1, Ordering::SeqCst), 0);
+                (json!({"content":"F2_ROOT_CHILD_RESULT_DONE"}), "stop")
+            } else {
+                assert_eq!(probe.outcome_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(probe.progress_calls.fetch_add(1, Ordering::SeqCst), 0);
+                (json!({"content":"F2_ROOT_DELEGATION_DONE"}), "stop")
+            }
         }
     } else {
         (json!({"content":"auxiliary"}), "stop")
@@ -2888,6 +2915,93 @@ async fn message_only_provider(
     HttpResponse::Ok()
         .content_type("text/event-stream")
         .body(format!("data: {event}\n\ndata: [DONE]\n\n"))
+}
+
+fn message_only_child_outcome(
+    root: &bamboo_domain::Session,
+) -> Option<(
+    &bamboo_domain::Message,
+    bamboo_domain::SessionMessageEnvelope,
+)> {
+    let outcomes: Vec<_> = root
+        .messages
+        .iter()
+        .filter_map(|message| {
+            let marker = message.metadata.as_ref()?.get("session_message")?;
+            let envelope: bamboo_domain::SessionMessageEnvelope =
+                serde_json::from_value(marker.clone()).unwrap();
+            (envelope.kind == bamboo_domain::SessionMessageKind::ChildOutcome)
+                .then_some((message, envelope))
+        })
+        .collect();
+    assert!(
+        outcomes.len() <= 1,
+        "one canonical ChildOutcome, no duplicate delivery"
+    );
+    outcomes.into_iter().next()
+}
+
+fn assert_message_only_child_outcome(
+    root: &bamboo_domain::Session,
+    child: &bamboo_domain::Session,
+    run_id: &str,
+) {
+    let (message, envelope) = message_only_child_outcome(root).expect("canonical ChildOutcome");
+    assert!(matches!(
+        &envelope.source,
+        bamboo_domain::SessionMessageSource::Runtime { subsystem }
+            if subsystem == "child_completion_coordinator"
+    ));
+    assert_eq!(envelope.target_session_id, root.id);
+    assert!(bamboo_domain::is_matching_session_message(
+        message, &envelope
+    ));
+    assert!(root
+        .session_inbox_admission()
+        .unwrap()
+        .contains(&envelope.id));
+    let bamboo_domain::SessionMessageBody::ChildOutcome(outcome) = &envelope.body else {
+        panic!("typed ChildOutcome body required");
+    };
+    assert_eq!(outcome.child_session_id, child.id);
+    assert_eq!(outcome.status, "completed");
+    // The preserved plain-text Child answer is not a structured report.
+    // Its typed projection must say unavailable, never invent report success.
+    assert!(outcome.result.is_none());
+    assert!(outcome.error.is_none());
+    let projection: Value = serde_json::from_str(
+        message
+            .content
+            .split_once("\n\nChild typed result:\n")
+            .unwrap()
+            .1
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        projection,
+        json!({
+            "view":"typed_result", "version":1, "available":false, "reason":"report_malformed"
+        })
+    );
+    assert_eq!(child.parent_session_id.as_deref(), Some(root.id.as_str()));
+    assert_eq!(child.root_session_id, root.id);
+    assert_message_only_completion_source(child, run_id);
+    let source: bamboo_engine::execution::ChildCompletionSource =
+        serde_json::from_str(&child.metadata["runtime.child_completion_source_v1"]).unwrap();
+    let metadata = message.metadata.as_ref().unwrap();
+    assert_eq!(metadata["runtime_kind"], "child_completion_resume");
+    assert_eq!(metadata["child_session_id"], child.id);
+    assert_eq!(metadata["child_status"], "completed");
+    assert_eq!(metadata["child_final_response_included"], false);
+    assert_eq!(metadata["child_typed_result_included"], true);
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        metadata["child_completion_source_sha256"],
+        hex::encode(Sha256::digest(serde_json::to_vec(&source).unwrap()))
+    );
 }
 
 fn message_only_root_result(root: &bamboo_domain::Session, completed: bool) -> Value {
@@ -2928,14 +3042,121 @@ fn message_only_root_result(root: &bamboo_domain::Session, completed: bool) -> V
         .map(|m| m.content.as_str())
         .collect();
     if completed {
-        assert_eq!(replies, ["F2_ROOT_DELEGATION_DONE"]);
+        let mut expected = Vec::new();
+        if replies.first() == Some(&"F2_ROOT_DELEGATION_DONE") {
+            expected.push("F2_ROOT_DELEGATION_DONE");
+        }
+        expected.push("F2_ROOT_CHILD_RESULT_DONE");
+        assert_eq!(replies, expected);
+        assert!(message_only_child_outcome(root).is_some());
     } else {
         assert!(replies.is_empty());
+        assert!(message_only_child_outcome(root).is_none());
     }
     result
 }
 
-async fn message_only_fixture(browser: Option<ActorBrowserFixture>) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MessageOnlyExecution {
+    LegacyWorker,
+    Tokio,
+}
+impl MessageOnlyExecution {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyWorker => "worker",
+            Self::Tokio => "tokio",
+        }
+    }
+}
+
+fn assert_no_message_only_broker_artifacts(data: &Path) {
+    for path in ["broker", "broker.json", "subagents"] {
+        assert!(
+            !data.join(path).exists(),
+            "native Tokio execution must not create {path}"
+        );
+    }
+}
+
+fn assert_message_only_tokio_observation(
+    session: &bamboo_domain::Session,
+    run_id: &str,
+    state: &str,
+) -> Option<uuid::Uuid> {
+    assert_eq!(session.metadata["runtime.local_task.state"], state);
+    assert_eq!(session.metadata["runtime.local_task.run_id"], run_id);
+    assert_eq!(
+        session.metadata["runtime.local_task.child_birth"],
+        session.created_at.to_rfc3339()
+    );
+    let observed_at =
+        chrono::DateTime::parse_from_rfc3339(&session.metadata["runtime.local_task.observed_at"])
+            .unwrap();
+    assert!(observed_at >= session.created_at);
+    assert!(!session.metadata.contains_key("runtime.local_task.reason"));
+    match state {
+        "running" => {
+            assert!(
+                !session.metadata.contains_key("runtime.local_task.instance"),
+                "running must not inherit an old execution's stop proof"
+            );
+            None
+        }
+        "stopped" => {
+            let instance = uuid::Uuid::parse_str(&session.metadata["runtime.local_task.instance"])
+                .expect("actual joined Tokio task must have a stop instance");
+            assert!(!instance.is_nil());
+            Some(instance)
+        }
+        _ => panic!("unexpected message-only Tokio observation"),
+    }
+}
+
+fn assert_message_only_completion_source(session: &bamboo_domain::Session, run_id: &str) {
+    let source: bamboo_engine::execution::ChildCompletionSource =
+        serde_json::from_str(&session.metadata["runtime.child_completion_source_v1"])
+            .expect("accepted SDK completion must publish a source, not a pending envelope");
+    assert_eq!(source.activation_run_id, run_id);
+    assert_eq!(source.child_session_id, session.id);
+    assert_eq!(source.child_created_at, session.created_at);
+    assert_eq!(source.parent_session_id, "plain-root");
+    assert_eq!(source.project_id, session.project_id_meta());
+    assert_eq!(source.status, "completed");
+    assert!(source.error_sha256.is_none());
+    let binding = bamboo_domain::ChildContextBinding::from_session(session)
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.assignment_sha256, Some(binding.assignment_sha256));
+    let answer = session.messages.last().unwrap();
+    assert_eq!(answer.role, bamboo_domain::Role::Assistant);
+    assert_eq!(answer.content, "F2_CHILD_COMPLETED");
+    assert_eq!(
+        source.result_message_id.as_deref(),
+        Some(answer.id.as_str())
+    );
+    let last_assistant = source.last_assistant.unwrap();
+    assert_eq!(last_assistant.message_id, answer.id);
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        last_assistant.message_sha256,
+        hex::encode(Sha256::digest(serde_json::to_vec(answer).unwrap()))
+    );
+    let users: Vec<_> = session
+        .messages
+        .iter()
+        .filter(|message| message.role == bamboo_domain::Role::User)
+        .collect();
+    assert_eq!(
+        source.input_sha256,
+        hex::encode(Sha256::digest(serde_json::to_vec(&users).unwrap()))
+    );
+}
+
+async fn message_only_fixture(
+    browser: Option<ActorBrowserFixture>,
+    execution: MessageOnlyExecution,
+) {
     let temp = tempfile::tempdir().unwrap();
     // Drop the log receipt guard before the temporary fixture data disappears.
     let mut browser = browser;
@@ -2953,7 +3174,10 @@ async fn message_only_fixture(browser: Option<ActorBrowserFixture>) {
     std::fs::write(agents.join("worker.md"), "---\nschema_version: 1\nname: worker\ndescription: One bounded plain reply\nmodel_hint: openai:plain-child\ntools:\n  deny: [Bash, Read, Glob, Edit, Write]\n---\nDo not use tools; return one plain answer and stop.\n").unwrap();
     let probe = web::Data::new(MessageOnlyProbe {
         browser: browser.is_some(),
+        data: data.clone(),
         root_calls: AtomicUsize::new(0),
+        progress_calls: AtomicUsize::new(0),
+        outcome_calls: AtomicUsize::new(0),
         child_calls: AtomicUsize::new(0),
         child_ready: AtomicBool::new(false),
         release_child: AtomicBool::new(false),
@@ -2983,7 +3207,15 @@ async fn message_only_fixture(browser: Option<ActorBrowserFixture>) {
     let running = server.run();
     let handle = running.handle();
     actix_web::rt::spawn(running);
-    std::fs::write(data.join("config.json"), serde_json::to_vec(&json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":format!("fixture-{}", uuid::Uuid::new_v4()),"base_url":provider_url,"model":"plain-root","runtime_models":["plain-root","plain-child"]}},"defaults":{"chat":{"provider":"openai","model":"plain-root"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","worker_bin":env!("CARGO_BIN_EXE_bamboo"),"worker_args":["subagent-worker"],"max_concurrent":1}})).unwrap()).unwrap();
+    let mut subagents = json!({"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1});
+    if execution == MessageOnlyExecution::LegacyWorker {
+        subagents["worker_bin"] = json!(env!("CARGO_BIN_EXE_bamboo"));
+        subagents["worker_args"] = json!(["subagent-worker"]);
+    } else {
+        assert!(subagents.get("worker_bin").is_none());
+        assert!(subagents.get("worker_args").is_none());
+    }
+    std::fs::write(data.join("config.json"), serde_json::to_vec(&json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":format!("fixture-{}", uuid::Uuid::new_v4()),"base_url":provider_url,"model":"plain-root","runtime_models":["plain-root","plain-child"]}},"defaults":{"chat":{"provider":"openai","model":"plain-root"}},"subagents":subagents})).unwrap()).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -3181,29 +3413,43 @@ async fn message_only_fixture(browser: Option<ActorBrowserFixture>) {
     assert_eq!(running.actor.current_attempt, 1);
     let activation = running.activation.unwrap();
     assert_eq!(activation.status, ActorActivationStatus::Running);
-    assert_eq!(
-        activation.placement_ref.as_ref().unwrap().class,
-        bamboo_domain::ActorPlacementClass::Local
-    );
-    let runs = claimed_required_runs(&data);
-    assert_eq!(
-        runs.len(),
-        1,
-        "one actual local worker Run before provider release"
-    );
-    assert_eq!(
-        runs[0].2.activation_run_id.as_deref(),
-        Some(activation.run_id.as_str())
-    );
-    let logical = runs[0].2.logical_session.as_ref().unwrap();
-    assert_eq!(logical.session_id, id);
-    assert_eq!(
-        logical.creation.as_ref().unwrap().created_at,
-        before.created_at
-    );
+    let runs = match execution {
+        MessageOnlyExecution::LegacyWorker => {
+            assert_eq!(
+                activation.placement_ref.as_ref().unwrap().class,
+                bamboo_domain::ActorPlacementClass::Local
+            );
+            let runs = claimed_required_runs(&data);
+            assert_eq!(
+                runs.len(),
+                1,
+                "one actual local worker Run before provider release"
+            );
+            assert_eq!(
+                runs[0].2.activation_run_id.as_deref(),
+                Some(activation.run_id.as_str())
+            );
+            let logical = runs[0].2.logical_session.as_ref().unwrap();
+            assert_eq!(logical.session_id, id);
+            assert_eq!(
+                logical.creation.as_ref().unwrap().created_at,
+                before.created_at
+            );
+            runs
+        }
+        MessageOnlyExecution::Tokio => {
+            assert!(activation.placement_ref.is_none());
+            assert_no_message_only_broker_artifacts(&data);
+            assert_message_only_tokio_observation(&before, &activation.run_id, "running");
+            // No broker directory means there can be no claimed Worker Run.
+            // Network non-use is separately observed by the assembly probe.
+            Vec::new()
+        }
+    };
     if let Some(browser) = &browser {
         browser.write(&browser.info, json!({
-            "schema_version":1, "origin":format!("http://127.0.0.1:{port}"), "api":base,
+            "schema_version":1, "execution_kind":execution.as_str(),
+            "origin":format!("http://127.0.0.1:{port}"), "api":base,
             "root_id":"plain-root", "child_id":id, "activation_id":activation.activation_id,
             "attempt":1, "release":browser.info.with_extension("release"),
             "completed":browser.info.with_extension("completed"), "restart":browser.info.with_extension("restart"),
@@ -3252,9 +3498,21 @@ async fn message_only_fixture(browser: Option<ActorBrowserFixture>) {
                 && child.last_run_status().as_deref() == Some("completed")
                 && actor.activation.as_ref().unwrap().status == ActorActivationStatus::Succeeded
                 && parent.last_run_status().as_deref() == Some("completed")
+                && parent.messages.iter().any(|message| {
+                    message.role == bamboo_domain::Role::Assistant
+                        && message.content == "F2_ROOT_CHILD_RESULT_DONE"
+                })
             {
+                assert_eq!(probe.outcome_calls.load(Ordering::SeqCst), 1);
+                assert_message_only_child_outcome(&parent, &child, &activation.run_id);
                 assert_eq!(actor.actor.current_attempt, 1);
                 assert_eq!(actor.activation.as_ref().unwrap().run_id, activation.run_id);
+                if execution == MessageOnlyExecution::Tokio {
+                    assert!(actor.activation.as_ref().unwrap().placement_ref.is_none());
+                    assert_no_message_only_broker_artifacts(&data);
+                    assert_message_only_tokio_observation(&child, &activation.run_id, "stopped");
+                    assert_message_only_completion_source(&child, &activation.run_id);
+                }
                 break (child, parent);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3263,7 +3521,21 @@ async fn message_only_fixture(browser: Option<ActorBrowserFixture>) {
     .await
     .unwrap();
     assert_eq!(message_only_root_result(&parent_completed, true), result);
-    assert!((2..=3).contains(&probe.root_calls.load(Ordering::SeqCst)));
+    let progress_calls = probe.progress_calls.load(Ordering::SeqCst);
+    assert!(progress_calls <= 1);
+    assert_eq!(probe.outcome_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.root_calls.load(Ordering::SeqCst), 2 + progress_calls);
+    assert_eq!(
+        parent_completed
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == bamboo_domain::Role::Assistant
+                    && message.content == "F2_ROOT_DELEGATION_DONE"
+            })
+            .count(),
+        progress_calls
+    );
     assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
     let index_store = SessionStoreV2::new(data.clone()).await.unwrap();
     let indexed: Vec<_> = index_store
@@ -3292,8 +3564,10 @@ async fn message_only_fixture(browser: Option<ActorBrowserFixture>) {
         // entries may be ACKed after completion, so this is not a lifetime total.
         browser.phase(
             "completed",
-            json!({"completed":true, "held_cut_runs":runs.len(),
+            json!({"completed":true, "execution_kind":execution.as_str(), "held_cut_runs":runs.len(),
             "root_provider_calls":probe.root_calls.load(Ordering::SeqCst),
+            "root_progress_calls":probe.progress_calls.load(Ordering::SeqCst),
+            "root_outcome_calls":probe.outcome_calls.load(Ordering::SeqCst),
             "child_provider_calls":probe.child_calls.load(Ordering::SeqCst),
             "host_pid":initial_host_pid, "actor_id":id,
             "activation_id":activation.activation_id, "attempt":1}),
@@ -3334,6 +3608,7 @@ async fn message_only_fixture(browser: Option<ActorBrowserFixture>) {
         serde_json::to_value(&parent_completed.messages).unwrap()
     );
     assert_eq!(message_only_root_result(&cold_root, true), result);
+    assert_message_only_child_outcome(&cold_root, &cold, &activation.run_id);
     assert_eq!(cold.last_run_status().as_deref(), Some("completed"));
     assert_eq!(cold_root.last_run_status().as_deref(), Some("completed"));
     let cold_actor = cold_store.inspect_actor(&id).await.unwrap();
@@ -3341,7 +3616,29 @@ async fn message_only_fixture(browser: Option<ActorBrowserFixture>) {
         cold_actor.activation.as_ref().unwrap().status,
         ActorActivationStatus::Succeeded
     );
-    assert_eq!(cold_actor.activation.unwrap().run_id, activation.run_id);
+    assert_eq!(cold_actor.actor.current_attempt, 1);
+    assert_eq!(
+        cold_actor.activation.as_ref().unwrap().run_id,
+        activation.run_id
+    );
+    if execution == MessageOnlyExecution::Tokio {
+        assert!(cold_actor
+            .activation
+            .as_ref()
+            .unwrap()
+            .placement_ref
+            .is_none());
+        assert_no_message_only_broker_artifacts(&data);
+        assert_eq!(
+            assert_message_only_tokio_observation(&cold, &activation.run_id, "stopped"),
+            assert_message_only_tokio_observation(&completed, &activation.run_id, "stopped")
+        );
+        assert_message_only_completion_source(&cold, &activation.run_id);
+        assert_eq!(
+            cold.metadata["runtime.child_completion_source_v1"],
+            completed.metadata["runtime.child_completion_source_v1"]
+        );
+    }
     if let Some(browser) = &browser {
         let mut restarted = start_with_static_dir(&data, port, Some(&browser.static_dir));
         restarted.record_cleanup(
@@ -3381,7 +3678,7 @@ async fn message_only_fixture(browser: Option<ActorBrowserFixture>) {
         assert_eq!(
             probe.child_calls.load(Ordering::SeqCst),
             1,
-            "restart did not admit another Worker"
+            "restart did not admit another Child execution"
         );
         let after = SessionStoreV2::new(data.clone()).await.unwrap();
         let child = after.load_session(&id).await.unwrap().unwrap();
@@ -3389,17 +3686,41 @@ async fn message_only_fixture(browser: Option<ActorBrowserFixture>) {
             serde_json::to_value(&child.messages).unwrap(),
             serde_json::to_value(&completed.messages).unwrap()
         );
+        let parent = after.load_session("plain-root").await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&parent.messages).unwrap(),
+            serde_json::to_value(&parent_completed.messages).unwrap()
+        );
+        assert_message_only_child_outcome(&parent, &child, &activation.run_id);
+        assert_eq!(probe.outcome_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.progress_calls.load(Ordering::SeqCst), progress_calls);
+        assert_eq!(probe.root_calls.load(Ordering::SeqCst), 2 + progress_calls);
         let actor = after.inspect_actor(&id).await.unwrap();
         assert_eq!(actor.actor.current_attempt, 1);
         assert_eq!(actor.activation.as_ref().unwrap().run_id, activation.run_id);
         assert_eq!(
-            actor.activation.unwrap().status,
+            actor.activation.as_ref().unwrap().status,
             ActorActivationStatus::Succeeded
         );
+        if execution == MessageOnlyExecution::Tokio {
+            assert!(actor.activation.as_ref().unwrap().placement_ref.is_none());
+            assert_no_message_only_broker_artifacts(&data);
+            assert_eq!(
+                assert_message_only_tokio_observation(&child, &activation.run_id, "stopped"),
+                assert_message_only_tokio_observation(&completed, &activation.run_id, "stopped")
+            );
+            assert_message_only_completion_source(&child, &activation.run_id);
+            assert_eq!(
+                child.metadata["runtime.child_completion_source_v1"],
+                completed.metadata["runtime.child_completion_source_v1"]
+            );
+        }
         browser.phase(
             "native",
-            json!({"pass":true,"held_cut_runs":runs.len(),
+            json!({"pass":true,"execution_kind":execution.as_str(),"held_cut_runs":runs.len(),
             "root_provider_calls":probe.root_calls.load(Ordering::SeqCst),
+            "root_progress_calls":probe.progress_calls.load(Ordering::SeqCst),
+            "root_outcome_calls":probe.outcome_calls.load(Ordering::SeqCst),
             "child_provider_calls":probe.child_calls.load(Ordering::SeqCst),
             "actor_id":id,"activation_id":activation.activation_id,"attempt":1,
             "initial_host_pid":initial_host_pid,"restarted_host_pid":restarted_host_pid,
@@ -3408,20 +3729,46 @@ async fn message_only_fixture(browser: Option<ActorBrowserFixture>) {
     }
     eprintln!(
         "message-only native evidence: {}",
-        json!({"call_id":MESSAGE_ONLY_CALL,"caller_keys":["message"],"actor_id":id,"root_provider_calls":probe.root_calls.load(Ordering::SeqCst),"child_provider_calls":probe.child_calls.load(Ordering::SeqCst),"actual_runs":runs.len(),"default_role":"worker","cold_answer":cold.messages.last().unwrap().content,"host_killed_and_waited":true})
+        json!({"execution_kind":execution.as_str(),"call_id":MESSAGE_ONLY_CALL,"caller_keys":["message"],"actor_id":id,"root_provider_calls":probe.root_calls.load(Ordering::SeqCst),"child_provider_calls":probe.child_calls.load(Ordering::SeqCst),"actual_runs":runs.len(),"default_role":"worker","cold_answer":cold.messages.last().unwrap().content,"host_killed_and_waited":true})
     );
     handle.stop(true).await;
 }
 
 #[actix_web::test]
 async fn actual_message_only_subagent_creates_and_completes_one_local_child() {
-    Box::pin(message_only_fixture(None)).await;
+    Box::pin(message_only_fixture(
+        None,
+        MessageOnlyExecution::LegacyWorker,
+    ))
+    .await;
 }
 
+#[actix_web::test]
+async fn actual_message_only_tokio_subagent_creates_and_completes_one_local_child() {
+    Box::pin(message_only_fixture(None, MessageOnlyExecution::Tokio)).await;
+}
+
+/// Historical name: this fixture explicitly selects the legacy Worker.
 /// Build separately with --no-run, then start this exact ignored fixture while
 /// Lotus runs playwright.actor-runtime.config.ts. No real provider is contacted.
 #[actix_web::test]
 #[ignore = "requires built Lotus and its focused real Actor browser test"]
 async fn actual_message_only_native_actor_browser_fixture() {
-    Box::pin(message_only_fixture(Some(ActorBrowserFixture::from_env()))).await;
+    Box::pin(message_only_fixture(
+        Some(ActorBrowserFixture::from_env()),
+        MessageOnlyExecution::LegacyWorker,
+    ))
+    .await;
+}
+
+/// Native Tokio acceptance uses the actual CLI Host with no legacy Worker config.
+/// Lotus must explicitly select v2 snapshots and execution_kind=tokio.
+#[actix_web::test]
+#[ignore = "requires built Lotus and its focused real Tokio Actor browser test"]
+async fn actual_message_only_tokio_actor_browser_fixture() {
+    Box::pin(message_only_fixture(
+        Some(ActorBrowserFixture::from_env()),
+        MessageOnlyExecution::Tokio,
+    ))
+    .await;
 }
