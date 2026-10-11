@@ -9,7 +9,7 @@ use crate::external_agents::local_task::{LocalTaskChildRunner, LocalTaskRuntime}
 use crate::external_agents::runtime::NativeToolCeilingSource;
 use crate::runtime::Agent;
 use async_trait::async_trait;
-use bamboo_agent_core::tools::{ToolCall, ToolError, ToolExecutor, ToolResult, ToolSchema};
+use bamboo_agent_core::tools::{ToolExecutor, ToolSchema};
 use bamboo_domain::{ActorActivationStatus, ActorDirectoryPort, Message};
 use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,21 +19,11 @@ use tokio_util::sync::CancellationToken;
 const RUN: &str = "host-run";
 const OUTPUT: &str = "Result from the actually joined local Ticket task";
 
-struct NoTools;
+struct TaskCeiling;
 #[async_trait]
-impl ToolExecutor for NoTools {
-    async fn execute(&self, call: &ToolCall) -> std::result::Result<ToolResult, ToolError> {
-        Err(ToolError::NotFound(call.function.name.clone()))
-    }
-    fn list_tools(&self) -> Vec<ToolSchema> {
-        Vec::new()
-    }
-}
-struct NoToolCeiling;
-#[async_trait]
-impl NativeToolCeilingSource for NoToolCeiling {
+impl NativeToolCeilingSource for TaskCeiling {
     async fn observe(&self, _: &Session) -> std::result::Result<Vec<String>, String> {
-        Ok(Vec::new())
+        Ok(vec!["Task".into()])
     }
 }
 struct OneReply(AtomicUsize);
@@ -68,7 +58,11 @@ async fn actual_local_task_stop_is_uuid_bound_and_result_replays_after_restart()
         .await
         .unwrap();
     let provider = Arc::new(OneReply(AtomicUsize::new(0)));
-    let tools: Arc<dyn ToolExecutor> = Arc::new(NoTools);
+    let tools: Arc<dyn ToolExecutor> = Arc::new(
+        bamboo_tools::BuiltinToolExecutor::new()
+            .with_native_tool_ceiling(vec!["Task".into()])
+            .unwrap(),
+    );
     let config = Config::default();
     let agent = Arc::new(
         Agent::builder()
@@ -90,7 +84,7 @@ async fn actual_local_task_stop_is_uuid_bound_and_result_replays_after_restart()
             .build()
             .unwrap(),
     );
-    let runner = LocalTaskChildRunner::new(&config, Some(Arc::new(NoToolCeiling)), None);
+    let runner = LocalTaskChildRunner::new(&config, Some(Arc::new(TaskCeiling)), None);
     runner.set_actor_directory_store(Some(f.storage.clone()));
     runner.set_session_inbox_runtime(Some(f.runtime.clone()));
     runner.set_ticket_service(Some(f.service.clone()));

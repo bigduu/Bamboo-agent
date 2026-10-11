@@ -2133,17 +2133,25 @@ async fn cancelled_published_placeholder_is_adopted_and_abandoned_by_raii() {
 }
 
 #[tokio::test]
-async fn aborted_reserved_child_setup_releases_placeholder_and_runs_one_successor() {
-    let mut harness =
-        build_terminal_delivery_harness(Arc::new(CompletedProvider), None, None).await;
-    let admission = harness
-        .messenger
-        .admit(SessionMessageEnvelope::user_input(
-            &harness.child_session_id,
-            "recover child work after its reserved setup task is aborted",
-        ))
-        .await
-        .unwrap();
+async fn aborted_reserved_child_setup_waiter_preserves_owned_run_without_successor() {
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let provider_release = Arc::new(Notify::new());
+    provider_release.notify_one();
+    let mut harness = build_terminal_delivery_harness(
+        Arc::new(BlockingCompletedProvider {
+            calls: provider_calls.clone(),
+            entered: Arc::new(Notify::new()),
+            release: provider_release,
+        }),
+        None,
+        None,
+    )
+    .await;
+    let input = SessionMessageEnvelope::user_input(
+        &harness.child_session_id,
+        "finish child work after its reserved setup waiter is aborted",
+    );
+    let admission = harness.messenger.admit(input.clone()).await.unwrap();
     harness
         .messenger
         .prepare_activation(&admission)
@@ -2173,9 +2181,9 @@ async fn aborted_reserved_child_setup_releases_placeholder_and_runs_one_successo
             panic!("unexpected child owner {run_id}")
         }
     };
-    let aborted_run_id = raw.run_id.clone();
+    let owned_run_id = raw.run_id.clone();
     router
-        .install_owner_placeholder_for_test(&harness.child_session_id, &aborted_run_id)
+        .install_owner_placeholder_for_test(&harness.child_session_id, &owned_run_id)
         .await;
     let mut reservation =
         crate::execution::SessionExecutionReservation::from_activation_placeholder(
@@ -2219,7 +2227,7 @@ async fn aborted_reserved_child_setup_releases_placeholder_and_runs_one_successo
         }
     })
     .await
-    .expect("reserved child setup must become runnable before cancellation");
+    .expect("reserved child setup must become runnable before its waiter is cancelled");
     setup.abort();
     match setup.await {
         Err(error) => assert!(error.is_cancelled()),
@@ -2228,51 +2236,31 @@ async fn aborted_reserved_child_setup_releases_placeholder_and_runs_one_successo
 
     release_lock.notify_one();
     lock_holder.await.unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        harness.reservation_entered.notified(),
-    )
-    .await
-    .expect("aborted child placeholder must request one bounded successor");
-    assert_eq!(harness.reservations.load(Ordering::SeqCst), 1);
-    assert!(
-        !router
-            .owns_run(&harness.child_session_id, &aborted_run_id)
-            .await
-    );
-    assert!(matches!(
-        harness
-            .agent_runners
-            .read()
-            .await
-            .get(&harness.child_session_id)
-            .filter(|runner| runner.run_id == aborted_run_id)
-            .map(|runner| &runner.status),
-        Some(crate::execution::AgentStatus::Cancelled)
-    ));
-
-    harness.allow_reservation.notify_one();
+    // Cancelling the caller's wait does not abandon the owned inner setup.
+    // It must hand the original reservation to exactly one real execution,
+    // without asking the router to replace an owner that may have claimed work.
     tokio::time::timeout(
         Duration::from_secs(10),
         harness.first_execute_returned.notified(),
     )
     .await
-    .expect("one real child successor must complete its provider boundary");
-    let successor_run_id = {
+    .expect("owned child setup must finish its original provider boundary");
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.reservations.load(Ordering::SeqCst), 0);
+    {
         let runners = harness.agent_runners.read().await;
         let runner = runners
             .get(&harness.child_session_id)
-            .expect("successor child runner must be present");
-        assert_ne!(runner.run_id, aborted_run_id);
+            .expect("original owned child runner must be present");
+        assert_eq!(runner.run_id, owned_run_id);
         assert!(matches!(
             runner.status,
             crate::execution::AgentStatus::Running
         ));
-        runner.run_id.clone()
-    };
+    }
     assert!(
         router
-            .owns_run(&harness.child_session_id, &successor_run_id)
+            .owns_run(&harness.child_session_id, &owned_run_id)
             .await
     );
 
@@ -2285,11 +2273,11 @@ async fn aborted_reserved_child_setup_releases_placeholder_and_runs_one_successo
                 .await
                 .get(&harness.child_session_id)
                 .is_some_and(|runner| {
-                    runner.run_id == successor_run_id
+                    runner.run_id == owned_run_id
                         && !matches!(runner.status, crate::execution::AgentStatus::Running)
                 });
             let owner_released = !router
-                .owns_run(&harness.child_session_id, &successor_run_id)
+                .owns_run(&harness.child_session_id, &owned_run_id)
                 .await;
             if settled && owner_released {
                 break;
@@ -2298,14 +2286,44 @@ async fn aborted_reserved_child_setup_releases_placeholder_and_runs_one_successo
         }
     })
     .await
-    .expect("child successor must settle without a phantom owner");
+    .expect("original child must settle without a phantom owner");
+    let events = collect_until_completed(&mut harness.parent_rx).await;
+    assert_eq!(events.iter().filter(|event| matches!(event,
+        AgentEvent::SubAgentCompleted { child_session_id, status, error, .. }
+            if child_session_id == &harness.child_session_id && status == "completed" && error.is_none()
+    )).count(), 1);
+    let saved = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.last_run_status().as_deref(), Some("completed"));
+    assert_eq!(
+        saved
+            .messages
+            .iter()
+            .filter(|message| message.id == input.id.as_str())
+            .count(),
+        1
+    );
+    let source = crate::execution::ChildCompletionSource::from_committed_session(&saved).unwrap();
+    assert_eq!(source.activation_run_id, owned_run_id);
     let backlog = harness
         .inbox
         .inspect(&harness.child_session_id)
         .await
         .unwrap();
     assert_eq!(backlog.pending + backlog.claimed, 0);
-    assert_eq!(harness.reservations.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.reservations.load(Ordering::SeqCst), 0);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.durable_confirmations.load(Ordering::SeqCst), 1);
+    while let Ok(event) = harness.parent_rx.try_recv() {
+        assert!(
+            !matches!(event, AgentEvent::SubAgentCompleted { .. }),
+            "owned run must publish completion once"
+        );
+    }
 }
 
 #[tokio::test]

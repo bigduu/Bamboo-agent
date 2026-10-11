@@ -8,6 +8,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
+struct TicketTaskCeiling;
+#[async_trait]
+impl NativeToolCeilingSource for TicketTaskCeiling {
+    async fn observe(&self, _: &Session) -> std::result::Result<Vec<String>, String> {
+        Ok(vec!["Task".into()])
+    }
+}
+
 #[tokio::test]
 async fn production_sdk_ticket_automatically_publishes_once_and_replays_after_restart() {
     let mut f = Fixture::new().await;
@@ -16,7 +24,11 @@ async fn production_sdk_ticket_automatically_publishes_once_and_replays_after_re
     f.storage.save_session(&f.child).await.unwrap();
     assert!(f.service.published().unwrap().1.submissions.is_empty());
     let provider = Arc::new(OneReply(AtomicUsize::new(0)));
-    let tools: Arc<dyn ToolExecutor> = Arc::new(NoTools);
+    let tools: Arc<dyn ToolExecutor> = Arc::new(
+        bamboo_tools::BuiltinToolExecutor::new()
+            .with_native_tool_ceiling(vec!["Task".into()])
+            .unwrap(),
+    );
     let config = Config::default();
     let agent = Arc::new(
         Agent::builder()
@@ -40,7 +52,7 @@ async fn production_sdk_ticket_automatically_publishes_once_and_replays_after_re
     );
     let runner = Arc::new(LocalTaskChildRunner::new(
         &config,
-        Some(Arc::new(NoToolCeiling)),
+        Some(Arc::new(TicketTaskCeiling)),
         None,
     ));
     runner.set_actor_directory_store(Some(f.storage.clone()));
