@@ -1,3 +1,13 @@
 {
-  "release": null
+  "release": {
+    "version": "0.3.2",
+    "manifest_url": "https://github.com/bigduu/Jiandu/releases/download/v0.3.2/jiandu-plugin-v0.3.2.tar.gz",
+    "sha256": "6c7ccbb36dd4f677ae50ea52019fe68ac9af977aa2108e97d39e88c5c2952ddd",
+    "manifest_sha256": "82c75bc77e4d7fcaa3d28229fd85ce193e57e8b213833ffd6ec6135d8273d33c",
+    "executable_sha256": {
+      "macos": "ab29ec0bd1127daa85a0452868f8e06df41a87254888159a1cd3e9c679af7fbb",
+      "windows": "8a1b4b24a42f49ba4a24d061175c8c5106f7e8c3ab62ef6045b81ebc0ddd0e1e",
+      "linux": "99fb11c74776363aeeb15abf203fe3c04260a1a15768f18db7054e7d39e98c7c"
+    }
+  }
 }
