@@ -39,6 +39,318 @@ async fn new_installer(data_dir: &Path) -> (web::Data<AppState>, ServerPluginIns
     (data, installer)
 }
 
+async fn jiandu_installer_with_root(
+    data_dir: &Path,
+    memory_root: PathBuf,
+) -> (web::Data<AppState>, ServerPluginInstaller) {
+    let mut state = AppState::new_with_memory_store(
+        data_dir.to_owned(),
+        bamboo_memory::memory_store::MemoryStore::new(memory_root),
+    )
+    .await
+    .unwrap();
+    state.wait_for_boot_reconcile_services().await;
+    state.stop_config_watcher_for_test();
+    let data = web::Data::new(state);
+    let installer = ServerPluginInstaller::new(data.clone());
+    (data, installer)
+}
+
+#[tokio::test]
+async fn jiandu_memory_paths_allow_missing_siblings_and_ancestors_but_not_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("plugins/jiandu");
+    let resolved_plugin = super::canonical_future_directory(&plugin).await.unwrap();
+    for (memory, overlap) in [
+        (plugin.clone(), true),
+        (plugin.join("nested/store"), true),
+        (dir.path().join("plugins/jiandu-other"), false),
+        (dir.path().join("plugins"), false),
+        (dir.path().to_owned(), false),
+        (dir.path().join("independent-store"), false),
+    ] {
+        let resolved_memory = super::canonical_future_directory(&memory).await.unwrap();
+        assert_eq!(
+            super::resolved_directory_contains(&resolved_plugin, &resolved_memory),
+            overlap,
+            "{memory:?}"
+        );
+    }
+    assert!(
+        !plugin.exists(),
+        "path inspection must not create a directory"
+    );
+    assert!(
+        super::canonical_future_directory(Path::new("relative/memory"))
+            .await
+            .is_err()
+    );
+    let file = dir.path().join("file");
+    tokio::fs::write(&file, b"not a directory").await.unwrap();
+    assert!(super::canonical_future_directory(&file.join("child"))
+        .await
+        .is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn jiandu_memory_path_aliases_resolve_and_dangling_aliases_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("actual-connector");
+    tokio::fs::create_dir(&plugin).await.unwrap();
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&plugin, &alias).unwrap();
+    let resolved_plugin = super::canonical_future_directory(&plugin).await.unwrap();
+    let resolved_alias = super::canonical_future_directory(&alias).await.unwrap();
+    assert_eq!(resolved_plugin, resolved_alias);
+    let nested = super::canonical_future_directory(&alias.join("future/store"))
+        .await
+        .unwrap();
+    assert!(super::resolved_directory_contains(
+        &resolved_plugin,
+        &nested
+    ));
+    let dangling = dir.path().join("dangling");
+    std::os::unix::fs::symlink(dir.path().join("absent"), &dangling).unwrap();
+    assert!(super::canonical_future_directory(&dangling.join("child"))
+        .await
+        .is_err());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn jiandu_future_case_aliases_are_refused_before_directory_activation() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("plugins/jiandu");
+    let memory = dir.path().join("PLUGINS/JIANDU/future-store");
+    let resolved_plugin = super::canonical_future_directory(&plugin).await.unwrap();
+    let resolved_memory = super::canonical_future_directory(&memory).await.unwrap();
+    assert!(super::resolved_directory_contains(
+        &resolved_plugin,
+        &resolved_memory
+    ));
+    assert!(!plugin.exists() && !memory.exists());
+    let data_dir = dir.path().join("bamboo");
+    let (_state, installer) =
+        jiandu_installer_with_root(&data_dir, data_dir.join("plugins/JIANDU/future-store")).await;
+    assert_eq!(
+        installer
+            .jiandu_memory_path_reason(&data_dir.join("plugins/jiandu"))
+            .await,
+        Some("memory_root_overlaps_plugin")
+    );
+    // A missing child must not erase an already established distinction
+    // between existing prefixes on a case-sensitive volume.
+    let plugin = super::ResolvedDirectory {
+        path: PathBuf::from("/owned/Case/jiandu"),
+        existing_components: Path::new("/owned/Case/jiandu").components().count(),
+    };
+    let separate = super::ResolvedDirectory {
+        path: PathBuf::from("/owned/CASE/jiandu/future-store"),
+        existing_components: Path::new("/owned/CASE/jiandu").components().count(),
+    };
+    assert!(!super::resolved_directory_contains(&plugin, &separate));
+}
+
+#[cfg(windows)]
+#[test]
+fn jiandu_missing_managed_path_suffixes_are_case_insensitive() {
+    assert!(super::directory_contains(
+        Path::new(r"C:\owned\plugins\jiandu"),
+        Path::new(r"C:\owned\PLUGINS\JIANDU\memory")
+    ));
+    assert!(!super::directory_contains(
+        Path::new(r"C:\owned\plugins\jiandu"),
+        Path::new(r"C:\owned\plugins\jiandu-other")
+    ));
+}
+
+#[tokio::test]
+async fn jiandu_preflight_and_direct_install_reject_overlap_before_mutation() {
+    for suffix in ["", "canonical-store"] {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("bamboo");
+        let plugin_dir = data_dir.join("plugins/jiandu");
+        let (state, installer) =
+            jiandu_installer_with_root(&data_dir, plugin_dir.join(suffix)).await;
+        state
+            .memory_store
+            .write_session_topic("overlap-preflight", "retained", "keep existing memory")
+            .await
+            .unwrap();
+        let directory_entries = || {
+            let mut entries: Vec<_> = std::fs::read_dir(&plugin_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            entries.sort();
+            entries
+        };
+        let before_entries = directory_entries();
+        let candidate = dir.path().join("isolated-candidate");
+        tokio::fs::create_dir(&candidate).await.unwrap();
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id":"jiandu", "name":"Jiandu test connector", "version":"0.3.2", "provides":{}
+        }))
+        .unwrap();
+        let before_config = serde_json::to_value(&*state.config.read().await).unwrap();
+        {
+            let guard = installer.begin_operation().await;
+            let error = installer
+                .preflight_prepared_candidate(
+                    &manifest,
+                    &candidate,
+                    InstallDisposition::FailIfInstalled,
+                    &guard,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("memory_root_overlaps_plugin"));
+        }
+        let error = installer
+            .install(
+                &manifest,
+                &plugin_dir,
+                PluginSource::LocalDir { path: candidate },
+                InstallDisposition::FailIfInstalled,
+                Utc::now(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("memory_root_overlaps_plugin"));
+        assert_eq!(directory_entries(), before_entries);
+        assert_eq!(
+            state
+                .memory_store
+                .read_session_topic("overlap-preflight", "retained")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("keep existing memory")
+        );
+        assert!(!data_dir.join("plugins/installed.json").exists());
+        assert_eq!(
+            serde_json::to_value(&*state.config.read().await).unwrap(),
+            before_config
+        );
+    }
+}
+
+#[actix_web::test]
+async fn jiandu_delete_after_memory_root_reselection_preserves_store_registry_and_capabilities() {
+    for selection in [
+        "equal",
+        "nested",
+        #[cfg(unix)]
+        "alias",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("bamboo");
+        let (_state, installer) =
+            jiandu_installer_with_root(&data_dir, dir.path().join("independent-memory")).await;
+        // Deliberately use an actual recorded location different from the fixed
+        // managed location: deletion must guard entry.plugin_dir itself.
+        let plugin_dir = dir.path().join("legacy-jiandu-connector");
+        tokio::fs::create_dir(&plugin_dir).await.unwrap();
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "id":"jiandu", "name":"Jiandu guard fixture", "version":"0.3.2",
+            "provides":{"prompts":[{"id":"jiandu_guard_fixture", "name":"Preserve owned preset", "content":"Fixture only"}]}
+        })).unwrap();
+        let manifest: PluginManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_bytes)
+            .await
+            .unwrap();
+        installer
+            .install(
+                &manifest,
+                &plugin_dir,
+                PluginSource::LocalDir {
+                    path: plugin_dir.clone(),
+                },
+                InstallDisposition::FailIfInstalled,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        // Simulate a later server selecting this root after installation.
+        let memory_root = match selection {
+            "equal" => plugin_dir.clone(),
+            "nested" => plugin_dir.join("canonical-store"),
+            #[cfg(unix)]
+            "alias" => {
+                let alias = dir.path().join("selected-memory-alias");
+                std::os::unix::fs::symlink(&plugin_dir, &alias).unwrap();
+                alias
+            }
+            _ => unreachable!(),
+        };
+        let (state, _installer) = jiandu_installer_with_root(&data_dir, memory_root).await;
+        let note_path = state
+            .memory_store
+            .write_session_topic(
+                "overlap-guard",
+                "retained",
+                "canonical content must survive",
+            )
+            .await
+            .unwrap();
+        let registry_path = data_dir.join("plugins/installed.json");
+        let presets_path = data_dir.join("prompt-presets.json");
+        let before_registry = tokio::fs::read(&registry_path).await.unwrap();
+        let before_presets = tokio::fs::read(&presets_path).await.unwrap();
+        assert!(String::from_utf8_lossy(&before_presets).contains("jiandu_guard_fixture"));
+        let before_memory = tokio::fs::read(&note_path).await.unwrap();
+        let before_config = serde_json::to_value(&*state.config.read().await).unwrap();
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .service(web::scope("/api/v1").service(crate::routes::plugin_scope())),
+        )
+        .await;
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::delete()
+                .uri("/api/v1/plugins/jiandu")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let response: serde_json::Value = actix_web::test::read_body_json(response).await;
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("memory_root_overlaps_plugin"));
+        assert_eq!(
+            tokio::fs::read(&registry_path).await.unwrap(),
+            before_registry
+        );
+        assert_eq!(
+            tokio::fs::read(&presets_path).await.unwrap(),
+            before_presets
+        );
+        assert_eq!(tokio::fs::read(&note_path).await.unwrap(), before_memory);
+        assert_eq!(
+            tokio::fs::read(plugin_dir.join("plugin.json"))
+                .await
+                .unwrap(),
+            manifest_bytes
+        );
+        assert_eq!(
+            state
+                .memory_store
+                .read_session_topic("overlap-guard", "retained")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("canonical content must survive")
+        );
+        assert_eq!(
+            serde_json::to_value(&*state.config.read().await).unwrap(),
+            before_config
+        );
+    }
+}
+
 fn mcp_manifest_json(id: &str, version: &str, mcp_ids: &[&str]) -> String {
     let servers: Vec<serde_json::Value> = mcp_ids
         .iter()

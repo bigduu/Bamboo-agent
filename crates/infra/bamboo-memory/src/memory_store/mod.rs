@@ -116,6 +116,12 @@ impl Default for MemoryStore {
 }
 
 impl MemoryStore {
+    /// The active Jiandu canonical root, including an explicitly selected root.
+    /// External clients must share this root rather than guessing a default.
+    pub fn data_dir(&self) -> PathBuf {
+        self.store.resolver().data_dir()
+    }
+
     /// Construct a Jiandu store rooted at an explicit data directory.
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {

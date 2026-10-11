@@ -1281,14 +1281,23 @@ pub struct TrustedKey {
     pub public_key: String,
 }
 
+/// Raw Ed25519 public anchor committed by the Jiandu plugin publisher.
+pub const JIANDU_PLUGIN_PUBLIC_KEY: &str =
+    "bba9d0e5553401125f939bc3d844e891706d579a611fea9215545771d5306676";
+
 /// The official plugin-signing keys trusted by default, so an out-of-the-box
 /// `bamboo plugin install <official release url>` needs no `--allow-unsigned`
 /// for a bundle those repos' release CI signed. One entry per first-party
 /// plugin publisher; each repo commits its public half as
 /// `packaging/plugin/signing-key.pub` (nova) / `plugin/signing-key.pub`
-/// (magpie) for cross-checking.
+/// (magpie and jiandu) for cross-checking.
 fn default_trusted_keys() -> Vec<TrustedKey> {
     vec![
+        TrustedKey {
+            label: "jiandu (bigduu official)".to_string(),
+            algorithm: "ed25519".to_string(),
+            public_key: JIANDU_PLUGIN_PUBLIC_KEY.to_string(),
+        },
         TrustedKey {
             label: "nova (bigduu official)".to_string(),
             algorithm: "ed25519".to_string(),
