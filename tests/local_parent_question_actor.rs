@@ -3,13 +3,18 @@
 
 use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;
-use bamboo_domain::{ActorDirectoryPort, ParentQuestion, Role, SessionMessageEnvelope};
+use bamboo_domain::{
+    ActorActivationStatus, ActorDirectoryPort, ParentQuestion, Role, SessionMessageEnvelope,
+};
 use bamboo_storage::SessionStoreV2;
 use serde_json::{json, Value};
 use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex,
+    },
     time::Duration,
 };
 
@@ -27,6 +32,7 @@ struct Probe {
     release_first_child: AtomicBool,
     second_child_ready: AtomicBool,
     release_second_child: AtomicBool,
+    returned_reply_activation: Mutex<Option<String>>,
     wake: tokio::sync::Notify,
 }
 
@@ -52,6 +58,7 @@ fn question_in_parent(parent: &bamboo_domain::Session) -> Vec<ParentQuestion> {
 
 async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
     let body = body.into_inner();
+    let mut returned_reply_activation = None;
     let (delta, finish) = if body["model"] == "question-child" {
         let round = probe.child_calls.fetch_add(1, Ordering::SeqCst);
         let tools = body["tools"].as_array().expect("Child has tools");
@@ -166,6 +173,16 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     probe
                         .early_completion_observed
                         .store(true, Ordering::SeqCst);
+                } else {
+                    let store = SessionStoreV2::new(probe.data.clone()).await.unwrap();
+                    let activation = store
+                        .inspect_actor(ROOT_ID)
+                        .await
+                        .unwrap()
+                        .activation
+                        .expect("Root reply has a canonical Actor activation");
+                    assert!(activation.status.is_live());
+                    returned_reply_activation = Some(activation.activation_id);
                 }
                 (json!({"content":"ROOT_REPLY_SENT"}), "stop")
             }
@@ -180,9 +197,13 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
     };
     let event = json!({"id":"parent-question","object":"chat.completion.chunk",
         "choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
-    HttpResponse::Ok()
+    let response = HttpResponse::Ok()
         .content_type("text/event-stream")
-        .body(format!("data: {event}\n\ndata: [DONE]\n\n"))
+        .body(format!("data: {event}\n\ndata: [DONE]\n\n"));
+    if let Some(activation_id) = returned_reply_activation {
+        *probe.returned_reply_activation.lock().unwrap() = Some(activation_id);
+    }
+    response
 }
 
 struct Host(Child);
@@ -249,6 +270,7 @@ async fn parent_question_round_trip(complete_child_before_parent_reply: bool) {
         release_first_child: AtomicBool::new(false),
         second_child_ready: AtomicBool::new(false),
         release_second_child: AtomicBool::new(false),
+        returned_reply_activation: Mutex::new(None),
         wake: tokio::sync::Notify::new(),
     });
     let server_probe = probe.clone();
@@ -389,11 +411,34 @@ async fn parent_question_round_trip(complete_child_before_parent_reply: bool) {
     let second_cut = tokio::time::timeout(Duration::from_secs(25), async {
         loop {
             let child = store.load_session(&child_id).await.unwrap().unwrap();
+            // An unfinished child wait suppresses this no-tool final candidate
+            // before it is appended. Observe the reply provider's return and
+            // that exact Actor's durable finish instead of its discarded text.
+            // The activation identity excludes the earlier suspended run.
+            let reply_finished = if complete_child_before_parent_reply {
+                true
+            } else {
+                let returned = probe.returned_reply_activation.lock().unwrap().clone();
+                match returned {
+                    Some(activation_id) => store
+                        .inspect_actor(ROOT_ID)
+                        .await
+                        .unwrap()
+                        .activation
+                        .is_some_and(|activation| {
+                            activation.activation_id == activation_id
+                                && activation.status == ActorActivationStatus::Succeeded
+                                && activation.finished_at.is_some()
+                        }),
+                    None => false,
+                }
+            };
+            // Read the wait after the terminal proof so an earlier suspended
+            // snapshot cannot satisfy this cut before the reply's final save.
             let parent = store.load_session(ROOT_ID).await.unwrap().unwrap();
             let requests = question_in_parent(&parent);
             assert!(requests.len() <= 1, "stable question delivery id");
-            if (complete_child_before_parent_reply
-                || parent.messages.iter().any(|message| message.content == "ROOT_REPLY_SENT"))
+            if reply_finished
                 && probe.second_child_ready.load(Ordering::SeqCst)
                 && parent.last_run_status().as_deref() == Some("suspended")
                 && parent
