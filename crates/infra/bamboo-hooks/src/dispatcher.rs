@@ -99,14 +99,27 @@ impl HookDispatcher {
         honor_control_decisions: bool,
     ) -> HookDispatchReport {
         let mut report = HookDispatchReport::default();
+        let legacy = crate::shell_compatibility::legacy_shell_projection(payload, session, None);
 
         for hook in &self.hooks {
-            if hook.point() != point || !hook.matches(payload) {
+            if hook.point() != point {
                 continue;
             }
+            // A wildcard or new-name hook sees the actual call exactly once.
+            // Only old-name matchers receive the compatibility projection.
+            let selected_payload = if hook.matches(payload) {
+                payload
+            } else if let Some(projected) = legacy
+                .as_ref()
+                .filter(|legacy| hook.matches(&legacy.payload))
+            {
+                &projected.payload
+            } else {
+                continue;
+            };
 
             let started = Instant::now();
-            let result = hook.run(point, payload, session).await;
+            let result = hook.run(point, selected_payload, session).await;
             report.executions.push(HookExecution {
                 hook_name: hook.name().to_string(),
                 point,
@@ -170,4 +183,141 @@ fn unwrap_context_result(mut result: HookResult) -> (HookResult, Vec<String>) {
         result = *inner;
     }
     (result, contexts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    struct RecordingHook {
+        point: AgentHookPoint,
+        matcher: regex::Regex,
+        seen: Arc<Mutex<Vec<HookPayload>>>,
+        result: HookResult,
+    }
+
+    #[async_trait]
+    impl AgentHook for RecordingHook {
+        fn point(&self) -> AgentHookPoint {
+            self.point
+        }
+        fn matches(&self, payload: &HookPayload) -> bool {
+            match payload {
+                HookPayload::ToolExecution { tool_name, .. }
+                | HookPayload::ToolResult { tool_name, .. } => self.matcher.is_match(tool_name),
+                _ => false,
+            }
+        }
+        async fn run(
+            &self,
+            _point: AgentHookPoint,
+            payload: &HookPayload,
+            _session: &Session,
+        ) -> HookResult {
+            self.seen.lock().unwrap().push(payload.clone());
+            self.result.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_shell_policy_applies_without_duplicate_primary_or_wildcard_hooks() {
+        for control in [
+            HookResult::Deny {
+                reason: "legacy policy".into(),
+            },
+            HookResult::Ask,
+        ] {
+            let mut dispatcher = HookDispatcher::new();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            for (matcher, result) in [
+                ("^exec_command$", HookResult::Allow),
+                (".*", HookResult::Continue),
+                ("^(exec_command|Bash)$", HookResult::Continue),
+                ("^Bash$", control.clone()),
+            ] {
+                dispatcher.register(Arc::new(RecordingHook {
+                    point: AgentHookPoint::BeforeToolExecution,
+                    matcher: regex::Regex::new(matcher).unwrap(),
+                    seen: seen.clone(),
+                    result,
+                }));
+            }
+            let payload = HookPayload::ToolExecution {
+                tool_name: "exec_command".into(),
+                tool_call_id: "exec-call".into(),
+                parsed_args: json!({"cmd":"cargo test"}),
+            };
+            let report = dispatcher
+                .run_hooks(
+                    AgentHookPoint::BeforeToolExecution,
+                    &payload,
+                    &Session::new("test", "model"),
+                )
+                .await;
+            assert_eq!(report.outcome.decision, control);
+            assert_eq!(report.executions.len(), 4);
+            let seen = seen.lock().unwrap();
+            assert_eq!(&seen[..3], &[payload.clone(), payload.clone(), payload]);
+            assert!(
+                matches!(&seen[3], HookPayload::ToolExecution { tool_name, parsed_args, .. }
+                if tool_name == "Bash" && parsed_args["command"] == "cargo test" && parsed_args.get("cmd").is_none())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_post_tool_hooks_resolve_stdin_operation_from_original_call() {
+        use bamboo_agent_core::{FunctionCall, Message, ToolCall};
+        for (input, legacy_name) in [
+            (json!({"session_id":"exec", "chars":""}), "BashOutput"),
+            (json!({"session_id":"exec", "chars":"yes\n"}), "BashInput"),
+            (
+                json!({"session_id":"exec", "chars":"", "eof":true}),
+                "BashInput",
+            ),
+            (json!({"session_id":"exec", "chars":"\u{3}"}), "KillShell"),
+        ] {
+            let mut session = Session::new("test", "model");
+            session.messages.push(Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: "stdin-call".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "write_stdin".into(),
+                        arguments: input.to_string(),
+                    },
+                }]),
+            ));
+            let payload = HookPayload::ToolResult {
+                tool_name: "write_stdin".into(),
+                tool_call_id: "stdin-call".into(),
+                outcome: bamboo_domain::HookToolOutcome {
+                    success: true,
+                    result: Some("done".into()),
+                    error: None,
+                    needs_human: false,
+                    duration_ms: 1,
+                },
+            };
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut dispatcher = HookDispatcher::new();
+            dispatcher.register(Arc::new(RecordingHook {
+                point: AgentHookPoint::AfterToolExecution,
+                matcher: regex::Regex::new(&format!("^{legacy_name}$")).unwrap(),
+                seen: seen.clone(),
+                result: HookResult::Ask,
+            }));
+            let report = dispatcher
+                .run_hooks(AgentHookPoint::AfterToolExecution, &payload, &session)
+                .await;
+            assert_eq!(report.outcome.decision, HookResult::Ask);
+            assert!(
+                matches!(&seen.lock().unwrap()[0], HookPayload::ToolResult { tool_name, .. } if tool_name == legacy_name)
+            );
+        }
+    }
 }

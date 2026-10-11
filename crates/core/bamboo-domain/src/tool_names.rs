@@ -220,6 +220,17 @@ pub fn normalize_builtin_alias(name: &str) -> &str {
         .unwrap_or(name)
 }
 
+/// Preserve a disabled legacy shell capability after the model surface rename.
+/// Call only after resolving an exact registered identity; foreign tools with
+/// the same suffix must retain their own policies.
+pub fn legacy_shell_replacement(execution_name: &str) -> Option<&'static str> {
+    match execution_name {
+        "Bash" => Some("exec_command"),
+        "BashInput" | "BashOutput" | "KillShell" => Some("write_stdin"),
+        _ => None,
+    }
+}
+
 /// Checks if a tool reference is a built-in tool
 pub fn is_builtin_tool(value: &str) -> bool {
     normalize_tool_ref(value).is_some()
@@ -228,6 +239,14 @@ pub fn is_builtin_tool(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_shell_disabled_policy_only_expands_exact_builtin_names() {
+        assert_eq!(legacy_shell_replacement("Bash"), Some("exec_command"));
+        assert_eq!(legacy_shell_replacement("BashOutput"), Some("write_stdin"));
+        assert_eq!(legacy_shell_replacement("vendor::Bash"), None);
+        assert_eq!(legacy_shell_replacement("exec_command"), None);
+    }
 
     #[test]
     fn test_normalize_tool_ref_accepts_claude_style_names() {

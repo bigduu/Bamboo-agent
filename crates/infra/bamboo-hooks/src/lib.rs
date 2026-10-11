@@ -8,6 +8,7 @@ mod command_executor;
 mod configured;
 mod dispatcher;
 pub mod portable;
+mod shell_compatibility;
 
 pub use bamboo_config::LifecycleScriptRunner;
 pub use configured::{

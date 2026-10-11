@@ -216,6 +216,10 @@ fn resolve_catalog_with_activation(
         .filter_map(|reference| {
             resolve_tool_reference_name(reference, |name| by_execution_name.contains_key(name))
         })
+        .flat_map(|name| {
+            let replacement = bamboo_domain::legacy_shell_replacement(&name).map(str::to_owned);
+            std::iter::once(name).chain(replacement)
+        })
         .collect::<std::collections::BTreeSet<_>>();
     by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
     prefer_delegated_plan_tool(session, &mut by_execution_name);
@@ -333,10 +337,19 @@ mod live_disabled_tests {
             self.execute(call).await
         }
         fn list_tools(&self) -> Vec<ToolSchema> {
-            ["alpha_tool", "beta_tool", "load_skill"]
-                .into_iter()
-                .map(schema)
-                .collect()
+            [
+                "alpha_tool",
+                "beta_tool",
+                "load_skill",
+                "Bash",
+                "BashOutput",
+                "exec_command",
+                "write_stdin",
+                "vendor::Bash",
+            ]
+            .into_iter()
+            .map(schema)
+            .collect()
         }
     }
 
@@ -374,6 +387,25 @@ mod live_disabled_tests {
         // alpha_tool still offered. Re-enable would restore it (list rebuilt fresh).
         assert!(!offered(&config, &tools, &session, "beta_tool"));
         assert!(offered(&config, &tools, &session, "alpha_tool"));
+    }
+
+    #[test]
+    fn legacy_disabled_shell_names_filter_replacements_without_foreign_suffix_fallback() {
+        let tools = TwoTools;
+        let session = Session::new("shell-policy", "m");
+        let mut config = AgentLoopConfig::default();
+        let present = |config: &AgentLoopConfig, name: &str| {
+            resolve_classified_tool_catalog_for_session(config, &tools, &session)
+                .iter()
+                .any(|entry| entry.execution_name() == name)
+        };
+        config.disabled_tools = BTreeSet::from(["Bash".into(), "BashOutput".into()]);
+        assert!(!present(&config, "exec_command"));
+        assert!(!present(&config, "write_stdin"));
+
+        config.disabled_tools = BTreeSet::from(["vendor::Bash".into()]);
+        assert!(present(&config, "exec_command"));
+        assert!(present(&config, "write_stdin"));
     }
 
     #[test]

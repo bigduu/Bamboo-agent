@@ -48,6 +48,9 @@ impl LocalChildTools {
             }) {
                 subagent_denied |= name == "SubAgent";
                 allowed.remove(&name);
+                if let Some(replacement) = bamboo_domain::legacy_shell_replacement(&name) {
+                    allowed.remove(replacement);
+                }
             }
         }
         let read_only = session
@@ -312,7 +315,17 @@ mod tests {
         stall: AtomicBool,
         entered: tokio::sync::Notify,
     }
-    const NAMES: &[&str] = &["Read", "Write", "Bash", "Task", "foreign::Read"];
+    const NAMES: &[&str] = &[
+        "Read",
+        "Write",
+        "Bash",
+        "BashOutput",
+        "exec_command",
+        "write_stdin",
+        "Task",
+        "foreign::Read",
+        "foreign::Bash",
+    ];
     #[async_trait]
     impl ToolExecutor for Base {
         async fn execute(&self, _: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -507,6 +520,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_shell_disabled_names_also_constrain_new_child_tools() {
+        let f = Fixture::new().await;
+        let tools = f.tools(&f.child, NAMES, &["Bash".into(), "BashOutput".into()]);
+        assert!(!tools.owns_exact_tool("exec_command"));
+        assert!(!tools.owns_exact_tool("write_stdin"));
+        let tools = f.tools(&f.child, NAMES, &["foreign::Bash".into()]);
+        assert!(tools.owns_exact_tool("exec_command"));
+        assert!(tools.owns_exact_tool("write_stdin"));
+    }
+
+    #[tokio::test]
     async fn readonly_child_denies_direct_side_effect_calls_in_auto_and_bypass() {
         let f = Fixture::new().await;
         let mut child = f.child.clone();
@@ -519,6 +543,8 @@ mod tests {
             for name in [
                 "Write",
                 "Bash",
+                "exec_command",
+                "write_stdin",
                 "Task",
                 "foreign::Read",
                 "SubAgent",
