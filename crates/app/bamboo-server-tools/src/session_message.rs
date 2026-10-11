@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
+use bamboo_domain::SessionInboxError;
 use bamboo_engine::{SessionMessenger, SessionMessengerError, SessionMessengerReceipt};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -122,7 +123,13 @@ impl Tool for SessionMessageTool {
 fn peer_error(error: SessionMessengerError) -> ToolError {
     match error {
         SessionMessengerError::InvalidEnvelope(message) => ToolError::InvalidArguments(message),
-        error => ToolError::Execution(error.to_string()),
+        SessionMessengerError::Inbox(
+            error @ (SessionInboxError::PayloadTooLarge { .. }
+            | SessionInboxError::BacklogFull { .. }),
+        ) => ToolError::Execution(error.to_string()),
+        // Missing, forbidden and failed canonical reads must not reveal whether
+        // an arbitrary target exists, nor expose its private storage diagnostics.
+        _ => ToolError::Execution("peer target is unavailable".into()),
     }
 }
 
@@ -208,6 +215,7 @@ mod tests {
 
     struct Fixture {
         _home: tempfile::TempDir,
+        store: Arc<SessionStoreV2>,
         inbox: Arc<FileSessionInbox>,
         activation: Arc<Activation>,
         tool: SessionMessageTool,
@@ -234,12 +242,13 @@ mod tests {
                 ..Activation::default()
             });
             let tool = SessionMessageTool::new(Arc::new(SessionMessenger::new(
-                store,
+                store.clone(),
                 inbox.clone(),
                 activation.clone(),
             )));
             Self {
                 _home: home,
+                store,
                 inbox,
                 activation,
                 tool,
@@ -325,6 +334,70 @@ mod tests {
                 .pending,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn unavailable_targets_do_not_disclose_existence_or_project() {
+        let fixture = Fixture::new(false).await;
+        let foreign = Session::new("private-foreign-root", "model");
+        let mut foreign_project = Session::new("private-project-root", "model");
+        foreign_project.set_project_id_meta("private-project");
+        for root in [&foreign, &foreign_project] {
+            fixture.store.save_session(root).await.unwrap();
+        }
+        let root = fixture
+            .store
+            .load_session("peer-root")
+            .await
+            .unwrap()
+            .unwrap();
+        let deleted = Session::new_child_of("deleted-peer", &root, "model", "deleted task");
+        fixture.store.save_session(&deleted).await.unwrap();
+        assert!(fixture.store.delete_session(&deleted.id).await.unwrap());
+
+        for target in [
+            "unknown-peer",
+            &deleted.id,
+            &foreign.id,
+            &foreign_project.id,
+        ] {
+            let mut args = fixture.send();
+            args["target_session_id"] = json!(target);
+            let error = fixture.tool.invoke(args, fixture.ctx()).await.unwrap_err();
+            let ToolError::Execution(message) = error else {
+                panic!("every unavailable target must return the same public error class")
+            };
+            assert_eq!(message, "peer target is unavailable");
+        }
+        assert!(fixture.activation.requests.lock().await.is_empty());
+        for target in [&fixture.recipient.id, &foreign.id, &foreign_project.id] {
+            let backlog = fixture.inbox.inspect(target).await.unwrap();
+            assert_eq!(backlog.generation, 0);
+            assert_eq!(backlog.pending, 0);
+        }
+    }
+
+    #[test]
+    fn public_peer_errors_omit_private_canonical_and_inbox_diagnostics() {
+        let private = "private-root/private-project/private-storage-path";
+        for error in [
+            SessionMessengerError::SourceNotFound(private.into()),
+            SessionMessengerError::TargetNotFound(private.into()),
+            SessionMessengerError::Unauthorized {
+                source_session_id: private.into(),
+                target: private.into(),
+            },
+            SessionMessengerError::Storage(private.into()),
+            SessionMessengerError::Inbox(SessionInboxError::TargetNotFound(private.into())),
+            SessionMessengerError::Inbox(SessionInboxError::Storage(private.into())),
+            SessionMessengerError::Inbox(SessionInboxError::InvalidClaim(private.into())),
+            SessionMessengerError::Inbox(SessionInboxError::AdmissionCancelled),
+        ] {
+            let ToolError::Execution(message) = peer_error(error) else {
+                panic!("private peer failures must use one public error class")
+            };
+            assert_eq!(message, "peer target is unavailable");
+        }
     }
 
     #[tokio::test]
