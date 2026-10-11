@@ -1503,6 +1503,39 @@ impl SessionInboxPort for FileSessionInbox {
         .await
     }
 
+    async fn deliver_peer_message(
+        &self,
+        envelope: &SessionMessageEnvelope,
+        source: &bamboo_domain::ActorSession,
+        target: &bamboo_domain::ActorSession,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        if envelope.source
+            != (SessionMessageSource::Session {
+                session_id: source.actor_id.clone(),
+            })
+            || envelope.target_session_id != target.actor_id
+            || envelope.kind != bamboo_domain::SessionMessageKind::PeerMessage
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "peer delivery identity differs from its observations".into(),
+            ));
+        }
+        let authority = self
+            .sessions
+            .lock_peer_delivery(source, target)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        self.deliver_with_lifecycle_held(
+            envelope,
+            InboxAuthority::Peer { _guard: authority },
+            None,
+            Some(SessionInboxActivationIntent::new(
+                SessionActivationPolicy::InterruptSpecificWait,
+            )),
+        )
+        .await
+    }
+
     async fn mark_activation_eligible(
         &self,
         target_session_id: &str,
