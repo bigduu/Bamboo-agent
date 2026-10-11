@@ -236,43 +236,51 @@ async fn context_management_patch_is_published_without_restart() {
             .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
     )
     .await;
-    let patch = serde_json::json!({
-        "context_management": {
-            "strategy": "retrieval_window",
-            "retrieval_window": {
-                "history_tool_required": true,
-                "fallback_strategy": "none"
+    for (strategy_name, strategy) in [
+        (
+            "retrieval_window",
+            bamboo_config::ContextManagementStrategy::RetrievalWindow,
+        ),
+        (
+            "message_summary",
+            bamboo_config::ContextManagementStrategy::MessageSummary,
+        ),
+    ] {
+        let patch = serde_json::json!({
+            "context_management": {
+                "strategy": strategy_name,
+                "retrieval_window": {
+                    "history_tool_required": true,
+                    "fallback_strategy": "none"
+                }
             }
-        }
-    });
+        });
 
-    let saved: serde_json::Value = test::call_and_read_body_json(
-        &app,
-        test::TestRequest::post()
-            .uri("/bamboo/config")
-            .set_json(patch)
-            .to_request(),
-    )
-    .await;
-    assert_eq!(
-        saved["context_management"]["strategy"], "retrieval_window",
-        "the save response must reflect the live strategy"
-    );
-    assert_eq!(
-        app_state.config.read().await.context_management.strategy,
-        bamboo_config::ContextManagementStrategy::RetrievalWindow,
-        "the committed strategy must become live without a restart"
-    );
+        let saved: serde_json::Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::post()
+                .uri("/bamboo/config")
+                .set_json(patch)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            saved["context_management"]["strategy"], strategy_name,
+            "the save response must reflect the live strategy"
+        );
+        assert_eq!(
+            app_state.config.read().await.context_management.strategy,
+            strategy,
+            "the committed strategy must become live without a restart"
+        );
 
-    let reloaded: serde_json::Value = test::call_and_read_body_json(
-        &app,
-        test::TestRequest::get().uri("/bamboo/config").to_request(),
-    )
-    .await;
-    assert_eq!(
-        reloaded["context_management"]["strategy"],
-        "retrieval_window"
-    );
+        let reloaded: serde_json::Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/bamboo/config").to_request(),
+        )
+        .await;
+        assert_eq!(reloaded["context_management"]["strategy"], strategy_name);
+    }
 }
 
 #[actix_web::test]

@@ -23,9 +23,14 @@ impl Tool for CompactContextTool {
     }
 
     fn description(&self) -> &str {
-        "Manually compress conversation history to free up context window space. \
+        "Manually compress conversation history using the configured summary or \
+         message_summary strategy to free up context window space. \
          Use at natural task boundaries (after finishing a feature, before starting a new topic). \
-         Optionally provide custom instructions to control what the summary focuses on."
+         message_summary summarizes historical user/assistant text, retains the current user \
+         request, and removes completed tool exchanges from the next model context. \
+         In message_summary mode, incomplete tool chains defer compression until they finish. \
+         The summary strategy accepts optional focus instructions; message_summary ignores \
+         tool arguments, including custom instructions."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -34,7 +39,7 @@ impl Tool for CompactContextTool {
             "properties": {
                 "instructions": {
                     "type": "string",
-                    "description": "Optional custom instructions for what to focus on in the summary. \
+                    "description": "Optional focus instructions for the summary strategy (ignored by message_summary). \
                      Examples: 'Preserve variable names and function signatures', \
                      'Focus on open issues and blockers', 'Keep only active task status'"
                 }

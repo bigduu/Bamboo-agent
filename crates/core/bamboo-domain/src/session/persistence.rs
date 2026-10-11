@@ -440,7 +440,7 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         Ok(None)
     }
 
-    /// Atomically commit a staged retrieval-window transcript rewrite.
+    /// Atomically commit a staged archive transcript rewrite.
     ///
     /// `expected_base` is the exact pre-archive Session used for planning.
     /// Implementations must compare it with the latest durable transcript while
@@ -448,7 +448,9 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     /// rewrite is present, they must perform no save, rebase `staged` onto that
     /// durable snapshot, and return [`RetrievalWindowCheckpointOutcome::Rebased`].
     /// Otherwise they must preserve the staged message archive flags and commit
-    /// them with the compression event and model-context reset.
+    /// them with the compression event and model-context reset. The built-in
+    /// implementation also accepts a MessageSummary archive through this same
+    /// boundary, preserving raw history while replacing its derived summary.
     ///
     /// There is no safe fallback through the ordinary append-only checkpoint,
     /// because that path deliberately restores durable message clones and would

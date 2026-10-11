@@ -1549,7 +1549,7 @@ impl LockedSessionStore {
         result
     }
 
-    /// Commit a retrieval-window rewrite without passing its message mutations
+    /// Commit an archive rewrite without passing its message mutations
     /// through the ordinary append-only reconciliation path.
     ///
     /// A concurrent durable transcript change returns a clean rebased Session
@@ -1563,7 +1563,15 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session) + Send,
     {
-        validate_staged_retrieval_window_transition(expected_base, staged)?;
+        if staged
+            .compression_events
+            .last()
+            .is_some_and(|event| event.kind == bamboo_domain::CompressionEventKind::MessageSummary)
+        {
+            validate_staged_message_summary_transition(expected_base, staged)?;
+        } else {
+            validate_staged_retrieval_window_transition(expected_base, staged)?;
+        }
         let _guard = self.acquire_lock(&staged.id).await;
         let latest = self.storage.load_session(&staged.id).await?;
 
@@ -2856,6 +2864,154 @@ fn validate_staged_retrieval_window_transition(
     Ok(())
 }
 
+/// Message-only summaries share the existing archive CAS/publication boundary.
+/// Validate their narrower projection separately: raw history is immutable,
+/// every completed tool exchange leaves the active view, and only derived
+/// compression state may change with the provider-continuation reset.
+fn validate_staged_message_summary_transition(
+    expected: &Session,
+    staged: &Session,
+) -> std::io::Result<()> {
+    use bamboo_domain::{CompressionEventKind, ModelContextResetReason, Role};
+
+    if expected.id != staged.id || expected.messages.len() != staged.messages.len() {
+        return Err(invalid_retrieval_window_checkpoint(
+            "message-summary checkpoint must preserve the Session ID and raw message array",
+        ));
+    }
+    if staged.compression_events.len() != expected.compression_events.len().saturating_add(1) {
+        return Err(invalid_retrieval_window_checkpoint(
+            "message-summary checkpoint must append exactly one compression event",
+        ));
+    }
+    let event = staged
+        .compression_events
+        .last()
+        .expect("validated event count");
+    if event.kind != CompressionEventKind::MessageSummary
+        || event.id.is_empty()
+        || expected
+            .compression_events
+            .iter()
+            .any(|prior| prior.id == event.id)
+    {
+        return Err(invalid_retrieval_window_checkpoint(
+            "message-summary checkpoint has an invalid archive event",
+        ));
+    }
+    let latest_user_id = expected
+        .messages
+        .iter()
+        .rev()
+        .find(|message| !message.compressed && message.role == Role::User)
+        .map(|message| message.id.as_str());
+    let mut canonical = expected.clone();
+    let mut newly_archived = 0usize;
+    let mut calls = std::collections::HashSet::new();
+    let mut results = std::collections::HashSet::new();
+    for (before, canonical_message) in expected.messages.iter().zip(&mut canonical.messages) {
+        if before.compressed {
+            continue;
+        }
+        let has_calls = before
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty());
+        let has_tool_protocol =
+            has_calls || before.tool_call_id.is_some() || before.role == Role::Tool;
+        let generated_recovery = before.role == Role::Assistant
+            && before.content.starts_with("[post-compaction-recovery]\n");
+        let should_archive = before.role != Role::System
+            && Some(before.id.as_str()) != latest_user_id
+            && (!before.never_compress || generated_recovery);
+        if has_tool_protocol && (before.never_compress || !should_archive) {
+            return Err(invalid_retrieval_window_checkpoint(
+                "message-summary checkpoint cannot retain active tool protocol",
+            ));
+        }
+        if has_calls {
+            if before.role != Role::Assistant {
+                return Err(invalid_retrieval_window_checkpoint(
+                    "message-summary checkpoint has tool calls outside an assistant message",
+                ));
+            }
+            for call in before.tool_calls.iter().flatten() {
+                if call.id.is_empty() || !calls.insert(call.id.as_str()) {
+                    return Err(invalid_retrieval_window_checkpoint(
+                        "message-summary checkpoint has empty or duplicate tool call identifiers",
+                    ));
+                }
+            }
+        }
+        if before.role == Role::Tool {
+            let id = before
+                .tool_call_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    invalid_retrieval_window_checkpoint(
+                        "message-summary checkpoint has an uncorrelated tool result",
+                    )
+                })?;
+            if !results.insert(id) {
+                return Err(invalid_retrieval_window_checkpoint(
+                    "message-summary checkpoint has duplicate tool results",
+                ));
+            }
+        } else if before.tool_call_id.is_some() {
+            return Err(invalid_retrieval_window_checkpoint(
+                "message-summary checkpoint has a tool result identifier outside a tool message",
+            ));
+        }
+        if should_archive {
+            if before.compressed_by_event_id.is_some() {
+                return Err(invalid_retrieval_window_checkpoint(
+                    "message-summary checkpoint has a pre-existing active archive correlation",
+                ));
+            }
+            canonical_message.compressed = true;
+            canonical_message.compressed_by_event_id = Some(event.id.clone());
+            newly_archived += 1;
+        }
+    }
+    if calls != results || newly_archived == 0 || event.messages_compressed != newly_archived {
+        return Err(invalid_retrieval_window_checkpoint(
+            "message-summary checkpoint must archive complete tool chains with an exact event count",
+        ));
+    }
+    if let Some(summary) = staged.conversation_summary.as_ref() {
+        if summary.content.trim().is_empty()
+            || summary.message_count != newly_archived
+            || summary.token_count != event.summary_tokens
+        {
+            return Err(invalid_retrieval_window_checkpoint(
+                "message-summary checkpoint has inconsistent summary metadata",
+            ));
+        }
+    }
+    canonical.compression_events.push(event.clone());
+    canonical
+        .conversation_summary
+        .clone_from(&staged.conversation_summary);
+    canonical.token_usage.clone_from(&staged.token_usage);
+    canonical.updated_at = staged.updated_at;
+    canonical.force_manual_compression = None;
+    canonical
+        .metadata
+        .remove(RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+    canonical.reset_model_context_epoch(ModelContextResetReason::Compression);
+    let canonical = serde_json::to_vec(&canonical)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let staged = serde_json::to_vec(staged)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if canonical != staged {
+        return Err(invalid_retrieval_window_checkpoint(
+            "message-summary checkpoint changed raw history, protected anchors, or state outside the compression projection and provider reset",
+        ));
+    }
+    Ok(())
+}
+
 fn retrieval_window_base_matches(expected: &Session, durable: &Session) -> std::io::Result<bool> {
     if expected.id != durable.id || durable.messages.len() > expected.messages.len() {
         return Ok(false);
@@ -4049,6 +4205,102 @@ mod tests {
         staged.compression_events.push(event);
         staged.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
         staged
+    }
+
+    fn message_summary_fixture(id: &str) -> (Session, Session) {
+        use bamboo_domain::{
+            CompressionEvent, CompressionEventKind, CompressionTriggerType, ConversationSummary,
+            FunctionCall, Message, ModelContextResetReason, ToolCall,
+        };
+
+        let mut expected = fresh(id);
+        expected.add_message(Message::system("Keep system policy"));
+        expected.add_message(Message::user("Historical request"));
+        let mut assistant = Message::assistant("Historical assistant prose", None);
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "summary-tool-call".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "skills_read".into(),
+                arguments: "{\"path\":\"skill.md\"}".into(),
+            },
+        }]);
+        expected.add_message(assistant);
+        expected.add_message(Message::tool_result("summary-tool-call", "Raw tool output"));
+        let mut recovery = Message::assistant(
+            "[post-compaction-recovery]\nOld tool-derived recovery",
+            None,
+        );
+        recovery.never_compress = true;
+        expected.add_message(recovery);
+        let mut anchor = Message::assistant("Protected prose anchor", None);
+        anchor.never_compress = true;
+        expected.add_message(anchor);
+        expected.add_message(Message::user("Current user request"));
+        expected.force_manual_compression = Some("Keep the user intent".into());
+        expected.metadata.insert(
+            RESPONSES_PREVIOUS_RESPONSE_ID_KEY.into(),
+            "response-before-summary".into(),
+        );
+        let boundary =
+            bamboo_domain::provider_transcript_boundary_sha256(Some("test"), Some("openai"))
+                .unwrap();
+        expected
+            .activate_provider_transcript_route(
+                bamboo_domain::ProviderFamily::OpenAi,
+                bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                &boundary,
+            )
+            .unwrap();
+
+        let mut staged = expected.clone();
+        let mut event = CompressionEvent::new(
+            4,
+            1,
+            85.0,
+            40.0,
+            20,
+            CompressionTriggerType::Manual,
+            2.0,
+            None,
+            0,
+        );
+        event.kind = CompressionEventKind::MessageSummary;
+        for message in &mut staged.messages[1..5] {
+            message.compressed = true;
+            message.compressed_by_event_id = Some(event.id.clone());
+        }
+        staged.compression_events.push(event);
+        staged.conversation_summary = Some(ConversationSummary::new(
+            "User and assistant prose summary",
+            4,
+            20,
+        ));
+        staged.force_manual_compression = None;
+        staged.metadata.remove(RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+        staged.reset_model_context_epoch(ModelContextResetReason::Compression);
+        (expected, staged)
+    }
+
+    struct FailingMessageSummaryStorage {
+        inner: Arc<dyn Storage>,
+        attempted_saves: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for FailingMessageSummaryStorage {
+        async fn save_session(&self, _: &Session) -> std::io::Result<()> {
+            self.attempted_saves.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("injected archive save failure"))
+        }
+
+        async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_session(id).await
+        }
+
+        async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(id).await
+        }
     }
 
     fn typed_permission_result(
@@ -6016,6 +6268,202 @@ mod tests {
             saved.metadata.get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY),
             Some(&serde_json::to_string(&occurrence).unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn message_summary_checkpoint_commits_raw_history_and_publishes_only_after_save() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let (expected, mut staged) = message_summary_fixture("message-summary-checkpoint");
+        storage.save_session(&expected).await.unwrap();
+        let published = std::sync::Mutex::new(None);
+
+        let outcome = store
+            .checkpoint_retrieval_window_and_publish(&expected, &mut staged, |saved| {
+                *published.lock().unwrap() = Some(saved.clone());
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Committed);
+        let saved = storage.load_session(&expected.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(published.lock().unwrap().as_ref().unwrap()).unwrap()
+        );
+        for (before, after) in expected.messages.iter().zip(&saved.messages) {
+            let mut original = after.clone();
+            original.compressed = before.compressed;
+            original
+                .compressed_by_event_id
+                .clone_from(&before.compressed_by_event_id);
+            assert_eq!(
+                serde_json::to_value(before).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+        }
+        assert!(saved.messages[1..5]
+            .iter()
+            .all(|message| message.compressed));
+        assert!(
+            !saved.messages[5].compressed,
+            "explicit prose anchor stays active"
+        );
+        assert!(
+            !saved.messages[6].compressed,
+            "current user request stays active"
+        );
+        assert_eq!(
+            saved.provider_transcript.last_reset_reason(),
+            Some(bamboo_domain::ProviderTranscriptResetReason::Compression)
+        );
+        assert!(!saved
+            .metadata
+            .contains_key(RESPONSES_PREVIOUS_RESPONSE_ID_KEY));
+    }
+
+    #[tokio::test]
+    async fn message_summary_checkpoint_accepts_an_unpersisted_midturn_suffix() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let (expected, mut staged) = message_summary_fixture("message-summary-local-suffix");
+        let mut durable_prefix = expected.clone();
+        durable_prefix.messages.truncate(2);
+        storage.save_session(&durable_prefix).await.unwrap();
+
+        let outcome = store
+            .checkpoint_retrieval_window_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Committed);
+        let saved = storage.load_session(&expected.id).await.unwrap().unwrap();
+        assert_eq!(saved.messages.len(), expected.messages.len());
+        assert!(saved.messages[1..5]
+            .iter()
+            .all(|message| message.compressed));
+        assert_eq!(saved.messages[6].content, "Current user request");
+        assert!(!saved.messages[6].compressed);
+    }
+
+    #[tokio::test]
+    async fn message_summary_checkpoint_failed_save_keeps_durable_history_and_cached_projection() {
+        let (_temp, storage) = make_storage().await;
+        let (expected, mut staged) = message_summary_fixture("message-summary-failed-save");
+        storage.save_session(&expected).await.unwrap();
+        let failing = Arc::new(FailingMessageSummaryStorage {
+            inner: storage.clone(),
+            attempted_saves: AtomicUsize::new(0),
+        });
+        let store = LockedSessionStore::new(failing.clone());
+        let cached = std::sync::Mutex::new(expected.clone());
+
+        let error = store
+            .checkpoint_retrieval_window_and_publish(&expected, &mut staged, |saved| {
+                *cached.lock().unwrap() = saved.clone();
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "injected archive save failure");
+        assert_eq!(failing.attempted_saves.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            serde_json::to_value(&*cached.lock().unwrap()).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let saved = storage.load_session(&expected.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn message_summary_checkpoint_rebases_concurrent_durable_changes_without_writing_or_publishing(
+    ) {
+        for append in [false, true] {
+            let (_temp, storage) = make_storage().await;
+            let store = LockedSessionStore::new(storage.clone());
+            let (expected, mut staged) = message_summary_fixture("message-summary-concurrent-base");
+            storage.save_session(&expected).await.unwrap();
+            let mut durable = expected.clone();
+            if append {
+                durable.add_message(bamboo_domain::Message::user("Concurrent current request"));
+            } else {
+                durable.messages[3].content = "Concurrent corrected tool output".into();
+            }
+            storage.save_session(&durable).await.unwrap();
+            let published = AtomicBool::new(false);
+
+            let outcome = store
+                .checkpoint_retrieval_window_and_publish(&expected, &mut staged, |_| {
+                    published.store(true, Ordering::SeqCst);
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+            assert!(!published.load(Ordering::SeqCst));
+            assert_eq!(
+                serde_json::to_value(&staged).unwrap(),
+                serde_json::to_value(&durable).unwrap()
+            );
+            let saved = storage.load_session(&expected.id).await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(&saved).unwrap(),
+                serde_json::to_value(&durable).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn message_summary_checkpoint_rejects_raw_rewrites_and_incomplete_or_retained_tool_protocol() {
+        let (expected, valid) = message_summary_fixture("message-summary-invalid-projection");
+        validate_staged_message_summary_transition(&expected, &valid).unwrap();
+        for mutation in 0..9 {
+            let mut staged = valid.clone();
+            match mutation {
+                0 => staged.messages[3].content = "Rewritten raw tool output".into(),
+                1 => {
+                    staged.messages[3].compressed = false;
+                    staged.messages[3].compressed_by_event_id = None;
+                }
+                2 | 3 => {
+                    let index = if mutation == 2 { 5 } else { 6 };
+                    staged.messages[index].compressed = true;
+                    staged.messages[index].compressed_by_event_id =
+                        Some(staged.compression_events[0].id.clone());
+                    staged.compression_events[0].messages_compressed += 1;
+                }
+                4 => staged
+                    .messages
+                    .push(bamboo_domain::Message::assistant("Injected recovery", None)),
+                5 => {
+                    staged.metadata.insert(
+                        RESPONSES_PREVIOUS_RESPONSE_ID_KEY.into(),
+                        "stale-response".into(),
+                    );
+                }
+                6 => staged.provider_transcript = expected.provider_transcript.clone(),
+                7 => staged.compression_events[0].messages_compressed = 3,
+                8 => staged.messages[0].content = "Rewritten system policy".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_staged_message_summary_transition(&expected, &staged).is_err(),
+                "accepted forbidden projection mutation {mutation}"
+            );
+        }
+        let mut incomplete = expected.clone();
+        incomplete.messages[3].tool_call_id = Some("orphan-result".into());
+        let mut staged = valid.clone();
+        staged.messages[3].tool_call_id = Some("orphan-result".into());
+        assert!(validate_staged_message_summary_transition(&incomplete, &staged).is_err());
+        let mut protected = expected.clone();
+        protected.messages[3].never_compress = true;
+        let mut staged = valid;
+        staged.messages[3].never_compress = true;
+        assert!(validate_staged_message_summary_transition(&protected, &staged).is_err());
     }
 
     #[tokio::test]
