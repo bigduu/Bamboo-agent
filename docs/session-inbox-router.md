@@ -28,6 +28,10 @@ an authorized target. Reply derives the recipient and thread from an exact,
 canonical peer message already saved in the caller's transcript. A guessed id
 or a provider-supplied metadata object cannot authorize a reply.
 
+The tool uses one unavailable-target error for missing, forbidden or failed
+canonical targets, so guesses cannot disclose foreign Session existence or
+private storage diagnostics. Internal Messenger errors remain typed.
+
 Delivery retains both observed Session birth identities through the existing
 lifecycle-locked Inbox commit. Deleting and recreating either participant with
 the same public id rejects the stale send or reply. Custom Inbox backends must
