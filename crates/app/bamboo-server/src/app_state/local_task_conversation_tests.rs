@@ -580,12 +580,17 @@ async fn installed_root_subagent(
 #[tokio::test]
 async fn native_subagent_installed_root_surface_creates_inspects_and_cancels_real_child() {
     let home = tempfile::tempdir().unwrap();
+    // The profile catalog deliberately rejects symlink ancestors. In particular,
+    // macOS's default /var temp prefix is an alias, not a valid catalog root.
+    // Author this fixture's data home as its physical path, just as the catalog
+    // fixtures do; do not relax the production no-follow boundary.
+    let home_dir = home.path().canonicalize().unwrap();
     let (send, mut requests) = mpsc::unbounded_channel();
     let provider = Arc::new(ConversationProvider { requests: send });
-    let mut config = Config::from_data_dir(Some(home.path().to_path_buf()));
+    let mut config = Config::from_data_dir(Some(home_dir.clone()));
     config.provider = PROVIDER.into();
     config.subagents_mut().max_concurrent = Some(1);
-    let state = AppState::new_with_provider(home.path().to_path_buf(), config, provider.clone())
+    let state = AppState::new_with_provider(home_dir.clone(), config, provider.clone())
         .await
         .unwrap();
     state.provider_registry.replace_with(ProviderRegistry::new(
@@ -596,7 +601,7 @@ async fn native_subagent_installed_root_surface_creates_inspects_and_cancels_rea
         .project_store
         .create("Native SubAgent entry", None)
         .unwrap();
-    let workspace = home.path().join("workspace");
+    let workspace = home_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let workspace = std::fs::canonicalize(workspace).unwrap();
     let parent_id = format!("local-entry-root-{}", uuid::Uuid::new_v4());
@@ -609,6 +614,19 @@ async fn native_subagent_installed_root_surface_creates_inspects_and_cancels_rea
     parent.title_generated = true;
     parent.add_message(Message::user("Create, inspect, then cancel one child."));
     state.storage.save_session(&parent).await.unwrap();
+    let catalog = crate::services::named_agent_catalog::discover(
+        &state,
+        &parent_id,
+        bamboo_skills::named_agents::NamedAgentLimits::default(),
+    )
+    .await
+    .expect("native entry fixture must expose its host-authored profile catalog");
+    assert_eq!(
+        catalog.metadata().status,
+        bamboo_skills::named_agents::ScopedNamedAgentCatalogStatus::Available,
+        "native entry fixture catalog: {:?}",
+        catalog.metadata()
+    );
     // This fixture explicitly authorizes exactly its Root lifecycle actions.
     // Inspect and direct-parent question/reply are not create permissions, and
     // neither permissions nor bypass flags are widened for the native Child.
