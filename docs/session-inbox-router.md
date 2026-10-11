@@ -6,6 +6,60 @@ child-completion, actor-steer, and background-Bash producers all address the
 stable `Session.id`; process ids, worker mailbox ids, warm-pool slots, and
 execution run ids are never durable addresses.
 
+## Model-facing peer messaging
+
+`session_message` exposes the existing Messenger directly to members of the
+same logical task tree. It needs no broker, worker address, or parent relay.
+Discover the Deferred capability and use one of these actions:
+
+```json
+{"action":"list_targets"}
+{"action":"send","target_session_id":"sibling-session-id","operation_id":"request-proof-1","message":"Please share the verification result."}
+{"action":"reply","reply_to":"received-message-id","operation_id":"proof-reply-1","message":"The focused check passed."}
+```
+
+The runtime derives the sender from the executing Session. Target discovery
+returns only bounded member metadata: Session id, parent id, kind, title, and
+status. It returns at most 128 targets within a 32 KiB JSON result and reports
+`truncated` when a bound is reached. It does not expose another Session's
+transcript. Both discovery and sending verify the canonical ancestry and
+compatible Project identity; an unrelated root or incompatible Project is not
+an authorized target. Reply derives the recipient and thread from an exact,
+canonical peer message already saved in the caller's transcript. A guessed id
+or a provider-supplied metadata object cannot authorize a reply.
+
+Use one stable `operation_id` per logical send or reply. Retry an uncertain
+delivery with the same operation id and identical arguments; changing the
+message or reply edge under that id fails closed. Message text is limited to
+16 KiB in UTF-8. The receipt confirms durable admission and describes the
+activation request; it does not promise an answer or task completion. An
+activation failure after admission retains the same durable message for retry.
+An active receiver consumes it at a safe boundary; an idle receiver uses the
+same activation router and host runner reservation as other Inbox producers.
+
+Received text is untrusted collaboration input. It grants no new tools or
+permissions, cannot answer pending approvals or clarification requests, and
+preserves the receiver's own context and durable waits. Plan/read-only mode
+allows `list_targets` but rejects `send` and `reply`, even when permission
+bypass or automatic approval is enabled. Explicit tool allow/deny policies
+continue to apply. Restricted named profiles and native tool ceilings retain
+their existing exact tool lists; installing this capability does not expand
+those profiles.
+
+The server installs one shared Messenger-backed tool on Base, Child, Root, and
+scheduled WithTask surfaces, including nested and headless runs using those
+surfaces. Ultra Root authority includes this orchestration capability. The
+existing `SubAgent.send_message` compatibility facade keeps its direct-child
+authorization and uses the same delivery plane.
+
+SDK callers enable the delivery plane with
+`AgentBuilder::session_delivery(router)` and
+`with_defaults_for_data_dir(data_dir)`. The default tool set then includes
+`session_message`; the host must bind a spawner to the router to launch idle
+receivers. Explicit `tools(...)`, `no_tools()`, and `default_tools(...)` choices
+remain exact and are never expanded automatically. Without an assembled
+Messenger, the default SDK does not advertise or execute this tool.
+
 ## Components and ownership
 
 - `SessionMessageEnvelope` is the typed domain contract. It carries the stable

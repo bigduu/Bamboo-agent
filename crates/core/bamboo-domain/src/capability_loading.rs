@@ -69,13 +69,14 @@ pub const HOST_ONLY_TOOL_NAMES: [&str; 4] = [
 ];
 
 /// Examples whose deferred status is part of the public migration contract.
-pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 6] = [
+pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 7] = [
     "Glob",
     "GetFileInfo",
     "ViewImage",
     "load_skill",
     "workflow_run",
     "update_goal",
+    "session_message",
 ];
 
 /// Reserved provider-safe function name used only by Bamboo's compatibility
