@@ -23,9 +23,11 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tracing::warn;
 
+use crate::command_executor::{
+    CapturedHookOutput as CapturedOutput, HookCommandOutput as CommandOutput,
+    HOOK_COMMAND_OUTPUT_LIMIT_BYTES as HOOK_OUTPUT_LIMIT_BYTES,
+};
 use crate::HookDispatcher;
-
-const HOOK_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 
 /// User-facing lifecycle events that currently map to engine hook seams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +168,12 @@ impl ShellCommandHook {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(executor) = crate::command_executor::current() {
+            return executor
+                .execute(command, input, self.timeout)
+                .await
+                .map_err(|e| e.to_string());
+        }
         configure_hook_process(&mut command);
 
         let child = command
@@ -892,6 +900,21 @@ impl ScriptHook {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            if let Some(executor) = crate::command_executor::current() {
+                match executor.execute(command, input.clone(), self.timeout).await {
+                    Ok(output) => return Ok(output),
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        missing_runtimes.push(invocation.program.to_string_lossy().into_owned());
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to execute owned lifecycle script runtime '{}': {error}",
+                            invocation.program.to_string_lossy()
+                        ))
+                    }
+                }
+            }
             configure_hook_process(&mut command);
 
             match command.spawn() {
@@ -1388,20 +1411,6 @@ fn interpret_response(response: HookResponse) -> HookResult {
     }
 }
 
-#[derive(Debug)]
-struct CommandOutput {
-    exit_code: Option<i32>,
-    stdout: CapturedOutput,
-    stderr: CapturedOutput,
-    timed_out: bool,
-}
-
-#[derive(Debug, Default)]
-struct CapturedOutput {
-    bytes: Vec<u8>,
-    truncated: bool,
-}
-
 async fn read_capped(mut reader: impl AsyncRead + Unpin) -> Result<CapturedOutput, std::io::Error> {
     let mut captured = CapturedOutput::default();
     let mut chunk = [0_u8; 8192];
@@ -1529,15 +1538,22 @@ pub(crate) async fn execute_portable_command(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_hook_process(&mut command);
-    let child = HookChild::new(command.spawn().map_err(|e| e.to_string())?)?;
-    let output = capture_hook_child(
-        child,
-        input,
-        Duration::from_secs(timeout_seconds),
-        "plugin-command",
-    )
-    .await?;
+    let output = if let Some(executor) = crate::command_executor::current() {
+        executor
+            .execute(command, input, Duration::from_secs(timeout_seconds))
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        configure_hook_process(&mut command);
+        let child = HookChild::new(command.spawn().map_err(|e| e.to_string())?)?;
+        capture_hook_child(
+            child,
+            input,
+            Duration::from_secs(timeout_seconds),
+            "plugin-command",
+        )
+        .await?
+    };
     Ok(LifecycleHookTestOutput {
         exit_code: output.exit_code,
         stdout: String::from_utf8(output.stdout.bytes).map_err(|e| e.to_string())?,

@@ -92,6 +92,9 @@ mod actor_snapshot_tests;
 mod actor_snapshot_windows_tests;
 #[cfg(test)]
 mod actor_transcript_tests;
+mod child_actor_runtime;
+#[cfg(test)]
+mod child_actor_runtime_tests;
 #[cfg(test)]
 mod child_deletion_tests;
 mod child_project;
@@ -110,6 +113,7 @@ pub use host_registry::FileHostRegistry;
 mod default_actor_context_tests;
 #[cfg(test)]
 mod host_registry_tests;
+mod parent_question_answer_proof;
 mod parent_question_checkpoint;
 #[cfg(test)]
 mod startup_sidecar_tests;
@@ -6344,6 +6348,34 @@ impl Storage for SessionStoreV2 {
 
     async fn validate_title_observations(&self, expected: &Session) -> io::Result<()> {
         self.validate_unchanged_title(expected).await
+    }
+
+    fn supports_child_actor_runtime_write(&self) -> bool {
+        true
+    }
+
+    fn bind_child_actor_inbox(
+        &self,
+        owner: &bamboo_domain::ChildActorRuntimeWrite,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+    ) -> io::Result<Arc<dyn bamboo_domain::SessionInboxPort>> {
+        Ok(Arc::new(self.bound_child_inbox(owner, &inbox)?))
+    }
+
+    async fn save_child_actor_runtime(
+        &self,
+        request: bamboo_domain::ChildActorRuntimeSave<'_>,
+    ) -> io::Result<()> {
+        self.save_child_actor_runtime_impl(request).await
+    }
+
+    async fn publish_child_actor_runtime_event(
+        &self,
+        owner: &bamboo_domain::ChildActorRuntimeWrite,
+        publish: bamboo_domain::RootActorRuntimeEventPublisher,
+    ) -> io::Result<()> {
+        self.publish_child_actor_runtime_event_impl(owner, publish)
+            .await
     }
 
     fn bind_root_actor_inbox(

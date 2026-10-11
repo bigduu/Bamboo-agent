@@ -5,6 +5,7 @@ pub mod actor_event_stream;
 pub mod approval_registry;
 pub mod config;
 pub mod live;
+pub mod local_task;
 pub mod mapping;
 pub mod runtime;
 

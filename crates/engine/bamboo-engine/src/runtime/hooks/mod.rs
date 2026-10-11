@@ -1,5 +1,7 @@
 //! Hook runner — dispatches registered hooks at lifecycle points.
 
+mod local_resources;
+
 use std::sync::Arc;
 
 use bamboo_agent_core::{AgentError, AgentEvent, AgentHook, Message, Session};
@@ -75,14 +77,14 @@ impl HookRunner {
         let Some(root) = &self.plugin_root else {
             return Ok(prompt.to_owned());
         };
-        let report = bamboo_hooks::portable::run(
+        let report = local_resources::run(bamboo_hooks::portable::run(
             root,
             AgentHookPoint::BeforeSessionSetup,
             &HookPayload::Prompt {
                 prompt: prompt.to_owned(),
             },
             session,
-        )
+        ))
         .await;
         for error in &report.errors {
             tracing::warn!(%error, "plugin prompt hook compatibility failure");
@@ -158,7 +160,7 @@ impl HookRunner {
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
         inputs: bamboo_hooks::portable::PortableInputs<'_>,
     ) -> HookRunOutcome {
-        let report = self.dispatcher.run_hooks(point, payload, session).await;
+        let report = local_resources::run(self.dispatcher.run_hooks(point, payload, session)).await;
         let mut outcome = record_dispatch_report(report, runtime_state, event_tx).await;
         if let Some(root) = &self.plugin_root {
             if matches!(
@@ -173,14 +175,14 @@ impl HookRunner {
                         _ => {}
                     }
                 }
-                let plugin = bamboo_hooks::portable::run_with_inputs(
+                let plugin = local_resources::run(bamboo_hooks::portable::run_with_inputs(
                     root,
                     point,
                     &portable_payload,
                     session,
                     inputs.original_tool_input,
                     inputs.final_assistant_content,
-                )
+                ))
                 .await;
                 for error in plugin.errors {
                     tracing::warn!(%error, "plugin hook compatibility failure");
@@ -213,10 +215,8 @@ impl HookRunner {
         runtime_state: &mut AgentRuntimeState,
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
     ) -> HookRunOutcome {
-        let report = self
-            .dispatcher
-            .run_observer_hooks(point, payload, session)
-            .await;
+        let report =
+            local_resources::run(self.dispatcher.run_observer_hooks(point, payload, session)).await;
         record_dispatch_report(report, runtime_state, event_tx).await
     }
 

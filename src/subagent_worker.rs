@@ -865,12 +865,12 @@ impl BambooRuntimeExecutor {
             }
             let external_runner = {
                 let cfg = config_for_stack.read().await;
-                bamboo_engine::external_agents::runtime::build_external_child_runner_with_registry_and_reviewer(
-                        &cfg,
-                        None,
-                        Some(reviewer.clone()),
-                        permission_config.clone(),
-                    )
+                bamboo_engine::external_agents::runtime::build_legacy_worker_child_runner(
+                    &cfg,
+                    None,
+                    Some(reviewer.clone()),
+                    permission_config.clone(),
+                )
             };
             external_runner.set_session_inbox_runtime(Some(
                 bamboo_engine::execution::spawn::SessionInboxRuntimeBinding {

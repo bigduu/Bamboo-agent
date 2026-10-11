@@ -214,9 +214,9 @@ pub struct AppState {
     /// HTTP operator handlers and the `cluster` agent tool).
     pub fabric_deployer: Arc<bamboo_server_tools::FabricDeployer>,
 
-    /// In-process mailbox bus (broker), when not externally configured. Held so
-    /// it lives for the server's lifetime (dropping it aborts the bus). `None`
-    /// when an external broker is configured or the bus couldn't bind. Never read
+    /// Legacy mailbox bus, enabled only for explicit process/remote routes.
+    /// Held for the server lifetime (dropping it aborts the bus). `None` for
+    /// native Tokio Children, an external broker, or a bind failure. Never read
     /// — its only job is to keep the bus task alive until AppState drops.
     #[allow(dead_code)]
     embedded_broker: Option<builder::EmbeddedBroker>,
@@ -298,6 +298,10 @@ pub struct AppState {
 
     /// Background scheduler for async sub-session spawning.
     pub spawn_scheduler: Arc<SpawnScheduler>,
+
+    /// Owning Child runtime handle, retained so graceful shutdown cancels and
+    /// joins same-process child tasks before their shared MCP tools are stopped.
+    pub(crate) external_child_runner: Arc<dyn bamboo_engine::execution::ExternalChildRunner>,
 
     /// One Host-owned Ticket authority; records survive disabling dispatch.
     pub tickets: Arc<ticket_application::TicketApplication>,
@@ -574,3 +578,9 @@ impl Default for ConfigUpdateEffects {
         }
     }
 }
+
+#[cfg(test)]
+mod local_task_assembly_tests;
+
+#[cfg(test)]
+mod local_task_conversation_tests;

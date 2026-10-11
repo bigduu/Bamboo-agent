@@ -19,6 +19,30 @@ pub trait NativeToolCeilingSource: Send + Sync {
     async fn observe(&self, session: &bamboo_domain::Session) -> Result<Vec<String>, String>;
 }
 
+/// Whether the default Child route explicitly requests the process runtime.
+/// Native Bamboo defaults, including tuning limits and a stale discovery path,
+/// do not select Worker IPC. An unknown explicit executor remains fail-closed.
+pub fn uses_legacy_default_child_runtime(config: &Config) -> bool {
+    let subagents = config.subagents();
+    subagents.worker_bin.is_some()
+        || subagents.worker_args.is_some()
+        || !matches!(subagents.executor.as_deref(), None | Some("bamboo_runtime"))
+}
+
+/// Whether existing explicit process/remote configuration needs legacy actor
+/// infrastructure. This is not a per-Child routing decision: a configured remote
+/// role or expert profile must not move unrelated native Children off Tokio.
+pub fn requires_legacy_child_runtime(config: &Config) -> bool {
+    let subagents = config.subagents();
+    uses_legacy_default_child_runtime(config)
+        || !subagents.remote_placements.is_empty()
+        || !subagents.schedulable_placements.is_empty()
+        || !config.cluster_fabric.nodes.is_empty()
+        || parse_external_agents(config)
+            .values()
+            .any(|profile| matches!(profile.protocol, ExternalAgentProtocol::Actor))
+}
+
 fn codex_auth_mode_name(mode: bamboo_config::CodexAuthMode) -> String {
     match mode {
         bamboo_config::CodexAuthMode::Inherit => "inherit",
@@ -97,6 +121,89 @@ impl CompositeExternalChildRunner {
 
 #[async_trait]
 impl ExternalChildRunner for CompositeExternalChildRunner {
+    fn set_local_task_runtime(&self, runtime: Option<super::local_task::LocalTaskRuntime>) {
+        for runner in &self.runners {
+            runner.set_local_task_runtime(runtime.clone());
+        }
+    }
+
+    async fn prepare_child_execution(
+        &self,
+        session: &bamboo_agent_core::Session,
+        run_id: &str,
+        cancel: CancellationToken,
+    ) -> Result<Option<Arc<dyn bamboo_domain::RuntimeSessionPersistence>>, String> {
+        for runner in &self.runners {
+            if runner.should_handle(session).await {
+                return runner
+                    .prepare_child_execution(session, run_id, cancel)
+                    .await;
+            }
+        }
+        Err("No child execution backend matched the canonical Session".into())
+    }
+
+    async fn abandon_child_execution(
+        &self,
+        session: &bamboo_agent_core::Session,
+        run_id: &str,
+    ) -> Result<(), String> {
+        for runner in &self.runners {
+            if runner.should_handle(session).await {
+                return runner.abandon_child_execution(session, run_id).await;
+            }
+        }
+        Err("Child execution backend disappeared before rollback".into())
+    }
+
+    fn quarantine_child_execution(&self, session: &bamboo_agent_core::Session, run_id: &str) {
+        for runner in &self.runners {
+            runner.quarantine_child_execution(session, run_id);
+        }
+    }
+
+    fn track_child_task(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        mut handle: tokio::task::JoinHandle<()>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        for runner in &self.runners {
+            handle = runner.track_child_task(session_id, run_id, handle)?;
+        }
+        Some(handle)
+    }
+
+    async fn finish_child_execution(
+        &self,
+        session: &bamboo_agent_core::Session,
+        run_id: &str,
+        history_committed: bool,
+    ) -> Result<(), String> {
+        for runner in &self.runners {
+            if runner.should_handle(session).await {
+                return runner
+                    .finish_child_execution(session, run_id, history_committed)
+                    .await;
+            }
+        }
+        Err("Child execution backend disappeared before finalization".into())
+    }
+
+    async fn shutdown(&self) -> Result<(), String> {
+        let mut failures = Vec::new();
+        for runner in &self.runners {
+            if let Err(error) = runner.shutdown().await {
+                failures.push(error);
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
     fn set_ticket_service(&self, service: Option<Arc<bamboo_tickets::TicketService>>) {
         for runner in &self.runners {
             runner.set_ticket_service(service.clone());
@@ -258,6 +365,29 @@ pub fn build_external_child_runner_with_registry_and_reviewer(
     )
 }
 
+/// Preserve the already-selected legacy Worker entrypoint's nested process
+/// backend. Its isolated store is not a Host canonical store for Tokio Children.
+/// This explicit compatibility assembly is never a native-runtime fallback.
+pub fn build_legacy_worker_child_runner(
+    config: &Config,
+    approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
+    approval_reviewer: Option<Arc<dyn ChildApprovalReviewer>>,
+    permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
+) -> Arc<dyn ExternalChildRunner> {
+    let mut config = config.clone();
+    let subagents = config.subagents_mut();
+    if subagents.worker_bin.is_none() && subagents.worker_args.is_none() {
+        // The old process backend already derived these exact arguments.
+        subagents.worker_args = Some(vec!["subagent-worker".into()]);
+    }
+    build_external_child_runner_with_registry_and_reviewer(
+        &config,
+        approval_registry,
+        approval_reviewer,
+        permission_config,
+    )
+}
+
 /// Full server wiring, including the process-ephemeral Codex per-run token
 /// authority. Non-server callers keep using the compatibility wrapper above.
 pub fn build_external_child_runner_with_codex_tokens(
@@ -336,20 +466,47 @@ fn build_external_child_runner_internal(
 
     let mut runners: Vec<Arc<dyn ExternalChildRunner>> = Vec::new();
 
-    // The built-in local actor worker is the default runtime for every
-    // sub-agent. Always build it; a build failure here is logged and leaves the
-    // composite without a default handler (dispatch then errors clearly).
-    match build_local_actor_runner(
-        config,
-        approval_registry.clone(),
-        approval_reviewer.clone(),
-        permission_config.clone(),
-        codex_run_tokens.clone(),
-        live_provider_config.clone(),
-        native_tool_ceiling,
-    ) {
-        Ok(runner) => runners.push(runner),
-        Err(e) => tracing::error!("local actor sub-agent runner unavailable: {e}"),
+    // Ordinary native Child executions stay in this Host process. The old
+    // Worker/broker implementation remains available only for explicit legacy
+    // configuration; a local task failure never selects it as a fallback.
+    if uses_legacy_default_child_runtime(config) {
+        match build_local_actor_runner(
+            config,
+            approval_registry.clone(),
+            approval_reviewer.clone(),
+            permission_config.clone(),
+            codex_run_tokens.clone(),
+            live_provider_config.clone(),
+            native_tool_ceiling.clone(),
+        ) {
+            Ok(runner) => runners.push(runner),
+            Err(error) => tracing::error!("explicit legacy child runner unavailable: {error}"),
+        }
+    } else {
+        runners.push(Arc::new(
+            super::local_task::LocalTaskChildRunner::new(
+                config,
+                native_tool_ceiling.clone(),
+                permission_config.clone(),
+            )
+            .with_approval(approval_registry.clone(), approval_reviewer.clone()),
+        ));
+        if !config.subagents().remote_placements.is_empty()
+            || !config.subagents().schedulable_placements.is_empty()
+        {
+            match build_local_actor_runner(
+                config,
+                approval_registry.clone(),
+                approval_reviewer.clone(),
+                permission_config.clone(),
+                codex_run_tokens.clone(),
+                live_provider_config.clone(),
+                native_tool_ceiling.clone(),
+            ) {
+                Ok(runner) => runners.push(runner),
+                Err(error) => tracing::error!("explicit remote child route unavailable: {error}"),
+            }
+        }
     }
 
     for (_agent_id, profile) in agents {

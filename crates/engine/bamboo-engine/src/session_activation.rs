@@ -431,6 +431,7 @@ pub struct SessionRunRegistration {
     run_id: String,
     notifications: Option<watch::Receiver<u64>>,
     abort_cleanup: Option<AbortCleanup>,
+    quarantine_on_drop: bool,
     armed: bool,
 }
 
@@ -455,6 +456,29 @@ impl SessionRunRegistration {
         self.router
             .begin_finalization(&self.target_session_id, &self.run_id)
             .await;
+    }
+
+    /// Physical execution now outlives this lease's future. Unexpected unwind
+    /// must retain ownership until backend reconciliation, never launch a
+    /// successor through the ordinary abandoned-startup cleanup.
+    pub(crate) fn quarantine_on_drop(&mut self) {
+        self.quarantine_on_drop = true;
+    }
+
+    /// Keep this exact logical owner finalizing when its physical stop or
+    /// terminal delivery is unconfirmed. Dropping this lease must not run the
+    /// usual abandoned-owner recovery and launch a successor.
+    ///
+    /// Recovery must explicitly reconcile the retained owner before finishing
+    /// finalization. Disarm before the await so cancelling quarantine itself
+    /// cannot accidentally release the owner.
+    pub async fn quarantine(mut self) {
+        self.armed = false;
+        self.abort_cleanup = None;
+        self.router
+            .begin_finalization(&self.target_session_id, &self.run_id)
+            .await;
+        self.notifications.take();
     }
 
     /// Synchronously abandon this exact ownership lease.
@@ -521,8 +545,13 @@ impl Drop for SessionRunRegistration {
         let target_session_id = self.target_session_id.clone();
         let run_id = self.run_id.clone();
         let abort_cleanup = self.abort_cleanup.take();
+        let quarantine = self.quarantine_on_drop;
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
+                if quarantine {
+                    router.begin_finalization(&target_session_id, &run_id).await;
+                    return;
+                }
                 if let Some(cleanup) = abort_cleanup {
                     cleanup().await;
                 }
@@ -803,6 +832,7 @@ impl SessionActivationRouter {
                 run_id: run_id.to_string(),
                 notifications,
                 abort_cleanup: None,
+                quarantine_on_drop: false,
                 armed: true,
             });
         }
@@ -2737,5 +2767,107 @@ mod tests {
         );
         assert_eq!(spawner.reservations.load(Ordering::SeqCst), 2);
         assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn quarantined_registration_never_releases_owner_or_launches_successor() {
+        let router = SessionActivationRouter::new();
+        let spawner = spawner();
+        router.set_spawner(spawner.clone()).await;
+        let mut registration = router
+            .register_run("session", "quarantined-run")
+            .await
+            .unwrap();
+        let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_flag = cleaned.clone();
+        registration.set_abort_cleanup(move || async move {
+            cleanup_flag.store(true, Ordering::SeqCst);
+        });
+        registration.quarantine().await;
+        assert_eq!(
+            router.request_activation("session", 19).await.unwrap(),
+            SessionActivationDisposition::ActivationCoalesced
+        );
+        assert!(router.register_run("session", "successor").await.is_err());
+        assert!(router
+            .register_run("session", "quarantined-run")
+            .await
+            .is_err());
+        tokio::task::yield_now().await;
+        assert!(!cleaned.load(Ordering::SeqCst));
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
+        let states = router.states.lock().await;
+        let owner = states["session"].owner.as_ref().unwrap();
+        assert_eq!(owner.run_id, "quarantined-run");
+        assert!(owner.finalizing);
+    }
+
+    #[tokio::test]
+    async fn physical_execution_registration_drop_is_quarantined() {
+        let router = SessionActivationRouter::new();
+        let spawner = spawner();
+        router.set_spawner(spawner.clone()).await;
+        let mut registration = router
+            .register_run("session", "physical-run")
+            .await
+            .unwrap();
+        let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_flag = cleaned.clone();
+        registration.set_abort_cleanup(move || async move {
+            cleanup_flag.store(true, Ordering::SeqCst);
+        });
+        registration.quarantine_on_drop();
+        drop(registration);
+        // Drop retains the owner synchronously, then an owned cleanup task
+        // marks it finalizing. A racing delivery can still notify that retained
+        // owner before the task is polled; it must never spawn a successor.
+        assert!(matches!(
+            router.request_activation("session", 7).await.unwrap(),
+            SessionActivationDisposition::ActiveNotified
+                | SessionActivationDisposition::ActivationCoalesced
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if router.states.lock().await["session"]
+                    .owner
+                    .as_ref()
+                    .unwrap()
+                    .finalizing
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            router.request_activation("session", 8).await.unwrap(),
+            SessionActivationDisposition::ActivationCoalesced
+        );
+        assert!(!cleaned.load(Ordering::SeqCst));
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
+        assert!(router.register_run("session", "successor").await.is_err());
+        let states = router.states.lock().await;
+        assert!(states["session"].owner.as_ref().unwrap().finalizing);
+    }
+
+    #[tokio::test]
+    async fn cancelling_quarantine_wait_does_not_arm_abandoned_cleanup() {
+        let router = SessionActivationRouter::new();
+        let registration = router
+            .register_run("session", "quarantined-run")
+            .await
+            .unwrap();
+        let states_guard = router.states.lock().await;
+        let mut quarantine = Box::pin(registration.quarantine());
+        assert!(futures::poll!(quarantine.as_mut()).is_pending());
+        drop(quarantine);
+        drop(states_guard);
+        tokio::task::yield_now().await;
+        assert!(router.register_run("session", "successor").await.is_err());
+        assert_eq!(
+            router.current_run_id("session").await.as_deref(),
+            Some("quarantined-run")
+        );
     }
 }

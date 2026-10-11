@@ -18,6 +18,66 @@ pub struct RootActorRuntimeWrite {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Exact native Child execution capability captured by its Host after Actor admission.
+/// This is not serialized and never recovered from Session metadata.
+#[derive(Debug, Clone)]
+pub struct ChildActorRuntimeWrite {
+    pub fence: crate::ActorActivationFence,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub root_session_id: String,
+    pub parent_session_id: String,
+    pub parent_created_at: chrono::DateTime<chrono::Utc>,
+    pub spawn_depth: u32,
+    pub project_id: Option<String>,
+}
+
+impl ChildActorRuntimeWrite {
+    /// Capture identity only. Every actual operation independently checks the
+    /// current canonical Actor fence, birth and complete ancestor chain.
+    pub fn from_session(
+        fence: crate::ActorActivationFence,
+        session: &Session,
+    ) -> std::io::Result<Self> {
+        if session.kind != crate::SessionKind::Child
+            || !session.authority_identity.is_ordinary()
+            || fence.actor_id != session.id
+        {
+            return Err(std::io::Error::other(
+                "native Child execution identity required",
+            ));
+        }
+        Ok(Self {
+            fence,
+            created_at: session.created_at,
+            root_session_id: session.root_session_id.clone(),
+            parent_session_id: session
+                .parent_session_id
+                .clone()
+                .ok_or_else(|| std::io::Error::other("Child parent missing"))?,
+            parent_created_at: session
+                .parent_created_at
+                .ok_or_else(|| std::io::Error::other("Child parent birth missing"))?,
+            spawn_depth: session.spawn_depth,
+            project_id: session.project_id_meta(),
+        })
+    }
+}
+
+/// Full/runtime publication through the dedicated native Child capability.
+/// Optional input is checkpointed and ACKed under the same physical guards.
+pub struct ChildActorRuntimeSave<'a> {
+    pub owner: &'a ChildActorRuntimeWrite,
+    pub session: &'a mut Session,
+    pub runtime_only: bool,
+    pub inherited: Option<&'a crate::InheritedChildWait>,
+    pub finalized_wait: Option<&'a crate::session::runtime_state::WaitingForChildrenState>,
+    pub input: Option<(
+        std::sync::Arc<dyn crate::SessionInboxPort>,
+        crate::SessionInboxOwnedClaim,
+    )>,
+    pub publish: RootActorRuntimePublisher,
+}
+
 /// Synchronous cache publication at the storage commit boundary. Implementors
 /// retain the same physical guards and revalidate the owner before invoking it.
 pub type RootActorRuntimePublisher = std::sync::Arc<dyn Fn(&Session) + Send + Sync>;
@@ -52,6 +112,46 @@ pub trait Storage: Send + Sync {
     async fn validate_title_observations(&self, expected: &Session) -> std::io::Result<()> {
         let _ = expected;
         Ok(())
+    }
+
+    /// Native Child support is separate from the ordinary Root contract.
+    fn supports_child_actor_runtime_write(&self) -> bool {
+        false
+    }
+
+    fn bind_child_actor_inbox(
+        &self,
+        owner: &ChildActorRuntimeWrite,
+        inbox: std::sync::Arc<dyn crate::SessionInboxPort>,
+    ) -> std::io::Result<std::sync::Arc<dyn crate::SessionInboxPort>> {
+        let _ = (owner, inbox);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage does not support owned Child Inbox admission",
+        ))
+    }
+
+    async fn save_child_actor_runtime(
+        &self,
+        request: ChildActorRuntimeSave<'_>,
+    ) -> std::io::Result<()> {
+        let _ = request;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage does not support fenced Child runtime writes",
+        ))
+    }
+
+    async fn publish_child_actor_runtime_event(
+        &self,
+        owner: &ChildActorRuntimeWrite,
+        publish: RootActorRuntimeEventPublisher,
+    ) -> std::io::Result<()> {
+        let _ = (owner, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage does not support fenced Child runtime events",
+        ))
     }
 
     /// Bind an Inbox to this exact Root execution before opting into owned

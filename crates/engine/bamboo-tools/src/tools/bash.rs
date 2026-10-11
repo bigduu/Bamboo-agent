@@ -14,6 +14,7 @@ use tokio::process::Command;
 use tokio::time::{Duration, Instant};
 
 use super::{bash_runtime, workspace_state};
+use crate::local_task_resources::ManagedBashChild;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -279,17 +280,14 @@ impl BashTool {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = cmd
-            .spawn()
+        let mut child = ManagedBashChild::spawn(&mut cmd)
             .map_err(|e| ToolError::Execution(format!("Failed to execute command: {}", e)))?;
 
         let stdout = child
-            .stdout
-            .take()
+            .take_stdout()
             .ok_or_else(|| ToolError::Execution("Failed to capture stdout".to_string()))?;
         let stderr = child
-            .stderr
-            .take()
+            .take_stderr()
             .ok_or_else(|| ToolError::Execution("Failed to capture stderr".to_string()))?;
 
         let mut stdout_reader = BufReader::new(stdout);
@@ -422,7 +420,7 @@ impl BashTool {
                 }
             }
 
-            let session = bash_runtime::adopt_running_child(
+            let session = bash_runtime::adopt_managed_child(
                 child,
                 stdout_reader,
                 stderr_reader,
@@ -1792,5 +1790,41 @@ mod tests {
         );
 
         let _ = super::bash_runtime::remove_shell(&shell.id);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_task_resources_promoted_bash_is_drained_with_its_pumps() {
+        let _command_environment = test_command_environment();
+        let resources = crate::LocalTaskResources::new(
+            "promotion-session",
+            "promotion-run",
+            chrono::Utc::now(),
+        );
+        let tool = BashTool::new();
+        let mut ctx = ToolCtx::none("promotion-call");
+        ctx.session_id = Some(std::sync::Arc::from("promotion-session"));
+        let cwd = std::env::current_dir().unwrap();
+        let result = resources
+            .scope(tool.run_streaming_command(
+                "printf before; sleep 30",
+                60_000,
+                Some(20),
+                &cwd,
+                ctx,
+            ))
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_str(&result.result).unwrap();
+        let id = payload["bash_id"].as_str().unwrap();
+        let shell = super::bash_runtime::get_shell(id).unwrap();
+        assert_eq!(shell.status(), "running");
+        tokio::time::timeout(Duration::from_secs(6), resources.close_and_drain())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(shell.status(), "completed");
+        assert!(super::bash_runtime::get_shell(id).is_none());
+        let (lines, _, _) = shell.read_output_since(0, None).await;
+        assert!(lines.iter().any(|line| line.contains("before")));
     }
 }

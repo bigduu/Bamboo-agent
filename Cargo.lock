@@ -1679,6 +1679,7 @@ dependencies = [
  "futures",
  "globset",
  "ignore",
+ "libc",
  "regex",
  "reqwest",
  "schemars",
@@ -1694,6 +1695,7 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

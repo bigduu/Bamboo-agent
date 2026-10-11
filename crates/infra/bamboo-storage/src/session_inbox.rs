@@ -140,6 +140,7 @@ impl UnownedActorClaimGuard {
 pub struct FileSessionInbox {
     sessions: Arc<SessionStoreV2>,
     root_owner: Option<bamboo_domain::RootActorRuntimeWrite>,
+    child_owner: Option<bamboo_domain::ChildActorRuntimeWrite>,
     limits: SessionInboxLimits,
     /// Runtime-owned path registry. Clones of this adapter share it, while
     /// independent AppState/SDK runtimes remain fully isolated.
@@ -173,6 +174,7 @@ impl FileSessionInbox {
         Self {
             sessions,
             root_owner: None,
+            child_owner: None,
             limits,
             operation_locks: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
@@ -212,6 +214,23 @@ impl FileSessionInbox {
         }
         let mut bound = self.clone();
         bound.root_owner = Some(owner.clone());
+        bound.child_owner = None;
+        Ok(bound)
+    }
+
+    pub(crate) fn bind_child_owner(
+        &self,
+        owner: &bamboo_domain::ChildActorRuntimeWrite,
+        sessions_dir: &Path,
+    ) -> std::io::Result<Self> {
+        if self.sessions.root_sessions_directory() != sessions_dir {
+            return Err(std::io::Error::other(
+                "Child Inbox belongs to a different storage directory",
+            ));
+        }
+        let mut bound = self.clone();
+        bound.root_owner = None;
+        bound.child_owner = Some(owner.clone());
         Ok(bound)
     }
 
@@ -355,12 +374,27 @@ impl FileSessionInbox {
     }
 
     async fn inbox_dir(&self, session_id: &str) -> Result<PathBuf, SessionInboxError> {
-        let rel = self
-            .sessions
-            .resolve_rel_path(session_id)
-            .await
-            .ok_or_else(|| SessionInboxError::TargetNotFound(session_id.to_string()))?;
-        let session_dir = self.sessions.bamboo_home_dir().join(rel);
+        let session_dir = if let Some(owner) = &self.child_owner {
+            if session_id != owner.fence.actor_id {
+                return Err(SessionInboxError::InvalidClaim(
+                    "Child Inbox target differs from its owner".into(),
+                ));
+            }
+            // A bound execution uses its canonical physical tree, never a
+            // stale mutable index hint from another Store instance.
+            self.sessions
+                .sessions_root_dir()
+                .join(&owner.root_session_id)
+                .join("children")
+                .join(session_id)
+        } else {
+            let rel = self
+                .sessions
+                .resolve_rel_path(session_id)
+                .await
+                .ok_or_else(|| SessionInboxError::TargetNotFound(session_id.to_string()))?;
+            self.sessions.bamboo_home_dir().join(rel)
+        };
         match tokio::fs::try_exists(session_dir.join("session.json")).await {
             Ok(true) => Ok(session_dir.join(INBOX_DIR)),
             Ok(false) => Err(SessionInboxError::TargetNotFound(session_id.to_string())),

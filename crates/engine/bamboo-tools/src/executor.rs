@@ -522,7 +522,56 @@ impl BuiltinToolExecutor {
             .then(|| self.pending_file_changed(execution_name, &tool, &args))
             .flatten();
 
-        let outcome = tool.invoke(args, ctx.to_tool_ctx()).await?;
+        // Native in-process runs keep mutating builtin invocations alive when
+        // their awaiter is cancelled. Tokio filesystem work cannot be aborted
+        // safely merely by dropping its future. Custom/plugin tools stay inline:
+        // their private task-local capability scopes must not be lost.
+        let owned_resources = crate::LocalTaskResources::current().filter(|_| {
+            matches!(execution_name, "Write" | "Edit" | "Bash")
+                && self.is_framework_builtin_instance(execution_name, &tool)
+        });
+        let outcome = if let Some(resources) = owned_resources {
+            let tool_ctx = ctx.to_tool_ctx();
+            let output_cap = bamboo_agent_core::tools::observed_tool_output_cap(&tool_ctx);
+            let approval = crate::current_approval_proxy();
+            let permission_override = crate::current_hook_permission_override(&call.id);
+            let root_writer = bamboo_agent_core::tools::context::root_actor_tool_writer();
+            let call_id = call.id.clone();
+            let session_id = ctx.session_id.unwrap_or_default().to_owned();
+            let invoke = async move {
+                let future = tool.invoke(args, tool_ctx);
+                let future = crate::with_approval_proxy(approval, future);
+                let future =
+                    crate::with_hook_permission_override(permission_override, &call_id, future);
+                let future = bamboo_agent_core::tools::scope_tool_output_cap(
+                    &session_id,
+                    &call_id,
+                    output_cap,
+                    future,
+                );
+                // Preserve absent Host scope versus a present unbound scope.
+                match root_writer {
+                    Some(writer) => {
+                        bamboo_agent_core::tools::context::with_root_actor_tool_writer(
+                            writer, future,
+                        )
+                        .await
+                    }
+                    None => future.await,
+                }
+            };
+            let registered = resources
+                .spawn_owned(invoke)
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            crate::local_task_resources::mark_current_invocation_owned();
+            registered.await.map_err(|_| {
+                ToolError::Execution(
+                    "owned tool invocation panicked; stop remains unconfirmed".into(),
+                )
+            })??
+        } else {
+            tool.invoke(args, ctx.to_tool_ctx()).await?
+        };
         if matches!(
             &outcome,
             ToolOutcome::Completed(result) if result.success
@@ -5159,6 +5208,138 @@ mod tests {
                 .await
                 .is_err());
         }
+        assert!(!path.exists());
+    }
+    #[tokio::test]
+    async fn local_task_resources_owned_write_survives_awaiter_abort_and_preserves_scopes() {
+        struct Proxy;
+        #[async_trait]
+        impl crate::ApprovalProxy for Proxy {
+            async fn request_approval(&self, _: crate::ApprovalAsk) -> bool {
+                false
+            }
+        }
+        struct Probe {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            path: std::path::PathBuf,
+        }
+        #[async_trait]
+        impl Tool for Probe {
+            fn name(&self) -> &str {
+                "Write"
+            }
+            fn description(&self) -> &str {
+                "owned invocation test fixture"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type":"object"})
+            }
+            async fn invoke(
+                &self,
+                _: serde_json::Value,
+                ctx: bamboo_agent_core::ToolCtx,
+            ) -> Result<ToolOutcome, ToolError> {
+                assert!(crate::current_approval_proxy().is_some());
+                assert_eq!(
+                    crate::current_hook_permission_override(ctx.tool_call_id.as_ref()),
+                    Some(crate::HookPermissionOverride::Allow)
+                );
+                assert_eq!(
+                    bamboo_agent_core::tools::observed_tool_output_cap(&ctx),
+                    Some(77)
+                );
+                assert!(matches!(
+                    bamboo_agent_core::tools::context::root_actor_tool_writer(),
+                    Some(None)
+                ));
+                self.entered.notify_one();
+                self.release.notified().await;
+                tokio::fs::write(&self.path, "finished after awaiter cancellation")
+                    .await
+                    .unwrap();
+                Ok(ToolOutcome::Completed(ToolResult {
+                    success: true,
+                    result: "done".into(),
+                    display_preference: None,
+                    images: vec![],
+                }))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("write.txt");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let tool: Arc<dyn Tool> = Arc::new(Probe {
+            entered: entered.clone(),
+            release: release.clone(),
+            path: path.clone(),
+        });
+        let registry = ToolRegistry::new();
+        registry.register_shared(tool.clone()).unwrap();
+        let executor = BuiltinToolExecutor {
+            registry,
+            permission_checker: None,
+            framework_builtin_tools: BTreeMap::from([("Write".into(), tool)]),
+            native_tool_ceiling: None,
+            tool_event_publisher: BuiltinToolExecutor::default_tool_event_publisher(),
+        };
+        let resources =
+            crate::LocalTaskResources::new("local-probe", "write-run", chrono::Utc::now());
+        let owned = resources.clone();
+        let call = make_tool_call("Write", json!({"file_path":path,"content":"value"}));
+        let invocation = tokio::spawn(async move {
+            let ctx = ToolExecutionContext {
+                session_id: Some("local-probe"),
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let invoke = executor.execute_with_context_outcome(&call, ctx);
+            let invoke =
+                bamboo_agent_core::tools::context::with_root_actor_tool_writer(None, invoke);
+            let invoke = bamboo_agent_core::tools::scope_tool_output_cap(
+                "local-probe",
+                &call.id,
+                Some(77),
+                invoke,
+            );
+            let invoke = crate::with_approval_proxy(Some(Arc::new(Proxy)), invoke);
+            let invoke = crate::with_hook_permission_override(
+                Some(crate::HookPermissionOverride::Allow),
+                &call.id,
+                invoke,
+            );
+            owned.scope(owned.guard_tool_invocation(invoke)).await
+        });
+        entered.notified().await;
+        invocation.abort();
+        assert!(invocation.await.unwrap_err().is_cancelled());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            resources.close_and_drain()
+        )
+        .await
+        .is_err());
+        assert!(!path.exists());
+        release.notify_one();
+        resources.close_and_drain().await.unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "finished after awaiter cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_task_resources_permission_denial_precedes_owned_invocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("must-not-write.txt");
+        let checker = Arc::new(crate::permission::ReadOnlyCommandChecker::new(Arc::new(
+            crate::permission::AllowAllPermissionChecker,
+        )));
+        let executor = BuiltinToolExecutor::new_with_permissions(checker);
+        let resources = crate::LocalTaskResources::new("denied", "denied-run", chrono::Utc::now());
+        let call = make_tool_call("Write", json!({"file_path":path,"content":"denied"}));
+        assert!(resources.scope(executor.execute(&call)).await.is_err());
+        resources.close_and_drain().await.unwrap();
         assert!(!path.exists());
     }
 }

@@ -112,7 +112,10 @@ pub fn question_terminal_call_id(
 struct OwnedStopCheckpoint {
     receipt: RuntimeReceipt,
     child_birth: chrono::DateTime<chrono::Utc>,
-    pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_instance: Option<uuid::Uuid>,
     completed: bool,
 }
 
@@ -125,6 +128,57 @@ pub async fn checkpoint_owned_ticket_stop(
     session: &mut Session,
     run_id: &str,
     proof: &bamboo_subagent::fleet::ConfirmedLocalStop,
+    completed: bool,
+) -> Result<()> {
+    checkpoint_owned_stop(
+        service,
+        runtime,
+        session,
+        run_id,
+        Some(proof.pid()),
+        None,
+        completed,
+    )
+    .await
+}
+
+/// Same Ticket receipt contract, backed by an actually joined in-process task
+/// and its drained resource domain. No synthetic PID is written.
+pub async fn checkpoint_owned_task_stop(
+    service: &TicketService,
+    runtime: &SessionInboxRuntimeBinding,
+    session: &mut Session,
+    run_id: &str,
+    proof: &crate::external_agents::local_task::ConfirmedTaskStop,
+    completed: bool,
+) -> Result<()> {
+    if proof.session_id() != session.id
+        || proof.child_birth() != session.created_at
+        || proof.run_id() != run_id
+    {
+        return Err(Error::ScopeDenied(
+            "task stop execution identity changed".into(),
+        ));
+    }
+    checkpoint_owned_stop(
+        service,
+        runtime,
+        session,
+        run_id,
+        None,
+        Some(proof.instance_id()),
+        completed,
+    )
+    .await
+}
+
+async fn checkpoint_owned_stop(
+    service: &TicketService,
+    runtime: &SessionInboxRuntimeBinding,
+    session: &mut Session,
+    run_id: &str,
+    pid: Option<u32>,
+    task_instance: Option<uuid::Uuid>,
     completed: bool,
 ) -> Result<()> {
     let dispatch = read_dispatch(session)?
@@ -141,7 +195,8 @@ pub async fn checkpoint_owned_ticket_stop(
     let checkpoint = OwnedStopCheckpoint {
         receipt: receipt.clone(),
         child_birth: session.created_at,
-        pid: proof.pid(),
+        pid,
+        task_instance,
         completed,
     };
     let raw = serde_json::to_string(&checkpoint)?;
@@ -297,7 +352,20 @@ pub async fn checkpoint_ticket_result(
             let checkpoint: OwnedStopCheckpoint = serde_json::from_str(raw)?;
             if checkpoint.receipt != *receipt
                 || checkpoint.child_birth != canonical.created_at
-                || checkpoint.pid == 0
+                || !matches!(
+                    (checkpoint.pid, checkpoint.task_instance),
+                    (Some(1..), None) | (None, Some(_))
+                )
+                || checkpoint.task_instance.is_some_and(|instance| {
+                    instance.is_nil()
+                        || canonical
+                            .metadata
+                            .get("runtime.local_task.state")
+                            .map(String::as_str)
+                            != Some("stopped")
+                        || canonical.metadata.get("runtime.local_task.instance")
+                            != Some(&instance.to_string())
+                })
                 || terminal_status.as_deref() == Some("completed")
                     && !checkpoint.completed
                     && assignment.awaiting_request.is_none()

@@ -8,7 +8,7 @@ use bamboo_domain::{
     PARENT_QUESTION_REQUEST_KEY, PARENT_QUESTION_RESOLUTION_KEY,
 };
 
-fn parent_request_is_durable(parent: &Session, question: &ParentQuestion) -> bool {
+pub(super) fn parent_request_is_durable(parent: &Session, question: &ParentQuestion) -> bool {
     let expected = question.envelope();
     let mut matches = parent
         .messages
@@ -188,22 +188,38 @@ impl SessionStoreV2 {
         if question.validate_answer(text).is_err()
             || validate_session_id(&question.child.session_id).is_err()
             || validate_session_id(&question.parent.session_id).is_err()
+            || ParentQuestion::from_envelope(&question.envelope()).as_ref() != Some(question)
         {
             return Ok(None);
         }
         let started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
         let task = self.lock_runtime_task_sidecar_shared().await?;
-        // Root -> Child is fixed acquisition order. Retain both physical
-        // Session guards even on replay/cache-only publication and cancellation.
-        let root_guard = if root_owner.is_some() {
-            Some(
-                self.acquire_session_write_lock(&question.parent.session_id, SaveKind::Full)
-                    .await?,
-            )
-        } else {
-            None
+        // Validate the immutable direct-parent ordering before acquiring two
+        // Session locks. A forged reverse/self relation must not choose an
+        // inconsistent lock order. The complete request is rechecked below.
+        let Some(observed_child) = self
+            .load_session_unlocked(&question.child.session_id)
+            .await?
+        else {
+            return Ok(None);
         };
+        if observed_child.kind != SessionKind::Child
+            || observed_child.created_at != question.child.created_at
+            || observed_child.parent_session_id.as_deref()
+                != Some(question.parent.session_id.as_str())
+            || observed_child.parent_created_at != Some(question.parent.created_at)
+        {
+            return Ok(None);
+        }
+        // Ancestor -> Child -> tree is the fixed acquisition order. Retain
+        // both physical Session guards even for the existing control-plane
+        // answer API without a runtime Root owner. Actor renewals acquire the
+        // same Session lock before tree and cannot race the exact witnesses.
+        let root_guard = Some(
+            self.acquire_session_write_lock(&question.parent.session_id, SaveKind::Full)
+                .await?,
+        );
         let writer = self
             .acquire_session_write_lock(&question.child.session_id, SaveKind::Full)
             .await?;
@@ -224,7 +240,7 @@ impl SessionStoreV2 {
         } else {
             None
         };
-        let guards = DefaultWriterGuards::shared_with_root_origin(
+        let mut guards = DefaultWriterGuards::shared_with_root_origin(
             lifecycle, task, writer, root_guard, origin,
         );
         let Some(parent) = self
@@ -263,6 +279,7 @@ impl SessionStoreV2 {
         {
             return Ok(None);
         }
+        let original = child.clone();
         let Some(paired) = child
             .messages
             .iter_mut()
@@ -281,11 +298,33 @@ impl SessionStoreV2 {
             serde_json::to_string(&resolution)
                 .map_err(|error| other_io_error(error.to_string()))?,
         );
+        let parent_directory = self.abs_path_from_rel(&Self::default_writer_rel_path(&parent)?);
+        let child_directory = self.abs_path_from_rel(&Self::default_writer_rel_path(&child)?);
+        let candidate = child.clone();
+        let request = question.clone();
+        let proof = Self::default_writer_job(&guards, move || {
+            parent_question_answer_proof::ParentQuestionAnswerProof::capture(
+                parent_directory,
+                child_directory,
+                &original,
+                &candidate,
+                &request,
+            )
+        })
+        .await?;
+        Arc::get_mut(&mut guards)
+            .expect("answer proof before publication jobs")
+            .parent_question_answer = Some(proof);
         self.save_session_after_lock(&child, started, &guards, Some(question))
             .await?;
         if let Some(proof) = &guards.root_origin {
             proof.validate()?;
         }
+        guards
+            .parent_question_answer
+            .as_ref()
+            .expect("exact answer proof")
+            .validate_publication()?;
         publish(&child);
         Ok(Some((child, true)))
     }

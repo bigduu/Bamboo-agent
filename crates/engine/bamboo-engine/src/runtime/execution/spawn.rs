@@ -131,6 +131,66 @@ pub struct SessionInboxRuntimeBinding {
 /// and respecting the `cancel_token`.
 #[async_trait::async_trait]
 pub trait ExternalChildRunner: Send + Sync {
+    /// Bind the Host's in-process execution resources. Process/remote adapters
+    /// deliberately ignore this capability and retain their existing mode.
+    fn set_local_task_runtime(
+        &self,
+        _runtime: Option<crate::external_agents::local_task::LocalTaskRuntime>,
+    ) {
+    }
+
+    /// Acquire this backend's exact durable writer before the canonical
+    /// running checkpoint. A default writer is never substituted after claim.
+    async fn prepare_child_execution(
+        &self,
+        _session: &Session,
+        _run_id: &str,
+        _cancel: CancellationToken,
+    ) -> Result<Option<Arc<dyn RuntimeSessionPersistence>>, String> {
+        Ok(None)
+    }
+
+    /// Roll back a prepared execution whose initial canonical checkpoint failed.
+    /// Local implementations must close the launch gate and prove resource drain.
+    async fn abandon_child_execution(
+        &self,
+        _session: &Session,
+        _run_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Record a setup panic without inventing a successful resource stop.
+    fn quarantine_child_execution(&self, _session: &Session, _run_id: &str) {}
+
+    /// Keep a local coordinator handle owned until it really exits. Returning
+    /// the handle leaves supervision to an outer composite or legacy caller.
+    fn track_child_task(
+        &self,
+        _session_id: &str,
+        _run_id: &str,
+        handle: tokio::task::JoinHandle<()>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        Some(handle)
+    }
+
+    /// End the exact backend writer after terminal persistence and the history
+    /// barrier, before publishing runner replacement eligibility.
+    async fn finish_child_execution(
+        &self,
+        _session: &Session,
+        _run_id: &str,
+        _history_committed: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Stop admission, request cancellation, and await owned task/resource
+    /// completion. This is called by the Host's graceful shutdown path.
+    async fn shutdown(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Opt-in, host-owned scope authority. It is never copied into the Worker.
     fn set_ticket_service(&self, _service: Option<Arc<bamboo_tickets::TicketService>>) {}
     /// A narrow, pre-persistence compatibility check on the actual registered

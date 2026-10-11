@@ -156,6 +156,24 @@ impl SessionStoreV2 {
                 Ok(())
             })
             .await
+        } else if let Some(proof) = guards.child_actor.as_ref() {
+            let incoming = incoming.clone();
+            let proof = proof.clone();
+            let input = guards.child_input.clone();
+            Self::default_writer_job(guards, move || {
+                proof.validate_candidate(&incoming)?;
+                if let Some(input) = input {
+                    input.validate(false)?;
+                    input.validate_transcript(&incoming)?;
+                }
+                Ok(())
+            })
+            .await
+        } else if let Some(proof) = guards.parent_question_answer.as_ref() {
+            let incoming = incoming.clone();
+            let proof = proof.clone();
+            Self::default_writer_job(guards, move || proof.validate_candidate(&incoming, full))
+                .await
         } else {
             self.check_default_actor_context(incoming, directory, full)
                 .await
@@ -167,6 +185,9 @@ impl SessionStoreV2 {
         guards: &Arc<DefaultWriterGuards>,
         publish: RootActorRuntimePublisher,
     ) -> io::Result<()> {
+        if guards.child_actor.is_some() {
+            return self.publish_child_actor_runtime(guards, publish).await;
+        }
         let proof = guards
             .root_actor
             .clone()

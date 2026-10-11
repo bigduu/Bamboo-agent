@@ -101,6 +101,11 @@ pub(crate) async fn append_tool_error(record: ToolErrorRecord) {
                     path.display()
                 );
             }
+            // write_all may only hand bytes to Tokio's blocking filesystem
+            // worker. A completed Agent must not leave this write outstanding.
+            if let Err(e) = file.flush().await {
+                tracing::warn!("Failed to flush tool error log {}: {e}", path.display());
+            }
         }
         Err(e) => {
             tracing::warn!("Failed to open tool error log {}: {e}", path.display());

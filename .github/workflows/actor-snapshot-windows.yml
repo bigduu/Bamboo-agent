@@ -13,6 +13,8 @@ on:
       - 'crates/**/Cargo.toml'
       # Snapshot and Directory share the store, session types and write paths.
       - 'crates/infra/bamboo-storage/**'
+      # Native Child Bash uses Windows Job Objects in the task resource owner.
+      - 'crates/engine/bamboo-tools/**'
       - 'crates/core/bamboo-domain/**'
       # The gateway exercises real AppState, host authentication and run tokens.
       - 'crates/app/bamboo-server/src/app_state/**'
@@ -123,7 +125,7 @@ jobs:
           shared-key: bamboo-actor-snapshot-windows-2025-msvc-1.99
           save-if: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' }}
 
-      - name: Compile and verify all 30 selected native tests
+      - name: Compile and verify all 35 selected native tests
         timeout-minutes: 20
         run: |
           $evidence = Join-Path $env:RUNNER_TEMP 'actor-snapshot-evidence'
@@ -184,8 +186,15 @@ jobs:
             'root_project_rebinds_only_when_no_activation_is_live'
             'store_opened_before_creation_discovers_root_and_child_from_durable_files'
           ) 'directory-list.log'
+          Assert-TestList 'bamboo-tools' 'local_task_resources::windows::tests::local_task_resources_windows_' @(
+            'foreground_cancel_reaps_descendants'
+            'background_scope_drain'
+            'fast_leader_descendants'
+            'execution_isolation'
+            'assignment_failure_reaps_suspended_child'
+          ) 'local-task-process-list.log'
 
-      - name: Execute 9 snapshot, 2 gateway and 19 directory tests
+      - name: Execute 9 snapshot, 2 gateway, 19 directory and 5 task-process tests
         timeout-minutes: 5
         run: |
           $evidence = Join-Path $env:RUNNER_TEMP 'actor-snapshot-evidence'
@@ -208,7 +217,8 @@ jobs:
           Assert-TestRun 'bamboo-storage' 'v2::actor_snapshot_windows_tests::' 9 'snapshot-run.log'
           Assert-TestRun 'bamboo-server' 'handlers::agent::actor_snapshot::tests::' 2 'gateway-run.log'
           Assert-TestRun 'bamboo-storage' 'v2::actor_directory::tests::' 19 'directory-run.log'
-          # This receipts the existing reader tests, not all of #1338 or #791.
+          Assert-TestRun 'bamboo-tools' 'local_task_resources::windows::tests::local_task_resources_windows_' 5 'local-task-process-run.log'
+          # This receipts the selected native reader/process tests, not all of #1338 or #791.
           Get-Content "$evidence/verified-counts.txt" | Add-Content $env:GITHUB_STEP_SUMMARY
 
       - name: Retain native Windows evidence even on failure

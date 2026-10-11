@@ -133,12 +133,25 @@ fn schedule_cleanup(root: &Path, retention: Duration) {
     }
     *last = Some(now);
     drop(last);
+    spawn_cleanup(root, retention);
+}
+
+fn spawn_cleanup(root: &Path, retention: Duration) {
     let root = root.to_path_buf();
-    tokio::spawn(async move {
+    let cleanup = async move {
         if let Err(error) = cleanup_expired(&root, retention, SystemTime::now()).await {
             tracing::warn!(error_kind = ?error.kind(), "Could not clean expired tee output");
         }
-    });
+    };
+    if let Some(scope) = bamboo_tools::LocalTaskResources::current() {
+        // The execution domain joins actual filesystem cleanup. Dropping the
+        // receiver cannot cancel it midway through a blocking remove operation.
+        if let Err(error) = scope.spawn_owned(cleanup) {
+            tracing::warn!(error_kind = ?error.kind(), "Local tee cleanup admission closed");
+        }
+    } else {
+        tokio::spawn(cleanup);
+    }
 }
 
 /// Stream only the tee root's immediate Session directories. Skip symlinks and
@@ -421,6 +434,25 @@ mod tests {
         let file = std::fs::File::create(path).unwrap();
         file.set_times(std::fs::FileTimes::new().set_modified(time))
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_scope_drains_tee_cleanup_before_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("local-session");
+        std::fs::create_dir(&session).unwrap();
+        let old = SystemTime::now() - default_retention() - Duration::from_secs(1);
+        let expired = session.join("expired.log");
+        write_at(&expired, old);
+        let scope =
+            bamboo_tools::LocalTaskResources::new("local-session", "run", chrono::Utc::now());
+        scope
+            .scope(async {
+                spawn_cleanup(root.path(), default_retention());
+            })
+            .await;
+        scope.close_and_drain().await.unwrap();
+        assert!(!expired.exists());
     }
 
     #[tokio::test]
