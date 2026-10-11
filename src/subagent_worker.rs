@@ -421,6 +421,13 @@ pub struct BambooRuntimeExecutor {
     /// Worker-local durable inbox. The orchestrator's copy remains canonical;
     /// this one drives the real local safe-turn admission/checkpoint boundary.
     session_inbox: Arc<dyn SessionInboxPort>,
+    /// Observe the real nested scheduler's publication boundary in wiring tests.
+    #[cfg(test)]
+    worker_event_senders: Arc<
+        tokio::sync::RwLock<
+            std::collections::HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>,
+        >,
+    >,
     model: Option<String>,
     workspace: Option<String>,
     disabled_tools: Option<BTreeSet<String>>,
@@ -956,6 +963,8 @@ impl BambooRuntimeExecutor {
         Ok(Self {
             agent,
             session_inbox,
+            #[cfg(test)]
+            worker_event_senders,
             model: spec.model.as_ref().map(|m| m.model.clone()),
             workspace: spec.workspace.clone(),
             disabled_tools: spec
@@ -2684,6 +2693,7 @@ mod tests {
         BambooRuntimeExecutor {
             agent,
             session_inbox: inbox.clone(),
+            worker_event_senders: Arc::default(),
             model: Some("test-model".to_string()),
             workspace: None,
             disabled_tools: None,
@@ -5347,16 +5357,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_worker_idle_session_message_uses_real_resume_reservation() {
+    async fn nested_worker_unroutable_child_reserves_once_and_preserves_unacknowledged_inbox() {
         let temp = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let provider_addr = listener.local_addr().unwrap();
-        let provider_hold = tokio::spawn(async move {
-            if let Ok((socket, _)) = listener.accept().await {
-                let _socket = socket;
-                std::future::pending::<()>().await;
-            }
-        });
         let mut spec = spec_with("openai", "sk-test", Some(("openai", "gpt-test")));
         spec.storage_dir = Some(temp.path().join("worker").to_string_lossy().into_owned());
         spec.fabric_dir = temp.path().join("fabric").to_string_lossy().into_owned();
@@ -5377,12 +5381,30 @@ mod tests {
         child.kind = SessionKind::Child;
         child.parent_session_id = Some("worker-parent".to_string());
         child.root_session_id = "worker-parent".to_string();
+        // This deliberately lacks the legacy Actor route. It exercises real
+        // reservation followed by fail-closed backend admission, not successful
+        // legacy Worker execution or an in-process fallback.
+        assert!(
+            !runtime
+                .child_runner
+                .as_ref()
+                .expect("nested worker child runner")
+                .should_handle(&child)
+                .await
+        );
         runtime
             .agent
             .storage()
             .save_session(&child)
             .await
             .expect("seed idle nested child");
+        let mut child_events = runtime
+            .worker_event_senders
+            .write()
+            .await
+            .entry(child.id.clone())
+            .or_insert_with(|| tokio::sync::broadcast::channel(32).0)
+            .subscribe();
 
         let envelope = SessionMessageEnvelope {
             id: SessionMessageId::parse("nested-idle-message").unwrap(),
@@ -5423,16 +5445,123 @@ mod tests {
             receipt.activation,
             bamboo_domain::SessionActivationDisposition::ActivationReserved
         );
+        let router = runtime.agent.activation_router().expect("worker router");
+        let run_id = router
+            .current_run_id(&child.id)
+            .await
+            .expect("real reservation owns the child");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match child_events.recv().await.expect("child event stream") {
+                    AgentEvent::Error { message } => {
+                        assert_eq!(
+                            message,
+                            format!(
+                                "Child {} activation blocked; execution outcome is unconfirmed: \
+                                 No child execution backend matched the canonical Session",
+                                child.id
+                            )
+                        );
+                        break;
+                    }
+                    AgentEvent::Complete { .. } => {
+                        panic!("unroutable child must not publish successful completion")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("actual backend rejection must be published");
+        let rejected = runtime
+            .session_inbox
+            .inspect(&child.id)
+            .await
+            .expect("backlog after backend rejection");
+        assert_eq!(
+            (
+                rejected.pending,
+                rejected.claimed,
+                rejected.generation,
+                rejected.oldest_generation,
+            ),
+            (
+                backlog.pending,
+                backlog.claimed,
+                backlog.generation,
+                backlog.oldest_generation,
+            ),
+            "backend refusal must not claim or ACK input"
+        );
+        assert_eq!(
+            [
+                backlog.activation_generation,
+                backlog.coordinator_generation,
+                backlog.interrupt_generation,
+            ],
+            [0; 3],
+            "admission alone does not authorize activation"
+        );
+        assert_eq!(
+            [
+                rejected.activation_generation,
+                rejected.coordinator_generation,
+                rejected.interrupt_generation,
+            ],
+            [admission.delivery.generation; 3],
+            "activation authorizes this generation before backend admission"
+        );
         let coalesced = messenger
             .activate(&admission)
             .await
             .expect("duplicate wake must target the existing owner");
         assert_eq!(
             coalesced.activation,
-            bamboo_domain::SessionActivationDisposition::ActiveNotified,
-            "the same durable generation must not reserve or launch a second runner"
+            bamboo_domain::SessionActivationDisposition::ActivationCoalesced,
+            "the rejected owner must not reserve or launch a second runner"
         );
-        provider_hold.abort();
+        assert_eq!(router.current_run_id(&child.id).await, Some(run_id));
+        let retained = runtime
+            .session_inbox
+            .inspect(&child.id)
+            .await
+            .expect("unacknowledged worker backlog");
+        assert_eq!(
+            (
+                retained.pending,
+                retained.claimed,
+                retained.generation,
+                retained.oldest_generation,
+            ),
+            (
+                rejected.pending,
+                rejected.claimed,
+                rejected.generation,
+                rejected.oldest_generation,
+            ),
+            "duplicate activation must not alter the retained input"
+        );
+        assert_eq!(
+            [
+                retained.activation_generation,
+                retained.coordinator_generation,
+                retained.interrupt_generation,
+            ],
+            [
+                rejected.activation_generation,
+                rejected.coordinator_generation,
+                rejected.interrupt_generation,
+            ],
+            "duplicate activation must not advance scheduling generations"
+        );
+        assert_eq!(retained.pending, 1);
+        assert_eq!(retained.claimed, 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "backend refusal must not contact the model provider"
+        );
     }
 
     #[tokio::test]
