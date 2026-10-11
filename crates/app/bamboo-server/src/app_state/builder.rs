@@ -96,6 +96,24 @@ impl AppState {
         bamboo_home_dir: PathBuf,
         memory_store: bamboo_memory::memory_store::MemoryStore,
     ) -> Result<Self, AppError> {
+        Self::new_with_memory_store_and_inbox_recovery(bamboo_home_dir, memory_store, true).await
+    }
+
+    /// Isolate the synchronous legacy Inbox consumer from background recovery.
+    /// Normal constructors and owned-Root/recovery fixtures keep recovery enabled.
+    #[cfg(test)]
+    pub(crate) async fn new_for_legacy_queued_ingress_test(
+        bamboo_home_dir: PathBuf,
+    ) -> Result<Self, AppError> {
+        let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
+        Self::new_with_memory_store_and_inbox_recovery(bamboo_home_dir, memory_store, false).await
+    }
+
+    async fn new_with_memory_store_and_inbox_recovery(
+        bamboo_home_dir: PathBuf,
+        memory_store: bamboo_memory::memory_store::MemoryStore,
+        start_inbox_reconciler: bool,
+    ) -> Result<Self, AppError> {
         // Ensure all helpers that rely on `core::paths::bamboo_dir()` see the same
         // directory as the server runtime.
         bamboo_config::paths::init_bamboo_dir(bamboo_home_dir.clone());
@@ -190,6 +208,7 @@ impl AppState {
             config_facade,
             Arc::new(NoopToolEventPublisher),
             memory_store,
+            start_inbox_reconciler,
         )
         .await
     }
@@ -221,6 +240,7 @@ impl AppState {
             None,
             Arc::new(NoopToolEventPublisher),
             memory_store,
+            true,
         )
         .await
     }
@@ -241,6 +261,7 @@ impl AppState {
             None,
             tool_event_publisher,
             memory_store,
+            true,
         )
         .await
     }
@@ -252,6 +273,7 @@ impl AppState {
         config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
         tool_event_publisher: Arc<dyn ToolEventPublisher>,
         memory_store: bamboo_memory::memory_store::MemoryStore,
+        start_inbox_reconciler: bool,
     ) -> Result<Self, AppError> {
         // Wire the configured-default-workspace resolver into agent-core. This keeps
         let data_dir = bamboo_home_dir.clone();
@@ -1157,27 +1179,29 @@ impl AppState {
         // terminal fanout after process restart.
         parent_question_coordinator.spawn();
 
-        // Reconcile exact Inbox wake readiness before serving, then pace
-        // runtime recovery for due leases and missed activation handoffs.
-        let wake_report = super::wake_reconciler::reconcile_startup(
-            session_store.clone(),
-            session_activation_router.clone(),
-            mcp_proxy_shutdown.clone(),
-        )
-        .await;
-        if wake_report.attempted > 0
-            || wake_report.retrying > 0
-            || wake_report.blocked > 0
-            || wake_report.queued > 0
-        {
-            tracing::info!(
-                checked = wake_report.checked,
-                queued = wake_report.queued,
-                attempted = wake_report.attempted,
-                retrying = wake_report.retrying,
-                blocked = wake_report.blocked,
-                "started durable SessionInbox wake reconciliation"
-            );
+        if start_inbox_reconciler {
+            // Reconcile exact Inbox wake readiness before serving, then pace
+            // runtime recovery for due leases and missed activation handoffs.
+            let wake_report = super::wake_reconciler::reconcile_startup(
+                session_store.clone(),
+                session_activation_router.clone(),
+                mcp_proxy_shutdown.clone(),
+            )
+            .await;
+            if wake_report.attempted > 0
+                || wake_report.retrying > 0
+                || wake_report.blocked > 0
+                || wake_report.queued > 0
+            {
+                tracing::info!(
+                    checked = wake_report.checked,
+                    queued = wake_report.queued,
+                    attempted = wake_report.attempted,
+                    retrying = wake_report.retrying,
+                    blocked = wake_report.blocked,
+                    "started durable SessionInbox wake reconciliation"
+                );
+            }
         }
 
         // bamboo-connect (#452 / epic #447): drives bamboo sessions from IM
