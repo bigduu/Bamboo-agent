@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+#[cfg(unix)]
+mod exec_sessions;
 mod message_summary;
 
 fn required_packet_session() -> Session {
