@@ -44,9 +44,12 @@ fn parse_warning_log_details<'a>(
     warning: &'a str,
 ) -> (String, &'a str) {
     let canonical = canonical_tool_name(execution_name);
-    if canonical.eq_ignore_ascii_case("browser") || canonical.eq_ignore_ascii_case("browser_eval") {
+    if ["browser", "browser_eval", "session_message"]
+        .iter()
+        .any(|name| canonical.eq_ignore_ascii_case(name))
+    {
         // A repaired JSON warning embeds its own preview, so both strings
-        // must be hidden when browser input may contain focused typed text.
+        // must be hidden for private browser input or peer message text.
         ("[redacted]".to_string(), "[redacted]")
     } else {
         (preview_for_log(args_raw, 180), warning)
@@ -1262,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_browser_arguments_redact_both_log_previews() {
+    fn malformed_private_arguments_redact_both_log_previews() {
         for (tool_name, raw) in [
             (
                 "browser",
@@ -1274,6 +1277,14 @@ mod tests {
             ),
             ("browser_eval", r#"{"code":"private page source"#),
             ("default::browser_eval", r#"{"code":"private page source"#),
+            (
+                "session_message",
+                r#"{"action":"send","message":"private peer text"#,
+            ),
+            (
+                "default::session_message",
+                r#"{"action":"send","message":"private peer text"#,
+            ),
         ] {
             let (_, warning) = parse_tool_args_best_effort(raw);
             let warning = warning.expect("malformed JSON must have a warning");
