@@ -59,9 +59,12 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn error_preview(tool_name: &str, value: &str) -> String {
     let canonical = bamboo_domain::canonical_tool_name(tool_name);
-    if canonical.eq_ignore_ascii_case("browser") || canonical.eq_ignore_ascii_case("browser_eval") {
-        // Browser input, page scripts and failure text can contain page
-        // data. Keep call metadata for correlation, not those payloads.
+    if canonical.eq_ignore_ascii_case("browser")
+        || canonical.eq_ignore_ascii_case("browser_eval")
+        || canonical.eq_ignore_ascii_case("session_message")
+    {
+        // Browser and peer arguments, results and failure text can contain
+        // private content. Keep correlation metadata, not those payloads.
         "[redacted]".to_string()
     } else {
         truncate(value, PREVIEW_MAX_CHARS)
