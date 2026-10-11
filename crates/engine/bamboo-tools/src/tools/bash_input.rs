@@ -97,9 +97,11 @@ impl Tool for BashInputTool {
             ));
         }
 
-        let shell = bash_runtime::get_shell(parsed.bash_id.trim()).ok_or_else(|| {
-            ToolError::Execution(format!("Background shell '{}' not found", parsed.bash_id))
-        })?;
+        let shell = bash_runtime::get_shell(parsed.bash_id.trim())
+            .filter(|shell| !shell.is_model_polled())
+            .ok_or_else(|| {
+                ToolError::Execution(format!("Background shell '{}' not found", parsed.bash_id))
+            })?;
 
         // Write any provided input first. When `input` is empty and no newline
         // is requested there is nothing to write — skip straight to the optional

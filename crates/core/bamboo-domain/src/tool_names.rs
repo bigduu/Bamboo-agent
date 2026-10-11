@@ -8,10 +8,12 @@
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 19] = [
+pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
     "Bash",
     "BashInput",
     "BashOutput",
+    "exec_command",
+    "write_stdin",
     "Edit",
     "ExitPlanMode",
     "GetFileInfo",
