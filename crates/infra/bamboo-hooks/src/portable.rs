@@ -487,8 +487,9 @@ async fn run_config_snapshot(
         original_tool_input,
         final_assistant_content,
     )?;
-    let legacy_input =
-        crate::shell_compatibility::legacy_shell_projection(payload, session, original_tool_input)
+    let legacy_inputs =
+        crate::shell_compatibility::legacy_shell_projections(payload, session, original_tool_input)
+            .into_iter()
             .map(|projected| {
                 envelope_with_tool_input(
                     event,
@@ -499,7 +500,7 @@ async fn run_config_snapshot(
                     final_assistant_content,
                 )
             })
-            .transpose()?;
+            .collect::<Result<Vec<_>, _>>()?;
     let stop_active = input["stop_hook_active"].as_bool().unwrap_or(false);
     let mut report = PortableReport::default();
     if let Some(groups) = config.hooks.get(&event) {
@@ -518,7 +519,7 @@ async fn run_config_snapshot(
             };
             let selected_input = if matches(&input) {
                 &input
-            } else if let Some(legacy) = legacy_input.as_ref().filter(|legacy| matches(legacy)) {
+            } else if let Some(legacy) = legacy_inputs.iter().find(|legacy| matches(legacy)) {
                 legacy
             } else {
                 continue;
@@ -825,7 +826,8 @@ mod tests {
             _timeout: std::time::Duration,
         ) -> std::io::Result<crate::HookCommandOutput> {
             let input: Value = serde_json::from_slice(&input).unwrap();
-            let deny = input["tool_name"] == "Bash" && input["hook_event_name"] == "PreToolUse";
+            let deny = (input["tool_name"] == "Bash" || input["tool_name"] == "BashOutput")
+                && input["hook_event_name"] == "PreToolUse";
             self.0.lock().unwrap().push(input);
             Ok(crate::HookCommandOutput {
                 exit_code: Some(0),
@@ -934,6 +936,99 @@ mod tests {
         }
         assert_eq!(seen[4]["tool_response"], "done");
         assert_eq!(seen[5]["tool_name"], "exec_command");
+    }
+
+    #[tokio::test]
+    async fn portable_output_policy_covers_input_eof_and_kill_without_duplicate_groups() {
+        let command = json!({"type":"command", "command":"record-envelope", "timeout":1});
+        let (temp, session, _) = fixture(vec![command.clone()]).await;
+        let root = temp.path();
+        let bundle = root.join("plugin with spaces");
+        let groups: Vec<_> = [
+            "^write_stdin$",
+            "*",
+            "^(write_stdin|BashOutput)$",
+            "^(BashInput|KillShell|BashOutput)$",
+            "^BashOutput$",
+        ]
+        .into_iter()
+        .map(|matcher| json!({"matcher":matcher,"hooks":[command.clone()]}))
+        .collect();
+        std::fs::write(
+            bundle.join("hooks.json"),
+            serde_json::to_vec(&json!({"hooks":{"PreToolUse":groups,"PostToolUse":groups}}))
+                .unwrap(),
+        )
+        .unwrap();
+        let manifest: PluginManifest =
+            serde_json::from_slice(&std::fs::read(bundle.join("plugin.json")).unwrap()).unwrap();
+        let mut store = InstalledPlugins::load(&root.join("installed.json"))
+            .await
+            .unwrap();
+        store.plugins[0].registered.hooks = registrations(&manifest, &bundle).unwrap();
+        store.save(&root.join("installed.json")).await.unwrap();
+        trust(root).await;
+
+        for (args, primary) in [
+            (
+                json!({"session_id":"exec", "chars":"yes\n", "eof":false, "yield_time_ms":250, "max_output_tokens":10}),
+                "BashInput",
+            ),
+            (json!({"session_id":"exec", "eof":true}), "BashInput"),
+            (json!({"session_id":"exec", "chars":"\u{3}"}), "KillShell"),
+        ] {
+            for (point, payload) in [
+                (
+                    AgentHookPoint::BeforeToolExecution,
+                    HookPayload::ToolExecution {
+                        tool_name: "write_stdin".into(),
+                        tool_call_id: "combined-call".into(),
+                        parsed_args: args.clone(),
+                    },
+                ),
+                (
+                    AgentHookPoint::AfterToolExecution,
+                    HookPayload::ToolResult {
+                        tool_name: "write_stdin".into(),
+                        tool_call_id: "combined-call".into(),
+                        outcome: bamboo_domain::HookToolOutcome {
+                            success: true,
+                            result: Some("output".into()),
+                            error: None,
+                            needs_human: false,
+                            duration_ms: 1,
+                        },
+                    },
+                ),
+            ] {
+                let recorder = std::sync::Arc::new(RecordingTerminalExecutor(
+                    std::sync::Mutex::new(Vec::new()),
+                ));
+                let report = crate::with_hook_command_executor(
+                    recorder.clone(),
+                    run_with_tool_input(root, point, &payload, &session, Some(&args)),
+                )
+                .await;
+                assert!(report.errors.is_empty(), "{:?}", report.errors);
+                if point == AgentHookPoint::BeforeToolExecution {
+                    assert!(matches!(report.decision, HookResult::Deny { .. }));
+                }
+                let seen = recorder.0.lock().unwrap();
+                assert_eq!(seen.len(), 5);
+                for input in &seen[..3] {
+                    assert_eq!(input["tool_name"], "write_stdin");
+                    assert_eq!(input["tool_input"], args);
+                }
+                assert_eq!(seen[3]["tool_name"], primary);
+                assert!(seen[3]["tool_input"].get("yield_time_ms").is_none());
+                assert!(seen[3]["tool_input"].get("max_output_tokens").is_none());
+                assert_eq!(seen[4]["tool_name"], "BashOutput");
+                assert_eq!(seen[4]["tool_input"], json!({"bash_id":"exec"}));
+                if point == AgentHookPoint::AfterToolExecution {
+                    assert_eq!(seen[4]["tool_response"], "output");
+                }
+            }
+        }
     }
 
     #[tokio::test]

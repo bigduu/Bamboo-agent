@@ -136,7 +136,7 @@ impl HookDispatcher {
                     _ => None,
                 }
             });
-        let legacy = crate::shell_compatibility::legacy_shell_projection(
+        let legacy = crate::shell_compatibility::legacy_shell_projections(
             resolved_shell.as_ref().unwrap_or(payload),
             session,
             original_tool_input,
@@ -149,18 +149,17 @@ impl HookDispatcher {
             // Original-name and wildcard matchers keep the actual spelling.
             // Each handler runs once, using shell compatibility only when its
             // primary matcher did not match the original call.
-            let selected_payload = if hook.matches(payload) {
-                payload
+            let (selected_payload, restriction_only) = if hook.matches(payload) {
+                (payload, false)
             } else if let Some(resolved) = resolved_shell
                 .as_ref()
                 .filter(|resolved| hook.matches(resolved))
             {
-                resolved
-            } else if let Some(projected) = legacy
-                .as_ref()
-                .filter(|legacy| hook.matches(&legacy.payload))
+                (resolved, false)
+            } else if let Some(projected) =
+                legacy.iter().find(|legacy| hook.matches(&legacy.payload))
             {
-                &projected.payload
+                (&projected.payload, projected.restriction_only)
             } else {
                 continue;
             };
@@ -176,6 +175,13 @@ impl HookDispatcher {
 
             let (result, mut contexts) = unwrap_context_result(result);
             report.outcome.injected_contexts.append(&mut contexts);
+            let result = if restriction_only && matches!(result, HookResult::Allow) {
+                // An output-only legacy policy may restrict the read side of a
+                // combined continuation, but cannot grant stdin/kill authority.
+                HookResult::Continue
+            } else {
+                result
+            };
 
             match &result {
                 HookResult::Abort { .. }
@@ -391,6 +397,128 @@ mod tests {
                 assert_eq!(name(&seen[3]), resolved);
                 assert_eq!(name(&seen[4]), legacy);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn combined_continuations_apply_output_restrictions_without_duplicate_handlers() {
+        for (input, primary) in [
+            (
+                json!({"session_id":"exec", "chars":"yes\n", "eof":false}),
+                "BashInput",
+            ),
+            (json!({"session_id":"exec", "eof":true}), "BashInput"),
+            (json!({"session_id":"exec", "chars":"\u{3}"}), "KillShell"),
+        ] {
+            for control in [
+                HookResult::Deny {
+                    reason: "output policy".into(),
+                },
+                HookResult::Ask,
+            ] {
+                for (point, payload) in [
+                    (
+                        AgentHookPoint::BeforeToolExecution,
+                        HookPayload::ToolExecution {
+                            tool_name: "default::write_stdin".into(),
+                            tool_call_id: "combined-call".into(),
+                            parsed_args: input.clone(),
+                        },
+                    ),
+                    (
+                        AgentHookPoint::AfterToolExecution,
+                        HookPayload::ToolResult {
+                            tool_name: "default::write_stdin".into(),
+                            tool_call_id: "combined-call".into(),
+                            outcome: bamboo_domain::HookToolOutcome {
+                                success: true,
+                                result: Some("output".into()),
+                                error: None,
+                                needs_human: false,
+                                duration_ms: 1,
+                            },
+                        },
+                    ),
+                ] {
+                    let mut dispatcher = HookDispatcher::new();
+                    let seen = Arc::new(Mutex::new(Vec::new()));
+                    for (matcher, result) in [
+                        ("^default::write_stdin$", HookResult::Continue),
+                        (".*", HookResult::Continue),
+                        ("^(BashInput|KillShell|BashOutput)$", HookResult::Continue),
+                        ("^write_stdin$", HookResult::Continue),
+                        ("^BashOutput$", control.clone()),
+                    ] {
+                        dispatcher.register(Arc::new(RecordingHook {
+                            point,
+                            matcher: regex::Regex::new(matcher).unwrap(),
+                            seen: seen.clone(),
+                            result,
+                        }));
+                    }
+                    let report = dispatcher
+                        .run_hooks_with_resolved_shell(
+                            point,
+                            &payload,
+                            &Session::new("test", "model"),
+                            Some("write_stdin"),
+                            Some(&input),
+                        )
+                        .await;
+                    assert_eq!(report.outcome.decision, control);
+                    assert_eq!(report.executions.len(), 5);
+                    let seen = seen.lock().unwrap();
+                    assert_eq!(&seen[..2], &[payload.clone(), payload]);
+                    let name = |payload: &HookPayload| match payload {
+                        HookPayload::ToolExecution { tool_name, .. }
+                        | HookPayload::ToolResult { tool_name, .. } => tool_name.clone(),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(name(&seen[2]), primary);
+                    assert_eq!(name(&seen[3]), "write_stdin");
+                    assert_eq!(name(&seen[4]), "BashOutput");
+                    if let HookPayload::ToolExecution { parsed_args, .. } = &seen[4] {
+                        assert_eq!(parsed_args, &json!({"bash_id":"exec"}));
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn secondary_output_allow_preserves_context_without_granting_input_authority() {
+        for (matcher, chars, expected) in [
+            ("^BashOutput$", "yes\n", HookResult::Continue),
+            ("^BashInput$", "yes\n", HookResult::Allow),
+            ("^write_stdin$", "yes\n", HookResult::Allow),
+            ("^BashOutput$", "", HookResult::Allow),
+        ] {
+            let mut dispatcher = HookDispatcher::new();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            dispatcher.register(Arc::new(RecordingHook {
+                point: AgentHookPoint::BeforeToolExecution,
+                matcher: regex::Regex::new(matcher).unwrap(),
+                seen: seen.clone(),
+                result: HookResult::WithContext {
+                    result: Box::new(HookResult::Allow),
+                    text: "policy context".into(),
+                },
+            }));
+            let payload = HookPayload::ToolExecution {
+                tool_name: "write_stdin".into(),
+                tool_call_id: "allow-call".into(),
+                parsed_args: json!({"session_id":"exec", "chars":chars}),
+            };
+            let report = dispatcher
+                .run_hooks(
+                    AgentHookPoint::BeforeToolExecution,
+                    &payload,
+                    &Session::new("test", "model"),
+                )
+                .await;
+            assert_eq!(report.outcome.decision, expected);
+            assert_eq!(report.outcome.injected_contexts, ["policy context"]);
+            assert_eq!(seen.lock().unwrap().len(), 1);
         }
     }
 
