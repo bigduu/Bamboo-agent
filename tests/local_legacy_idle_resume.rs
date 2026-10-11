@@ -7,24 +7,29 @@
 //! rather than the default native Tokio backend or a mocked ExternalChildRunner.
 #![cfg(target_os = "linux")]
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Mutex,
+    Arc, Mutex,
 };
 use std::time::Duration;
 
 use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;
-use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutionContext, ToolOutcome};
+use bamboo_agent_core::tools::{
+    FunctionCall, ToolCall, ToolExecutionContext, ToolOutcome, ToolSchema,
+};
 use bamboo_agent_core::{Message, Role, Session};
 use bamboo_domain::{
-    ProviderModelRef, SessionActivationDisposition, SessionMessageBody, SessionMessageContent,
+    ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, ProviderModelRef,
+    SessionActivationDisposition, SessionMessageBody, SessionMessageContent,
     SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
 };
 use bamboo_server::app_state::{AgentStatus, AppState, MemoryStore};
 use bamboo_server::tools::ToolSurface;
 use bamboo_storage::SessionStoreV2;
+use bamboo_tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder};
 use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
@@ -47,6 +52,8 @@ struct ProviderProbe {
     parent_notifications: Mutex<Vec<(usize, String)>>,
     unexpected_requests: Mutex<Vec<Value>>,
     child_id: Mutex<Option<String>>,
+    storage: Mutex<Option<Arc<dyn Storage>>>,
+    parent_tool_names: Mutex<BTreeSet<String>>,
     entered: Notify,
     released: AtomicUsize,
     release: Notify,
@@ -63,11 +70,69 @@ fn plain_response(id: &str, reply: &str) -> HttpResponse {
 }
 
 fn unexpected_request(probe: &ProviderProbe, body: &Value, reason: &str) -> HttpResponse {
-    // Only synthetic fixture data is logged. Keep unexpected callers visible
-    // rather than silently filtering them out of the exact Child-call proof.
-    eprintln!("unexpected legacy fixture provider request ({reason}): {body}");
-    probe.unexpected_requests.lock().unwrap().push(body.clone());
+    // Retain bounded identity evidence rather than repeating entire prompts in
+    // the request handler and again in the terminal assertion.
+    let summary = json!({
+        "reason": reason,
+        "model": body["model"],
+        "messages": body["messages"].as_array().map(|messages| messages.iter().enumerate()
+            .map(|(index, message)| message_diagnostic(index, message)).collect::<Vec<_>>()),
+    });
+    eprintln!("unexpected legacy fixture provider request: {summary}");
+    probe.unexpected_requests.lock().unwrap().push(summary);
     HttpResponse::BadRequest().body("unexpected legacy fixture provider request")
+}
+
+fn text_diagnostic(content: &str) -> Value {
+    json!({"bytes":content.len(), "sha256":bamboo_domain::sha256_hex(content.as_bytes())})
+}
+
+fn message_diagnostic(index: usize, message: &Value) -> Value {
+    let content = message["content"].as_str().unwrap_or_default();
+    json!({"index":index, "role":message["role"],
+        "context_type":content.lines().find_map(|line| line.strip_prefix("context_type: ")),
+        "content":text_diagnostic(content)})
+}
+
+fn parent_context_diagnostic(parent: &Session, expected_guide: &str) -> Value {
+    json!({
+        "prompt_snapshot_present":parent.prompt_snapshot.is_some(),
+        "snapshot_guide":parent.prompt_snapshot.as_ref()
+            .and_then(|snapshot| snapshot.tool_guide_context.as_deref()).map(text_diagnostic),
+        "actual_root_guide":text_diagnostic(expected_guide),
+        "ledger":parent.model_context_state.as_ref().map(|state| state.events.iter().map(|event|
+            json!({"context_type":event.block_type, "content":text_diagnostic(&event.rendered_text)})
+        ).collect::<Vec<_>>()),
+    })
+}
+
+fn is_persisted_parent_context(message: &Value, parent: &Session, expected_guide: &str) -> bool {
+    if message["role"] != "user" {
+        return false;
+    }
+    let Some(content) = message["content"].as_str() else {
+        return false;
+    };
+    // OpenAI wire messages omit the Host metadata. The production runner
+    // checkpoints these byte-authoritative events before provider dispatch;
+    // match that evidence instead of trusting marker-shaped user text.
+    if parent.model_context_state.as_ref().is_some_and(|state| {
+        state.events.iter().any(|event| {
+            matches!(
+                event.block_type,
+                ContextBlockType::SessionIdentity
+                    | ContextBlockType::Workspace
+                    | ContextBlockType::ProjectResources
+                    | ContextBlockType::ExternalMemory
+            ) && event.rendered_text == content
+        })
+    }) {
+        return true;
+    }
+    // Stable tool guidance is built from the final provider catalog, outside
+    // the ledger. Neither the unfiltered Root surface nor PromptSnapshot is
+    // authoritative for this freshly generated provider prefix.
+    !expected_guide.is_empty() && content == expected_guide
 }
 
 async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>) -> HttpResponse {
@@ -92,6 +157,51 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
         let (Some(child_id), Some(messages)) = (child_id, messages) else {
             return unexpected_request(&probe, &body, "unrecognized parent call");
         };
+        let storage = probe.storage.lock().unwrap().clone().unwrap();
+        let parent = match storage.load_session(PARENT).await {
+            Ok(Some(parent)) => parent,
+            _ => return unexpected_request(&probe, &body, "Parent context checkpoint unavailable"),
+        };
+        let schemas: Vec<ToolSchema> = match serde_json::from_value(body["tools"].clone()) {
+            Ok(schemas) => schemas,
+            Err(_) => return unexpected_request(&probe, &body, "invalid Parent tool catalog"),
+        };
+        {
+            let allowed_names = probe.parent_tool_names.lock().unwrap();
+            let mut seen = BTreeSet::new();
+            if schemas.is_empty()
+                || schemas.iter().any(|schema| {
+                    schema.schema_type != "function"
+                        || (!allowed_names.contains(&schema.function.name)
+                            && schema.function.name
+                                != bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
+                            // ServerSkillRuntime adds these exact progressive
+                            // catalog tools around the Root executor per run.
+                            && !matches!(schema.function.name.as_str(), "skills_list" | "skills_read"))
+                        || !seen.insert(schema.function.name.as_str())
+                })
+            {
+                eprintln!(
+                    "Parent catalog mismatch: actual={:?}, root={allowed_names:?}",
+                    schemas
+                        .iter()
+                        .map(|schema| (&schema.schema_type, &schema.function.name))
+                        .collect::<Vec<_>>()
+                );
+                return unexpected_request(&probe, &body, "unknown or repeated Parent tool");
+            }
+        }
+        // Use the real post-filter provider catalog. The Root surface also
+        // contains HostOnly/legacy tools that production removes, while the
+        // compatibility adapter appends its public discovery-control schema.
+        let expected_guide = ContextBlock::new(
+            ContextBlockType::ToolGuide,
+            ContextBlockPriority::High,
+            ContextBlockStability::SessionStable,
+            "Tool & Connected-Server Guide",
+            EnhancedPromptBuilder::build(None, &schemas, &GuideBuildContext::default()),
+        )
+        .render_runtime_context_text();
         let prefix = format!(
             "Runtime notification: child session `{child_id}` finished with status `completed`."
         );
@@ -100,8 +210,14 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
         });
         let mut fresh = Vec::new();
         let mut initial_seen = false;
-        for message in &messages[last_ack.map_or(0, |index| index + 1)..] {
-            if message["role"] == "system" {
+        for (index, message) in messages
+            .iter()
+            .enumerate()
+            .skip(last_ack.map_or(0, |index| index + 1))
+        {
+            if message["role"] == "system"
+                || is_persisted_parent_context(message, &parent, &expected_guide)
+            {
                 continue;
             }
             if last_ack.is_none()
@@ -118,6 +234,11 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
                 .iter()
                 .position(|reply| content.contains(&format!("Child final response:\n{reply}\n\n")));
             if message["role"] != "user" || !content.starts_with(&prefix) || outcome.is_none() {
+                eprintln!(
+                    "unrecognized Parent input: message={}, durable_context={}",
+                    message_diagnostic(index, message),
+                    parent_context_diagnostic(&parent, &expected_guide)
+                );
                 return unexpected_request(&probe, &body, "unknown new parent input");
             }
             fresh.push((outcome.unwrap(), content.to_string()));
@@ -421,37 +542,65 @@ async fn wait_parent_settled(
     probe: &ProviderProbe,
     child: &Session,
     run_id: &str,
+    outcome_index: usize,
 ) -> Session {
     tokio::time::timeout(WAIT, async {
         loop {
             {
                 let unexpected = probe.unexpected_requests.lock().unwrap();
-                assert!(unexpected.is_empty(), "unexpected requests: {unexpected:#?}");
+                assert!(
+                    unexpected.is_empty(),
+                    "unexpected requests: {unexpected:#?}"
+                );
             }
             let parent = state.storage.load_session(PARENT).await.unwrap().unwrap();
-            if matches!(parent.last_run_status().as_deref(), Some("error" | "timeout" | "cancelled")) {
-                panic!("Parent notification run failed: {:?}", parent.last_run_error());
+            if matches!(
+                parent.last_run_status().as_deref(),
+                Some("error" | "timeout" | "cancelled")
+            ) {
+                panic!(
+                    "Parent notification run failed: {:?}",
+                    parent.last_run_error()
+                );
             }
             if let Some((index, envelope)) = parent_outcome(&parent, child, run_id) {
-                let acknowledged = state.session_inbox.was_admitted(PARENT, &envelope.id).await.unwrap();
+                let acknowledged = state
+                    .session_inbox
+                    .was_admitted(PARENT, &envelope.id)
+                    .await
+                    .unwrap();
                 let inbox = state.session_inbox.inspect(PARENT).await.unwrap();
-                let completed = state.agent_runners.read().await.get(PARENT)
+                let completed = state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(PARENT)
                     .is_some_and(|runner| matches!(runner.status, AgentStatus::Completed));
-                let idle = state.session_activation_router.current_run_id(PARENT).await.is_none();
-                let answered = parent.messages[index + 1..].iter()
-                    .any(|message| message.role == Role::Assistant && message.content == PARENT_ACK);
-                if acknowledged && completed && idle && answered
+                let idle = state
+                    .session_activation_router
+                    .current_run_id(PARENT)
+                    .await
+                    .is_none();
+                let answered = parent.messages[index + 1..].iter().any(|message| {
+                    message.role == Role::Assistant && message.content == PARENT_ACK
+                });
+                if acknowledged
+                    && completed
+                    && idle
+                    && answered
                     && parent.last_run_status().as_deref() == Some("completed")
                     && (inbox.pending, inbox.claimed) == (0, 0)
                     && !inbox.activation_pending()
-                    && probe.parent_consumed.lock().unwrap()[1]
+                    && probe.parent_consumed.lock().unwrap()[outcome_index]
                 {
                     return parent;
                 }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }).await.expect("final Child outcome, canonical Parent ACK and idle Root must converge before provider shutdown")
+    })
+    .await
+    .expect("Child outcome, canonical Parent ACK and idle Root must converge")
 }
 
 #[test]
@@ -506,7 +655,8 @@ async fn run_fixture() {
     std::fs::write(home.join("config.json"), serde_json::to_vec(&json!({
         "provider":"openai",
         "features":{"provider_model_ref":true},
-        "providers":{"openai":{"api_key":"local-fixture-only","base_url":base_url,"model":PARENT_MODEL}},
+        "providers":{"openai":{"api_key":"local-fixture-only","base_url":base_url,"model":PARENT_MODEL,
+            "runtime_models":[MODEL,PARENT_MODEL]}},
         "defaults":{"chat":{"provider":"openai","model":PARENT_MODEL}},
         "subagents":{"runtime":"actor","executor":"bamboo_runtime",
             "worker_bin":env!("CARGO_BIN_EXE_bamboo"),"worker_args":["subagent-worker"],
@@ -515,6 +665,16 @@ async fn run_fixture() {
     let state = AppState::new_with_memory_store(home.clone(), MemoryStore::new(jiandu))
         .await
         .unwrap();
+    *probe.storage.lock().unwrap() = Some(state.storage.clone());
+    // Bound catalog identity by the actual Root surface; request-time guide
+    // rendering uses the provider's final filtered schemas instead.
+    *probe.parent_tool_names.lock().unwrap() = state
+        .tool_factory
+        .get(ToolSurface::Root)
+        .list_tools()
+        .into_iter()
+        .map(|schema| schema.function.name)
+        .collect();
     {
         let config = state.config.read().await;
         assert!(bamboo_engine::external_agents::runtime::requires_legacy_child_runtime(&config));
@@ -639,6 +799,12 @@ async fn run_fixture() {
             .count(),
         1
     );
+
+    // Let the first incremental outcome settle before making the Child active
+    // again. Otherwise the Root may correctly establish a new implicit wait
+    // and withhold its first ACK, which this fixture's strict replay detector
+    // must not confuse with a duplicated notification.
+    wait_parent_settled(&state, &probe, &first, &first_run_id, 0).await;
 
     let envelope = SessionMessageEnvelope {
         id: SessionMessageId::parse("legacy-idle-resume-input").unwrap(),
@@ -870,7 +1036,7 @@ async fn run_fixture() {
     // The SDK can release the Child router before publishing its Parent
     // callback. Observe the final exact source through the Root checkpoint and
     // receipt, and let its real reasoning owner settle before stopping HTTP.
-    let parent = wait_parent_settled(&state, &probe, &completed, &resumed_run_id).await;
+    let parent = wait_parent_settled(&state, &probe, &completed, &resumed_run_id, 1).await;
     let notifications = probe.parent_notifications.lock().unwrap().clone();
     for (outcome, text) in notifications {
         let (child, run_id) = match outcome {

@@ -52,8 +52,10 @@ Builtin Write/Edit work remains owned until its physical asynchronous work
 finishes. Bash subprocess groups have an explicit per-execution owner; shutdown
 kills and reaps the group and joins its output pumps. Dropping a tool waiter
 does not pretend that a blocking write stopped. Unix process groups and Windows
-Job Objects provide native process ownership. Windows keeps the existing Git
-Bash/cmd shell selection, starts suspended before Job assignment, and requires
+Job Objects provide native process ownership. Unix stop evidence covers the
+owned process group, not an arbitrary daemon that deliberately leaves it (for
+example with `setsid`), and it does not undo external side effects. Windows keeps
+the existing Git Bash/cmd shell selection, starts suspended before Job assignment, and requires
 the owned Job to have zero active processes before confirming stop. Other
 platforms reject scoped command execution before spawning it. Platform
 acceptance is recorded separately; cross-compilation is not runtime evidence.

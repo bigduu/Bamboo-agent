@@ -101,8 +101,21 @@ async fn actual_local_task_stop_is_uuid_bound_and_result_replays_after_restart()
         .await
         .unwrap()
         .unwrap();
+    // This direct-runner adapter fixture owns the publication tail below.
+    // Keep its coordinator alive until that tail really finishes; an already
+    // exited coordinator correctly triggers orphan cancellation and cannot
+    // stand in for a live owner of the Agent execution.
+    let (coordinator_finished, publication_finished) = tokio::sync::oneshot::channel();
     assert!(runner
-        .track_child_task(&f.child.id, RUN, tokio::spawn(async {}))
+        .track_child_task(
+            &f.child.id,
+            RUN,
+            tokio::spawn(async move {
+                publication_finished
+                    .await
+                    .expect("direct fixture must finish its publication tail");
+            }),
+        )
         .is_none());
     assert!(runner
         .prepare_durable_child_delivery(&f.child, RUN)
@@ -215,6 +228,7 @@ async fn actual_local_task_stop_is_uuid_bound_and_result_replays_after_restart()
             .status,
         ActorActivationStatus::Succeeded
     );
+    coordinator_finished.send(()).unwrap();
     runner.shutdown().await.unwrap();
     drop(registration);
     drop(runner);
