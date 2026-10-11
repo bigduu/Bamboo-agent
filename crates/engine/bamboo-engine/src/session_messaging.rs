@@ -11,10 +11,10 @@ use std::time::Instant;
 
 use bamboo_agent_core::storage::Storage;
 use bamboo_domain::{
-    Session, SessionActivationDisposition, SessionActivationError, SessionActivationPolicy,
-    SessionActivationPort, SessionInboxError, SessionInboxPort, SessionInboxReceipt,
-    SessionMessageBody, SessionMessageContent, SessionMessageEnvelope, SessionMessageId,
-    SessionMessageKind, SessionMessageSource, SupervisorReference,
+    ActorSession, Session, SessionActivationDisposition, SessionActivationError,
+    SessionActivationPolicy, SessionActivationPort, SessionInboxError, SessionInboxPort,
+    SessionInboxReceipt, SessionMessageBody, SessionMessageContent, SessionMessageEnvelope,
+    SessionMessageId, SessionMessageKind, SessionMessageSource, SupervisorReference,
 };
 
 /// A followup is one bounded peer instruction, not a context export or file transfer.
@@ -320,7 +320,7 @@ impl SessionMessenger {
             id.to_string(),
             None,
         );
-        self.send_peer_envelope(envelope).await
+        self.send_peer_envelope(envelope, &caller, &target).await
     }
 
     /// Reply only to a canonical received peer envelope in the caller's saved
@@ -393,7 +393,7 @@ impl SessionMessenger {
             thread,
             Some(original.id),
         );
-        self.send_peer_envelope(envelope).await
+        self.send_peer_envelope(envelope, &caller, &target).await
     }
 
     fn validate_peer_input(operation_id: &str, message: &str) -> Result<(), SessionMessengerError> {
@@ -526,11 +526,31 @@ impl SessionMessenger {
     async fn send_peer_envelope(
         &self,
         envelope: SessionMessageEnvelope,
+        caller: &Session,
+        target: &Session,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
-        // Peer scheduling uses the existing per-message durable intent and
-        // safe-boundary activation path; it grants no queue-prefix permission.
-        self.send_with_policy(envelope, SessionActivationPolicy::InterruptSpecificWait)
+        let started = Instant::now();
+        let source = ActorSession::from_session(caller)
+            .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
+        let target = ActorSession::from_session(target)
+            .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
+        // These are the same births used for the stable message id. The inbox
+        // must revalidate them under its retained lifecycle authority; a fresh
+        // relationship read before generic delivery would still race rebirth.
+        let delivery = match self
+            .inbox
+            .deliver_peer_message(&envelope, &source, &target)
             .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let error = SessionMessengerError::Inbox(error);
+                self.record_rejection(&error);
+                return Err(error);
+            }
+        };
+        let admission = self.record_admission(envelope, delivery, started);
+        self.activate_prepared(&admission).await
     }
 
     /// Follow an already-attached Ordinary Root from the original executing
@@ -1179,6 +1199,189 @@ mod tests {
             session.set_project_id_meta("peer-project");
             store.save_session(&session).await.unwrap();
         }
+    }
+
+    struct PausedPeerAdmission {
+        inner: Arc<FileSessionInbox>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl SessionInboxPort for PausedPeerAdmission {
+        async fn deliver(
+            &self,
+            envelope: &SessionMessageEnvelope,
+        ) -> Result<SessionInboxReceipt, SessionInboxError> {
+            self.inner.deliver(envelope).await
+        }
+
+        async fn deliver_peer_message(
+            &self,
+            envelope: &SessionMessageEnvelope,
+            source: &ActorSession,
+            target: &ActorSession,
+        ) -> Result<SessionInboxReceipt, SessionInboxError> {
+            // The engine has already captured both births and built its id;
+            // actual filesystem admission has not yet acquired its authority.
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.inner
+                .deliver_peer_message(envelope, source, target)
+                .await
+        }
+
+        async fn mark_activation_eligible(
+            &self,
+            target: &str,
+            generation: u64,
+            policy: SessionActivationPolicy,
+        ) -> Result<(), SessionInboxError> {
+            self.inner
+                .mark_activation_eligible(target, generation, policy)
+                .await
+        }
+
+        async fn claim(
+            &self,
+            target: &str,
+            limit: usize,
+        ) -> Result<Vec<bamboo_domain::SessionInboxClaim>, SessionInboxError> {
+            self.inner.claim(target, limit).await
+        }
+
+        async fn was_admitted(
+            &self,
+            target: &str,
+            id: &SessionMessageId,
+        ) -> Result<bool, SessionInboxError> {
+            self.inner.was_admitted(target, id).await
+        }
+
+        async fn ack(
+            &self,
+            target: &str,
+            claim: &bamboo_domain::SessionInboxClaim,
+        ) -> Result<(), SessionInboxError> {
+            self.inner.ack(target, claim).await
+        }
+
+        async fn inspect(
+            &self,
+            target: &str,
+        ) -> Result<bamboo_domain::SessionInboxBacklog, SessionInboxError> {
+            self.inner.inspect(target).await
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_send_and_reply_reject_either_lifetime_recreated_before_admission() {
+        for reply in [false, true] {
+            for replaced_id in ["peer-left", "peer-right"] {
+                let (_temp, store, activation, messenger) = fixture().await;
+                seed_peer_tree(store.as_ref()).await;
+                let received_id = if reply {
+                    let incoming = messenger
+                        .send_peer("peer-left", "peer-right", "incoming", "question")
+                        .await
+                        .unwrap();
+                    admit_peer_for_test(store.as_ref(), messenger.inbox().as_ref(), "peer-right")
+                        .await;
+                    Some(incoming.delivery.id.to_string())
+                } else {
+                    None
+                };
+                activation.calls.lock().await.clear();
+                let (caller, target) = if reply {
+                    ("peer-right", "peer-left")
+                } else {
+                    ("peer-left", "peer-right")
+                };
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let release = Arc::new(tokio::sync::Notify::new());
+                let inbox = Arc::new(FileSessionInbox::new(
+                    store.clone(),
+                    SessionInboxLimits::default(),
+                ));
+                let paused = SessionMessenger::new(
+                    store.clone(),
+                    Arc::new(PausedPeerAdmission {
+                        inner: inbox.clone(),
+                        entered: entered.clone(),
+                        release: release.clone(),
+                    }),
+                    activation.clone(),
+                );
+                let sending = tokio::spawn(async move {
+                    if let Some(id) = received_id {
+                        paused
+                            .reply_peer(caller, &id, "racing", "old lifetime")
+                            .await
+                    } else {
+                        paused
+                            .send_peer(caller, target, "racing", "old lifetime")
+                            .await
+                    }
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+                    .await
+                    .unwrap();
+                let old = store.load_session(replaced_id).await.unwrap().unwrap();
+                assert!(store.delete_session(replaced_id).await.unwrap());
+                let root = store.load_session("peer-root").await.unwrap().unwrap();
+                let mut replacement =
+                    Session::new_child_of(replaced_id, &root, "model", "Replacement");
+                replacement.created_at = old.created_at + chrono::Duration::seconds(1);
+                replacement.set_project_id_meta("peer-project");
+                store.save_session(&replacement).await.unwrap();
+                release.notify_one();
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), sending)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(result.is_err(), "reply={reply}, replaced={replaced_id}");
+                let backlog = inbox.inspect(target).await.unwrap();
+                assert_eq!(backlog.generation, 0);
+                assert_eq!(backlog.pending, 0);
+                assert!(!backlog.activation_pending());
+                assert!(activation.calls.lock().await.is_empty());
+                // Same ids, tree and Project are legal for a fresh operation;
+                // only the stale captured lifetime must fail closed.
+                let current = messenger
+                    .send_peer(caller, target, "current-lifetime", "current")
+                    .await
+                    .unwrap();
+                assert_eq!(current.delivery.generation, 1);
+                assert_eq!(activation.calls.lock().await.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_admission_without_integrated_lifetime_fence_is_unsupported() {
+        let (_temp, store, activation, _messenger) = fixture().await;
+        seed_peer_tree(store.as_ref()).await;
+        let inbox = Arc::new(FileSessionInbox::new(
+            store.clone(),
+            SessionInboxLimits::default(),
+        ));
+        let messenger = SessionMessenger::new(
+            store,
+            Arc::new(FailEligibilityOnce {
+                inner: inbox.clone(),
+                fail_next: std::sync::atomic::AtomicBool::new(false),
+            }),
+            activation.clone(),
+        );
+        let error = messenger
+            .send_peer("peer-left", "peer-right", "unsupported", "message")
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("lifetime-fenced peer SessionInbox admission is unsupported"));
+        assert_eq!(inbox.inspect("peer-right").await.unwrap().pending, 0);
+        assert!(activation.calls.lock().await.is_empty());
     }
 
     async fn admit_peer_for_test(

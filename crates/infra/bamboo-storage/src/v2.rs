@@ -531,6 +531,22 @@ impl Drop for SessionLifecycleReadGuard {
     }
 }
 
+/// Existing authority locks retained by one peer Inbox admission.
+pub(crate) struct PeerDeliveryGuard {
+    pub(crate) inbox_dir: PathBuf,
+    tree: Option<ActorTreeWriteGuard>,
+    sessions: Vec<SessionWriteGuard>,
+    _task: RuntimeTaskTransactionReadGuard,
+    _lifecycle: SessionLifecycleReadGuard,
+}
+
+impl Drop for PeerDeliveryGuard {
+    fn drop(&mut self) {
+        drop(self.tree.take());
+        while let Some(_guard) = self.sessions.pop() {}
+    }
+}
+
 pub(crate) struct SessionLifecycleWriteGuard {
     _process: OwnedRwLockWriteGuard<()>,
     file: std::fs::File,
@@ -2576,6 +2592,138 @@ impl SessionStoreV2 {
             _process: process,
             file,
         })
+    }
+
+    /// Validate both observations under the locks held through Inbox commit.
+    /// Private canonical reads avoid reentering Task or Session locks.
+    pub(crate) async fn lock_peer_delivery(
+        &self,
+        source: &bamboo_domain::ActorSession,
+        target: &bamboo_domain::ActorSession,
+    ) -> io::Result<PeerDeliveryGuard> {
+        let denied = || other_io_error("peer Session identity or tree changed");
+        if source.actor_id == target.actor_id
+            || source.root_actor_id != target.root_actor_id
+            || source.project_id != target.project_id
+        {
+            return Err(denied());
+        }
+        for id in [&source.actor_id, &target.actor_id, &source.root_actor_id] {
+            validate_session_id(id)?;
+        }
+        let matches = |current: &bamboo_domain::ActorSession,
+                       expected: &bamboo_domain::ActorSession| {
+            current.schema_version == expected.schema_version
+                && current.actor_id == expected.actor_id
+                && current.session_created_at == expected.session_created_at
+                && current.parent_actor_id == expected.parent_actor_id
+                && current.root_actor_id == expected.root_actor_id
+                && current.spawn_depth == expected.spawn_depth
+                && current.project_id == expected.project_id
+        };
+        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let mut ids = vec![(0, source.root_actor_id.as_str())];
+        for expected in [source, target] {
+            let current = self
+                .peer_delivery_actor(&expected.actor_id, &expected.root_actor_id)
+                .await?;
+            if !matches(&current, expected) {
+                return Err(denied());
+            }
+            ids.push((current.spawn_depth, expected.actor_id.as_str()));
+        }
+        // ParentQuestion also locks ancestor before child. Canonical depths
+        // prevent forged observations from selecting a conflicting order.
+        ids.sort_unstable();
+        ids.dedup();
+        let mut sessions = Vec::with_capacity(ids.len());
+        for (_, id) in ids {
+            sessions.push(self.acquire_session_maintenance_lock(id).await?);
+        }
+        // Writers take the same tree lock after their Session lock. It freezes
+        // ancestor context without acquiring ancestor Session locks out of order.
+        let tree = self
+            .acquire_actor_tree_write_guard(&source.root_actor_id)
+            .await?;
+        let guard = PeerDeliveryGuard {
+            inbox_dir: self
+                .abs_path_from_rel(&if target.actor_id == target.root_actor_id {
+                    Self::root_rel_path(&target.actor_id)
+                } else {
+                    Self::child_rel_path(&target.root_actor_id, &target.actor_id)
+                })
+                .join("inbox"),
+            tree: Some(tree),
+            sessions,
+            _task: task,
+            _lifecycle: lifecycle,
+        };
+        for expected in [source, target] {
+            let mut current = self
+                .peer_delivery_actor(&expected.actor_id, &expected.root_actor_id)
+                .await?;
+            if !matches(&current, expected) {
+                return Err(denied());
+            }
+            let mut seen = HashSet::from([current.actor_id.clone()]);
+            while let Some(parent_id) = &current.parent_actor_id {
+                if !seen.insert(parent_id.clone()) || seen.len() > 5000 {
+                    return Err(denied());
+                }
+                let parent = self
+                    .peer_delivery_actor(parent_id, &expected.root_actor_id)
+                    .await?;
+                // Preserve the existing owned-tree reader's legacy semantics:
+                // no new parent_created_at or Actor-ledger prerequisite.
+                if parent.project_id != expected.project_id
+                    || parent.spawn_depth.checked_add(1) != Some(current.spawn_depth)
+                    || parent.session_created_at > current.session_created_at
+                {
+                    return Err(denied());
+                }
+                current = parent;
+            }
+            if current.actor_id != expected.root_actor_id
+                || current.spawn_depth != 0
+                || seen.len() != expected.spawn_depth as usize + 1
+            {
+                return Err(denied());
+            }
+        }
+        Ok(guard)
+    }
+
+    async fn peer_delivery_actor(
+        &self,
+        id: &str,
+        root_id: &str,
+    ) -> io::Result<bamboo_domain::ActorSession> {
+        let kind = if id == root_id {
+            SessionKind::Root
+        } else {
+            SessionKind::Child
+        };
+        let rel = if kind == SessionKind::Root {
+            Self::root_rel_path(id)
+        } else {
+            Self::child_rel_path(root_id, id)
+        };
+        let session = self
+            .load_session_from_dir_strict(&self.abs_path_from_rel(&rel), id, kind, root_id)
+            .await?
+            .ok_or_else(|| other_io_error("peer Session no longer exists"))?;
+        if session
+            .runtime_metadata
+            .as_ref()
+            .and_then(|m| m.project_id.as_ref())
+            .zip(session.metadata.get("project_id"))
+            .is_some_and(|(typed, legacy)| typed != legacy)
+        {
+            return Err(other_io_error("peer Session Project mirror changed"));
+        }
+        bamboo_domain::ActorSession::from_session(&session)
+            .map_err(|error| other_io_error(error.to_string()))
     }
 
     async fn lock_session_lifecycle_exclusive(&self) -> io::Result<SessionLifecycleWriteGuard> {
@@ -8482,6 +8630,60 @@ mod tests {
             Some("run-after-full")
         );
         assert!(storage.session_write_locks.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_delivery_waits_for_ancestor_without_holding_reverse_lexical_child(
+    ) -> io::Result<()> {
+        use std::future::Future;
+        let (store, _temp) = create_temp_storage().await?;
+        let root = Session::new("z-root", "model");
+        let child = Session::new_child_of("a-child", &root, "model", "child");
+        store.save_session(&root).await?;
+        store.save_session(&child).await?;
+        let source = bamboo_domain::ActorSession::from_session(&child).unwrap();
+        let target = bamboo_domain::ActorSession::from_session(&root).unwrap();
+        // ParentQuestion acquires the ancestor Session before its child.
+        let ancestor = store.acquire_session_maintenance_lock(&root.id).await?;
+        let root_lock = store
+            .session_write_locks
+            .get(&root.id)
+            .unwrap()
+            .value()
+            .clone();
+        let owners = Arc::strong_count(&root_lock);
+        let mut peer = Box::pin(store.lock_peer_delivery(&source, &target));
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            std::future::poll_fn(|cx| {
+                assert!(peer.as_mut().poll(cx).is_pending());
+                // The owned Mutex waiter retains an Arc as soon as it queues.
+                if Arc::strong_count(&root_lock) > owners {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("peer must reach the held ancestor lock");
+        // Once peer is waiting for the ancestor, the answer writer must still
+        // acquire the child. Child-first ordering would deadlock this step.
+        let descendant = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.acquire_session_maintenance_lock(&child.id),
+        )
+        .await
+        .expect("peer must not hold child while waiting for ancestor")?;
+        drop(descendant);
+        drop(ancestor);
+        drop(root_lock);
+        drop(
+            tokio::time::timeout(Duration::from_secs(10), peer)
+                .await
+                .expect("peer must proceed after the answer writer releases")?,
+        );
         Ok(())
     }
 
