@@ -18,7 +18,8 @@ use bamboo_agent::server::app_state::AgentRunner;
 use bamboo_agent::server::schedule_app::ScheduleTasksTool;
 use bamboo_agent::server::schedule_app::{ResolvedRunConfig, ScheduleContext};
 use bamboo_agent::server::schedule_app::{
-    ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore,
+    ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleRunRecord, ScheduleRunStatus,
+    ScheduleStore,
 };
 use bamboo_agent::Config;
 use bamboo_agent_core::storage::Storage;
@@ -150,6 +151,25 @@ fn build_manager(
     provider: Arc<dyn LLMProvider>,
     config: Config,
 ) -> (Arc<Agent>, Arc<ScheduleManager>) {
+    let schedule_storage: Arc<dyn Storage> = store.clone();
+    build_manager_with_schedule_storage(
+        dir,
+        schedule_store,
+        store,
+        provider,
+        config,
+        schedule_storage,
+    )
+}
+
+fn build_manager_with_schedule_storage(
+    dir: &std::path::Path,
+    schedule_store: Arc<ScheduleStore>,
+    store: Arc<SessionStoreV2>,
+    provider: Arc<dyn LLMProvider>,
+    config: Config,
+    schedule_storage: Arc<dyn Storage>,
+) -> (Arc<Agent>, Arc<ScheduleManager>) {
     use bamboo_metrics::collector::MetricsCollector;
     use bamboo_metrics::storage::SqliteMetricsStorage;
     use bamboo_skills::SkillManager;
@@ -198,7 +218,7 @@ fn build_manager(
         workflow_runs: None,
         schedule_store,
         agent: agent.clone(),
-        persistence: Arc::new(bamboo_storage::LockedSessionStore::new(store.clone())),
+        persistence: Arc::new(bamboo_storage::LockedSessionStore::new(schedule_storage)),
         tools: Arc::new(NoopTools),
         permission_config: None,
         sessions_cache: Arc::default(),
@@ -230,6 +250,66 @@ fn build_manager(
 
     let manager = Arc::new(ScheduleManager::new(ctx));
     (agent, manager)
+}
+
+const SCHEDULE_COMPLETION_GUARD: Duration = Duration::from_secs(30);
+
+async fn wait_for_terminal_schedule_run(
+    store: &ScheduleStore,
+    schedule_id: &str,
+    run_id: &str,
+) -> ScheduleRunRecord {
+    let mut last_run = None;
+    let mut last_schedule = None;
+    let completed = tokio::time::timeout(SCHEDULE_COMPLETION_GUARD, async {
+        loop {
+            last_run = store.get_run_record(run_id).await;
+            last_schedule = store.get_schedule(schedule_id).await;
+            if let Some(record) = last_run.as_ref().filter(|record| {
+                record.schedule_id == schedule_id
+                    && record.status.is_terminal()
+                    && record.completed_at.is_some()
+            }) {
+                return record.clone();
+            }
+            // Pace observations; only the authoritative terminal record ends
+            // the wait. The deadline guards a stuck worker, not normal I/O speed.
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    completed.unwrap_or_else(|_| {
+        panic!(
+            "schedule {schedule_id} run {run_id} did not reach terminal accounting within \
+             {SCHEDULE_COMPLETION_GUARD:?}; last run: {last_run:?}; last schedule: {last_schedule:?}"
+        )
+    })
+}
+
+// The real index is published before this save returns to the schedule worker.
+// Hold that boundary to distinguish session visibility from terminal accounting.
+struct SessionSaveBarrier {
+    store: Arc<SessionStoreV2>,
+    persisted: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Storage for SessionSaveBarrier {
+    async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+        self.store.save_session(session).await?;
+        self.persisted.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+
+    async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+        self.store.load_session(session_id).await
+    }
+
+    async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
+        self.store.delete_session(session_id).await
+    }
 }
 
 #[tokio::test]
@@ -693,13 +773,9 @@ async fn schedule_run_non_auto_execute_completes_with_success_accounting() {
         .await
         .unwrap();
 
-    for _ in 0..20 {
-        let schedule = schedule_store.get_schedule(&created.id).await.unwrap();
-        if schedule.state.last_success_at.is_some() {
-            break;
-        }
-        sleep(Duration::from_millis(25)).await;
-    }
+    let completed =
+        wait_for_terminal_schedule_run(&schedule_store, &created.id, &claimed.run_id).await;
+    assert_eq!(completed.status, ScheduleRunStatus::Success);
 
     let entries = store.list_index_entries().await;
     assert_eq!(entries.len(), 1, "expected one session, got: {entries:?}");
@@ -708,6 +784,107 @@ async fn schedule_run_non_auto_execute_completes_with_success_accounting() {
         Some(claimed.run_id.as_str())
     );
 
+    let updated = schedule_store.get_schedule(&created.id).await.unwrap();
+    assert_eq!(updated.state.running_run_count, 0);
+    assert!(updated.state.last_started_at.is_some());
+    assert!(updated.state.last_finished_at.is_some());
+    assert!(updated.state.last_success_at.is_some());
+    assert_eq!(updated.state.total_run_count, 1);
+    assert_eq!(updated.state.total_success_count, 1);
+    assert_eq!(updated.state.total_failure_count, 0);
+}
+
+#[tokio::test]
+async fn terminal_schedule_waiter_waits_past_session_persistence_and_the_old_poll_budget() {
+    common::init_test_env();
+    let dir = common::create_temp_dir();
+    let store = Arc::new(SessionStoreV2::new(dir.path().to_path_buf()).await.unwrap());
+    let schedule_store = Arc::new(ScheduleStore::new(dir.path().to_path_buf()).await.unwrap());
+    let created = schedule_store
+        .create_schedule(
+            "Delayed terminal accounting".to_string(),
+            bamboo_agent::server::schedule_app::ScheduleTrigger::Interval {
+                every_seconds: 60,
+                anchor_at: None,
+            },
+            true,
+            ScheduleRunConfig {
+                auto_execute: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let persisted = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (_agent, manager) = build_manager_with_schedule_storage(
+        dir.path(),
+        schedule_store.clone(),
+        store.clone(),
+        Arc::new(DummyProvider),
+        clean_config(dir.path()),
+        Arc::new(SessionSaveBarrier {
+            store: store.clone(),
+            persisted: persisted.clone(),
+            release: release.clone(),
+        }),
+    );
+    let claimed = schedule_store
+        .create_run_now(&created.id)
+        .await
+        .unwrap()
+        .expect("run job should be created");
+    manager
+        .enqueue_run_now(ScheduleRunJob {
+            run_id: claimed.run_id.clone(),
+            schedule_id: claimed.schedule_id.clone(),
+            schedule_name: claimed.schedule_name.clone(),
+            run_config: claimed.run_config.clone(),
+            scheduled_for: claimed.scheduled_for,
+            claimed_at: claimed.claimed_at,
+            was_catch_up: claimed.was_catch_up,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(SCHEDULE_COMPLETION_GUARD, persisted.notified())
+        .await
+        .expect("scheduled session must reach the storage barrier");
+    let entries = store.list_index_entries().await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].schedule_run_id.as_deref(),
+        Some(claimed.run_id.as_str())
+    );
+    let running = schedule_store.get_schedule(&created.id).await.unwrap();
+    assert_eq!(running.state.running_run_count, 1);
+    assert!(running.state.last_success_at.is_none());
+
+    // Pause only after real filesystem I/O reaches the barrier. Drive beyond
+    // the former 20 x 25ms wait without wall-clock sleeps or racing its release.
+    tokio::time::pause();
+    let completion = wait_for_terminal_schedule_run(&schedule_store, &created.id, &claimed.run_id);
+    tokio::pin!(completion);
+    let mut returned_before_release = futures::poll!(completion.as_mut()).is_ready();
+    for _ in 0..20 {
+        if returned_before_release {
+            break;
+        }
+        tokio::time::advance(Duration::from_millis(30)).await;
+        returned_before_release = futures::poll!(completion.as_mut()).is_ready();
+    }
+    tokio::time::resume();
+    release.notify_one();
+    assert!(
+        !returned_before_release,
+        "session visibility and the former short poll budget must not satisfy the terminal barrier"
+    );
+    let completed = completion.await;
+    assert_eq!(completed.status, ScheduleRunStatus::Success);
+    assert!(completed.completed_at.is_some());
+    assert_eq!(
+        completed.session_id.as_deref(),
+        Some(entries[0].id.as_str())
+    );
     let updated = schedule_store.get_schedule(&created.id).await.unwrap();
     assert_eq!(updated.state.running_run_count, 0);
     assert!(updated.state.last_started_at.is_some());
@@ -775,20 +952,15 @@ async fn schedule_run_uses_config_get_fast_then_default_fallback() {
         .await
         .unwrap();
 
-    let mut created_id: Option<String> = None;
-    for _ in 0..40 {
-        let entries = store.list_index_entries().await;
-        if let Some(first) = entries.first() {
-            created_id = Some(first.id.clone());
-        }
-        let schedule = schedule_store.get_schedule(&created.id).await.unwrap();
-        if created_id.is_some() && schedule.state.last_success_at.is_some() {
-            break;
-        }
-        sleep(Duration::from_millis(25)).await;
-    }
-
-    let session_id = created_id.expect("expected a scheduled session to be created");
+    let completed =
+        wait_for_terminal_schedule_run(&schedule_store, &created.id, &claimed.run_id).await;
+    assert_eq!(completed.status, ScheduleRunStatus::Success);
+    let entries = store.list_index_entries().await;
+    let session_id = entries
+        .first()
+        .expect("expected a scheduled session to be created")
+        .id
+        .clone();
     let session = store
         .load_session(&session_id)
         .await
@@ -894,13 +1066,7 @@ async fn schedule_auto_execute_keeps_running_until_background_completion() {
 
     release.notify_one();
 
-    for _ in 0..40 {
-        let schedule = schedule_store.get_schedule(&created.id).await.unwrap();
-        if schedule.state.last_success_at.is_some() && schedule.state.running_run_count == 0 {
-            break;
-        }
-        sleep(Duration::from_millis(25)).await;
-    }
+    wait_for_terminal_schedule_run(&schedule_store, &created.id, &claimed.run_id).await;
 
     let updated = schedule_store.get_schedule(&created.id).await.unwrap();
     assert_eq!(updated.state.running_run_count, 0);
