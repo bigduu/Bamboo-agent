@@ -334,6 +334,10 @@ impl SpawnScheduler {
         role: &str,
     ) -> Result<(), String> {
         let mut candidate = Session::new("required-context-preflight", "");
+        // This is a route-only probe for the Child we have not created yet.
+        // Keep it out of execution/persistence, but select the same backend as
+        // that Child; a Root-shaped probe cannot match the native Child runner.
+        candidate.kind = bamboo_domain::SessionKind::Child;
         candidate.metadata = metadata.clone();
         candidate
             .metadata

@@ -579,6 +579,15 @@ async fn installed_root_subagent(
 
 #[tokio::test]
 async fn native_subagent_installed_root_surface_creates_inspects_and_cancels_real_child() {
+    assert_installed_root_child_lifecycle(false).await;
+}
+
+#[tokio::test]
+async fn native_subagent_named_profile_preflight_creates_inspects_and_cancels_real_child() {
+    assert_installed_root_child_lifecycle(true).await;
+}
+
+async fn assert_installed_root_child_lifecycle(named_profile: bool) {
     let home = tempfile::tempdir().unwrap();
     // The profile catalog deliberately rejects symlink ancestors. In particular,
     // macOS's default /var temp prefix is an alias, not a valid catalog root.
@@ -601,6 +610,18 @@ async fn native_subagent_installed_root_surface_creates_inspects_and_cancels_rea
         .project_store
         .create("Native SubAgent entry", None)
         .unwrap();
+    if named_profile {
+        let agents = state
+            .project_store
+            .paths()
+            .project_home(&project.id)
+            .join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("native-profile.md"),
+            "---\nschema_version: 1\nname: native-profile\ndescription: Native profile admission test\ntools:\n  deny: [Bash, Read, Glob, Edit, Write]\n---\nReturn one bounded answer.\n",
+        ).unwrap();
+    }
     let workspace = home_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let workspace = std::fs::canonicalize(workspace).unwrap();
@@ -627,6 +648,21 @@ async fn native_subagent_installed_root_surface_creates_inspects_and_cancels_rea
         "native entry fixture catalog: {:?}",
         catalog.metadata()
     );
+    if named_profile {
+        let foreign = HashMap::from([
+            ("runtime.kind".into(), "external".into()),
+            ("external.protocol".into(), "actor".into()),
+            ("external.agent_id".into(), "unregistered-remote".into()),
+        ]);
+        assert!(
+            state
+                .spawn_scheduler
+                .validate_required_child_context_route(&foreign, "native-profile")
+                .await
+                .is_err(),
+            "native preflight must not adopt an explicit foreign route"
+        );
+    }
     // This fixture explicitly authorizes exactly its Root lifecycle actions.
     // Inspect and direct-parent question/reply are not create permissions, and
     // neither permissions nor bypass flags are widened for the native Child.
@@ -653,13 +689,12 @@ async fn native_subagent_installed_root_surface_creates_inspects_and_cancels_rea
 
     // Only the Root is a fixture. The installed facade, canonical adapter,
     // admission scheduler and native backend own the Child's entire lifecycle.
-    let created = installed_root_subagent(
-        &state,
-        &parent_id,
-        "native-entry-create",
-        json!({"intent":"chat", "message":CHILD_INPUT}),
-    )
-    .await;
+    let mut arguments = json!({"intent":"chat", "message":CHILD_INPUT});
+    if named_profile {
+        arguments["role"] = json!("native-profile");
+    }
+    let created =
+        installed_root_subagent(&state, &parent_id, "native-entry-create", arguments).await;
     let child_id = created["actor_id"].as_str().unwrap().to_owned();
     assert_eq!(created["observed_status"], "running_in_background");
     let child_call = next_request(&mut requests, &state, &parent_id, &child_id).await;
@@ -687,6 +722,35 @@ async fn native_subagent_installed_root_surface_creates_inspects_and_cancels_rea
     assert_eq!(running.project_id_meta(), parent.project_id_meta());
     assert_eq!(running.workspace_path_meta(), parent.workspace_path_meta());
     assert_eq!(running.metadata["assignment_prompt"], CHILD_INPUT);
+    assert_eq!(
+        running.metadata.contains_key("child.named_profile.v1"),
+        named_profile,
+        "named-profile creation must retain its canonical profile binding"
+    );
+    if named_profile {
+        use bamboo_engine::session_app::child_session::named_profile::validate_named_profile;
+        validate_named_profile(&running).unwrap();
+        let binding: serde_json::Value =
+            serde_json::from_str(&running.metadata["child.named_profile.v1"]).unwrap();
+        assert_eq!(binding["name"], "native-profile");
+        assert_eq!(binding["source"], "project");
+        assert_eq!(binding["project_id"], project.id.to_string());
+        assert_eq!(binding["child_id"], child_id);
+        assert_eq!(
+            binding["child_created_at"],
+            serde_json::to_value(running.created_at).unwrap()
+        );
+        assert_eq!(binding["tools"], json!([]));
+        for denied in ["Bash", "Read", "Glob", "Edit", "Write"] {
+            assert!(
+                !child_call
+                    .tools
+                    .iter()
+                    .any(|tool| tool.function.name == denied),
+                "the actual native provider schema must honor profile denial of {denied}"
+            );
+        }
+    }
     assert_eq!(running.last_run_status().as_deref(), Some("running"));
     let active = state.session_store.inspect_actor(&child_id).await.unwrap();
     assert_eq!(

@@ -327,8 +327,9 @@ impl ExternalChildRunner for LocalTaskChildRunner {
                 .any(|role| session.metadata.get("subagent_type") == Some(role))
     }
     async fn validate_required_child_context_route(&self, session: &Session) -> Result<(), String> {
-        // Admission probes use a synthetic root-shaped Session before the
-        // actual Child exists. Check only its configured route here.
+        // Admission probes use a synthetic Child before its durable birth.
+        // Check only its configured route here; execution separately proves
+        // the canonical Child, lineage and activation ownership.
         if session
             .metadata
             .get("external.agent_id")

@@ -1,4 +1,5 @@
-//! Real serve/SubAgent/Host/current_exe worker. Only the provider is simulated.
+//! Real serve/SubAgent/Host with an explicitly selected same-source legacy Worker.
+//! Only the provider is simulated; native brokerless routing is tested separately.
 //! Explicit Ultra + a normally selected deny-all profile opts in; no manual claim.
 #![cfg(unix)]
 use actix_web::{web, App, HttpResponse, HttpServer};
@@ -1149,7 +1150,7 @@ async fn fixture_with_followups(
     let running = server.run();
     let handle = running.handle();
     actix_web::rt::spawn(running);
-    std::fs::write(data.join("config.json"),serde_json::to_vec(&json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":"fixture","base_url":provider_url,"model":"plain-root","runtime_models":["plain-root","plain-child"]}},"defaults":{"chat":{"provider":"openai","model":"plain-root"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1}})).unwrap()).unwrap();
+    std::fs::write(data.join("config.json"),serde_json::to_vec(&json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":"fixture","base_url":provider_url,"model":"plain-root","runtime_models":["plain-root","plain-child"]}},"defaults":{"chat":{"provider":"openai","model":"plain-root"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","worker_bin":env!("CARGO_BIN_EXE_bamboo"),"worker_args":["subagent-worker"],"max_concurrent":1}})).unwrap()).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -2982,7 +2983,7 @@ async fn message_only_fixture(browser: Option<ActorBrowserFixture>) {
     let running = server.run();
     let handle = running.handle();
     actix_web::rt::spawn(running);
-    std::fs::write(data.join("config.json"), serde_json::to_vec(&json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":format!("fixture-{}", uuid::Uuid::new_v4()),"base_url":provider_url,"model":"plain-root","runtime_models":["plain-root","plain-child"]}},"defaults":{"chat":{"provider":"openai","model":"plain-root"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1}})).unwrap()).unwrap();
+    std::fs::write(data.join("config.json"), serde_json::to_vec(&json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":format!("fixture-{}", uuid::Uuid::new_v4()),"base_url":provider_url,"model":"plain-root","runtime_models":["plain-root","plain-child"]}},"defaults":{"chat":{"provider":"openai","model":"plain-root"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","worker_bin":env!("CARGO_BIN_EXE_bamboo"),"worker_args":["subagent-worker"],"max_concurrent":1}})).unwrap()).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()

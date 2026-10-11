@@ -664,10 +664,24 @@ fn build_external_child_runner_internal(
     Arc::new(CompositeExternalChildRunner::new(runners))
 }
 
-/// Build the built-in local actor runner from the typed `subagents`
-/// config. Everything is derived: worker = the current bamboo executable +
-/// `subagent-worker`, fabric = per-user temp dir — unless expert fields
-/// override them.
+/// Classify the resolved local launch without granting execution authority.
+fn builtin_local_worker_launch(worker_bin: &std::path::Path, worker_args: &[String]) -> bool {
+    if worker_args != ["subagent-worker".to_string()] {
+        return false;
+    }
+    // Explicit selection of the retained local process backend is still the
+    // built-in route only for this Host executable and its exact Worker argv.
+    // Failed path observations never qualify. Actor admission rechecks this
+    // identity and the actual Worker capabilities before any Child is created.
+    let Ok(current) = std::env::current_exe().and_then(|path| path.canonicalize()) else {
+        return false;
+    };
+    worker_bin
+        .canonicalize()
+        .is_ok_and(|worker| worker == current)
+}
+
+/// Build the explicitly selected local process runner from typed configuration.
 fn build_local_actor_runner(
     config: &Config,
     approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
@@ -701,6 +715,7 @@ fn build_local_actor_runner(
         .unwrap_or_else(bamboo_config::paths::subagents_dir);
 
     let executor = subagent_executor_spec(config)?;
+    let builtin_required_context_route = builtin_local_worker_launch(&worker_bin, &worker_args);
 
     let mut runner = ActorChildRunner::new(
         super::config::LOCAL_ACTOR_AGENT_ID.to_string(),
@@ -714,7 +729,7 @@ fn build_local_actor_runner(
             .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
     )
     .with_max_spawn_depth(sub.effective_max_spawn_depth())
-    .with_builtin_required_context_route(sub.worker_bin.is_none() && sub.worker_args.is_none())
+    .with_builtin_required_context_route(builtin_required_context_route)
     .with_remote_placements(resolve_remote_placements(
         &sub.remote_placements,
         &config.cluster_fabric.nodes,
@@ -1129,6 +1144,36 @@ pub fn extract_provider_credentials(
 
 #[cfg(test)]
 mod codex_runtime_config_tests {
+    #[test]
+    fn builtin_local_worker_launch_requires_current_executable_and_exact_arguments() {
+        let current = std::env::current_exe().unwrap();
+        let exact = vec!["subagent-worker".to_string()];
+        assert!(super::builtin_local_worker_launch(&current, &exact));
+        assert!(super::builtin_local_worker_launch(
+            &current.canonicalize().unwrap(),
+            &exact
+        ));
+        for args in [
+            vec![],
+            vec!["serve".into()],
+            vec!["subagent-worker".into(), "--extra".into()],
+        ] {
+            assert!(!super::builtin_local_worker_launch(&current, &args));
+        }
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!super::builtin_local_worker_launch(
+            &temp.path().join("missing"),
+            &exact
+        ));
+        let foreign = temp.path().join("foreign-worker");
+        std::fs::write(
+            &foreign,
+            "claimed worker capabilities do not establish executable identity",
+        )
+        .unwrap();
+        assert!(!super::builtin_local_worker_launch(&foreign, &exact));
+    }
+
     #[tokio::test]
     async fn required_context_uses_registered_launch_snapshot_after_live_config_flip() {
         let mut candidate = bamboo_agent_core::Session::new("preflight", "model");
