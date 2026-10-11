@@ -98,6 +98,10 @@ impl PolledShellState {
         }
     }
 
+    pub(crate) async fn is_complete(&self) -> bool {
+        self.output.lock().await.completion.is_some()
+    }
+
     async fn take(&self, shell_id: &str, max_output_tokens: Option<usize>) -> ExecSessionResult {
         let mut output = self.output.lock().await;
         let bytes = std::mem::take(&mut output.bytes);
@@ -330,7 +334,7 @@ impl Tool for ExecCommandTool {
         let shell = bash_runtime::spawn_polled(
             &parsed.cmd,
             &cwd,
-            ctx.event_tx.clone(),
+            None,
             owner.to_owned(),
             parsed.interactive,
             state,

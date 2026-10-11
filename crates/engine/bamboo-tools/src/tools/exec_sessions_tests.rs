@@ -214,6 +214,47 @@ mod process_tests {
     }
 
     #[tokio::test]
+    async fn input_after_process_exit_returns_final_output_and_exit_code() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let release = directory.path().join("release");
+        let first = start(
+            format!(
+                "while [ ! -f '{}' ]; do sleep 0.01; done; printf final; exit 7",
+                release.display()
+            ),
+            "exited-input-exec",
+            true,
+        )
+        .await;
+        let id = first["session_id"].as_str().unwrap();
+        let shell = bash_runtime::get_shell(id).unwrap();
+        std::fs::write(release, b"release").unwrap();
+        timeout(Duration::from_secs(2), async {
+            while !shell.polled.as_ref().unwrap().is_complete().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Exercise the completed-process/no-stdin branch deterministically.
+        shell.close_stdin().await;
+        let last = payload(
+            WriteStdinTool::new()
+                .invoke(
+                    json!({"session_id": id, "chars": "late input"}),
+                    context("exited-input-exec"),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(last["status"], "completed");
+        assert_eq!(last["exit_code"], 7);
+        assert_eq!(last["output"], "final");
+        assert!(last.get("session_id").is_none());
+    }
+
+    #[tokio::test]
     async fn interactive_bytes_and_eof_finish_without_implicit_newline() {
         let _environment = environment();
         let first = start("cat".into(), "interactive-exec", true).await;
@@ -308,6 +349,8 @@ mod process_tests {
         let mut ctx = context("pull-exec");
         ctx.can_async_resume = true;
         ctx.bash_completion_sink = Some(sink.clone());
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        ctx.event_tx = Some(event_tx);
         let first = payload(
             ExecCommandTool::new()
                 .invoke(
@@ -328,6 +371,7 @@ mod process_tests {
                 .unwrap(),
         );
         assert_eq!(sink.0.load(Ordering::SeqCst), 0);
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]

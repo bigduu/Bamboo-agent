@@ -137,12 +137,14 @@ impl ShellSession {
     /// exited shell's pipe is gone.
     pub async fn write_stdin(&self, data: &str, append_newline: bool) -> Result<(), String> {
         let mut guard = self.stdin.lock().await;
-        let stdin = guard.as_mut().ok_or_else(|| {
-            format!(
-                "Shell '{}' has no interactive stdin pipe; spawn it via Bash with interactive=true",
-                self.id
+        let stdin =
+            guard.as_mut().ok_or_else(|| {
+                format!(
+                "Shell '{}' has no interactive stdin pipe; spawn it via {} with interactive=true",
+                self.id,
+                if self.is_model_polled() { "exec_command" } else { "Bash" }
             )
-        })?;
+            })?;
         let mut bytes = data.as_bytes().to_vec();
         if append_newline {
             bytes.push(b'\n');
@@ -486,8 +488,8 @@ fn spawn_completion_poll(
                 state.stop_capture();
                 drain.await;
             }
-            stdin.lock().await.take();
             state.finish(status_str, exit_code_value).await;
+            stdin.lock().await.take();
         }
         *exit_code.lock().await = exit_code_value;
         running.store(false, Ordering::Relaxed);

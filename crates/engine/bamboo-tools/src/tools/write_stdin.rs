@@ -77,10 +77,13 @@ impl Tool for WriteStdinTool {
         if parsed.chars == "\u{3}" {
             shell.kill().await.map_err(ToolError::Execution)?;
         } else if !parsed.chars.is_empty() {
-            shell
-                .write_stdin(&parsed.chars, false)
-                .await
-                .map_err(ToolError::Execution)?;
+            if let Err(error) = shell.write_stdin(&parsed.chars, false).await {
+                // The process can exit between yielding its handle and this
+                // write. Its final output remains the useful result.
+                if !state.is_complete().await {
+                    return Err(ToolError::Execution(error));
+                }
+            }
         }
         if parsed.eof {
             shell.close_stdin().await;
