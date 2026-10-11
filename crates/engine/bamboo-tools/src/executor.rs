@@ -741,7 +741,12 @@ impl ToolExecutor for BuiltinToolExecutor {
                     .to_string(),
             ));
         }
-        if ctx.plan_read_only && !crate::orchestrator::plan_mode_allows_tool(&tool_name) {
+        if ctx.plan_read_only
+            && (!crate::orchestrator::plan_mode_allows_tool(&tool_name)
+                || (tool_name == "session_message"
+                    && args.get("action").and_then(serde_json::Value::as_str)
+                        != Some("list_targets")))
+        {
             return Err(ToolError::Execution(format!(
                 "Plan mode: {tool_name} operation blocked"
             )));
