@@ -80,6 +80,7 @@ fn context_management_telemetry(
     );
     let strategy = match strategy {
         ContextManagementStrategy::Summary => "summary",
+        ContextManagementStrategy::MessageSummary => "message_summary",
         ContextManagementStrategy::RetrievalWindow => "retrieval_window",
     };
     let model_context_state = session.model_context_state.as_ref();

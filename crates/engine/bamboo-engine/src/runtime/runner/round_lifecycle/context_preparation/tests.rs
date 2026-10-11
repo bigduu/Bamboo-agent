@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+mod message_summary;
+
 fn required_packet_session() -> Session {
     let mut parent = Session::new("packet-parent", "test-model");
     let background = Message::assistant("optional background words ".repeat(60), None);
@@ -43,6 +45,7 @@ async fn required_packet_midturn_manual_archive_and_overflow_do_not_call_lossy_p
     let (llm, model_calls) = recording_llm();
     for strategy in [
         ContextManagementStrategy::Summary,
+        ContextManagementStrategy::MessageSummary,
         ContextManagementStrategy::RetrievalWindow,
     ] {
         let mut config = AgentLoopConfig::default();

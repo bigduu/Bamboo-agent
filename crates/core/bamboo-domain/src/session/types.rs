@@ -483,6 +483,8 @@ pub enum CompressionTriggerType {
 pub enum CompressionEventKind {
     #[default]
     Summary,
+    /// Only user/assistant message text was summarized; tool context was archived.
+    MessageSummary,
     RetrievalWindow,
 }
 
@@ -2036,6 +2038,16 @@ mod tests {
     /// #520: the reasoning signature round-trips through serde and stays
     /// absent from the wire when unset (so pre-existing session files and
     /// consumers are untouched).
+    #[test]
+    fn message_summary_compression_kind_has_a_distinct_durable_discriminator() {
+        let value = serde_json::to_value(CompressionEventKind::MessageSummary).unwrap();
+        assert_eq!(value, serde_json::json!("message_summary"));
+        assert_eq!(
+            serde_json::from_value::<CompressionEventKind>(value).unwrap(),
+            CompressionEventKind::MessageSummary
+        );
+    }
+
     #[test]
     fn reasoning_signature_serde_round_trip_and_backward_compat() {
         let signed =
