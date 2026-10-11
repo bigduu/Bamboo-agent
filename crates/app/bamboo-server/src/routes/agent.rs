@@ -42,6 +42,11 @@ pub(crate) fn plugin_scope() -> impl HttpServiceFactory {
     web::scope("/plugins")
         .route("", web::get().to(agent::plugin::list_plugins))
         .route("/install", web::post().to(agent::plugin::install_plugin))
+        .route("/jiandu/setup", web::get().to(agent::plugin::jiandu_setup))
+        .route(
+            "/official/jiandu/install",
+            web::post().to(agent::plugin::install_official_jiandu),
+        )
         .route("/{id}/hooks", web::get().to(agent::plugin::plugin_hooks))
         .route(
             "/{id}/hooks/review",

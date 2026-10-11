@@ -241,6 +241,33 @@ impl ServerPluginInstaller {
         }
     }
 
+    /// Jiandu's active canonical store must survive replacement/removal of its
+    /// connector. Resolve existing aliases without creating either directory.
+    pub(crate) async fn jiandu_memory_path_reason(
+        &self,
+        plugin_dir: &Path,
+    ) -> Option<&'static str> {
+        let memory = canonical_future_directory(&self.state.memory_store.data_dir()).await;
+        let plugin = canonical_future_directory(plugin_dir).await;
+        match (memory, plugin) {
+            (Ok(memory), Ok(plugin)) if resolved_directory_contains(&plugin, &memory) => {
+                Some("memory_root_overlaps_plugin")
+            }
+            (Ok(_), Ok(_)) => None,
+            _ => Some("memory_root_unavailable"),
+        }
+    }
+
+    async fn ensure_jiandu_memory_separate(&self, plugin_dir: &Path) -> PluginResult<()> {
+        if let Some(reason) = self.jiandu_memory_path_reason(plugin_dir).await {
+            return Err(PluginError::InvalidManifest(format!(
+                "Jiandu memory path safety check failed ({reason}); select an independent \
+                 memory root outside the connector directory before installing or removing it"
+            )));
+        }
+        Ok(())
+    }
+
     async fn preflight_provenance_ownership(
         &self,
         manifest: &PluginManifest,
@@ -307,6 +334,12 @@ impl ServerPluginInstaller {
         disposition: InstallDisposition,
         _guard: &PluginOperationGuard,
     ) -> PluginResult<Option<InstalledPlugin>> {
+        // Check the activation destination, not the isolated candidate: source
+        // activation may replace the whole live bundle before install() runs.
+        if manifest.id == "jiandu" {
+            self.ensure_jiandu_memory_separate(&self.plugins_dir().join("jiandu"))
+                .await?;
+        }
         let previous =
             load_previous_for_disposition(&self.installed_json_path(), &manifest.id, disposition)
                 .await?;
@@ -1087,6 +1120,9 @@ impl ServerPluginInstaller {
         prepared_event_sink_grants: Option<&EventSinkPermissionGrants>,
         failure_injection: InstallFailureInjection,
     ) -> PluginResult<InstalledPlugin> {
+        if manifest.id == "jiandu" {
+            self.ensure_jiandu_memory_separate(plugin_dir).await?;
+        }
         let installed_json_path = self.installed_json_path();
 
         // Disposition gate (AlreadyInstalled only for a COMPLETED prior
@@ -1391,6 +1427,14 @@ impl PluginInstaller for ServerPluginInstaller {
             return Err(PluginError::NotFound(id.to_string()));
         };
 
+        // A later server may select a store inside an already installed
+        // connector. Refuse before hook revocation, capability cleanup, or any
+        // disk/provenance mutation, using the actual directory being deleted.
+        if id == "jiandu" {
+            self.ensure_jiandu_memory_separate(&entry.plugin_dir)
+                .await?;
+        }
+
         // Persist revocation before cleanup. A failed filesystem removal leaves
         // a retryable row whose plugin commands are already disabled.
         if !entry.registered.hooks.is_empty() {
@@ -1437,6 +1481,101 @@ impl PluginInstaller for ServerPluginInstaller {
 // see `app_state::builder`, which calls it before `AppState` finishes
 // constructing).
 // ---------------------------------------------------------------------
+
+/// Canonicalize the nearest existing directory, then append only normal
+/// missing components. A fresh store/connector need not exist yet; dangling
+/// aliases, non-directories, relative paths and other IO uncertainty fail closed.
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedDirectory {
+    path: PathBuf,
+    existing_components: usize,
+}
+
+async fn canonical_future_directory(path: &Path) -> std::io::Result<ResolvedDirectory> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err(std::io::Error::other("directory must be absolute"));
+    }
+    let mut ancestor = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match fs::symlink_metadata(&ancestor).await {
+            Ok(_) => {
+                let mut resolved = fs::canonicalize(&ancestor).await?;
+                if !fs::metadata(&resolved).await?.is_dir() {
+                    return Err(std::io::Error::other("path is not a directory"));
+                }
+                let existing_components = resolved.components().count();
+                for component in missing.into_iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(ResolvedDirectory {
+                    path: resolved,
+                    existing_components,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(Component::Normal(component)) = ancestor.components().next_back() else {
+                    return Err(error);
+                };
+                missing.push(component.to_os_string());
+                ancestor.pop();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn resolved_directory_contains(directory: &ResolvedDirectory, path: &ResolvedDirectory) -> bool {
+    if directory_contains(&directory.path, &path.path) {
+        return true;
+    }
+    // Missing ASCII tails cannot establish case-sensitive independence on
+    // macOS. Existing canonical prefixes still establish distinct directories
+    // on a case-sensitive volume, even if a later child is missing.
+    cfg!(target_os = "macos") && {
+        let mut parts = path.path.components();
+        directory
+            .path
+            .components()
+            .enumerate()
+            .all(|(index, component)| {
+                parts.next().is_some_and(|part| {
+                    part == component
+                        || ((index >= directory.existing_components
+                            || index >= path.existing_components)
+                            && part
+                                .as_os_str()
+                                .as_encoded_bytes()
+                                .eq_ignore_ascii_case(component.as_os_str().as_encoded_bytes()))
+                })
+            })
+    }
+}
+
+#[cfg(windows)]
+fn ascii_directory_contains(directory: &Path, path: &Path) -> bool {
+    let mut parts = path.components();
+    directory.components().all(|component| {
+        parts.next().is_some_and(|part| {
+            part.as_os_str()
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(component.as_os_str().as_encoded_bytes())
+        })
+    })
+}
+
+fn directory_contains(directory: &Path, path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        // Canonical existing prefixes have resolved spelling. Missing suffixes
+        // include our ASCII managed names, which remain case-insensitive on Windows.
+        ascii_directory_contains(directory, path)
+    }
+    #[cfg(not(windows))]
+    path.starts_with(directory)
+}
 
 /// See `ServerPluginInstaller::service_config_path`'s doc comment for the
 /// full rationale (kept there since that's the reader's first encounter).
