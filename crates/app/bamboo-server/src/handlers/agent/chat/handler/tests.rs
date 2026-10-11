@@ -4973,6 +4973,23 @@ mod native_inbox_wait_boundaries {
         e
     }
 
+    fn bare_child(id: &str) -> SessionMessageEnvelope {
+        let mut e = SessionMessageEnvelope::user_input(id, "bare Child control");
+        e.source = SessionMessageSource::Runtime {
+            subsystem: "raw_test_control".into(),
+        };
+        e.kind = SessionMessageKind::ChildOutcome;
+        e.body = SessionMessageBody::ChildOutcome(bamboo_domain::SessionChildOutcome {
+            child_session_id: "native-raw-untracked-child".into(),
+            status: "completed".into(),
+            result: None,
+            error: None,
+            provider_message: None,
+        });
+        e.validate().unwrap();
+        e
+    }
+
     type Feed = tokio::sync::broadcast::Receiver<Arc<bamboo_engine::events::ChangeEvent>>;
 
     // Account broadcast follows journal.append_synced; do not fence with try_recv.
@@ -5028,6 +5045,7 @@ mod native_inbox_wait_boundaries {
         state: &web::Data<crate::AppState>,
         id: &str,
         released: &[bamboo_domain::SessionInboxClaim],
+        expected_staged_remaining: usize,
         feed: &mut Feed,
     ) -> serde_json::Value {
         let before = cold(state, id).await;
@@ -5085,7 +5103,8 @@ mod native_inbox_wait_boundaries {
             );
         }
         let backlog = state.session_inbox.inspect(id).await.unwrap();
-        assert_eq!(backlog.pending + backlog.claimed, 0);
+        assert_eq!(backlog.pending, expected_staged_remaining);
+        assert_eq!(backlog.claimed, 0);
         assert!(!backlog.activation_pending());
         serde_json::to_value(&saved.messages).unwrap()
     }
@@ -5096,6 +5115,7 @@ mod native_inbox_wait_boundaries {
         saved: &serde_json::Value,
         released: &[bamboo_domain::SessionInboxClaim],
         native: &str,
+        expected_staged_remaining: usize,
         feed: &mut Feed,
     ) {
         let retry = state.admit_chat_for_execute(id).await.unwrap();
@@ -5119,7 +5139,8 @@ mod native_inbox_wait_boundaries {
             .unwrap());
         assert!(state.session_inbox.claim(id, 128).await.unwrap().is_empty());
         let backlog = state.session_inbox.inspect(id).await.unwrap();
-        assert_eq!(backlog.pending + backlog.claimed, 0);
+        assert_eq!(backlog.pending, expected_staged_remaining);
+        assert_eq!(backlog.claimed, 0);
         assert!(!backlog.activation_pending());
         // Finite post-callback observation; journal identity is checked as well.
         assert!(
@@ -5214,7 +5235,7 @@ mod native_inbox_wait_boundaries {
     }
 
     #[actix_web::test]
-    async fn native_respect_only_self_leaves_bare_child_and_bash_until_child_wait_release() {
+    async fn native_respect_and_child_callbacks_leave_unrelated_bare_controls_inert() {
         let home = tempfile::tempdir().unwrap();
         let state = web::Data::new(crate::AppState::new(home.path().into()).await.unwrap());
         let spawner = Arc::new(CountingSpawner::default());
@@ -5254,25 +5275,19 @@ mod native_inbox_wait_boundaries {
             child.set_last_run_status(if ordinal == 0 { "completed" } else { "running" });
             state.storage.save_session(&child).await.unwrap();
         }
-        // This callback really stages the first neutral outcome; it cannot
-        // complete All while the second owned child is still running.
-        ChildCompletionHandler::on_child_completed(
-            state.child_completion_coordinator.as_ref(),
-            complete(id, children[0]),
-        )
-        .await;
-        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
-        assert_eq!(
-            cold(&state, id)
-                .await
-                .agent_runtime_state
-                .unwrap()
-                .waiting_for_children,
-            Some(wait.clone())
-        );
-        assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
-        // Manual bare Bash envelope is only eligibility control, not a claimed
-        // real Bash producer completion. Real-shell supplement is separate.
+        // Raw envelopes exercise eligibility isolation independently from real
+        // completion callbacks. This Child is not in the parent's tracked wait.
+        let raw_child = bare_child(id);
+        let SessionMessageBody::ChildOutcome(raw_outcome) = &raw_child.body else {
+            unreachable!()
+        };
+        assert!(!wait
+            .child_session_ids
+            .contains(&raw_outcome.child_session_id));
+        let raw_child_id = raw_child.id.clone();
+        state.session_messenger.admit(raw_child).await.unwrap();
+        // The bare Bash is also only eligibility control, not a real shell
+        // completion. The real-shell supplement remains separate.
         let bash = bare_bash(id);
         let bash_id = bash.id.clone();
         state.session_messenger.admit(bash).await.unwrap();
@@ -5295,15 +5310,37 @@ mod native_inbox_wait_boundaries {
                 .agent_runtime_state
                 .unwrap()
                 .waiting_for_children,
-            Some(wait)
+            Some(wait.clone())
         );
         assert_eq!(spawner.reservations.load(Ordering::SeqCst), 0);
         assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
         assert!(state.session_inbox.claim(id, 128).await.unwrap().is_empty());
+        // The first real callback authorizes only its own outcome and wakes a
+        // reasoning turn while the exact All wait remains armed.
+        ChildCompletionHandler::on_child_completed(
+            state.child_completion_coordinator.as_ref(),
+            complete(id, children[0]),
+        )
+        .await;
+        assert_eq!(
+            cold(&state, id)
+                .await
+                .agent_runtime_state
+                .unwrap()
+                .waiting_for_children,
+            Some(wait)
+        );
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
+        let backlog = state.session_inbox.inspect(id).await.unwrap();
+        assert_eq!(backlog.pending, 3);
+        assert_eq!(backlog.coordinator_generation, 0);
+        assert!(backlog.interrupt_pending());
         let mut second = cold(&state, children[1]).await;
         second.set_last_run_status("completed");
         state.storage.save_session(&second).await.unwrap();
-        // Only original coordinator clears/saves the wait and grants its prefix.
+        // The final callback clears the wait and grants each Child outcome;
+        // neither unrelated bare envelope gains permission from that clear.
         ChildCompletionHandler::on_child_completed(
             state.child_completion_coordinator.as_ref(),
             complete(id, children[1]),
@@ -5318,14 +5355,15 @@ mod native_inbox_wait_boundaries {
         assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
         assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
         let released = state.session_inbox.claim(id, 128).await.unwrap();
-        assert_eq!(released.len(), 3);
+        assert_eq!(released.len(), 2);
         let mut seen_children = BTreeSet::new();
-        let mut seen_bash = 0;
         for claim in &released {
             assert_ne!(claim.envelope.id.as_str(), native_id);
+            assert_ne!(claim.envelope.id, raw_child_id);
+            assert_ne!(claim.envelope.id, bash_id);
             assert_eq!(
                 claim.activation_policy,
-                SessionActivationPolicy::RespectSpecificWait
+                SessionActivationPolicy::InterruptSpecificWait
             );
             match &claim.envelope.body {
                 SessionMessageBody::ChildOutcome(outcome) => {
@@ -5336,11 +5374,7 @@ mod native_inbox_wait_boundaries {
                     );
                     assert!(seen_children.insert(outcome.child_session_id.clone()));
                 }
-                SessionMessageBody::RuntimeInstruction(_) => {
-                    assert_eq!(claim.envelope.id, bash_id);
-                    seen_bash += 1;
-                }
-                _ => panic!("coordinator release must expose only original sibling control"),
+                _ => panic!("coordinator grants must expose only its own Child outcomes"),
             }
         }
         assert_eq!(
@@ -5350,23 +5384,20 @@ mod native_inbox_wait_boundaries {
                 .map(|id| id.to_string())
                 .collect::<BTreeSet<_>>()
         );
-        assert_eq!(seen_bash, 1);
         assert!(
             !serde_json::to_string(&released.iter().map(|c| &c.envelope).collect::<Vec<_>>())
                 .unwrap()
                 .contains("UNSEALED answer must not be imported")
         );
-        // Exact original generation order: first Child, staged Bash, final Child.
-        for (claim, expected) in released.iter().zip([children[0], "bare-bash", children[1]]) {
-            match &claim.envelope.body {
-                SessionMessageBody::ChildOutcome(outcome) => {
-                    assert_eq!(outcome.child_session_id, expected)
-                }
-                SessionMessageBody::RuntimeInstruction(_) => assert_eq!(expected, "bare-bash"),
-                _ => unreachable!(),
-            }
+        // Claim order skips the earlier bare siblings, retaining the real
+        // outcomes' original generation order.
+        for (claim, expected) in released.iter().zip(children) {
+            let SessionMessageBody::ChildOutcome(outcome) = &claim.envelope.body else {
+                unreachable!()
+            };
+            assert_eq!(outcome.child_session_id, expected);
         }
-        let saved = consume_released(&state, id, &released, &mut feed).await;
+        let saved = consume_released(&state, id, &released, 2, &mut feed).await;
         ChildCompletionHandler::on_child_completed(
             state.child_completion_coordinator.as_ref(),
             complete(id, children[1]),
@@ -5374,7 +5405,14 @@ mod native_inbox_wait_boundaries {
         .await;
         assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
         assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
-        no_new_after_controls(&state, id, &saved, &released, &native_id, &mut feed).await;
+        no_new_after_controls(&state, id, &saved, &released, &native_id, 2, &mut feed).await;
+        for bare_id in [raw_child_id, bash_id] {
+            assert!(!state
+                .session_inbox
+                .was_admitted(id, &bare_id)
+                .await
+                .unwrap());
+        }
     }
     struct OwnedShellCleanup(Vec<Arc<bamboo_tools::tools::bash_runtime::ShellSession>>);
     impl Drop for OwnedShellCleanup {
@@ -5527,8 +5565,8 @@ mod native_inbox_wait_boundaries {
             (first.status(), second.status()),
             ("completed", "completed")
         );
-        let saved = consume_released(&state, &id, &released, &mut feed).await;
-        no_new_after_controls(&state, &id, &saved, &released, &native, &mut feed).await;
+        let saved = consume_released(&state, &id, &released, 0, &mut feed).await;
+        no_new_after_controls(&state, &id, &saved, &released, &native, 0, &mut feed).await;
         remove_shell(&first.id);
         remove_shell(&second.id);
         cleanup.0.clear();
