@@ -34,7 +34,10 @@ private storage diagnostics. Internal Messenger errors remain typed.
 
 Delivery retains both observed Session birth identities through the existing
 lifecycle-locked Inbox commit. Deleting and recreating either participant with
-the same public id rejects the stale send or reply. Custom Inbox backends must
+the same public id rejects the stale send or reply. Reply admission also
+revalidates the received message against the current canonical source transcript
+and retains the same locks through commit; clearing or replacing that proof
+before admission rejects the reply, including a duplicate retry. Custom Inbox backends must
 implement this atomic peer admission capability; unsupported backends reject
 peer sends rather than falling back to an unfenced delivery path.
 
