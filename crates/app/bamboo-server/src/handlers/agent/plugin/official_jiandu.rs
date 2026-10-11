@@ -164,6 +164,9 @@ async fn setup(
     let registry =
         InstalledPlugins::load(&state.app_data_dir.join("plugins/installed.json")).await?;
     let entry = registry.get_unique("jiandu")?;
+    let memory_reason = installer
+        .jiandu_memory_path_reason(&state.app_data_dir.join("plugins/jiandu"))
+        .await;
     let trust = state.config.read().await.plugin_trust.clone();
     let trust_reason = trust_reason(&trust, release.as_ref());
     let mut installed = Installed {
@@ -180,7 +183,7 @@ async fn setup(
         } else {
             installed.state = "unverified";
             installed.reason = Some("unverified_install");
-            if host.supported && trust_reason.is_none() {
+            if host.supported && trust_reason.is_none() && memory_reason.is_none() {
                 if let Some(release) = &release {
                     if let Ok(command) = validated_executable(state, entry, release, &host.os).await
                     {
@@ -207,8 +210,12 @@ async fn setup(
             }
         }
     }
+    if let Some(reason) = memory_reason {
+        installed.reason = Some(reason);
+    }
     let unavailable = host
         .reason
+        .or(memory_reason)
         .or(trust_reason)
         .or_else(|| release.is_none().then_some("artifact_unavailable"))
         .or_else(|| {

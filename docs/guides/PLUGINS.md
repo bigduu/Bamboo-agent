@@ -109,6 +109,16 @@ Wrap that object as `{"mcpServers":{"jiandu": <external_client>}}` for clients
 using that configuration shape. Removal uses the existing plugin delete action;
 it removes the connector without deleting canonical memory.
 
+The active memory root must be outside the managed `plugins/jiandu` directory.
+Setup and installation refuse an equal or nested root with
+`memory_root_overlaps_plugin`; paths that cannot be resolved safely report
+`memory_root_unavailable`. Existing filesystem aliases are resolved without
+creating a store. If a later server selects a root inside an installed Jiandu
+connector, removal also refuses before changing capabilities, provenance or
+files. Select an independent memory root before retrying; this check never moves
+memory automatically. Sibling roots and roots containing the connector directory
+remain allowed because removing the connector does not remove those roots.
+
 ## List, update, remove
 
 ```bash

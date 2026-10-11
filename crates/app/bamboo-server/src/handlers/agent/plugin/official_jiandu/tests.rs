@@ -7,6 +7,18 @@ fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+async fn isolated_state(data_dir: PathBuf, memory_root: PathBuf) -> web::Data<AppState> {
+    let mut state = AppState::new_with_memory_store(
+        data_dir,
+        bamboo_memory::memory_store::MemoryStore::new(memory_root),
+    )
+    .await
+    .unwrap();
+    state.wait_for_boot_reconcile_services().await;
+    state.stop_config_watcher_for_test();
+    web::Data::new(state)
+}
+
 async fn fixture() -> (
     tempfile::TempDir,
     web::Data<AppState>,
@@ -15,14 +27,7 @@ async fn fixture() -> (
 ) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("separate-canonical-store");
-    let state = web::Data::new(
-        AppState::new_with_memory_store(
-            dir.path().join("bamboo"),
-            bamboo_memory::memory_store::MemoryStore::new(root),
-        )
-        .await
-        .unwrap(),
-    );
+    let state = isolated_state(dir.path().join("bamboo"), root).await;
     let plugin_dir = state.app_data_dir.join("plugins/jiandu");
     tokio::fs::create_dir_all(plugin_dir.join("bin/macos"))
         .await
@@ -113,7 +118,7 @@ async fn compatibility_uses_process_abi_and_runtime_glibc() {
 #[actix_web::test]
 async fn passive_http_metadata_and_official_action_reject_caller_sources() {
     let dir = tempfile::tempdir().unwrap();
-    let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+    let state = isolated_state(dir.path().join("bamboo"), dir.path().join("memory")).await;
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
@@ -307,4 +312,96 @@ async fn symlinked_directory_and_executable_are_refused_even_with_matching_bytes
         .unwrap()
         .external_client
         .is_none());
+}
+
+#[actix_web::test]
+async fn equal_or_nested_memory_root_blocks_setup_and_official_install_without_mutation() {
+    for suffix in ["", "canonical-store"] {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("bamboo");
+        let plugin_dir = data_dir.join("plugins/jiandu");
+        let state = isolated_state(data_dir, plugin_dir.join(suffix)).await;
+        let mcp_before = serde_json::to_value(&state.config.read().await.mcp).unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::scope("/api/v1").service(crate::routes::plugin_scope())),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/plugins/jiandu/setup")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let report: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(report["install"]["available"], false);
+        assert_eq!(report["install"]["reason"], "memory_root_overlaps_plugin");
+        assert_eq!(report["installed"]["reason"], "memory_root_overlaps_plugin");
+        assert!(report["external_client"].is_null());
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/plugins/official/jiandu/install")
+                .set_json(serde_json::json!({}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["reason"], "memory_root_overlaps_plugin");
+        assert!(!plugin_dir.exists());
+        assert!(!state.app_data_dir.join("plugins/installed.json").exists());
+        assert_eq!(
+            serde_json::to_value(&state.config.read().await.mcp).unwrap(),
+            mcp_before
+        );
+    }
+}
+
+#[actix_web::test]
+async fn completed_connector_never_exports_an_overlapping_active_store() {
+    let (_dir, state, release, entry) = fixture().await;
+    let state = isolated_state(
+        state.app_data_dir.clone(),
+        entry.plugin_dir.join("canonical-store"),
+    )
+    .await;
+    let registry = tokio::fs::read(state.app_data_dir.join("plugins/installed.json"))
+        .await
+        .unwrap();
+    let report = setup(&state, mac(), Some(release)).await.unwrap();
+    assert_eq!(report.installed.state, "unverified");
+    assert_eq!(report.installed.reason, Some("memory_root_overlaps_plugin"));
+    assert_eq!(report.install.reason, Some("memory_root_overlaps_plugin"));
+    assert!(report.external_client.is_none());
+    assert_eq!(
+        tokio::fs::read(state.app_data_dir.join("plugins/installed.json"))
+            .await
+            .unwrap(),
+        registry
+    );
+}
+
+#[cfg(unix)]
+#[actix_web::test]
+async fn memory_alias_overlap_and_unresolvable_alias_are_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("bamboo");
+    let plugin_dir = data_dir.join("plugins/jiandu");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    let alias = dir.path().join("selected-memory");
+    std::os::unix::fs::symlink(&plugin_dir, &alias).unwrap();
+    let state = isolated_state(data_dir.clone(), alias.clone()).await;
+    let report = setup(&state, mac(), accepted_release()).await.unwrap();
+    assert_eq!(report.install.reason, Some("memory_root_overlaps_plugin"));
+    assert!(report.external_client.is_none());
+    tokio::fs::remove_file(&alias).await.unwrap();
+    std::os::unix::fs::symlink(dir.path().join("absent-target"), &alias).unwrap();
+    let state = isolated_state(data_dir, alias).await;
+    let report = setup(&state, mac(), accepted_release()).await.unwrap();
+    assert_eq!(report.install.reason, Some("memory_root_unavailable"));
+    assert!(report.external_client.is_none());
 }
