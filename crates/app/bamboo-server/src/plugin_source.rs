@@ -2012,7 +2012,8 @@ async fn fetch_and_verify_signature(
 /// artifact declared for [`Platform::current`] (a no-op if the manifest
 /// declares none for this platform — not every plugin needs a binary),
 /// verifies its sha256 BEFORE unpacking, and places the single expected
-/// executable at `<staging_dir>/bin/<platform>/<id>[.exe]`.
+/// executable at `<staging_dir>/bin/<platform>/<id>[.exe]`, retaining an
+/// optional regular root `LICENSE` beside it. No other artifact members are allowed.
 ///
 /// This stays as defense in depth alongside [`fetch_manifest_bundle`]'s
 /// bundle-sha256 check (see the module docs): the artifact hash is declared
@@ -2060,39 +2061,49 @@ async fn fetch_and_place_artifact(
         ))
     })?;
 
-    let scratch_dir = staging_dir.join(format!(".artifact-scratch-{}", platform.as_str()));
-    extract_archive(bytes, kind, scratch_dir.clone(), max_decompressed_bytes).await?;
-
     let expected_name = if matches!(platform, Platform::Windows) {
         format!("{}.exe", manifest.id)
     } else {
         manifest.id.clone()
     };
-    let source_bin = scratch_dir.join(&expected_name);
-    if !tokio::fs::try_exists(&source_bin).await.unwrap_or(false) {
-        return Err(PluginError::InvalidManifest(format!(
-            "artifact archive for platform '{}' does not contain the expected root executable '{}'",
-            platform.as_str(),
-            expected_name
-        )));
-    }
+    let scratch_dir = staging_dir.join(format!(".artifact-scratch-{}", platform.as_str()));
+    let has_license = extract_artifact_archive(
+        bytes,
+        kind,
+        scratch_dir.clone(),
+        expected_name.clone(),
+        max_decompressed_bytes,
+    )
+    .await?;
 
+    let source_bin = scratch_dir.join(&expected_name);
+    let source_license = scratch_dir.join("LICENSE");
     let dest_dir = staging_dir.join("bin").join(platform.as_str());
     tokio::fs::create_dir_all(&dest_dir).await?;
     let dest_bin = dest_dir.join(&expected_name);
-    move_file(&source_bin, &dest_bin).await?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = tokio::fs::metadata(&dest_bin).await?.permissions();
-        perms.set_mode(0o755);
-        tokio::fs::set_permissions(&dest_bin, perms).await?;
+    let dest_license = dest_dir.join("LICENSE");
+    // Check both targets before moving either member. symlink_metadata also
+    // sees broken links; create_new below separately closes no-replace races.
+    for destination in std::iter::once(&dest_bin).chain(has_license.then_some(&dest_license)) {
+        match tokio::fs::symlink_metadata(destination).await {
+            Ok(_) => {
+                return Err(PluginError::InvalidManifest(format!(
+                    "artifact destination '{}' already exists",
+                    destination.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    move_artifact_file(&source_bin, &dest_bin, 0o755).await?;
+    if has_license {
+        move_artifact_file(&source_license, &dest_license, 0o644).await?;
     }
 
     tokio::fs::remove_dir(&scratch_dir).await.map_err(|error| {
         PluginError::InvalidManifest(format!(
-            "artifact archive for platform '{}' must contain only the expected root executable '{}': {error}",
+            "artifact archive for platform '{}' must contain only the expected root executable '{}' and optional LICENSE: {error}",
             platform.as_str(),
             expected_name
         ))
@@ -2100,13 +2111,28 @@ async fn fetch_and_place_artifact(
     Ok(())
 }
 
-/// `rename`, falling back to copy+remove across a device boundary.
-async fn move_file(source: &Path, dest: &Path) -> PluginResult<()> {
-    if tokio::fs::rename(source, dest).await.is_ok() {
-        return Ok(());
+/// Place a validated artifact file without replacing a bundle member or a
+/// filesystem alias. Streaming copy works on filesystems without hard links.
+async fn move_artifact_file(source: &Path, dest: &Path, mode: u32) -> PluginResult<()> {
+    let mut input = tokio::fs::File::open(source).await?;
+    let mut output = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .await?;
+    tokio::io::copy(&mut input, &mut output).await?;
+    tokio::io::AsyncWriteExt::flush(&mut output).await?;
+    drop(input);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        output
+            .set_permissions(std::fs::Permissions::from_mode(mode))
+            .await?;
     }
-    let data = tokio::fs::read(source).await?;
-    tokio::fs::write(dest, data).await?;
+    #[cfg(not(unix))]
+    let _ = mode;
+    drop(output);
     tokio::fs::remove_file(source).await?;
     Ok(())
 }
@@ -2312,6 +2338,203 @@ async fn extract_archive(
     .map_err(|error| {
         PluginError::Registration(format!("archive extraction task panicked: {error}"))
     })?
+}
+
+/// Binary artifacts have a deliberately narrower layout than plugin bundles.
+/// Inspect original member types/names before writing, and validate the entire
+/// inventory before the caller moves either allowlisted file out of scratch.
+async fn extract_artifact_archive(
+    bytes: Vec<u8>,
+    kind: ArchiveKind,
+    dest_dir: PathBuf,
+    expected_name: String,
+    max_decompressed_bytes: u64,
+) -> PluginResult<bool> {
+    // A bundle-supplied scratch directory must not seed the artifact inventory.
+    tokio::fs::create_dir(&dest_dir).await?;
+    tokio::task::spawn_blocking(move || {
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0;
+        match kind {
+            ArchiveKind::Zip => {
+                let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice()))
+                    .map_err(|error| {
+                        PluginError::InvalidManifest(format!("invalid artifact zip: {error}"))
+                    })?;
+                validate_artifact_zip_records(&bytes, &mut archive)?;
+                for index in 0..archive.len() {
+                    let mut file = archive.by_index(index).map_err(|error| {
+                        PluginError::InvalidManifest(format!("invalid artifact zip entry: {error}"))
+                    })?;
+                    let regular_type = file
+                        .unix_mode()
+                        .is_none_or(|mode| matches!(mode & 0o170000, 0 | 0o100000));
+                    if !file.is_file() || !regular_type {
+                        return Err(PluginError::InvalidManifest(format!(
+                            "artifact entry '{}' must be a regular file",
+                            file.name()
+                        )));
+                    }
+                    let path = file.enclosed_name().ok_or_else(|| {
+                        PluginError::InvalidManifest("artifact zip entry has an unsafe path".into())
+                    })?;
+                    // Check the original spelling too: enclosed_name may simplify
+                    // components, while artifact paths must be root-only.
+                    let original_path = PathBuf::from(file.name());
+                    if original_path
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::ParentDir))
+                    {
+                        return Err(PluginError::InvalidManifest(
+                            "artifact zip entry has an unsafe path".into(),
+                        ));
+                    }
+                    write_artifact_member(
+                        &mut file,
+                        &path,
+                        &expected_name,
+                        &dest_dir,
+                        &mut seen,
+                        &mut total,
+                        max_decompressed_bytes,
+                    )?;
+                }
+            }
+            ArchiveKind::TarGz => {
+                let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(bytes.as_slice()));
+                // Metadata/long-name records are not one of the two allowed root
+                // files. Raw iteration prevents the reader silently swallowing them.
+                for entry in archive.entries()?.raw(true) {
+                    let mut entry = entry?;
+                    if !entry.header().entry_type().is_file() {
+                        return Err(PluginError::InvalidManifest(
+                            "artifact tar members must be regular files".into(),
+                        ));
+                    }
+                    let path = entry.path()?.into_owned();
+                    write_artifact_member(
+                        &mut entry,
+                        &path,
+                        &expected_name,
+                        &dest_dir,
+                        &mut seen,
+                        &mut total,
+                        max_decompressed_bytes,
+                    )?;
+                }
+            }
+        }
+        if !seen.contains(&expected_name) {
+            return Err(PluginError::InvalidManifest(format!(
+                "artifact archive does not contain the expected root executable '{expected_name}'"
+            )));
+        }
+        // Use the canonical inventory, not filesystem existence: on a
+        // case-insensitive filesystem a bare executable named 'license' would
+        // otherwise be mistaken for the optional uppercase companion.
+        Ok(seen.contains("LICENSE"))
+    })
+    .await
+    .map_err(|error| {
+        PluginError::Registration(format!("artifact extraction task panicked: {error}"))
+    })?
+}
+
+/// zip 2 indexes central records by filename, hiding exact duplicates from
+/// len()/by_index(). Check that its at-most-two parsed members cover consecutive
+/// raw central records. This bounded guard reads only the fixed central header
+/// and its three lengths; the crate still parses ZIP/ZIP64, descriptors and data.
+/// It does not implement EOCD validation or enumerate orphan local headers.
+fn validate_artifact_zip_records(
+    bytes: &[u8],
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+) -> PluginResult<()> {
+    let invalid = || {
+        PluginError::InvalidManifest(
+            "artifact zip has duplicate or unexpected central records".into(),
+        )
+    };
+    if archive.is_empty() || archive.len() > 2 {
+        return Err(invalid());
+    }
+    let mut offsets = Vec::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        let file = archive.by_index(index).map_err(|_| invalid())?;
+        offsets.push(usize::try_from(file.central_header_start()).map_err(|_| invalid())?);
+    }
+    offsets.sort_unstable();
+    let mut next = usize::try_from(archive.central_directory_start()).map_err(|_| invalid())?;
+    for offset in offsets {
+        if offset != next {
+            return Err(invalid());
+        }
+        let header_end = offset.checked_add(46).ok_or_else(invalid)?;
+        let header = bytes.get(offset..header_end).ok_or_else(invalid)?;
+        if &header[..4] != b"PK\x01\x02" {
+            return Err(invalid());
+        }
+        next = header_end;
+        for field in [28, 30, 32] {
+            let length = u16::from_le_bytes([header[field], header[field + 1]]) as usize;
+            next = next.checked_add(length).ok_or_else(invalid)?;
+        }
+        if next > bytes.len() {
+            return Err(invalid());
+        }
+    }
+    if bytes.get(next..next.saturating_add(4)) == Some(b"PK\x01\x02") {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn write_artifact_member(
+    reader: &mut impl std::io::Read,
+    path: &Path,
+    expected_name: &str,
+    dest_dir: &Path,
+    seen: &mut std::collections::HashSet<String>,
+    total: &mut u64,
+    max_decompressed_bytes: u64,
+) -> PluginResult<()> {
+    use std::path::Component;
+    let mut components = path
+        .components()
+        .filter(|part| !matches!(part, Component::CurDir));
+    let name = match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None) if name == expected_name || name == "LICENSE" => name,
+        _ => {
+            return Err(PluginError::InvalidManifest(format!(
+                "artifact entry '{}' must be the root executable '{expected_name}' or LICENSE",
+                path.display()
+            )))
+        }
+    };
+    if !seen.insert(name.to_string_lossy().into_owned()) {
+        return Err(PluginError::InvalidManifest(format!(
+            "duplicate artifact entry '{}'",
+            path.display()
+        )));
+    }
+    let out_path = dest_dir.join(name);
+    // Besides canonical duplicates, create_new refuses real filesystem aliases
+    // (e.g. executable 'license' versus 'LICENSE' on case-insensitive macOS).
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&out_path)
+        .map_err(|error| {
+            PluginError::InvalidManifest(format!(
+                "cannot create unique artifact entry '{}': {error}",
+                path.display()
+            ))
+        })?;
+    if let Err(error) = copy_capped(reader, &mut output, total, max_decompressed_bytes) {
+        drop(output);
+        let _ = std::fs::remove_file(&out_path);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Copy `reader` into `writer` in small, bounded chunks, tallying bytes into
