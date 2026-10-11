@@ -4,6 +4,7 @@
 //! actor adapters, the SDK, and runtime coordinators all submit the same typed
 //! envelope addressed by stable [`Session::id`](bamboo_domain::Session).
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -18,6 +19,60 @@ use bamboo_domain::{
 
 /// A followup is one bounded peer instruction, not a context export or file transfer.
 pub const MAX_SUPERVISOR_FOLLOWUP_BYTES: usize = 16 * 1024;
+
+pub const MAX_PEER_MESSAGE_BYTES: usize = 16 * 1024;
+pub const MAX_PEER_TARGETS: usize = 128;
+pub const MAX_PEER_TARGET_RESULT_BYTES: usize = 32 * 1024;
+const MAX_PEER_TARGET_TITLE_BYTES: usize = 256;
+const MAX_PEER_TARGET_STATUS_BYTES: usize = 64;
+const MAX_PEER_TARGET_SCAN: usize = 1024;
+
+/// Logical discovery data only. A target observation is never delivery authority.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionPeerTarget {
+    pub session_id: String,
+    pub parent_session_id: Option<String>,
+    pub kind: bamboo_domain::SessionKind,
+    pub title: String,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionPeerTargets {
+    pub targets: Vec<SessionPeerTarget>,
+    pub truncated: bool,
+}
+
+struct PeerTreePort<'a>(&'a dyn Storage);
+
+#[async_trait::async_trait]
+impl crate::session_app::child_session::owned_tree::OwnedTreePort for PeerTreePort<'_> {
+    async fn load(
+        &self,
+        id: &str,
+    ) -> Result<Session, crate::session_app::child_session::owned_tree::OwnedTreeError> {
+        use crate::session_app::child_session::owned_tree::OwnedTreeError;
+        bamboo_domain::validate_supervisor_target_id(id)
+            .map_err(|_| OwnedTreeError::InvalidLineage)?;
+        self.0
+            .load_runtime_control_plane(id)
+            .await
+            .map_err(|_| OwnedTreeError::InvalidLineage)?
+            .ok_or(OwnedTreeError::InvalidLineage)
+    }
+
+    async fn child_ids(
+        &self,
+        parent_id: &str,
+    ) -> Result<Vec<String>, crate::session_app::child_session::owned_tree::OwnedTreeError> {
+        use crate::session_app::child_session::owned_tree::OwnedTreeError;
+        self.0
+            .list_child_run_statuses(parent_id)
+            .await
+            .map(|children| children.into_iter().map(|(id, _)| id).collect())
+            .map_err(|_| OwnedTreeError::InvalidLineage)
+    }
+}
 
 /// Observable counters for the internal delivery plane.
 #[derive(Debug, Default)]
@@ -161,6 +216,321 @@ impl SessionMessenger {
 
     pub fn metrics(&self) -> &Arc<SessionMessagingMetrics> {
         &self.metrics
+    }
+
+    /// Discover bounded logical peers in the caller's current canonical tree.
+    /// `caller_session_id` comes from the authenticated runtime context, never
+    /// from model arguments. Every candidate is revalidated before disclosure.
+    pub async fn list_peer_targets(
+        &self,
+        caller_session_id: &str,
+    ) -> Result<SessionPeerTargets, SessionMessengerError> {
+        let caller = self.peer_member(caller_session_id, true).await?;
+        let mut pending = VecDeque::from([(caller.root_session_id.clone(), None)]);
+        let mut seen = HashSet::new();
+        let mut result = SessionPeerTargets {
+            targets: Vec::new(),
+            truncated: false,
+        };
+        // Account for JSON escaping, separators, and the complete wrapper,
+        // rather than treating raw display-string lengths as an output bound.
+        let mut result_bytes = serde_json::to_vec(&result)
+            .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?
+            .len();
+        while let Some((id, indexed_parent)) = pending.pop_front() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let current = match self.peer_member(&id, false).await {
+                Ok(current)
+                    if current.root_session_id == caller.root_session_id
+                        && current.project_id_meta() == caller.project_id_meta()
+                        && current.parent_session_id == indexed_parent =>
+                {
+                    current
+                }
+                Ok(_)
+                | Err(SessionMessengerError::TargetNotFound(_))
+                | Err(SessionMessengerError::Unauthorized { .. })
+                | Err(SessionMessengerError::InvalidEnvelope(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            if id != caller_session_id {
+                if result.targets.len() == MAX_PEER_TARGETS {
+                    result.truncated = true;
+                    break;
+                }
+                let target = SessionPeerTarget {
+                    session_id: current.id.clone(),
+                    parent_session_id: current.parent_session_id.clone(),
+                    kind: current.kind,
+                    title: Self::bounded_peer_label(&current.title, MAX_PEER_TARGET_TITLE_BYTES),
+                    status: current.last_run_status().map(|status| {
+                        Self::bounded_peer_label(&status, MAX_PEER_TARGET_STATUS_BYTES)
+                    }),
+                };
+                let target_bytes = serde_json::to_vec(&target)
+                    .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?
+                    .len()
+                    + usize::from(!result.targets.is_empty());
+                if result_bytes.saturating_add(target_bytes) > MAX_PEER_TARGET_RESULT_BYTES {
+                    result.truncated = true;
+                    break;
+                }
+                result_bytes += target_bytes;
+                result.targets.push(target);
+            }
+            let mut children = self
+                .sessions
+                .list_child_run_statuses(&id)
+                .await
+                .map_err(|error| SessionMessengerError::Storage(error.to_string()))?;
+            children.sort_by(|left, right| left.0.cmp(&right.0));
+            let budget = MAX_PEER_TARGET_SCAN.saturating_sub(seen.len() + pending.len());
+            result.truncated |= children.len() > budget;
+            pending.extend(
+                children
+                    .into_iter()
+                    .take(budget)
+                    .map(|(child, _)| (child, Some(id.clone()))),
+            );
+        }
+        Ok(result)
+    }
+
+    /// Send an asynchronous peer instruction. Source identity and association
+    /// fields are constructed by the runtime; callers provide no envelope.
+    /// Reuse the same operation id and message after an uncertain result.
+    pub async fn send_peer(
+        &self,
+        caller_session_id: &str,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        Self::validate_peer_input(operation_id, message)?;
+        let (caller, target) = self.peer_pair(caller_session_id, target_session_id).await?;
+        let id = Self::peer_message_id(&caller, &target, operation_id);
+        let envelope = Self::peer_envelope(
+            &caller,
+            &target,
+            operation_id,
+            message,
+            id.clone(),
+            id.to_string(),
+            None,
+        );
+        self.send_peer_envelope(envelope).await
+    }
+
+    /// Reply only to a canonical received peer envelope in the caller's saved
+    /// transcript. Recipient and thread edges are never supplied by the model.
+    pub async fn reply_peer(
+        &self,
+        caller_session_id: &str,
+        received_message_id: &str,
+        operation_id: &str,
+        message: &str,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        Self::validate_peer_input(operation_id, message)?;
+        Self::validate_peer_session_id(caller_session_id)?;
+        let received_id = SessionMessageId::parse(received_message_id)
+            .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
+        let received = self
+            .load_session(caller_session_id)
+            .await?
+            .ok_or_else(|| SessionMessengerError::SourceNotFound(caller_session_id.into()))?;
+        let original = received
+            .messages
+            .iter()
+            .filter(|message| message.id == received_message_id)
+            .find_map(|message| {
+                let envelope: SessionMessageEnvelope = serde_json::from_value(
+                    message.metadata.as_ref()?.get("session_message")?.clone(),
+                )
+                .ok()?;
+                (envelope.id == received_id
+                    && envelope.kind == SessionMessageKind::PeerMessage
+                    && envelope.target_session_id == caller_session_id
+                    && bamboo_domain::is_matching_session_message(message, &envelope))
+                .then_some(envelope)
+            })
+            .ok_or_else(|| {
+                SessionMessengerError::InvalidEnvelope(
+                    "reply requires a canonical received peer message".into(),
+                )
+            })?;
+        let SessionMessageSource::Session {
+            session_id: target_id,
+        } = &original.source
+        else {
+            return Err(SessionMessengerError::InvalidEnvelope(
+                "reply has no logical sender".into(),
+            ));
+        };
+        let (caller, target) = self.peer_pair(caller_session_id, target_id).await?;
+        let thread = original.thread_id.clone().ok_or_else(|| {
+            SessionMessengerError::InvalidEnvelope("reply requires a threaded peer message".into())
+        })?;
+        let original_operation = original.correlation_id.as_deref().ok_or_else(|| {
+            SessionMessengerError::InvalidEnvelope(
+                "reply requires a peer operation identity".into(),
+            )
+        })?;
+        if original.id != Self::peer_message_id(&target, &caller, original_operation) {
+            return Err(SessionMessengerError::InvalidEnvelope(
+                "received peer message belongs to a different session lifetime".into(),
+            ));
+        }
+        SessionMessageId::parse(&thread)
+            .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
+        let envelope = Self::peer_envelope(
+            &caller,
+            &target,
+            operation_id,
+            message,
+            Self::peer_message_id(&caller, &target, operation_id),
+            thread,
+            Some(original.id),
+        );
+        self.send_peer_envelope(envelope).await
+    }
+
+    fn validate_peer_input(operation_id: &str, message: &str) -> Result<(), SessionMessengerError> {
+        SessionMessageId::parse(operation_id)
+            .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
+        if message.trim().is_empty()
+            || message.len() > MAX_PEER_MESSAGE_BYTES
+            || message.contains('\0')
+        {
+            return Err(SessionMessengerError::InvalidEnvelope(format!(
+                "peer message must contain 1..={MAX_PEER_MESSAGE_BYTES} UTF-8 bytes without NUL"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_peer_session_id(id: &str) -> Result<(), SessionMessengerError> {
+        bamboo_domain::validate_supervisor_target_id(id)
+            .map_err(|error| SessionMessengerError::InvalidEnvelope(error.into()))?;
+        SessionMessageId::parse(id)
+            .map(|_| ())
+            .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))
+    }
+
+    fn bounded_peer_label(value: &str, max_bytes: usize) -> String {
+        let mut end = value.len().min(max_bytes);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value[..end].to_owned()
+    }
+
+    async fn peer_member(&self, id: &str, source: bool) -> Result<Session, SessionMessengerError> {
+        Self::validate_peer_session_id(id)?;
+        let session = self
+            .sessions
+            .load_runtime_control_plane(id)
+            .await
+            .map_err(|error| SessionMessengerError::Storage(error.to_string()))?
+            .ok_or_else(|| {
+                if source {
+                    SessionMessengerError::SourceNotFound(id.into())
+                } else {
+                    SessionMessengerError::TargetNotFound(id.into())
+                }
+            })?;
+        let unauthorized = || SessionMessengerError::Unauthorized {
+            source_session_id: id.into(),
+            target: session.root_session_id.clone(),
+        };
+        if session.id != id
+            || session
+                .runtime_metadata
+                .as_ref()
+                .and_then(|meta| meta.project_id.as_ref())
+                .zip(session.metadata.get("project_id"))
+                .is_some_and(|(typed, legacy)| typed != legacy)
+            || bamboo_domain::ActorSession::from_session(&session).is_err()
+        {
+            return Err(unauthorized());
+        }
+        if session.kind == bamboo_domain::SessionKind::Root {
+            return Ok(session);
+        }
+        crate::session_app::child_session::owned_tree::load_owned_descendant(
+            &PeerTreePort(self.sessions.as_ref()),
+            &session.root_session_id,
+            id,
+        )
+        .await
+        .map_err(|_| unauthorized())
+    }
+
+    async fn peer_pair(
+        &self,
+        caller_id: &str,
+        target_id: &str,
+    ) -> Result<(Session, Session), SessionMessengerError> {
+        let caller = self.peer_member(caller_id, true).await?;
+        let target = self.peer_member(target_id, false).await?;
+        if caller_id == target_id
+            || caller.root_session_id != target.root_session_id
+            || caller.project_id_meta() != target.project_id_meta()
+        {
+            return Err(SessionMessengerError::Unauthorized {
+                source_session_id: caller_id.into(),
+                target: target_id.into(),
+            });
+        }
+        Ok((caller, target))
+    }
+
+    fn peer_message_id(caller: &Session, target: &Session, operation_id: &str) -> SessionMessageId {
+        SessionMessageId::stable(
+            "session-peer-v1",
+            &serde_json::json!({
+                "source": caller.id, "source_birth": caller.created_at,
+                "target": target.id, "target_birth": target.created_at,
+                "operation_id": operation_id,
+            }),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn peer_envelope(
+        caller: &Session,
+        target: &Session,
+        operation_id: &str,
+        message: &str,
+        id: SessionMessageId,
+        thread_id: String,
+        in_reply_to: Option<SessionMessageId>,
+    ) -> SessionMessageEnvelope {
+        SessionMessageEnvelope {
+            id,
+            source: SessionMessageSource::Session {
+                session_id: caller.id.clone(),
+            },
+            target_session_id: target.id.clone(),
+            kind: SessionMessageKind::PeerMessage,
+            body: SessionMessageBody::Content(SessionMessageContent::text(message)),
+            created_at: chrono::Utc::now(),
+            thread_id: Some(thread_id),
+            in_reply_to,
+            attempt: None,
+            correlation_id: Some(operation_id.into()),
+        }
+    }
+
+    async fn send_peer_envelope(
+        &self,
+        envelope: SessionMessageEnvelope,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        // Peer scheduling uses the existing per-message durable intent and
+        // safe-boundary activation path; it grants no queue-prefix permission.
+        self.send_with_policy(envelope, SessionActivationPolicy::InterruptSpecificWait)
+            .await
     }
 
     /// Follow an already-attached Ordinary Root from the original executing
@@ -759,6 +1129,575 @@ mod tests {
             attempt: None,
             correlation_id: None,
         }
+    }
+
+    #[derive(Default)]
+    struct PeerMemoryStorage(tokio::sync::RwLock<std::collections::HashMap<String, Session>>);
+
+    #[async_trait]
+    impl Storage for PeerMemoryStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.0
+                .write()
+                .await
+                .insert(session.id.clone(), session.clone());
+            Ok(())
+        }
+
+        async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+            Ok(self.0.read().await.get(id).cloned())
+        }
+
+        async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+            Ok(self.0.write().await.remove(id).is_some())
+        }
+
+        async fn list_child_run_statuses(
+            &self,
+            parent: &str,
+        ) -> std::io::Result<Vec<(String, Option<String>)>> {
+            Ok(self
+                .0
+                .read()
+                .await
+                .values()
+                .filter(|session| session.parent_session_id.as_deref() == Some(parent))
+                .map(|session| (session.id.clone(), session.last_run_status()))
+                .collect())
+        }
+    }
+
+    async fn seed_peer_tree(store: &dyn Storage) {
+        let mut root = Session::new("peer-root", "model");
+        root.title = "Logical root".into();
+        root.set_project_id_meta("peer-project");
+        let left = Session::new_child_of("peer-left", &root, "model", "Left");
+        let right = Session::new_child_of("peer-right", &root, "model", "Right");
+        let cousin_left = Session::new_child_of("peer-left-leaf", &left, "model", "Left leaf");
+        let cousin_right = Session::new_child_of("peer-right-leaf", &right, "model", "Right leaf");
+        for mut session in [root, left, right, cousin_left, cousin_right] {
+            session.set_project_id_meta("peer-project");
+            store.save_session(&session).await.unwrap();
+        }
+    }
+
+    async fn admit_peer_for_test(
+        store: &dyn Storage,
+        inbox: &dyn SessionInboxPort,
+        target: &str,
+    ) -> SessionMessageEnvelope {
+        let claims = inbox.claim(target, 16).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        let claim = &claims[0];
+        let mut session = store.load_session(target).await.unwrap().unwrap();
+        session.add_message(claim.envelope.to_provider_message().unwrap());
+        store.save_session(&session).await.unwrap();
+        inbox.ack(target, claim).await.unwrap();
+        claim.envelope.clone()
+    }
+
+    #[tokio::test]
+    async fn peer_api_discovers_and_messages_parent_child_siblings_and_cousins() {
+        let (_temp, store, activation, messenger) = fixture().await;
+        seed_peer_tree(store.as_ref()).await;
+        store
+            .save_session(&Session::new("foreign-root", "model"))
+            .await
+            .unwrap();
+        let targets = messenger.list_peer_targets("peer-left-leaf").await.unwrap();
+        assert!(!targets.truncated);
+        let ids: Vec<_> = targets
+            .targets
+            .iter()
+            .map(|target| target.session_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["peer-root", "peer-left", "peer-right", "peer-right-leaf"]
+        );
+        assert_eq!(targets.targets[0].title, "Logical root");
+        assert!(targets.targets[0].parent_session_id.is_none());
+        assert!(!serde_json::to_string(&targets)
+            .unwrap()
+            .contains("foreign-root"));
+
+        for (index, (source, target)) in [
+            ("peer-root", "peer-left"),
+            ("peer-left", "peer-root"),
+            ("peer-left", "peer-right"),
+            ("peer-left-leaf", "peer-right-leaf"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let receipt = messenger
+                .send_peer(
+                    source,
+                    target,
+                    &format!("operation-{index}"),
+                    "bounded peer instruction",
+                )
+                .await
+                .unwrap();
+            let backlog = messenger.inbox().inspect(target).await.unwrap();
+            assert_eq!(
+                backlog.coordinator_generation, 0,
+                "peer permission must not release a prefix"
+            );
+            assert!(backlog.interrupt_pending());
+            let envelope =
+                admit_peer_for_test(store.as_ref(), messenger.inbox().as_ref(), target).await;
+            assert_eq!(envelope.id, receipt.delivery.id);
+            assert_eq!(
+                envelope.source,
+                SessionMessageSource::Session {
+                    session_id: source.into()
+                }
+            );
+            assert_eq!(envelope.thread_id.as_deref(), Some(envelope.id.as_str()));
+            assert_eq!(
+                envelope.correlation_id.as_deref(),
+                Some(format!("operation-{index}").as_str())
+            );
+            assert!(envelope.in_reply_to.is_none());
+        }
+        assert_eq!(activation.calls.lock().await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn peer_api_denies_unknown_deleted_cross_root_and_invalid_project_or_lineage() {
+        let (_temp, store, activation, messenger) = fixture().await;
+        seed_peer_tree(store.as_ref()).await;
+        store
+            .save_session(&Session::new("foreign-root", "model"))
+            .await
+            .unwrap();
+        for (source, target) in [
+            ("peer-left", "foreign-root"),
+            ("unknown", "peer-left"),
+            ("peer-left", "unknown"),
+            ("peer-left", "peer-left"),
+        ] {
+            assert!(messenger
+                .send_peer(source, target, "denied-operation", "instruction")
+                .await
+                .is_err());
+        }
+        store.delete_session("peer-right-leaf").await.unwrap();
+        assert!(matches!(
+            messenger
+                .send_peer("peer-left", "peer-right-leaf", "deleted", "instruction")
+                .await,
+            Err(SessionMessengerError::TargetNotFound(_))
+        ));
+        assert!(matches!(
+            messenger
+                .send_peer(
+                    "peer-right-leaf",
+                    "peer-left",
+                    "deleted-source",
+                    "instruction"
+                )
+                .await,
+            Err(SessionMessengerError::SourceNotFound(_))
+        ));
+
+        // Invalid canonical snapshots exercise the read boundary without
+        // relaxing the production store's immutable lineage writer checks.
+        let memory = Arc::new(PeerMemoryStorage::default());
+        seed_peer_tree(memory.as_ref()).await;
+        let strict = SessionMessenger::new(
+            memory.clone(),
+            messenger.inbox().clone(),
+            activation.clone(),
+        );
+        let original = memory.load_session("peer-right").await.unwrap().unwrap();
+        for defect in [
+            "project",
+            "missing_project",
+            "project_mirror",
+            "parent",
+            "depth",
+            "root",
+            "cycle",
+        ] {
+            let mut invalid = original.clone();
+            match defect {
+                "project" => invalid.set_project_id_meta("other-project"),
+                "missing_project" => {
+                    invalid.metadata.remove("project_id");
+                    if let Some(metadata) = invalid.runtime_metadata.as_mut() {
+                        metadata.project_id = None;
+                    }
+                }
+                "project_mirror" => {
+                    invalid
+                        .metadata
+                        .insert("project_id".into(), "other-project".into());
+                }
+                "parent" => invalid.parent_session_id = Some("missing-parent".into()),
+                "depth" => invalid.spawn_depth += 1,
+                "root" => invalid.root_session_id = "foreign-root".into(),
+                "cycle" => invalid.parent_session_id = Some("peer-right-leaf".into()),
+                _ => unreachable!(),
+            }
+            memory.save_session(&invalid).await.unwrap();
+            assert!(
+                strict
+                    .send_peer("peer-left", "peer-right", "invalid", "instruction")
+                    .await
+                    .is_err(),
+                "{defect}"
+            );
+            let targets = strict.list_peer_targets("peer-left").await.unwrap();
+            assert!(
+                !targets
+                    .targets
+                    .iter()
+                    .any(|target| target.session_id == "peer-right"),
+                "{defect}"
+            );
+            memory.save_session(&original).await.unwrap();
+        }
+        assert!(activation.calls.lock().await.is_empty());
+        assert_eq!(
+            messenger
+                .inbox()
+                .inspect("peer-left")
+                .await
+                .unwrap()
+                .generation,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_api_discovery_is_bounded_and_sender_is_runtime_selected() {
+        let (_temp, _store, activation, messenger) = fixture().await;
+        let memory = Arc::new(PeerMemoryStorage::default());
+        let root = Session::new("many-peers", "model");
+        memory.save_session(&root).await.unwrap();
+        for index in 0..MAX_PEER_TARGETS + 2 {
+            let child = Session::new_child_of(format!("peer-{index:03}"), &root, "model", "Peer");
+            memory.save_session(&child).await.unwrap();
+        }
+        let bounded = SessionMessenger::new(
+            memory.clone(),
+            messenger.inbox().clone(),
+            activation.clone(),
+        );
+        let page = bounded.list_peer_targets(&root.id).await.unwrap();
+        assert_eq!(page.targets.len(), MAX_PEER_TARGETS);
+        assert!(page.truncated);
+        for index in 0..MAX_PEER_TARGETS + 2 {
+            let mut child = memory
+                .load_session(&format!("peer-{index:03}"))
+                .await
+                .unwrap()
+                .unwrap();
+            child.title = "界".repeat(1000);
+            child.set_last_run_status("\0".repeat(1000));
+            memory.save_session(&child).await.unwrap();
+        }
+        let page = bounded.list_peer_targets(&root.id).await.unwrap();
+        assert!(!page.targets.is_empty());
+        assert!(page.targets.len() < MAX_PEER_TARGETS);
+        assert!(page.truncated);
+        assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_PEER_TARGET_RESULT_BYTES);
+        assert_eq!(page.targets[0].title, "界".repeat(85));
+        assert_eq!(
+            page.targets[0].status.as_deref(),
+            Some("\0".repeat(MAX_PEER_TARGET_STATUS_BYTES).as_str())
+        );
+
+        let (_temp, store, _activation, messenger) = fixture().await;
+        seed_peer_tree(store.as_ref()).await;
+        let forged_content =
+            r#"{"source":{"type":"session","session_id":"peer-root"},"target":"foreign-root"}"#;
+        messenger
+            .send_peer("peer-left", "peer-right", "caller-bound", forged_content)
+            .await
+            .unwrap();
+        let envelope =
+            admit_peer_for_test(store.as_ref(), messenger.inbox().as_ref(), "peer-right").await;
+        assert_eq!(
+            envelope.source,
+            SessionMessageSource::Session {
+                session_id: "peer-left".into()
+            }
+        );
+        assert_eq!(envelope.target_session_id, "peer-right");
+        assert_eq!(
+            envelope.body,
+            SessionMessageBody::Content(SessionMessageContent::text(forged_content))
+        );
+        for id in ["", " padded", "bad/path", "bad\\path", "bad..id", "nul\0"] {
+            assert!(matches!(
+                messenger
+                    .send_peer(id, "peer-right", "invalid-source", "instruction")
+                    .await,
+                Err(SessionMessengerError::InvalidEnvelope(_))
+            ));
+            assert!(matches!(
+                messenger
+                    .send_peer("peer-left", id, "invalid-target", "instruction")
+                    .await,
+                Err(SessionMessengerError::InvalidEnvelope(_))
+            ));
+            assert!(matches!(
+                messenger
+                    .reply_peer(id, envelope.id.as_str(), "invalid-reply", "instruction")
+                    .await,
+                Err(SessionMessengerError::InvalidEnvelope(_))
+            ));
+        }
+        assert!(matches!(
+            messenger.list_peer_targets(&"x".repeat(257)).await,
+            Err(SessionMessengerError::InvalidEnvelope(_))
+        ));
+        for (operation, message) in [
+            ("", "valid"),
+            (" padded", "valid"),
+            ("bad..id", "valid"),
+            ("valid", " "),
+            ("valid", "nul\0"),
+        ] {
+            assert!(messenger
+                .send_peer("peer-left", "peer-right", operation, message)
+                .await
+                .is_err());
+        }
+        assert!(messenger
+            .send_peer(
+                "peer-left",
+                "peer-right",
+                "oversized",
+                &"x".repeat(MAX_PEER_MESSAGE_BYTES + 1)
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn peer_api_retry_dedupes_before_claim_and_after_ack_restart_but_rejects_changed_payload()
+    {
+        let (temp, store, activation, messenger) = fixture().await;
+        seed_peer_tree(store.as_ref()).await;
+        let first = messenger
+            .send_peer("peer-left", "peer-right", "stable-operation", "original")
+            .await
+            .unwrap();
+        let retry = messenger
+            .send_peer("peer-left", "peer-right", "stable-operation", "original")
+            .await
+            .unwrap();
+        assert_eq!(retry.delivery, first.delivery);
+        assert!(matches!(
+            messenger
+                .send_peer("peer-left", "peer-right", "stable-operation", "changed")
+                .await,
+            Err(SessionMessengerError::Inbox(
+                SessionInboxError::InvalidClaim(_)
+            ))
+        ));
+        assert_eq!(
+            messenger
+                .inbox()
+                .inspect("peer-right")
+                .await
+                .unwrap()
+                .generation,
+            1
+        );
+        admit_peer_for_test(store.as_ref(), messenger.inbox().as_ref(), "peer-right").await;
+        drop(messenger);
+        drop(store);
+        let reopened = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+        let inbox = Arc::new(FileSessionInbox::new(
+            reopened.clone(),
+            SessionInboxLimits::default(),
+        ));
+        let messenger = SessionMessenger::new(reopened, inbox.clone(), activation);
+        let after_ack = messenger
+            .send_peer("peer-left", "peer-right", "stable-operation", "original")
+            .await
+            .unwrap();
+        assert_eq!(after_ack.delivery, first.delivery);
+        assert!(inbox.claim("peer-right", 16).await.unwrap().is_empty());
+        assert!(matches!(
+            messenger
+                .send_peer("peer-left", "peer-right", "stable-operation", "changed")
+                .await,
+            Err(SessionMessengerError::Inbox(
+                SessionInboxError::InvalidClaim(_)
+            ))
+        ));
+        assert_eq!(inbox.inspect("peer-right").await.unwrap().generation, 1);
+    }
+
+    #[tokio::test]
+    async fn peer_api_reply_recovers_durable_recipient_and_thread_after_restart() {
+        let (temp, store, activation, messenger) = fixture().await;
+        seed_peer_tree(store.as_ref()).await;
+        let first = messenger
+            .send_peer("peer-left-leaf", "peer-right-leaf", "initial", "question")
+            .await
+            .unwrap();
+        let incoming = admit_peer_for_test(
+            store.as_ref(),
+            messenger.inbox().as_ref(),
+            "peer-right-leaf",
+        )
+        .await;
+        drop(messenger);
+        drop(store);
+        let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+        let inbox = Arc::new(FileSessionInbox::new(
+            store.clone(),
+            SessionInboxLimits::default(),
+        ));
+        let messenger = SessionMessenger::new(store.clone(), inbox.clone(), activation);
+        let reply = messenger
+            .reply_peer(
+                "peer-right-leaf",
+                first.delivery.id.as_str(),
+                "answer",
+                "answer text",
+            )
+            .await
+            .unwrap();
+        let retry = messenger
+            .reply_peer(
+                "peer-right-leaf",
+                first.delivery.id.as_str(),
+                "answer",
+                "answer text",
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.delivery, retry.delivery);
+        let response = admit_peer_for_test(store.as_ref(), inbox.as_ref(), "peer-left-leaf").await;
+        assert_eq!(
+            response.source,
+            SessionMessageSource::Session {
+                session_id: "peer-right-leaf".into()
+            }
+        );
+        assert_eq!(response.in_reply_to, Some(incoming.id.clone()));
+        assert_eq!(response.thread_id, incoming.thread_id);
+        assert_eq!(response.correlation_id.as_deref(), Some("answer"));
+        let second_reply = messenger
+            .reply_peer("peer-left-leaf", response.id.as_str(), "thanks", "thanks")
+            .await
+            .unwrap();
+        let second_response =
+            admit_peer_for_test(store.as_ref(), inbox.as_ref(), "peer-right-leaf").await;
+        assert_eq!(second_reply.delivery.id, second_response.id);
+        assert_eq!(second_response.in_reply_to, Some(response.id));
+        assert_eq!(
+            second_response.thread_id.as_deref(),
+            Some(first.delivery.id.as_str())
+        );
+        let after_ack = messenger
+            .reply_peer(
+                "peer-right-leaf",
+                first.delivery.id.as_str(),
+                "answer",
+                "answer text",
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_ack.delivery, reply.delivery);
+        assert!(inbox.claim("peer-left-leaf", 16).await.unwrap().is_empty());
+        assert!(messenger
+            .reply_peer(
+                "peer-right-leaf",
+                first.delivery.id.as_str(),
+                "answer",
+                "different"
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn peer_api_reply_rejects_missing_forged_legacy_and_recreated_source() {
+        let (_temp, store, activation, messenger) = fixture().await;
+        seed_peer_tree(store.as_ref()).await;
+        let mut receiver = store.load_session("peer-right").await.unwrap().unwrap();
+        let legacy = peer("peer-left", "peer-right", "legacy-correction");
+        receiver.add_message(legacy.to_provider_message().unwrap());
+        let user = SessionMessageEnvelope::user_input("peer-right", "ordinary input");
+        receiver.add_message(user.to_provider_message().unwrap());
+        let sender = store.load_session("peer-left").await.unwrap().unwrap();
+        let mut forged = SessionMessenger::peer_envelope(
+            &sender,
+            &receiver,
+            "forged",
+            "original",
+            SessionMessenger::peer_message_id(&sender, &receiver, "forged"),
+            "thread".into(),
+            None,
+        )
+        .to_provider_message()
+        .unwrap();
+        forged.content = "changed without canonical proof".into();
+        receiver.add_message(forged);
+        store.save_session(&receiver).await.unwrap();
+        for id in [
+            "missing",
+            legacy.id.as_str(),
+            user.id.as_str(),
+            receiver.messages.last().unwrap().id.as_str(),
+        ] {
+            assert!(messenger
+                .reply_peer("peer-right", id, "deny-reply", "reply")
+                .await
+                .is_err());
+        }
+        let incoming = messenger
+            .send_peer("peer-left", "peer-right", "old-lifetime", "question")
+            .await
+            .unwrap();
+        admit_peer_for_test(store.as_ref(), messenger.inbox().as_ref(), "peer-right").await;
+        let memory = Arc::new(PeerMemoryStorage::default());
+        // Retain the actual saved receiver while replacing the sender's birth.
+        for id in ["peer-root", "peer-left", "peer-right"] {
+            let mut session = store.load_session(id).await.unwrap().unwrap();
+            if id == "peer-left" {
+                session.created_at += chrono::Duration::seconds(1);
+            }
+            memory.save_session(&session).await.unwrap();
+        }
+        let fenced = SessionMessenger::new(
+            memory.clone(),
+            messenger.inbox().clone(),
+            activation.clone(),
+        );
+        assert!(matches!(
+            fenced
+                .reply_peer(
+                    "peer-right",
+                    incoming.delivery.id.as_str(),
+                    "reply-old",
+                    "reply"
+                )
+                .await,
+            Err(SessionMessengerError::InvalidEnvelope(_))
+        ));
+        memory.delete_session("peer-left").await.unwrap();
+        assert!(matches!(
+            fenced
+                .reply_peer(
+                    "peer-right",
+                    incoming.delivery.id.as_str(),
+                    "reply-deleted",
+                    "reply"
+                )
+                .await,
+            Err(SessionMessengerError::TargetNotFound(_))
+        ));
+        assert_eq!(activation.calls.lock().await.len(), 1);
     }
 
     #[tokio::test]
