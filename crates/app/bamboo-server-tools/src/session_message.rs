@@ -402,6 +402,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_rejects_peer_mutations_before_ask_and_emits_no_approval() {
+        let fixture = Fixture::new(false).await;
+        let config = Arc::new(PermissionConfig::new());
+        config.set_ask_rules(["session_message(*)".into()]);
+        let overlay = fixture.permission_overlay(config.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        for action in ["send", "reply"] {
+            let call = peer_call(action, &fixture);
+            for (bypass, auto) in [(false, false), (true, false), (false, true)] {
+                let mut ctx = ToolExecutionContext::none(&call.id);
+                ctx.session_id = Some(&fixture.sender.id);
+                ctx.event_tx = Some(&tx);
+                ctx.plan_read_only = true;
+                ctx.bypass_permissions = bypass;
+                ctx.auto_approve_permissions = auto;
+                let error = overlay.execute_with_context(&call, ctx).await.unwrap_err();
+                assert!(
+                    matches!(error, ToolError::Execution(ref message) if message.contains("Plan mode")),
+                    "{error:?}"
+                );
+                assert!(config
+                    .pending_request(&fixture.sender.id, &call.id)
+                    .is_none());
+            }
+        }
+        let call = ToolCall {
+            id: "plan-discovery".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "default::session_message".into(),
+                arguments: json!({"action":"list_targets"}).to_string(),
+            },
+        };
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.session_id = Some(&fixture.sender.id);
+        ctx.event_tx = Some(&tx);
+        ctx.plan_read_only = true;
+        assert!(
+            overlay
+                .execute_with_context(&call, ctx)
+                .await
+                .unwrap()
+                .success
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        fixture.assert_no_peer_effects().await;
+    }
+
+    #[tokio::test]
     async fn peer_execute_allow_uses_the_existing_direct_delivery_path() {
         let fixture = Fixture::new(false).await;
         let config = Arc::new(PermissionConfig::new());
