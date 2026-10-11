@@ -74,6 +74,11 @@ fn approval_tool_name_for_display(tool_name: &str) -> String {
 }
 
 fn approval_parameters_for_display(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
+    if canonical_tool_name(tool_name).eq_ignore_ascii_case("session_message") {
+        // Peer text and routing identifiers must not enter approval display
+        // events. Classification has already validated the exact action.
+        return serde_json::json!({"action": args.get("action")});
+    }
     if canonical_tool_name(tool_name).eq_ignore_ascii_case("browser_eval") {
         return serde_json::json!({
             "code":"[redacted]",
@@ -1297,6 +1302,24 @@ mod tests {
             assert!(ordinary_preview.contains("private"));
             assert_eq!(ordinary_warning, warning);
         }
+    }
+
+    #[test]
+    fn peer_approval_event_hides_message_and_routing_without_changing_execution_args() {
+        let args = json!({
+            "action":"send", "target_session_id":"private-target",
+            "operation_id":"private-operation", "message":"private-message",
+            "reply_to":"private-received-id", "extra":{"secret":"private-extra"},
+        });
+        let original = args.clone();
+        for name in ["session_message", "default::session_message"] {
+            assert_eq!(
+                approval_parameters_for_display(name, &args),
+                json!({"action":"send"})
+            );
+        }
+        assert_eq!(args, original);
+        assert_eq!(approval_parameters_for_display("Write", &args), args);
     }
 
     #[test]

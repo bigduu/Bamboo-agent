@@ -52,7 +52,11 @@ permissions, cannot answer pending approvals or clarification requests, and
 preserves the receiver's own context and durable waits. Plan/read-only mode
 allows `list_targets` but rejects `send` and `reply`, even when permission
 bypass or automatic approval is enabled. Explicit tool allow/deny policies
-continue to apply. Restricted named profiles and native tool ceilings retain
+continue to apply. When a permission checker is installed, `send` and `reply`
+require `ExecuteCommand` permission because delivery can activate the receiver;
+`list_targets` remains read-only. ASK pauses and DENY rejects before admission
+or activation. Approval displays omit peer text and routing identifiers.
+Restricted named profiles and native tool ceilings retain
 their existing exact tool lists; installing this capability does not expand
 those profiles.
 
