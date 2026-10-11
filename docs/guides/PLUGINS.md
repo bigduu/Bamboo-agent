@@ -156,11 +156,12 @@ compatibility. A lost HTTP response does not cancel the bounded owned operation;
 refresh status before retrying.
 
 The downloaded development archive is ad-hoc signed (`artifact.signing:
-"ad_hoc"`). Installation explicitly creates or reuses a stable local signing
-identity (`artifact.install_mode: "local_self_signed"`); it is not an Apple
-Developer ID or notarized distribution. Follow the reported manual guidance
-for an abnormal or partial keychain identity. Setup does not launch Nova.app or
-grant Accessibility or Screen Recording permission. Open the app and grant
+"ad_hoc"`). Installation removes quarantine and applies a local ad-hoc signature
+in the verified private stage (`artifact.install_mode: "local_ad_hoc"`); it does
+not access or create keychain identities, certificates or trust settings. This
+is not an Apple Developer ID or notarized distribution and does not guarantee
+privacy permission continuity across upgrades. Setup does not launch Nova.app
+or grant Accessibility or Screen Recording permission. Open the app and grant
 permissions yourself after installation.
 
 `desktop_server_id` is returned only when the installed manifest, registration

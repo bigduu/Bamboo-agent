@@ -9,8 +9,8 @@ use actix_web::{web, HttpResponse};
 use bamboo_config::PluginTrustConfig;
 use bamboo_domain::mcp_config::{McpServerConfig, TransportConfig};
 use bamboo_plugin::{
-    InstalledPlugin, InstalledPlugins, McpTransportManifest, PluginInstallStatus, PluginManifest,
-    PluginSource,
+    InstalledPlugin, InstalledPlugins, McpTransportManifest, Platform, PluginInstallStatus,
+    PluginManifest, PluginSource,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -70,7 +70,7 @@ fn valid_artifact(artifact: &AppArtifact) -> bool {
         && artifact.sha256.len() == 64
         && artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
         && artifact.signing == "ad_hoc"
-        && artifact.install_mode == "local_self_signed"
+        && artifact.install_mode == "local_ad_hoc"
         && artifact.development
         && artifact.url == format!("https://github.com/bigduu/Nova/releases/download/v{0}/nova-v{0}-universal-apple-darwin-development-app.zip", artifact.version)
 }
@@ -315,10 +315,17 @@ fn desktop_entry(manifest: &PluginManifest) -> Option<&bamboo_plugin::McpServerM
 fn desktop_server_id(
     entry: &InstalledPlugin,
     manifest: &PluginManifest,
-    command: &Path,
+    os: &str,
     servers: &[McpServerConfig],
 ) -> Option<String> {
-    desktop_entry(manifest)?;
+    // Match the installer's literal token resolution, not canonical aliases
+    // (Windows extended paths and macOS /var vs /private/var differ).
+    let expected = desktop_entry(manifest)?
+        .resolve(&entry.plugin_dir, &manifest.id, Platform::parse(os)?)
+        .ok()?;
+    let TransportConfig::Stdio(expected) = expected.transport else {
+        return None;
+    };
     if !entry
         .registered
         .mcp_server_ids
@@ -334,10 +341,10 @@ fn desktop_server_id(
     }
     match &server.transport {
         TransportConfig::Stdio(config)
-            if Path::new(&config.command) == command
-                && config.args == ["mcp"]
-                && config.cwd.is_none()
-                && config.env.is_empty()
+            if config.command == expected.command
+                && config.args == expected.args
+                && config.cwd == expected.cwd
+                && config.env == expected.env
                 && config.env_encrypted.is_empty()
                 && config.env_credential_refs.is_empty() =>
         {
@@ -414,12 +421,10 @@ async fn run_cli(
         || report.next_action.is_empty()
         || report.message.len() > 8192
         || report.next_action.len() > 8192
-        || report.signing.as_deref().is_some_and(|signing| {
-            !matches!(
-                signing,
-                "ad_hoc" | "developer_id" | "local_self_signed" | "other"
-            )
-        })
+        || report
+            .signing
+            .as_deref()
+            .is_some_and(|signing| !matches!(signing, "ad_hoc" | "developer_id" | "other"))
         || (report.success
             && !matches!(
                 report.state,
@@ -448,7 +453,7 @@ fn manual_guidance(reason: Option<&str>) -> String {
         Some("legacy_cli_unavailable") => "This verified connector does not support Nova.app setup. Upgrade the official Nova plugin to a reviewed release with structured app setup, or follow its release guide manually.",
         Some("unsupported_host") => "Nova.app setup supports macOS Apple Silicon and Intel only.",
         Some("artifact_unavailable") => "No matching published app archive has been accepted yet. Follow the official Nova release guide; do not substitute a moving latest URL.",
-        _ => "Install a verified official Nova plugin first. Setup never launches Nova.app or grants privacy permissions. After explicit local self-sign installation, open Nova.app and grant permissions yourself, then reconnect only its owned desktop MCP server. If an install response is lost, refresh status before retrying; inspect any partial stable keychain identity manually.",
+        _ => "Install a verified official Nova plugin first. Setup never launches Nova.app or grants privacy permissions. After explicit local ad-hoc installation, open Nova.app and grant permissions yourself, then reconnect only its owned desktop MCP server. No keychain or certificate is created; permission continuity across upgrades is not guaranteed. If an install response is lost, refresh status before retrying.",
     }.into()
 }
 
@@ -500,7 +505,7 @@ async fn inspect_locked(
                 {
                     connector.state = "verified";
                     connector.reason = None;
-                    desktop_id = desktop_server_id(entry, &manifest, &binary, &config.mcp.servers);
+                    desktop_id = desktop_server_id(entry, &manifest, &host.os, &config.mcp.servers);
                     command = Some(binary);
                 }
             }
@@ -666,6 +671,13 @@ async fn install_owned(
     let inspection = inspect_locked(&state, Host::detect(), &catalog)
         .await
         .map_err(|_| "invalid_registry")?;
+    if !inspection.report.install.available {
+        return Err(inspection
+            .report
+            .install
+            .reason
+            .unwrap_or("setup_unavailable"));
+    }
     let artifact = catalog.app.as_ref().ok_or("artifact_unavailable")?;
     if request
         .artifact_id
@@ -673,13 +685,6 @@ async fn install_owned(
         .is_some_and(|id| id != &artifact.artifact_id)
     {
         return Err("artifact_changed");
-    }
-    if !inspection.report.install.available {
-        return Err(inspection
-            .report
-            .install
-            .reason
-            .unwrap_or("setup_unavailable"));
     }
     inspection.command.ok_or("unverified_install")?;
     let (_temporary, archive) = download_archive(artifact).await?;
@@ -732,7 +737,7 @@ async fn install_downloaded(
             && report.state == AppStateKind::Installed
             && report.version.as_deref() == Some(artifact.version.as_str())
             && report.connector_compatible == Some(true)
-            && report.signing.as_deref() == Some("local_self_signed")
+            && report.signing.as_deref() == Some("ad_hoc")
             && report.development == Some(true)
     }) {
         return Err("install_unconfirmed");

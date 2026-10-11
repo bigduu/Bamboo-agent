@@ -23,7 +23,7 @@ fn artifact() -> AppArtifact {
         url: "https://github.com/bigduu/Nova/releases/download/v0.3.1/nova-v0.3.1-universal-apple-darwin-development-app.zip".into(),
         sha256: digest(b"fixture archive"),
         signing: "ad_hoc".into(),
-        install_mode: "local_self_signed".into(),
+        install_mode: "local_ad_hoc".into(),
         development: true,
     }
 }
@@ -194,6 +194,48 @@ fn reviewed_catalog_uses_immutable_release_urls_and_valid_digests() {
     assert!(!valid_artifact(&invalid));
 }
 
+#[test]
+fn desktop_proof_matches_installer_resolution_without_accepting_path_aliases() {
+    let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+        "id":"nova","version":"0.3.1","provides":{"mcp_servers":[
+            {"id":"nova","transport":{"type":"stdio","command":"${platform_bin}","args":["mcp"]}}
+        ]}
+    }))
+    .unwrap();
+    for (os, root, alias) in [
+        (
+            "windows",
+            r"C:\Bamboo\plugins\nova",
+            r"\\?\C:\Bamboo\plugins\nova",
+        ),
+        (
+            "macos",
+            "/var/bamboo/plugins/nova",
+            "/private/var/bamboo/plugins/nova",
+        ),
+    ] {
+        let entry=InstalledPlugin {
+            id:"nova".into(),version:"0.3.1".into(),plugin_dir:PathBuf::from(root),
+            source:PluginSource::Url {url:"https://github.com/bigduu/Nova/releases/download/v0.3.1/nova-plugin-v0.3.1.tar.gz".into(),sha256:Some("a".repeat(64)),signed_by:Some("nova".into()),allow_unverified:false,allow_unsigned:false,allow_untrusted_host:false,insecure:false},
+            installed_at:Utc::now(),status:PluginInstallStatus::Installed,
+            registered:RegisteredCapabilities {mcp_server_ids:vec!["nova".into()],..Default::default()},
+        };
+        let desktop = desktop_entry(&manifest).unwrap();
+        let mut server = desktop
+            .resolve(&entry.plugin_dir, "nova", Platform::parse(os).unwrap())
+            .unwrap();
+        assert_eq!(
+            desktop_server_id(&entry, &manifest, os, &[server.clone()]).as_deref(),
+            Some("nova")
+        );
+        let foreign = desktop
+            .resolve(Path::new(alias), "nova", Platform::parse(os).unwrap())
+            .unwrap();
+        server.transport = foreign.transport;
+        assert!(desktop_server_id(&entry, &manifest, os, &[server]).is_none());
+    }
+}
+
 #[actix_web::test]
 async fn http_is_passive_and_rejects_caller_commands_paths_urls_or_flags() {
     let dir = tempfile::tempdir().unwrap();
@@ -213,6 +255,7 @@ async fn http_is_passive_and_rejects_caller_commands_paths_urls_or_flags() {
     .await;
     assert_eq!(response.status(), actix_web::http::StatusCode::OK);
     let report: serde_json::Value = http_test::read_body_json(response).await;
+    let expected_unavailable = report["install"]["reason"].clone();
     assert_eq!(report["plugin_id"], "nova");
     assert_eq!(report["connector"]["state"], "missing");
     assert!(report["app"].is_null());
@@ -243,6 +286,8 @@ async fn http_is_passive_and_rejects_caller_commands_paths_urls_or_flags() {
     )
     .await;
     assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
+    let error: serde_json::Value = http_test::read_body_json(response).await;
+    assert_eq!(error["error"]["reason"], expected_unavailable);
     assert!(!state.app_data_dir.join("plugins/installed.json").exists());
 }
 
@@ -662,7 +707,7 @@ async fn fixed_install_arguments_are_followed_by_fresh_structured_confirmation()
     let (_dir, state, mut catalog, entry) = fixture("exit 66").await;
     let marker = state.app_data_dir.join("installed-marker");
     let arguments = state.app_data_dir.join("install-arguments");
-    let installed = r#"{"success":true,"state":"installed","message":"Installed","next_action":"Open manually and grant permissions","path":"/fixture/Nova.app","version":"0.3.1","signing":"local_self_signed","development":true,"connector_compatible":true}"#;
+    let installed = r#"{"success":true,"state":"installed","message":"Installed","next_action":"Open manually and grant permissions","path":"/fixture/Nova.app","version":"0.3.1","signing":"ad_hoc","development":true,"connector_compatible":true}"#;
     let body=format!("if [ \"$2\" = install ]; then\n  printf '%s\\n' \"$@\" > {}\n  : > {}\nfi\nif [ -e {} ]; then printf '%s\\n' '{}'; else printf '%s\\n' '{}'; fi",quoted(&arguments),quoted(&marker),quoted(&marker),installed,missing());
     let binary = script(&entry.plugin_dir.join("bin/macos/nova"), &body).await;
     catalog.connectors[0]
@@ -735,7 +780,7 @@ async fn download_time_policy_and_binary_changes_are_rechecked_before_install() 
 #[cfg(unix)]
 #[actix_web::test]
 async fn install_exit_success_cannot_replace_fresh_installed_confirmation() {
-    let installed = r#"{"success":true,"state":"installed","message":"Installed","next_action":"Open manually","path":"/fixture/Nova.app","version":"0.3.1","signing":"local_self_signed","development":true,"connector_compatible":true}"#;
+    let installed = r#"{"success":true,"state":"installed","message":"Installed","next_action":"Open manually","path":"/fixture/Nova.app","version":"0.3.1","signing":"ad_hoc","development":true,"connector_compatible":true}"#;
     let body = format!(
         "if [ \"$2\" = install ]; then printf '%s\\n' '{installed}'; else printf '%s\\n' '{}'; fi",
         missing()
