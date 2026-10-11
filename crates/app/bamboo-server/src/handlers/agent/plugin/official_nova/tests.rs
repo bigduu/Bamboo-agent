@@ -80,7 +80,7 @@ async fn fixture(
         .await
         .unwrap();
     let manifest = serde_json::to_vec(&serde_json::json!({
-        "id":"nova", "version":"0.3.1", "platforms":["macos","windows"],
+        "id":"nova", "name":"Fixture Nova", "version":"0.3.1", "platforms":["macos","windows"],
         "provides":{"mcp_servers":[
             {"id":"nova", "transport":{"type":"stdio","command":"${platform_bin}","args":["mcp"]}},
             {"id":"nova-chrome-devtools", "enabled":false,
@@ -197,7 +197,7 @@ fn reviewed_catalog_uses_immutable_release_urls_and_valid_digests() {
 #[test]
 fn desktop_proof_matches_installer_resolution_without_accepting_path_aliases() {
     let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
-        "id":"nova","version":"0.3.1","provides":{"mcp_servers":[
+        "id":"nova","name":"Fixture Nova","version":"0.3.1","provides":{"mcp_servers":[
             {"id":"nova","transport":{"type":"stdio","command":"${platform_bin}","args":["mcp"]}}
         ]}
     }))

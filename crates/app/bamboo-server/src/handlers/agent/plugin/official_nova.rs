@@ -615,7 +615,14 @@ async fn save_archive(
     if response.content_length().is_some_and(|size| size > max) {
         return Err("download_too_large");
     }
-    let temporary = tempfile::tempdir().map_err(|_| "download_failed")?;
+    let mut directory = tempfile::Builder::new();
+    directory.prefix("bamboo-nova-app-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        directory.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let temporary = directory.tempdir().map_err(|_| "download_failed")?;
     let archive = temporary.path().join("nova-app.zip");
     let mut options = tokio::fs::OpenOptions::new();
     options.write(true).create_new(true);
