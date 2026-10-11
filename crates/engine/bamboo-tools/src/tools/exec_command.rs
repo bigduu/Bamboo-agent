@@ -110,10 +110,7 @@ impl PolledShellState {
             .unwrap_or(DEFAULT_OUTPUT_TOKENS)
             .clamp(1, MAX_OUTPUT_TOKENS)
             .saturating_mul(4);
-        let mut end = decoded.len().min(budget);
-        while !decoded.is_char_boundary(end) {
-            end -= 1;
-        }
+        let end = json_output_prefix_end(&decoded, budget);
         let omitted = std::mem::take(&mut output.omitted_bytes)
             .saturating_add(decoded.len().saturating_sub(end));
         let (status, exit_code) = output.completion.unwrap_or(("running", None));
@@ -126,6 +123,27 @@ impl PolledShellState {
             error: output.error.clone(),
         }
     }
+}
+
+/// Bound the serialized `output` string, including its JSON quotes and escapes.
+/// Protocol fields such as status and session_id remain outside this body budget.
+fn json_output_prefix_end(output: &str, budget: usize) -> usize {
+    let mut encoded_bytes = 2; // The surrounding JSON string quotes.
+    let mut end = 0;
+    for (offset, character) in output.char_indices() {
+        // Match serde_json's string escaping without allocating an encoded copy.
+        let character_bytes = match character {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            '\u{0}'..='\u{1f}' => 6,
+            _ => character.len_utf8(),
+        };
+        if encoded_bytes + character_bytes > budget {
+            break;
+        }
+        encoded_bytes += character_bytes;
+        end = offset + character.len_utf8();
+    }
+    end
 }
 
 /// Fixed-size reads capture prompts without a newline and keep an unterminated
@@ -261,6 +279,12 @@ struct ExecCommandArgs {
 
 fn resolve_cwd(owner: &str, workdir: Option<&str>) -> Result<PathBuf, ToolError> {
     let workspace = workspace_state::workspace_or_process_cwd(Some(owner));
+    let workspace = workspace.canonicalize().map_err(|error| {
+        ToolError::InvalidArguments(format!(
+            "Invalid session workspace '{}': {error}",
+            workspace.display()
+        ))
+    })?;
     let requested = match workdir {
         Some(value) if value.trim().is_empty() => {
             return Err(ToolError::InvalidArguments(
@@ -281,6 +305,11 @@ fn resolve_cwd(owner: &str, workdir: Option<&str>) -> Result<PathBuf, ToolError>
     if !canonical.is_dir() {
         return Err(ToolError::InvalidArguments(
             "workdir must be a directory".into(),
+        ));
+    }
+    if !canonical.starts_with(&workspace) {
+        return Err(ToolError::InvalidArguments(
+            "workdir must stay within the current session workspace".into(),
         ));
     }
     Ok(canonical)
@@ -308,9 +337,9 @@ impl Tool for ExecCommandTool {
     fn parameters_schema(&self) -> serde_json::Value {
         json!({"type":"object","properties":{
             "cmd":{"type":"string","description":"Shell command to execute"},
-            "workdir":{"type":"string","description":"Working directory, relative to the session workspace or absolute"},
+            "workdir":{"type":"string","description":"Working directory within the current session workspace, relative or absolute; paths and symlinks outside the workspace are rejected"},
             "yield_time_ms":{"type":"integer","description":"Wait before yielding a running session; default 10000, clamped to 250..30000 ms"},
-            "max_output_tokens":{"type":"integer","description":"Output budget, default 2000 and capped at 8192; estimated as four UTF-8 bytes per token"},
+            "max_output_tokens":{"type":"integer","description":"Output string budget, default 2000 and capped at 8192; estimated as four JSON-encoded bytes per token, including string quotes and escapes. Status/session/exit metadata is additional"},
             "interactive":{"type":"boolean","description":"Keep a piped stdin open for write_stdin; default false sends immediate EOF"}
         },"required":["cmd"],"additionalProperties":false})
     }

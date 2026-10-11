@@ -46,7 +46,7 @@ impl Tool for WriteStdinTool {
             "session_id":{"type":"string","description":"Running handle returned by exec_command"},
             "chars":{"type":"string","description":"Exact stdin bytes; empty or omitted waits/polls. A lone Ctrl-C stops the process"},
             "yield_time_ms":{"type":"integer","description":"Wait before yielding again; default 10000, clamped to 250..30000 ms"},
-            "max_output_tokens":{"type":"integer","description":"Output budget, default 2000, capped at 8192"},
+            "max_output_tokens":{"type":"integer","description":"Output string budget, default 2000, capped at 8192; four JSON-encoded bytes per token including quotes and escapes. Status/session/exit metadata is additional"},
             "eof":{"type":"boolean","description":"Close the stdin pipe after sending chars"}
         },"required":["session_id"],"additionalProperties":false})
     }

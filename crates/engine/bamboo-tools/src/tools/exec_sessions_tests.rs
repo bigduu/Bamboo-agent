@@ -39,11 +39,108 @@ async fn capture_and_response_limits_report_omissions_and_advance_cursor() {
     state.push(&vec![b'x'; MAX_CAPTURE_BYTES + 100]).await;
     state.finish("completed", Some(0)).await;
     let result = state.take("unused", Some(1)).await;
-    assert_eq!(result.output, "xxxx");
-    assert_eq!(result.output_omitted_bytes, MAX_CAPTURE_BYTES + 96);
+    assert_eq!(result.output, "xx");
+    assert_eq!(result.output_omitted_bytes, MAX_CAPTURE_BYTES + 98);
     let second = state.take("unused", None).await;
     assert!(second.output.is_empty());
     assert_eq!(second.output_omitted_bytes, 0);
+}
+
+#[tokio::test]
+async fn response_budget_accounts_for_json_escaping_and_utf8_without_miscounting_omissions() {
+    let text = "\0\"\\汉🙂\n\r\t\u{8}\u{c}\u{1f}/\u{7f}\u{2028}\u{2029}".repeat(40);
+    for tokens in 1..=64 {
+        let state = PolledShellState::new().unwrap();
+        state.push(text.as_bytes()).await;
+        state.finish("completed", Some(7)).await;
+        let result = state.take("unused", Some(tokens)).await;
+        let encoded = serde_json::to_string(&result.output).unwrap();
+        assert!(encoded.len() <= tokens * 4);
+        assert!(text.starts_with(&result.output));
+        assert_eq!(
+            result.output_omitted_bytes,
+            text.len() - result.output.len()
+        );
+        assert_eq!(result.exit_code, Some(7));
+        if let Some(next) = text[result.output.len()..].chars().next() {
+            let mut longer = result.output.clone();
+            longer.push(next);
+            assert!(serde_json::to_string(&longer).unwrap().len() > tokens * 4);
+        }
+    }
+}
+
+#[tokio::test]
+async fn tiny_output_budget_preserves_running_session_metadata() {
+    let state = PolledShellState::new().unwrap();
+    let text = "\0\"\\汉🙂";
+    state.push(text.as_bytes()).await;
+    let result = state.take("running-handle", Some(1)).await;
+    assert!(result.output.is_empty());
+    assert_eq!(serde_json::to_string(&result.output).unwrap().len(), 2);
+    assert_eq!(result.output_omitted_bytes, text.len());
+    let envelope = serde_json::to_value(&result).unwrap();
+    assert_eq!(envelope["session_id"], "running-handle");
+    assert_eq!(envelope["status"], "running");
+    // This cap covers the encoded output string; required protocol metadata is
+    // additional even when the requested body budget is only four bytes.
+    assert!(serde_json::to_string(&result).unwrap().len() > 4);
+}
+
+#[test]
+fn workdir_accepts_workspace_and_nested_paths_but_rejects_other_directories() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    let nested = workspace.join("nested");
+    let outside = directory.path().join("workspace-other");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let owner = format!("workdir-{}", uuid::Uuid::new_v4());
+    workspace_state::publish_resolved_workspace(&owner, workspace.clone());
+
+    assert_eq!(
+        resolve_cwd(&owner, None).unwrap(),
+        workspace.canonicalize().unwrap()
+    );
+    assert_eq!(
+        resolve_cwd(&owner, Some("nested")).unwrap(),
+        nested.canonicalize().unwrap()
+    );
+    assert_eq!(
+        resolve_cwd(&owner, Some(nested.to_str().unwrap())).unwrap(),
+        nested.canonicalize().unwrap()
+    );
+    for requested in ["../workspace-other", outside.to_str().unwrap()] {
+        assert!(matches!(
+            resolve_cwd(&owner, Some(requested)),
+            Err(ToolError::InvalidArguments(message)) if message.contains("within the current session workspace")
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn workdir_canonicalizes_workspace_and_rejects_symlink_escape() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    let nested = workspace.join("nested");
+    let outside = directory.path().join("outside");
+    let workspace_alias = directory.path().join("workspace-alias");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&workspace, &workspace_alias).unwrap();
+    std::os::unix::fs::symlink(&outside, workspace.join("escape")).unwrap();
+    let owner = format!("workdir-symlink-{}", uuid::Uuid::new_v4());
+    workspace_state::publish_resolved_workspace(&owner, workspace_alias);
+
+    assert_eq!(
+        resolve_cwd(&owner, Some("nested")).unwrap(),
+        nested.canonicalize().unwrap()
+    );
+    assert!(matches!(
+        resolve_cwd(&owner, Some("escape")),
+        Err(ToolError::InvalidArguments(message)) if message.contains("within the current session workspace")
+    ));
 }
 
 #[cfg(unix)]
@@ -117,6 +214,31 @@ mod process_tests {
         let output = result["output"].as_str().unwrap();
         assert!(output.contains("out"));
         assert!(output.contains("err"));
+    }
+
+    #[tokio::test]
+    async fn exec_command_runs_in_an_authorized_workspace_subdirectory() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let owner = format!("workdir-process-{}", uuid::Uuid::new_v4());
+        workspace_state::publish_resolved_workspace(&owner, directory.path().to_path_buf());
+        let result = payload(
+            ExecCommandTool::new()
+                .invoke(
+                    json!({"cmd":"pwd","workdir":"nested","yield_time_ms":2000}),
+                    context(&owner),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["exit_code"], 0);
+        assert_eq!(
+            result["output"].as_str().unwrap().trim(),
+            nested.canonicalize().unwrap().to_str().unwrap()
+        );
     }
 
     #[tokio::test]
