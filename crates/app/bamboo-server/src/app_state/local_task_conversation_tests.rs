@@ -761,6 +761,17 @@ async fn native_subagent_installed_root_surface_creates_inspects_and_cancels_rea
 async fn settled_native_root(state: &AppState, parent_id: &str, status: &str) -> Session {
     tokio::time::timeout(WAIT, async {
         loop {
+            if state
+                .session_activation_router
+                .current_run_id(parent_id)
+                .await
+                .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            // Each caller has observed this run's provider request. Read its
+            // durable state after owner exit, then exclude a new owner below.
             let parent = state
                 .storage
                 .load_session(parent_id)
