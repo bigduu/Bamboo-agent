@@ -321,6 +321,20 @@ async fn equal_or_nested_memory_root_blocks_setup_and_official_install_without_m
         let data_dir = dir.path().join("bamboo");
         let plugin_dir = data_dir.join("plugins/jiandu");
         let state = isolated_state(data_dir, plugin_dir.join(suffix)).await;
+        state
+            .memory_store
+            .write_session_topic("overlap-setup", "retained", "keep existing memory")
+            .await
+            .unwrap();
+        let directory_entries = || {
+            let mut entries: Vec<_> = std::fs::read_dir(&plugin_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            entries.sort();
+            entries
+        };
+        let before_entries = directory_entries();
         let mcp_before = serde_json::to_value(&state.config.read().await.mcp).unwrap();
         let app = test::init_service(
             App::new()
@@ -352,7 +366,16 @@ async fn equal_or_nested_memory_root_blocks_setup_and_official_install_without_m
         assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
         let body: serde_json::Value = test::read_body_json(response).await;
         assert_eq!(body["error"]["reason"], "memory_root_overlaps_plugin");
-        assert!(!plugin_dir.exists());
+        assert_eq!(directory_entries(), before_entries);
+        assert_eq!(
+            state
+                .memory_store
+                .read_session_topic("overlap-setup", "retained")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("keep existing memory")
+        );
         assert!(!state.app_data_dir.join("plugins/installed.json").exists());
         assert_eq!(
             serde_json::to_value(&state.config.read().await.mcp).unwrap(),

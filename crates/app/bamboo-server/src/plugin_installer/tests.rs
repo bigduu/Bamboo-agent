@@ -173,6 +173,20 @@ async fn jiandu_preflight_and_direct_install_reject_overlap_before_mutation() {
         let plugin_dir = data_dir.join("plugins/jiandu");
         let (state, installer) =
             jiandu_installer_with_root(&data_dir, plugin_dir.join(suffix)).await;
+        state
+            .memory_store
+            .write_session_topic("overlap-preflight", "retained", "keep existing memory")
+            .await
+            .unwrap();
+        let directory_entries = || {
+            let mut entries: Vec<_> = std::fs::read_dir(&plugin_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            entries.sort();
+            entries
+        };
+        let before_entries = directory_entries();
         let candidate = dir.path().join("isolated-candidate");
         tokio::fs::create_dir(&candidate).await.unwrap();
         let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
@@ -204,7 +218,16 @@ async fn jiandu_preflight_and_direct_install_reject_overlap_before_mutation() {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("memory_root_overlaps_plugin"));
-        assert!(!plugin_dir.exists());
+        assert_eq!(directory_entries(), before_entries);
+        assert_eq!(
+            state
+                .memory_store
+                .read_session_topic("overlap-preflight", "retained")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("keep existing memory")
+        );
         assert!(!data_dir.join("plugins/installed.json").exists());
         assert_eq!(
             serde_json::to_value(&*state.config.read().await).unwrap(),
