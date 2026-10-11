@@ -2600,6 +2600,7 @@ impl SessionStoreV2 {
         &self,
         source: &bamboo_domain::ActorSession,
         target: &bamboo_domain::ActorSession,
+        reply_to: Option<&SessionMessageEnvelope>,
     ) -> io::Result<PeerDeliveryGuard> {
         let denied = || other_io_error("peer Session identity or tree changed");
         if source.actor_id == target.actor_id
@@ -2691,6 +2692,22 @@ impl SessionStoreV2 {
                 return Err(denied());
             }
         }
+        if let Some(proof) = reply_to {
+            // Use a private canonical read while the source Session writer and
+            // lifecycle locks are retained. Reentering the public loader could
+            // deadlock behind a queued lifecycle writer. The same guard keeps
+            // this received proof present through the physical Inbox commit.
+            let current = self
+                .peer_delivery_session(&source.actor_id, &source.root_actor_id)
+                .await?;
+            if !current
+                .messages
+                .iter()
+                .any(|message| is_matching_session_message(message, proof))
+            {
+                return Err(other_io_error("peer reply proof changed before admission"));
+            }
+        }
         Ok(guard)
     }
 
@@ -2699,6 +2716,12 @@ impl SessionStoreV2 {
         id: &str,
         root_id: &str,
     ) -> io::Result<bamboo_domain::ActorSession> {
+        let session = self.peer_delivery_session(id, root_id).await?;
+        bamboo_domain::ActorSession::from_session(&session)
+            .map_err(|error| other_io_error(error.to_string()))
+    }
+
+    async fn peer_delivery_session(&self, id: &str, root_id: &str) -> io::Result<Session> {
         let kind = if id == root_id {
             SessionKind::Root
         } else {
@@ -2722,8 +2745,7 @@ impl SessionStoreV2 {
         {
             return Err(other_io_error("peer Session Project mirror changed"));
         }
-        bamboo_domain::ActorSession::from_session(&session)
-            .map_err(|error| other_io_error(error.to_string()))
+        Ok(session)
     }
 
     async fn lock_session_lifecycle_exclusive(&self) -> io::Result<SessionLifecycleWriteGuard> {
@@ -8653,7 +8675,7 @@ mod tests {
             .value()
             .clone();
         let owners = Arc::strong_count(&root_lock);
-        let mut peer = Box::pin(store.lock_peer_delivery(&source, &target));
+        let mut peer = Box::pin(store.lock_peer_delivery(&source, &target, None));
         tokio::time::timeout(
             Duration::from_secs(10),
             std::future::poll_fn(|cx| {

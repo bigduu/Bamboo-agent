@@ -320,7 +320,8 @@ impl SessionMessenger {
             id.to_string(),
             None,
         );
-        self.send_peer_envelope(envelope, &caller, &target).await
+        self.send_peer_envelope(envelope, &caller, &target, None)
+            .await
     }
 
     /// Reply only to a canonical received peer envelope in the caller's saved
@@ -391,9 +392,10 @@ impl SessionMessenger {
             message,
             Self::peer_message_id(&caller, &target, operation_id),
             thread,
-            Some(original.id),
+            Some(original.id.clone()),
         );
-        self.send_peer_envelope(envelope, &caller, &target).await
+        self.send_peer_envelope(envelope, &caller, &target, Some(&original))
+            .await
     }
 
     fn validate_peer_input(operation_id: &str, message: &str) -> Result<(), SessionMessengerError> {
@@ -528,6 +530,7 @@ impl SessionMessenger {
         envelope: SessionMessageEnvelope,
         caller: &Session,
         target: &Session,
+        reply_to: Option<&SessionMessageEnvelope>,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
         let started = Instant::now();
         let source = ActorSession::from_session(caller)
@@ -539,7 +542,7 @@ impl SessionMessenger {
         // relationship read before generic delivery would still race rebirth.
         let delivery = match self
             .inbox
-            .deliver_peer_message(&envelope, &source, &target)
+            .deliver_peer_message(&envelope, &source, &target, reply_to)
             .await
         {
             Ok(receipt) => receipt,
@@ -1221,13 +1224,14 @@ mod tests {
             envelope: &SessionMessageEnvelope,
             source: &ActorSession,
             target: &ActorSession,
+            reply_to: Option<&SessionMessageEnvelope>,
         ) -> Result<SessionInboxReceipt, SessionInboxError> {
             // The engine has already captured both births and built its id;
             // actual filesystem admission has not yet acquired its authority.
             self.entered.notify_one();
             self.release.notified().await;
             self.inner
-                .deliver_peer_message(envelope, source, target)
+                .deliver_peer_message(envelope, source, target, reply_to)
                 .await
         }
 
@@ -1354,6 +1358,105 @@ mod tests {
                 assert_eq!(current.delivery.generation, 1);
                 assert_eq!(activation.calls.lock().await.len(), 1);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_reply_revalidates_received_proof_after_concurrent_clear_or_save() {
+        for clear in [true, false] {
+            let (_temp, store, activation, messenger) = fixture().await;
+            seed_peer_tree(store.as_ref()).await;
+            let incoming = messenger
+                .send_peer("peer-left", "peer-right", "incoming", "question")
+                .await
+                .unwrap();
+            admit_peer_for_test(store.as_ref(), messenger.inbox().as_ref(), "peer-right").await;
+            activation.calls.lock().await.clear();
+            let before = store.load_session("peer-right").await.unwrap().unwrap();
+            let received_id = incoming.delivery.id.to_string();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let inbox = Arc::new(FileSessionInbox::new(
+                store.clone(),
+                SessionInboxLimits::default(),
+            ));
+            let paused = SessionMessenger::new(
+                store.clone(),
+                Arc::new(PausedPeerAdmission {
+                    inner: inbox.clone(),
+                    entered: entered.clone(),
+                    release: release.clone(),
+                }),
+                activation.clone(),
+            );
+            let old_id = received_id.clone();
+            let replying = tokio::spawn(async move {
+                paused
+                    .reply_peer("peer-right", &old_id, "racing-proof", "reply")
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            if clear {
+                assert!(store.clear_session("peer-right").await.unwrap());
+            } else {
+                let mut changed = before.clone();
+                changed.messages.retain(|message| message.id != received_id);
+                store.save_session(&changed).await.unwrap();
+            }
+            let after = store.load_session("peer-right").await.unwrap().unwrap();
+            assert_eq!(before.created_at, after.created_at);
+            assert_eq!(before.root_session_id, after.root_session_id);
+            assert_eq!(before.project_id_meta(), after.project_id_meta());
+            assert!(!after
+                .messages
+                .iter()
+                .any(|message| message.id == received_id));
+            release.notify_one();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), replying)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                result.is_err(),
+                "clear={clear}: removed proof must not admit a reply"
+            );
+            let backlog = inbox.inspect("peer-left").await.unwrap();
+            assert_eq!(backlog.generation, 0);
+            assert_eq!(backlog.pending, 0);
+            assert!(!backlog.activation_pending());
+            assert!(activation.calls.lock().await.is_empty());
+
+            let current = messenger
+                .send_peer("peer-left", "peer-right", "current-question", "current")
+                .await
+                .unwrap();
+            admit_peer_for_test(store.as_ref(), messenger.inbox().as_ref(), "peer-right").await;
+            let reply = messenger
+                .reply_peer(
+                    "peer-right",
+                    current.delivery.id.as_str(),
+                    "racing-proof",
+                    "reply",
+                )
+                .await
+                .unwrap();
+            let retry = messenger
+                .reply_peer(
+                    "peer-right",
+                    current.delivery.id.as_str(),
+                    "racing-proof",
+                    "reply",
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply.delivery.generation, 1);
+            assert_eq!(retry.delivery.generation, reply.delivery.generation);
+            assert_eq!(retry.delivery.id, reply.delivery.id);
+            let backlog = inbox.inspect("peer-left").await.unwrap();
+            assert_eq!(backlog.generation, 1);
+            assert_eq!(backlog.pending, 1);
         }
     }
 
