@@ -596,7 +596,14 @@ mod execution_input_http {
         assert_eq!(upgraded.merged, 0);
         assert!(upgraded.admission_error.is_none());
         reservation.abandon().await;
-        assert!(!state.agent_runners.read().await.contains_key(id));
+        {
+            let runners = state.agent_runners.read().await;
+            let retired = runners
+                .get(id)
+                .expect("exact reservation cleanup retains its terminal slot");
+            assert_eq!(retired.run_id, initial_run);
+            assert!(matches!(retired.status, AgentStatus::Cancelled));
+        }
         assert!(state
             .session_activation_router
             .current_run_id(id)
