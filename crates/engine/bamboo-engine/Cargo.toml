@@ -28,7 +28,7 @@ bamboo-broker = { path = "../../app/bamboo-broker" }
 bamboo-tools = { path = "../../engine/bamboo-tools" }
 serde = { workspace = true }
 serde_json = { version = "1", features = ["raw_value"] }
-serde_yaml = "0.9"
+serde_yaml = { package = "serde_norway", version = "=0.9.42" }
 anyhow = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full", "test-util"] }

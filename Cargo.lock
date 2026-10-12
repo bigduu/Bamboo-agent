@@ -939,7 +939,6 @@ dependencies = [
  "rust_ocr",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.11.0",
  "sysinfo",
  "tempfile",
@@ -974,7 +973,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "serde_yaml",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1065,7 +1063,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
@@ -1085,7 +1082,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "serde_yaml_ng",
+ "serde_norway",
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "tracing",
@@ -1139,7 +1136,7 @@ dependencies = [
  "rust_ocr",
  "serde",
  "serde_json",
- "serde_yaml",
+ "serde_norway",
  "sha2 0.11.0",
  "sysinfo",
  "tempfile",
@@ -1274,7 +1271,7 @@ dependencies = [
  "seahash",
  "serde",
  "serde_json",
- "serde_yaml",
+ "serde_norway",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1334,7 +1331,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.10.9",
  "sha2 0.11.0",
  "tempfile",
@@ -1492,7 +1488,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "serde_yaml_ng",
+ "serde_norway",
  "sha2 0.11.0",
  "socket2",
  "tar",
@@ -1566,7 +1562,7 @@ dependencies = [
  "notify",
  "serde",
  "serde_json",
- "serde_yaml",
+ "serde_norway",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
@@ -1685,7 +1681,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "serde_yaml",
+ "serde_norway",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
@@ -4142,15 +4138,15 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jiandu-memory"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8f3126b0c0c4fe32e5b1d74cfdd10fce37f8f070f6ace922ee46a554e154be1"
+checksum = "316d7d485d2808edf713953136b8918698c33662a04997173a9993bab229f15d"
 dependencies = [
  "chrono",
  "dashmap",
  "serde",
  "serde_json",
- "serde_yaml",
+ "serde_norway",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
@@ -6568,6 +6564,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_norway"
+version = "0.9.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e408f29489b5fd500fab51ff1484fc859bb655f32c671f307dcd733b72e8168c"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml-norway",
+]
+
+[[package]]
 name = "serde_path_to_error"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6608,32 +6617,6 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
-]
-
-[[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
-name = "serde_yaml_ng"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
 ]
 
 [[package]]
@@ -7813,10 +7796,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
+name = "unsafe-libyaml-norway"
+version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
+checksum = "b39abd59bf32521c7f2301b52d05a6a2c975b6003521cbd0c6dc1582f0a22104"
 
 [[package]]
 name = "untrusted"
