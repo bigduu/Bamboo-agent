@@ -5,9 +5,9 @@ use super::initial_user_message_for_session;
 use crate::runtime::config::{AgentLoopConfig, PromptMemoryFlags};
 use bamboo_agent_core::tools::{ToolCall, ToolError, ToolExecutor, ToolResult, ToolSchema};
 use bamboo_domain::{
-    ActorActivationFinish, ActorSession, Message, Role, RootActorExecutionBinding, Session,
-    SessionInboxLimits, SessionInboxPort, SessionMessageEnvelope, SessionMessageId,
-    SessionMessageKind, SessionMessageSource, Storage,
+    ActorActivationFinish, ActorSession, Message, Role, RootActorExecutionBinding,
+    RuntimeSessionPersistence, Session, SessionInboxLimits, SessionInboxPort,
+    SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource, Storage,
 };
 use bamboo_llm::provider::{LLMError, LLMProvider, LLMStream};
 use std::sync::{Arc, Mutex};
