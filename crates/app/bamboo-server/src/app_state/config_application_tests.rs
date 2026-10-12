@@ -362,6 +362,102 @@ fn actual_provider_and_mcp_publications_preserve_unrelated_receipts() {
 }
 
 #[test]
+fn mcp_reset_binds_committed_credentials_without_claiming_rotated_core_proxy() {
+    with_application_runtime(async {
+        for rotate_proxy in [false, true] {
+            let (dir, state) = application_state_with_core(json!({
+                "provider": "openai", "http_proxy": "http://127.0.0.1:19877",
+                "proxy_auth": {"username": "proxy-user", "password": "reset-proxy-original-sentinel"}
+            }))
+            .await;
+            let candidate = serde_json::from_value(json!({"reset-proof": {
+                "command": "true", "enabled": false,
+                "env": {"TOKEN": "reset-mcp-secret-sentinel"}
+            }}))
+            .unwrap();
+            state
+                .update_legacy_mcp_config(BTreeSet::new(), move |mcp| {
+                    *mcp = candidate;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let before = application_report(&state).await;
+            assert_eq!(consumer(&before, "mcp-runtime")["state"], "in_sync");
+            assert!(!state.config.read().await.mcp.servers.is_empty());
+
+            let store = bamboo_config::CredentialStore::open(dir.path());
+            if rotate_proxy {
+                let reference = state
+                    .config
+                    .read()
+                    .await
+                    .proxy_auth_credential_ref
+                    .clone()
+                    .unwrap();
+                store
+                    .replace(
+                        reference,
+                        &json!({"username": "proxy-user", "password": "reset-proxy-rotated-sentinel"})
+                            .to_string(),
+                        bamboo_config::CredentialSource::User,
+                        store.revision().unwrap(),
+                    )
+                    .unwrap();
+            }
+
+            let revision = state
+                .reset_mcp_section(application_section(&state, SectionId::Mcp).revision)
+                .await
+                .unwrap();
+            assert!(state.config.read().await.mcp.servers.is_empty());
+            assert!(state.mcp_manager.list_servers().is_empty());
+            assert!(state.mcp_manager.tool_index().all_aliases().is_empty());
+            assert_eq!(
+                state
+                    .config
+                    .read()
+                    .await
+                    .proxy_auth
+                    .as_ref()
+                    .unwrap()
+                    .password,
+                "reset-proxy-original-sentinel"
+            );
+            let reset = application_report(&state).await;
+            let mcp = consumer(&reset, "mcp-runtime");
+            assert_eq!(mcp["applied_dependencies"]["mcp"], revision);
+            assert_eq!(mcp["last_apply_error"], Value::Null);
+            if rotate_proxy {
+                assert_eq!(mcp["state"], "unknown");
+                assert_eq!(mcp["credential_source"]["status"], "unknown");
+                assert_eq!(mcp["applied_dependencies"]["credentials"], Value::Null);
+            } else {
+                assert_eq!(mcp["state"], "in_sync");
+                assert_eq!(mcp["credential_source"]["status"], "observed_inputs");
+                assert_eq!(
+                    mcp["credential_source"]["revision"],
+                    store.revision().unwrap()
+                );
+                assert_eq!(
+                    mcp["applied_dependencies"]["credentials"],
+                    reset["sections"]["credentials"]["revision"]
+                );
+            }
+            let repeated = application_report(&state).await;
+            assert_eq!(consumer(&repeated, "mcp-runtime"), mcp);
+            for secret in [
+                "reset-proxy-original-sentinel",
+                "reset-proxy-rotated-sentinel",
+                "reset-mcp-secret-sentinel",
+            ] {
+                assert!(!serde_json::to_string(&repeated).unwrap().contains(secret));
+            }
+        }
+    });
+}
+
+#[test]
 fn actual_typed_provider_failure_keeps_receipt_and_repair_converges() {
     with_application_runtime(async {
         let (_dir, state) = application_state().await;

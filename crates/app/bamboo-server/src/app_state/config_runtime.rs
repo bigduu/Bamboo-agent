@@ -4195,6 +4195,7 @@ impl AppState {
                     Ok(commit) => {
                         match install_credential_section_commit(commit, &mut candidate_config, &config_application, SectionId::Mcp) {
                             Ok(installed) => {
+                                inputs.bind_committed_credentials(&candidate_config, installed.metadata.credential_health.revision, Some(facade.as_ref()));
                                 inputs.set_revision(SectionId::Mcp, installed.section.as_ref().expect("MCP reset section").revision);
                                 *live_config = candidate_config.clone();
                                 commit_events = installed.events;
