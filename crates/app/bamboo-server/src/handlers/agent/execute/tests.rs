@@ -546,7 +546,12 @@ mod execution_input_http {
         // SkillManager. Keep the original 15-second completion deadline.
         state
             .skill_manager
-            .store_for_workspace(session.workspace_path_meta().map(std::path::Path::new))
+            .store_for_workspace(
+                session
+                    .workspace_path_meta()
+                    .as_deref()
+                    .map(std::path::Path::new),
+            )
             .await
             .unwrap();
         assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
