@@ -43,11 +43,16 @@ impl LocalChildTools {
         for denied in denied {
             // Resolve against all exact identities before applying restrictions:
             // an unavailable exact foreign::Read must never fall through to Read.
-            if let Some(name) = bamboo_domain::resolve_tool_reference_name(&denied, |name| {
-                name == "SubAgent" || inner.owns_exact_tool(name)
-            }) {
+            if let Some(name) =
+                bamboo_domain::resolve_disabled_tool_reference_name(&denied, |name| {
+                    name == "SubAgent" || inner.owns_exact_tool(name)
+                })
+            {
                 subagent_denied |= name == "SubAgent";
                 allowed.remove(&name);
+                if let Some(replacement) = bamboo_domain::legacy_shell_replacement(&name) {
+                    allowed.remove(replacement);
+                }
             }
         }
         let read_only = session
@@ -305,6 +310,7 @@ mod tests {
 
     #[derive(Default)]
     struct Base {
+        names: Option<&'static [&'static str]>,
         executions: AtomicUsize,
         gates: AtomicUsize,
         deny: AtomicBool,
@@ -312,7 +318,17 @@ mod tests {
         stall: AtomicBool,
         entered: tokio::sync::Notify,
     }
-    const NAMES: &[&str] = &["Read", "Write", "Bash", "Task", "foreign::Read"];
+    const NAMES: &[&str] = &[
+        "Read",
+        "Write",
+        "Bash",
+        "BashOutput",
+        "exec_command",
+        "write_stdin",
+        "Task",
+        "foreign::Read",
+        "foreign::Bash",
+    ];
     #[async_trait]
     impl ToolExecutor for Base {
         async fn execute(&self, _: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -344,7 +360,8 @@ mod tests {
             }
         }
         fn list_tools(&self) -> Vec<ToolSchema> {
-            NAMES
+            self.names
+                .unwrap_or(NAMES)
                 .iter()
                 .map(|name| {
                     serde_json::from_value(json!({"type":"function", "function": {
@@ -354,7 +371,10 @@ mod tests {
                 .collect()
         }
         fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
-            NAMES.contains(&name).then_some(self as &dyn ToolExecutor)
+            self.names
+                .unwrap_or(NAMES)
+                .contains(&name)
+                .then_some(self as &dyn ToolExecutor)
         }
     }
     fn completed() -> ToolOutcome {
@@ -507,6 +527,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_shell_disabled_names_also_constrain_new_child_tools() {
+        let f = Fixture::new().await;
+        let tools = f.tools(&f.child, NAMES, &["Bash".into(), "BashOutput".into()]);
+        assert!(!tools.owns_exact_tool("exec_command"));
+        assert!(!tools.owns_exact_tool("write_stdin"));
+        let tools = f.tools(&f.child, NAMES, &["foreign::Bash".into()]);
+        assert!(tools.owns_exact_tool("exec_command"));
+        assert!(tools.owns_exact_tool("write_stdin"));
+    }
+
+    #[tokio::test]
+    async fn exact_legacy_denials_constrain_a_canonical_only_child_ceiling() {
+        const PAIR_ONLY: &[&str] = &["exec_command", "write_stdin", "vendor::Bash"];
+        let mut f = Fixture::new().await;
+        f.base = Arc::new(Base {
+            names: Some(PAIR_ONLY),
+            ..Default::default()
+        });
+        for (denied, exec_allowed, stdin_allowed, foreign_allowed) in [
+            ("Bash", false, true, true),
+            ("bash", false, true, true),
+            ("bAsH", false, true, true),
+            ("execute_command", false, true, true),
+            ("BashInput", true, false, true),
+            ("bashinput", true, false, true),
+            ("BashOutput", true, false, true),
+            ("bashoutput", true, false, true),
+            ("KillShell", true, false, true),
+            ("killshell", true, false, true),
+            ("vendor::Bash", true, true, false),
+            ("default::Bash", true, true, true),
+            ("unregistered::Bash", true, true, true),
+        ] {
+            let tools = f.tools(&f.child, PAIR_ONLY, &[denied.to_owned()]);
+            assert_eq!(
+                tools.owns_exact_tool("exec_command"),
+                exec_allowed,
+                "{denied}"
+            );
+            assert_eq!(
+                tools.owns_exact_tool("write_stdin"),
+                stdin_allowed,
+                "{denied}"
+            );
+            assert_eq!(
+                tools.owns_exact_tool("vendor::Bash"),
+                foreign_allowed,
+                "{denied}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn readonly_child_denies_direct_side_effect_calls_in_auto_and_bypass() {
         let f = Fixture::new().await;
         let mut child = f.child.clone();
@@ -519,6 +592,8 @@ mod tests {
             for name in [
                 "Write",
                 "Bash",
+                "exec_command",
+                "write_stdin",
                 "Task",
                 "foreign::Read",
                 "SubAgent",

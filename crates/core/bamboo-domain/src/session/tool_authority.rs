@@ -304,6 +304,8 @@ mod tests {
             assert!(root.allows_model_tool_execution(tool), "{tool}");
         }
         for tool in [
+            "exec_command",
+            "write_stdin",
             "Bash",
             "Edit",
             "Write",

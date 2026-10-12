@@ -26,6 +26,10 @@ pub const PROVISION_VERSION: u32 = 2;
 pub const TYPED_READ_ONLY_WORKER_CAPABILITY: &str = "typed_read_only_tool_policy_v1";
 pub const REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY: &str = "required_child_context_v1";
 pub const NATIVE_TOOL_CEILING_WORKER_CAPABILITY: &str = "native_tool_ceiling_v1";
+/// Additive acknowledgement for exec_command/write_stdin in a native ceiling.
+/// Keep the original capability for workers that only understand legacy names.
+pub const EXEC_SESSION_NATIVE_CEILING_WORKER_CAPABILITY: &str =
+    "native_tool_ceiling_exec_sessions_v1";
 pub const INITIAL_INPUT_RELEASE_WORKER_CAPABILITY: &str = "owned_initial_input_release_v1";
 pub const CHILD_CREATION_IDENTITY_WORKER_CAPABILITY: &str = "durable_child_creation_identity_v1";
 
@@ -49,6 +53,7 @@ impl WorkerCapabilityReport {
                 REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY.to_string(),
                 CHILD_CREATION_IDENTITY_WORKER_CAPABILITY.to_string(),
                 NATIVE_TOOL_CEILING_WORKER_CAPABILITY.to_string(),
+                EXEC_SESSION_NATIVE_CEILING_WORKER_CAPABILITY.to_string(),
             ],
         }
     }
@@ -689,6 +694,17 @@ impl ProvisionSpec {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn current_worker_acknowledges_legacy_and_exec_session_native_ceilings() {
+        let current = WorkerCapabilityReport::current();
+        assert!(current.supports("native_tool_ceiling_v1"));
+        assert!(current.supports("native_tool_ceiling_exec_sessions_v1"));
+        assert_eq!(current.provision_version, PROVISION_VERSION);
+        let restored: WorkerCapabilityReport =
+            serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+        assert_eq!(restored, current);
+    }
+
     use super::*;
 
     fn spec() -> ProvisionSpec {
