@@ -96,12 +96,14 @@ Both stdout and stderr use the native executor's 64 KiB capture limit.
 
 Only tool events accept nontrivial matchers. Omitted, empty or `*` matchers
 match everything. Other patterns must compile using Rust `regex`; lookaround
-(including lookbehind) and backreferences are rejected. Matching uses the real
-Bamboo tool name, without Claude tool aliases. JSON stdin includes
+(including lookbehind) and backreferences are rejected. Groups first match the
+selected Bamboo executor identity. Exact terminal tools also support the bounded
+legacy shell projections described below. JSON stdin includes
 `session_id`, nullable `transcript_path`, `cwd`, `hook_event_name` and
 `permission_mode: "default"` (conservative portable policy; no permission
 delegation). Event fields include `prompt`, or `tool_name`, `tool_use_id`,
-original executor `tool_input` and post-execution `tool_response`, or
+executor `tool_input` (or the documented shell projection) and post-execution
+`tool_response`, or
 `stop_hook_active` and `last_assistant_message`. Tool response is Bamboo's
 model-facing result text. No synthetic Claude `Edit` input is produced for
 `apply_patch` or other tools.
@@ -136,14 +138,47 @@ rewrites, persistent permission updates, env-file, executable handler objects,
 are rejected instead of silently discarded. Raw stderr and context may contain
 plugin-provided text; treat them as untrusted data.
 
-Portable tool matchers and stdin `tool_name` use the exact executor identity selected
-by Bamboo's callable-set resolver. Provider aliases and namespace prefixes cannot
-bypass a canonical matcher. This is the actual registered host identity, not a
-compatibility rename: an exact registered `apply_patch` stays `apply_patch`.
-Arguments remain the values supplied to that executor; Bamboo does not reshape
-patch input into Claude Edit input. Native hooks/events/transcripts retain their
-original provider spelling. PostToolUse carries the selected identity and parsed
-input from execution rather than re-resolving against a later catalog.
+### Terminal matcher compatibility
+
+Portable tool groups first match the exact executor identity selected by Bamboo's
+callable-set resolver. A group matching that identity, including an omitted,
+empty or `*` matcher, executes once with the actual name and arguments. Provider
+aliases resolve before this check; an exact custom registration such as
+`vendor::exec_command` is not treated as the builtin shell tool.
+
+If a group does not match the actual name, exact builtin `exec_command` and
+`write_stdin` calls also check these legacy shell projections for both PreToolUse
+and PostToolUse:
+
+| Actual operation | Projected `tool_name` | Projected `tool_input` |
+| --- | --- | --- |
+| `exec_command` | `Bash` | Rename `cmd` to `command`; retain other arguments except the transport fields below |
+| `write_stdin` with nonempty `chars` or `eof: true` | `BashInput` | Rename `session_id` to `bash_id`, rename `chars` to `input`, and set `append_newline: false`; retain true `eof` |
+| `write_stdin` with exactly the lone Ctrl-C character (`\u0003`) | `KillShell` | Rename `session_id` to `bash_id`; omit `chars` and `eof` (Ctrl-C takes precedence over EOF) |
+| `write_stdin` with empty/omitted `chars` and no true `eof` | `BashOutput` | Rename `session_id` to `bash_id`; omit `chars` and `eof` |
+
+Every projection removes `yield_time_ms` and `max_output_tokens`. Missing
+`chars` becomes empty input for an EOF projection; false `eof` is omitted.
+An input/EOF or Ctrl-C continuation additionally has a `BashOutput` projection
+containing only `bash_id`, since it also reads output. A legacy-only group runs
+once for each matching projection, in primary-operation then output order. Thus
+`^(BashInput|BashOutput)$` can execute its commands twice for one input call;
+a group already matching `write_stdin` executes once instead.
+
+These projected names and arguments are confined to Hook matching and Hook
+stdin. Execution, tool results, events and stored transcripts keep their actual
+identities and data. PostToolUse uses the identity and parsed input captured for
+execution; its `tool_response` remains the actual result, including terminal
+session JSON. Other tools retain their executor arguments; `apply_patch` is not
+reshaped into Claude Edit input.
+
+Every projected command still requires the exact reviewed bundle and trust
+receipt, rechecked under the existing plugin-operation lock before each spawn.
+All applicable portable denials remain sticky, including output-side denial of
+a combined continuation after a native Ask. Portable `allow` never grants
+permission, and portable `ask` remains unsupported. Reviewers of legacy shell
+matchers must therefore review their commands for these terminal operations and
+projected inputs as well as explicit calls to the legacy tools.
 
 Persistent hook data uses the reserved `.hook-data` namespace, which cannot be
 accepted as a plugin id. A valid plugin named `data` remains independent of that

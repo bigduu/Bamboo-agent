@@ -32,12 +32,12 @@ impl Tool for ProtectedTool {
         "Exercise strict Supervisor management after the real permission gate"
     }
     fn parameters_schema(&self) -> Value {
-        json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})
+        json!({"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]})
     }
     async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
         assert!(!ctx.bypass_permissions && !ctx.auto_approve_permissions && !ctx.plan_read_only);
         let mut gates = Vec::new();
-        if self.name == "execute_command" {
+        if self.name == "default::exec_command" {
             gates.push((PermissionType::ExecuteCommand, "current-command"));
         }
         if self.second_context {
@@ -106,7 +106,7 @@ impl Tool for ProtectedTool {
 }
 
 fn protected_agent(fixture: &Fixture) -> Agent {
-    protected_agent_with(fixture, alias_config(), &["Bash"], false, None)
+    protected_agent_with(fixture, alias_config(), &["exec_command"], false, None)
 }
 
 fn protected_agent_with(
@@ -137,7 +137,7 @@ fn protected_agent_with(
 }
 
 async fn protected_pending() -> (Fixture, Session, bamboo_domain::SupervisorReference) {
-    protected_pending_with(&["Bash"]).await
+    protected_pending_with(&["exec_command"]).await
 }
 
 async fn setup_supervisor(fixture: &Fixture) -> bamboo_domain::SupervisorReference {
@@ -284,7 +284,7 @@ async fn supervisor_replay_rejects_corrupted_native_bindings_before_protected_wr
             }
             "record_owner" => {
                 approved.messages[index].metadata.as_mut().unwrap()[AUTHORITY]["execution_name"] =
-                    json!("execute_command")
+                    json!("default::exec_command")
             }
             "record_generation" => {
                 approved.messages[index].metadata.as_mut().unwrap()[AUTHORITY]
@@ -456,9 +456,11 @@ async fn supervisor_shared_validation_rejects_an_old_same_id_occurrence_without_
     let mut newer = Message::tool_result(CALL, "new waiting occurrence");
     newer.metadata = Some(json!({"permission_request":{"request_generation":"new-generation"}}));
     session.add_message(newer);
-    assert!(validate_permission_replay_authority(&session, &old, "Bash").is_err());
+    assert!(validate_permission_replay_authority(&session, &old, "exec_command").is_err());
     let config = alias_config();
-    assert!(restore_permission_replay_authorization(&config, &session, &old, "Bash").is_err());
+    assert!(
+        restore_permission_replay_authorization(&config, &session, &old, "exec_command").is_err()
+    );
     assert!(!config.consume_once_for_generation(
         &session.id,
         CALL,
@@ -476,7 +478,7 @@ async fn supervisor_exact_custom_owner_and_builtin_alias_remain_distinct() {
         protected_agent_with(
             &fixture,
             alias_config(),
-            &["Bash", "execute_command"],
+            &["exec_command", "default::exec_command"],
             false,
             None,
         )
@@ -493,15 +495,18 @@ async fn supervisor_exact_custom_owner_and_builtin_alias_remain_distinct() {
         1
     );
 
-    let (fixture, pending, original) =
-        Box::pin(protected_pending_with(&["Bash", "execute_command"])).await;
-    assert_eq!(current_request(&pending).tool_name, "execute_command");
+    let (fixture, pending, original) = Box::pin(protected_pending_with(&[
+        "exec_command",
+        "default::exec_command",
+    ]))
+    .await;
+    assert_eq!(current_request(&pending).tool_name, "default::exec_command");
     let approved = fixture.approve(&current_request(&pending)).await;
     events(
         protected_agent_with(
             &fixture,
             alias_config(),
-            &["Bash", "execute_command"],
+            &["exec_command", "default::exec_command"],
             false,
             None,
         )
@@ -551,7 +556,7 @@ async fn supervisor_recreated_after_restoration_is_rejected_at_the_final_writer(
     let stream = protected_agent_with(
         &fixture,
         alias_config(),
-        &["Bash"],
+        &["exec_command"],
         false,
         Some((entered_tx, release.clone())),
     )

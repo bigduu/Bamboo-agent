@@ -80,7 +80,7 @@ async fn run_stage(home: &Path, stage: u32) {
             .decision_receipt(id, CALL, &request.request_generation)
             .is_none());
     }
-    let agent = protected_agent_with(&fixture, config, &["Bash"], true, None);
+    let agent = protected_agent_with(&fixture, config, &["exec_command"], true, None);
     match stage {
         1 => {
             *fixture.probe.next_call.lock().unwrap() = Some(alias_call());

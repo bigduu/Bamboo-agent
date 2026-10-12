@@ -578,6 +578,115 @@ async fn streamable_http_transport_respects_proxy_settings_when_available() {
 }
 
 #[tokio::test]
+async fn candidate_proxy_failure_precedes_commit_and_preserves_live_network_config() {
+    let live = Arc::new(tokio::sync::RwLock::new(Config::default()));
+    let manager = McpServerManager::new_with_config(live.clone());
+    let mut candidate = Config::default();
+    candidate.http_proxy = "http://".to_string();
+    let mut server = test_config("candidate-http");
+    server.transport = TransportConfig::StreamableHttp(StreamableHttpConfig {
+        url: "http://localhost:9999/mcp".to_string(),
+        headers: Vec::new(),
+        connect_timeout_ms: 100,
+    });
+    let config = McpConfig {
+        version: 1,
+        servers: vec![server],
+    };
+    let committed = AtomicBool::new(false);
+    let error = manager
+        .reconcile_with_runtime_config_after(&config, &candidate, || async {
+            committed.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, McpError::InvalidConfig(_)));
+    assert!(!committed.load(Ordering::SeqCst));
+    assert!(live.read().await.http_proxy.is_empty());
+    assert!(manager.authority.generation().servers.is_empty());
+}
+
+#[tokio::test]
+async fn candidate_proxy_snapshot_replaces_http_runtime_before_live_config_changes() {
+    use rmcp::model::{ListToolsResult, ServerCapabilities, ServerConfig};
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    };
+
+    #[derive(Clone)]
+    struct Fixture;
+    impl rmcp::ServerHandler for Fixture {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> std::result::Result<ListToolsResult, rmcp::ErrorData> {
+            Ok(ListToolsResult::with_all_items(Vec::new()))
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = StreamableHttpService::new(
+        || Ok(Fixture),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default().with_json_response(true),
+    );
+    let task = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new().nest_service("/mcp", service))
+            .await
+            .unwrap();
+    });
+    let live = Arc::new(tokio::sync::RwLock::new(Config::default()));
+    let manager = McpServerManager::new_with_config(live.clone());
+    let mut server = test_config("candidate-http");
+    server.transport = TransportConfig::StreamableHttp(StreamableHttpConfig {
+        url: format!("http://{address}/mcp"),
+        headers: Vec::new(),
+        connect_timeout_ms: 1_000,
+    });
+    let config = McpConfig {
+        version: 1,
+        servers: vec![server],
+    };
+    manager
+        .reconcile_from_config_transactional(&config)
+        .await
+        .unwrap();
+    let before = manager.authority.generation();
+    let mut candidate = live.read().await.clone();
+    candidate.http_proxy = "http://127.0.0.1:12345".to_string();
+    manager
+        .reconcile_with_runtime_config_after(&config, &candidate, || async {
+            assert!(live.read().await.http_proxy.is_empty());
+            assert!(Arc::ptr_eq(&before, &manager.authority.generation()));
+            *live.write().await = candidate.clone();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let after = manager.authority.generation();
+    assert!(!Arc::ptr_eq(
+        &before.servers["candidate-http"],
+        &after.servers["candidate-http"]
+    ));
+    assert_eq!(
+        after.servers["candidate-http"]
+            .runtime
+            .runtime
+            .proxy_fingerprint,
+        proxy_fingerprint(&candidate)
+    );
+    manager.stop_server("candidate-http").await.unwrap();
+    task.abort();
+}
+
+#[tokio::test]
 async fn qos_circuit_opens_after_consecutive_failures() {
     let qos = McpServerQos::new(McpQosConfig {
         max_concurrent_calls: 2,

@@ -790,9 +790,10 @@ fn copy_checked_request(
 ///
 /// This is intentional: a run sees a stable configuration, so its behavior can't
 /// shift underneath it mid-execution. The deliberate exceptions are the
-/// late-bound, per-request trait objects that resolve LIVE each time they're
+/// late-bound handles that resolve LIVE each time they're
 /// used rather than being snapshotted — `auxiliary_model_resolver` (auxiliary
-/// model selection) and `guardian_spawner` (the reviewer child). If a frozen
+/// model selection), `model_limits_section` (validated model limits), and
+/// `guardian_spawner` (the reviewer child). If a frozen
 /// field ever needs to become live-per-round, follow that resolver pattern
 /// rather than widening the snapshot.
 #[non_exhaustive]
@@ -914,10 +915,15 @@ pub struct AgentLoopConfig {
     pub(crate) disabled_tools: BTreeSet<String>,
     /// Token budget for context management (optional, defaults to model's limits)
     pub(crate) token_budget: Option<TokenBudget>,
+    /// Host-owned model-limit section. The handle stays stable for the run;
+    /// each budget resolution reads its immutable last-known-good snapshot.
+    /// Standalone runtimes without this handle retain instance-local file loading.
+    pub(crate) model_limits_section:
+        Option<Arc<bamboo_config::LiveSection<bamboo_config::ModelLimitsSection>>>,
     /// Legacy `config.json` `model_limits` value, snapshotted from the live
     /// in-memory Config when this loop config is built. Consulted per model when
-    /// the instance-local `model_limits.json` has no matching entry or cannot be
-    /// loaded, so the engine never does a fresh disk-reading `Config::new()`
+    /// the host section or standalone `model_limits.json` has no matching entry
+    /// or cannot be loaded, so the engine never does a disk-reading `Config::new()`
     /// (which would also clobber the global env-var cache). #38.
     pub(crate) legacy_model_limits: Option<serde_json::Value>,
     /// Optional image fallback behavior applied to *LLM requests only* (never persisted).
@@ -1062,6 +1068,7 @@ impl Default for AgentLoopConfig {
             memory_store: bamboo_memory::memory_store::MemoryStore::with_defaults(),
             disabled_tools: BTreeSet::new(),
             token_budget: None,
+            model_limits_section: None,
             legacy_model_limits: None,
             image_fallback: None,
             prompt_memory_flags: PromptMemoryFlags::default(),

@@ -45,9 +45,12 @@ fn parse_warning_log_details<'a>(
     warning: &'a str,
 ) -> (String, &'a str) {
     let canonical = canonical_tool_name(execution_name);
-    if canonical.eq_ignore_ascii_case("browser") || canonical.eq_ignore_ascii_case("browser_eval") {
+    if ["browser", "browser_eval", "session_message"]
+        .iter()
+        .any(|name| canonical.eq_ignore_ascii_case(name))
+    {
         // A repaired JSON warning embeds its own preview, so both strings
-        // must be hidden when browser input may contain focused typed text.
+        // must be hidden for private browser input or peer message text.
         ("[redacted]".to_string(), "[redacted]")
     } else {
         (preview_for_log(args_raw, 180), warning)
@@ -72,6 +75,11 @@ fn approval_tool_name_for_display(tool_name: &str) -> String {
 }
 
 fn approval_parameters_for_display(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
+    if canonical_tool_name(tool_name).eq_ignore_ascii_case("session_message") {
+        // Peer text and routing identifiers must not enter approval display
+        // events. Classification has already validated the exact action.
+        return serde_json::json!({"action": args.get("action")});
+    }
     if canonical_tool_name(tool_name).eq_ignore_ascii_case("browser_eval") {
         return serde_json::json!({
             "code":"[redacted]",
@@ -334,7 +342,9 @@ impl BuiltinToolExecutor {
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, ExecCommandTool::new()) {
             framework_tools.insert(name, tool);
         }
-        let _ = registry.register(WriteStdinTool::new());
+        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, WriteStdinTool::new()) {
+            framework_tools.insert(name, tool);
+        }
         let _ = registry.register(BashInputTool::new());
         let _ = registry.register(BashOutputTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, EditTool::new()) {
@@ -386,9 +396,22 @@ impl BuiltinToolExecutor {
             .is_some_and(|builtin| Arc::ptr_eq(builtin, tool))
     }
 
+    // Kept in sync with the startup wire's NativeToolCeiling::NAMES. This crate
+    // intentionally does not depend on the sub-agent transport crate.
+    const NATIVE_TOOL_NAMES: [&'static str; 8] = [
+        "Bash",
+        "Edit",
+        "Glob",
+        "Read",
+        "Task",
+        "Write",
+        "exec_command",
+        "write_stdin",
+    ];
+
     /// Observe the registered Arc, not a same-name custom replacement.
     pub fn eligible_native_tool(&self, name: &str) -> bool {
-        matches!(name, "Bash" | "Edit" | "Glob" | "Read" | "Task" | "Write")
+        Self::NATIVE_TOOL_NAMES.contains(&name)
             && self.registry.get(name).is_some_and(|tool| {
                 self.is_framework_builtin_instance(name, &tool)
                     && self
@@ -402,7 +425,7 @@ impl BuiltinToolExecutor {
     pub fn with_native_tool_ceiling(mut self, names: Vec<String>) -> Result<Self, ToolError> {
         let set: BTreeSet<_> = names.iter().cloned().collect();
         if set.len() != names.len()
-            || names.len() > 6
+            || names.len() > Self::NATIVE_TOOL_NAMES.len()
             || names.iter().any(|name| !self.eligible_native_tool(name))
         {
             return Err(ToolError::Execution("native_tool_ceiling_invalid".into()));
@@ -738,7 +761,12 @@ impl ToolExecutor for BuiltinToolExecutor {
                     .to_string(),
             ));
         }
-        if ctx.plan_read_only && !crate::orchestrator::plan_mode_allows_tool(&tool_name) {
+        if ctx.plan_read_only
+            && (!crate::orchestrator::plan_mode_allows_tool(&tool_name)
+                || (tool_name == "session_message"
+                    && args.get("action").and_then(serde_json::Value::as_str)
+                        != Some("list_targets")))
+        {
             return Err(ToolError::Execution(format!(
                 "Plan mode: {tool_name} operation blocked"
             )));
@@ -1275,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_browser_arguments_redact_both_log_previews() {
+    fn malformed_private_arguments_redact_both_log_previews() {
         for (tool_name, raw) in [
             (
                 "browser",
@@ -1287,6 +1315,14 @@ mod tests {
             ),
             ("browser_eval", r#"{"code":"private page source"#),
             ("default::browser_eval", r#"{"code":"private page source"#),
+            (
+                "session_message",
+                r#"{"action":"send","message":"private peer text"#,
+            ),
+            (
+                "default::session_message",
+                r#"{"action":"send","message":"private peer text"#,
+            ),
         ] {
             let (_, warning) = parse_tool_args_best_effort(raw);
             let warning = warning.expect("malformed JSON must have a warning");
@@ -1299,6 +1335,24 @@ mod tests {
             assert!(ordinary_preview.contains("private"));
             assert_eq!(ordinary_warning, warning);
         }
+    }
+
+    #[test]
+    fn peer_approval_event_hides_message_and_routing_without_changing_execution_args() {
+        let args = json!({
+            "action":"send", "target_session_id":"private-target",
+            "operation_id":"private-operation", "message":"private-message",
+            "reply_to":"private-received-id", "extra":{"secret":"private-extra"},
+        });
+        let original = args.clone();
+        for name in ["session_message", "default::session_message"] {
+            assert_eq!(
+                approval_parameters_for_display(name, &args),
+                json!({"action":"send"})
+            );
+        }
+        assert_eq!(args, original);
+        assert_eq!(approval_parameters_for_display("Write", &args), args);
     }
 
     #[test]
@@ -5153,6 +5207,53 @@ mod tests {
             .is_err());
     }
 
+    #[test]
+    fn native_ceiling_admits_original_polled_shells_and_never_expands_frozen_grants() {
+        let executor = BuiltinToolExecutor::new()
+            .with_native_tool_ceiling(
+                BuiltinToolExecutor::NATIVE_TOOL_NAMES
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            )
+            .unwrap();
+        for name in ["Bash", "exec_command", "write_stdin"] {
+            assert!(executor.eligible_native_tool(name));
+            assert!(executor.owns_exact_tool(name));
+        }
+        for name in [
+            "default::exec_command",
+            "Exec_Command",
+            "BashInput",
+            "BashOutput",
+            "KillShell",
+        ] {
+            assert!(!executor.eligible_native_tool(name));
+        }
+        let narrowed = executor
+            .with_native_tool_ceiling(vec!["Bash".into()])
+            .unwrap();
+        assert!(narrowed.owns_exact_tool("Bash"));
+        assert!(!narrowed.owns_exact_tool("exec_command"));
+        assert!(!narrowed.owns_exact_tool("write_stdin"));
+        assert!(narrowed
+            .with_native_tool_ceiling(vec!["exec_command".into()])
+            .is_err());
+        for name in ["exec_command", "write_stdin"] {
+            let registry = ToolRegistry::new();
+            registry
+                .register(ExactRoutingTool {
+                    name,
+                    label: "spoofed native shell",
+                    args_sensitive: false,
+                })
+                .unwrap();
+            assert!(BuiltinToolExecutor::with_registry(registry)
+                .with_native_tool_ceiling(vec![name.into()])
+                .is_err());
+        }
+    }
+
     #[tokio::test]
     async fn task_only_native_ceiling_has_no_filesystem_or_shell_surface() {
         let executor = BuiltinToolExecutor::new()
@@ -5171,7 +5272,15 @@ mod tests {
             json!({"tasks":[{"content":"Own step","status":"pending"}]}),
         );
         assert!(executor.execute(&call).await.unwrap().success);
-        for name in ["Bash", "Read", "Write", "Edit", "SubAgent"] {
+        for name in [
+            "Bash",
+            "exec_command",
+            "write_stdin",
+            "Read",
+            "Write",
+            "Edit",
+            "SubAgent",
+        ] {
             assert!(executor
                 .execute(&make_tool_call(name, json!({})))
                 .await

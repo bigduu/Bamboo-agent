@@ -59,6 +59,8 @@ pub struct AgentRuntime {
     pub project_context_resolver: Option<Arc<crate::project_context::ProjectContextResolver>>,
     pub metrics_collector: MetricsCollector,
     pub config: Arc<RwLock<Config>>,
+    pub(crate) model_limits_section:
+        Option<Arc<bamboo_config::LiveSection<bamboo_config::ModelLimitsSection>>>,
     /// Live process-wide permission policy when the embedding exposes one.
     pub permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     /// SDK/static fallback used when there is no live policy handle.
@@ -105,6 +107,8 @@ pub struct AgentRuntimeBuilder {
     project_context_resolver: Option<Arc<crate::project_context::ProjectContextResolver>>,
     metrics_collector: Option<MetricsCollector>,
     config: Option<Arc<RwLock<Config>>>,
+    model_limits_section:
+        Option<Arc<bamboo_config::LiveSection<bamboo_config::ModelLimitsSection>>>,
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     permission_mode: PermissionMode,
     provider: Option<Arc<dyn LLMProvider>>,
@@ -126,6 +130,7 @@ impl AgentRuntimeBuilder {
             project_context_resolver: None,
             metrics_collector: None,
             config: None,
+            model_limits_section: None,
             permission_config: None,
             permission_mode: PermissionMode::Default,
             provider: None,
@@ -188,6 +193,17 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Use a host's validated model-limit snapshots for every agent round.
+    /// The host owns reloads and section health; budget resolution performs no
+    /// file I/O when this handle is installed.
+    pub fn model_limits_section(
+        mut self,
+        section: Arc<bamboo_config::LiveSection<bamboo_config::ModelLimitsSection>>,
+    ) -> Self {
+        self.model_limits_section = Some(section);
+        self
+    }
+
     pub fn permission_config(mut self, v: Arc<bamboo_tools::permission::PermissionConfig>) -> Self {
         self.permission_config = Some(v);
         self
@@ -244,6 +260,7 @@ impl AgentRuntimeBuilder {
                 .metrics_collector
                 .ok_or_else(|| format_missing("metrics_collector"))?,
             config: self.config.ok_or_else(|| format_missing("config"))?,
+            model_limits_section: self.model_limits_section,
             permission_config: self.permission_config,
             permission_mode: self.permission_mode,
             provider: self.provider.ok_or_else(|| format_missing("provider"))?,
@@ -869,6 +886,7 @@ impl AgentRuntime {
             // Snapshot the legacy model_limits from the live in-memory config so
             // resolve_token_budget never falls back to a disk-reading Config::new(). #38.
             legacy_model_limits: config.extra.get("model_limits").cloned(),
+            model_limits_section: self.model_limits_section.clone(),
             disabled_skill_ids: disabled_skill_ids.unwrap_or_else(|| config.disabled_skill_ids()),
             selected_skill_ids,
             selected_skill_mode,

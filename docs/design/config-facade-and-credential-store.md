@@ -45,6 +45,14 @@ and already extracted sidecars remain readable. Existing `memory.json`,
 wire shape stays unchanged until the manifest migration switches them to the
 revisioned envelope.
 
+After this one-way activation, saves of the built-in memory, subagent, and
+provider legacy modules (including registry calls), and `Config::save_memory_to_dir`,
+`save_subagents_to_dir`, and `save_providers_to_dir` reject writes. Use the revisioned section APIs instead.
+The authority check and physical sidecar write share the layout migration lock,
+so a waiting legacy writer cannot overwrite a newly activated section. Incomplete
+or corrupt modular authority evidence also rejects legacy writes; it never
+reopens the old persistence path.
+
 ## Snapshot lifecycle and precedence
 
 Precedence is defaults, migrated legacy values, section file, environment, then
@@ -69,6 +77,24 @@ retry across the debounce window before applying each section's missing-file
 policy. Provider, MCP, environment, notification and cluster side effects run
 after snapshot publication; adapters must construct a replacement runtime first
 and keep the old runtime if construction fails, marking the section degraded.
+
+Core proxy URL/authentication and ModelPolicy keyword masking are dependencies
+of constructed provider clients. Typed writes and watched external generations
+compare effective values with the current process generation, stage replacement
+providers only when those dependencies change, and stage HTTP MCP transports for
+proxy changes against the same immutable network snapshot. Unrelated Core/model
+mapping edits do not rebuild clients. An installation without a configured default
+provider remains configurable; an existing usable provider must not disappear
+silently during a dependent reload.
+
+Typed dependency writes stage before their existing section CAS, so a failed
+replacement leaves both durable data and the effective runtime unchanged. Once
+dispatched, an owned transaction holds the configuration IO lock through commit,
+Config/provider/MCP publication and the confirmed section event even if the caller
+is cancelled. An external edit is already durable: if staging fails, the source
+section reports degraded while the process keeps its previous effective section
+and usable clients. Successful publication updates only the source section and
+its dependent clients; other section revisions remain independent.
 
 ## Atomicity, CAS and recovery
 

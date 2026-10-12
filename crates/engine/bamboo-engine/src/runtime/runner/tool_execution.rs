@@ -169,6 +169,8 @@ async fn execute_and_apply_single_tool_call(
     let executing_supervisor =
         ExecutingSupervisorObservation::capture_from_executing_session(session);
     let root_orchestration_only = session.root_orchestration_only_enabled();
+    let admitted_execution_name =
+        effective_callable_set.resolve_callable_reference(&tool_call.function.name);
     // Plan mode gate: block mutating tools (except pause/clarification tools)
     if session_flags.plan_read_only {
         let tool_name = tool_call.function.name.trim();
@@ -189,7 +191,11 @@ async fn execute_and_apply_single_tool_call(
                 result: Err(format!("Plan mode: {} operation blocked", tool_name)),
                 tool_duration: std::time::Duration::ZERO,
             };
-            policy_guard.observe_outcome(tool_call, &outcome.result);
+            policy_guard.observe_execution_outcome(
+                tool_call,
+                &outcome,
+                admitted_execution_name.as_deref(),
+            );
             let task_hint = build_task_compression_hint(task_context);
             let outcome = output_compressor::maybe_compress(
                 &tool_call.function.name,
@@ -231,7 +237,11 @@ async fn execute_and_apply_single_tool_call(
     }
 
     let mut stop_round = false;
-    let outcome = match policy_guard.check_before_execution(tool_call, reserved_calls) {
+    let outcome = match policy_guard.check_before_execution_for_name(
+        tool_call,
+        reserved_calls,
+        admitted_execution_name.as_deref(),
+    ) {
         Ok(()) => {
             per_call::execute_model_requested_tool_call_only(
                 effective_callable_set,
@@ -309,7 +319,7 @@ async fn execute_and_apply_single_tool_call(
     .await;
     // The output budget may turn an otherwise successful browser download
     // into a bounded failure. Count the result the model actually receives.
-    policy_guard.observe_outcome(tool_call, &outcome.result);
+    policy_guard.observe_execution_outcome(tool_call, &outcome, admitted_execution_name.as_deref());
 
     let should_break = per_call::apply_tool_execution_outcome(
         per_call::ToolExecutionApplyContext {
@@ -544,10 +554,17 @@ pub(crate) async fn execute_round_tool_calls(
 
             let batch = &tool_calls[batch_start..next_index];
 
-            let policy_precheck_error = batch
-                .iter()
-                .enumerate()
-                .find_map(|(offset, call)| policy_guard.check_before_execution(call, offset).err());
+            let policy_precheck_error = batch.iter().enumerate().find_map(|(offset, call)| {
+                policy_guard
+                    .check_before_execution_for_name(
+                        call,
+                        offset,
+                        effective_callable_set
+                            .resolve_callable_reference(&call.function.name)
+                            .as_deref(),
+                    )
+                    .err()
+            });
 
             if policy_precheck_error.is_some() {
                 for batch_call in batch {
@@ -820,7 +837,13 @@ pub(crate) async fn execute_round_tool_calls(
                 .await;
 
             for (batch_call, outcome) in batch.iter().zip(compressed) {
-                policy_guard.observe_outcome(batch_call, &outcome.result);
+                policy_guard.observe_execution_outcome(
+                    batch_call,
+                    &outcome,
+                    effective_callable_set
+                        .resolve_callable_reference(&batch_call.function.name)
+                        .as_deref(),
+                );
 
                 let should_break = per_call::apply_tool_execution_outcome(
                     per_call::ToolExecutionApplyContext {
@@ -947,6 +970,190 @@ mod tests {
 
     fn builtin_tools() -> Arc<dyn ToolExecutor> {
         Arc::new(BuiltinToolExecutor::new())
+    }
+
+    #[derive(Default)]
+    struct ShellPolicyExecutor(Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for ShellPolicyExecutor {
+        async fn execute(
+            &self,
+            call: &ToolCall,
+        ) -> Result<ToolResult, bamboo_agent_core::ToolError> {
+            self.0.lock().unwrap().push(call.function.name.clone());
+            let args: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap();
+            let case = args["test_case"].as_str().unwrap();
+            if case == "transport_error" {
+                return Err(bamboo_agent_core::ToolError::Execution(
+                    "test failure".into(),
+                ));
+            }
+            let (status, exit_code) = match case {
+                "ok" => ("completed", Some(0)),
+                "failed" => ("completed", Some(7)),
+                "running" => ("running", None),
+                "error" => ("error", None),
+                "killed" => ("killed", None),
+                _ => unreachable!(),
+            };
+            Ok(ToolResult::text(
+                true,
+                json!({"status":status, "exit_code":exit_code, "output":""}).to_string(),
+            ))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            [
+                "exec_command",
+                "write_stdin",
+                "vendor::exec_command",
+                "vendor::write_stdin",
+            ]
+            .into_iter()
+            .map(|name| ToolSchema {
+                schema_type: "function".into(),
+                function: FunctionSchema {
+                    name: name.into(),
+                    description: "shell policy test".into(),
+                    parameters: json!({"type":"object"}),
+                },
+            })
+            .collect()
+        }
+    }
+
+    async fn run_shell_policy_cases(cases: &[(&str, &str)]) -> (Session, Vec<String>) {
+        let mut session = Session::new("shell-policy", "model");
+        let executor = Arc::new(ShellPolicyExecutor::default());
+        let tools: Arc<dyn ToolExecutor> = executor.clone();
+        let schemas = tools.list_tools();
+        let callable = legacy_effective_callable_set(&schemas);
+        let config = crate::runtime::config::AgentLoopConfig::default();
+        let (event_tx, _event_rx) = mpsc::channel(256);
+        let mut runtime = AgentRuntimeState::new("shell-policy");
+        let mut state = super::loop_state::RoundExecutionState::default();
+        let mut policy = super::ToolPolicyGuard::new(80, 3);
+        for (index, (name, case)) in cases.iter().enumerate() {
+            let mut call = tool_call_with_args(name, json!({"test_case":case}));
+            call.id = format!("shell-policy-{index}");
+            super::execute_and_apply_single_tool_call(
+                true,
+                &call,
+                &event_tx,
+                None,
+                "shell-policy",
+                "round",
+                0,
+                &mut session,
+                &tools,
+                &config,
+                &callable,
+                &schemas,
+                &mut runtime,
+                &mut None,
+                &mut state,
+                &mut policy,
+                0,
+            )
+            .await
+            .unwrap();
+        }
+        let entered = executor.0.lock().unwrap().clone();
+        (session, entered)
+    }
+
+    #[tokio::test]
+    async fn shell_terminal_failures_open_the_existing_round_circuit_across_aliases() {
+        for name in ["exec_command", "write_stdin"] {
+            let alias = format!("default::{name}");
+            for failed in ["failed", "error", "killed"] {
+                let (session, entered) = run_shell_policy_cases(&[
+                    (name, failed),
+                    (&alias, failed),
+                    (name, failed),
+                    (&alias, "ok"),
+                ])
+                .await;
+                assert_eq!(entered, [name, name, name]);
+                let results: Vec<_> = session
+                    .messages
+                    .iter()
+                    .filter(|message| message.tool_call_id.is_some())
+                    .collect();
+                assert!(results[..3]
+                    .iter()
+                    .all(|result| result.tool_success == Some(true)));
+                assert_eq!(results[3].tool_success, Some(false));
+                assert!(results[3].content.contains("circuit limit (3)"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn running_shell_results_preserve_failures_and_exit_zero_resets_them() {
+        for name in ["exec_command", "write_stdin"] {
+            let (session, entered) = run_shell_policy_cases(&[
+                (name, "failed"),
+                (name, "running"),
+                (name, "failed"),
+                (name, "running"),
+                (name, "failed"),
+                (name, "ok"),
+            ])
+            .await;
+            assert_eq!(entered.len(), 5);
+            assert!(session
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("circuit limit (3)"));
+            let (session, entered) = run_shell_policy_cases(&[
+                (name, "failed"),
+                (name, "failed"),
+                (name, "ok"),
+                (name, "failed"),
+                (name, "failed"),
+                (name, "ok"),
+            ])
+            .await;
+            assert_eq!(entered.len(), 6);
+            assert_eq!(session.messages.last().unwrap().tool_success, Some(true));
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_foreign_shell_names_keep_boolean_outcomes_and_separate_circuits() {
+        for name in ["exec_command", "write_stdin"] {
+            let foreign = format!("vendor::{name}");
+            let (session, entered) = run_shell_policy_cases(&[
+                (name, "failed"),
+                (name, "failed"),
+                (&foreign, "failed"),
+                (name, "failed"),
+                (name, "ok"),
+            ])
+            .await;
+            assert_eq!(entered, [name, name, &foreign, name]);
+            assert!(session
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("circuit limit (3)"));
+            let (session, entered) = run_shell_policy_cases(&[
+                (&foreign, "transport_error"),
+                (&foreign, "transport_error"),
+                (&foreign, "failed"),
+                (&foreign, "transport_error"),
+                (&foreign, "transport_error"),
+                (&foreign, "failed"),
+            ])
+            .await;
+            assert_eq!(entered.len(), 6);
+            assert_eq!(session.messages.last().unwrap().tool_success, Some(true));
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -1137,7 +1344,7 @@ mod tests {
         fn list_tools(&self) -> Vec<ToolSchema> {
             [
                 "Read",
-                "Bash",
+                "exec_command",
                 "prepare",
                 "mutation",
                 "parallel_a",
@@ -1431,7 +1638,7 @@ mod tests {
         ));
         let calls = [
             named_call("read-first", "Read"),
-            named_call("bash-stale", "Bash"),
+            named_call("exec-stale", "exec_command"),
         ];
 
         let (result, running, _, events) =
@@ -1441,12 +1648,12 @@ mod tests {
         assert!(running.root_orchestration_only_enabled());
         assert_eq!(running.root_tool_authority_revision, 1);
         assert!(executor.entered("Read"));
-        assert!(!executor.entered("Bash"));
+        assert!(!executor.entered("exec_command"));
         assert!(events.iter().all(|event| {
-            !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "bash-stale")
+            !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "exec-stale")
         }));
         assert!(running.messages.iter().any(|message| {
-            message.tool_call_id.as_deref() == Some("bash-stale")
+            message.tool_call_id.as_deref() == Some("exec-stale")
                 && message
                     .content
                     .contains("outside orchestration-only Root authority")

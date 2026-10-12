@@ -160,21 +160,36 @@ impl HookRunner {
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
         inputs: bamboo_hooks::portable::PortableInputs<'_>,
     ) -> HookRunOutcome {
-        let report = local_resources::run(self.dispatcher.run_hooks(point, payload, session)).await;
+        let report = local_resources::run(self.dispatcher.run_hooks_with_resolved_shell(
+            point,
+            payload,
+            session,
+            inputs.resolved_tool_name,
+            inputs.original_tool_input,
+        ))
+        .await;
         let mut outcome = record_dispatch_report(report, runtime_state, event_tx).await;
         if let Some(root) = &self.plugin_root {
+            let mut portable_payload = payload.clone();
+            if let Some(name) = inputs.resolved_tool_name {
+                match &mut portable_payload {
+                    HookPayload::ToolExecution { tool_name, .. }
+                    | HookPayload::ToolResult { tool_name, .. } => *tool_name = name.to_owned(),
+                    _ => {}
+                }
+            }
+            let pending_composite_ask = matches!(outcome.decision, HookResult::Ask)
+                && bamboo_hooks::requires_complete_shell_policy_checks(
+                    point,
+                    &portable_payload,
+                    session,
+                    inputs.original_tool_input,
+                );
             if matches!(
                 outcome.decision,
                 HookResult::Continue | HookResult::Allow | HookResult::Mutated
-            ) {
-                let mut portable_payload = payload.clone();
-                if let Some(name) = inputs.resolved_tool_name {
-                    match &mut portable_payload {
-                        HookPayload::ToolExecution { tool_name, .. }
-                        | HookPayload::ToolResult { tool_name, .. } => *tool_name = name.to_owned(),
-                        _ => {}
-                    }
-                }
+            ) || pending_composite_ask
+            {
                 let plugin = local_resources::run(bamboo_hooks::portable::run_with_inputs(
                     root,
                     point,
@@ -193,7 +208,15 @@ impl HookRunner {
                         duration_ms: 0,
                     });
                 }
-                if !matches!(plugin.decision, HookResult::Continue) {
+                if !matches!(plugin.decision, HookResult::Continue)
+                    && (!pending_composite_ask
+                        || matches!(
+                            plugin.decision,
+                            HookResult::Deny { .. }
+                                | HookResult::Abort { .. }
+                                | HookResult::Suspend { .. }
+                        ))
+                {
                     outcome.decision = plugin.decision;
                 }
                 outcome.plugin_contexts = plugin.contexts;
@@ -485,6 +508,165 @@ impl Default for HookRunner {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn combined_shell_ask_checks_trusted_portable_output_policy() {
+        use bamboo_plugin::{
+            InstalledPlugin, InstalledPlugins, PluginInstallStatus, PluginManifest, PluginSource,
+            RegisteredCapabilities,
+        };
+        use serde_json::json;
+        for decision in ["deny", "continue", "allow"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("plugins");
+            let bundle = root.join("combined-ask");
+            std::fs::create_dir_all(&bundle).unwrap();
+            let manifest: PluginManifest = serde_json::from_value(json!({
+                "id":"combined-ask", "name":"Combined Ask", "version":"0.1.0",
+                "provides":{"hooks":[{"config":"hooks.json", "scripts":["policy.sh"]}]}
+            }))
+            .unwrap();
+            std::fs::write(
+                bundle.join("plugin.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(bundle.join("policy.sh"), "# reviewed fixture").unwrap();
+            let response = if decision == "continue" {
+                String::new()
+            } else {
+                json!({"hookSpecificOutput":{"hookEventName":"PreToolUse", "permissionDecision":decision, "permissionDecisionReason":"portable output denied"}}).to_string()
+            };
+            let command = format!("touch \"$PLUGIN_DATA/seen\"; printf '%s' '{}'", response);
+            std::fs::write(bundle.join("hooks.json"), serde_json::to_vec(&json!({"hooks":{"PreToolUse":[{
+                "matcher":"^BashOutput$", "hooks":[{"type":"command", "command":command, "timeout":1}]
+            }]}})).unwrap()).unwrap();
+            let mut hooks = bamboo_plugin::hooks::registrations(&manifest, &bundle).unwrap();
+            let digest = hooks[0].digest.clone();
+            hooks[0].confirm_review(&digest).unwrap();
+            InstalledPlugins {
+                plugins: vec![InstalledPlugin {
+                    id: manifest.id,
+                    version: manifest.version,
+                    source: PluginSource::LocalDir {
+                        path: bundle.clone(),
+                    },
+                    plugin_dir: bundle,
+                    installed_at: Utc::now(),
+                    status: PluginInstallStatus::Installed,
+                    registered: RegisteredCapabilities {
+                        hooks,
+                        ..Default::default()
+                    },
+                }],
+            }
+            .save(&root.join("installed.json"))
+            .await
+            .unwrap();
+            let marker = root.join(".hook-data/combined-ask/seen");
+            for name in ["write_stdin", "default::write_stdin"] {
+                for (primary, args) in [
+                    ("BashInput", json!({"session_id":"exec", "chars":"yes"})),
+                    ("BashInput", json!({"session_id":"exec", "eof":true})),
+                    ("KillShell", json!({"session_id":"exec", "chars":"\u{3}"})),
+                ] {
+                    let _ = std::fs::remove_file(&marker);
+                    let mut runner = HookRunner::new().with_lifecycle_config(
+                        &bamboo_config::LifecycleHooksConfig::default(),
+                        Some(temp.path().to_owned()),
+                    );
+                    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    runner.register(Arc::new(ToolNameHook {
+                        point: AgentHookPoint::BeforeToolExecution,
+                        name: primary.into(),
+                        seen: seen.clone(),
+                        result: HookResult::Ask,
+                    }));
+                    let outcome = runner
+                        .run_hooks_with_inputs(
+                            AgentHookPoint::BeforeToolExecution,
+                            &HookPayload::ToolExecution {
+                                tool_name: name.into(),
+                                tool_call_id: "combined-ask".into(),
+                                parsed_args: args.clone(),
+                            },
+                            &test_session(),
+                            &mut AgentRuntimeState::new("combined-ask"),
+                            None,
+                            bamboo_hooks::portable::PortableInputs {
+                                resolved_tool_name: Some("write_stdin"),
+                                original_tool_input: Some(&args),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    let expected = if decision == "deny" {
+                        HookResult::Deny {
+                            reason: "portable output denied".into(),
+                        }
+                    } else {
+                        HookResult::Ask
+                    };
+                    assert_eq!(outcome.decision, expected, "{decision}, {name}: {args}");
+                    assert_eq!(seen.lock().unwrap().len(), 1);
+                    assert!(
+                        marker.exists(),
+                        "trusted portable output handler must run after native Ask"
+                    );
+                }
+            }
+            // Legacy and pure-poll calls retain the native Ask short circuit.
+            for (name, args, resolved) in [
+                ("BashOutput", json!({"bash_id":"legacy"}), None),
+                (
+                    "write_stdin",
+                    json!({"session_id":"exec", "chars":""}),
+                    Some("write_stdin"),
+                ),
+                (
+                    "default::write_stdin",
+                    json!({"session_id":"exec", "eof":false}),
+                    Some("write_stdin"),
+                ),
+            ] {
+                let _ = std::fs::remove_file(&marker);
+                let mut runner = HookRunner::new().with_lifecycle_config(
+                    &bamboo_config::LifecycleHooksConfig::default(),
+                    Some(temp.path().to_owned()),
+                );
+                runner.register(Arc::new(ToolNameHook {
+                    point: AgentHookPoint::BeforeToolExecution,
+                    name: "BashOutput".into(),
+                    seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+                    result: HookResult::Ask,
+                }));
+                let outcome = runner
+                    .run_hooks_with_inputs(
+                        AgentHookPoint::BeforeToolExecution,
+                        &HookPayload::ToolExecution {
+                            tool_name: name.into(),
+                            tool_call_id: "legacy-ask".into(),
+                            parsed_args: args.clone(),
+                        },
+                        &test_session(),
+                        &mut AgentRuntimeState::new("legacy-ask"),
+                        None,
+                        bamboo_hooks::portable::PortableInputs {
+                            resolved_tool_name: resolved,
+                            original_tool_input: Some(&args),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                assert_eq!(outcome.decision, HookResult::Ask);
+                assert!(
+                    !marker.exists(),
+                    "ordinary legacy Ask must skip portable execution"
+                );
+            }
+        }
+    }
     use super::*;
 
     /// A no-op hook that always returns Continue.
@@ -545,6 +727,257 @@ mod tests {
 
     fn test_session() -> Session {
         Session::new("test", "test-model")
+    }
+
+    struct ToolNameHook {
+        point: AgentHookPoint,
+        name: String,
+        seen: Arc<std::sync::Mutex<Vec<HookPayload>>>,
+        result: HookResult,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentHook for ToolNameHook {
+        fn point(&self) -> AgentHookPoint {
+            self.point
+        }
+
+        fn matches(&self, payload: &HookPayload) -> bool {
+            match payload {
+                HookPayload::ToolExecution { tool_name, .. }
+                | HookPayload::ToolResult { tool_name, .. } => tool_name == &self.name,
+                _ => false,
+            }
+        }
+
+        async fn run(
+            &self,
+            _point: AgentHookPoint,
+            payload: &HookPayload,
+            _session: &Session,
+        ) -> HookResult {
+            self.seen.lock().unwrap().push(payload.clone());
+            self.result.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_builtin_aliases_keep_native_legacy_shell_policy() {
+        use bamboo_agent_core::{FunctionCall, ToolCall};
+        use serde_json::json;
+
+        for (alias, resolved, legacy, input) in [
+            (
+                "default::exec_command",
+                "exec_command",
+                "Bash",
+                json!({"cmd":"cargo test"}),
+            ),
+            (
+                "default::write_stdin",
+                "write_stdin",
+                "BashInput",
+                json!({"session_id":"exec", "chars":"yes\n"}),
+            ),
+        ] {
+            let mut session = test_session();
+            session.messages.push(Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: "alias-call".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: alias.into(),
+                        arguments: input.to_string(),
+                    },
+                }]),
+            ));
+            for (point, payload) in [
+                (
+                    AgentHookPoint::BeforeToolExecution,
+                    HookPayload::ToolExecution {
+                        tool_name: alias.into(),
+                        tool_call_id: "alias-call".into(),
+                        parsed_args: input.clone(),
+                    },
+                ),
+                (
+                    AgentHookPoint::AfterToolExecution,
+                    HookPayload::ToolResult {
+                        tool_name: alias.into(),
+                        tool_call_id: "alias-call".into(),
+                        outcome: bamboo_domain::HookToolOutcome {
+                            success: true,
+                            result: Some("done".into()),
+                            error: None,
+                            needs_human: false,
+                            duration_ms: 1,
+                        },
+                    },
+                ),
+            ] {
+                let mut runner = HookRunner::new();
+                let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let deny = HookResult::Deny {
+                    reason: "legacy shell policy".into(),
+                };
+                runner.register(Arc::new(ToolNameHook {
+                    point,
+                    name: legacy.into(),
+                    seen: seen.clone(),
+                    result: deny.clone(),
+                }));
+                let outcome = runner
+                    .run_hooks_with_inputs(
+                        point,
+                        &payload,
+                        &session,
+                        &mut AgentRuntimeState::new("alias-run"),
+                        None,
+                        bamboo_hooks::portable::PortableInputs {
+                            resolved_tool_name: Some(resolved),
+                            original_tool_input: Some(&input),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                assert_eq!(outcome.decision, deny);
+                let seen = seen.lock().unwrap();
+                assert_eq!(seen.len(), 1);
+                match &seen[0] {
+                    HookPayload::ToolExecution {
+                        tool_name,
+                        parsed_args,
+                        ..
+                    } => {
+                        assert_eq!(tool_name, legacy);
+                        if resolved == "exec_command" {
+                            assert_eq!(parsed_args, &json!({"command":"cargo test"}));
+                        } else {
+                            assert_eq!(parsed_args["bash_id"], "exec");
+                            assert_eq!(parsed_args["input"], "yes\n");
+                        }
+                    }
+                    HookPayload::ToolResult { tool_name, .. } => assert_eq!(tool_name, legacy),
+                    _ => panic!("expected tool hook payload"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_non_shell_aliases_preserve_native_matchers_and_payloads() {
+        for alias in ["read_file", "default::Read"] {
+            for (point, payload) in [
+                (
+                    AgentHookPoint::BeforeToolExecution,
+                    HookPayload::ToolExecution {
+                        tool_name: alias.into(),
+                        tool_call_id: "read-alias".into(),
+                        parsed_args: serde_json::json!({"path":"input.txt"}),
+                    },
+                ),
+                (
+                    AgentHookPoint::AfterToolExecution,
+                    HookPayload::ToolResult {
+                        tool_name: alias.into(),
+                        tool_call_id: "read-alias".into(),
+                        outcome: bamboo_domain::HookToolOutcome {
+                            success: true,
+                            result: Some("file contents".into()),
+                            error: None,
+                            needs_human: false,
+                            duration_ms: 1,
+                        },
+                    },
+                ),
+            ] {
+                let mut runner = HookRunner::new();
+                let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+                runner.register(Arc::new(ToolNameHook {
+                    point,
+                    name: "Read".into(),
+                    seen: seen.clone(),
+                    result: HookResult::Deny {
+                        reason: "must not newly match the resolved name".into(),
+                    },
+                }));
+                let expected = HookResult::Deny {
+                    reason: "original alias policy".into(),
+                };
+                runner.register(Arc::new(ToolNameHook {
+                    point,
+                    name: alias.into(),
+                    seen: seen.clone(),
+                    result: expected.clone(),
+                }));
+                let outcome = runner
+                    .run_hooks_with_inputs(
+                        point,
+                        &payload,
+                        &test_session(),
+                        &mut AgentRuntimeState::new("read-alias-run"),
+                        None,
+                        bamboo_hooks::portable::PortableInputs {
+                            resolved_tool_name: Some("Read"),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                assert_eq!(outcome.decision, expected);
+                assert_eq!(*seen.lock().unwrap(), vec![payload]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_and_unresolved_tool_names_do_not_inherit_native_shell_policy() {
+        for (name, resolved) in [
+            ("vendor::exec_command", Some("vendor::exec_command")),
+            ("vendor::write_stdin", Some("vendor::write_stdin")),
+            ("default::exec_command", None),
+            ("default::write_stdin", None),
+        ] {
+            let point = AgentHookPoint::BeforeToolExecution;
+            let mut runner = HookRunner::new();
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            for legacy in ["Bash", "BashInput"] {
+                runner.register(Arc::new(ToolNameHook {
+                    point,
+                    name: legacy.into(),
+                    seen: seen.clone(),
+                    result: HookResult::Deny {
+                        reason: "must not govern a foreign tool".into(),
+                    },
+                }));
+            }
+            runner.register(Arc::new(ToolNameHook {
+                point,
+                name: name.into(),
+                seen: seen.clone(),
+                result: HookResult::Continue,
+            }));
+            let payload = HookPayload::ToolExecution {
+                tool_name: name.into(),
+                tool_call_id: "foreign-call".into(),
+                parsed_args: serde_json::json!({"cmd":"cargo test", "session_id":"exec", "chars":"yes"}),
+            };
+            let outcome = runner
+                .run_hooks_with_inputs(
+                    point,
+                    &payload,
+                    &test_session(),
+                    &mut AgentRuntimeState::new("foreign-run"),
+                    None,
+                    bamboo_hooks::portable::PortableInputs {
+                        resolved_tool_name: resolved,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(outcome.decision, HookResult::Continue);
+            assert_eq!(*seen.lock().unwrap(), vec![payload]);
+        }
     }
 
     #[tokio::test]

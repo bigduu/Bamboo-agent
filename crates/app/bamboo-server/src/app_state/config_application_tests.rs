@@ -1,0 +1,533 @@
+use super::*;
+
+fn consumer<'a>(report: &'a Value, id: &str) -> &'a Value {
+    report["consumers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|consumer| consumer["id"] == id)
+        .unwrap()
+}
+
+fn assert_uncaptured_consumers_remain_unknown(report: &Value) {
+    for consumer in report["consumers"].as_array().unwrap() {
+        if consumer["id"] != "provider-runtime" {
+            assert_eq!(consumer["state"], "unknown");
+            assert_eq!(consumer["applied_dependencies"], Value::Null);
+        }
+    }
+}
+
+#[test]
+fn user_named_provider_instances_remain_runtime_inputs() {
+    let mut config = Config::default();
+    config.provider_instances = serde_json::from_value(
+        json!({"team-encrypted": {"provider_type":"openai", "api_key":"old-key"}}),
+    )
+    .unwrap();
+    let before_provider = input_digest(ConfigConsumer::ProviderRuntime, &config);
+    config
+        .provider_instances
+        .get_mut("team-encrypted")
+        .unwrap()
+        .api_key = "new-key".into();
+    assert!(before_provider != input_digest(ConfigConsumer::ProviderRuntime, &config));
+}
+
+#[test]
+fn legacy_and_uncaptured_consumers_do_not_claim_application() {
+    let config = Config::default();
+    let state = ConfigApplicationState::default();
+    let report =
+        serde_json::to_value(state.diagnostics(None, &config, &config, &BTreeSet::new())).unwrap();
+    for status in report["consumers"].as_array().unwrap() {
+        assert_eq!(status["state"], "unknown");
+        assert_eq!(status["applied_dependencies"], Value::Null);
+    }
+}
+
+#[test]
+fn object_order_does_not_change_private_input_comparison() {
+    let left = json!({"b": [1, 2], "a": {"x": true, "y": "text"}});
+    let right: Value = serde_json::from_str(r#"{"a":{"y":"text","x":true},"b":[1,2]}"#).unwrap();
+    let mut left_hash = Sha256::new();
+    let mut right_hash = Sha256::new();
+    hash_value(&mut left_hash, &left);
+    hash_value(&mut right_hash, &right);
+    assert_eq!(left_hash.finalize(), right_hash.finalize());
+}
+
+thread_local! {
+    static APPLICATION_THREAD_KEY: std::cell::RefCell<Option<bamboo_config::encryption::TestKeyGuard>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// Exact transactions decrypt in spawn_blocking. Give this test's owned pool
+// the same synthetic thread-local key as its async driver, without touching
+// process environment or the user's encryption key.
+fn with_application_runtime(test: impl std::future::Future<Output = ()>) {
+    let _key = bamboo_config::encryption::set_test_encryption_key([0x71; 32]);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .on_thread_start(|| {
+            APPLICATION_THREAD_KEY.with(|key| {
+                *key.borrow_mut() = Some(bamboo_config::encryption::set_test_encryption_key(
+                    [0x71; 32],
+                ));
+            });
+        })
+        .on_thread_stop(|| {
+            APPLICATION_THREAD_KEY.with(|key| {
+                key.borrow_mut().take();
+            });
+        })
+        .build()
+        .unwrap()
+        .block_on(test);
+}
+
+async fn application_state() -> (tempfile::TempDir, AppState) {
+    application_state_with_core(json!({"provider":"openai"})).await
+}
+
+async fn application_state_with_core(document: Value) -> (tempfile::TempDir, AppState) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.json"),
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("providers.json"), serde_json::to_vec(&json!({"openai": {
+        "api_key_encrypted": bamboo_config::encryption::encrypt("application-secret-sentinel").unwrap(),
+        "base_url": "http://127.0.0.1:9876/v1", "model": "old-model"
+    }})).unwrap()).unwrap();
+    let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+    state.stop_config_watcher_for_test();
+    (dir, state)
+}
+
+fn application_section(state: &AppState, id: SectionId) -> bamboo_config::SectionEnvelope<Value> {
+    state
+        .config_facade
+        .as_ref()
+        .unwrap()
+        .registry()
+        .envelope_value(id)
+        .unwrap()
+}
+
+async fn application_report(state: &AppState) -> Value {
+    let _io = state.config_io_lock.lock().await;
+    serde_json::to_value(state.config_application_diagnostics_locked().await).unwrap()
+}
+
+#[test]
+fn environment_backed_inputs_remain_available_without_hiding_other_missing_credentials() {
+    with_application_runtime(async {
+        let _provider =
+            bamboo_config::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
+        let _openai = bamboo_config::test_support::override_runtime_env_var(
+            "BAMBOO_OPENAI_API_KEY",
+            Some("application-environment-secret-sentinel"),
+        );
+        let _anthropic =
+            bamboo_config::test_support::override_runtime_env_var("BAMBOO_ANTHROPIC_API_KEY", None);
+        let _gemini =
+            bamboo_config::test_support::override_runtime_env_var("BAMBOO_GEMINI_API_KEY", None);
+
+        for stored_proxy in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut document = json!({
+                "provider": "openai",
+                "default_provider_instance": "env-backed",
+                "provider_instances": {"env-backed": {
+                    "provider_type": "openai",
+                    "base_url": "http://127.0.0.1:9876/v1",
+                    "credential_ref": "provider.missing.env-fallback",
+                    "api_key_from_env": true
+                }}
+            });
+            if stored_proxy {
+                let reference =
+                    bamboo_config::CredentialRef::parse("proxy.application.auth").unwrap();
+                bamboo_config::CredentialStore::open(dir.path())
+                    .replace(
+                        reference.clone(),
+                        &serde_json::to_string(&bamboo_config::ProxyAuth {
+                            username: "application-proxy-user".into(),
+                            password: "application-proxy-secret-sentinel".into(),
+                        })
+                        .unwrap(),
+                        bamboo_config::CredentialSource::User,
+                        0,
+                    )
+                    .unwrap();
+                document["http_proxy"] = json!("http://127.0.0.1:19877");
+                document["proxy_auth_credential_ref"] = json!(reference);
+            }
+            std::fs::write(
+                dir.path().join("config.json"),
+                serde_json::to_vec(&document).unwrap(),
+            )
+            .unwrap();
+            let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+            state.stop_config_watcher_for_test();
+            let report = application_report(&state).await;
+            let provider = consumer(&report, "provider-runtime");
+            assert_eq!(provider["state"], "in_sync");
+            assert_eq!(provider["last_apply_error"], Value::Null);
+            assert_eq!(
+                provider["credential_source"]["status"],
+                if stored_proxy {
+                    "observed_inputs"
+                } else {
+                    "not_required"
+                }
+            );
+            assert_uncaptured_consumers_remain_unknown(&report);
+            let serialized = serde_json::to_string(&report).unwrap();
+            assert!(!serialized.contains("application-environment-secret-sentinel"));
+            assert!(!serialized.contains("application-proxy-secret-sentinel"));
+
+            let facade = state.config_facade.as_ref().unwrap();
+            let mut providers = application_section(&state, SectionId::Providers);
+            providers.data["provider_instances"]["still-missing"] = json!({
+                "provider_type": "anthropic",
+                "credential_ref": "provider.missing.anthropic",
+                "api_key_from_env": true
+            });
+            facade
+                .registry()
+                .providers
+                .commit(
+                    providers.revision,
+                    serde_json::from_value(providers.data).unwrap(),
+                )
+                .unwrap();
+            let unavailable = application_report(&state).await;
+            assert_eq!(
+                consumer(&unavailable, "provider-runtime")["state"],
+                "failed"
+            );
+            assert_eq!(
+                consumer(&unavailable, "provider-runtime")["last_apply_error"]["code"],
+                "runtime_input_unavailable"
+            );
+            assert_eq!(
+                consumer(&unavailable, "provider-runtime")["applied_dependencies"],
+                provider["applied_dependencies"]
+            );
+            assert_uncaptured_consumers_remain_unknown(&unavailable);
+        }
+    });
+}
+
+#[test]
+fn actual_provider_publications_preserve_unrelated_receipts_and_remain_secret_free() {
+    with_application_runtime(async {
+        let (_dir, state) = application_state().await;
+        let before = application_report(&state).await;
+        assert_eq!(consumer(&before, "provider-runtime")["state"], "in_sync");
+        assert_uncaptured_consumers_remain_unknown(&before);
+        let mut core = application_section(&state, SectionId::Core);
+        core.data["server"]["port"] = json!(19876);
+        state
+            .put_ordinary_section(SectionId::Core, core.revision, core.data)
+            .await
+            .unwrap();
+        let after = application_report(&state).await;
+        assert_eq!(consumer(&after, "provider-runtime")["state"], "in_sync");
+        assert_eq!(
+            consumer(&after, "provider-runtime")["applied_dependencies"],
+            consumer(&before, "provider-runtime")["applied_dependencies"]
+        );
+        assert_eq!(
+            consumer(&after, "provider-runtime")["last_applied_at"],
+            consumer(&before, "provider-runtime")["last_applied_at"]
+        );
+        assert_uncaptured_consumers_remain_unknown(&after);
+        let rev = application_section(&state, SectionId::Providers).revision;
+        state
+            .put_provider_settings(rev, |_old, candidate| {
+                candidate
+                    .provider_instances
+                    .values_mut()
+                    .next()
+                    .unwrap()
+                    .model = Some("next-model".into());
+                candidate.provider_instances.insert(
+                    "disabled-peer".into(),
+                    serde_json::from_value(json!({"provider_type":"openai", "enabled":false}))
+                        .unwrap(),
+                );
+                Ok((BTreeSet::new(), BTreeSet::new()))
+            })
+            .await
+            .unwrap();
+        let defaults = application_report(&state).await;
+        assert_eq!(consumer(&defaults, "provider-runtime")["state"], "in_sync");
+        assert_uncaptured_consumers_remain_unknown(&defaults);
+        let serialized = serde_json::to_string(&defaults).unwrap();
+        for forbidden in [
+            "application-secret-sentinel",
+            "old-model",
+            "next-model",
+            "credential_ref",
+            "digest",
+            "9876",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+    });
+}
+
+#[test]
+fn actual_typed_provider_failure_keeps_receipt_and_repair_converges() {
+    with_application_runtime(async {
+        let (_dir, state) = application_state().await;
+        let before = application_report(&state).await;
+        let rev = application_section(&state, SectionId::Providers).revision;
+        assert!(state
+            .put_provider_settings(rev, |_old, candidate| {
+                candidate.provider = "unavailable-provider".into();
+                candidate.default_provider_instance = Some("unavailable-instance".into());
+                Ok((BTreeSet::new(), BTreeSet::new()))
+            })
+            .await
+            .is_err());
+        let failed = application_report(&state).await;
+        let provider = consumer(&failed, "provider-runtime");
+        assert_eq!(
+            provider["applied_dependencies"],
+            consumer(&before, "provider-runtime")["applied_dependencies"]
+        );
+        // The rejected attempt did not change desired storage or its active runtime.
+        assert_eq!(provider["state"], "in_sync");
+        assert_eq!(
+            provider["last_apply_error"]["code"],
+            "provider_initialization_failed"
+        );
+        let mut core = application_section(&state, SectionId::Core);
+        core.data["server"]["port"] = json!(19878);
+        state
+            .put_ordinary_section(SectionId::Core, core.revision, core.data)
+            .await
+            .unwrap();
+        assert_eq!(
+            consumer(&application_report(&state).await, "provider-runtime")["last_apply_error"]
+                ["code"],
+            "provider_initialization_failed"
+        );
+        let revision = state
+            .put_provider_settings(rev, |_old, candidate| {
+                candidate
+                    .provider_instances
+                    .values_mut()
+                    .next()
+                    .unwrap()
+                    .model = Some("repaired-model".into());
+                Ok((BTreeSet::new(), BTreeSet::new()))
+            })
+            .await
+            .unwrap();
+        let repaired = application_report(&state).await;
+        assert_eq!(consumer(&repaired, "provider-runtime")["state"], "in_sync");
+        assert_eq!(
+            consumer(&repaired, "provider-runtime")["last_apply_error"],
+            Value::Null
+        );
+        assert_eq!(
+            consumer(&repaired, "provider-runtime")["applied_dependencies"]["providers"],
+            revision
+        );
+        assert_uncaptured_consumers_remain_unknown(&repaired);
+    });
+}
+
+#[test]
+fn provider_owned_publication_cannot_attribute_old_core_proxy_to_new_credentials() {
+    with_application_runtime(async {
+        let (dir, state) = application_state_with_core(json!({
+            "provider": "openai", "http_proxy": "http://127.0.0.1:19877",
+            "proxy_auth": {"username": "proxy-user", "password": "proxy-original-sentinel"}
+        }))
+        .await;
+        let store = bamboo_config::CredentialStore::open(dir.path());
+        let before = application_report(&state).await;
+        let old_revision = store.revision().unwrap();
+        assert_eq!(
+            consumer(&before, "provider-runtime")["credential_source"]["revision"],
+            old_revision
+        );
+        let reference = state
+            .config
+            .read()
+            .await
+            .proxy_auth_credential_ref
+            .clone()
+            .unwrap();
+        store
+            .replace(
+                reference,
+                &json!({"username":"proxy-user", "password":"proxy-rotated-sentinel"}).to_string(),
+                bamboo_config::CredentialSource::User,
+                old_revision,
+            )
+            .unwrap();
+        assert!(store.revision().unwrap() > old_revision);
+        let observed = application_report(&state).await;
+        assert_eq!(
+            consumer(&observed, "provider-runtime")["applied_dependencies"],
+            consumer(&before, "provider-runtime")["applied_dependencies"]
+        );
+
+        // Provider owns only its metadata/keys. Adopting the rotated credential
+        // document cannot update or prove the running sibling Core proxy.
+        let revision = state
+            .put_provider_settings(
+                application_section(&state, SectionId::Providers).revision,
+                |_old, candidate| {
+                    candidate
+                        .provider_instances
+                        .values_mut()
+                        .next()
+                        .unwrap()
+                        .model = Some("rotated-provider-model".into());
+                    Ok((BTreeSet::new(), BTreeSet::new()))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .proxy_auth
+                .as_ref()
+                .unwrap()
+                .password,
+            "proxy-original-sentinel"
+        );
+        let adopted = application_report(&state).await;
+        let provider = consumer(&adopted, "provider-runtime");
+        assert_eq!(
+            adopted["sections"]["credentials"]["revision"],
+            store.revision().unwrap()
+        );
+        assert_eq!(provider["applied_dependencies"]["providers"], revision);
+        assert_eq!(provider["credential_source"]["status"], "unknown");
+        assert_eq!(provider["applied_dependencies"]["credentials"], Value::Null);
+        let repeated = application_report(&state).await;
+        assert_eq!(
+            consumer(&repeated, "provider-runtime")["applied_dependencies"],
+            provider["applied_dependencies"]
+        );
+        assert_eq!(
+            consumer(&repeated, "provider-runtime")["credential_source"]["status"],
+            "unknown"
+        );
+        for secret in [
+            "proxy-original-sentinel",
+            "proxy-rotated-sentinel",
+            "application-secret-sentinel",
+        ] {
+            assert!(!serde_json::to_string(&repeated).unwrap().contains(secret));
+        }
+        assert_uncaptured_consumers_remain_unknown(&adopted);
+    });
+}
+
+#[test]
+fn actual_direct_provider_reload_failure_retains_receipt_and_reports_error() {
+    with_application_runtime(async {
+        let (_dir, state) = application_state().await;
+        let before = application_report(&state).await;
+        let original = state.config.read().await.clone();
+        state.config.write().await.default_provider_instance =
+            Some("unavailable-default-instance".into());
+        assert!(state.reload_provider().await.is_err());
+        let failed = application_report(&state).await;
+        let provider = consumer(&failed, "provider-runtime");
+        assert_eq!(
+            provider["applied_dependencies"],
+            consumer(&before, "provider-runtime")["applied_dependencies"]
+        );
+        assert_eq!(
+            provider["last_applied_at"],
+            consumer(&before, "provider-runtime")["last_applied_at"]
+        );
+        assert_eq!(
+            provider["last_apply_error"]["code"],
+            "provider_initialization_failed"
+        );
+        *state.config.write().await = original;
+        state.reload_provider().await.unwrap();
+        let repaired = application_report(&state).await;
+        assert_eq!(consumer(&repaired, "provider-runtime")["state"], "in_sync");
+        assert_eq!(
+            consumer(&repaired, "provider-runtime")["last_apply_error"],
+            Value::Null
+        );
+    });
+}
+
+#[test]
+fn actual_dependent_publication_retains_unapplied_policy_source() {
+    with_application_runtime(async {
+        let (dir, state) = application_state().await;
+        let before = application_report(&state).await;
+        let policy = application_section(&state, SectionId::ModelPolicy);
+        let mut document: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("model-policy.json")).unwrap())
+                .unwrap();
+        document["data"]["keyword_masking"] =
+            json!({"entries":[{"pattern":"secret-pattern", "match_type":"exact", "enabled":true}]});
+        std::fs::write(
+            dir.path().join("model-policy.json"),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .reload_if_changed(SectionId::ModelPolicy)
+            .unwrap();
+        let mut core = application_section(&state, SectionId::Core);
+        core.data["http_proxy"] = json!("http://127.0.0.1:19877");
+        let core = state
+            .put_ordinary_section(SectionId::Core, core.revision, core.data)
+            .await
+            .unwrap();
+        let staged = application_report(&state).await;
+        let provider = consumer(&staged, "provider-runtime");
+        assert_eq!(provider["applied_dependencies"]["core"], core.revision);
+        assert_eq!(
+            provider["applied_dependencies"]["model-policy"],
+            policy.revision
+        );
+        assert_ne!(
+            provider["desired_dependencies"]["model-policy"],
+            policy.revision
+        );
+        assert_eq!(provider["state"], "pending_apply");
+        // Publishing the remaining policy adopts its own revision and the live Core.
+        let policy = application_section(&state, SectionId::ModelPolicy);
+        state
+            .put_ordinary_section(SectionId::ModelPolicy, policy.revision, policy.data)
+            .await
+            .unwrap();
+        let repaired = application_report(&state).await;
+        assert_eq!(consumer(&repaired, "provider-runtime")["state"], "in_sync");
+        assert_eq!(
+            consumer(&repaired, "provider-runtime")["applied_dependencies"]["core"],
+            core.revision
+        );
+        assert_ne!(
+            consumer(&repaired, "provider-runtime")["applied_dependencies"],
+            consumer(&before, "provider-runtime")["applied_dependencies"]
+        );
+    });
+}

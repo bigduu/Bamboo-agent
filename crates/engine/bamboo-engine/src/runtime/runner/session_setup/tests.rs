@@ -1122,6 +1122,11 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
     let tools = StaticToolExecutor {
         schemas: [
             "Bash",
+            "BashInput",
+            "BashOutput",
+            "KillShell",
+            "exec_command",
+            "write_stdin",
             "Read",
             "Grep",
             "Edit",
@@ -1148,7 +1153,14 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
         .map(|entry| (entry.execution_name(), entry.loading_class()))
         .collect::<std::collections::BTreeMap<_, _>>();
 
-    for name in ["Bash", "Read", "Grep", "Edit", "Write"] {
+    for name in [
+        "exec_command",
+        "write_stdin",
+        "Read",
+        "Grep",
+        "Edit",
+        "Write",
+    ] {
         assert_eq!(classes[name], CapabilityLoadingClass::Core, "{name}");
     }
     for name in [
@@ -1162,7 +1174,14 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
     ] {
         assert_eq!(classes[name], CapabilityLoadingClass::Deferred, "{name}");
     }
-    for name in ["Workspace", "request_permissions"] {
+    for name in [
+        "Workspace",
+        "request_permissions",
+        "Bash",
+        "BashInput",
+        "BashOutput",
+        "KillShell",
+    ] {
         assert_eq!(classes[name], CapabilityLoadingClass::HostOnly, "{name}");
     }
 
@@ -1181,7 +1200,14 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
     ] {
         assert!(model_names.contains(name), "legacy projection lost {name}");
     }
-    for name in ["Workspace", "request_permissions"] {
+    for name in [
+        "Workspace",
+        "request_permissions",
+        "Bash",
+        "BashInput",
+        "BashOutput",
+        "KillShell",
+    ] {
         assert!(!model_names.contains(name), "HostOnly leaked: {name}");
     }
 
@@ -1235,6 +1261,7 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
             "Plan",
             "Task",
             "session_history_current",
+            "session_message",
             "work_overview",
             "work_search",
             "work_inspect",
@@ -1247,6 +1274,8 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
             "GetFileInfo",
             "ViewImage",
             "Bash",
+            "exec_command",
+            "write_stdin",
             "Edit",
             "Write",
             "load_skill",
@@ -1296,9 +1325,18 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
         .map(|entry| entry.execution_name().to_string())
         .collect::<std::collections::BTreeSet<_>>();
     assert!(child_names.contains("Bash"));
+    assert!(child_names.contains("exec_command"));
+    assert!(child_names.contains("write_stdin"));
     assert!(child_names.contains("Edit"));
     assert!(child_names.contains("load_skill"));
     assert!(child_names.contains("mcp__external__read"));
+    let child_provider_names = resolve_available_tool_schemas_for_session(&config, &tools, &child)
+        .into_iter()
+        .map(|entry| entry.function.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(child_provider_names.contains("exec_command"));
+    assert!(child_provider_names.contains("write_stdin"));
+    assert!(!child_provider_names.contains("Bash"));
 }
 
 #[test]
@@ -1365,7 +1403,13 @@ fn automatic_ultra_subagent_guide_preserves_disabled_and_child_tool_authority() 
         ..Default::default()
     };
     let tools = StaticToolExecutor {
-        schemas: vec![schema("SubAgent"), schema("Read"), schema("Bash")],
+        schemas: vec![
+            schema("SubAgent"),
+            schema("Read"),
+            schema("Bash"),
+            schema("exec_command"),
+            schema("write_stdin"),
+        ],
     };
     let mut root = Session::new("disabled-ultra-guide", "model");
     root.set_root_orchestration_only(true).unwrap();
@@ -1392,6 +1436,12 @@ fn automatic_ultra_subagent_guide_preserves_disabled_and_child_tool_authority() 
     let child_schemas =
         resolve_available_tool_schemas_for_session(&ordinary_config, &tools, &child);
     assert!(child_schemas
+        .iter()
+        .any(|schema| schema.function.name == "exec_command"));
+    assert!(child_schemas
+        .iter()
+        .any(|schema| schema.function.name == "write_stdin"));
+    assert!(!child_schemas
         .iter()
         .any(|schema| schema.function.name == "Bash"));
     assert!(child_schemas
@@ -1441,7 +1491,8 @@ async fn root_and_child_model_catalogs_use_subagent_without_physical_deployment_
             "default::deploy_agent",
             "default::cluster",
             "Plan",
-            "Bash",
+            "exec_command",
+            "write_stdin",
             "load_skill",
             "mcp__external__read",
         ]
@@ -1466,7 +1517,13 @@ async fn root_and_child_model_catalogs_use_subagent_without_physical_deployment_
     ] {
         assert!(!names.contains(hidden), "{hidden}");
     }
-    for ordinary in ["Plan", "Bash", "load_skill", "mcp__external__read"] {
+    for ordinary in [
+        "Plan",
+        "exec_command",
+        "write_stdin",
+        "load_skill",
+        "mcp__external__read",
+    ] {
         assert!(names.contains(ordinary), "{ordinary}");
     }
     assert_eq!(
@@ -1522,6 +1579,8 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
         schemas: [
             "Read",
             "Bash",
+            "exec_command",
+            "write_stdin",
             "Edit",
             "read_file",
             "apply_patch",
@@ -1540,6 +1599,9 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
         [
             "Bash",
             "default::Bash",
+            "exec_command",
+            "default::exec_command",
+            "write_stdin",
             "apply_patch",
             "read_file",
             "mcp__x__run",
@@ -1553,6 +1615,9 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
     for denied in [
         "Bash",
         "default::Bash",
+        "exec_command",
+        "default::exec_command",
+        "write_stdin",
         "Edit",
         "apply_patch",
         "mcp__x__run",
@@ -1622,8 +1687,8 @@ fn exact_custom_alias_registrations_remain_deferred_and_keep_execution_names() {
             schema("Edit"),
             schema("apply_patch"),
             schema("read_file"),
-            schema("execute_command"),
-            schema("bash"),
+            schema("default::exec_command"),
+            schema("Exec_Command"),
             schema("a::custom_tool"),
             schema("custom_tool"),
         ],
@@ -1650,6 +1715,11 @@ fn exact_custom_alias_registrations_remain_deferred_and_keep_execution_names() {
                 CapabilityLoadingClass::Core
             ),
             (
+                "Exec_Command".to_string(),
+                "Exec_Command".to_string(),
+                CapabilityLoadingClass::Deferred
+            ),
+            (
                 "a::custom_tool".to_string(),
                 "a::custom_tool".to_string(),
                 CapabilityLoadingClass::Deferred
@@ -1660,18 +1730,13 @@ fn exact_custom_alias_registrations_remain_deferred_and_keep_execution_names() {
                 CapabilityLoadingClass::Deferred
             ),
             (
-                "bash".to_string(),
-                "bash".to_string(),
-                CapabilityLoadingClass::Deferred
-            ),
-            (
                 "custom_tool".to_string(),
                 "custom_tool".to_string(),
                 CapabilityLoadingClass::Deferred
             ),
             (
-                "execute_command".to_string(),
-                "execute_command".to_string(),
+                "default::exec_command".to_string(),
+                "default::exec_command".to_string(),
                 CapabilityLoadingClass::Deferred
             ),
             (
@@ -1690,11 +1755,11 @@ fn exact_custom_alias_registrations_remain_deferred_and_keep_execution_names() {
         model_names,
         vec![
             "Edit",
+            "Exec_Command",
             "a::custom_tool",
             "apply_patch",
-            "bash",
             "custom_tool",
-            "execute_command",
+            "default::exec_command",
             "read_file"
         ]
     );

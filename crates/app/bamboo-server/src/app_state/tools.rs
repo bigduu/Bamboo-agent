@@ -2,7 +2,7 @@
 //!
 //! These functions compose the tool executor chain:
 //! ```text
-//! base_tools (builtin + MCP + memory + skills + context controls + legacy self-only
+//! base_tools (builtin + MCP + memory + session messaging + skills + context controls + legacy self-only
 //!             session_history + exact self-only session_history_current)
 //!   └─> root_tools (base + Plan + SubAgent + scheduler + full legacy session_history)
 //! ```
@@ -46,6 +46,7 @@ pub(super) fn build_base_tools(
     workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
     tool_event_publisher: Arc<dyn ToolEventPublisher>,
     memory_store: bamboo_memory::memory_store::MemoryStore,
+    session_messenger: Arc<bamboo_engine::SessionMessenger>,
 ) -> (
     Arc<dyn ToolExecutor>,
     Arc<dyn bamboo_engine::external_agents::runtime::NativeToolCeilingSource>,
@@ -118,6 +119,14 @@ pub(super) fn build_base_tools(
         with_project,
         memory_tool,
     ));
+    // One logical-session delivery plane serves Root, Child, nested Child and
+    // scheduled/headless executions through their shared Base tool surface.
+    let with_messages: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
+        with_memory,
+        Arc::new(bamboo_server_tools::SessionMessageTool::new(
+            session_messenger,
+        )),
+    ));
 
     // `ledger` sits in the base layer (not root-only) so headless reminder
     // sessions fired by the schedule manager can read and transition the very
@@ -129,7 +138,7 @@ pub(super) fn build_base_tools(
             .with_project_store(project_store.clone()),
     );
     let with_ledger: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        with_memory,
+        with_messages,
         ledger_tool,
     ));
 
@@ -225,6 +234,19 @@ impl HostNativeToolCeiling {
             self.base.owns_exact_tool(name)
         })
     }
+
+    fn resolve_disabled(&self, reference: &str) -> Vec<String> {
+        let Some(name) = self.resolve(reference) else {
+            return Vec::new();
+        };
+        let mut names = vec![name.clone()];
+        if name == "Bash" {
+            names.extend(["exec_command".into(), "write_stdin".into()]);
+        } else if let Some(replacement) = bamboo_domain::legacy_shell_replacement(&name) {
+            names.push(replacement.into());
+        }
+        names
+    }
 }
 
 #[async_trait::async_trait]
@@ -261,7 +283,7 @@ impl bamboo_engine::external_agents::runtime::NativeToolCeilingSource for HostNa
         let disabled = self.config.read().await.disabled_tool_references();
         let disabled: std::collections::BTreeSet<_> = disabled
             .iter()
-            .filter_map(|reference| self.resolve(reference))
+            .flat_map(|reference| self.resolve_disabled(reference))
             .collect();
         for name in bamboo_subagent::proto::NativeToolCeiling::NAMES {
             if self.base.owns_exact_tool(name) && self.base.exact_tool_owner(name).is_none() {
@@ -283,7 +305,7 @@ impl bamboo_engine::external_agents::runtime::NativeToolCeilingSource for HostNa
             .transpose()?
             .unwrap_or_default()
             .iter()
-            .filter_map(|name| self.resolve(name))
+            .flat_map(|name| self.resolve_disabled(name))
             .collect();
         let ticket_child = session
             .metadata
@@ -517,11 +539,22 @@ mod native_ceiling_tests {
     }
 
     #[tokio::test]
-    async fn ticket_ceiling_selects_only_host_builtin_task_and_legacy_keeps_five_tools() {
+    async fn ticket_ceiling_selects_only_host_builtin_task_and_shells_stay_outside_ticket_scope() {
         let home = tempfile::tempdir().unwrap();
         let mut source = source(home.path());
         let mut child = bamboo_domain::Session::new_child("ticket-child", "root", "", "");
-        assert_eq!(source.observe(&child).await.unwrap().len(), 5);
+        assert_eq!(
+            source.observe(&child).await.unwrap(),
+            [
+                "Bash",
+                "Edit",
+                "Glob",
+                "Read",
+                "Write",
+                "exec_command",
+                "write_stdin"
+            ]
+        );
         child.metadata.insert(
             bamboo_engine::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
             "assignment".into(),
@@ -535,6 +568,78 @@ mod native_ceiling_tests {
         source.base = source.builtin.clone();
         source.config.write().await.tools.disabled = vec!["Task".into()];
         assert!(source.observe(&child).await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn native_ceiling_preserves_exact_frozen_profile_grants() {
+        use sha2::{Digest, Sha256};
+        let home = tempfile::tempdir().unwrap();
+        let source = source(home.path());
+        let parent = bamboo_domain::Session::new("profile-parent", "model");
+        for (tools, read_only) in [
+            (vec!["Bash"], false),
+            (vec!["exec_command", "write_stdin"], false),
+            (vec!["Glob", "Read"], true),
+        ] {
+            let mut child =
+                bamboo_domain::Session::new_child_of("profile-child", &parent, "model", "role");
+            child
+                .agent_runtime_state
+                .get_or_insert_with(Default::default)
+                .read_only = read_only;
+            let prompt = "frozen selected role";
+            child
+                .metadata
+                .insert("base_system_prompt".into(), prompt.into());
+            child.add_message(bamboo_domain::Message::system(prompt));
+            child.metadata.insert(
+                bamboo_engine::session_app::child_session::named_profile::NAMED_PROFILE_BINDING_KEY
+                    .into(),
+                json!({
+                    "version": 1, "name": "role", "source": "global", "project_id": null,
+                    "scope_project_id": null, "revision": "0".repeat(64),
+                    "child_id": child.id, "child_created_at": child.created_at,
+                    "parent_id": parent.id, "root_id": child.root_session_id,
+                    "model": child.model, "model_ref": child.model_ref, "read_only": read_only,
+                    "prompt_sha256": hex::encode(Sha256::digest(prompt.as_bytes())), "tools": tools,
+                })
+                .to_string(),
+            );
+            assert_eq!(source.observe(&child).await.unwrap(), tools);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_shell_denials_cover_polled_native_sessions_without_suffix_matching() {
+        let home = tempfile::tempdir().unwrap();
+        let mut source = source(home.path());
+        let mut child = bamboo_domain::Session::new_child("denied-child", "root", "", "");
+        for reference in ["Bash", "default::execute_command"] {
+            child.metadata.insert(
+                "disabled_tools".into(),
+                serde_json::to_string(&[reference]).unwrap(),
+            );
+            assert_eq!(
+                source.observe(&child).await.unwrap(),
+                ["Edit", "Glob", "Read", "Write"]
+            );
+        }
+        child
+            .metadata
+            .insert("disabled_tools".into(), "[\"BashOutput\"]".into());
+        let tools = source.observe(&child).await.unwrap();
+        assert!(tools.contains(&"exec_command".into()));
+        assert!(!tools.contains(&"write_stdin".into()));
+
+        source.base = Arc::new(crate::tools::OverlayToolExecutor::new(
+            source.base.clone(),
+            Arc::new(Foreign("vendor::Bash")),
+        ));
+        child
+            .metadata
+            .insert("disabled_tools".into(), "[\"vendor::Bash\"]".into());
+        let tools = source.observe(&child).await.unwrap();
+        assert!(tools.contains(&"exec_command".into()));
+        assert!(tools.contains(&"write_stdin".into()));
     }
     #[tokio::test]
     async fn native_owner_uses_complete_composite_overlay_exact_before_alias_and_config() {
@@ -591,7 +696,7 @@ mod native_ceiling_tests {
             .unwrap();
         let mut foreign = source.projects.create("foreign fixture", None).unwrap();
         session.set_project_id_meta(project.id.as_str());
-        assert_eq!(source.observe(&session).await.unwrap().len(), 5);
+        assert_eq!(source.observe(&session).await.unwrap().len(), 7);
         session
             .metadata
             .insert("project_id".into(), "another-project".into());
@@ -626,6 +731,117 @@ mod native_ceiling_tests {
             .await
             .unwrap()
             .contains(&"Write".into()));
+    }
+}
+
+#[cfg(test)]
+mod session_message_assembly_tests {
+    use super::*;
+    use bamboo_agent_core::tools::{FunctionCall, Tool, ToolMutability};
+    use bamboo_agent_core::{Session, ToolCall, ToolExecutionContext};
+    use serde_json::json;
+
+    fn call(action: &str) -> ToolCall {
+        ToolCall {
+            id: format!("installed-peer-{action}"),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "session_message".into(),
+                arguments: match action {
+                    "send" => json!({"action": action, "target_session_id": "peer-child", "operation_id": "blocked-send", "message": "must not enqueue"}),
+                    "reply" => json!({"action": action, "reply_to": "unreceived", "operation_id": "blocked-reply", "message": "must not enqueue"}),
+                    _ => json!({"action": action}),
+                }.to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn installed_peer_tool_is_shared_across_surfaces_and_preserves_read_only_posture() {
+        let home = tempfile::tempdir().unwrap();
+        let state = super::super::AppState::new_with_provider(
+            home.path().to_path_buf(),
+            Config::default(),
+            Arc::new(super::super::UnconfiguredProvider {
+                message: "tool assembly must not call a model".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut root = Session::new("peer-root", "model");
+        root.set_root_orchestration_only(true).unwrap();
+        assert!(root.allows_model_tool_execution("session_message"));
+        let mut child = Session::new_child_of("peer-child", &root, "model", "Child");
+        let mut nested = Session::new_child_of("peer-nested", &child, "model", "Nested");
+        for session in [&mut root, &mut child, &mut nested] {
+            state.session_repo.save(session).await.unwrap();
+        }
+        let expected =
+            bamboo_server_tools::SessionMessageTool::new(state.session_messenger.clone())
+                .to_schema();
+        assert_eq!(
+            bamboo_domain::capability_loading_class_for_reference("session_message"),
+            bamboo_domain::CapabilityLoadingClass::Deferred
+        );
+        assert!(Arc::ptr_eq(
+            state.agent.default_tools(),
+            &state.tools_for(crate::tools::ToolSurface::Base)
+        ));
+        for (surface, session) in [
+            (crate::tools::ToolSurface::Base, &root),
+            (crate::tools::ToolSurface::Root, &root),
+            (crate::tools::ToolSurface::Child, &child),
+            (crate::tools::ToolSurface::Child, &nested),
+            (crate::tools::ToolSurface::WithTask, &child),
+        ] {
+            let tools = state.tools_for(surface);
+            assert!(tools.owns_exact_tool("session_message"));
+            let schemas = tools.list_tools();
+            let matching: Vec<_> = schemas
+                .iter()
+                .filter(|schema| schema.function.name == "session_message")
+                .collect();
+            assert_eq!(matching.len(), 1, "{surface:?}");
+            assert_eq!(
+                serde_json::to_value(matching[0]).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            for action in ["list_targets", "send", "reply"] {
+                let call = call(action);
+                assert_eq!(
+                    tools.call_parallel_classification(&call),
+                    if action == "list_targets" {
+                        (ToolMutability::ReadOnly, true)
+                    } else {
+                        (ToolMutability::Mutating, false)
+                    }
+                );
+                let mut ctx = ToolExecutionContext::none(&call.id);
+                ctx.session_id = Some(&session.id);
+                ctx.root_session_id = Some(&session.root_session_id);
+                ctx.plan_read_only = true;
+                ctx.bypass_permissions = true;
+                ctx.auto_approve_permissions = true;
+                let result = tools.execute_with_context(&call, ctx).await;
+                if action == "list_targets" {
+                    let result = result.unwrap();
+                    assert!(result.success);
+                    let listing: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+                    assert_eq!(listing["truncated"], false);
+                    let targets = listing["targets"].as_array().unwrap();
+                    assert_eq!(targets.len(), 2);
+                    assert!(targets
+                        .iter()
+                        .all(|target| target["session_id"] != session.id));
+                } else {
+                    assert!(result.is_err(), "{surface:?} {action}");
+                }
+            }
+        }
+        for session in [&root, &child, &nested] {
+            let inbox = state.session_inbox.inspect(&session.id).await.unwrap();
+            assert_eq!(inbox.pending + inbox.claimed, 0);
+        }
     }
 }
 

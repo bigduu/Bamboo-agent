@@ -21,6 +21,310 @@ async fn reopen(temp: &TempDir) -> FileSessionInbox {
     FileSessionInbox::new(store, SessionInboxLimits::default())
 }
 
+fn peer_envelope(source: &str, target: &str) -> SessionMessageEnvelope {
+    let mut envelope = SessionMessageEnvelope::user_input(target, "peer feedback");
+    envelope.source = SessionMessageSource::Session {
+        session_id: source.into(),
+    };
+    envelope.kind = SessionMessageKind::PeerMessage;
+    envelope.thread_id = Some("peer-thread".into());
+    envelope.correlation_id = Some("peer-operation".into());
+    envelope
+}
+
+#[tokio::test]
+async fn peer_admission_preserves_legacy_lineage_precise_intent_and_ack_retry() {
+    let (_temp, store, inbox) = fixture().await;
+    let parent = store.load_session("parent").await.unwrap().unwrap();
+    // Existing owned-tree membership accepts a legacy child without this witness.
+    let child = Session::new_child("a-child", "parent", "model", "child");
+    assert!(child.parent_created_at.is_none());
+    store.save_session(&child).await.unwrap();
+    let source = bamboo_domain::ActorSession::from_session(&child).unwrap();
+    let target = bamboo_domain::ActorSession::from_session(&parent).unwrap();
+    let staged = staged_child();
+    inbox.deliver(&staged).await.unwrap();
+    let envelope = peer_envelope(&child.id, &parent.id);
+    let receipt = inbox
+        .deliver_peer_message(&envelope, &source, &target, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        inbox
+            .deliver_peer_message(&envelope, &source, &target, None)
+            .await
+            .unwrap(),
+        receipt
+    );
+    let claims = inbox.claim("parent", 128).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].envelope, envelope);
+    assert_eq!(
+        claims[0].activation_policy,
+        SessionActivationPolicy::InterruptSpecificWait
+    );
+    inbox.ack("parent", &claims[0]).await.unwrap();
+    assert_eq!(
+        inbox
+            .deliver_peer_message(&envelope, &source, &target, None)
+            .await
+            .unwrap(),
+        receipt
+    );
+    let backlog = inbox.inspect("parent").await.unwrap();
+    assert_eq!(backlog.pending, 1);
+    assert_eq!(backlog.coordinator_generation, 0);
+    assert!(!backlog.activation_pending());
+    assert!(inbox.claim("parent", 128).await.unwrap().is_empty());
+}
+
+#[test]
+fn peer_admission_retains_authority_through_commit_with_lifecycle_writer_queued() {
+    use super::owned_lifetime_tests::{Fixture, Parked};
+    let fixture = Fixture::new();
+    let child = Session::new_child("a-child", "target", "model", "child");
+    let (source, target) = fixture.runtime.block_on(async {
+        fixture.store.save_session(&child).await.unwrap();
+        let parent = fixture.store.load_session("target").await.unwrap().unwrap();
+        (
+            bamboo_domain::ActorSession::from_session(&child).unwrap(),
+            bamboo_domain::ActorSession::from_session(&parent).unwrap(),
+        )
+    });
+    let envelope = peer_envelope(&child.id, "target");
+    let delivery = envelope.clone();
+    let mut parked = Parked::start(
+        fixture.inbox.clone(),
+        "acquire",
+        fixture.dir.clone(),
+        move |inbox| async move {
+            inbox
+                .deliver_peer_message(&delivery, &source, &target, None)
+                .await
+                .map(|_| ())
+        },
+    );
+    fixture.assert_physical_locks(false);
+    let writer_store = fixture.store.clone();
+    let mut writer = Box::pin(writer_store.delete_session_recursive("a-child", true));
+    fixture.runtime.block_on(std::future::poll_fn(|cx| {
+        use std::future::Future;
+        assert!(writer.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    }));
+    // Polling once registers the waiting writer on this same Store before
+    // resuming admission; no scheduler timing assumption is needed.
+    parked.result().unwrap();
+    assert!(fixture.runtime.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .unwrap()
+            .unwrap()
+    }));
+    let claims = fixture
+        .runtime
+        .block_on(fixture.other.claim("target", 1))
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].envelope, envelope);
+    assert_eq!(
+        claims[0].activation_policy,
+        SessionActivationPolicy::InterruptSpecificWait
+    );
+}
+
+async fn peer_reply_proof_fixture(
+    store: &SessionStoreV2,
+    root_id: &str,
+) -> (
+    Session,
+    Session,
+    SessionMessageEnvelope,
+    SessionMessageEnvelope,
+) {
+    let root = store.load_session(root_id).await.unwrap().unwrap();
+    let mut source = Session::new_child("a-child", root_id, "model", "reply source");
+    let original = peer_envelope(root_id, &source.id);
+    source.add_message(original.to_provider_message().unwrap());
+    store.save_session(&source).await.unwrap();
+    let mut reply = peer_envelope(&source.id, root_id);
+    reply.in_reply_to = Some(original.id.clone());
+    reply.thread_id = original.thread_id.clone();
+    (source, root, original, reply)
+}
+
+#[test]
+fn peer_reply_proof_remains_locked_through_commit_against_clear_and_full_save() {
+    use super::owned_lifetime_tests::{Fixture, Parked};
+    use std::future::Future;
+    use std::time::Duration;
+
+    for clear in [true, false] {
+        let fixture = Fixture::new();
+        let (mut child, root, original, reply) = fixture
+            .runtime
+            .block_on(peer_reply_proof_fixture(&fixture.store, "target"));
+        let source = bamboo_domain::ActorSession::from_session(&child).unwrap();
+        let target = bamboo_domain::ActorSession::from_session(&root).unwrap();
+        let delivery = reply.clone();
+        let proof = original.clone();
+        // This is the actual started Maildir job immediately before commit,
+        // after canonical proof validation and acquisition of Inbox authority.
+        let mut parked = Parked::start(
+            fixture.inbox.clone(),
+            "maildir",
+            fixture.dir.clone(),
+            move |inbox| async move {
+                inbox
+                    .deliver_peer_message(&delivery, &source, &target, Some(&proof))
+                    .await
+                    .map(|_| ())
+            },
+        );
+        fixture.assert_physical_locks(true);
+        child.messages.clear();
+        let writer_store = fixture.store.clone();
+        let mut writer = Box::pin(async move {
+            if clear {
+                assert!(writer_store.clear_session(&child.id).await?);
+                Ok(())
+            } else {
+                writer_store.save_session(&child).await
+            }
+        });
+        fixture.runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                std::future::poll_fn(|cx| {
+                    assert!(writer.as_mut().poll(cx).is_pending());
+                    // Clear queues immediately on lifecycle exclusive. A full save
+                    // first performs async shared lock work; wait for its existing
+                    // metric to prove it reached the held source Session lock.
+                    if clear || fixture.store.persistence_metrics().waiting_saves == 1 {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        parked.result().unwrap();
+        fixture.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), writer)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        let current = fixture
+            .runtime
+            .block_on(fixture.store.load_session("a-child"))
+            .unwrap()
+            .unwrap();
+        assert!(!current
+            .messages
+            .iter()
+            .any(|message| { bamboo_domain::is_matching_session_message(message, &original) }));
+        let claims = fixture
+            .runtime
+            .block_on(fixture.other.claim("target", 1))
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].envelope, reply);
+        assert_eq!(
+            claims[0].activation_policy,
+            SessionActivationPolicy::InterruptSpecificWait
+        );
+    }
+}
+
+#[tokio::test]
+async fn peer_reply_revalidates_canonical_proof_before_returning_duplicate_ack_receipt() {
+    let (_temp, store, inbox) = fixture().await;
+    let (mut child, root, original, reply) = peer_reply_proof_fixture(&store, "parent").await;
+    let source = bamboo_domain::ActorSession::from_session(&child).unwrap();
+    let target = bamboo_domain::ActorSession::from_session(&root).unwrap();
+    let receipt = inbox
+        .deliver_peer_message(&reply, &source, &target, Some(&original))
+        .await
+        .unwrap();
+    assert_eq!(
+        inbox
+            .deliver_peer_message(&reply, &source, &target, Some(&original))
+            .await
+            .unwrap(),
+        receipt
+    );
+    let claim = inbox.claim("parent", 1).await.unwrap().remove(0);
+    inbox.ack("parent", &claim).await.unwrap();
+    assert!(inbox.was_admitted("parent", &reply.id).await.unwrap());
+    child.messages.clear();
+    store.save_session(&child).await.unwrap();
+    let before = inbox.inspect("parent").await.unwrap();
+    // Birth, ancestry, reply ID and durable receipt are all unchanged. The
+    // removed canonical source transcript must still revoke this retry proof.
+    assert!(inbox
+        .deliver_peer_message(&reply, &source, &target, Some(&original))
+        .await
+        .is_err());
+    assert_eq!(inbox.inspect("parent").await.unwrap(), before);
+    assert!(inbox.was_admitted("parent", &reply.id).await.unwrap());
+    assert!(inbox.claim("parent", 1).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn peer_reply_rejects_route_and_canonical_proof_mismatches_without_inbox_effects() {
+    for case in [
+        "missing_reply_id",
+        "different_reply_id",
+        "different_thread",
+        "different_original_source",
+        "different_original_target",
+        "forged_presentation",
+        "omitted_proof",
+    ] {
+        let (_temp, store, inbox) = fixture().await;
+        let (mut child, root, mut original, mut reply) =
+            peer_reply_proof_fixture(&store, "parent").await;
+        match case {
+            "missing_reply_id" => reply.in_reply_to = None,
+            "different_reply_id" => {
+                reply.in_reply_to = Some(SessionMessageEnvelope::user_input("parent", "other").id);
+            }
+            "different_thread" => reply.thread_id = Some("unrelated-thread".into()),
+            "different_original_source" => {
+                original.source = SessionMessageSource::Session {
+                    session_id: "other-root".into(),
+                };
+            }
+            "different_original_target" => original.target_session_id = root.id.clone(),
+            "forged_presentation" | "omitted_proof" => {}
+            _ => unreachable!(),
+        }
+        // Route mismatch cases have an otherwise exact canonical transcript.
+        // Presentation forgery retains the complete canonical metadata marker.
+        child.messages = vec![original.to_provider_message().unwrap()];
+        if case == "forged_presentation" {
+            child.messages[0].content.push_str(" forged suffix");
+        }
+        store.save_session(&child).await.unwrap();
+        let source = bamboo_domain::ActorSession::from_session(&child).unwrap();
+        let target = bamboo_domain::ActorSession::from_session(&root).unwrap();
+        let before = inbox.inspect("parent").await.unwrap();
+        let proof = (case != "omitted_proof").then_some(&original);
+        assert!(
+            inbox
+                .deliver_peer_message(&reply, &source, &target, proof)
+                .await
+                .is_err(),
+            "{case} must not authorize a reply"
+        );
+        assert_eq!(inbox.inspect("parent").await.unwrap(), before, "{case}");
+        assert!(!inbox.was_admitted("parent", &reply.id).await.unwrap());
+    }
+}
+
 async fn v1_only_mark(inbox: &FileSessionInbox, generation: u64) -> Result<(), SessionInboxError> {
     let _lifecycle = inbox.lock_lifecycle().await?;
     let dir = inbox.inbox_dir("parent").await?;

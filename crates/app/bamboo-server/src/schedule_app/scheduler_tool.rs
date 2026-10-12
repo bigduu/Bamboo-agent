@@ -708,8 +708,8 @@ mod tests {
             id: "scheduled-forced-ask".to_string(),
             tool_type: "function".to_string(),
             function: FunctionCall {
-                name: "Bash".to_string(),
-                arguments: serde_json::json!({"command": scheduled_command}).to_string(),
+                name: "exec_command".to_string(),
+                arguments: serde_json::json!({"cmd": scheduled_command}).to_string(),
             },
         };
         let first_call_started = Arc::new(Notify::new());

@@ -54,11 +54,12 @@ impl RootThinkingMode {
 /// Exact execution identities admitted for an orchestration-only Root.
 /// Unknown tools, external providers, and legacy aliases do not enter this
 /// list; callers first resolve a registered execution identity.
-pub const ROOT_ORCHESTRATION_TOOLS: [&str; 15] = [
+pub const ROOT_ORCHESTRATION_TOOLS: [&str; 16] = [
     "SubAgent",
     "Plan",
     "Task",
     "session_history_current",
+    "session_message",
     "Read",
     "Grep",
     "Glob",
@@ -303,6 +304,8 @@ mod tests {
             assert!(root.allows_model_tool_execution(tool), "{tool}");
         }
         for tool in [
+            "exec_command",
+            "write_stdin",
             "Bash",
             "Edit",
             "Write",

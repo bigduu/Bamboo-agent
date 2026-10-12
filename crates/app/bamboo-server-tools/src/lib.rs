@@ -22,6 +22,7 @@ pub mod project_tools;
 pub mod registry_keys;
 pub mod session_control;
 pub mod session_inspector;
+pub mod session_message;
 pub mod skill_runtime;
 pub mod sub_agent;
 mod sub_agent_facade;
@@ -45,6 +46,7 @@ pub use plan::PlanTool;
 pub use project_tools::{ProjectTool, ProjectWorkspaceTool};
 pub use session_control::SessionControlTool;
 pub use session_inspector::SessionInspectorTool;
+pub use session_message::SessionMessageTool;
 pub use skill_runtime::{
     assemble_legacy_skill_tools, skill_response_byte_budget, LegacySkillContextRegistry,
     LoadSkillTool, ReadSkillResourceTool, SelectedSkillSource, SkillCatalogCaller,

@@ -9110,6 +9110,13 @@ mod tests {
 
     #[test]
     fn plain_rejection_logs_branch_and_run_without_changing_error() {
+        // Keep shared callsites consulting the current subscriber during scoped capture.
+        let capture_interest_guard = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing_subscriber::filter::LevelFilter::OFF)
+                .with_writer(std::io::sink)
+                .finish(),
+        );
         let output = tempfile::NamedTempFile::new().unwrap();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -9118,6 +9125,10 @@ mod tests {
             .finish();
         let branch_line = std::cell::Cell::new(0);
         let error = tracing::subscriber::with_default(subscriber, || {
+            // Exercise the shared warning callsite without this thread's scoped subscriber.
+            std::thread::spawn(|| drop(plain_actor_unsupported()))
+                .join()
+                .expect("unscoped rejection warning thread panicked");
             let span = tracing::warn_span!(
                 "actor_child_run",
                 child_session_id = %"diagnostic-child",
@@ -9153,6 +9164,7 @@ mod tests {
             "{log}"
         );
         assert!(!error.to_string().contains("diagnostic-run"));
+        drop(capture_interest_guard);
     }
 
     #[tokio::test]
