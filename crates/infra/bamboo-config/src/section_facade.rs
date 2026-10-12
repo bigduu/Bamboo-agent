@@ -2729,9 +2729,28 @@ fn validate_model_policy(value: &ModelPolicySection) -> Result<(), String> {
     validate_json_serializable(value)
 }
 
+/// Decode the shape consumed by `bamboo_compression::limits::ModelLimit`
+/// before publishing a model-limit snapshot. This private DTO keeps the config
+/// crate independent of compression while preserving unknown row fields.
+#[derive(Deserialize)]
+struct ModelLimitRowShape {
+    #[serde(rename = "model_pattern")]
+    _model_pattern: String,
+    #[serde(rename = "max_context_tokens")]
+    _max_context_tokens: u32,
+    #[serde(default, rename = "max_output_tokens")]
+    _max_output_tokens: Option<u32>,
+    #[serde(default, rename = "safety_margin")]
+    _safety_margin: Option<u32>,
+}
+
 fn validate_model_limits(value: &ModelLimitsSection) -> Result<(), String> {
-    if value.0.iter().any(|entry| !entry.is_object()) {
-        return Err("model limit entries must be objects".to_string());
+    for (index, row) in value.0.iter().enumerate() {
+        if !row.is_object() {
+            return Err(format!("model limit entry {index}: expected an object"));
+        }
+        serde_json::from_value::<ModelLimitRowShape>(row.clone())
+            .map_err(|error| format!("model limit entry {index}: {error}"))?;
     }
     validate_json_serializable(value)
 }
@@ -4942,7 +4961,19 @@ impl SectionRegistry {
             access_control: open!(AccessControl, AccessControlSection, validate_access_control),
             hooks: open!(Hooks, HooksSection, validate_hooks),
             model_policy: open!(ModelPolicy, ModelPolicySection, validate_model_policy),
-            model_limits: open!(ModelLimits, ModelLimitsSection, validate_model_limits),
+            model_limits: {
+                let descriptor = SectionId::ModelLimits.descriptor();
+                Arc::new(LiveSection::open_with_raw_validator_allowing_unversioned(
+                    descriptor.name,
+                    AtomicJsonStore::<ModelLimitsSection>::new(
+                        data_dir.join(descriptor.file_name),
+                        SECTION_SCHEMA_VERSION,
+                    ),
+                    ModelLimitsSection::default(),
+                    validate_model_limits,
+                    validate_ordinary_section_raw,
+                )?)
+            },
             credentials: Arc::new(CredentialSection::open(data_dir, migration_lock_held)),
         })
     }
@@ -5611,6 +5642,16 @@ impl ConfigFacade {
 
     pub fn registry(&self) -> &Arc<SectionRegistry> {
         &self.registry
+    }
+
+    /// Replace compatibility model limits against the latest durable section,
+    /// adopting that exact result into this facade before returning success.
+    pub fn replace_compatibility_model_limits(
+        &self,
+        candidate: ModelLimitsSection,
+    ) -> ConfigStoreResult<Option<ConfigSectionEvent>> {
+        crate::ensure_provider_mcp_migration_ready(&self.data_dir)?;
+        self.registry.model_limits.replace_from_durable(candidate)
     }
 
     pub fn effective_config(&self) -> Config {
@@ -6519,6 +6560,128 @@ mod tests {
     }
 
     #[test]
+    fn model_limit_validation_accepts_compression_shape_and_preserves_unknown_fields() {
+        let section = ModelLimitsSection(vec![json!({
+            "model_pattern": "model-family",
+            "max_context_tokens": 0,
+            "max_output_tokens": null,
+            "safety_margin": 0,
+            "future_option": {"enabled": true}
+        })]);
+        validate_model_limits(&section).unwrap();
+        assert_eq!(section.0[0]["future_option"]["enabled"], true);
+        validate_model_limits(&ModelLimitsSection(vec![json!({
+            "model_pattern": "model",
+            "max_context_tokens": u32::MAX
+        })]))
+        .unwrap();
+    }
+
+    #[test]
+    fn model_limit_validation_rejects_rows_the_runtime_cannot_decode() {
+        for row in [
+            json!(["model", 48_000, null, null]),
+            json!({}),
+            json!({"model_pattern": "model"}),
+            json!({"model_pattern": 42, "max_context_tokens": 48_000}),
+            json!({"model_pattern": "model", "max_context_tokens": -1}),
+            json!({"model_pattern": "model", "max_context_tokens": u64::MAX}),
+            json!({"model_pattern": "model", "max_context_tokens": "48000"}),
+            json!({"model_pattern": "model", "max_context_tokens": 48_000, "max_output_tokens": -1}),
+            json!({"model_pattern": "model", "max_context_tokens": 48_000, "safety_margin": "500"}),
+        ] {
+            assert!(
+                validate_model_limits(&ModelLimitsSection(vec![row.clone()])).is_err(),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_limit_raw_sidecar_reopens_after_modular_install_and_retains_lkg() {
+        let _key = crate::encryption::set_test_encryption_key([0x63; 32]);
+        let dir = TempDir::new().unwrap();
+        let installed = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        // Use an existing exact authority transaction to represent an
+        // established installation beyond the initial split manifest.
+        let mut config = installed.effective_config();
+        config.proxy_auth = Some(crate::ProxyAuth {
+            username: "test-user".into(),
+            password: "test-password".into(),
+        });
+        crate::persist_proxy_auth_credential_transaction_at_revision(
+            dir.path(),
+            &mut config,
+            installed.registry().core.snapshot().revision,
+        )
+        .unwrap();
+        drop(installed);
+        let path = dir.path().join("model_limits.json");
+        let first = json!([{
+            "model_pattern": "legacy-hosted-model",
+            "max_context_tokens": 48_000,
+            "max_output_tokens": 4_000,
+            "future_option": {"kept": true}
+        }]);
+        write_json(&path, &first);
+
+        // Existing modular installations can still be edited with the
+        // documented raw-array sidecar before the server restarts.
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let section = &facade.registry().model_limits;
+        assert_eq!(section.snapshot().status, SectionStatus::Healthy);
+        assert_eq!(section.snapshot().revision, 0);
+        assert_eq!(
+            serde_json::to_value(section.snapshot().data.as_ref()).unwrap(),
+            first
+        );
+        section
+            .commit(0, section.snapshot().data.as_ref().clone())
+            .unwrap();
+        assert_eq!(section.snapshot().revision, 1);
+        let upgraded: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(upgraded["revision"], 1);
+        assert_eq!(upgraded["data"], first);
+
+        let second = json!([{
+            "model_pattern": "legacy-hosted-model",
+            "max_context_tokens": 72_000,
+            "max_output_tokens": 6_000
+        }]);
+        write_json(&path, &second);
+        section.reload();
+        let good = section.snapshot();
+        assert_eq!(good.status, SectionStatus::Healthy);
+        assert_eq!(good.revision, 2);
+        let normalized: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(normalized["revision"], good.revision);
+        assert_eq!(normalized["data"], second);
+
+        for corrupt in ["{invalid", "[{}]"] {
+            std::fs::write(&path, corrupt).unwrap();
+            section.reload();
+            assert_ne!(section.snapshot().status, SectionStatus::Healthy);
+            assert_eq!(section.snapshot().revision, good.revision);
+            assert_eq!(section.snapshot().data.0, good.data.0);
+        }
+
+        write_json(&path, &first);
+        section.reload();
+        let repaired = section.snapshot();
+        assert_eq!(repaired.status, SectionStatus::Healthy);
+        assert_eq!(repaired.revision, good.revision + 1);
+        assert_eq!(serde_json::to_value(repaired.data.as_ref()).unwrap(), first);
+        assert!(matches!(
+            section.commit(good.revision, repaired.data.as_ref().clone()),
+            Err(crate::ConfigStoreError::Conflict { .. })
+        ));
+        section
+            .commit(repaired.revision, repaired.data.as_ref().clone())
+            .unwrap();
+        assert_eq!(section.snapshot().revision, repaired.revision + 1);
+    }
+
+    #[test]
     fn provider_api_metadata_scrubber_matches_durable_credential_contexts() {
         let original = json!({
             "headless_auth": true,
@@ -7395,7 +7558,9 @@ mod tests {
 
         let projection = SectionProjection::from_config(
             &config,
-            ModelLimitsSection(vec![json!({"model_pattern": "gpt-*", "max_tokens": 42})]),
+            ModelLimitsSection(vec![
+                json!({"model_pattern": "gpt-*", "max_context_tokens": 42, "max_tokens": 42}),
+            ]),
         )
         .unwrap();
         assert_eq!(projection.core.extra["future_root_key"]["nested"], true);
@@ -7661,7 +7826,7 @@ mod tests {
         );
         write_json(
             &dir.path().join("model_limits.json"),
-            &json!([{"model_pattern": "future-*", "custom": {"kept": true}}]),
+            &json!([{"model_pattern": "future-*", "max_context_tokens": 48_000, "custom": {"kept": true}}]),
         );
         write_json(
             &dir.path().join("mcp.json"),
@@ -9338,6 +9503,7 @@ mod tests {
                 },
                 "model_limits": [{
                     "model_pattern": "future-*",
+                    "max_context_tokens": 48_000,
                     "future_limit": {"nested": "kept"}
                 }]
             }),

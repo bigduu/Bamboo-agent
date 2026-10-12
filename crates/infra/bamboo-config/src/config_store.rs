@@ -890,6 +890,29 @@ where
             serde_json::to_value(retained_data)?;
         }
         let _lock = self.file.lock()?;
+        self.commit_validated_locked(
+            expected_revision,
+            candidate,
+            validate,
+            allow_unversioned,
+            authority,
+            0,
+        )
+    }
+
+    /// The caller owns this store's file lock and has validated the candidate.
+    fn commit_validated_locked<F>(
+        &self,
+        expected_revision: u64,
+        candidate: T,
+        validate: F,
+        allow_unversioned: bool,
+        authority: CommitAuthority<'_, T>,
+        minimum_revision: u64,
+    ) -> ConfigStoreResult<u64>
+    where
+        F: Fn(&T) -> Result<(), String>,
+    {
         let candidate_data = serde_json::to_value(&candidate)?;
         self.validate_raw_data(&candidate_data)
             .map_err(ConfigStoreError::Validation)?;
@@ -965,7 +988,8 @@ where
             None if repair_revision.is_some() => observed_revision_floor?,
             None => 0,
         }
-        .max(actual);
+        .max(actual)
+        .max(minimum_revision);
         let revision = revision_floor.checked_add(1).ok_or_else(|| {
             ConfigStoreError::Validation("revision counter exhausted".to_string())
         })?;
@@ -1413,6 +1437,143 @@ where
         candidate: T,
     ) -> ConfigStoreResult<(ConfigSectionEvent, SectionEnvelope<T>)> {
         self.commit_inner_with_envelope(expected_revision, candidate, || {})
+    }
+
+    /// Compatibility replacement has no caller-supplied revision. Read its
+    /// exact durable base, compare and commit under the existing file lock,
+    /// then publish without exposing an intermediate external generation.
+    pub(crate) fn replace_from_durable(
+        &self,
+        candidate: T,
+    ) -> ConfigStoreResult<Option<ConfigSectionEvent>> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        (self.validate)(&candidate).map_err(ConfigStoreError::Validation)?;
+        let candidate_value = serde_json::to_value(&candidate)?;
+        self.store
+            .validate_raw_data(&candidate_value)
+            .map_err(ConfigStoreError::Validation)?;
+        let _file = self.store.file.lock()?;
+        // Compatibility replacement cannot claim authority over a primary
+        // written by a newer runtime, even if the recovery loader could find
+        // an older valid backup or raw-data validation would fail first.
+        match std::fs::read(self.store.path()) {
+            Ok(bytes) => {
+                if serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .and_then(|value| value.get("schema_version").and_then(|v| v.as_u64()))
+                    .is_some_and(|version| version > u64::from(self.store.schema_version))
+                {
+                    return Err(ConfigStoreError::Validation(
+                        "document schema is newer than this runtime".to_string(),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let current = self.snapshot();
+        let current_value = serde_json::to_value(current.data.as_ref())?;
+        let trusted =
+            current.status == SectionStatus::Healthy || self.repair_authority().can_repair();
+        let loaded = if self.allow_unversioned_reload {
+            self.store
+                .load_validated_compatible_locked(&|value| (self.validate)(value))
+        } else {
+            self.store
+                .load_validated_locked(&|value| (self.validate)(value))
+        };
+        let stored = match loaded {
+            Ok(stored) => stored,
+            Err(error) if trusted && repairable_live_lkg_error(&error) => None,
+            Err(error) => return Err(error),
+        };
+        let stored_value = stored
+            .as_ref()
+            .map(|stored| serde_json::to_value(&stored.data))
+            .transpose()?;
+        let durable_noop = stored.as_ref().is_some_and(|stored| {
+            !stored.recovered_from_backup
+                && stored_value.as_ref() == Some(&candidate_value)
+                && (stored.revision > current.revision
+                    || (stored.revision == current.revision && candidate_value == current_value))
+        });
+        let revision = if durable_noop {
+            stored
+                .as_ref()
+                .expect("durable no-op has a primary")
+                .revision
+        } else {
+            let (expected, authority) = match stored.as_ref() {
+                Some(stored) if !stored.recovered_from_backup => {
+                    (stored.revision, CommitAuthority::LiveSnapshot(&stored.data))
+                }
+                Some(stored) if stored.revision > current.revision => (
+                    stored.revision,
+                    CommitAuthority::RetainedLiveSnapshot {
+                        revision: stored.revision,
+                        data: &stored.data,
+                    },
+                ),
+                _ if trusted => (
+                    current.revision,
+                    CommitAuthority::RetainedLiveSnapshot {
+                        revision: current.revision,
+                        data: current.data.as_ref(),
+                    },
+                ),
+                Some(stored) => (
+                    stored.revision,
+                    CommitAuthority::RetainedLiveSnapshot {
+                        revision: stored.revision,
+                        data: &stored.data,
+                    },
+                ),
+                None => (
+                    current.revision,
+                    CommitAuthority::LiveSnapshot(current.data.as_ref()),
+                ),
+            };
+            self.store.commit_validated_locked(
+                expected,
+                candidate.clone(),
+                |value| (self.validate)(value),
+                self.allow_unversioned_reload,
+                authority,
+                current.revision,
+            )?
+        };
+        if durable_noop && revision == current.revision && current.status == SectionStatus::Healthy
+        {
+            return Ok(None);
+        }
+        self.publish(
+            SectionSnapshot {
+                data: Arc::new(candidate),
+                revision,
+                loaded_at: Utc::now(),
+                source_path: self.store.path().to_path_buf(),
+                source_kind: SectionSourceKind::File,
+                status: SectionStatus::Healthy,
+                last_error: None,
+            },
+            LiveRepairAuthority::None,
+        );
+        Ok(Some(
+            if durable_noop && current.status != SectionStatus::Healthy {
+                ConfigSectionEvent::Recovered {
+                    section: self.name.clone(),
+                    revision,
+                }
+            } else {
+                ConfigSectionEvent::Changed {
+                    section: self.name.clone(),
+                    revision,
+                }
+            },
+        ))
     }
 
     /// Commit against an exact healthy durable base while permitting this
@@ -2989,6 +3150,163 @@ mod tests {
         let after = section.snapshot();
         assert_eq!(after.revision, before.revision);
         assert_eq!(after.data.value, "good");
+    }
+
+    #[test]
+    fn compatibility_replace_uses_latest_durable_base_and_adopts_exact_noop_revision() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let section = open_example_live_section(&path, 0);
+        let external = AtomicJsonStore::new(&path, 1);
+        let value = |value: &str| Example {
+            value: value.into(),
+        };
+        section.commit(0, value("local")).unwrap();
+        external.commit(1, value("external"), |_| Ok(())).unwrap();
+
+        // Matching the stale process snapshot must not skip the durable write.
+        section.replace_from_durable(value("local")).unwrap();
+        assert_eq!(section.snapshot().revision, 3);
+        assert_eq!(external.load().unwrap().unwrap().data, value("local"));
+
+        external.commit(3, value("external"), |_| Ok(())).unwrap();
+        section.replace_from_durable(value("replacement")).unwrap();
+        assert_eq!(section.snapshot().revision, 5);
+        assert_eq!(section.snapshot().data.as_ref(), &value("replacement"));
+
+        external
+            .commit(5, value("replacement"), |_| Ok(()))
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            section.replace_from_durable(value("replacement")).unwrap(),
+            Some(ConfigSectionEvent::Changed { revision: 6, .. })
+        ));
+        assert_eq!(section.snapshot().revision, 6);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(section
+            .replace_from_durable(value("replacement"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn compatibility_replace_failure_does_not_publish_external_or_candidate_data() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let mut section = open_example_live_section(&path, 0);
+        section
+            .commit(
+                0,
+                Example {
+                    value: "local".into(),
+                },
+            )
+            .unwrap();
+        let external = AtomicJsonStore::new(&path, 1);
+        external
+            .commit(
+                1,
+                Example {
+                    value: "external".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        section.store.file.test_fault = Some(AtomicWriteFault::Rename);
+
+        assert!(matches!(
+            section.replace_from_durable(Example {
+                value: "candidate".into()
+            }),
+            Err(ConfigStoreError::Io(_))
+        ));
+        assert_eq!(section.snapshot().revision, 1);
+        assert_eq!(section.snapshot().data.value, "local");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn compatibility_replace_repairs_trusted_lkg_but_rejects_future_schema() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let section = open_example_live_section(&path, 0);
+        let value = |value: &str| Example {
+            value: value.into(),
+        };
+        section.commit(0, value("trusted")).unwrap();
+        std::fs::write(&path, br#"{"schema_version":1,"revision":40,"data":{}}"#).unwrap();
+        section.replace_from_durable(value("repaired")).unwrap();
+        assert_eq!(section.snapshot().revision, 41);
+
+        std::fs::remove_file(&path).unwrap();
+        section.replace_from_durable(value("restored")).unwrap();
+        assert_eq!(section.snapshot().revision, 42);
+        assert_eq!(section.snapshot().data.as_ref(), &value("restored"));
+
+        let future = br#"{"schema_version":2,"revision":90,"data":{"value":"future"}}"#;
+        std::fs::write(&path, future).unwrap();
+        assert!(matches!(
+            section.replace_from_durable(value("unsupported")),
+            Err(ConfigStoreError::Validation(message)) if message == "document schema is newer than this runtime"
+        ));
+        assert_eq!(section.snapshot().revision, 42);
+        assert_eq!(section.snapshot().data.as_ref(), &value("restored"));
+        assert_eq!(std::fs::read(&path).unwrap(), future);
+    }
+
+    #[test]
+    fn compatibility_replace_repairs_backup_ahead_of_process_above_observed_floor() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let section = open_example_live_section(&path, 3);
+        let value = |value: &str| Example {
+            value: value.into(),
+        };
+        section.commit(0, value("local")).unwrap();
+        let external = AtomicJsonStore::new(&path, 1);
+        external
+            .commit(1, value("external backup"), |_| Ok(()))
+            .unwrap();
+        external
+            .commit(2, value("external primary"), |_| Ok(()))
+            .unwrap();
+        std::fs::write(&path, br#"{"schema_version":1,"revision":40,"data":{}}"#).unwrap();
+
+        section.replace_from_durable(value("replacement")).unwrap();
+        assert_eq!(section.snapshot().revision, 41);
+        assert_eq!(section.snapshot().data.as_ref(), &value("replacement"));
+        assert_eq!(external.load().unwrap().unwrap().revision, 41);
+    }
+
+    #[test]
+    fn compatibility_replace_rejects_future_primary_even_with_valid_backup() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let mut section = open_example_live_section(&path, 3);
+        commit_two_live_revisions(&section);
+        section.store = section.store.with_raw_validator(reject_test_secrets);
+        let before = section.snapshot();
+
+        for data in [
+            serde_json::json!({"value": "future"}),
+            serde_json::json!({"value": "future", "token": "legacy-secret"}),
+        ] {
+            let future = serde_json::to_vec(&serde_json::json!({
+                "schema_version": 2, "revision": 90, "data": data
+            }))
+            .unwrap();
+            std::fs::write(&path, &future).unwrap();
+            assert!(matches!(
+                section.replace_from_durable(Example { value: "candidate".into() }),
+                Err(ConfigStoreError::Validation(message)) if message == "document schema is newer than this runtime"
+            ));
+            assert_eq!(section.snapshot().revision, before.revision);
+            assert_eq!(section.snapshot().data.as_ref(), before.data.as_ref());
+            assert_eq!(std::fs::read(&path).unwrap(), future);
+            assert!(!has_example_quarantine(dir.path()));
+        }
     }
 
     #[test]

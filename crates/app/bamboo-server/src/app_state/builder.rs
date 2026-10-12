@@ -677,6 +677,10 @@ impl AppState {
             .memory_store(memory_store.clone())
             .default_tools(base_tools.clone())
             .project_context_resolver(project_context_resolver.clone());
+        if let Some(facade) = &config_facade {
+            agent_builder =
+                agent_builder.model_limits_section(facade.registry().model_limits.clone());
+        }
         if let Some(permission_config) = permission_checker.permission_config() {
             agent_builder = agent_builder.permission_config(permission_config);
         }

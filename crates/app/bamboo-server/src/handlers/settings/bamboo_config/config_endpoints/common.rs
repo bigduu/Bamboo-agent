@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use crate::error::AppError;
+use crate::{
+    app_state::{AppState, ConfigSectionMutationError},
+    error::AppError,
+};
 use bamboo_compression::limits::ModelLimit;
 use bamboo_llm::Config;
 use serde_json::{Map, Value};
@@ -101,6 +104,32 @@ pub(super) async fn write_model_limits_file(
             atomic_write(&path, content.as_bytes()).await
         }
     }
+}
+
+/// Compatibility writes must publish through the same section that the hosted
+/// Agent reads. A separately opened facade only updates its own snapshot.
+pub(super) async fn write_model_limits(
+    app_state: &AppState,
+    value: &Value,
+) -> Result<(), AppError> {
+    if app_state.config_facade.is_none() {
+        let _io = app_state.config_io_lock.lock().await;
+        return write_model_limits_file(&app_state.app_data_dir, Some(value)).await;
+    }
+    let limits: Vec<ModelLimit> = serde_json::from_value(value.clone())?;
+    let rows = serde_json::to_value(limits)?
+        .as_array()
+        .cloned()
+        .expect("model limits serialize as an array");
+    app_state
+        .replace_compatibility_model_limits(rows)
+        .await
+        .map_err(|error| match error {
+            ConfigSectionMutationError::Store(error) => map_config_store_error(error),
+            ConfigSectionMutationError::Invalid(message)
+            | ConfigSectionMutationError::Runtime(message) => AppError::BadRequest(message),
+        })?;
+    Ok(())
 }
 
 fn map_config_store_error(error: bamboo_config::ConfigStoreError) -> AppError {

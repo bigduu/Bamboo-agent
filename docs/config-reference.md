@@ -686,9 +686,13 @@ context-window contract before runtime budgeting.
 
 The modular configuration store persists this section in a revisioned
 `{schema_version, revision, data}` envelope. Runtime loading accepts both that
-envelope and the legacy raw array, and root sessions re-read the sidecar at
-the start of every agent round; an explicit session/child or engine-level
-`TokenBudget` remains an intentional higher-priority override. Manage the
+envelope and the legacy raw array. Hosted agent runs use their server's live
+validated section snapshot at the start of every agent round. Invalid or
+temporarily deleted files retain the last-known-good limits and report section
+health errors; a valid repair is adopted by the existing configuration watcher.
+Standalone SDK and headless runtimes without a host section handle continue to
+read their instance-local sidecar each round. An explicit session/child or
+engine-level `TokenBudget` remains an intentional higher-priority override. Manage the
 section through Bamboo's settings API instead of hand-editing it while the
 server is running.
 
