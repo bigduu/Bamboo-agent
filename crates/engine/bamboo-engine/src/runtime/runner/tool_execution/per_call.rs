@@ -140,6 +140,24 @@ pub(super) struct PortableToolExecution {
     input: serde_json::Value,
 }
 
+impl PortableToolExecution {
+    pub(super) fn execution_name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[cfg(test)]
+impl PortableToolExecution {
+    /// Declare an already-selected executor identity for result-contract tests.
+    /// Model catalog admission is covered separately by the promotion tests.
+    pub(super) fn selected_identity_fixture(execution_name: &str) -> Self {
+        Self {
+            name: execution_name.to_owned(),
+            input: serde_json::json!({}),
+        }
+    }
+}
+
 pub(super) fn portable_tool_for_admitted_call(
     callable: &EffectiveCallableSet,
     call: &ToolCall,
@@ -174,6 +192,74 @@ pub(super) struct ToolExecutionOutcome {
     /// a completed tool and must not fire `PostToolUse`.
     pub post_tool_hook_eligible: bool,
     pub tool_duration: std::time::Duration,
+}
+
+pub(super) enum ShellAccountingOutcome {
+    Ordinary,
+    Pending,
+    Terminal(bool),
+}
+
+pub(super) fn shell_accounting_outcome(
+    outcome: &ToolExecutionOutcome,
+    admitted_execution_name: Option<&str>,
+) -> ShellAccountingOutcome {
+    if !matches!(
+        outcome
+            .portable_tool
+            .as_ref()
+            .map(|tool| tool.execution_name())
+            .or(admitted_execution_name),
+        Some("exec_command" | "write_stdin")
+    ) {
+        return ShellAccountingOutcome::Ordinary;
+    }
+    if outcome.needs_human.is_some() {
+        return ShellAccountingOutcome::Pending;
+    }
+    let Ok(result) = &outcome.result else {
+        // Infrastructure/argument errors retain ordinary failure accounting.
+        return ShellAccountingOutcome::Ordinary;
+    };
+    // The permission gate uses a Completed acknowledgement while the command
+    // remains unexecuted. Its pause marker survives output compression, unlike
+    // the JSON body; use the same success/marker contract as clarification.
+    if result.success && result.display_preference.as_deref() == Some("request_permissions") {
+        return ShellAccountingOutcome::Pending;
+    }
+    let envelope = serde_json::from_str::<serde_json::Value>(&result.result).ok();
+    let status = envelope.as_ref().and_then(|value| value["status"].as_str());
+    if status == Some("running") {
+        return ShellAccountingOutcome::Pending;
+    }
+    ShellAccountingOutcome::Terminal(
+        result.success
+            && status == Some("completed")
+            && envelope
+                .as_ref()
+                .and_then(|value| value["exit_code"].as_i64())
+                == Some(0),
+    )
+}
+
+fn task_progress_result_for_outcome(
+    outcome: &ToolExecutionOutcome,
+) -> execution_paths::TaskProgressResult {
+    use execution_paths::TaskProgressResult;
+
+    match shell_accounting_outcome(outcome, None) {
+        ShellAccountingOutcome::Ordinary => TaskProgressResult::Ordinary,
+        ShellAccountingOutcome::Pending => TaskProgressResult::Skip,
+        ShellAccountingOutcome::Terminal(success) => {
+            let mut result = outcome
+                .result
+                .as_ref()
+                .expect("terminal shell result")
+                .clone();
+            result.success = success;
+            TaskProgressResult::CommandOutcome(result)
+        }
+    }
 }
 
 /// Admit one model-requested function call before it enters Bamboo's existing
@@ -265,7 +351,9 @@ async fn execute_tool_call_only_with_execution_name(
         });
     }
 
-    if let Err(policy_error) = policy::validate_tool_call_arguments(ctx.tool_call) {
+    if let Err(policy_error) =
+        policy::validate_tool_call_arguments_for_execution(ctx.tool_call, execution_name)
+    {
         tracing::warn!(
             "[{}][round:{}] Tool call blocked by strict argument policy before ToolStart: tool_call_id={}, tool_name={}, error={}",
             ctx.session_id,
@@ -765,7 +853,12 @@ async fn hook_ask_outcome(
     })
 }
 
-fn append_post_tool_feedback(result: &mut Result<ToolResult, String>, feedback: Vec<String>) {
+fn append_post_tool_feedback(
+    result: &mut Result<ToolResult, String>,
+    feedback: Vec<String>,
+    execution_name: Option<&str>,
+    max_tool_output_tokens: u32,
+) {
     let feedback = feedback
         .into_iter()
         .filter_map(|text| {
@@ -775,6 +868,60 @@ fn append_post_tool_feedback(result: &mut Result<ToolResult, String>, feedback: 
         .collect::<Vec<_>>();
     if feedback.is_empty() {
         return;
+    }
+
+    if matches!(execution_name, Some("exec_command" | "write_stdin")) {
+        if let Ok(result) = result {
+            if let Ok(mut envelope) = serde_json::from_str::<serde_json::Value>(&result.result) {
+                if let Some(object) = envelope.as_object_mut() {
+                    // Native hooks have no aggregate context cap. Bound only
+                    // this optional shell-result metadata before preserving it.
+                    let mut remaining = bamboo_hooks::portable::PORTABLE_CONTEXT_BYTES;
+                    let total = feedback.iter().map(String::len).sum::<usize>();
+                    let mut bounded = Vec::new();
+                    for mut text in feedback {
+                        if remaining == 0 {
+                            break;
+                        }
+                        let mut end = text.len().min(remaining);
+                        while !text.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        text.truncate(end);
+                        remaining -= end;
+                        if !text.is_empty() {
+                            bounded.push(text);
+                        }
+                    }
+                    let kept = bounded.iter().map(String::len).sum::<usize>();
+                    object.insert("hook_feedback".into(), serde_json::json!(bounded));
+                    if total > kept {
+                        object.insert(
+                            "hook_feedback_omitted_bytes".into(),
+                            serde_json::json!(total - kept),
+                        );
+                    }
+                    result.result = serde_json::to_string(&envelope)
+                        .expect("shell feedback envelope is serializable");
+                    if max_tool_output_tokens > 0 {
+                        use bamboo_compression::TokenCounter;
+                        let counter = bamboo_compression::TiktokenTokenCounter::default();
+                        if counter.count_text(&result.result) > max_tool_output_tokens {
+                            if let Some(truncated) =
+                                super::output_compressor::truncate_exec_session_output(
+                                    &result.result,
+                                    max_tool_output_tokens,
+                                    &counter,
+                                )
+                            {
+                                result.result = truncated;
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     let block = format!(
@@ -866,7 +1013,26 @@ pub(super) async fn apply_tool_execution_outcome(
             )?;
         }
     }
-    append_post_tool_feedback(&mut outcome.result, post_tool_feedback);
+    // Read the shell envelope before post-hook feedback appends prose. Only
+    // the admitted exact identity selects command-specific task accounting.
+    let task_progress_result = task_progress_result_for_outcome(&outcome);
+    let feedback_cap = outcome
+        .output_cap
+        .unwrap_or_else(|| {
+            ctx.session
+                .effective_token_budget()
+                .map(|budget| budget.max_tool_output_tokens)
+        })
+        .unwrap_or(0);
+    append_post_tool_feedback(
+        &mut outcome.result,
+        post_tool_feedback,
+        outcome
+            .portable_tool
+            .as_ref()
+            .map(|tool| tool.execution_name()),
+        feedback_cap,
+    );
 
     // Capture tool lifecycle metadata before the borrow-splitting match.
     let tool_name_for_meta = ctx.tool_call.function.name.clone();
@@ -895,15 +1061,17 @@ pub(super) async fn apply_tool_execution_outcome(
         // suspended. The other success-path steps (taskwrite/workspace/goal/
         // agentic) are tool-specific no-ops here, and suspend_for_pending_question
         // already emits the ToolComplete event.
-        super::task::track_task_progress(
-            ctx.task_context,
-            ctx.event_tx,
-            ctx.session_id,
-            ctx.tool_call,
-            &display_result,
-            ctx.round,
-        )
-        .await;
+        if let Some(progress_result) = task_progress_result.result(&display_result) {
+            super::task::track_task_progress(
+                ctx.task_context,
+                ctx.event_tx,
+                ctx.session_id,
+                ctx.tool_call,
+                progress_result,
+                ctx.round,
+            )
+            .await;
+        }
         super::clarification::suspend_for_pending_question(
             ctx.tool_call,
             outcome.permission_replay_origin.as_ref(),
@@ -927,6 +1095,7 @@ pub(super) async fn apply_tool_execution_outcome(
                         tool_call: ctx.tool_call,
                         permission_replay_origin: outcome.permission_replay_origin.as_ref(),
                         result: &result,
+                        task_progress_result,
                         event_tx: ctx.event_tx,
                         metrics_collector: ctx.metrics_collector,
                         session_id: ctx.session_id,
@@ -1001,6 +1170,412 @@ pub(super) async fn apply_tool_execution_outcome(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod task_progress_tests {
+    use super::*;
+    use crate::runtime::task_context::{TaskLoopItem, ToolCallRecord};
+    use bamboo_agent_core::tools::FunctionCall;
+    use bamboo_domain::TaskItemStatus;
+    use chrono::Utc;
+
+    fn active_task(history: &[bool]) -> TaskLoopContext {
+        let now = Utc::now();
+        TaskLoopContext {
+            session_id: "shell-progress".into(),
+            items: vec![TaskLoopItem {
+                id: "verify".into(),
+                description: "Run verification".into(),
+                status: TaskItemStatus::InProgress,
+                tool_calls: history
+                    .iter()
+                    .map(|success| ToolCallRecord {
+                        round: 0,
+                        tool_name: "prior".into(),
+                        success: *success,
+                        timestamp: now,
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            active_item_id: Some("verify".into()),
+            current_round: 0,
+            max_rounds: None,
+            created_at: now,
+            updated_at: now,
+            version: 0,
+            task_list_dirty: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_result(
+        task: TaskLoopContext,
+        requested_name: &str,
+        execution_name: &str,
+        status: &str,
+        exit_code: Option<i32>,
+        needs_human: bool,
+        round: usize,
+    ) -> TaskLoopContext {
+        let call = ToolCall {
+            id: format!("shell-progress-{round}"),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: requested_name.into(),
+                arguments: "{}".into(),
+            },
+        };
+        let result = ToolResult::text(
+            true,
+            serde_json::json!({"status":status,"output":"","exit_code":exit_code}).to_string(),
+        );
+        let expected_result = result.result.clone();
+        let outcome = ToolExecutionOutcome {
+            output_cap: None,
+            portable_tool: Some(PortableToolExecution {
+                name: execution_name.into(),
+                input: serde_json::json!({}),
+            }),
+            permission_replay_origin: None,
+            result: Ok(result),
+            needs_human: needs_human.then(|| bamboo_agent_core::PendingQuestion {
+                tool_call_id: call.id.clone(),
+                tool_name: requested_name.into(),
+                question: "Approve command?".into(),
+                options: vec!["yes".into(), "no".into()],
+                allow_custom: false,
+                source: bamboo_agent_core::PendingQuestionSource::PauseTool,
+            }),
+            post_tool_hook_eligible: true,
+            tool_duration: std::time::Duration::ZERO,
+        };
+        let mut session = Session::new("shell-progress", "model");
+        let flags = ToolExecutionSessionFlags::from_session(&session);
+        let tools: Arc<dyn ToolExecutor> = Arc::new(
+            bamboo_tools::BuiltinToolExecutor::with_registry(bamboo_tools::ToolRegistry::new()),
+        );
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut context = Some(task);
+        apply_tool_execution_outcome(
+            ToolExecutionApplyContext {
+                tool_call: &call,
+                event_tx: &event_tx,
+                metrics_collector: None,
+                session_id: "shell-progress",
+                round_id: "round",
+                round,
+                session: &mut session,
+                tools: &tools,
+                session_flags: flags,
+                config: &AgentLoopConfig::default(),
+                runtime_state: &mut AgentRuntimeState::new("shell-progress"),
+                task_context: &mut context,
+                state: &mut RoundExecutionState::default(),
+            },
+            outcome,
+        )
+        .await
+        .unwrap();
+        let completed = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .find_map(|event| match event {
+                AgentEvent::ToolComplete { result, .. } => Some(result),
+                _ => None,
+            })
+            .expect("tool completion remains visible");
+        assert!(
+            completed.success,
+            "public transport success must be unchanged"
+        );
+        assert_eq!(completed.result, expected_result);
+        context.unwrap()
+    }
+
+    #[tokio::test]
+    async fn running_shell_polls_neither_complete_nor_block_active_tasks() {
+        for execution_name in ["exec_command", "write_stdin"] {
+            for history in [&[][..], &[true, true, true][..], &[false, false][..]] {
+                let mut task = active_task(history);
+                for round in 0..4 {
+                    task = apply_result(
+                        task,
+                        &format!("default::{execution_name}"),
+                        execution_name,
+                        "running",
+                        None,
+                        false,
+                        round,
+                    )
+                    .await;
+                }
+                assert_eq!(task.items[0].status, TaskItemStatus::InProgress);
+                assert_eq!(task.items[0].tool_calls.len(), history.len());
+                assert!(task.items[0].evidence.is_empty());
+                assert_eq!(task.version, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_shell_results_follow_existing_task_success_and_failure_rules() {
+        for execution_name in ["exec_command", "write_stdin"] {
+            for (status, exit_code, expected, successful) in [
+                ("completed", Some(0), TaskItemStatus::Completed, true),
+                ("completed", Some(7), TaskItemStatus::Blocked, false),
+                ("error", None, TaskItemStatus::Blocked, false),
+                ("killed", None, TaskItemStatus::Blocked, false),
+            ] {
+                let mut task = active_task(&[]);
+                for round in 0..4 {
+                    task = apply_result(
+                        task,
+                        execution_name,
+                        execution_name,
+                        status,
+                        exit_code,
+                        false,
+                        round,
+                    )
+                    .await;
+                }
+                assert_eq!(task.items[0].status, expected, "{execution_name}:{status}");
+                assert!(task.items[0]
+                    .tool_calls
+                    .iter()
+                    .all(|record| record.success == successful));
+                assert!(task.items[0]
+                    .evidence
+                    .iter()
+                    .all(|evidence| evidence.success == Some(successful)));
+            }
+        }
+    }
+
+    async fn real_shell_permission_ack_is_neutral(cap: u32) {
+        for (requested, execution_name) in [
+            ("exec_command", "exec_command"),
+            ("default::exec_command", "exec_command"),
+            ("write_stdin", "write_stdin"),
+            ("default::write_stdin", "write_stdin"),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let sentinel = home.path().join("must-not-execute");
+            let permission = Arc::new(bamboo_tools::permission::PermissionConfig::new());
+            permission.set_ask_rules(["exec_command".into(), "write_stdin".into()]);
+            let checker = Arc::new(bamboo_tools::permission::ConfigPermissionChecker::new(
+                permission,
+            ));
+            let tools: Arc<dyn ToolExecutor> = Arc::new(
+                bamboo_tools::BuiltinToolExecutor::new_with_permissions(checker),
+            );
+            let schemas = tools.list_tools();
+            let args = if execution_name == "exec_command" {
+                serde_json::json!({"cmd":format!("printf forbidden > '{}'", sentinel.display())})
+            } else {
+                // The gate must pause before the actual tool rejects this unknown handle.
+                serde_json::json!({"session_id":"00000000-0000-0000-0000-000000000000", "chars":""})
+            };
+            let call = ToolCall {
+                id: format!("real-pending-{cap}-{requested}"),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: requested.into(),
+                    arguments: args.to_string(),
+                },
+            };
+            let mut session = Session::new("shell-progress", "model");
+            session.token_budget = Some(bamboo_domain::TokenBudget {
+                max_tool_output_tokens: cap,
+                ..Default::default()
+            });
+            let flags = ToolExecutionSessionFlags::from_session(&session);
+            assert!(!flags.bypass_permissions && !flags.auto_approve_permissions);
+            let config = AgentLoopConfig::default();
+            let mut runtime = AgentRuntimeState::new("shell-progress");
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let outcome = bamboo_tools::with_approval_proxy(
+                None,
+                // Exercise the real gate for an explicitly selected executor;
+                // pair model admission remains disabled until promotion.
+                execute_tool_call_only_with_execution_name(
+                    execution_name,
+                    ToolExecutionOnlyContext {
+                        vision_support: true,
+                        output_cap: None,
+                        executing_supervisor: None,
+                        tool_call: &call,
+                        event_tx: &event_tx,
+                        metrics_collector: None,
+                        session_id: "shell-progress",
+                        root_orchestration_only: false,
+                        root_session_id: "shell-progress",
+                        round_id: "round",
+                        round: 0,
+                        tools: &tools,
+                        config: &config,
+                        hook_session: Some(&mut session),
+                        hook_runtime_state: Some(&mut runtime),
+                        session_flags: flags,
+                        available_tool_schemas: &schemas,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(
+                outcome.needs_human.is_none(),
+                "real gate uses the legacy Completed adapter"
+            );
+            let result = outcome.result.as_ref().unwrap();
+            assert!(result.success);
+            assert_eq!(
+                result.display_preference.as_deref(),
+                Some("request_permissions")
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&result.result).unwrap()["status"],
+                "awaiting_permission_approval"
+            );
+            assert!(!sentinel.exists());
+            assert!(std::iter::from_fn(|| event_rx.try_recv().ok())
+                .any(|event| matches!(event, AgentEvent::ToolApprovalRequested { .. })));
+            let outcome = super::super::output_compressor::maybe_compress(
+                requested,
+                &call.function.arguments,
+                "shell-progress",
+                outcome,
+                cap,
+                None,
+                None,
+            )
+            .await;
+            assert!(outcome.needs_human.is_none());
+            assert_eq!(
+                outcome.portable_tool.as_ref().unwrap().execution_name(),
+                execution_name
+            );
+            assert_eq!(
+                outcome
+                    .result
+                    .as_ref()
+                    .unwrap()
+                    .display_preference
+                    .as_deref(),
+                Some("request_permissions")
+            );
+            if cap == 1 {
+                assert!(outcome
+                    .result
+                    .as_ref()
+                    .unwrap()
+                    .result
+                    .contains("tool output truncated"));
+            }
+            assert!(matches!(shell_accounting_outcome(&outcome, Some(execution_name)), ShellAccountingOutcome::Pending),
+                "{requested}, cap={cap}: an unexecuted permission acknowledgment is not command failure");
+
+            let mut canonical_call = call.clone();
+            canonical_call.function.name = execution_name.into();
+            let prior_error = Err("prior command failure".into());
+            let mut guard = policy::ToolPolicyGuard::new(80, 3);
+            for _ in 0..2 {
+                guard.observe_outcome(&canonical_call, &prior_error);
+            }
+            guard.observe_execution_outcome(&call, &outcome, Some(execution_name));
+            assert!(
+                guard
+                    .check_before_execution_for_name(&call, 0, Some(execution_name))
+                    .is_ok(),
+                "approval must not add a third failure"
+            );
+            guard.observe_outcome(&canonical_call, &prior_error);
+            assert!(
+                matches!(
+                    guard.check_before_execution_for_name(&call, 0, Some(execution_name)),
+                    Err(policy::ToolPolicyPrecheckViolation::ToolCircuitOpen {
+                        consecutive_failures: 3,
+                        ..
+                    })
+                ),
+                "approval must not reset the existing two failures"
+            );
+
+            let mut task = Some(active_task(&[false, false]));
+            apply_tool_execution_outcome(
+                ToolExecutionApplyContext {
+                    tool_call: &call,
+                    event_tx: &event_tx,
+                    metrics_collector: None,
+                    session_id: "shell-progress",
+                    round_id: "round",
+                    round: 0,
+                    session: &mut session,
+                    tools: &tools,
+                    session_flags: flags,
+                    config: &config,
+                    runtime_state: &mut runtime,
+                    task_context: &mut task,
+                    state: &mut RoundExecutionState::default(),
+                },
+                outcome,
+            )
+            .await
+            .unwrap();
+            if cap == 0 {
+                let question = session
+                    .pending_question
+                    .as_ref()
+                    .expect("real gate must pause for approval");
+                assert_eq!(question.tool_call_id, call.id);
+                assert_eq!(question.tool_name, requested);
+            }
+            let task = task.unwrap();
+            assert_eq!(task.items[0].status, TaskItemStatus::InProgress);
+            assert_eq!(task.items[0].tool_calls.len(), 2);
+            assert!(task.items[0]
+                .tool_calls
+                .iter()
+                .all(|record| !record.success));
+            assert!(task.items[0].evidence.is_empty());
+            assert_eq!(task.version, 0);
+            assert!(!sentinel.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn real_shell_permission_gate_completed_ack_does_not_record_command_outcome() {
+        real_shell_permission_ack_is_neutral(0).await;
+    }
+
+    #[tokio::test]
+    async fn compressed_real_shell_permission_ack_remains_neutral_without_json() {
+        real_shell_permission_ack_is_neutral(1).await;
+    }
+
+    #[tokio::test]
+    async fn pending_shell_approval_and_exact_foreign_tools_keep_their_own_semantics() {
+        let task = apply_result(
+            active_task(&[true, true, true]),
+            "default::exec_command",
+            "exec_command",
+            "completed",
+            Some(0),
+            true,
+            0,
+        )
+        .await;
+        assert_eq!(task.items[0].status, TaskItemStatus::InProgress);
+        assert_eq!(task.items[0].tool_calls.len(), 3);
+        for name in ["vendor::exec_command", "vendor::write_stdin"] {
+            let mut task = active_task(&[]);
+            for round in 0..4 {
+                task = apply_result(task, name, name, "completed", Some(7), false, round).await;
+            }
+            assert_eq!(task.items[0].status, TaskItemStatus::Completed);
+            assert!(task.items[0].tool_calls.iter().all(|record| record.success));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1398,6 +1973,121 @@ mod hook_tests {
                 name: name.to_string(),
                 arguments: serde_json::json!({"value": 7}).to_string(),
             },
+        }
+    }
+
+    struct ShellFeedbackHook(String);
+
+    #[async_trait]
+    impl AgentHook for ShellFeedbackHook {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::AfterToolExecution
+        }
+
+        async fn run(&self, _: AgentHookPoint, _: &HookPayload, _: &Session) -> HookResult {
+            HookResult::InjectContext {
+                text: self.0.clone(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_post_hook_feedback_keeps_json_protocol_and_respects_output_caps() {
+        use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
+
+        let feedback = "review 界🦀\\\"\n".repeat(1_000);
+        let mut runner = crate::runtime::hooks::HookRunner::new();
+        runner.register(Arc::new(ShellFeedbackHook(feedback.clone())));
+        let config = AgentLoopConfig {
+            hook_runner: Arc::new(runner),
+            ..Default::default()
+        };
+        let tools: Arc<dyn ToolExecutor> = Arc::new(RecordingExecutor(AtomicBool::new(false)));
+        for (requested, execution_name) in [
+            ("exec_command", "exec_command"),
+            ("default::write_stdin", "write_stdin"),
+        ] {
+            for status in ["running", "completed"] {
+                for cap in [0, 1, 256] {
+                    let call = probe_call(requested);
+                    let mut payload = serde_json::json!({"status":status,"output":"captured output ".repeat(100)});
+                    if status == "running" {
+                        payload["session_id"] = "retained-handle".into();
+                    } else {
+                        payload["exit_code"] = 7.into();
+                    }
+                    let original_output = payload["output"].as_str().unwrap().to_owned();
+                    let outcome = ToolExecutionOutcome {
+                        output_cap: Some(Some(cap)),
+                        portable_tool: Some(PortableToolExecution {
+                            name: execution_name.into(),
+                            input: serde_json::json!({}),
+                        }),
+                        permission_replay_origin: None,
+                        result: Ok(ToolResult::text(true, payload.to_string())),
+                        needs_human: None,
+                        post_tool_hook_eligible: true,
+                        tool_duration: std::time::Duration::ZERO,
+                    };
+                    let (event_tx, _event_rx) = mpsc::channel(64);
+                    let mut session = Session::new("shell-feedback", "model");
+                    apply_test_outcome(&config, &tools, &call, &mut session, &event_tx, outcome)
+                        .await
+                        .unwrap();
+                    let message = session
+                        .messages
+                        .iter()
+                        .find(|message| message.tool_call_id.as_deref() == Some(call.id.as_str()))
+                        .unwrap();
+                    assert_eq!(message.tool_success, Some(true));
+                    let received: serde_json::Value =
+                        serde_json::from_str(&message.content).unwrap();
+                    assert_eq!(received["status"], status);
+                    if status == "running" {
+                        assert_eq!(received["session_id"], "retained-handle");
+                    } else {
+                        assert_eq!(received["exit_code"], 7);
+                    }
+                    let retained_feedback = received["hook_feedback"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|text| text.as_str().unwrap().len())
+                        .sum::<usize>();
+                    assert!(retained_feedback <= bamboo_hooks::portable::PORTABLE_CONTEXT_BYTES);
+                    assert_eq!(
+                        received["hook_feedback_omitted_bytes"].as_u64().unwrap() as usize
+                            + retained_feedback,
+                        feedback.trim().len(),
+                    );
+                    if cap > 0 {
+                        assert!(received.get("hook_feedback").is_none());
+                        let kept = received["output"].as_str().unwrap();
+                        assert_eq!(
+                            received["output_omitted_bytes"],
+                            original_output.len() - kept.len()
+                        );
+                        if cap == 1 {
+                            assert!(kept.is_empty());
+                        } else {
+                            assert!(
+                                TiktokenTokenCounter::default().count_text(&message.content) <= cap
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for name in ["Read", "vendor::exec_command", "vendor::write_stdin"] {
+            let mut result = Ok(ToolResult::text(
+                true,
+                "{\"status\":\"running\",\"output\":\"\"}",
+            ));
+            append_post_tool_feedback(&mut result, vec!["ordinary feedback".into()], Some(name), 1);
+            let content = result.unwrap().result;
+            assert!(content.contains("<post_tool_use_feedback>"));
+            assert!(serde_json::from_str::<serde_json::Value>(&content).is_err());
         }
     }
 
@@ -1895,6 +2585,126 @@ mod hook_tests {
                 .filter(|event| matches!(event, AgentEvent::ToolStart { .. }))
                 .count(),
             3
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_shells_reject_repairable_json_before_tool_start_or_side_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let sentinel = temp.path().join("must-not-exist");
+        let tools: Arc<dyn ToolExecutor> = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+        let schemas = tools.list_tools();
+        let session = Session::new("strict-shell-arguments", "model");
+        let config = AgentLoopConfig::default();
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        for (name, execution_name, args) in [
+            (
+                "exec_command",
+                "exec_command",
+                serde_json::json!({"cmd":format!("touch '{}'", sentinel.display())}),
+            ),
+            (
+                "default::exec_command",
+                "exec_command",
+                serde_json::json!({"cmd":format!("touch '{}'", sentinel.display())}),
+            ),
+            (
+                "write_stdin",
+                "write_stdin",
+                serde_json::json!({"session_id":"not-owned", "chars":"yes\n"}),
+            ),
+            (
+                "default::write_stdin",
+                "write_stdin",
+                serde_json::json!({"session_id":"not-owned", "eof":true}),
+            ),
+        ] {
+            let mut call = probe_call(name);
+            call.function.arguments = args.to_string();
+            call.function.arguments.pop();
+            assert!(parse_tool_args_best_effort(&call.function.arguments)
+                .1
+                .is_some());
+            // The contract starts after exact identity selection, without
+            // promoting the HostOnly pair into a model callable catalog.
+            let outcome = execute_tool_call_only_with_execution_name(
+                execution_name,
+                ToolExecutionOnlyContext {
+                    vision_support: true,
+                    output_cap: None,
+                    executing_supervisor: None,
+                    tool_call: &call,
+                    event_tx: &event_tx,
+                    metrics_collector: None,
+                    session_id: "strict-shell-arguments",
+                    root_orchestration_only: false,
+                    root_session_id: "strict-shell-arguments",
+                    round_id: "round-1",
+                    round: 0,
+                    tools: &tools,
+                    config: &config,
+                    hook_session: None,
+                    hook_runtime_state: None,
+                    session_flags: ToolExecutionSessionFlags::from_session(&session),
+                    available_tool_schemas: &schemas,
+                },
+            )
+            .await
+            .expect("selected strict-argument rejection is a per-call outcome");
+            assert!(
+                matches!(outcome.result, Err(ref error) if error.contains("invalid JSON arguments"))
+            );
+            assert!(!outcome.post_tool_hook_eligible);
+            assert!(!sentinel.exists());
+        }
+        assert!(std::iter::from_fn(|| event_rx.try_recv().ok())
+            .all(|event| !matches!(event, AgentEvent::ToolStart { .. })));
+
+        let concrete = Arc::new(NameRecordingExecutor::new(&[
+            "vendor::exec_command",
+            "vendor::write_stdin",
+        ]));
+        let tools: Arc<dyn ToolExecutor> = concrete.clone();
+        let schemas = tools.list_tools();
+        for name in ["vendor::exec_command", "vendor::write_stdin"] {
+            let mut call = probe_call(name);
+            call.function.arguments = "{\"ordinary\":true".into();
+            // Exact foreign identities retain ordinary argument behavior after
+            // selection, independently of pre-promotion catalog eligibility.
+            let outcome = execute_tool_call_only_with_execution_name(
+                name,
+                ToolExecutionOnlyContext {
+                    vision_support: true,
+                    output_cap: None,
+                    executing_supervisor: None,
+                    tool_call: &call,
+                    event_tx: &event_tx,
+                    metrics_collector: None,
+                    session_id: "strict-shell-arguments",
+                    root_orchestration_only: false,
+                    root_session_id: "strict-shell-arguments",
+                    round_id: "round-1",
+                    round: 0,
+                    tools: &tools,
+                    config: &config,
+                    hook_session: None,
+                    hook_runtime_state: None,
+                    session_flags: ToolExecutionSessionFlags::from_session(&session),
+                    available_tool_schemas: &schemas,
+                },
+            )
+            .await
+            .expect("selected foreign execution is a per-call outcome");
+            assert!(
+                outcome.result.is_ok(),
+                "{name}: {:?}",
+                outcome.result.as_ref().err()
+            );
+            assert_eq!(outcome.portable_tool.unwrap().execution_name(), name);
+        }
+        assert_eq!(
+            concrete.entered(),
+            ["vendor::exec_command", "vendor::write_stdin"]
         );
     }
 
