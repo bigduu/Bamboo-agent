@@ -1,13 +1,23 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
+use actix_web::web;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::ToolSchema;
-use bamboo_agent_core::{Message, Session};
+use bamboo_agent_core::{AgentEvent, Message, Session};
+use bamboo_engine::execution::{
+    reserve_session_execution, AgentStatus, SessionExecutionReserveOutcome,
+};
 use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
 use futures::stream;
 use serde_json::json;
 
 use super::AppState;
+use crate::handlers::agent::execute::runtime::{
+    spawn_agent_execution, spawn_event_forwarder_with_root_actor, SpawnAgentExecution,
+};
 
 #[derive(Default)]
 struct ModelLimitProbe {
@@ -29,6 +39,117 @@ impl LLMProvider for ModelLimitProbe {
             Ok(LLMChunk::Done),
         ])))
     }
+}
+
+async fn run_hosted_probe(
+    state: &web::Data<AppState>,
+    mut session: Session,
+    probe: Arc<ModelLimitProbe>,
+) -> u32 {
+    state
+        .agent
+        .prepare_external_session_for_execution(&mut session)
+        .await
+        .unwrap();
+    state.storage.save_session(&session).await.unwrap();
+    let session_id = session.id.clone();
+    let session_tx = state.get_session_event_sender(&session_id).await;
+    let mut events = session_tx.subscribe();
+    let mut reservation = match reserve_session_execution(
+        &state.agent,
+        &state.agent_runners,
+        &state.session_event_senders,
+        &session_id,
+        &session_tx,
+    )
+    .await
+    {
+        SessionExecutionReserveOutcome::Reserved(reservation) => reservation,
+        SessionExecutionReserveOutcome::AlreadyRunning { run_id } => {
+            panic!("fresh hosted probe already has a run: {run_id}")
+        }
+    };
+    reservation
+        .bind_root_actor(&state.agent, &session)
+        .await
+        .unwrap();
+    let writer = reservation
+        .root_actor_writer()
+        .expect("hosted Root must have its real Actor writer");
+    let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel(128);
+    let history_commit_barrier = spawn_event_forwarder_with_root_actor(
+        state.clone(),
+        session_id.clone(),
+        reservation.run_id().to_string(),
+        mpsc_rx,
+        session_tx,
+        None,
+        Some(writer),
+    );
+    spawn_agent_execution(SpawnAgentExecution {
+        state: state.clone(),
+        session_id: session_id.clone(),
+        session,
+        execution_reservation: reservation,
+        is_child_session: false,
+        provider_name: state.config.read().await.provider.clone(),
+        provider_override: Some(probe),
+        model_roster: bamboo_engine::ModelRoster {
+            model: Some("legacy-hosted-model".into()),
+            ..Default::default()
+        },
+        reasoning_effort: None,
+        reasoning_effort_source: "test".into(),
+        disabled_tools: Default::default(),
+        disabled_skill_ids: Default::default(),
+        mpsc_tx,
+        history_commit_barrier,
+        image_fallback: None,
+        gold_config: None,
+        app_data_dir: Some(state.app_data_dir.clone()),
+        run_budget: None,
+    });
+    // Resolved budgets are deliberately not persisted. Observe the actual
+    // hosted event route, then wait for its durable history and finalization.
+    let context = tokio::time::timeout(Duration::from_secs(60), async {
+        let mut context = None;
+        loop {
+            match events.recv().await.unwrap() {
+                AgentEvent::TokenBudgetUpdated { usage } => {
+                    context = Some(usage.max_context_tokens);
+                }
+                AgentEvent::SessionHistoryCommitted {
+                    session_id: committed,
+                } => {
+                    assert_eq!(committed, session_id);
+                    break context.expect("hosted provider run must publish its resolved budget");
+                }
+                AgentEvent::Error { message } => panic!("hosted probe failed: {message}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("hosted probe must publish its durable history");
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let status = state
+                .agent_runners
+                .read()
+                .await
+                .get(&session_id)
+                .map(|runner| runner.status.clone());
+            match status {
+                Some(AgentStatus::Completed) => break,
+                Some(AgentStatus::Error(error)) => panic!("hosted probe failed: {error}"),
+                Some(AgentStatus::Cancelled) => panic!("hosted probe was cancelled"),
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("hosted probe must finalize its reserved runner");
+    context
 }
 
 #[tokio::test]
@@ -66,7 +187,7 @@ async fn hosted_restart_loads_legacy_raw_model_limits_and_retains_them_until_rep
 
     // Use the real hosted constructor: it must inject the section reopened
     // from an already-installed modular layout into its assembled Agent.
-    let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+    let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
     let section = state
         .config_facade
         .as_ref()
@@ -112,23 +233,7 @@ async fn hosted_restart_loads_legacy_raw_model_limits_and_retains_them_until_rep
         let mut session = Session::new(format!("legacy-model-limit-{run}"), "legacy-hosted-model");
         session.set_project_id_meta(project.id.to_string());
         session.add_message(Message::user("finish this request"));
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(128);
-        state
-            .agent
-            .execute_direct(
-                &mut session,
-                bamboo_engine::ExecuteRequestBuilder::new(
-                    "",
-                    event_tx,
-                    tokio_util::sync::CancellationToken::new(),
-                )
-                .provider_override(probe.clone())
-                .model("legacy-hosted-model")
-                .build(),
-            )
-            .await
-            .unwrap();
-        contexts.push(session.effective_token_budget().unwrap().max_context_tokens);
+        contexts.push(Box::pin(run_hosted_probe(&state, session, probe.clone())).await);
     }
 
     assert_eq!(contexts, [48_000, 48_000, 48_000, 96_000]);
