@@ -1697,8 +1697,8 @@ async fn reload_and_apply_ordinary_sections(
         }
         let mut candidate = current.clone();
         apply_runtime_section(id, &materialized.config, &mut candidate);
-        if matches!(id, SectionId::Core | SectionId::ModelPolicy) {
-            if publish_dependent_config(
+        if matches!(id, SectionId::Core | SectionId::ModelPolicy)
+            && publish_dependent_config(
                 dependent_context,
                 config,
                 &current,
@@ -1707,27 +1707,25 @@ async fn reload_and_apply_ordinary_sections(
             )
             .await
             .is_err()
-            {
-                let revision = config_section_event_revision(&event);
-                let invalid = facade.registry().mark_runtime_degraded(
-                    id,
-                    "dependent runtime initialization failed; retaining last-known-good runtime",
-                );
-                if let Some(invalid) = invalid {
-                    if pending_root_publications
-                        .get(&id)
-                        .is_some_and(|event| config_section_event_revision(event) == revision)
-                    {
-                        let _ =
-                            confirm_legacy_root_runtime_failure(data_dir, account_sink, &invalid)
-                                .await;
-                    } else if reported_root_runtime_failures.insert((id, revision)) {
-                        publish_registry_event(account_sink, &invalid).await;
-                    }
+        {
+            let revision = config_section_event_revision(&event);
+            let invalid = facade.registry().mark_runtime_degraded(
+                id,
+                "dependent runtime initialization failed; retaining last-known-good runtime",
+            );
+            if let Some(invalid) = invalid {
+                if pending_root_publications
+                    .get(&id)
+                    .is_some_and(|event| config_section_event_revision(event) == revision)
+                {
+                    let _ =
+                        confirm_legacy_root_runtime_failure(data_dir, account_sink, &invalid).await;
+                } else if reported_root_runtime_failures.insert((id, revision)) {
+                    publish_registry_event(account_sink, &invalid).await;
                 }
-                retry_legacy_root_publication |= pending_root_publications.contains_key(&id);
-                continue;
             }
+            retry_legacy_root_publication |= pending_root_publications.contains_key(&id);
+            continue;
         }
         current = candidate;
         applied.push((id, event));
