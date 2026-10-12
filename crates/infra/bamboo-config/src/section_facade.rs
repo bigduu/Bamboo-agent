@@ -2729,9 +2729,28 @@ fn validate_model_policy(value: &ModelPolicySection) -> Result<(), String> {
     validate_json_serializable(value)
 }
 
+/// Decode the shape consumed by `bamboo_compression::limits::ModelLimit`
+/// before publishing a model-limit snapshot. This private DTO keeps the config
+/// crate independent of compression while preserving unknown row fields.
+#[derive(Deserialize)]
+struct ModelLimitRowShape {
+    #[serde(rename = "model_pattern")]
+    _model_pattern: String,
+    #[serde(rename = "max_context_tokens")]
+    _max_context_tokens: u32,
+    #[serde(default, rename = "max_output_tokens")]
+    _max_output_tokens: Option<u32>,
+    #[serde(default, rename = "safety_margin")]
+    _safety_margin: Option<u32>,
+}
+
 fn validate_model_limits(value: &ModelLimitsSection) -> Result<(), String> {
-    if value.0.iter().any(|entry| !entry.is_object()) {
-        return Err("model limit entries must be objects".to_string());
+    for (index, row) in value.0.iter().enumerate() {
+        if !row.is_object() {
+            return Err(format!("model limit entry {index}: expected an object"));
+        }
+        serde_json::from_value::<ModelLimitRowShape>(row.clone())
+            .map_err(|error| format!("model limit entry {index}: {error}"))?;
     }
     validate_json_serializable(value)
 }
@@ -6519,6 +6538,44 @@ mod tests {
     }
 
     #[test]
+    fn model_limit_validation_accepts_compression_shape_and_preserves_unknown_fields() {
+        let section = ModelLimitsSection(vec![json!({
+            "model_pattern": "model-family",
+            "max_context_tokens": 0,
+            "max_output_tokens": null,
+            "safety_margin": 0,
+            "future_option": {"enabled": true}
+        })]);
+        validate_model_limits(&section).unwrap();
+        assert_eq!(section.0[0]["future_option"]["enabled"], true);
+        validate_model_limits(&ModelLimitsSection(vec![json!({
+            "model_pattern": "model",
+            "max_context_tokens": u32::MAX
+        })]))
+        .unwrap();
+    }
+
+    #[test]
+    fn model_limit_validation_rejects_rows_the_runtime_cannot_decode() {
+        for row in [
+            json!(["model", 48_000, null, null]),
+            json!({}),
+            json!({"model_pattern": "model"}),
+            json!({"model_pattern": 42, "max_context_tokens": 48_000}),
+            json!({"model_pattern": "model", "max_context_tokens": -1}),
+            json!({"model_pattern": "model", "max_context_tokens": u64::MAX}),
+            json!({"model_pattern": "model", "max_context_tokens": "48000"}),
+            json!({"model_pattern": "model", "max_context_tokens": 48_000, "max_output_tokens": -1}),
+            json!({"model_pattern": "model", "max_context_tokens": 48_000, "safety_margin": "500"}),
+        ] {
+            assert!(
+                validate_model_limits(&ModelLimitsSection(vec![row.clone()])).is_err(),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
     fn provider_api_metadata_scrubber_matches_durable_credential_contexts() {
         let original = json!({
             "headless_auth": true,
@@ -7395,7 +7452,9 @@ mod tests {
 
         let projection = SectionProjection::from_config(
             &config,
-            ModelLimitsSection(vec![json!({"model_pattern": "gpt-*", "max_tokens": 42})]),
+            ModelLimitsSection(vec![
+                json!({"model_pattern": "gpt-*", "max_context_tokens": 42, "max_tokens": 42}),
+            ]),
         )
         .unwrap();
         assert_eq!(projection.core.extra["future_root_key"]["nested"], true);
@@ -7661,7 +7720,7 @@ mod tests {
         );
         write_json(
             &dir.path().join("model_limits.json"),
-            &json!([{"model_pattern": "future-*", "custom": {"kept": true}}]),
+            &json!([{"model_pattern": "future-*", "max_context_tokens": 48_000, "custom": {"kept": true}}]),
         );
         write_json(
             &dir.path().join("mcp.json"),
@@ -9338,6 +9397,7 @@ mod tests {
                 },
                 "model_limits": [{
                     "model_pattern": "future-*",
+                    "max_context_tokens": 48_000,
                     "future_limit": {"nested": "kept"}
                 }]
             }),

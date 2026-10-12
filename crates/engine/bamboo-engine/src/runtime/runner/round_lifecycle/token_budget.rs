@@ -182,8 +182,9 @@ async fn resolve_token_budget_with_model_limits_path(
     // the server context bar, `estimate_context_compression_exposure` — sees the
     // same limits via `Session::effective_token_budget` instead of `None`
     // (issue #20 bug 1). This runtime snapshot is never used to skip resolution:
-    // every new round re-reads `model_limits.json` and refreshes provider
-    // metadata, so an edit takes effect in an already-running session.
+    // every new round reads the host's latest validated section (or the
+    // standalone model_limits.json) and refreshes provider metadata, so an edit
+    // takes effect in an already-running session.
     session.resolved_token_budget = Some((model_name.to_string(), resolved.clone()));
 
     resolved
@@ -203,7 +204,19 @@ async fn resolve_configured_model_limit(
     purpose: &str,
 ) -> Option<ModelLimit> {
     let mut dedicated_registry = ModelLimitsRegistry::with_config_path(model_limits_path);
-    if let Err(error) = dedicated_registry.load_user_config().await {
+    let loaded = if let Some(section) = &config.model_limits_section {
+        let snapshot = section.snapshot();
+        serde_json::from_value::<Vec<ModelLimit>>(serde_json::Value::Array(snapshot.data.0.clone()))
+            .map(|limits| {
+                for limit in limits {
+                    dedicated_registry.add_limit(limit);
+                }
+            })
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    } else {
+        dedicated_registry.load_user_config().await
+    };
+    if let Err(error) = loaded {
         if error.kind() == std::io::ErrorKind::InvalidData {
             let error_fingerprint = error.to_string();
             let key = ("invalid-model-limits-file", model_limits_path);
@@ -213,7 +226,7 @@ async fn resolve_configured_model_limit(
                     purpose,
                     error = %error,
                     path = ?model_limits_path,
-                    "Failed to load model_limits.json; checking legacy configured limits"
+                    "Failed to resolve configured model limits; checking legacy configured limits"
                 );
             } else {
                 tracing::debug!(
@@ -221,7 +234,7 @@ async fn resolve_configured_model_limit(
                     purpose,
                     error = %error,
                     path = ?model_limits_path,
-                    "Failed to load model_limits.json; checking legacy configured limits"
+                    "Failed to resolve configured model limits; checking legacy configured limits"
                 );
             }
         } else {
@@ -230,7 +243,7 @@ async fn resolve_configured_model_limit(
                 purpose,
                 error = %error,
                 path = ?model_limits_path,
-                "Failed to load model_limits.json; checking legacy configured limits"
+                "Failed to resolve configured model limits; checking legacy configured limits"
             );
         }
     } else if let Some(limit) = dedicated_registry.get(model_name) {
@@ -378,6 +391,171 @@ mod tests {
         let bad = serde_json::json!({ "not": "an array" });
         apply_legacy_model_limits(&mut registry, Some(&bad));
         assert!(registry.get("legacy-model").is_none());
+    }
+
+    fn write_snapshot_limit(path: &Path, revision: u64, model: &str, context: u32) {
+        std::fs::write(
+            path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "revision": revision,
+                "data": [{
+                    "model_pattern": model,
+                    "max_context_tokens": context,
+                    "max_output_tokens": 4_000,
+                    "safety_margin": 400
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hosted_model_limits_follow_live_lkg_across_rounds_and_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let facade = bamboo_config::ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let section = facade.registry().model_limits.clone();
+        let path = dir.path().join("model_limits.json");
+        let model = "hosted-live-model-1861";
+        let first_revision = section.snapshot().revision + 1;
+        write_snapshot_limit(&path, first_revision, model, 48_000);
+        section.reload();
+        assert_eq!(
+            section.snapshot().status,
+            bamboo_config::SectionStatus::Healthy
+        );
+
+        let config = AgentLoopConfig {
+            app_data_dir: Some(dir.path().to_path_buf()),
+            model_limits_section: Some(section.clone()),
+            provider_type: Some("copilot".into()),
+            ..Default::default()
+        };
+        let provider = MetadataProvider {
+            models: vec![ProviderModelInfo {
+                id: model.into(),
+                max_context_tokens: Some(128_000),
+                max_output_tokens: Some(16_000),
+            }],
+        };
+        let mut session = Session::new("hosted-live", model);
+        let first = resolve_token_budget(&mut session, &config, model, &provider).await;
+        assert_eq!(first.max_context_tokens, 48_000);
+
+        // A disk edit is not authority until the host's existing watcher has
+        // validated and published it. Budget resolution must not read it itself.
+        write_snapshot_limit(&path, first_revision + 1, model, 72_000);
+        let unpublished = resolve_token_budget(&mut session, &config, model, &provider).await;
+        assert_eq!(unpublished.max_context_tokens, 48_000);
+        section.reload();
+        let next_round = resolve_token_budget(&mut session, &config, model, &provider).await;
+        assert_eq!(next_round.max_context_tokens, 72_000);
+
+        for corrupt in [
+            "{invalid".to_string(),
+            serde_json::json!({
+                "schema_version": 1,
+                "revision": first_revision + 2,
+                "data": [{}]
+            })
+            .to_string(),
+        ] {
+            std::fs::write(&path, corrupt).unwrap();
+            section.reload();
+            let invalid = section.snapshot();
+            assert_ne!(invalid.status, bamboo_config::SectionStatus::Healthy);
+            assert!(invalid.last_error.is_some());
+            assert_eq!(invalid.revision, first_revision + 1);
+            let after_corruption =
+                resolve_token_budget(&mut session, &config, model, &provider).await;
+            assert_eq!(after_corruption.max_context_tokens, 72_000);
+        }
+        let auxiliary = resolve_auxiliary_token_budget(&config, model, &provider).await;
+        assert_eq!(auxiliary.max_context_tokens, 72_000);
+
+        std::fs::remove_file(&path).unwrap();
+        section.reload();
+        assert_ne!(
+            section.snapshot().status,
+            bamboo_config::SectionStatus::Healthy
+        );
+        let after_deletion = resolve_token_budget(&mut session, &config, model, &provider).await;
+        assert_eq!(after_deletion.max_context_tokens, 72_000);
+
+        write_snapshot_limit(&path, first_revision + 2, model, 96_000);
+        section.reload();
+        assert_eq!(
+            section.snapshot().status,
+            bamboo_config::SectionStatus::Healthy
+        );
+        assert!(section.snapshot().last_error.is_none());
+        let repaired = resolve_token_budget(&mut session, &config, model, &provider).await;
+        assert_eq!(repaired.max_context_tokens, 96_000);
+        assert_eq!(
+            session
+                .resolved_token_budget
+                .as_ref()
+                .unwrap()
+                .1
+                .max_context_tokens,
+            96_000
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_model_limit_sections_are_isolated_and_keep_override_precedence() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let model = "isolated-family-1861-latest";
+        let mut configs = Vec::new();
+        for (dir, context) in [(&first_dir, 48_000), (&second_dir, 80_000)] {
+            let facade = bamboo_config::ConfigFacade::open_or_migrate(dir.path()).unwrap();
+            let section = facade.registry().model_limits.clone();
+            write_snapshot_limit(
+                &dir.path().join("model_limits.json"),
+                section.snapshot().revision + 1,
+                "isolated-family-1861",
+                context,
+            );
+            section.reload();
+            configs.push(AgentLoopConfig {
+                model_limits_section: Some(section),
+                // Even an exact legacy entry cannot shadow the dedicated
+                // section's higher-priority family pattern.
+                legacy_model_limits: Some(serde_json::json!([{
+                    "model_pattern": model,
+                    "max_context_tokens": 160_000
+                }, {
+                    "model_pattern": "legacy-only-1861",
+                    "max_context_tokens": 24_000
+                }])),
+                ..Default::default()
+            });
+        }
+        let provider = MetadataProvider::default();
+        let mut session = Session::new("isolated-model-limits", model);
+        for (config, context) in configs.iter().zip([48_000, 80_000]) {
+            let budget = resolve_token_budget(&mut session, config, model, &provider).await;
+            assert_eq!(budget.max_context_tokens, context);
+            let legacy =
+                resolve_token_budget(&mut session, config, "legacy-only-1861", &provider).await;
+            assert_eq!(legacy.max_context_tokens, 24_000);
+        }
+
+        let explicit =
+            TokenBudget::new(20_000, 2_000, bamboo_compression::BudgetStrategy::default());
+        configs[0].token_budget = Some(explicit.clone());
+        let configured = resolve_token_budget(&mut session, &configs[0], model, &provider).await;
+        assert_eq!(configured.max_context_tokens, 20_000);
+        session.token_budget = Some(TokenBudget::new(
+            12_000,
+            1_000,
+            bamboo_compression::BudgetStrategy::default(),
+        ));
+        let session_override =
+            resolve_token_budget(&mut session, &configs[0], model, &provider).await;
+        assert_eq!(session_override.max_context_tokens, 12_000);
     }
 
     #[tokio::test]

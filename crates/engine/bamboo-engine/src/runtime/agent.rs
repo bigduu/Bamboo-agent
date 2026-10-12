@@ -623,6 +623,16 @@ impl AgentBuilder {
         self
     }
 
+    /// Resolve model limits from a host-owned last-known-good section on each
+    /// round instead of reopening the instance's configuration file.
+    pub fn model_limits_section(
+        mut self,
+        section: Arc<bamboo_config::LiveSection<bamboo_config::ModelLimitsSection>>,
+    ) -> Self {
+        self.inner = self.inner.model_limits_section(section);
+        self
+    }
+
     pub fn permission_config(mut self, v: Arc<bamboo_tools::permission::PermissionConfig>) -> Self {
         self.inner = self.inner.permission_config(v);
         self
