@@ -517,115 +517,125 @@ async fn run_config_snapshot(
                     matcher.is_match(input["tool_name"].as_str().unwrap_or(""))
                 })
             };
-            let selected_input = if matches(&input) {
-                &input
-            } else if let Some(legacy) = legacy_inputs.iter().find(|legacy| matches(legacy)) {
-                legacy
+            // Canonical/wildcard groups run once. Legacy-only groups evaluate
+            // both operations of a combined continuation so an output-side
+            // restriction is not skipped after matching its stdin/kill side.
+            let selected_inputs: Vec<_> = if matches(&input) {
+                vec![&input]
             } else {
-                continue;
+                legacy_inputs
+                    .iter()
+                    .filter(|legacy| matches(legacy))
+                    .collect()
             };
-            let bytes = serde_json::to_vec(selected_input).map_err(|e| e.to_string())?;
-            for command in &group.hooks {
-                let _operation = bamboo_plugin::registry::PLUGIN_OPERATION_LOCK.lock().await;
-                // A preceding command may have changed its bundle. Recheck at
-                // every spawn boundary, not merely once at the lifecycle seam.
-                let review_check: Result<(), String> = async {
-                    let store = InstalledPlugins::load(&reviewed.registry_path)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let installed = store
-                        .get_unique(&reviewed.receipt.plugin_id)
-                        .map_err(|e| e.to_string())?
-                        .ok_or("plugin uninstalled before execution")?;
-                    if installed.status != PluginInstallStatus::Installed
-                        || installed.version != reviewed.receipt.version
-                        || !installed.registered.hooks.iter().any(|hook| {
-                            hook.config == reviewed.receipt.config
-                                && hook.plugin_id == installed.id
-                                && hook.version == installed.version
-                                && hook.state(reviewed_digest) == HookState::Active
-                        })
-                    {
-                        return Err("plugin hook execution trust revoked before spawn".into());
-                    }
-                    let current_manifest: PluginManifest = serde_json::from_slice(
-                        &tokio::fs::read(root.join("plugin.json"))
+            for selected_input in selected_inputs {
+                let bytes = serde_json::to_vec(selected_input).map_err(|e| e.to_string())?;
+                for command in &group.hooks {
+                    let _operation = bamboo_plugin::registry::PLUGIN_OPERATION_LOCK.lock().await;
+                    // A preceding command may have changed its bundle. Recheck at
+                    // every spawn boundary, not merely once at the lifecycle seam.
+                    let review_check: Result<(), String> = async {
+                        let store = InstalledPlugins::load(&reviewed.registry_path)
                             .await
-                            .map_err(|e| e.to_string())?,
-                    )
-                    .map_err(|e| e.to_string())?;
-                    let bundle = root.to_owned();
-                    let current = tokio::task::spawn_blocking(move || {
-                        current_manifest.validate()?;
-                        registrations(&current_manifest, &bundle)
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .map_err(|e| e.to_string())?;
-                    if !current.iter().any(|r| r.digest == reviewed_digest) {
-                        return Err("reviewed plugin bytes changed before command execution".into());
-                    }
-                    // The parsed snapshot may have come from a replacement
-                    // bundle while a managed update held this lock. If that
-                    // update rolled back, the old receipt/hash is valid again,
-                    // but commands captured from its candidate are not trusted.
-                    let current_path =
-                        bundle_path(root, reviewed.config).map_err(|e| e.to_string())?;
-                    let current_bytes = tokio::fs::read(current_path)
-                        .await
+                            .map_err(|e| e.to_string())?;
+                        let installed = store
+                            .get_unique(&reviewed.receipt.plugin_id)
+                            .map_err(|e| e.to_string())?
+                            .ok_or("plugin uninstalled before execution")?;
+                        if installed.status != PluginInstallStatus::Installed
+                            || installed.version != reviewed.receipt.version
+                            || !installed.registered.hooks.iter().any(|hook| {
+                                hook.config == reviewed.receipt.config
+                                    && hook.plugin_id == installed.id
+                                    && hook.version == installed.version
+                                    && hook.state(reviewed_digest) == HookState::Active
+                            })
+                        {
+                            return Err("plugin hook execution trust revoked before spawn".into());
+                        }
+                        let current_manifest: PluginManifest = serde_json::from_slice(
+                            &tokio::fs::read(root.join("plugin.json"))
+                                .await
+                                .map_err(|e| e.to_string())?,
+                        )
                         .map_err(|e| e.to_string())?;
-                    if current_bytes != config_bytes {
-                        return Err("hook configuration changed before command execution".into());
-                    }
-                    tokio::fs::create_dir_all(data)
+                        let bundle = root.to_owned();
+                        let current = tokio::task::spawn_blocking(move || {
+                            current_manifest.validate()?;
+                            registrations(&current_manifest, &bundle)
+                        })
                         .await
-                        .map_err(|e| e.to_string())
-                }
-                .await;
-                if let Err(error) = review_check {
-                    report.errors.push(error);
-                    return Ok(report);
-                }
-                let execution = crate::configured::execute_portable_command(
-                    &command.command,
-                    bytes.clone(),
-                    command.timeout,
-                    &cwd,
-                    root,
-                    data,
-                )
-                .await;
-                match execution.and_then(|o| interpret(event, o, stop_active)) {
-                    Ok((decision, context)) => {
-                        if !matches!(
-                            report.decision,
-                            HookResult::Deny { .. } | HookResult::Abort { .. }
-                        ) {
-                            report.decision = decision;
+                        .map_err(|e| e.to_string())?
+                        .map_err(|e| e.to_string())?;
+                        if !current.iter().any(|r| r.digest == reviewed_digest) {
+                            return Err(
+                                "reviewed plugin bytes changed before command execution".into()
+                            );
                         }
-                        if let Some(mut text) = context {
-                            let source: String = source.chars().take(512).collect();
-                            let overhead = PluginContext {
-                                source: source.clone(),
-                                text: String::new(),
-                            }
-                            .rendered_text()
-                            .len();
-                            if *remaining <= overhead {
-                                continue;
-                            }
-                            let mut end = text.len().min(*remaining - overhead);
-                            while !text.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            text.truncate(end);
-                            *remaining -= end + overhead;
-                            if !text.trim().is_empty() {
-                                report.contexts.push(PluginContext { source, text });
-                            }
+                        // The parsed snapshot may have come from a replacement
+                        // bundle while a managed update held this lock. If that
+                        // update rolled back, the old receipt/hash is valid again,
+                        // but commands captured from its candidate are not trusted.
+                        let current_path =
+                            bundle_path(root, reviewed.config).map_err(|e| e.to_string())?;
+                        let current_bytes = tokio::fs::read(current_path)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        if current_bytes != config_bytes {
+                            return Err(
+                                "hook configuration changed before command execution".into()
+                            );
                         }
+                        tokio::fs::create_dir_all(data)
+                            .await
+                            .map_err(|e| e.to_string())
                     }
-                    Err(e) => report.errors.push(e),
+                    .await;
+                    if let Err(error) = review_check {
+                        report.errors.push(error);
+                        return Ok(report);
+                    }
+                    let execution = crate::configured::execute_portable_command(
+                        &command.command,
+                        bytes.clone(),
+                        command.timeout,
+                        &cwd,
+                        root,
+                        data,
+                    )
+                    .await;
+                    match execution.and_then(|o| interpret(event, o, stop_active)) {
+                        Ok((decision, context)) => {
+                            if !matches!(
+                                report.decision,
+                                HookResult::Deny { .. } | HookResult::Abort { .. }
+                            ) {
+                                report.decision = decision;
+                            }
+                            if let Some(mut text) = context {
+                                let source: String = source.chars().take(512).collect();
+                                let overhead = PluginContext {
+                                    source: source.clone(),
+                                    text: String::new(),
+                                }
+                                .rendered_text()
+                                .len();
+                                if *remaining <= overhead {
+                                    continue;
+                                }
+                                let mut end = text.len().min(*remaining - overhead);
+                                while !text.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                text.truncate(end);
+                                *remaining -= end + overhead;
+                                if !text.trim().is_empty() {
+                                    report.contexts.push(PluginContext { source, text });
+                                }
+                            }
+                        }
+                        Err(e) => report.errors.push(e),
+                    }
                 }
             }
         }
@@ -846,6 +856,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn portable_legacy_only_overlap_evaluates_output_policy_after_input_eof_or_kill() {
+        let command = json!({"type":"command", "command":"record-envelope", "timeout":1});
+        let (temp, session, _) = fixture(vec![command.clone()]).await;
+        let root = temp.path();
+        let bundle = root.join("plugin with spaces");
+        let groups: Vec<_> = [
+            "^write_stdin$",
+            "*",
+            "^(write_stdin|BashInput|KillShell|BashOutput)$",
+            "^(BashInput|KillShell|BashOutput)$",
+        ]
+        .into_iter()
+        .map(|matcher| json!({"matcher":matcher,"hooks":[command.clone()]}))
+        .collect();
+        std::fs::write(
+            bundle.join("hooks.json"),
+            serde_json::to_vec(&json!({"hooks":{"PreToolUse":groups}})).unwrap(),
+        )
+        .unwrap();
+        let manifest: PluginManifest =
+            serde_json::from_slice(&std::fs::read(bundle.join("plugin.json")).unwrap()).unwrap();
+        let mut store = InstalledPlugins::load(&root.join("installed.json"))
+            .await
+            .unwrap();
+        store.plugins[0].registered.hooks = registrations(&manifest, &bundle).unwrap();
+        store.save(&root.join("installed.json")).await.unwrap();
+        trust(root).await;
+
+        for (args, primary_name) in [
+            (json!({"session_id":"exec", "chars":"yes\n"}), "BashInput"),
+            (json!({"session_id":"exec", "eof":true}), "BashInput"),
+            (json!({"session_id":"exec", "chars":"\u{3}"}), "KillShell"),
+        ] {
+            let recorder =
+                std::sync::Arc::new(RecordingTerminalExecutor(std::sync::Mutex::new(Vec::new())));
+            let payload = HookPayload::ToolExecution {
+                tool_name: "write_stdin".into(),
+                tool_call_id: "overlap-call".into(),
+                parsed_args: args.clone(),
+            };
+            let report = crate::with_hook_command_executor(
+                recorder.clone(),
+                run_with_tool_input(
+                    root,
+                    AgentHookPoint::BeforeToolExecution,
+                    &payload,
+                    &session,
+                    Some(&args),
+                ),
+            )
+            .await;
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert!(matches!(report.decision, HookResult::Deny { .. }));
+            let seen = recorder.0.lock().unwrap();
+            assert_eq!(seen.len(), 5);
+            for input in &seen[..3] {
+                assert_eq!(input["tool_name"], "write_stdin");
+                assert_eq!(input["tool_input"], args);
+            }
+            assert_eq!(seen[3]["tool_name"], primary_name);
+            assert_eq!(seen[4]["tool_name"], "BashOutput");
+            assert_eq!(seen[4]["tool_input"], json!({"bash_id":"exec"}));
+        }
+    }
+
+    #[tokio::test]
     async fn portable_legacy_shell_hooks_keep_command_policy_and_primary_hooks_run_once() {
         let (temp, session, _) = fixture(vec![
             json!({"type":"command", "command":"record-envelope", "timeout":1}),
@@ -939,7 +1015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portable_output_policy_covers_input_eof_and_kill_without_duplicate_groups() {
+    async fn portable_output_policy_covers_input_eof_and_kill_without_duplicate_canonical_groups() {
         let command = json!({"type":"command", "command":"record-envelope", "timeout":1});
         let (temp, session, _) = fixture(vec![command.clone()]).await;
         let root = temp.path();
@@ -1014,7 +1090,7 @@ mod tests {
                     assert!(matches!(report.decision, HookResult::Deny { .. }));
                 }
                 let seen = recorder.0.lock().unwrap();
-                assert_eq!(seen.len(), 5);
+                assert_eq!(seen.len(), 6);
                 for input in &seen[..3] {
                     assert_eq!(input["tool_name"], "write_stdin");
                     assert_eq!(input["tool_input"], args);
@@ -1022,10 +1098,12 @@ mod tests {
                 assert_eq!(seen[3]["tool_name"], primary);
                 assert!(seen[3]["tool_input"].get("yield_time_ms").is_none());
                 assert!(seen[3]["tool_input"].get("max_output_tokens").is_none());
-                assert_eq!(seen[4]["tool_name"], "BashOutput");
-                assert_eq!(seen[4]["tool_input"], json!({"bash_id":"exec"}));
-                if point == AgentHookPoint::AfterToolExecution {
-                    assert_eq!(seen[4]["tool_response"], "output");
+                for output in [&seen[4], &seen[5]] {
+                    assert_eq!(output["tool_name"], "BashOutput");
+                    assert_eq!(output["tool_input"], json!({"bash_id":"exec"}));
+                    if point == AgentHookPoint::AfterToolExecution {
+                        assert_eq!(output["tool_response"], "output");
+                    }
                 }
             }
         }

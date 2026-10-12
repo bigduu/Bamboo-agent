@@ -43,15 +43,11 @@ impl LocalChildTools {
         for denied in denied {
             // Resolve against all exact identities before applying restrictions:
             // an unavailable exact foreign::Read must never fall through to Read.
-            if let Some(name) = bamboo_domain::resolve_tool_reference_name(&denied, |name| {
-                name == "SubAgent" || inner.owns_exact_tool(name)
-            })
-            .or_else(|| {
-                // A positive ceiling can omit the old host route. Keep exact
-                // reserved legacy denials without guessing foreign suffixes.
-                bamboo_domain::legacy_shell_replacement(denied.trim())
-                    .map(|_| denied.trim().to_owned())
-            }) {
+            if let Some(name) =
+                bamboo_domain::resolve_disabled_tool_reference_name(&denied, |name| {
+                    name == "SubAgent" || inner.owns_exact_tool(name)
+                })
+            {
                 subagent_denied |= name == "SubAgent";
                 allowed.remove(&name);
                 if let Some(replacement) = bamboo_domain::legacy_shell_replacement(&name) {
@@ -551,9 +547,15 @@ mod tests {
         });
         for (denied, exec_allowed, stdin_allowed, foreign_allowed) in [
             ("Bash", false, true, true),
+            ("bash", false, true, true),
+            ("bAsH", false, true, true),
+            ("execute_command", false, true, true),
             ("BashInput", true, false, true),
+            ("bashinput", true, false, true),
             ("BashOutput", true, false, true),
+            ("bashoutput", true, false, true),
             ("KillShell", true, false, true),
+            ("killshell", true, false, true),
             ("vendor::Bash", true, true, false),
             ("default::Bash", true, true, true),
             ("unregistered::Bash", true, true, true),

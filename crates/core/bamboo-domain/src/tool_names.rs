@@ -231,6 +231,25 @@ pub fn legacy_shell_replacement(execution_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Resolve a disabled reference without losing legacy shell denials when a
+/// positive catalog omits the old route. Exact registrations keep priority.
+/// Only missing unqualified references may use this denial-only fallback;
+/// callable resolution and qualified foreign identities remain unchanged.
+pub fn resolve_disabled_tool_reference_name(
+    reference: &str,
+    contains_registered_name: impl FnMut(&str) -> bool,
+) -> Option<String> {
+    if let Some(name) = crate::resolve_tool_reference_name(reference, contains_registered_name) {
+        return Some(name);
+    }
+    let reference = reference.trim();
+    if reference.contains("::") {
+        return None;
+    }
+    let legacy = canonical_tool_name(reference);
+    legacy_shell_replacement(&legacy).map(|_| legacy)
+}
+
 /// Checks if a tool reference is a built-in tool
 pub fn is_builtin_tool(value: &str) -> bool {
     normalize_tool_ref(value).is_some()
@@ -246,6 +265,77 @@ mod tests {
         assert_eq!(legacy_shell_replacement("BashOutput"), Some("write_stdin"));
         assert_eq!(legacy_shell_replacement("vendor::Bash"), None);
         assert_eq!(legacy_shell_replacement("exec_command"), None);
+    }
+
+    #[test]
+    fn disabled_shell_fallback_reuses_only_supported_missing_unqualified_aliases() {
+        for (reference, legacy) in [
+            ("Bash", "Bash"),
+            (" bash ", "Bash"),
+            ("bAsH", "Bash"),
+            ("execute_command", "Bash"),
+            ("bashinput", "BashInput"),
+            ("bashoutput", "BashOutput"),
+            ("kIlLsHeLl", "KillShell"),
+        ] {
+            assert_eq!(
+                crate::resolve_tool_reference_name(reference, |name| name == legacy),
+                Some(legacy.to_owned()),
+            );
+            assert_eq!(
+                resolve_disabled_tool_reference_name(reference, |_| false),
+                Some(legacy.to_owned()),
+                "{reference}",
+            );
+        }
+        for reference in [
+            "",
+            "EXECUTE_COMMAND",
+            "unknown",
+            "Read",
+            "exec_command",
+            "write_stdin",
+            "vendor::Bash",
+            "default::Bash",
+            "vendor::execute_command",
+            "default::bashoutput",
+        ] {
+            assert_eq!(
+                resolve_disabled_tool_reference_name(reference, |_| false),
+                None,
+                "{reference}",
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_shell_fallback_keeps_registered_exact_and_alias_resolution_first() {
+        let registered = [
+            "Bash",
+            "bash",
+            "execute_command",
+            "vendor::Bash",
+            "default::Bash",
+            "default::execute_command",
+            "Read",
+        ];
+        for reference in registered {
+            assert_eq!(
+                resolve_disabled_tool_reference_name(reference, |name| registered.contains(&name)),
+                Some(reference.to_owned()),
+                "{reference}",
+            );
+        }
+        // A real legacy route keeps the shared resolver's qualified-alias
+        // behavior; only the additional missing-route fallback is unqualified.
+        assert_eq!(
+            resolve_disabled_tool_reference_name("default::execute_command", |name| name == "Bash"),
+            Some("Bash".to_owned()),
+        );
+        assert_eq!(
+            resolve_disabled_tool_reference_name("read_file", |name| name == "Read"),
+            Some("Read".to_owned()),
+        );
     }
 
     #[test]

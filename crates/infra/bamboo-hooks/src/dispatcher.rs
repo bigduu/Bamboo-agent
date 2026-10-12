@@ -146,64 +146,75 @@ impl HookDispatcher {
             if hook.point() != point {
                 continue;
             }
-            // Original-name and wildcard matchers keep the actual spelling.
-            // Each handler runs once, using shell compatibility only when its
-            // primary matcher did not match the original call.
-            let (selected_payload, restriction_only) = if hook.matches(payload) {
-                (payload, false)
+            // Original/resolved-name and wildcard handlers run once. A legacy-
+            // only matcher must evaluate each distinct operation it covers:
+            // stdin/kill also reads output, whose policy can independently deny.
+            let selected: Vec<_> = if hook.matches(payload) {
+                vec![(payload, false)]
             } else if let Some(resolved) = resolved_shell
                 .as_ref()
                 .filter(|resolved| hook.matches(resolved))
             {
-                (resolved, false)
-            } else if let Some(projected) =
-                legacy.iter().find(|legacy| hook.matches(&legacy.payload))
-            {
-                (&projected.payload, projected.restriction_only)
+                vec![(resolved, false)]
             } else {
-                continue;
+                legacy
+                    .iter()
+                    .filter(|projected| hook.matches(&projected.payload))
+                    .map(|projected| (&projected.payload, projected.restriction_only))
+                    .collect()
             };
 
-            let started = Instant::now();
-            let result = hook.run(point, selected_payload, session).await;
-            report.executions.push(HookExecution {
-                hook_name: hook.name().to_string(),
-                point,
-                duration_ms: started.elapsed().as_millis() as u64,
-                result: result.clone(),
-            });
+            let mut deferred_ask = false;
+            for (selected_payload, restriction_only) in selected {
+                let started = Instant::now();
+                let result = hook.run(point, selected_payload, session).await;
+                report.executions.push(HookExecution {
+                    hook_name: hook.name().to_string(),
+                    point,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    result: result.clone(),
+                });
 
-            let (result, mut contexts) = unwrap_context_result(result);
-            report.outcome.injected_contexts.append(&mut contexts);
-            let result = if restriction_only && matches!(result, HookResult::Allow) {
-                // An output-only legacy policy may restrict the read side of a
-                // combined continuation, but cannot grant stdin/kill authority.
-                HookResult::Continue
-            } else {
-                result
-            };
+                let (result, mut contexts) = unwrap_context_result(result);
+                report.outcome.injected_contexts.append(&mut contexts);
+                let result = if restriction_only && matches!(result, HookResult::Allow) {
+                    // An output-only legacy policy may restrict the read side of a
+                    // combined continuation, but cannot grant stdin/kill authority.
+                    HookResult::Continue
+                } else {
+                    result
+                };
 
-            match &result {
-                HookResult::Abort { .. }
-                | HookResult::Suspend { .. }
-                | HookResult::Deny { .. }
-                | HookResult::Ask => {
-                    if honor_control_decisions {
-                        report.outcome.decision = result;
-                        return report;
+                match &result {
+                    HookResult::Abort { .. }
+                    | HookResult::Suspend { .. }
+                    | HookResult::Deny { .. } => {
+                        if honor_control_decisions {
+                            report.outcome.decision = result;
+                            return report;
+                        }
                     }
-                }
-                HookResult::InjectContext { text } => {
-                    report.outcome.injected_contexts.push(text.clone());
-                }
-                HookResult::Mutated => {
-                    if matches!(report.outcome.decision, HookResult::Continue) {
-                        report.outcome.decision = HookResult::Mutated;
+                    HookResult::Ask => {
+                        // Approval of the input side cannot override an unchecked
+                        // output denial from this same legacy-only handler.
+                        deferred_ask |= honor_control_decisions;
                     }
+                    HookResult::InjectContext { text } => {
+                        report.outcome.injected_contexts.push(text.clone());
+                    }
+                    HookResult::Mutated => {
+                        if matches!(report.outcome.decision, HookResult::Continue) {
+                            report.outcome.decision = HookResult::Mutated;
+                        }
+                    }
+                    HookResult::Allow => report.outcome.decision = HookResult::Allow,
+                    HookResult::Continue => {}
+                    HookResult::WithContext { .. } => unreachable!("context results are unwrapped"),
                 }
-                HookResult::Allow => report.outcome.decision = HookResult::Allow,
-                HookResult::Continue => {}
-                HookResult::WithContext { .. } => unreachable!("context results are unwrapped"),
+            }
+            if deferred_ask {
+                report.outcome.decision = HookResult::Ask;
+                return report;
             }
         }
 
@@ -272,6 +283,167 @@ mod tests {
         ) -> HookResult {
             self.seen.lock().unwrap().push(payload.clone());
             self.result.clone()
+        }
+    }
+
+    struct LegacyOperationPolicyHook {
+        matcher: regex::Regex,
+        seen: Arc<Mutex<Vec<HookPayload>>>,
+        output_result: HookResult,
+        primary_result: HookResult,
+    }
+
+    #[async_trait]
+    impl AgentHook for LegacyOperationPolicyHook {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::BeforeToolExecution
+        }
+
+        fn matches(&self, payload: &HookPayload) -> bool {
+            matches!(payload, HookPayload::ToolExecution { tool_name, .. }
+                if self.matcher.is_match(tool_name))
+        }
+
+        async fn run(&self, _: AgentHookPoint, payload: &HookPayload, _: &Session) -> HookResult {
+            self.seen.lock().unwrap().push(payload.clone());
+            if matches!(payload, HookPayload::ToolExecution { tool_name, .. } if tool_name == "BashOutput")
+            {
+                self.output_result.clone()
+            } else {
+                self.primary_result.clone()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_only_overlap_output_deny_precedes_input_ask() {
+        for args in [
+            json!({"session_id":"exec", "chars":"yes"}),
+            json!({"session_id":"exec", "eof":true}),
+            json!({"session_id":"exec", "chars":char::from(3).to_string()}),
+        ] {
+            for output_result in [
+                HookResult::Deny {
+                    reason: "output remains denied".into(),
+                },
+                HookResult::Continue,
+                HookResult::Allow,
+            ] {
+                let mut dispatcher = HookDispatcher::new();
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let expected = if matches!(output_result, HookResult::Deny { .. }) {
+                    output_result.clone()
+                } else {
+                    HookResult::Ask
+                };
+                dispatcher.register(Arc::new(LegacyOperationPolicyHook {
+                    matcher: regex::Regex::new("^(BashInput|KillShell|BashOutput)$").unwrap(),
+                    seen: seen.clone(),
+                    primary_result: HookResult::Ask,
+                    output_result,
+                }));
+                let report = dispatcher
+                    .run_hooks_with_resolved_shell(
+                        AgentHookPoint::BeforeToolExecution,
+                        &HookPayload::ToolExecution {
+                            tool_name: "write_stdin".into(),
+                            tool_call_id: "ask-before-output".into(),
+                            parsed_args: args.clone(),
+                        },
+                        &Session::new("ask-before-output", "model"),
+                        Some("write_stdin"),
+                        Some(&args),
+                    )
+                    .await;
+                assert_eq!(report.outcome.decision, expected);
+                assert_eq!(report.executions.len(), 2);
+                assert!(
+                    matches!(&seen.lock().unwrap()[1], HookPayload::ToolExecution {tool_name,..} if tool_name == "BashOutput")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_only_overlap_evaluates_output_policy_after_input_eof_or_kill() {
+        for (input, primary_name) in [
+            (json!({"session_id":"exec", "chars":"yes\n"}), "BashInput"),
+            (json!({"session_id":"exec", "eof":true}), "BashInput"),
+            (json!({"session_id":"exec", "chars":"\u{3}"}), "KillShell"),
+        ] {
+            for output_result in [
+                HookResult::Deny {
+                    reason: "legacy output policy".into(),
+                },
+                HookResult::Ask,
+                HookResult::Allow,
+            ] {
+                let mut dispatcher = HookDispatcher::new();
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                for matcher in [
+                    "^default::write_stdin$",
+                    "^write_stdin$",
+                    ".*",
+                    "^(write_stdin|BashInput|KillShell|BashOutput)$",
+                ] {
+                    dispatcher.register(Arc::new(RecordingHook {
+                        point: AgentHookPoint::BeforeToolExecution,
+                        matcher: regex::Regex::new(matcher).unwrap(),
+                        seen: seen.clone(),
+                        result: HookResult::Continue,
+                    }));
+                }
+                dispatcher.register(Arc::new(LegacyOperationPolicyHook {
+                    matcher: regex::Regex::new("^(BashInput|KillShell|BashOutput)$").unwrap(),
+                    seen: seen.clone(),
+                    output_result: output_result.clone(),
+                    primary_result: HookResult::Continue,
+                }));
+                let payload = HookPayload::ToolExecution {
+                    tool_name: "default::write_stdin".into(),
+                    tool_call_id: "overlap-call".into(),
+                    parsed_args: input.clone(),
+                };
+                let report = dispatcher
+                    .run_hooks_with_resolved_shell(
+                        AgentHookPoint::BeforeToolExecution,
+                        &payload,
+                        &Session::new("overlap", "model"),
+                        Some("write_stdin"),
+                        Some(&input),
+                    )
+                    .await;
+                let expected = if matches!(output_result, HookResult::Allow) {
+                    HookResult::Continue
+                } else {
+                    output_result
+                };
+                assert_eq!(report.outcome.decision, expected);
+                assert_eq!(report.executions.len(), 6);
+                let seen = seen.lock().unwrap();
+                let names: Vec<_> = seen
+                    .iter()
+                    .map(|payload| match payload {
+                        HookPayload::ToolExecution { tool_name, .. } => tool_name.as_str(),
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                assert_eq!(
+                    names,
+                    [
+                        "default::write_stdin",
+                        "write_stdin",
+                        "default::write_stdin",
+                        "write_stdin",
+                        primary_name,
+                        "BashOutput"
+                    ]
+                );
+                assert!(
+                    matches!(&seen[5], HookPayload::ToolExecution { parsed_args, .. }
+                    if parsed_args == &json!({"bash_id":"exec"}))
+                );
+            }
         }
     }
 
@@ -401,7 +573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn combined_continuations_apply_output_restrictions_without_duplicate_handlers() {
+    async fn combined_continuations_apply_output_restrictions_without_duplicate_primary_hooks() {
         for (input, primary) in [
             (
                 json!({"session_id":"exec", "chars":"yes\n", "eof":false}),
@@ -466,7 +638,7 @@ mod tests {
                         )
                         .await;
                     assert_eq!(report.outcome.decision, control);
-                    assert_eq!(report.executions.len(), 5);
+                    assert_eq!(report.executions.len(), 6);
                     let seen = seen.lock().unwrap();
                     assert_eq!(&seen[..2], &[payload.clone(), payload]);
                     let name = |payload: &HookPayload| match payload {
@@ -475,9 +647,10 @@ mod tests {
                         _ => unreachable!(),
                     };
                     assert_eq!(name(&seen[2]), primary);
-                    assert_eq!(name(&seen[3]), "write_stdin");
-                    assert_eq!(name(&seen[4]), "BashOutput");
-                    if let HookPayload::ToolExecution { parsed_args, .. } = &seen[4] {
+                    assert_eq!(name(&seen[3]), "BashOutput");
+                    assert_eq!(name(&seen[4]), "write_stdin");
+                    assert_eq!(name(&seen[5]), "BashOutput");
+                    if let HookPayload::ToolExecution { parsed_args, .. } = &seen[5] {
                         assert_eq!(parsed_args, &json!({"bash_id":"exec"}));
                     }
                 }
