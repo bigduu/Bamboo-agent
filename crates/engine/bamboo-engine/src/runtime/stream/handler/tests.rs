@@ -219,9 +219,9 @@ async fn finalized_ordinary_arguments_keep_bounded_unicode_and_escaped_preview()
         assert!(!warning.contains("[redacted]"), "{name}: {warning}");
         assert!(!warning.contains('\n') && !warning.contains('\r'));
 
-        let warnings = finalized_tool_warnings(name, "ordinary\n\r").await;
+        let warnings = finalized_tool_warnings(name, "ordinary\n\rtail").await;
         assert_eq!(warnings.len(), 1, "{name}: {warnings:?}");
-        assert!(warnings[0].contains("args_preview=\"ordinary\\n\\r\""));
+        assert!(warnings[0].contains("args_preview=\"ordinary\\n\\rtail\""));
     }
 }
 
