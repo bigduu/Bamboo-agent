@@ -9724,6 +9724,52 @@ mod tests {
     }
 
     #[test]
+    fn pending_initial_split_rejects_legacy_writes_before_marker_publication() {
+        use crate::credential_migration::{
+            install_section_split_migration_with_fault, SectionSplitTestFault,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let mut candidate = Config::default();
+        candidate.save_to_dir(dir.path().to_path_buf()).unwrap();
+        let plan = plan_config_facade_layout(dir.path()).unwrap();
+        assert!(install_section_split_migration_with_fault(
+            dir.path(),
+            plan,
+            SectionSplitTestFault::Manifest,
+        )
+        .is_err());
+        // The journal is authoritative before any modular marker/quorum.
+        assert!(!crate::modular_authority_boundary_present(dir.path()).unwrap());
+        let paths = ["memory.json", "subagents.json", "providers.json"];
+        let before: Vec<_> = paths
+            .iter()
+            .map(|name| std::fs::read(dir.path().join(name)).unwrap())
+            .collect();
+        candidate.memory.0 = Some(MemoryConfig {
+            background_model: Some("must-not-replace-committed-split".into()),
+            ..MemoryConfig::default()
+        });
+        candidate.subagents.max_concurrent = Some(99);
+        assert!(candidate.save_memory_to_dir(dir.path()).is_err());
+        assert!(candidate.save_subagents_to_dir(dir.path()).is_err());
+        assert!(candidate.save_providers_to_dir(dir.path()).is_err());
+        for (name, bytes) in paths.iter().zip(before) {
+            assert_eq!(
+                std::fs::read(dir.path().join(name)).unwrap(),
+                bytes,
+                "{name}"
+            );
+        }
+        let recovered = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert!(recovered.effective_config().memory.is_none());
+        assert_ne!(
+            recovered.effective_config().subagents.max_concurrent,
+            Some(99)
+        );
+    }
+
+    #[test]
     fn pending_split_with_modular_quorum_never_reopens_legacy_root() {
         use crate::credential_migration::{
             install_section_split_migration_with_fault, SectionSplitTestFault,

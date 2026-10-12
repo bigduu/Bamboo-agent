@@ -4815,18 +4815,22 @@ impl Config {
     }
 
     /// Persist only the memory module, leaving every other config file untouched.
+    /// Legacy layouts only; modular layouts require a revisioned section update.
     pub fn save_memory_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
         self.memory.save_sync(data_dir)
     }
 
     /// Persist only the sub-agent module, leaving every other config file untouched.
+    /// Legacy layouts only; modular layouts require a revisioned section update.
     pub fn save_subagents_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
         self.subagents.save_sync(data_dir)
     }
 
     /// Persist only provider configuration. Provider plaintext keys are first
     /// refreshed into their encrypted at-rest representation.
+    /// Legacy layouts only; modular layouts require a revisioned section update.
     pub fn save_providers_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
+        crate::config_module::ensure_legacy_module_layout(data_dir)?;
         crate::validate_runtime_model_admission(self).map_err(anyhow::Error::msg)?;
         let mut config = self.clone();
         config.clear_legacy_provider_aliases_for_instance_mode();
