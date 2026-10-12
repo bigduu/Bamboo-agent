@@ -37,6 +37,106 @@ const SECTION_LAYOUT_COMPLETION_VERSION: u32 = 1;
 pub const COPILOT_GITHUB_ACCESS_CREDENTIAL_REF: &str = "copilot.oauth.github_access_token";
 pub const COPILOT_CHAT_CONFIG_CREDENTIAL_REF: &str = "copilot.oauth.chat_config";
 
+#[cfg(test)]
+mod observed_credential_hydration_tests {
+    use super::*;
+
+    #[test]
+    fn observed_hydration_uses_retained_document_until_explicit_reload_and_keeps_lkg() {
+        let _key = crate::encryption::set_test_encryption_key([0x63; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let reference = crate::CredentialRef::parse("provider.openai.api_key").unwrap();
+        let store = crate::CredentialStore::open(dir.path());
+        store
+            .replace(
+                reference.clone(),
+                "observed-old",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let old_revision = facade.registry().credentials.snapshot().revision;
+        let mut runtime = Config::default();
+        runtime.providers_mut().openai = Some(crate::OpenAIConfig {
+            credential_ref: Some(reference.clone()),
+            ..Default::default()
+        });
+        store
+            .replace(
+                reference,
+                "external-new",
+                crate::CredentialSource::User,
+                old_revision,
+            )
+            .unwrap();
+        assert_eq!(
+            facade
+                .hydrate_runtime_section_from_observed_credentials(
+                    SectionId::Providers,
+                    &mut runtime
+                )
+                .unwrap(),
+            old_revision
+        );
+        assert_eq!(
+            runtime.providers().openai.as_ref().unwrap().api_key,
+            "observed-old"
+        );
+        facade
+            .registry()
+            .reload_if_changed(SectionId::Credentials)
+            .unwrap();
+        let new_revision = facade.registry().credentials.snapshot().revision;
+        assert!(new_revision > old_revision);
+        runtime
+            .providers_mut()
+            .openai
+            .as_mut()
+            .unwrap()
+            .api_key
+            .clear();
+        assert_eq!(
+            facade
+                .hydrate_runtime_section_from_observed_credentials(
+                    SectionId::Providers,
+                    &mut runtime
+                )
+                .unwrap(),
+            new_revision
+        );
+        assert_eq!(
+            runtime.providers().openai.as_ref().unwrap().api_key,
+            "external-new"
+        );
+        std::fs::write(dir.path().join("credentials.json"), b"{broken").unwrap();
+        facade
+            .registry()
+            .reload_if_changed(SectionId::Credentials)
+            .unwrap();
+        runtime
+            .providers_mut()
+            .openai
+            .as_mut()
+            .unwrap()
+            .api_key
+            .clear();
+        assert_eq!(
+            facade
+                .hydrate_runtime_section_from_observed_credentials(
+                    SectionId::Providers,
+                    &mut runtime
+                )
+                .unwrap(),
+            new_revision
+        );
+        assert_eq!(
+            runtime.providers().openai.as_ref().unwrap().api_key,
+            "external-new"
+        );
+    }
+}
+
 /// Stable logical identity for every section in the accepted #597 ADR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -5656,6 +5756,42 @@ impl ConfigFacade {
 
     pub fn effective_config(&self) -> Config {
         self.registry.projection().into_config()
+    }
+
+    /// Hydrate one runtime domain from this process's retained credential
+    /// document. This is a read-only materialization: it never opens or reloads
+    /// the durable store, and returns the exact observed credential revision.
+    /// Callers must keep the resulting runtime inputs paired with that revision.
+    pub fn hydrate_runtime_section_from_observed_credentials(
+        &self,
+        section: SectionId,
+        runtime: &mut Config,
+    ) -> ConfigStoreResult<u64> {
+        let credentials = &self.registry.credentials;
+        let _operation = credentials
+            .operation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let revision = credentials.snapshot().revision;
+        let document = credentials.live_credential_document(revision)?;
+        match section {
+            SectionId::Core => runtime.hydrate_proxy_auth_from_snapshot(&document)?,
+            SectionId::Providers => {
+                runtime.hydrate_provider_credentials_from_snapshot(&document)?
+            }
+            SectionId::Mcp => runtime.hydrate_mcp_credentials_from_snapshot(&document)?,
+            SectionId::Connect => runtime.hydrate_connect_credentials_from_snapshot(&document)?,
+            SectionId::Notifications => {
+                runtime.hydrate_notification_credentials_from_snapshot(&document)?
+            }
+            _ => {
+                return Err(crate::ConfigStoreError::Validation(
+                    "observed credential hydration is unsupported for this runtime domain"
+                        .to_string(),
+                ))
+            }
+        }
+        Ok(revision)
     }
 
     pub fn data_dir(&self) -> &Path {

@@ -74,6 +74,18 @@ async fn unavailable_mcp(state: &AppState) -> MockServer {
     endpoint
 }
 
+async fn application_consumer(state: &AppState, id: &str) -> Value {
+    let _io = state.config_io_lock.lock().await;
+    let report = serde_json::to_value(state.config_application_diagnostics_locked().await).unwrap();
+    report["consumers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|consumer| consumer["id"] == id)
+        .unwrap()
+        .clone()
+}
+
 fn section(state: &AppState, id: SectionId) -> bamboo_config::SectionEnvelope<Value> {
     state
         .config_facade
@@ -266,6 +278,7 @@ async fn dependent_external_failure_retains_effective_generation_and_recovers() 
     let sink = request_sink().await;
     let replacement = request_sink().await;
     let (dir, state) = configured_state(&sink.uri()).await;
+    let before_provider = application_consumer(&state, "provider-runtime").await;
     let _unavailable = unavailable_mcp(&state).await;
     let provider = state.provider_registry.get_default().unwrap();
     external_edit(dir.path(), SectionId::Core, |data| {
@@ -294,6 +307,12 @@ async fn dependent_external_failure_retains_effective_generation_and_recovers() 
         section(&state, SectionId::Core).status,
         SectionStatus::Degraded
     );
+    let failed_provider = application_consumer(&state, "provider-runtime").await;
+    assert_eq!(
+        failed_provider["applied_dependencies"],
+        before_provider["applied_dependencies"]
+    );
+    assert_eq!(failed_provider["state"], "pending_apply");
     request(&state).await;
     external_edit(dir.path(), SectionId::Core, |data| {
         data["http_proxy"] = Value::String(sink.uri());
@@ -306,6 +325,12 @@ async fn dependent_external_failure_retains_effective_generation_and_recovers() 
     assert_eq!(
         section(&state, SectionId::Core).status,
         SectionStatus::Healthy
+    );
+    let repaired_provider = application_consumer(&state, "provider-runtime").await;
+    assert_eq!(repaired_provider["state"], "in_sync");
+    assert_eq!(
+        repaired_provider["applied_dependencies"],
+        before_provider["applied_dependencies"]
     );
 }
 

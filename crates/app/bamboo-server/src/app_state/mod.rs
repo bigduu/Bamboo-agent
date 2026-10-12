@@ -195,6 +195,10 @@ pub struct AppState {
     /// unblocked during a write's disk I/O. #126.
     pub config_io_lock: Arc<tokio::sync::Mutex<()>>,
 
+    /// Process-local consumer publication receipts; never a configuration writer.
+    pub(crate) config_application:
+        Arc<std::sync::RwLock<config_application::ConfigApplicationState>>,
+
     /// Server-owned live configuration watcher and its health envelope.
     /// The runtime handle keeps the directory watcher tasks alive.
     pub config_live_health: Arc<std::sync::RwLock<config_runtime::ConfigLiveHealth>>,
@@ -576,6 +580,7 @@ impl AppState {
 pub(crate) mod actor_events;
 mod agent_session_context;
 mod builder;
+mod config_application;
 mod config_runtime;
 pub(crate) use config_runtime::ConfigLiveHealth;
 pub(crate) use config_runtime::ConfigSectionMutationError;
