@@ -44,6 +44,39 @@ async fn configured_state(proxy: &str) -> (tempfile::TempDir, AppState) {
     (dir, state)
 }
 
+async fn unavailable_mcp(state: &AppState) -> MockServer {
+    let endpoint = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&endpoint)
+        .await;
+    let mcp: bamboo_config::McpConfig = serde_json::from_value(serde_json::json!({
+        "version":1,
+        "servers":[{
+            "id":"configured-but-unavailable",
+            "transport":{"type":"streamable_http","url":endpoint.uri(),"connect_timeout_ms":100},
+            "request_timeout_ms":500,
+            "reconnect":{"enabled":false}
+        }]
+    }))
+    .unwrap();
+    let facade = state.config_facade.as_ref().unwrap();
+    let revision = section(state, SectionId::Mcp).revision;
+    facade
+        .registry()
+        .commit_value_with_envelope(
+            SectionId::Mcp,
+            revision,
+            serde_json::to_value(&mcp).unwrap(),
+        )
+        .unwrap();
+    // Model a configured server whose bootstrap failed: its desired metadata
+    // stays effective while the manager has no usable transport to publish.
+    // A new proxy generation must retry it before committing either dependency.
+    state.config.write().await.mcp = mcp;
+    endpoint
+}
+
 fn section(state: &AppState, id: SectionId) -> bamboo_config::SectionEnvelope<Value> {
     state
         .config_facade
@@ -140,6 +173,7 @@ async fn dependent_metadata_only_edits_keep_provider_handles() {
     let _key = bamboo_config::encryption::set_test_encryption_key([0x63; 32]);
     let sink = request_sink().await;
     let (dir, state) = configured_state(&sink.uri()).await;
+    let _unavailable = unavailable_mcp(&state).await;
     let provider = state.provider_registry.get_default().unwrap();
     let mut core = section(&state, SectionId::Core);
     core.data["server"]["port"] = serde_json::json!(24_123);
@@ -197,12 +231,14 @@ async fn dependent_edits_remain_configurable_without_a_default_provider() {
 async fn dependent_typed_failure_does_not_commit_or_replace_usable_runtime() {
     let _key = bamboo_config::encryption::set_test_encryption_key([0x65; 32]);
     let sink = request_sink().await;
+    let replacement = request_sink().await;
     let (dir, state) = configured_state(&sink.uri()).await;
+    let _unavailable = unavailable_mcp(&state).await;
     let path = dir.path().join("core.json");
     let before = std::fs::read(&path).unwrap();
     let provider = state.provider_registry.get_default().unwrap();
     let mut core = section(&state, SectionId::Core);
-    core.data["http_proxy"] = serde_json::json!("http://");
+    core.data["http_proxy"] = Value::String(replacement.uri());
     assert!(matches!(
         state
             .put_ordinary_section(SectionId::Core, core.revision, core.data)
@@ -226,10 +262,23 @@ async fn dependent_typed_failure_does_not_commit_or_replace_usable_runtime() {
 async fn dependent_external_failure_retains_effective_generation_and_recovers() {
     let _key = bamboo_config::encryption::set_test_encryption_key([0x66; 32]);
     let sink = request_sink().await;
+    let replacement = request_sink().await;
     let (dir, state) = configured_state(&sink.uri()).await;
+    let _unavailable = unavailable_mcp(&state).await;
     let provider = state.provider_registry.get_default().unwrap();
     external_edit(dir.path(), SectionId::Core, |data| {
         data["http_proxy"] = serde_json::json!("http://");
+    });
+    state
+        .reload_ordinary_section_for_test(SectionId::Core)
+        .await;
+    assert_eq!(
+        section(&state, SectionId::Core).status,
+        SectionStatus::Invalid
+    );
+    assert_eq!(state.config.read().await.http_proxy, sink.uri());
+    external_edit(dir.path(), SectionId::Core, |data| {
+        data["http_proxy"] = Value::String(replacement.uri());
     });
     state
         .reload_ordinary_section_for_test(SectionId::Core)
