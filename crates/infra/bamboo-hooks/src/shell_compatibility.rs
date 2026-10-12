@@ -11,6 +11,21 @@ pub(crate) struct LegacyShellProjection {
     pub restriction_only: bool,
 }
 
+/// A resolved combined continuation needs every operation policy checked before
+/// an Ask can be approved. Keep ordinary/legacy, pure-poll and post-tool control
+/// semantics unchanged, and derive the boundary from the existing projections.
+pub fn requires_complete_shell_policy_checks(
+    point: bamboo_domain::AgentHookPoint,
+    payload: &HookPayload,
+    session: &Session,
+    original_input: Option<&Value>,
+) -> bool {
+    point == bamboo_domain::AgentHookPoint::BeforeToolExecution
+        && legacy_shell_projections(payload, session, original_input)
+            .iter()
+            .any(|projected| projected.restriction_only)
+}
+
 /// A continuation always reads output, in addition to its optional input/kill
 /// operation. Keep that secondary policy surface from granting write authority.
 pub(crate) fn legacy_shell_projections(

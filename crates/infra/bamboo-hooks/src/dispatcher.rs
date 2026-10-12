@@ -142,6 +142,14 @@ impl HookDispatcher {
             original_tool_input,
         );
 
+        let complete_operation_checks = crate::requires_complete_shell_policy_checks(
+            point,
+            resolved_shell.as_ref().unwrap_or(payload),
+            session,
+            original_tool_input,
+        );
+        let mut pending_composite_ask = false;
+
         for hook in &self.hooks {
             if hook.point() != point {
                 continue;
@@ -213,11 +221,19 @@ impl HookDispatcher {
                 }
             }
             if deferred_ask {
-                report.outcome.decision = HookResult::Ask;
-                return report;
+                if complete_operation_checks {
+                    // A separate handler may still restrict the output side.
+                    pending_composite_ask = true;
+                } else {
+                    report.outcome.decision = HookResult::Ask;
+                    return report;
+                }
             }
         }
 
+        if pending_composite_ask {
+            report.outcome.decision = HookResult::Ask;
+        }
         report
     }
 
@@ -251,6 +267,162 @@ fn unwrap_context_result(mut result: HookResult) -> (HookResult, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn combined_shell_ask_checks_later_native_output_policy() {
+        for name in ["write_stdin", "default::write_stdin"] {
+            for args in [
+                json!({"session_id":"exec", "chars":"yes"}),
+                json!({"session_id":"exec", "eof":true}),
+                json!({"session_id":"exec", "chars":"\u{3}"}),
+            ] {
+                for output in [
+                    HookResult::Deny {
+                        reason: "output denied".into(),
+                    },
+                    HookResult::Abort {
+                        reason: "output aborted".into(),
+                    },
+                    HookResult::Suspend {
+                        reason: "output suspended".into(),
+                    },
+                    HookResult::Continue,
+                    HookResult::Allow,
+                    HookResult::Mutated,
+                ] {
+                    for primary_matcher in ["^(BashInput|KillShell)$", "^write_stdin$", ".*"] {
+                        let mut dispatcher = HookDispatcher::new();
+                        let seen = Arc::new(Mutex::new(Vec::new()));
+                        for (matcher, result) in [
+                            (primary_matcher, HookResult::Ask),
+                            ("^BashOutput$", output.clone()),
+                        ] {
+                            dispatcher.register(Arc::new(RecordingHook {
+                                point: AgentHookPoint::BeforeToolExecution,
+                                matcher: regex::Regex::new(matcher).unwrap(),
+                                seen: seen.clone(),
+                                result,
+                            }));
+                        }
+                        let expected = if matches!(
+                            output,
+                            HookResult::Deny { .. }
+                                | HookResult::Abort { .. }
+                                | HookResult::Suspend { .. }
+                        ) {
+                            output.clone()
+                        } else {
+                            HookResult::Ask
+                        };
+                        let report = dispatcher
+                            .run_hooks_with_resolved_shell(
+                                AgentHookPoint::BeforeToolExecution,
+                                &HookPayload::ToolExecution {
+                                    tool_name: name.into(),
+                                    tool_call_id: "combined-ask".into(),
+                                    parsed_args: args.clone(),
+                                },
+                                &Session::new("combined-ask", "model"),
+                                Some("write_stdin"),
+                                Some(&args),
+                            )
+                            .await;
+                        assert_eq!(report.outcome.decision, expected, "{name}: {args}");
+                        assert_eq!(
+                            report.executions.len(),
+                            2,
+                            "distinct handlers must both run"
+                        );
+                        assert!(
+                            matches!(&seen.lock().unwrap()[1], HookPayload::ToolExecution { tool_name, .. } if tool_name == "BashOutput")
+                        );
+                    }
+                }
+            }
+        }
+        // These single-operation calls retain the existing Ask short circuit.
+        for (name, args) in [
+            ("BashInput", json!({"bash_id":"legacy", "input":"yes"})),
+            ("KillShell", json!({"bash_id":"legacy"})),
+            ("exec_command", json!({"cmd":"echo yes"})),
+            ("write_stdin", json!({"session_id":"exec", "chars":""})),
+            (
+                "vendor::write_stdin",
+                json!({"session_id":"foreign", "chars":"yes"}),
+            ),
+        ] {
+            let mut dispatcher = HookDispatcher::new();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            for result in [
+                HookResult::Ask,
+                HookResult::Deny {
+                    reason: "must remain skipped".into(),
+                },
+            ] {
+                dispatcher.register(Arc::new(RecordingHook {
+                    point: AgentHookPoint::BeforeToolExecution,
+                    matcher: regex::Regex::new(".*").unwrap(),
+                    seen: seen.clone(),
+                    result,
+                }));
+            }
+            let report = dispatcher
+                .run_hooks_with_resolved_shell(
+                    AgentHookPoint::BeforeToolExecution,
+                    &HookPayload::ToolExecution {
+                        tool_name: name.into(),
+                        tool_call_id: "ordinary-ask".into(),
+                        parsed_args: args.clone(),
+                    },
+                    &Session::new("ordinary-ask", "model"),
+                    Some(name),
+                    Some(&args),
+                )
+                .await;
+            assert_eq!(report.outcome.decision, HookResult::Ask, "{name}");
+            assert_eq!(report.executions.len(), 1, "{name}");
+            assert_eq!(seen.lock().unwrap().len(), 1);
+        }
+        // A combined post-tool payload keeps its prior Ask short circuit.
+        for name in ["write_stdin", "default::write_stdin"] {
+            let mut dispatcher = HookDispatcher::new();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            for result in [
+                HookResult::Ask,
+                HookResult::Deny {
+                    reason: "post-tool skipped".into(),
+                },
+            ] {
+                dispatcher.register(Arc::new(RecordingHook {
+                    point: AgentHookPoint::AfterToolExecution,
+                    matcher: regex::Regex::new(".*").unwrap(),
+                    seen: seen.clone(),
+                    result,
+                }));
+            }
+            let report = dispatcher
+                .run_hooks_with_resolved_shell(
+                    AgentHookPoint::AfterToolExecution,
+                    &HookPayload::ToolResult {
+                        tool_name: name.into(),
+                        tool_call_id: "post-ask".into(),
+                        outcome: bamboo_domain::HookToolOutcome {
+                            success: true,
+                            result: Some("done".into()),
+                            error: None,
+                            needs_human: false,
+                            duration_ms: 1,
+                        },
+                    },
+                    &Session::new("post-ask", "model"),
+                    Some("write_stdin"),
+                    Some(&json!({"session_id":"exec", "chars":"yes"})),
+                )
+                .await;
+            assert_eq!(report.outcome.decision, HookResult::Ask);
+            assert_eq!(report.executions.len(), 1);
+        }
+    }
     use super::*;
     use async_trait::async_trait;
     use serde_json::json;
