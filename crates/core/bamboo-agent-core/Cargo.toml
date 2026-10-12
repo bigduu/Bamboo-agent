@@ -24,7 +24,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
 dashmap = "6"
 base64 = "0.23"
-serde_yaml = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
