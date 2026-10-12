@@ -90,6 +90,20 @@ jobs:
       - name: Require source files to remain unchanged
         run: git diff --exit-code
 
+      - name: Require the exact clean source after execution
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse HEAD^{tree})"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          printf 'Final source C: %s, tree: %s\n' "$source_sha" "$source_tree"
+          printf '%s\n' "$source_status"
+          test "$source_sha" = "$EXPECTED_SOURCE_SHA"
+          test "$source_tree" = "$EXPECTED_SOURCE_TREE"
+          test -z "$source_status"
+
   test:
     name: Frozen source tests (recovery)
     needs: build
@@ -173,3 +187,17 @@ jobs:
 
       - name: Require source files to remain unchanged
         run: git diff --exit-code
+
+      - name: Require the exact clean source after execution
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse HEAD^{tree})"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          printf 'Final source C: %s, tree: %s\n' "$source_sha" "$source_tree"
+          printf '%s\n' "$source_status"
+          test "$source_sha" = "$EXPECTED_SOURCE_SHA"
+          test "$source_tree" = "$EXPECTED_SOURCE_TREE"
+          test -z "$source_status"

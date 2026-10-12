@@ -350,7 +350,11 @@ function assertRecoveryPolicy(source) {
   assert.match(source, /\non:\n  workflow_dispatch:\n\npermissions:\n  contents: read\n\nenv:\n/u)
   assert.match(source, new RegExp(`^  EXPECTED_SOURCE_SHA: ${recoverySha}$`, "mu"))
   assert.match(source, new RegExp(`^  EXPECTED_SOURCE_TREE: ${recoveryTree}$`, "mu"))
-  assert.doesNotMatch(source, /^\s*(?:if|continue-on-error|working-directory|defaults|strategy|container|services|secrets|environment):/mu)
+  const withoutFinalConditions = source.replaceAll(
+    "      - name: Require the exact clean source after execution\n        if: always()\n",
+    "      - name: Require the exact clean source after execution\n",
+  )
+  assert.doesNotMatch(withoutFinalConditions, /^\s*(?:if|continue-on-error|working-directory|defaults|strategy|container|services|secrets|environment):/mu)
   assert.doesNotMatch(source, /(?:actions\/(?:cache|upload-artifact|download-artifact)|rust-cache)@|\b(?:git reset|git clean|git checkout|git switch|cargo install|cargo publish)\b/u)
   assert.equal((source.match(/^permissions:/gmu) || []).length, 1)
   assert.equal((source.match(/^[ \t]+permissions:/gmu) || []).length, 0)
@@ -375,6 +379,7 @@ function assertRecoveryPolicy(source) {
       "Require and record the original Linux Rust toolchain", "Check formatting",
       ...(index === 0 ? ["Build locked Rust workspace"] : ["Compile locked Rust test targets", "Test locked Rust workspace"]),
       "Record checked source identity", "Require source files to remain unchanged",
+      "Require the exact clean source after execution",
     ])
     assert.equal(recoveryStep(recoveryJob, "Setup Node.js"), "      - name: Setup Node.js\n        uses: actions/setup-node@v7\n        with:\n          node-version: lts/*\n          package-manager-cache: false")
     assert.equal(recoveryStep(recoveryJob, "Install Rust"), "      - name: Install Rust\n        uses: dtolnay/rust-toolchain@stable\n        with:\n          toolchain: 1.99.0\n          components: rustfmt")
@@ -390,6 +395,18 @@ function assertRecoveryPolicy(source) {
     ]) {
       assert.equal(recoveryStep(recoveryJob, name), `      - name: ${name}\n${timeout ? `        timeout-minutes: ${timeout}\n` : ""}        run: ${command}${timeout ? '\n        env:\n          RUST_MIN_STACK: "8388608"' : ""}`)
     }
+    assert.equal(recoveryStep(recoveryJob, "Require the exact clean source after execution"), [
+      "      - name: Require the exact clean source after execution", "        if: always()", "        shell: bash", "        run: |",
+      "          set -euo pipefail",
+      '          source_sha="$(git rev-parse HEAD)"',
+      '          source_tree="$(git rev-parse HEAD^{tree})"',
+      '          source_status="$(git status --porcelain --untracked-files=all)"',
+      `          printf 'Final source C: %s, tree: %s\\n' "$source_sha" "$source_tree"`,
+      `          printf '%s\\n' "$source_status"`,
+      '          test "$source_sha" = "$EXPECTED_SOURCE_SHA"',
+      '          test "$source_tree" = "$EXPECTED_SOURCE_TREE"',
+      '          test -z "$source_status"',
+    ].join("\n"))
     const guard = recoveryStep(recoveryJob, "Require the exact clean candidate source")
     assert.equal(guard.split("        run: |\n")[0], "      - name: Require the exact clean candidate source\n" + (index === 0
       ? "        id: source\n"
@@ -434,6 +451,11 @@ test("frozen Test recovery preserves both original command gates and exact-C ide
     ["run: cargo test --locked\n", "run: cargo test --locked -- --skip slow\n"],
     ['RUST_MIN_STACK: "8388608"', 'RUST_MIN_STACK: "16777216"'],
     ["run: git diff --exit-code", "run: true"],
+    ["        if: always()\n", ""],
+    ["        if: always()", "        if: success()"],
+    ['source_status="$(git status --porcelain --untracked-files=all)"', 'source_status="$(git diff --name-only)"'],
+    ['source_status="$(git status --porcelain --untracked-files=all)"', 'source_status="$(git status --porcelain --untracked-files=no)"'],
+    ['test -z "$source_status"', "true"],
     ['test "$source_tree" = "$EXPECTED_SOURCE_TREE"', "true"],
     ['test "$source_sha" = "$BUILD_SOURCE_SHA"', "true"],
     ['test "$cargo_version" = "$BUILD_CARGO_VERSION"', "true"],
@@ -532,5 +554,74 @@ test("frozen Test recovery toolchain guards reject changed compilers and cross-j
     }
   } finally {
     rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test("frozen Test recovery final guards inspect actual HEAD, index and untracked files", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-recovery-final-source-"))
+  const statusTools = mkdtempSync(path.join(os.tmpdir(), "bamboo-recovery-status-failure-"))
+  const realGit = spawnSync("bash", ["-c", "command -v git"], { encoding: "utf8" })
+  assert.equal(realGit.status, 0, realGit.stderr)
+  writeFileSync(path.join(statusTools, "git"), [
+    "#!/bin/bash", 'if [[ "$1" == status ]]; then exit 23; fi', 'exec "$FIXTURE_REAL_GIT" "$@"', "",
+  ].join("\n"), { mode: 0o755 })
+  const git = (...args) => {
+    const result = spawnSync("git", args, { cwd: directory, encoding: "utf8" })
+    assert.equal(result.status, 0, result.stderr)
+    return result.stdout.trim()
+  }
+  try {
+    git("init", "--quiet")
+    writeFileSync(path.join(directory, "source.txt"), "accepted\n")
+    git("add", "source.txt")
+    const commit = (...args) => git("-c", "user.name=ci-policy", "-c", "user.email=ci-policy@example.invalid", "commit", "--quiet", ...args)
+    commit("-m", "accepted fixture")
+    const sha = git("rev-parse", "HEAD")
+    const tree = git("rev-parse", "HEAD^{tree}")
+    for (const source of [recoveryWorkflow, recoveryWorkflow.replace(/\n/gu, "\r\n")]) {
+      for (const recoveryJob of recoveryJobs(source)) {
+        const finalScript = recoveryScript(recoveryStep(recoveryJob, "Require the exact clean source after execution"))
+        const run = (env = {}) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", finalScript], {
+          cwd: directory, encoding: "utf8",
+          env: { ...process.env, EXPECTED_SOURCE_SHA: sha, EXPECTED_SOURCE_TREE: tree, ...env },
+        })
+        assert.equal(run().status, 0, "unchanged source is admitted")
+        assert.equal(run({
+          PATH: `${statusTools}${path.delimiter}${process.env.PATH}`,
+          FIXTURE_REAL_GIT: realGit.stdout.trim(),
+        }).status, 23, "git status failure must not be mistaken for a clean checkout")
+        assert.notEqual(run({ EXPECTED_SOURCE_SHA: "0".repeat(40) }).status, 0)
+        assert.notEqual(run({ EXPECTED_SOURCE_TREE: "1".repeat(40) }).status, 0)
+        writeFileSync(path.join(directory, "source.txt"), "changed by test\n")
+        assert.notEqual(run().status, 0, "unstaged source changes fail")
+        git("add", "source.txt")
+        git("diff", "--exit-code") // The original gate alone misses staged changes.
+        assert.notEqual(run().status, 0, "staged source changes fail")
+        assert.equal(git("diff", "--cached", "--name-only"), "source.txt", "guard must not erase staged evidence")
+        git("restore", "--source=HEAD", "--staged", "--worktree", "source.txt")
+        writeFileSync(path.join(directory, "unexpected.txt"), "test residue\n")
+        git("diff", "--exit-code") // The original gate alone also misses untracked files.
+        assert.notEqual(run().status, 0, "untracked files fail")
+        assert.equal(readFileSync(path.join(directory, "unexpected.txt"), "utf8"), "test residue\n", "guard must not clean untracked evidence")
+        git("add", "unexpected.txt")
+        git("diff", "--exit-code")
+        assert.notEqual(run().status, 0, "new staged files fail")
+        git("rm", "--cached", "unexpected.txt")
+        rmSync(path.join(directory, "unexpected.txt"))
+        commit("--allow-empty", "-m", "unexpected HEAD with identical tree")
+        assert.equal(git("rev-parse", "HEAD^{tree}"), tree)
+        assert.notEqual(run().status, 0, "a different clean HEAD with the same tree fails")
+        git("checkout", "--detach", sha)
+        writeFileSync(path.join(directory, "source.txt"), "new clean source\n")
+        git("add", "source.txt")
+        commit("-m", "unexpected changed tree")
+        assert.notEqual(run({ EXPECTED_SOURCE_SHA: git("rev-parse", "HEAD") }).status, 0, "a changed tree fails even if its HEAD is supplied")
+        git("checkout", "--detach", sha)
+        assert.equal(run().status, 0, "restored accepted fixture is admitted")
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+    rmSync(statusTools, { recursive: true, force: true })
   }
 })
