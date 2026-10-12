@@ -168,7 +168,41 @@ struct Setup {
 
 struct Inspection {
     report: Setup,
-    command: Option<PathBuf>,
+    command: Option<VerifiedCli>,
+}
+
+/// Keep the exact verified bytes private and alive until the owned child is reaped.
+struct VerifiedCli {
+    _temporary: tempfile::TempDir,
+    executable: PathBuf,
+}
+
+impl VerifiedCli {
+    async fn snapshot(bytes: &[u8], temporary: tempfile::TempDir) -> Result<Self, ()> {
+        let executable = temporary
+            .path()
+            .join(if cfg!(windows) { "nova.exe" } else { "nova" });
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o500);
+        let mut file = options.open(&executable).await.map_err(|_| ())?;
+        file.write_all(bytes).await.map_err(|_| ())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o500))
+                .await
+                .map_err(|_| ())?;
+        }
+        file.sync_all().await.map_err(|_| ())?;
+        // Close every writer before spawning (also avoids ETXTBSY on Linux).
+        drop(file.into_std().await);
+        Ok(Self {
+            _temporary: temporary,
+            executable,
+        })
+    }
 }
 
 fn trust_reason(trust: &PluginTrustConfig, url: &str) -> Option<&'static str> {
@@ -195,33 +229,45 @@ fn plain(metadata: &std::fs::Metadata) -> bool {
     !metadata.file_type().is_symlink()
 }
 
-async fn regular_hash(path: &Path, expected: &str, max: u64) -> Result<(), ()> {
-    let metadata = tokio::fs::symlink_metadata(path).await.map_err(|_| ())?;
+async fn verified_bytes(
+    path: &Path,
+    expected: &str,
+    max: u64,
+    executable: bool,
+) -> Result<Vec<u8>, ()> {
+    if !plain(&tokio::fs::symlink_metadata(path).await.map_err(|_| ())?) {
+        return Err(());
+    }
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path).await.map_err(|_| ())?;
+    let metadata = file.metadata().await.map_err(|_| ())?;
     if !plain(&metadata) || !metadata.is_file() || metadata.len() == 0 || metadata.len() > max {
         return Err(());
     }
-    let mut reader = tokio::fs::File::open(path)
-        .await
-        .map_err(|_| ())?
-        .take(max + 1);
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 16384];
-    let mut total = 0;
-    loop {
-        let count = reader.read(&mut buffer).await.map_err(|_| ())?;
-        if count == 0 {
-            break;
-        }
-        total += count as u64;
-        if total > max {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if executable && metadata.permissions().mode() & 0o111 == 0 {
             return Err(());
         }
-        hasher.update(&buffer[..count]);
     }
-    if total != metadata.len() || !hex::encode(hasher.finalize()).eq_ignore_ascii_case(expected) {
+    #[cfg(not(unix))]
+    let _ = executable;
+    let mut bytes = Vec::new();
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| ())?;
+    if bytes.len() as u64 != metadata.len()
+        || bytes.len() as u64 > max
+        || !hex::encode(Sha256::digest(&bytes)).eq_ignore_ascii_case(expected)
+    {
         return Err(());
     }
-    Ok(())
+    Ok(bytes)
 }
 
 async fn validated_cli(
@@ -229,7 +275,7 @@ async fn validated_cli(
     entry: &InstalledPlugin,
     release: &ConnectorRelease,
     os: &str,
-) -> Result<(PathBuf, PluginManifest), ()> {
+) -> Result<(VerifiedCli, PluginManifest), ()> {
     if entry.status != PluginInstallStatus::Installed
         || entry.id != "nova"
         || entry.version != release.version
@@ -262,10 +308,9 @@ async fn validated_cli(
         return Err(());
     }
     let manifest_path = root.join("plugins/nova/plugin.json");
-    regular_hash(&manifest_path, &release.manifest_sha256, 64 * 1024).await?;
-    let manifest: PluginManifest =
-        serde_json::from_slice(&tokio::fs::read(&manifest_path).await.map_err(|_| ())?)
-            .map_err(|_| ())?;
+    let manifest_bytes =
+        verified_bytes(&manifest_path, &release.manifest_sha256, 64 * 1024, false).await?;
+    let manifest: PluginManifest = serde_json::from_slice(&manifest_bytes).map_err(|_| ())?;
     manifest.validate().map_err(|_| ())?;
     if manifest.id != "nova"
         || manifest.version != entry.version
@@ -274,26 +319,21 @@ async fn validated_cli(
         return Err(());
     }
     let command = directory.join(if os == "windows" { "nova.exe" } else { "nova" });
-    regular_hash(
+    let bytes = verified_bytes(
         &command,
         release.executable_sha256.get(os).ok_or(())?,
         MAX_ARCHIVE,
+        true,
     )
     .await?;
+    let mut private = tempfile::Builder::new();
+    private.prefix("bamboo-nova-cli-");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if tokio::fs::metadata(&command)
-            .await
-            .map_err(|_| ())?
-            .permissions()
-            .mode()
-            & 0o111
-            == 0
-        {
-            return Err(());
-        }
+        private.permissions(std::fs::Permissions::from_mode(0o700));
     }
+    let command = VerifiedCli::snapshot(&bytes, private.tempdir().map_err(|_| ())?).await?;
     Ok((command, manifest))
 }
 
@@ -377,12 +417,12 @@ impl Drop for ProcessGroup {
 }
 
 async fn run_cli(
-    command: &Path,
+    command: &VerifiedCli,
     args: &[String],
     timeout: Duration,
     legacy: bool,
 ) -> Result<AppReport, &'static str> {
-    let mut process = tokio::process::Command::new(command);
+    let mut process = tokio::process::Command::new(&command.executable);
     process
         .args(args)
         .stdin(Stdio::null())
@@ -654,11 +694,21 @@ async fn save_archive(
 }
 
 pub async fn nova_app(state: web::Data<AppState>) -> HttpResponse {
-    let installer = ServerPluginInstaller::new(state.clone());
-    let _guard = installer.begin_operation().await;
-    match inspect_locked(&state, Host::detect(), &accepted_catalog()).await {
-        Ok(inspection) => HttpResponse::Ok().json(inspection.report),
-        Err(error) => plugin_error_response(&error),
+    // HTTP cancellation must not release the snapshot/lock before bounded child cleanup.
+    match actix_web::rt::spawn(async move {
+        let installer = ServerPluginInstaller::new(state.clone());
+        let _guard = installer.begin_operation().await;
+        inspect_locked(&state, Host::detect(), &accepted_catalog())
+            .await
+            .map(|inspection| inspection.report)
+    })
+    .await
+    {
+        Ok(Ok(report)) => HttpResponse::Ok().json(report),
+        Ok(Err(error)) => plugin_error_response(&error),
+        Err(_) => plugin_error_response(&bamboo_plugin::PluginError::Io(std::io::Error::other(
+            "Nova status task failed",
+        ))),
     }
 }
 

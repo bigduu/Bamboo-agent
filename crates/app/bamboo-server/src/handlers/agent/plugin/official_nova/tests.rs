@@ -67,6 +67,31 @@ fn quoted(path: &Path) -> String {
 }
 
 #[cfg(unix)]
+async fn run_fixture(
+    path: &Path,
+    args: &[String],
+    timeout: Duration,
+    legacy: bool,
+) -> Result<AppReport, &'static str> {
+    let temporary = tempfile::tempdir().unwrap();
+    let command = if path.exists() {
+        VerifiedCli::snapshot(&tokio::fs::read(path).await.unwrap(), temporary)
+            .await
+            .unwrap()
+    } else {
+        VerifiedCli {
+            executable: temporary.path().join("missing"),
+            _temporary: temporary,
+        }
+    };
+    let private = command._temporary.path().to_path_buf();
+    let result = run_cli(&command, args, timeout, legacy).await;
+    drop(command);
+    assert!(!private.exists());
+    result
+}
+
+#[cfg(unix)]
 async fn fixture(
     body: &str,
 ) -> (
@@ -440,6 +465,108 @@ async fn tampered_managed_manifest_or_executable_prevents_cli_execution() {
 
 #[cfg(unix)]
 #[actix_web::test]
+async fn verified_snapshot_executes_original_bytes_despite_managed_path_replacement() {
+    use std::os::unix::fs::PermissionsExt;
+    for atomic in [true, false] {
+        let (_dir, state, catalog, entry) =
+            fixture(&format!("printf '%s\\n' '{}'", missing())).await;
+        let (verified, _) = validated_cli(&state, &entry, &catalog.connectors[0], "macos")
+            .await
+            .unwrap();
+        let snapshot = verified.executable.clone();
+        let private = verified._temporary.path().to_path_buf();
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&snapshot).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        let command = entry.plugin_dir.join("bin/macos/nova");
+        let marker = state.app_data_dir.join("unverified-executed");
+        let replacement = if atomic {
+            command.with_extension("replacement")
+        } else {
+            command.clone()
+        };
+        script(
+            &replacement,
+            &format!(": > {}; printf '%s\\n' '{}'", quoted(&marker), missing()),
+        )
+        .await;
+        if atomic {
+            tokio::fs::rename(&replacement, &command).await.unwrap();
+        }
+        let report = run_cli(
+            &verified,
+            &["app".into(), "status".into()],
+            STATUS_TIMEOUT,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.state, AppStateKind::Missing);
+        assert!(
+            !marker.exists(),
+            "the replaced managed executable must never run"
+        );
+        assert!(
+            validated_cli(&state, &entry, &catalog.connectors[0], "macos")
+                .await
+                .is_err()
+        );
+        drop(verified);
+        assert!(!snapshot.exists());
+        assert!(!private.exists());
+    }
+}
+
+#[cfg(unix)]
+#[actix_web::test]
+async fn nonexecutable_file_and_fifo_fail_validation_without_blocking() {
+    use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+    let (_dir, state, catalog, entry) = fixture("exit 66").await;
+    let command = entry.plugin_dir.join("bin/macos/nova");
+    tokio::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o600))
+        .await
+        .unwrap();
+    assert!(
+        validated_cli(&state, &entry, &catalog.connectors[0], "macos")
+            .await
+            .is_err()
+    );
+    tokio::fs::remove_file(&command).await.unwrap();
+    let fifo = std::ffi::CString::new(command.as_os_str().as_bytes()).unwrap();
+    // SAFETY: fifo is a live NUL-terminated path inside this test's temporary directory.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    assert!(tokio::time::timeout(
+        Duration::from_secs(1),
+        validated_cli(&state, &entry, &catalog.connectors[0], "macos")
+    )
+    .await
+    .expect("FIFO open must not block")
+    .is_err());
+}
+
+#[tokio::test]
+async fn snapshot_creation_failure_removes_its_owned_private_files() {
+    let temporary = tempfile::tempdir().unwrap();
+    let private = temporary.path().to_path_buf();
+    tokio::fs::write(
+        private.join(if cfg!(windows) { "nova.exe" } else { "nova" }),
+        b"occupied",
+    )
+    .await
+    .unwrap();
+    assert!(VerifiedCli::snapshot(b"must not overwrite", temporary)
+        .await
+        .is_err());
+    assert!(!private.exists());
+}
+
+#[cfg(unix)]
+#[actix_web::test]
 async fn symlinked_managed_directory_or_binary_is_not_package_owned() {
     use std::os::unix::fs::symlink;
     for relative in ["bin/macos", "bin/macos/nova"] {
@@ -546,27 +673,27 @@ async fn legacy_requires_known_legacy_receipt_and_actual_app_rejection() {
     )
     .await;
     assert_eq!(
-        run_cli(&command, &[], STATUS_TIMEOUT, true)
+        run_fixture(&command, &[], STATUS_TIMEOUT, true)
             .await
             .unwrap_err(),
         "legacy_cli_unavailable"
     );
     assert_eq!(
-        run_cli(&command, &[], STATUS_TIMEOUT, false)
+        run_fixture(&command, &[], STATUS_TIMEOUT, false)
             .await
             .unwrap_err(),
         "invalid_report"
     );
     script(&command, "printf 'not JSON'; exit 0").await;
     assert_eq!(
-        run_cli(&command, &[], STATUS_TIMEOUT, true)
+        run_fixture(&command, &[], STATUS_TIMEOUT, true)
             .await
             .unwrap_err(),
         "invalid_report"
     );
     tokio::fs::remove_file(&command).await.unwrap();
     assert_eq!(
-        run_cli(&command, &[], STATUS_TIMEOUT, true)
+        run_fixture(&command, &[], STATUS_TIMEOUT, true)
             .await
             .unwrap_err(),
         "status_failed"
@@ -587,7 +714,7 @@ async fn malformed_inconsistent_or_permission_claiming_reports_are_rejected() {
     ] {
         script(&command, &format!("printf '%s\\n' '{report}'")).await;
         assert_eq!(
-            run_cli(&command, &[], STATUS_TIMEOUT, false)
+            run_fixture(&command, &[], STATUS_TIMEOUT, false)
                 .await
                 .unwrap_err(),
             "invalid_report"
@@ -595,7 +722,7 @@ async fn malformed_inconsistent_or_permission_claiming_reports_are_rejected() {
     }
     script(&command, &format!("printf '%s\\n' '{}'; exit 1", missing())).await;
     assert_eq!(
-        run_cli(&command, &[], STATUS_TIMEOUT, false)
+        run_fixture(&command, &[], STATUS_TIMEOUT, false)
             .await
             .unwrap_err(),
         "invalid_report"
@@ -609,7 +736,7 @@ async fn output_limits_and_timeout_clean_up_the_owned_process_group() {
     let command = dir.path().join("nova");
     script(&command,"while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done").await;
     assert_eq!(
-        run_cli(&command, &[], STATUS_TIMEOUT, false)
+        run_fixture(&command, &[], STATUS_TIMEOUT, false)
             .await
             .unwrap_err(),
         "invalid_report"
@@ -621,7 +748,7 @@ async fn output_limits_and_timeout_clean_up_the_owned_process_group() {
     )
     .await;
     assert_eq!(
-        run_cli(&command, &[], Duration::from_millis(100), false)
+        run_fixture(&command, &[], Duration::from_millis(100), false)
             .await
             .unwrap_err(),
         "status_timeout"
