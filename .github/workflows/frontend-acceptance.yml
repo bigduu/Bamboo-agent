@@ -97,7 +97,7 @@ jobs:
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
-          source_tree="$(git rev-parse HEAD^{tree})"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
           source_status="$(git status --porcelain --untracked-files=all)"
           test "$source_sha" = "$EXPECTED_SHA"
           test -z "$source_status"
@@ -149,7 +149,7 @@ jobs:
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
-          source_tree="$(git rev-parse HEAD^{tree})"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
           source_status="$(git status --porcelain --untracked-files=all)"
           printf 'Final source: %s, tree: %s\n' "$source_sha" "$source_tree"
           printf '%s\n' "$source_status"
@@ -178,7 +178,7 @@ jobs:
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
-          source_tree="$(git rev-parse HEAD^{tree})"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
           source_status="$(git status --porcelain --untracked-files=all)"
           test "$source_sha" = "$EXPECTED_SHA"
           test "$source_sha" = "$BUILD_SOURCE_SHA"
@@ -246,7 +246,7 @@ jobs:
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
-          source_tree="$(git rev-parse HEAD^{tree})"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
           source_status="$(git status --porcelain --untracked-files=all)"
           printf 'Final source: %s, tree: %s\n' "$source_sha" "$source_tree"
           printf '%s\n' "$source_status"

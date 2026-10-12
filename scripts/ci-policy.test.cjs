@@ -464,7 +464,7 @@ function assertFrontendPolicy(source) {
       "        shell: bash", "        run: |",
       "          set -euo pipefail",
       '          source_sha="$(git rev-parse HEAD)"',
-      '          source_tree="$(git rev-parse HEAD^{tree})"',
+      '          source_tree="$(git rev-parse \'HEAD^{tree}\')"',
       '          source_status="$(git status --porcelain --untracked-files=all)"',
       `          printf 'Final source: %s, tree: %s\\n' "$source_sha" "$source_tree"`,
       `          printf '%s\\n' "$source_status"`,
@@ -479,6 +479,7 @@ function assertFrontendPolicy(source) {
     for (const line of ['test "$source_sha" = "$EXPECTED_SHA"', 'source_status="$(git status --porcelain --untracked-files=all)"', 'test -z "$source_status"']) {
       assert.ok(frontendScript(guard).split("\n").includes(line), `missing source guard: ${line}`)
     }
+    assert.ok(frontendScript(guard).split("\n").includes('source_tree="$(git rev-parse \'HEAD^{tree}\')"'))
     const toolchain = frontendStep(frontendJob, "Record and bind the actual Rust toolchain")
     assert.equal(toolchain.split("        run: |\n")[0], "      - name: Record and bind the actual Rust toolchain\n        id: toolchain\n" + (index === 0 ? "" :
       "        env:\n          BUILD_RUSTC_VERSION: ${{ needs.build.outputs.rustc_version }}\n          BUILD_CARGO_VERSION: ${{ needs.build.outputs.cargo_version }}\n") + "        shell: bash\n")
@@ -519,6 +520,7 @@ test("frontend acceptance preserves both original command gates and actual-head 
     ["run: cargo test --locked\n", "run: cargo test --locked -- --skip slow\n"],
     ['RUST_MIN_STACK: "8388608"', 'RUST_MIN_STACK: "16777216"'],
     ["run: git diff --exit-code", "run: true"],
+    ["git rev-parse 'HEAD^{tree}'", "git rev-parse HEAD^{tree}"],
     ["        if: always()\n", ""],
     ["        if: always()", "        if: success()"],
     ['source_status="$(git status --porcelain --untracked-files=all)"', 'source_status="$(git diff --name-only)"'],
