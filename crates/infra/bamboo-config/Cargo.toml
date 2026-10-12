@@ -10,7 +10,6 @@ license = "MIT"
 bamboo-domain = { path = "../../core/bamboo-domain" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = "0.9"
 chrono = { workspace = true }
 thiserror = { workspace = true }
 anyhow = "1"
