@@ -119,6 +119,27 @@ async fn ensure_provision_capabilities(
             crate::provision::NATIVE_TOOL_CEILING_WORKER_CAPABILITY,
         )
         .await?;
+        // The v1 acknowledgement alone only promises the original six names.
+        // Probe the expanded vocabulary before either launch path can spawn or
+        // deliver a provision; never silently reduce the selected grants.
+        if spec
+            .capabilities
+            .native_tool_ceiling
+            .as_ref()
+            .is_some_and(|ceiling| {
+                ceiling
+                    .tools
+                    .iter()
+                    .any(|name| matches!(name.as_str(), "exec_command" | "write_stdin"))
+            })
+        {
+            require_worker_capability(
+                worker_bin,
+                worker_args,
+                crate::provision::EXEC_SESSION_NATIVE_CEILING_WORKER_CAPABILITY,
+            )
+            .await?;
+        }
     }
     if spec.capabilities.child_creation_identity {
         require_worker_capability(
@@ -349,6 +370,121 @@ pub async fn spawn_worker_on_bus(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_session_native_ceiling_requires_additive_capability_before_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const EXTENSION: &str = "native_tool_ceiling_exec_sessions_v1";
+        let temp = tempfile::tempdir().unwrap();
+        let worker = temp.path().join("legacy-native-worker");
+        let marker = temp.path().join("spawned");
+        let report_path = temp.path().join("capabilities.json");
+        let fabric = temp.path().join("fabric");
+        std::fs::write(
+            &worker,
+            "#!/bin/sh\nif [ \"$3\" = --print-capabilities ]; then\ncat \"$2\"\nelse\n: > \"$1\"\ncat >/dev/null\nfi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let args = vec![
+            marker.to_str().unwrap().to_owned(),
+            report_path.to_str().unwrap().to_owned(),
+        ];
+        // Keep every other current acknowledgement: rejection must be for the
+        // expanded vocabulary, not an older required-context or birth bit.
+        let mut legacy_report = WorkerCapabilityReport::current();
+        legacy_report
+            .capabilities
+            .retain(|entry| entry != EXTENSION);
+        assert!(legacy_report.supports(crate::provision::NATIVE_TOOL_CEILING_WORKER_CAPABILITY));
+        assert!(legacy_report.supports(crate::provision::CHILD_CREATION_IDENTITY_WORKER_CAPABILITY));
+        assert!(legacy_report.supports(REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY));
+        assert!(!legacy_report.supports(EXTENSION));
+        std::fs::write(&report_path, serde_json::to_vec(&legacy_report).unwrap()).unwrap();
+        let mut spec = ProvisionSpec::from_json(
+            &serde_json::json!({
+                "version":2,
+                "identity":{"child_id":"ceiling-child","parent_id":"ceiling-root","depth":1},
+                "executor":{"kind":"bamboo_runtime"},
+                "fabric_dir":fabric,
+                "bus":{"endpoint":"ws://127.0.0.1:1","token":"fixture"},
+                "capabilities":{
+                    "enforce_permissions":true,"required_child_context":true,
+                    "child_creation_identity":true,"native_tool_ceiling_required":true,
+                    "native_tool_ceiling":{
+                        "version":1,"child_session_id":"ceiling-child",
+                        "parent_session_id":"ceiling-root","root_session_id":"ceiling-root",
+                        "created_at":chrono::Utc::now(),"spawn_depth":1,
+                        "project_id":null,"tools":[]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for names in [
+            Vec::<String>::new(),
+            vec!["Read".into()],
+            vec![
+                "Bash".into(),
+                "Edit".into(),
+                "Glob".into(),
+                "Read".into(),
+                "Task".into(),
+                "Write".into(),
+            ],
+        ] {
+            spec.capabilities
+                .native_tool_ceiling
+                .as_mut()
+                .unwrap()
+                .tools = names;
+            spec.validate().unwrap();
+            ensure_provision_capabilities(&worker, &args, &spec)
+                .await
+                .unwrap();
+        }
+        for names in [
+            vec!["exec_command".into()],
+            vec!["write_stdin".into()],
+            vec!["exec_command".into(), "write_stdin".into()],
+            vec!["Read".into(), "exec_command".into()],
+        ] {
+            spec.capabilities
+                .native_tool_ceiling
+                .as_mut()
+                .unwrap()
+                .tools = names;
+            spec.validate().unwrap();
+            let error = ensure_provision_capabilities(&worker, &args, &spec)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(EXTENSION), "{error}");
+            for result in [
+                spawn_worker(&worker, &args, &spec, Duration::from_secs(1)).await,
+                spawn_worker_on_bus(&worker, &args, &spec).await,
+            ] {
+                assert!(matches!(result, Err(ref error) if error.to_string().contains(EXTENSION)));
+                assert!(
+                    !marker.exists(),
+                    "an unsupported worker must never be spawned"
+                );
+                assert!(
+                    !fabric.exists(),
+                    "capability rejection precedes fabric creation"
+                );
+            }
+        }
+        let mut expanded_report = legacy_report;
+        expanded_report.capabilities.push(EXTENSION.into());
+        std::fs::write(&report_path, serde_json::to_vec(&expanded_report).unwrap()).unwrap();
+        ensure_provision_capabilities(&worker, &args, &spec)
+            .await
+            .unwrap();
+        assert!(!marker.exists() && !fabric.exists());
+    }
+
     use super::*;
     use crate::provision::{ChildIdentity, ExecutorSpec};
 
