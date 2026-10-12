@@ -80,6 +80,9 @@ pub async fn handle_execute(
         Ok(reservation) => reservation,
         Err(response) => return *response,
     };
+    #[cfg(test)]
+    super::tests::after_root_admission_selection(&session_id, admission_reservation.is_some())
+        .await;
     let response = handle_reserved_execute(
         state,
         session_id,
@@ -102,7 +105,7 @@ async fn handle_reserved_execute(
     admission_reservation: &mut Option<SessionExecutionReservation>,
 ) -> HttpResponse {
     let admission = match state
-        .admit_chat_for_execute_with_reservation(&session_id, admission_reservation.as_ref())
+        .admit_chat_for_execute_with_http_reservation(&session_id, admission_reservation)
         .await
     {
         Ok(admission) => admission,
