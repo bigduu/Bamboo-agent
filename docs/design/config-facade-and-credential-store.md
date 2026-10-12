@@ -70,6 +70,24 @@ policy. Provider, MCP, environment, notification and cluster side effects run
 after snapshot publication; adapters must construct a replacement runtime first
 and keep the old runtime if construction fails, marking the section degraded.
 
+Core proxy URL/authentication and ModelPolicy keyword masking are dependencies
+of constructed provider clients. Typed writes and watched external generations
+compare effective values with the current process generation, stage replacement
+providers only when those dependencies change, and stage HTTP MCP transports for
+proxy changes against the same immutable network snapshot. Unrelated Core/model
+mapping edits do not rebuild clients. An installation without a configured default
+provider remains configurable; an existing usable provider must not disappear
+silently during a dependent reload.
+
+Typed dependency writes stage before their existing section CAS, so a failed
+replacement leaves both durable data and the effective runtime unchanged. Once
+dispatched, an owned transaction holds the configuration IO lock through commit,
+Config/provider/MCP publication and the confirmed section event even if the caller
+is cancelled. An external edit is already durable: if staging fails, the source
+section reports degraded while the process keeps its previous effective section
+and usable clients. Successful publication updates only the source section and
+its dependent clients; other section revisions remain independent.
+
 ## Atomicity, CAS and recovery
 
 The shared store uses a same-directory UUID temp file, write-all, file fsync,

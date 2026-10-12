@@ -165,13 +165,14 @@ impl McpServerManager {
         server_id: &str,
         config: &McpServerConfig,
         phase: &'static str,
+        runtime_config: Option<&Config>,
     ) -> Result<(
         McpProtocolClient,
         Vec<McpTool>,
         Option<String>,
         Option<tokio::sync::mpsc::Receiver<JsonRpcNotification>>,
     )> {
-        let client = self.build_client(&config.transport).await?;
+        let client = self.build_client(&config.transport, runtime_config)?;
         let init_result = client
             .initialize(config.request_timeout_ms)
             .await
@@ -191,17 +192,16 @@ impl McpServerManager {
         Ok((client, tools, instructions, notification_rx))
     }
 
-    async fn build_client(&self, transport: &TransportConfig) -> Result<McpProtocolClient> {
+    fn build_client(
+        &self,
+        transport: &TransportConfig,
+        runtime_config: Option<&Config>,
+    ) -> Result<McpProtocolClient> {
         let http_client = if matches!(transport, TransportConfig::StreamableHttp(_)) {
-            match self.config.as_ref() {
-                Some(config) => Some(
-                    bamboo_llm::http_client::build_http_client(&config.read().await.clone())
-                        .map_err(|error| {
-                            McpError::InvalidConfig(format!(
-                                "Failed to build MCP HTTP client: {error}"
-                            ))
-                        })?,
-                ),
+            match runtime_config {
+                Some(config) => Some(bamboo_llm::http_client::build_http_client(config).map_err(
+                    |_| McpError::InvalidConfig("Failed to build MCP HTTP client".to_string()),
+                )?),
                 None => None,
             }
         } else {
