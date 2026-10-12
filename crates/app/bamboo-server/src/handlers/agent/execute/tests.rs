@@ -1127,6 +1127,12 @@ mod execution_input_http {
             (true, "sync"),
         ] {
             let (_home, state, _fault) = state(None).await;
+            // A rejected early reservation has already activated this Root.
+            // Keep its later Chat input for this fixture's manual HTTP owner.
+            state
+                .session_activation_router
+                .set_spawner(Arc::new(ManualHttpOnly))
+                .await;
             let id = format!("execution-input-http-reject-{native}-{reason}");
             if !native {
                 bootstrap(&state, &id).await;
@@ -1207,7 +1213,7 @@ mod execution_input_http {
                 .is_none());
             assert!(state
                 .session_inbox
-                .was_admitted(&id, &SessionMessageId::parse(rejected).unwrap())
+                .was_admitted(&id, &SessionMessageId::parse(&rejected).unwrap())
                 .await
                 .unwrap());
             let no_new = state.admit_chat_for_execute(&id).await.unwrap();
@@ -1228,10 +1234,37 @@ mod execution_input_http {
                 .admit_chat_for_execute_with_reservation(&id, successor_reservation.as_ref())
                 .await
                 .unwrap();
-            only_id(
-                &successor_admission.inputs.unwrap(),
-                successor["message_id"].as_str().unwrap(),
+            let stored = state.storage.load_session(&id).await.unwrap().unwrap();
+            let user = stored
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == bamboo_agent_core::Role::User)
+                .expect("successor has a canonical typed User checkpoint");
+            let proof = &user.metadata.as_ref().unwrap()["session_message"];
+            assert_eq!(proof["source"]["type"], "user");
+            assert_eq!(proof["kind"], "user_input");
+            assert_eq!(proof["target_session_id"], id);
+            let envelope: SessionMessageEnvelope = serde_json::from_value(proof.clone()).unwrap();
+            assert!(bamboo_domain::is_matching_session_message(user, &envelope));
+            assert_ne!(
+                user.id, rejected,
+                "a successor cannot reuse rejected current data"
             );
+            if let Some(receipt) = successor["message_id"].as_str() {
+                assert_eq!(user.id, receipt);
+            } else {
+                assert!(
+                    native,
+                    "only activated Native Root Chat may omit its receipt"
+                );
+            }
+            assert!(state
+                .session_inbox
+                .was_admitted(&id, &envelope.id)
+                .await
+                .unwrap());
+            only_id(&successor_admission.inputs.unwrap(), &user.id);
             if let Some(reservation) = successor_reservation {
                 reservation.abandon().await;
             }
