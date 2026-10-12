@@ -1,8 +1,8 @@
 //! Independently persisted legacy provider configuration (`providers.json`).
 
 use crate::{
-    config_module::save_sidecar_with_sanitized_backup, AtomicJsonStore, Config, ConfigModule,
-    ProviderConfigs,
+    config_module::{save_sidecar_with_sanitized_backup, with_legacy_module_write},
+    AtomicJsonStore, Config, ConfigModule, ProviderConfigs,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -46,6 +46,10 @@ impl ProviderConfigsModule {
         Ok(false)
     }
     pub(crate) fn save_sync(&self, data_dir: &Path) -> Result<()> {
+        // Reject modular directories before credential migration can make any
+        // changes. The physical write below checks again under the same lock
+        // as layout activation, covering activation after this early check.
+        crate::config_module::ensure_legacy_module_layout(data_dir)?;
         // The sidecar is metadata-only after credential-ref migration. Runtime
         // plaintext is skipped by serde and legacy ciphertext is explicitly
         // cleared. A new non-environment secret must be written through the
@@ -105,7 +109,13 @@ impl ProviderConfigsModule {
     }
 }
 
-fn persist_provider_sidecar(path: &Path, mut providers: ProviderConfigs) -> Result<()> {
+fn persist_provider_sidecar(path: &Path, providers: ProviderConfigs) -> Result<()> {
+    with_legacy_module_write(path.parent().unwrap_or_else(|| Path::new(".")), || {
+        persist_provider_sidecar_locked(path, providers)
+    })
+}
+
+fn persist_provider_sidecar_locked(path: &Path, mut providers: ProviderConfigs) -> Result<()> {
     let existing = std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());

@@ -45,6 +45,14 @@ and already extracted sidecars remain readable. Existing `memory.json`,
 wire shape stays unchanged until the manifest migration switches them to the
 revisioned envelope.
 
+After this one-way activation, saves of the built-in memory, subagent, and
+provider legacy modules (including registry calls), and `Config::save_memory_to_dir`,
+`save_subagents_to_dir`, and `save_providers_to_dir` reject writes. Use the revisioned section APIs instead.
+The authority check and physical sidecar write share the layout migration lock,
+so a waiting legacy writer cannot overwrite a newly activated section. Incomplete
+or corrupt modular authority evidence also rejects legacy writes; it never
+reopens the old persistence path.
+
 ## Snapshot lifecycle and precedence
 
 Precedence is defaults, migrated legacy values, section file, environment, then
