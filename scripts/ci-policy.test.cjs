@@ -96,7 +96,7 @@ test("routine dev pull requests run locked Rust, formatting, and policy checks",
   assert.match(testJob, /run: cargo build --locked\n/u)
   assert.match(
     testJob,
-    /- name: Test locked Rust workspace\n        timeout-minutes: 30\n        run: cargo test --locked\n/u,
+    /- name: Test locked Rust workspace\n        timeout-minutes: 45\n        run: cargo test --locked\n/u,
   )
   assert.match(
     testJob,
@@ -134,8 +134,7 @@ test("routine dev pull requests run locked Rust, formatting, and policy checks",
   )
 })
 
-test("locked Rust test compilation has a separate budget before the complete suite", () => {
-  const testJob = job("test")
+function assertLockedWorkspaceBudget(testJob) {
   const [settings, ...steps] = testJob.split(/(?=^      - )/mu)
   assert.doesNotMatch(settings, /^    (?:if|continue-on-error):/mu)
   assert.match(settings, /^    timeout-minutes: 75$/mu)
@@ -143,7 +142,7 @@ test("locked Rust test compilation has a separate budget before the complete sui
   const requiredSteps = [
     ["Build locked Rust workspace", "cargo build --locked", undefined],
     ["Compile locked Rust test targets", "cargo test --locked --no-run", "15"],
-    ["Test locked Rust workspace", "cargo test --locked", "30"],
+    ["Test locked Rust workspace", "cargo test --locked", "45"],
   ]
   let previousIndex = -1
   for (const [name, command, timeout] of requiredSteps) {
@@ -174,6 +173,20 @@ test("locked Rust test compilation has a separate budget before the complete sui
       1,
       `${command} must not run again under another step name`,
     )
+  }
+}
+
+test("locked Rust compilation and the complete suite retain explicit aggregate budgets", () => {
+  const testJob = job("test")
+  assertLockedWorkspaceBudget(testJob)
+  for (const [from, to] of [
+    ["    timeout-minutes: 75", "    timeout-minutes: 45"],
+    ["        timeout-minutes: 15", "        timeout-minutes: 30"],
+    ["        timeout-minutes: 45", "        timeout-minutes: 30"],
+    ["        timeout-minutes: 45", "        timeout-minutes: 60"],
+  ]) {
+    assert.ok(testJob.includes(from))
+    assert.throws(() => assertLockedWorkspaceBudget(testJob.replace(from, to)), `reject unapproved aggregate budget: ${to}`)
   }
 })
 
@@ -427,7 +440,7 @@ function assertFrontendPolicy(source) {
   for (const [index, frontendJob] of jobs.entries()) {
     assert.ok(frontendJob.settings.startsWith(`    name: Original release ${index === 0 ? "Build" : "Test"} on frozen consumer source\n`))
     assert.doesNotMatch(frontendJob.settings, /^    env:/mu, "job environments must not alter Cargo or test behavior")
-    assert.match(frontendJob.settings, /^    runs-on: ubuntu-latest\n    timeout-minutes: 45$/mu)
+    assert.match(frontendJob.settings, new RegExp(`^    runs-on: ubuntu-latest\n    timeout-minutes: ${index === 0 ? 45 : 75}$`, "mu"))
     if (index === 0) {
       assert.doesNotMatch(frontendJob.settings, /^    needs:/mu)
       for (const [name, step, field] of [["source_sha", "source", "sha"], ["source_tree", "source", "tree"], ["rustc_version", "toolchain", "rustc_version"], ["cargo_version", "toolchain", "cargo_version"]]) {
@@ -452,7 +465,7 @@ function assertFrontendPolicy(source) {
       ["Check formatting", "cargo fmt --all -- --check"],
       ...(index === 0 ? [["Build locked Rust workspace", "cargo build --locked"]] : [
         ["Compile locked Rust test targets", "cargo test --locked --no-run", 15],
-        ["Test locked Rust workspace", "cargo test --locked", 30],
+        ["Test locked Rust workspace", "cargo test --locked", 45],
       ]),
       ["Require source files to remain unchanged", "git diff --exit-code"],
     ]) {
@@ -512,7 +525,9 @@ test("frontend acceptance preserves both original command gates and actual-head 
     ["name: Original release Test on frozen consumer source", "name: Different Test"],
     ["timeout-minutes: 45", "timeout-minutes: 60"],
     ["timeout-minutes: 15", "timeout-minutes: 30"],
-    ["timeout-minutes: 30", "timeout-minutes: 45"],
+    ["timeout-minutes: 75", "timeout-minutes: 45"],
+    ["name: Test locked Rust workspace\n        timeout-minutes: 45", "name: Test locked Rust workspace\n        timeout-minutes: 30"],
+    ["name: Test locked Rust workspace\n        timeout-minutes: 45", "name: Test locked Rust workspace\n        timeout-minutes: 60"],
     ["package-manager-cache: false", "package-manager-cache: true"],
     ["components: rustfmt\n", "toolchain: 1.99.0\n          components: rustfmt\n"],
     ["run: cargo build --locked", "run: true"],

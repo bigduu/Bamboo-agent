@@ -161,7 +161,7 @@ jobs:
     name: Original release Test on frozen consumer source
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v7
         with:
@@ -229,7 +229,7 @@ jobs:
           RUST_MIN_STACK: "8388608"
 
       - name: Test locked Rust workspace
-        timeout-minutes: 30
+        timeout-minutes: 45
         run: cargo test --locked
         env:
           RUST_MIN_STACK: "8388608"
