@@ -347,6 +347,9 @@ test("frozen promotion bootstrap is read-only and leaves merge-tree validation i
   assert.match(contributing, /Static CI cannot prove the historical timing/u)
   assert.doesNotMatch(contributing, /it need not be\s+the current tip/u)
   assert.match(contributing, /do not squash or rebase/u)
+  assert.match(contributing, /current `dev` tip must be an ancestor\n   of the fix head/u)
+  assert.match(contributing, /stop this cut's fix path/u)
+  assert.match(contributing, /Do not fast-forward that updated dev-based fix into the old release branch/u)
   assert.match(contributing, /Release source and version tags are immutable/u)
   assert.match(readFileSync("AGENTS.md", "utf8"), /CONTRIBUTING\.md#release-process/u)
 })
@@ -359,8 +362,8 @@ test("frozen promotion proves exact ancestry, accepts dev advancement, and rejec
     return result.stdout.trim()
   }
   let sequence = 0
-  const commit = (label) => {
-    writeFileSync(path.join(directory, `${++sequence}.txt`), `${label}\n`)
+  const commit = (label, file = `${++sequence}.txt`) => {
+    writeFileSync(path.join(directory, file), `${label}\n`)
     git("add", ".")
     git("commit", "--quiet", "-m", label)
     return git("rev-parse", "HEAD")
@@ -373,12 +376,52 @@ test("frozen promotion proves exact ancestry, accepts dev advancement, and rejec
     const cut = commit("accepted cut")
     git("switch", "--quiet", "-c", "dev")
     const feature = commit("unrelated ongoing development")
-    git("switch", "--quiet", "-c", `release/${cut}`, cut)
-    const fix = commit("bounded release fix")
+    git("branch", `release/${cut}`, cut)
+    git("switch", "--quiet", "-c", "required-release-fix", cut)
+    const fixFile = "bounded-release-fix.txt"
+    const fix = commit("bounded release fix", fixFile)
     const pending = commit("not yet backmerged")
     git("switch", "--quiet", "dev")
-    git("merge", "--quiet", "--no-ff", "-m", "reviewed fix preserving source", fix)
+    const isAncestor = (source, target) => {
+      const result = spawnSync("git", ["merge-base", "--is-ancestor", source, target], {
+        cwd: directory, encoding: "utf8",
+      })
+      assert.ok([0, 1].includes(result.status), result.stderr)
+      return result.status === 0
+    }
+    assert.equal(isAncestor(feature, fix), false, "a release-only fix lacks the current dev base")
+    // This local FF refusal models only strict base ancestry; GitHub need not
+    // use FF merges, and this fixture does not attempt a protected GitHub PR.
+    const staleFix = spawnSync("git", ["merge", "--ff-only", fix], {
+      cwd: directory, encoding: "utf8",
+    })
+    assert.notEqual(staleFix.status, 0)
+    assert.equal(git("rev-parse", "dev"), feature)
+    assert.equal(git("rev-parse", `release/${cut}`), cut, "stop the old cut's necessary-fix path")
+
+    git("switch", "--quiet", "-c", "required-fix-on-current-dev", "dev")
+    const originalFix = spawnSync("git", ["show", `${fix}:${fixFile}`], { cwd: directory })
+    assert.equal(originalFix.status, 0, originalFix.stderr.toString())
+    const fixBytes = originalFix.stdout
+    writeFileSync(path.join(directory, fixFile), fixBytes)
+    git("add", fixFile)
+    git("commit", "--quiet", "-m", "necessary fix based on current dev")
+    const updatedFix = git("rev-parse", "HEAD")
+    assert.equal(isAncestor(feature, updatedFix), true, "the replacement PR contains actual current dev")
+    assert.equal(isAncestor(fix, updatedFix), false, "the old fix is not presented as normally accepted")
+    assert.deepEqual(readFileSync(path.join(directory, fixFile)), fixBytes)
+    assert.equal(git("diff", "--binary", cut, fix, "--", fixFile),
+      git("diff", "--binary", feature, updatedFix, "--", fixFile), "carry only the exact necessary fix patch")
+    git("switch", "--quiet", "dev")
+    // Advance the toy accepted-dev ref only after proving the strict premise.
+    git("merge", "--quiet", "--ff-only", updatedFix)
     const reviewed = git("rev-parse", "HEAD")
+    const newCut = git("rev-parse", "dev")
+    assert.equal(newCut, updatedFix, "freshly read the actual accepted dev tip")
+    git("branch", `release/${newCut}`, newCut)
+    assert.equal(git("rev-parse", `release/${newCut}`), reviewed)
+    assert.equal(git("rev-parse", `release/${cut}`), cut, "never fast-forward updated dev into the old release")
+    assert.equal(isAncestor(feature, cut), false, "unrelated dev work stays outside the old release")
     const advanced = commit("later dev work")
 
     const bootstrap = promotionScript().match(/^python3 - <<'PYTHON'\n([\s\S]*)\nPYTHON\s*$/u)?.[1]
@@ -454,23 +497,23 @@ assert counts == fixture.get("counts", {"release": 2, "dev": 2, "compare": 2}), 
 `
     const run = ({ env = {}, ...fixture } = {}) => {
       writeFileSync(path.join(directory, "fixture.json"), JSON.stringify({
-        release: [fix, fix], dev: [reviewed, reviewed], ...fixture,
+        release: [reviewed, reviewed], dev: [reviewed, reviewed], ...fixture,
       }))
       return spawnSync("python3", ["-c", fixtureProgram], {
         cwd: directory, encoding: "utf8", env: { ...process.env,
           GITHUB_REPOSITORY: "bigduu/Bamboo-agent", GH_TOKEN: "fixture-read-only",
-          HEAD_REPOSITORY: "bigduu/Bamboo-agent", HEAD_REF: `release/${cut}`, HEAD_SHA: fix,
+          HEAD_REPOSITORY: "bigduu/Bamboo-agent", HEAD_REF: `release/${newCut}`, HEAD_SHA: reviewed,
           ...env,
         },
       })
     }
     for (const [name, fixture] of [
-      ["reviewed release fix with unrelated dev work excluded", {}],
-      ["original cut remains accepted after dev advances", { release: [cut, cut], env: { HEAD_SHA: cut } }],
+      ["new cut freshly read from normally accepted current dev", {}],
+      ["original no-fix cut remains accepted after dev advances", { release: [cut, cut], env: { HEAD_REF: `release/${cut}`, HEAD_SHA: cut } }],
       ["later dev tip", { dev: [advanced, advanced] }],
       ["API origin cannot be changed by environment", { env: { GITHUB_API_URL: "https://invalid.example" } }],
       ["dev advances between metadata reads", { dev: [reviewed, advanced], counts: { release: 2, dev: 2, compare: 3 } }],
-      ["dev and release head may initially be identical", { dev: [fix, fix] }],
+      ["dev and new release head may initially be identical", { dev: [reviewed, reviewed] }],
     ]) {
       const result = run(fixture)
       assert.equal(result.status, 0, `${name}: ${result.stderr}`)
@@ -483,14 +526,15 @@ assert counts == fixture.get("counts", {"release": 2, "dev": 2, "compare": 2}), 
       ["malformed cut", { env: { HEAD_REF: "release/latest" } }],
       ["short cut", { env: { HEAD_REF: `release/${cut.slice(0, 12)}` } }],
       ["uppercase cut", { env: { HEAD_REF: `release/${cut.toUpperCase()}` } }],
-      ["wrong cut ancestor", { env: { HEAD_REF: `release/${feature}` } }],
+      ["wrong cut ancestor", { env: { HEAD_REF: `release/${fix}` } }],
       ["missing head", { env: { HEAD_SHA: "" } }],
       ["missing token", { env: { GH_TOKEN: "" } }],
       ["release head mismatches PR event", { release: [pending, pending] }],
-      ["release moves during proof", { release: [fix, pending] }],
-      ["unbackmerged release commit", { release: [pending, pending], env: { HEAD_SHA: pending } }],
+      ["release moves during proof", { release: [reviewed, pending] }],
+      ["old release fix lacks normal dev acceptance", { release: [fix, fix], env: { HEAD_REF: `release/${cut}`, HEAD_SHA: fix } }],
+      ["unbackmerged release commit", { release: [pending, pending], env: { HEAD_REF: `release/${cut}`, HEAD_SHA: pending } }],
       ["dev rewrites to history that excludes the release fix", { dev: [reviewed, feature], counts: { release: 2, dev: 2, compare: 3 } }],
-      ["dev rewrites even though the release head remains an ancestor", { dev: [reviewed, pending], counts: { release: 2, dev: 2, compare: 3 } }],
+      ["dev rewrites even though the release head remains an ancestor", { dev: [advanced, reviewed], counts: { release: 2, dev: 2, compare: 3 } }],
       ["dev initially unprotected", { protected: [false, false] }],
       ["dev loses protection during proof", { protected: [true, false] }],
       ["truthy protection is insufficient", { protected: ["true", "true"] }],

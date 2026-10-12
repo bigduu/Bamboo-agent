@@ -212,12 +212,18 @@ the moving `dev` branch directly to `main`.
    record a new cut and scope on a new release branch.
 3. For a necessary release fix, branch from the frozen release head, keep the
    change within the recorded release scope, and submit it to protected `dev`
-   through normal review and checks. Preserve that exact fix commit's ancestry
-   when merging into `dev` (do not squash or rebase it into a different commit).
-   Only then fast-forward the release branch to that reviewed fix head. Do not
-   merge `dev` back into the release. If ancestry cannot be preserved under the
-   existing branch rules, stop and choose a new accepted cut through the normal
-   process; never bypass protection.
+   through normal review and checks. The current `dev` tip must be an ancestor
+   of the fix head to satisfy the strict up-to-date PR requirement. If unrelated
+   development has advanced `dev`, the frozen-release fix alone does not meet
+   that requirement: stop this cut's fix path. Apply the necessary fix through
+   a normal PR based on actual protected `dev`, then freshly read that accepted
+   `dev` tip and create a new release branch with a new cut receipt and scope.
+   Do not fast-forward that updated dev-based fix into the old release branch.
+   When the original fix can satisfy normal branch rules, preserve its exact
+   ancestry when merging into `dev` (do not squash or rebase it into a different
+   commit); only then fast-forward the release to that reviewed fix head. Never
+   merge `dev` back into the release or bypass protection. If ancestry cannot
+   be preserved, stop and choose a new accepted cut through the normal process.
 4. The required `Promotion Source` gate verifies the actual same-repository
    release branch against the PR's exact head, proves cut → release-head
    ancestry, and proves release-head → protected-`dev` ancestry. Missing proof,
