@@ -755,7 +755,7 @@ function assertFrontendPolicy(source) {
       "        shell: bash", "        run: |",
       "          set -euo pipefail",
       '          source_sha="$(git rev-parse HEAD)"',
-      '          source_tree="$(git rev-parse HEAD^{tree})"',
+      '          source_tree="$(git rev-parse \'HEAD^{tree}\')"',
       '          source_status="$(git status --porcelain --untracked-files=all)"',
       `          printf 'Final source: %s, tree: %s\\n' "$source_sha" "$source_tree"`,
       `          printf '%s\\n' "$source_status"`,
