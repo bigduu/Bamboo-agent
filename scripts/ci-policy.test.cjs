@@ -360,6 +360,15 @@ test("frozen promotion bootstrap is read-only and leaves merge-tree validation i
   assert.match(contributing, /Static CI cannot prove the historical timing/u)
   assert.doesNotMatch(contributing, /it need not be\s+the current tip/u)
   assert.match(contributing, /do not squash or rebase/u)
+  assert.match(contributing, /original fix head `F` within the recorded release scope/u)
+  assert.match(contributing, /integration head `U` containing both\n   `F` and the current protected `dev` head/u)
+  assert.match(contributing, /exact `F` → `U` → accepted-`dev` ancestry/u)
+  assert.match(contributing, /Bind both receipts to their respective\n   SHA\/tree/u)
+  assert.match(contributing, /branch to the recorded original fix head `F`; never substitute `U`/u)
+  assert.match(contributing, /dev merge result for recorded `F`\. Review must reject any other repair target/u)
+  assert.match(contributing, /Pending or failing checks block this route/u)
+  assert.match(contributing, /Only if existing branch rules cannot preserve exact\n   `F` ancestry, or the necessary repair cannot stay within the recorded scope/u)
+  assert.match(contributing, /this gate alone cannot\n   authorize `U` as the release target/u)
   assert.match(contributing, /Release source and version tags are immutable/u)
   assert.match(readFileSync("AGENTS.md", "utf8"), /CONTRIBUTING\.md#release-process/u)
 })
@@ -372,8 +381,8 @@ test("frozen promotion proves exact ancestry, accepts dev advancement, and rejec
     return result.stdout.trim()
   }
   let sequence = 0
-  const commit = (label) => {
-    writeFileSync(path.join(directory, `${++sequence}.txt`), `${label}\n`)
+  const commit = (label, file = `${++sequence}.txt`) => {
+    writeFileSync(path.join(directory, file), `${label}\n`)
     git("add", ".")
     git("commit", "--quiet", "-m", label)
     return git("rev-parse", "HEAD")
@@ -385,14 +394,72 @@ test("frozen promotion proves exact ancestry, accepts dev advancement, and rejec
     commit("root")
     const cut = commit("accepted cut")
     git("switch", "--quiet", "-c", "dev")
-    const feature = commit("unrelated ongoing development")
-    git("switch", "--quiet", "-c", `release/${cut}`, cut)
-    const fix = commit("bounded release fix")
+    const featureFile = "unrelated-dev-feature.txt"
+    const feature = commit("unrelated ongoing development", featureFile)
+    git("branch", `release/${cut}`, cut)
+    git("switch", "--quiet", "-c", "original-release-fix", cut)
+    const fixFile = "bounded-release-fix.txt"
+    const fix = commit("bounded release fix", fixFile)
     const pending = commit("not yet backmerged")
+    const isAncestor = (source, target) => {
+      const result = spawnSync("git", ["merge-base", "--is-ancestor", source, target], {
+        cwd: directory, encoding: "utf8",
+      })
+      assert.ok([0, 1].includes(result.status), result.stderr)
+      return result.status === 0
+    }
+    assert.equal(isAncestor(feature, fix), false, "original F is not up to date with dev D1")
+    git("switch", "--quiet", "-c", "strict-dev-integration", feature)
+    git("merge", "--quiet", "--no-ff", "-m", "integration U preserves dev D1 and original F", fix)
+    const integration = git("rev-parse", "HEAD")
+    assert.equal(isAncestor(feature, integration), true, "U contains current dev for strict checks")
+    assert.equal(isAncestor(fix, integration), true, "U preserves exact original F ancestry")
     git("switch", "--quiet", "dev")
-    git("merge", "--quiet", "--no-ff", "-m", "reviewed fix preserving source", fix)
+    // Model only the strict up-to-date ancestry prerequisite. This local merge
+    // does not claim live protected admission or actual review/check receipts.
+    assert.equal(isAncestor(git("rev-parse", "dev"), integration), true)
+    git("merge", "--quiet", "--no-ff", "-m", "model normal admission of reviewed U", integration)
     const reviewed = git("rev-parse", "HEAD")
     const advanced = commit("later dev work")
+
+    // Equal patches/trees do not substitute for the original F's ancestry.
+    git("switch", "--quiet", "-c", "cherry-pick-counterexample", feature)
+    git("cherry-pick", "--quiet", fix)
+    const cherryPicked = git("rev-parse", "HEAD")
+    git("switch", "--quiet", "-c", "squash-counterexample", feature)
+    git("merge", "--quiet", "--squash", fix)
+    git("commit", "--quiet", "-m", "squashed fix counterexample")
+    const squashed = git("rev-parse", "HEAD")
+    for (const replacement of [cherryPicked, squashed]) {
+      assert.equal(isAncestor(fix, replacement), false)
+      assert.equal(git("rev-parse", `${replacement}^{tree}`), git("rev-parse", `${integration}^{tree}`))
+    }
+
+    // This models the documented review contract, not a new production gate.
+    // F's release-source receipt and U's integration receipt are separate.
+    const sourceReceipt = { sha: fix, tree: git("rev-parse", `${fix}^{tree}`) }
+    const integrationReceipt = { sha: integration, tree: git("rev-parse", `${integration}^{tree}`), acceptedDev: reviewed }
+    const requireRecordedRepairTarget = (target) => {
+      assert.equal(target, sourceReceipt.sha, "review must require the recorded original fix head F")
+      assert.equal(git("rev-parse", `${target}^{tree}`), sourceReceipt.tree)
+      assert.equal(git("rev-parse", `${integrationReceipt.sha}^{tree}`), integrationReceipt.tree)
+      assert.equal(isAncestor(cut, target), true)
+      assert.equal(isAncestor(feature, integrationReceipt.sha), true)
+      assert.equal(isAncestor(target, integrationReceipt.sha), true)
+      assert.equal(isAncestor(integrationReceipt.sha, integrationReceipt.acceptedDev), true)
+    }
+    requireRecordedRepairTarget(fix)
+    for (const wrongTarget of [integration, reviewed, cherryPicked, squashed, pending]) {
+      assert.throws(() => requireRecordedRepairTarget(wrongTarget), /recorded original fix head F/u)
+    }
+    git("switch", "--quiet", `release/${cut}`)
+    git("merge", "--quiet", "--ff-only", fix)
+    assert.equal(git("rev-parse", "HEAD"), fix, "release advances only to original F")
+    assert.equal(isAncestor(feature, fix), false, "unrelated D1 stays outside the frozen release")
+    assert.equal(git("ls-tree", "--name-only", fix).split("\n").includes(featureFile), false)
+    assert.equal(git("ls-tree", "--name-only", integration).split("\n").includes(featureFile), true)
+    assert.equal(isAncestor(fix, advanced), true, "later dev advancement retains accepted F")
+    git("switch", "--quiet", "dev")
 
     const bootstrap = promotionScript().match(/^python3 - <<'PYTHON'\n([\s\S]*)\nPYTHON\s*$/u)?.[1]
     assert.ok(bootstrap, "extract the exact production Python bootstrap")
@@ -478,7 +545,7 @@ assert counts == fixture.get("counts", {"release": 2, "dev": 2, "compare": 2}), 
       })
     }
     for (const [name, fixture] of [
-      ["reviewed release fix with unrelated dev work excluded", {}],
+      ["original F admitted through strict-compatible U excludes unrelated dev work", {}],
       ["original cut remains accepted after dev advances", { release: [cut, cut], env: { HEAD_SHA: cut } }],
       ["later dev tip", { dev: [advanced, advanced] }],
       ["API origin cannot be changed by environment", { env: { GITHUB_API_URL: "https://invalid.example" } }],
@@ -489,7 +556,17 @@ assert counts == fixture.get("counts", {"release": 2, "dev": 2, "compare": 2}), 
       assert.equal(result.status, 0, `${name}: ${result.stderr}`)
       assert.match(result.stdout, /Accepted frozen release/u)
     }
+    // U also passes the ancestry-only controller after admission. It remains
+    // an invalid repair target under the separately required review contract;
+    // never present this scope decision as an automatic controller guarantee.
+    const integrationAsRelease = run({ release: [integration, integration], env: { HEAD_SHA: integration } })
+    assert.equal(integrationAsRelease.status, 0, integrationAsRelease.stderr)
+    assert.throws(() => requireRecordedRepairTarget(integration), /recorded original fix head F/u)
+
     for (const [name, fixture] of [
+      ["original F not yet admitted through U", { dev: [feature, feature] }],
+      ["cherry-picked equivalent lacks original F ancestry", { dev: [cherryPicked, cherryPicked] }],
+      ["squashed equivalent lacks original F ancestry", { dev: [squashed, squashed] }],
       ["fork", { env: { HEAD_REPOSITORY: "someone/Bamboo-agent" } }],
       ["unexpected target repository", { env: { GITHUB_REPOSITORY: "someone/Bamboo-agent", HEAD_REPOSITORY: "someone/Bamboo-agent" } }],
       ["direct dev", { env: { HEAD_REF: "dev" } }],
