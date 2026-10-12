@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use super::super::super::redaction::redact_config_for_api;
 use super::common::{
-    read_model_limits_file, redacted_config_json, take_model_limits_patch, write_model_limits_file,
+    read_model_limits_file, redacted_config_json, take_model_limits_patch, write_model_limits,
 };
 
 /// Updates the Bamboo application configuration.
@@ -125,13 +125,11 @@ pub async fn set_bamboo_config(
     };
 
     // Omission means "leave this independently owned section unchanged"; only
-    // an explicit model_limits field may replace or clear it. Persist under the
-    // config write lock so concurrent compatibility writes cannot clobber each
-    // other (the file commit is atomic too — see common::write_model_limits_file).
-    // #42, #775.
+    // an explicit model_limits field may replace or clear it. Use the process
+    // section's existing serialized CAS path so a successful response also
+    // publishes the limits to hosted rounds without depending on the watcher.
     if let Some(model_limits_patch) = model_limits_patch.as_ref() {
-        let _config_guard = app_state.config.write().await;
-        write_model_limits_file(&app_state.app_data_dir, Some(model_limits_patch)).await?;
+        write_model_limits(&app_state, model_limits_patch).await?;
     }
 
     // The live config deliberately retains the current node heartbeat/runtime

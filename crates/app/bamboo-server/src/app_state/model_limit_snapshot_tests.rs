@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use actix_web::web;
+use actix_web::{test, web, App};
 use async_trait::async_trait;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{AgentEvent, Message, Session};
@@ -240,6 +240,94 @@ async fn hosted_restart_loads_legacy_raw_model_limits_and_retains_them_until_rep
     assert_eq!(
         *probe.output_limits.lock().unwrap(),
         [Some(4_000), Some(4_000), Some(4_000), Some(8_000)]
+    );
+    state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn compatibility_model_limit_writes_and_clear_reach_hosted_rounds_without_watcher() {
+    use bamboo_compression::limits::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS};
+
+    let _key = bamboo_config::encryption::set_test_encryption_key([0x64; 32]);
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+    state.stop_config_watcher_for_test();
+    let state = web::Data::new(state);
+    let section = state
+        .config_facade
+        .as_ref()
+        .unwrap()
+        .registry()
+        .model_limits
+        .clone();
+    let initial_revision = section.snapshot().revision;
+    let app = test::init_service(App::new().app_data(state.clone()).route(
+        "/bamboo/config",
+        web::post().to(crate::handlers::settings::set_bamboo_config),
+    ))
+    .await;
+    let project = state
+        .project_store
+        .create_with_project_path(
+            "Compatibility model limits",
+            None,
+            workspace.path().to_string_lossy().into_owned(),
+            Vec::new(),
+        )
+        .unwrap();
+    let probe = Arc::new(ModelLimitProbe::default());
+
+    for (run, (rows, expected_context)) in [
+        (
+            json!([{
+                "model_pattern": "legacy-hosted-model",
+                "max_context_tokens": 48_000,
+                "max_output_tokens": 4_000
+            }]),
+            48_000,
+        ),
+        (
+            json!([{
+                "model_pattern": "legacy-hosted-model",
+                "max_context_tokens": 96_000,
+                "max_output_tokens": 8_000
+            }]),
+            96_000,
+        ),
+        (json!([]), DEFAULT_MAX_CONTEXT_TOKENS),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/bamboo/config")
+                .set_json(json!({"model_limits": rows}))
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let snapshot = section.snapshot();
+        assert_eq!(snapshot.revision, initial_revision + run as u64 + 1);
+        assert_eq!(snapshot.data.0.len(), if run == 2 { 0 } else { 1 });
+
+        let mut session = Session::new(
+            format!("compatibility-model-limit-{run}"),
+            "legacy-hosted-model",
+        );
+        session.set_project_id_meta(project.id.to_string());
+        session.add_message(Message::user("finish this request"));
+        assert_eq!(
+            Box::pin(run_hosted_probe(&state, session, probe.clone())).await,
+            expected_context
+        );
+    }
+
+    assert_eq!(
+        *probe.output_limits.lock().unwrap(),
+        [Some(4_000), Some(8_000), Some(DEFAULT_MAX_OUTPUT_TOKENS)]
     );
     state.shutdown().await;
 }
