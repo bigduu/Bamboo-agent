@@ -80,6 +80,9 @@ pub async fn handle_execute(
         Ok(reservation) => reservation,
         Err(response) => return *response,
     };
+    #[cfg(test)]
+    super::tests::after_root_admission_selection(&session_id, admission_reservation.is_some())
+        .await;
     let response = handle_reserved_execute(
         state,
         session_id,
