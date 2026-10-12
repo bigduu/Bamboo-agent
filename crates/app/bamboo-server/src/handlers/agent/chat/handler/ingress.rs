@@ -5,6 +5,9 @@ use super::ChatRequest;
 use crate::{app_state::AppState, handlers::agent::tickets};
 use actix_web::{http::StatusCode, HttpRequest, HttpResponse, ResponseError};
 use bamboo_domain::{Session, SessionInboxReceipt, SessionMessageEnvelope, SessionMessageId};
+use bamboo_engine::execution::{
+    reserve_session_execution, SessionExecutionReservation, SessionExecutionReserveOutcome,
+};
 use bamboo_engine::ticket_worker_plan::tickets::{
     HumanIngressRecord, Principal, VerifiedUserIngress,
 };
@@ -258,16 +261,84 @@ pub(crate) async fn admit_for_execute(
     id: &str,
 ) -> ResponseResult<Option<bamboo_engine::config::UntrustedExecutionInputs>> {
     state
-        .admit_chat_for_execute_inner(id)
+        .admit_chat_for_execute_inner(id, None)
         .await
         .map(|admission| admission.inputs)
 }
 
 impl AppState {
+    /// Native ordinary Roots must own their exact Actor writer before Inbox
+    /// admission. Inspection only selects an attempt; the existing reservation
+    /// protocol remains authoritative if another execution wins the race.
+    pub(crate) async fn reserve_root_chat_for_execute(
+        &self,
+        id: &str,
+    ) -> ResponseResult<Option<SessionExecutionReservation>> {
+        if self
+            .agent_runners
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|runner| {
+                matches!(
+                    runner.status,
+                    crate::app_state::AgentStatus::Pending | crate::app_state::AgentStatus::Running
+                )
+            })
+        {
+            return Ok(None);
+        }
+        let Some(session) = self
+            .storage
+            .load_session(id)
+            .await
+            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        else {
+            return Ok(None);
+        };
+        if !crate::skill_runtime::ordinary_main(&session)
+            || session.metadata.contains_key("chat.queued_ingress.v1")
+            || !self
+                .session_inbox
+                .inspect(id)
+                .await
+                .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?
+                .activation_pending()
+        {
+            return Ok(None);
+        }
+        let sender = self.get_session_event_sender(id).await;
+        let mut reservation = match reserve_session_execution(
+            &self.agent,
+            &self.agent_runners,
+            &self.session_event_senders,
+            id,
+            &sender,
+        )
+        .await
+        {
+            SessionExecutionReserveOutcome::Reserved(reservation) => reservation,
+            SessionExecutionReserveOutcome::AlreadyRunning { .. } => return Ok(None),
+        };
+        if let Err(e) = reservation.bind_root_actor(&self.agent, &session).await {
+            reservation.abandon().await;
+            return Err(error(StatusCode::CONFLICT, e).into());
+        }
+        Ok(Some(reservation))
+    }
+
     /// Keep the existing runner/startup owner and SDK checkpoint/ACK boundary.
     pub(crate) async fn admit_chat_for_execute(
         &self,
         id: &str,
+    ) -> ResponseResult<ExecuteAdmission> {
+        self.admit_chat_for_execute_with_reservation(id, None).await
+    }
+
+    pub(crate) async fn admit_chat_for_execute_with_reservation(
+        &self,
+        id: &str,
+        reservation: Option<&SessionExecutionReservation>,
     ) -> ResponseResult<ExecuteAdmission> {
         let legacy_queue = self
             .storage
@@ -286,12 +357,30 @@ impl AppState {
                     native_main: false,
                 });
         }
-        self.admit_chat_for_execute_inner(id).await
+        self.admit_chat_for_execute_inner(id, reservation).await
     }
 
-    async fn admit_chat_for_execute_inner(&self, id: &str) -> ResponseResult<ExecuteAdmission> {
+    async fn admit_chat_for_execute_inner(
+        &self,
+        id: &str,
+        reservation: Option<&SessionExecutionReservation>,
+    ) -> ResponseResult<ExecuteAdmission> {
         let runners = self.agent_runners.read().await;
-        if runners.get(id).is_some_and(|r| {
+        if let Some(reservation) = reservation {
+            if reservation.session_id() != id
+                || reservation.cancel_token().is_cancelled()
+                || !runners.get(id).is_some_and(|runner| {
+                    runner.run_id == reservation.run_id()
+                        && matches!(runner.status, crate::app_state::AgentStatus::Running)
+                })
+            {
+                return Err(error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Root admission reservation is no longer current",
+                )
+                .into());
+            }
+        } else if runners.get(id).is_some_and(|r| {
             matches!(
                 r.status,
                 crate::app_state::AgentStatus::Pending | crate::app_state::AgentStatus::Running
@@ -321,7 +410,15 @@ impl AppState {
             return Ok(ExecuteAdmission::default());
         }
         let persistence: std::sync::Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
-            self.persistence.clone();
+            match reservation {
+                Some(reservation) => reservation.execution_persistence().ok_or_else(|| {
+                    error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Root admission writer is unavailable",
+                    )
+                })?,
+                None => self.persistence.clone(),
+            };
         let (refreshed, inputs) =
             bamboo_engine::config::UntrustedExecutionInputs::admit_with_startup_observation(
                 &mut session,
