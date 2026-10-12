@@ -259,14 +259,14 @@ pub(crate) struct ExecuteAdmission {
 // Selection is not admission: only the HTTP owner can retain a newly acquired
 // reservation through Ready or awaited non-spawn cleanup.
 enum ExecuteAdmissionCheck {
-    Checked(ExecuteAdmission),
+    Checked(Box<ExecuteAdmission>),
     NeedsRootReservation,
 }
 
 impl ExecuteAdmissionCheck {
     fn into_admission(self) -> ResponseResult<ExecuteAdmission> {
         match self {
-            Self::Checked(admission) => Ok(admission),
+            Self::Checked(admission) => Ok(*admission),
             Self::NeedsRootReservation => Err(error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Native Root admission requires an execution reservation; retry execute",
@@ -389,7 +389,7 @@ impl AppState {
             .check_chat_for_execute_inner(id, reservation.as_ref(), true)
             .await?
         {
-            ExecuteAdmissionCheck::Checked(admission) => return Ok(admission),
+            ExecuteAdmissionCheck::Checked(admission) => return Ok(*admission),
             ExecuteAdmissionCheck::NeedsRootReservation => {}
         }
         #[cfg(test)]
@@ -450,7 +450,7 @@ impl AppState {
                 crate::app_state::AgentStatus::Pending | crate::app_state::AgentStatus::Running
             )
         }) {
-            return Ok(ExecuteAdmissionCheck::Checked(ExecuteAdmission::default()));
+            return Ok(ExecuteAdmissionCheck::Checked(Box::default()));
         }
         let Some(mut session) = self
             .storage
@@ -458,7 +458,7 @@ impl AppState {
             .await
             .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?
         else {
-            return Ok(ExecuteAdmissionCheck::Checked(ExecuteAdmission::default()));
+            return Ok(ExecuteAdmissionCheck::Checked(Box::default()));
         };
         let queued_id = session.metadata.get("chat.queued_ingress.v1").cloned();
         // Inspection selects an attempt; it neither grants a sibling nor proves Fresh.
@@ -471,7 +471,7 @@ impl AppState {
                 .activation_pending()
         {
             recover_user_handoff(self, &session).await?;
-            return Ok(ExecuteAdmissionCheck::Checked(ExecuteAdmission::default()));
+            return Ok(ExecuteAdmissionCheck::Checked(Box::default()));
         }
         if require_native_owner
             && reservation.is_none()
@@ -548,11 +548,11 @@ impl AppState {
             )
             .into());
         }
-        Ok(ExecuteAdmissionCheck::Checked(ExecuteAdmission {
+        Ok(ExecuteAdmissionCheck::Checked(Box::new(ExecuteAdmission {
             inputs,
             generate_title,
             native_main,
-        }))
+        })))
     }
 }
 
