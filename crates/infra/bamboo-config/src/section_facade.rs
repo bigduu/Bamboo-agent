@@ -4961,7 +4961,19 @@ impl SectionRegistry {
             access_control: open!(AccessControl, AccessControlSection, validate_access_control),
             hooks: open!(Hooks, HooksSection, validate_hooks),
             model_policy: open!(ModelPolicy, ModelPolicySection, validate_model_policy),
-            model_limits: open!(ModelLimits, ModelLimitsSection, validate_model_limits),
+            model_limits: {
+                let descriptor = SectionId::ModelLimits.descriptor();
+                Arc::new(LiveSection::open_with_raw_validator_allowing_unversioned(
+                    descriptor.name,
+                    AtomicJsonStore::<ModelLimitsSection>::new(
+                        data_dir.join(descriptor.file_name),
+                        SECTION_SCHEMA_VERSION,
+                    ),
+                    ModelLimitsSection::default(),
+                    validate_model_limits,
+                    validate_ordinary_section_raw,
+                )?)
+            },
             credentials: Arc::new(CredentialSection::open(data_dir, migration_lock_held)),
         })
     }
@@ -6573,6 +6585,90 @@ mod tests {
                 "{row}"
             );
         }
+    }
+
+    #[test]
+    fn model_limit_raw_sidecar_reopens_after_modular_install_and_retains_lkg() {
+        let _key = crate::encryption::set_test_encryption_key([0x63; 32]);
+        let dir = TempDir::new().unwrap();
+        let installed = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        // Use an existing exact authority transaction to represent an
+        // established installation beyond the initial split manifest.
+        let mut config = installed.effective_config();
+        config.proxy_auth = Some(crate::ProxyAuth {
+            username: "test-user".into(),
+            password: "test-password".into(),
+        });
+        crate::persist_proxy_auth_credential_transaction_at_revision(
+            dir.path(),
+            &mut config,
+            installed.registry().core.snapshot().revision,
+        )
+        .unwrap();
+        drop(installed);
+        let path = dir.path().join("model_limits.json");
+        let first = json!([{
+            "model_pattern": "legacy-hosted-model",
+            "max_context_tokens": 48_000,
+            "max_output_tokens": 4_000,
+            "future_option": {"kept": true}
+        }]);
+        write_json(&path, &first);
+
+        // Existing modular installations can still be edited with the
+        // documented raw-array sidecar before the server restarts.
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let section = &facade.registry().model_limits;
+        assert_eq!(section.snapshot().status, SectionStatus::Healthy);
+        assert_eq!(section.snapshot().revision, 0);
+        assert_eq!(
+            serde_json::to_value(section.snapshot().data.as_ref()).unwrap(),
+            first
+        );
+        section
+            .commit(0, section.snapshot().data.as_ref().clone())
+            .unwrap();
+        assert_eq!(section.snapshot().revision, 1);
+        let upgraded: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(upgraded["revision"], 1);
+        assert_eq!(upgraded["data"], first);
+
+        let second = json!([{
+            "model_pattern": "legacy-hosted-model",
+            "max_context_tokens": 72_000,
+            "max_output_tokens": 6_000
+        }]);
+        write_json(&path, &second);
+        section.reload();
+        let good = section.snapshot();
+        assert_eq!(good.status, SectionStatus::Healthy);
+        assert_eq!(good.revision, 2);
+        let normalized: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(normalized["revision"], good.revision);
+        assert_eq!(normalized["data"], second);
+
+        for corrupt in ["{invalid", "[{}]"] {
+            std::fs::write(&path, corrupt).unwrap();
+            section.reload();
+            assert_ne!(section.snapshot().status, SectionStatus::Healthy);
+            assert_eq!(section.snapshot().revision, good.revision);
+            assert_eq!(section.snapshot().data.0, good.data.0);
+        }
+
+        write_json(&path, &first);
+        section.reload();
+        let repaired = section.snapshot();
+        assert_eq!(repaired.status, SectionStatus::Healthy);
+        assert_eq!(repaired.revision, good.revision + 1);
+        assert_eq!(serde_json::to_value(repaired.data.as_ref()).unwrap(), first);
+        assert!(matches!(
+            section.commit(good.revision, repaired.data.as_ref().clone()),
+            Err(crate::ConfigStoreError::Conflict { .. })
+        ));
+        section
+            .commit(repaired.revision, repaired.data.as_ref().clone())
+            .unwrap();
+        assert_eq!(section.snapshot().revision, repaired.revision + 1);
     }
 
     #[test]
