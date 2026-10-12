@@ -342,7 +342,9 @@ impl BuiltinToolExecutor {
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, ExecCommandTool::new()) {
             framework_tools.insert(name, tool);
         }
-        let _ = registry.register(WriteStdinTool::new());
+        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, WriteStdinTool::new()) {
+            framework_tools.insert(name, tool);
+        }
         let _ = registry.register(BashInputTool::new());
         let _ = registry.register(BashOutputTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, EditTool::new()) {
@@ -394,9 +396,22 @@ impl BuiltinToolExecutor {
             .is_some_and(|builtin| Arc::ptr_eq(builtin, tool))
     }
 
+    // Kept in sync with the startup wire's NativeToolCeiling::NAMES. This crate
+    // intentionally does not depend on the sub-agent transport crate.
+    const NATIVE_TOOL_NAMES: [&'static str; 8] = [
+        "Bash",
+        "Edit",
+        "Glob",
+        "Read",
+        "Task",
+        "Write",
+        "exec_command",
+        "write_stdin",
+    ];
+
     /// Observe the registered Arc, not a same-name custom replacement.
     pub fn eligible_native_tool(&self, name: &str) -> bool {
-        matches!(name, "Bash" | "Edit" | "Glob" | "Read" | "Task" | "Write")
+        Self::NATIVE_TOOL_NAMES.contains(&name)
             && self.registry.get(name).is_some_and(|tool| {
                 self.is_framework_builtin_instance(name, &tool)
                     && self
@@ -410,7 +425,7 @@ impl BuiltinToolExecutor {
     pub fn with_native_tool_ceiling(mut self, names: Vec<String>) -> Result<Self, ToolError> {
         let set: BTreeSet<_> = names.iter().cloned().collect();
         if set.len() != names.len()
-            || names.len() > 6
+            || names.len() > Self::NATIVE_TOOL_NAMES.len()
             || names.iter().any(|name| !self.eligible_native_tool(name))
         {
             return Err(ToolError::Execution("native_tool_ceiling_invalid".into()));
@@ -5192,6 +5207,53 @@ mod tests {
             .is_err());
     }
 
+    #[test]
+    fn native_ceiling_admits_original_polled_shells_and_never_expands_frozen_grants() {
+        let executor = BuiltinToolExecutor::new()
+            .with_native_tool_ceiling(
+                BuiltinToolExecutor::NATIVE_TOOL_NAMES
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            )
+            .unwrap();
+        for name in ["Bash", "exec_command", "write_stdin"] {
+            assert!(executor.eligible_native_tool(name));
+            assert!(executor.owns_exact_tool(name));
+        }
+        for name in [
+            "default::exec_command",
+            "Exec_Command",
+            "BashInput",
+            "BashOutput",
+            "KillShell",
+        ] {
+            assert!(!executor.eligible_native_tool(name));
+        }
+        let narrowed = executor
+            .with_native_tool_ceiling(vec!["Bash".into()])
+            .unwrap();
+        assert!(narrowed.owns_exact_tool("Bash"));
+        assert!(!narrowed.owns_exact_tool("exec_command"));
+        assert!(!narrowed.owns_exact_tool("write_stdin"));
+        assert!(narrowed
+            .with_native_tool_ceiling(vec!["exec_command".into()])
+            .is_err());
+        for name in ["exec_command", "write_stdin"] {
+            let registry = ToolRegistry::new();
+            registry
+                .register(ExactRoutingTool {
+                    name,
+                    label: "spoofed native shell",
+                    args_sensitive: false,
+                })
+                .unwrap();
+            assert!(BuiltinToolExecutor::with_registry(registry)
+                .with_native_tool_ceiling(vec![name.into()])
+                .is_err());
+        }
+    }
+
     #[tokio::test]
     async fn task_only_native_ceiling_has_no_filesystem_or_shell_surface() {
         let executor = BuiltinToolExecutor::new()
@@ -5210,7 +5272,15 @@ mod tests {
             json!({"tasks":[{"content":"Own step","status":"pending"}]}),
         );
         assert!(executor.execute(&call).await.unwrap().success);
-        for name in ["Bash", "Read", "Write", "Edit", "SubAgent"] {
+        for name in [
+            "Bash",
+            "exec_command",
+            "write_stdin",
+            "Read",
+            "Write",
+            "Edit",
+            "SubAgent",
+        ] {
             assert!(executor
                 .execute(&make_tool_call(name, json!({})))
                 .await

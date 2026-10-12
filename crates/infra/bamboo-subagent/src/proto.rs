@@ -281,7 +281,16 @@ fn deserialize_project_observation<'de, D: serde::Deserializer<'de>>(
 }
 
 impl NativeToolCeiling {
-    pub const NAMES: [&'static str; 6] = ["Bash", "Edit", "Glob", "Read", "Task", "Write"];
+    pub const NAMES: [&'static str; 8] = [
+        "Bash",
+        "Edit",
+        "Glob",
+        "Read",
+        "Task",
+        "Write",
+        "exec_command",
+        "write_stdin",
+    ];
     pub const MAX_BYTES: usize = 16 * 1024;
 
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -1019,6 +1028,63 @@ impl ChildFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_tool_ceiling_accepts_exact_shell_names_and_keeps_wire_bounds() {
+        let parent = bamboo_domain::Session::new("native-parent", "model");
+        let child = bamboo_domain::Session::new_child_of("native-child", &parent, "model", "role");
+        let ceiling = NativeToolCeiling {
+            version: 1,
+            child_session_id: child.id.clone(),
+            parent_session_id: parent.id,
+            root_session_id: child.root_session_id,
+            created_at: child.created_at,
+            spawn_depth: child.spawn_depth,
+            project_id: None,
+            tools: NativeToolCeiling::NAMES
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        };
+        ceiling.validate().unwrap();
+        let raw = serde_json::to_value(&ceiling).unwrap();
+        assert_eq!(raw["project_id"], serde_json::Value::Null);
+        let restored: NativeToolCeiling = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(restored, ceiling);
+        restored.validate().unwrap();
+
+        // Old frozen ceilings keep their exact legacy grant after decoding.
+        let mut legacy = ceiling.clone();
+        legacy.tools = vec!["Bash".into()];
+        let restored: NativeToolCeiling =
+            serde_json::from_slice(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored.tools, ["Bash"]);
+
+        for tools in [
+            vec!["default::exec_command".into()],
+            vec!["Exec_Command".into()],
+            vec!["exec_command".into(), "exec_command".into()],
+            vec!["write_stdin".into(), "exec_command".into()],
+            vec!["Bash".into(); NativeToolCeiling::NAMES.len() + 1],
+        ] {
+            let mut invalid = ceiling.clone();
+            invalid.tools = tools;
+            assert!(invalid.validate().is_err());
+        }
+        let mut oversized = ceiling.clone();
+        oversized.child_session_id = "x".repeat(NativeToolCeiling::MAX_BYTES);
+        assert!(oversized.validate().is_err());
+        let mut missing_project = raw.clone();
+        missing_project
+            .as_object_mut()
+            .unwrap()
+            .remove("project_id");
+        assert!(serde_json::from_value::<NativeToolCeiling>(missing_project).is_err());
+        let mut unknown = raw;
+        unknown["extra"] = true.into();
+        assert!(serde_json::from_value::<NativeToolCeiling>(unknown).is_err());
+    }
 
     #[test]
     fn workflow_agent_usage_is_bound_to_current_activation_and_birth() {
