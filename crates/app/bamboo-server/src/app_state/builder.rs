@@ -185,6 +185,7 @@ impl AppState {
                 }
             };
 
+        let boot_provider_handle_available = provider_registry.get_default().is_some();
         let provider = provider_registry.get_default().unwrap_or_else(|| {
             let default_provider_name = provider_registry.default_provider_name();
             let message = if config.has_provider_instances() {
@@ -205,6 +206,7 @@ impl AppState {
             bamboo_home_dir,
             config,
             provider,
+            boot_provider_handle_available,
             config_facade,
             Arc::new(NoopToolEventPublisher),
             memory_store,
@@ -237,6 +239,7 @@ impl AppState {
             bamboo_home_dir,
             config,
             provider,
+            false,
             None,
             Arc::new(NoopToolEventPublisher),
             memory_store,
@@ -258,6 +261,7 @@ impl AppState {
             bamboo_home_dir,
             config,
             provider,
+            false,
             None,
             tool_event_publisher,
             memory_store,
@@ -270,11 +274,17 @@ impl AppState {
         bamboo_home_dir: PathBuf,
         config: Config,
         provider: Arc<dyn LLMProvider>,
+        boot_provider_handle_available: bool,
         config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
         tool_event_publisher: Arc<dyn ToolEventPublisher>,
         memory_store: bamboo_memory::memory_store::MemoryStore,
         start_inbox_reconciler: bool,
     ) -> Result<Self, AppError> {
+        let boot_application_inputs =
+            super::config_application::ApplicationInputs::boot(&config, config_facade.as_deref());
+        let config_application = Arc::new(std::sync::RwLock::new(
+            super::config_application::ConfigApplicationState::new(&boot_application_inputs),
+        ));
         // Wire the configured-default-workspace resolver into agent-core. This keeps
         let data_dir = bamboo_home_dir.clone();
         let (session_store, storage) = init_storage(&data_dir).await?;
@@ -480,6 +490,20 @@ impl AppState {
                 )
             }
         };
+        if boot_provider_handle_available
+            && super::config_application::boot_provider_is_complete(
+                &config_snapshot,
+                &provider_registry,
+            )
+        {
+            config_application
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .record_applied(
+                    super::config_application::ConfigConsumer::ProviderRuntime,
+                    &boot_application_inputs,
+                );
+        }
         drop(config_snapshot);
 
         let provider_router = Arc::new(bamboo_llm::ProviderModelRouter::new(
@@ -1237,7 +1261,6 @@ impl AppState {
             .await
             .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?,
         );
-
         // Dedicated child-session adapter backing the guardian review spawner.
         // The guardian path passes an explicit model (no subagent_type routing)
         // and registers its parent wait at the terminal gate (not via the
@@ -1333,6 +1356,7 @@ impl AppState {
                 provider_lock.clone(),
                 mcp_manager.clone(),
                 account_sink.clone(),
+                config_application.clone(),
             );
         Ok(Self {
             browser,
@@ -1343,6 +1367,7 @@ impl AppState {
             config,
             config_facade,
             config_io_lock,
+            config_application,
             config_live_health,
             mcp_config_live_health,
             config_watcher,
