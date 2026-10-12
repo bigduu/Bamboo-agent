@@ -124,6 +124,16 @@ pub struct Probe {
     pub release: tokio::sync::Notify,
 }
 
+/// Native Task returns the service error directly; the legacy HostBridge wraps
+/// it once. These are the two exact wire forms of this fixture's known CAS race,
+/// not a general production error classifier or retry policy.
+pub fn is_question_revision_conflict(content: &str) -> bool {
+    matches!(
+        content,
+        "revision_conflict" | "authority_unavailable: revision_conflict"
+    )
+}
+
 /// A new model attempt must not reuse a completed tool-call identity. Only the
 /// known concurrent Ticket revision conflict permits this fixture to retry.
 pub fn question_call(messages: &Value, letter: &str, probe: &Probe) -> Value {
@@ -137,9 +147,9 @@ pub fn question_call(messages: &Value, letter: &str, probe: &Probe) -> Value {
     for (attempt, result) in previous.iter().enumerate() {
         assert_eq!(result["tool_call_id"], format!("{prefix}{attempt}"));
         let content = result["content"].as_str().unwrap();
-        assert_eq!(
-            content, "authority_unavailable: revision_conflict",
-            "question may retry only an observed native revision conflict: {result}"
+        assert!(
+            is_question_revision_conflict(content),
+            "question may retry only an observed Ticket revision conflict: {result}"
         );
     }
     if !previous.is_empty() {
