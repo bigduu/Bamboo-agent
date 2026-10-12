@@ -279,6 +279,25 @@ pub(crate) async fn poll_result(
     })
 }
 
+/// A newly spawned command still belongs to its invoking future until the
+/// initial result hands its handle to the caller. Later polls must not acquire
+/// this guard: delivered handles intentionally survive across agent rounds.
+struct InitialExecGuard<'a> {
+    shell: &'a bash_runtime::ShellSession,
+    delivered: bool,
+}
+
+impl Drop for InitialExecGuard<'_> {
+    fn drop(&mut self) {
+        if !self.delivered {
+            // The completion task retains the real child handle and performs
+            // the kill/reap and existing output drain. Never signal by PID.
+            self.shell.request_kill();
+            bash_runtime::remove_shell(&self.shell.id);
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExecCommandArgs {
@@ -383,12 +402,18 @@ impl Tool for ExecCommandTool {
         )
         .await
         .map_err(ToolError::Execution)?;
-        Ok(poll_result(
+        let mut initial = InitialExecGuard {
+            shell: &shell,
+            delivered: false,
+        };
+        let result = poll_result(
             &shell,
             yield_duration(parsed.yield_time_ms),
             parsed.max_output_tokens,
         )
-        .await)
+        .await;
+        initial.delivered = true;
+        Ok(result)
     }
 }
 

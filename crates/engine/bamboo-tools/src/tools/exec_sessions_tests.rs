@@ -204,6 +204,180 @@ mod process_tests {
         )
     }
 
+    // Each new lifetime test has a unique owner. Request cleanup through the
+    // real child supervisor even if setup or an assertion panics early. This
+    // fallback is not a substitute for the explicit async cleanup checks below.
+    struct ExecTestCleanup<'a>(&'a str);
+
+    impl Drop for ExecTestCleanup<'_> {
+        fn drop(&mut self) {
+            for id in bash_runtime::uncollected_polled_shells_for_session(self.0) {
+                if let Some(shell) = bash_runtime::remove_shell(&id) {
+                    // kill() has no suspension point in either baseline. Poll
+                    // its existing request path without spawning cleanup work.
+                    let _ = futures::FutureExt::now_or_never(shell.kill());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_initial_exec_reaps_child_without_stopping_delivered_same_owner_handle() {
+        let _environment = environment();
+        assert!(crate::LocalTaskResources::current().is_none());
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("cancel-initial-exec-{}", uuid::Uuid::new_v4());
+        let _cleanup = ExecTestCleanup(&owner);
+        workspace_state::publish_resolved_workspace(&owner, directory.path().to_path_buf());
+        struct AbortGate(PathBuf);
+        impl Drop for AbortGate {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, b"abort");
+            }
+        }
+        let _abort = AbortGate(directory.path().join("abort"));
+        let survivor = start("cat".into(), &owner, true).await;
+        let survivor_id = survivor["session_id"].as_str().unwrap();
+        let tool = ExecCommandTool::new();
+        // Only cmd is supplied, as in the ordinary Root path. The original
+        // 10-second initial result remains pending behind a private gate.
+        let mut invocation = tool.invoke(
+            json!({"cmd":"printf started > started; while [ ! -f abort ]; do sleep 0.01; done"}),
+            context(&owner),
+        );
+        tokio::select! {
+            result = &mut invocation => panic!("initial exec returned before cancellation: {result:?}"),
+            _ = async {
+                timeout(Duration::from_secs(2), async {
+                    while !directory.path().join("started").exists() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }).await.expect("the real shell must start before cancellation");
+            } => {}
+        }
+        let ids = bash_runtime::uncollected_polled_shells_for_session(&owner);
+        assert_eq!(ids.len(), 2);
+        let id = ids.iter().find(|id| id.as_str() != survivor_id).unwrap();
+        let shell = bash_runtime::get_shell(id).unwrap();
+        let state = shell.polled.as_ref().unwrap();
+        assert!(!state.process_exited());
+        drop(invocation);
+        state.wait(2000).await;
+        // Observe the real child's successful wait/reap before any test
+        // cleanup. The optimistic ShellSession::status is not process proof.
+        let reaped_before_cleanup = state.process_exited();
+        let result_before_cleanup = state.take(id, None).await;
+        let removed_before_cleanup = bash_runtime::get_shell(id).is_none();
+        if !state.is_complete().await {
+            shell.kill().await.unwrap();
+            state.wait(2000).await;
+        }
+        let cleanup_reaped = state.process_exited();
+        let cleanup_complete = state.is_complete().await;
+        bash_runtime::remove_shell(id);
+        let survivor_result = payload(
+            WriteStdinTool::new()
+                .invoke(
+                    json!({"session_id":survivor_id,"chars":"still alive","eof":true,"yield_time_ms":2000}),
+                    context(&owner),
+                )
+                .await
+                .unwrap(),
+        );
+        // Expected-red runs must confirm both children are finished before
+        // asserting the earlier product observation. wait() alone can time out.
+        assert!(
+            cleanup_reaped,
+            "initial exec cleanup did not reap the child"
+        );
+        assert!(
+            cleanup_complete,
+            "initial exec cleanup did not finish capture"
+        );
+        assert_eq!(survivor_result["status"], "completed");
+        assert_eq!(survivor_result["exit_code"], 0);
+        assert!(survivor_result.get("session_id").is_none());
+        assert_eq!(survivor_result["output"], "still alive");
+        eprintln!("INITIAL_EXEC_CLEANUP_CONFIRMED owner={owner} reaped=true capture_complete=true survivor_completed=true");
+        assert!(
+            reaped_before_cleanup,
+            "cancelled initial exec left its child alive"
+        );
+        assert_eq!(result_before_cleanup.status, "killed");
+        assert!(
+            removed_before_cleanup,
+            "an undelivered handle must not consume registry capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_initial_exec_before_completion_task_first_poll_still_reaps_child() {
+        let _environment = environment();
+        let owner = format!("cancel-before-poll-{}", uuid::Uuid::new_v4());
+        let _cleanup = ExecTestCleanup(&owner);
+        let tool = ExecCommandTool::new();
+        let mut invocation = tool.invoke(json!({"cmd":"exec sleep 30"}), context(&owner));
+        // The environment override is immediately ready. A single poll on
+        // this current-thread runtime spawns the real child and waits for its
+        // first result without scheduling the completion task yet.
+        assert!(futures::poll!(invocation.as_mut()).is_pending());
+        let ids = bash_runtime::uncollected_polled_shells_for_session(&owner);
+        assert_eq!(ids.len(), 1);
+        let shell = bash_runtime::get_shell(&ids[0]).unwrap();
+        let state = shell.polled.as_ref().unwrap();
+        drop(invocation);
+        state.wait(2000).await;
+        let reaped_before_cleanup = state.process_exited();
+        let result_before_cleanup = state.take(&shell.id, None).await;
+        if !state.is_complete().await {
+            shell.kill().await.unwrap();
+            state.wait(2000).await;
+        }
+        assert!(
+            state.process_exited(),
+            "early cancellation cleanup did not reap the child"
+        );
+        assert!(
+            state.is_complete().await,
+            "early cancellation cleanup did not finish capture"
+        );
+        bash_runtime::remove_shell(&shell.id);
+        eprintln!("INITIAL_EXEC_CLEANUP_CONFIRMED owner={owner} reaped=true capture_complete=true");
+        assert!(
+            reaped_before_cleanup,
+            "initial cancellation notification was lost"
+        );
+        assert_eq!(result_before_cleanup.status, "killed");
+    }
+
+    #[tokio::test]
+    async fn cancelled_later_poll_preserves_delivered_exec_handle() {
+        let _environment = environment();
+        let owner = format!("cancel-later-poll-{}", uuid::Uuid::new_v4());
+        let _cleanup = ExecTestCleanup(&owner);
+        let first = start("cat".into(), &owner, true).await;
+        let id = first["session_id"].as_str().unwrap();
+        let tool = WriteStdinTool::new();
+        let mut invocation = tool.invoke(json!({"session_id":id}), context(&owner));
+        assert!(futures::poll!(invocation.as_mut()).is_pending());
+        drop(invocation);
+        let shell = bash_runtime::get_shell(id).unwrap();
+        let state = shell.polled.as_ref().unwrap();
+        state.wait(250).await;
+        assert!(!state.process_exited());
+        let last = payload(
+            tool.invoke(
+                json!({"session_id":id,"chars":"next round","eof":true,"yield_time_ms":2000}),
+                context(&owner),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(last["status"], "completed");
+        assert_eq!(last["exit_code"], 0);
+        assert_eq!(last["output"], "next round");
+    }
+
     #[tokio::test]
     async fn fast_completion_drains_stdout_and_stderr_before_returning_final_result() {
         let _environment = environment();
