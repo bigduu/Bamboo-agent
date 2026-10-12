@@ -59,9 +59,12 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn error_preview(tool_name: &str, value: &str) -> String {
     let canonical = bamboo_domain::canonical_tool_name(tool_name);
-    if canonical.eq_ignore_ascii_case("browser") || canonical.eq_ignore_ascii_case("browser_eval") {
-        // Browser input, page scripts and failure text can contain page
-        // data. Keep call metadata for correlation, not those payloads.
+    if canonical.eq_ignore_ascii_case("browser")
+        || canonical.eq_ignore_ascii_case("browser_eval")
+        || canonical.eq_ignore_ascii_case("session_message")
+    {
+        // Browser and peer arguments, results and failure text can contain
+        // private content. Keep correlation metadata, not those payloads.
         "[redacted]".to_string()
     } else {
         truncate(value, PREVIEW_MAX_CHARS)
@@ -78,8 +81,10 @@ fn error_log_path() -> PathBuf {
 /// This is fire-and-forget: if the write fails, it only logs a tracing warning
 /// and never propagates the error back to the caller.
 pub(crate) async fn append_tool_error(record: ToolErrorRecord) {
-    let path = error_log_path();
+    append_tool_error_to_path(record, error_log_path()).await;
+}
 
+async fn append_tool_error_to_path(record: ToolErrorRecord, path: PathBuf) {
     let line = match serde_json::to_string(&record) {
         Ok(json) => format!("{json}\n"),
         Err(e) => {
@@ -160,6 +165,170 @@ pub(crate) fn soft_failure_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn peer_hard_and_soft_error_jsonl_redacts_message_and_routing() {
+        let home = tempfile::tempdir().expect("isolated collector directory");
+        let path = home.path().join("tool_errors.jsonl");
+        let body = "synthetic-peer-private-body";
+        let target = "synthetic-peer-private-target";
+        let reply_to = "synthetic-peer-private-reply";
+        let operation = "synthetic-peer-private-operation";
+        let failure = format!("synthetic-peer-private-failure {body} {target}");
+        let cases = [
+            ("session_message", "send", false),
+            ("session_message", "reply", false),
+            ("SESSION_MESSAGE", "send", false),
+            ("default::session_message", "reply", false),
+            ("default::SESSION_MESSAGE", "send", true),
+            ("session_message", "reply", true),
+        ];
+        for (tool_name, action, malformed) in cases {
+            let mut arguments = serde_json::json!({
+                "action": action,
+                "operation_id": operation,
+                "message": body,
+            });
+            if action == "send" {
+                arguments["target_session_id"] = target.into();
+            } else {
+                arguments["reply_to"] = reply_to.into();
+            }
+            let mut arguments = arguments.to_string();
+            if malformed {
+                arguments.pop();
+                assert!(serde_json::from_str::<serde_json::Value>(&arguments).is_err());
+            }
+            for record in [
+                hard_error_record(
+                    "collector-session",
+                    3,
+                    tool_name,
+                    "collector-call",
+                    &arguments,
+                    &failure,
+                ),
+                soft_failure_record(
+                    "collector-session",
+                    3,
+                    tool_name,
+                    "collector-call",
+                    &arguments,
+                    &failure,
+                ),
+            ] {
+                append_tool_error_to_path(record, path.clone()).await;
+            }
+        }
+
+        let serialized = tokio::fs::read_to_string(&path)
+            .await
+            .expect("actual JSONL records");
+        for sentinel in [
+            body,
+            target,
+            reply_to,
+            operation,
+            "synthetic-peer-private-failure",
+        ] {
+            assert!(
+                !serialized.contains(sentinel),
+                "collector persisted private marker {sentinel}"
+            );
+        }
+        let records: Vec<serde_json::Value> = serialized
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("serialized collector record"))
+            .collect();
+        assert_eq!(records.len(), cases.len() * 2);
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record["session_id"], "collector-session");
+            assert_eq!(record["round"], 3);
+            assert_eq!(record["tool_name"], cases[index / 2].0);
+            assert_eq!(record["tool_call_id"], "collector-call");
+            chrono::DateTime::parse_from_rfc3339(record["ts"].as_str().expect("record timestamp"))
+                .expect("existing timestamp format");
+            assert_eq!(record["args_preview"], "[redacted]");
+            assert_eq!(record["error_message"], "[redacted]");
+            if index % 2 == 0 {
+                assert_eq!(record["error_kind"], "hard");
+                assert!(record.get("result_snippet").is_none());
+            } else {
+                assert_eq!(record["error_kind"], "soft");
+                assert_eq!(record["result_snippet"], "[redacted]");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_and_browser_error_jsonl_keep_existing_policy() {
+        let home = tempfile::tempdir().expect("isolated collector directory");
+        let path = home.path().join("tool_errors.jsonl");
+        let arguments = "界".repeat(PREVIEW_MAX_CHARS + 1);
+        let expected_preview = format!("{}...", "界".repeat(PREVIEW_MAX_CHARS));
+        for record in [
+            hard_error_record("session", 2, "Bash", "call", &arguments, "ordinary failure"),
+            soft_failure_record("session", 2, "Bash", "call", &arguments, "ordinary failure"),
+        ] {
+            append_tool_error_to_path(record, path.clone()).await;
+        }
+        for tool_name in ["browser", "BROWSER", "default::browser_eval"] {
+            for record in [
+                hard_error_record(
+                    "session",
+                    2,
+                    tool_name,
+                    "call",
+                    "private browser input",
+                    "private browser error",
+                ),
+                soft_failure_record(
+                    "session",
+                    2,
+                    tool_name,
+                    "call",
+                    "private browser input",
+                    "private browser result",
+                ),
+            ] {
+                append_tool_error_to_path(record, path.clone()).await;
+            }
+        }
+        let serialized = tokio::fs::read_to_string(&path)
+            .await
+            .expect("actual JSONL records");
+        assert!(!serialized.contains("private browser"));
+        let records: Vec<serde_json::Value> = serialized
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("serialized collector record"))
+            .collect();
+        assert_eq!(records.len(), 8);
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(
+                record["error_kind"],
+                if index % 2 == 0 { "hard" } else { "soft" }
+            );
+            if index < 2 {
+                assert_eq!(record["args_preview"], expected_preview);
+                assert_eq!(record["error_message"], "ordinary failure");
+                assert_eq!(
+                    record
+                        .get("result_snippet")
+                        .and_then(serde_json::Value::as_str),
+                    (index == 1).then_some("ordinary failure")
+                );
+            } else {
+                assert_eq!(record["args_preview"], "[redacted]");
+                assert_eq!(record["error_message"], "[redacted]");
+                assert_eq!(
+                    record
+                        .get("result_snippet")
+                        .and_then(serde_json::Value::as_str),
+                    (index % 2 == 1).then_some("[redacted]")
+                );
+            }
+        }
+    }
 
     #[test]
     fn browser_hard_and_soft_errors_keep_metadata_without_input_or_result_text() {
