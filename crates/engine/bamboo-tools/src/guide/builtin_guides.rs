@@ -1,4 +1,4 @@
-//! Built-in tool guides for the Claude-style tool surface.
+//! Built-in tool guides for the model-visible tool surface.
 
 use std::sync::Arc;
 
@@ -6,16 +6,14 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 20] = [
-    "Bash",
-    "BashInput",
-    "BashOutput",
+pub const BUILTIN_GUIDE_NAMES: [&str; 18] = [
+    "exec_command",
+    "write_stdin",
     "Edit",
     "ExitPlanMode",
     "GetFileInfo",
     "Glob",
     "Grep",
-    "KillShell",
     "session_note",
     "Plan",
     "Read",
@@ -53,7 +51,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             "Read",
             ToolCategory::FileReading,
             "Use for reading file contents, especially before Edit/Write on existing files.",
-            "Do not use for writing or cross-project search; do not substitute Bash cat/head/tail for this.",
+            "Do not use for writing or cross-project search; do not substitute exec_command cat/head/tail for this.",
             &["Edit", "Write", "Grep"],
             vec![example(
                 "Read a config file",
@@ -152,6 +150,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 ),
             ],
         )),
+        // Retained for explicit host-side legacy lookups, not default model guides.
         "Bash" => Some(guide(
             "Bash",
             ToolCategory::CommandExecution,
@@ -274,7 +273,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::CommandExecution,
             "Retrieve the session's current workspace directory. (Alias for Workspace with no path argument.)",
             "Do not use when absolute paths are already known.",
-            &["Workspace", "Bash", "Read"],
+            &["Workspace", "exec_command", "Read"],
             vec![example(
                 "Inspect working directory",
                 json!({}),
@@ -395,7 +394,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::CommandExecution,
             "Change the current session workspace. (Alias for Workspace with path argument.)",
             "Do not use with non-directory or missing paths.",
-            &["Workspace", "Bash", "Read"],
+            &["Workspace", "exec_command", "Read"],
             vec![example(
                 "Switch session workspace",
                 json!({"path":"/workspace/project"}),
@@ -408,7 +407,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::CommandExecution,
             "Get or set the current session workspace directory. Call without 'path' to read the current workspace; call with 'path' to change it.",
             "Do not set workspace to a non-directory or missing path.",
-            &["Bash", "Read"],
+            &["exec_command", "Read"],
             vec![
                 example(
                     "Get current workspace",
@@ -427,7 +426,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::UserInteraction,
             "Request one or more remembered permission scopes through independent typed decisions. Batch entries are reviewed one at a time.",
             "Do not use this for a one-shot operation: invoke the target tool directly so Allow once is bound to that exact tool-call occurrence.",
-            &["Write", "Edit", "Bash", "WebFetch"],
+            &["Write", "Edit", "exec_command", "WebFetch"],
             vec![example(
                 "Request remembered file-write permission",
                 json!({"reason":"Need to write deployment config to /etc/nginx","permissions":[{"type":"write_file","resource":"/etc/nginx/conf.d/*"}]}),
@@ -439,7 +438,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::CommandExecution,
             "Pause briefly when waiting for an external state change before polling again.",
             "Do not use for normal reasoning pauses or long waits when another tool can fetch status directly.",
-            &["BashOutput", "WebFetch"],
+            &["write_stdin", "WebFetch"],
             vec![example(
                 "Wait before next poll",
                 json!({"seconds":2,"reason":"wait for background process output"}),
@@ -693,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn exec_guides_teach_pull_results() {
+    fn default_shell_guides_teach_pull_results_and_keep_legacy_lookup_explicit() {
         let exec = builtin_guide_spec("exec_command").unwrap();
         assert!(exec.when_to_use.contains("session_id"));
         assert!(exec.when_to_use.contains("not injected as a user message"));
@@ -704,6 +703,10 @@ mod tests {
         assert!(poll.when_to_use.contains("final results omit it"));
         assert!(poll.when_to_use.contains("include your own newline"));
         assert_eq!(poll.examples[0].parameters["chars"], "");
+        for legacy in ["Bash", "BashInput", "BashOutput", "KillShell"] {
+            assert!(!BUILTIN_GUIDE_NAMES.contains(&legacy));
+            assert!(builtin_guide_spec(legacy).is_some());
+        }
     }
 
     #[test]

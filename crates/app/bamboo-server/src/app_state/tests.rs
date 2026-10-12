@@ -290,7 +290,7 @@ async fn root_tools_include_server_overlays_and_session_note() {
 }
 
 #[tokio::test]
-async fn root_catalog_keeps_only_current_history_in_the_six_core_functions() {
+async fn root_catalog_keeps_only_current_history_in_the_core_functions() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
@@ -309,7 +309,8 @@ async fn root_catalog_keeps_only_current_history_in_the_six_core_functions() {
     assert_eq!(
         core_names,
         std::collections::BTreeSet::from([
-            "Bash".to_string(),
+            "exec_command".to_string(),
+            "write_stdin".to_string(),
             "Edit".to_string(),
             "Grep".to_string(),
             "Read".to_string(),

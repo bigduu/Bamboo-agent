@@ -193,14 +193,14 @@ impl Tool for RegisteredProbeTool {
         "record the selected exact tool"
     }
     fn parameters_schema(&self) -> Value {
-        json!({ "type": "object", "properties": { "command": { "type": "string" } }, "required": ["command"] })
+        json!({ "type": "object", "properties": { "cmd": { "type": "string" } }, "required": ["cmd"] })
     }
     async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
         let session_id = ctx.session_id.as_deref().unwrap();
-        // Bash is gated by the real BuiltinToolExecutor. The exact custom
+        // exec_command is gated by the real BuiltinToolExecutor. The exact custom
         // registration requests its own permission through the same public
         // evaluator, so the engine creates both pending structures itself.
-        if self.name == "execute_command" {
+        if self.name == "default::exec_command" {
             match self
                 .config
                 .evaluate(bamboo_tools::permission::PermissionEvaluation {
@@ -210,7 +210,7 @@ impl Tool for RegisteredProbeTool {
                     tool_name: self.name.clone(),
                     tool_args: args.clone(),
                     permission_type: PermissionType::ExecuteCommand,
-                    resource: args["command"].as_str().unwrap().into(),
+                    resource: args["cmd"].as_str().unwrap().into(),
                     operation_summary: "custom operation".into(),
                     risk_level: RiskLevel::High,
                     bypass_requested: ctx.bypass_permissions,
@@ -589,8 +589,8 @@ fn alias_call() -> ToolCall {
         id: CALL.into(),
         tool_type: "function".into(),
         function: FunctionCall {
-            name: "execute_command".into(),
-            arguments: json!({"command": "current-command"}).to_string(),
+            name: "default::exec_command".into(),
+            arguments: json!({"cmd": "current-command"}).to_string(),
         },
     }
 }
@@ -608,13 +608,16 @@ fn current_request(session: &Session) -> PermissionRequest {
 
 fn alias_config() -> Arc<PermissionConfig> {
     let config = Arc::new(PermissionConfig::new());
-    config.set_ask_rules(["Bash(current-command)".into(), "execute_command".into()]);
+    config.set_ask_rules([
+        "Bash(current-command)".into(),
+        "default::exec_command".into(),
+    ]);
     config
 }
 
 async fn alias_pending_fixture() -> (Fixture, Session, PermissionRequest) {
     let fixture = Fixture::new().await;
-    let agent = fixture.registered_agent(alias_config(), &["Bash"]);
+    let agent = fixture.registered_agent(alias_config(), &["exec_command"]);
     *fixture.probe.next_call.lock().unwrap() = Some(alias_call());
     let initial_events =
         events(agent.run_stream(Session::new("alias-pending", "test-model"), "operate")).await;
@@ -624,14 +627,14 @@ async fn alias_pending_fixture() -> (Fixture, Session, PermissionRequest) {
     let pending = agent.load_session("alias-pending").await.unwrap().unwrap();
     assert_eq!(
         pending.pending_question.as_ref().unwrap().tool_name,
-        "execute_command"
+        "default::exec_command"
     );
     assert_eq!(
         pending.pending_question.as_ref().unwrap().source,
         PendingQuestionSource::PauseTool
     );
     let request = current_request(&pending);
-    assert_eq!(request.tool_name, "Bash");
+    assert_eq!(request.tool_name, "exec_command");
     assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
     (fixture, pending, request)
 }
@@ -639,12 +642,12 @@ async fn alias_pending_fixture() -> (Fixture, Session, PermissionRequest) {
 #[tokio::test]
 async fn typed_alias_pending_retains_the_real_original_question_identity() {
     let (fixture, pending, _) = Box::pin(alias_pending_fixture()).await;
-    let agent = fixture.registered_agent(alias_config(), &["Bash"]);
+    let agent = fixture.registered_agent(alias_config(), &["exec_command"]);
     let calls_before = fixture.probe.provider_calls.load(Ordering::SeqCst);
     let waiting = events(agent.resume_stream(pending)).await;
     assert_eq!(waiting.len(), 1);
     assert!(
-        matches!(&waiting[0], AgentEvent::NeedClarification { tool_name: Some(name), .. } if name == "execute_command")
+        matches!(&waiting[0], AgentEvent::NeedClarification { tool_name: Some(name), .. } if name == "default::exec_command")
     );
     assert_eq!(
         fixture.probe.provider_calls.load(Ordering::SeqCst),
@@ -654,11 +657,11 @@ async fn typed_alias_pending_retains_the_real_original_question_identity() {
 }
 
 #[tokio::test]
-async fn typed_alias_approved_replay_reaches_the_registered_bash_owner() {
+async fn typed_alias_approved_replay_reaches_the_registered_exec_owner() {
     let (mut fixture, _, request) = Box::pin(alias_pending_fixture()).await;
     fixture.approve(&request).await;
     fixture.reopen_store().await;
-    let agent = fixture.registered_agent(alias_config(), &["Bash"]);
+    let agent = fixture.registered_agent(alias_config(), &["exec_command"]);
     let session = agent
         .load_session(&request.session_id)
         .await
@@ -672,8 +675,8 @@ async fn typed_alias_approved_replay_reaches_the_registered_bash_owner() {
     )));
     let calls = fixture.probe.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "Bash");
-    assert_eq!(calls[0].arguments, json!({"command": "current-command"}));
+    assert_eq!(calls[0].name, "exec_command");
+    assert_eq!(calls[0].arguments, json!({"cmd": "current-command"}));
     assert_eq!(
         calls[0].generation.as_deref(),
         Some(request.request_generation.as_str())
@@ -688,7 +691,7 @@ async fn sdk_approval_replay_does_not_retain_a_completed_original_output_cap_sco
     // Keep the positive limit large enough for the real permission payload.
     for cap in [0, 4096] {
         let mut fixture = Fixture::new().await;
-        let agent = fixture.registered_agent(alias_config(), &["Bash"]);
+        let agent = fixture.registered_agent(alias_config(), &["exec_command"]);
         let id = format!("replay-cap-{cap}");
         let mut session = Session::new(&id, "test-model");
         session.token_budget = Some(bamboo_domain::TokenBudget {
@@ -732,7 +735,7 @@ async fn sdk_approval_replay_does_not_retain_a_completed_original_output_cap_sco
                 .map(|budget| budget.max_tool_output_tokens),
             None
         );
-        let replay_agent = fixture.registered_agent(alias_config(), &["Bash"]);
+        let replay_agent = fixture.registered_agent(alias_config(), &["exec_command"]);
         let provider_calls = fixture.probe.provider_calls.load(Ordering::SeqCst);
         Box::pin(replay_agent.resume(&mut reloaded)).await.unwrap();
 
@@ -750,8 +753,8 @@ async fn sdk_approval_replay_does_not_retain_a_completed_original_output_cap_sco
             .starts_with("REAL OUTPUT"));
         let calls = fixture.probe.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "Bash");
-        assert_eq!(calls[0].arguments, json!({"command": "current-command"}));
+        assert_eq!(calls[0].name, "exec_command");
+        assert_eq!(calls[0].arguments, json!({"cmd": "current-command"}));
         assert_eq!(
             calls[0].generation.as_deref(),
             Some(request.request_generation.as_str())
@@ -768,7 +771,7 @@ async fn approved_alias_is_blocked_after_durable_root_tool_tightening() {
     fixture.store.save_session(&latest).await.unwrap();
 
     let config = alias_config();
-    let agent = fixture.registered_agent(config.clone(), &["Bash"]);
+    let agent = fixture.registered_agent(config.clone(), &["exec_command"]);
     let completed = events(agent.resume_stream(stale)).await;
     assert!(!completed.iter().any(|event| matches!(
         event,
@@ -803,9 +806,10 @@ async fn approved_alias_is_blocked_after_durable_root_tool_tightening() {
 }
 
 #[tokio::test]
-async fn typed_alias_exact_custom_owner_cannot_borrow_bash_approval() {
+async fn typed_alias_exact_custom_owner_cannot_borrow_exec_approval() {
     let (fixture, mut pending, request) = Box::pin(alias_pending_fixture()).await;
-    let shadow = fixture.registered_agent(alias_config(), &["Bash", "execute_command"]);
+    let shadow =
+        fixture.registered_agent(alias_config(), &["exec_command", "default::exec_command"]);
     let before = fixture.probe.provider_calls.load(Ordering::SeqCst);
     assert!(Box::pin(shadow.resume(&mut pending)).await.is_err());
     let mut approved = Box::pin(fixture.approve(&request)).await;
@@ -830,10 +834,10 @@ async fn typed_alias_exact_custom_owner_cannot_borrow_bash_approval() {
     );
     assert_eq!(
         pending.pending_question.as_ref().unwrap().tool_name,
-        "execute_command"
+        "default::exec_command"
     );
     let request = current_request(&pending);
-    assert_eq!(request.tool_name, "execute_command");
+    assert_eq!(request.tool_name, "default::exec_command");
     let approved = fixture.approve(&request).await;
     let completed = events(shadow.resume_stream(approved)).await;
     assert!(!completed.iter().any(|event| matches!(
@@ -842,7 +846,7 @@ async fn typed_alias_exact_custom_owner_cannot_borrow_bash_approval() {
     )));
     let calls = fixture.probe.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "execute_command");
+    assert_eq!(calls[0].name, "default::exec_command");
     assert_eq!(
         calls[0].generation.as_deref(),
         Some(request.request_generation.as_str())

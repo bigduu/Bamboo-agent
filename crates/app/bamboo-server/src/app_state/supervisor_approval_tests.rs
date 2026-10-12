@@ -43,8 +43,8 @@ impl LLMProvider for Probe {
                 id: CALL.into(),
                 tool_type: "function".into(),
                 function: FunctionCall {
-                    name: "execute_command".into(),
-                    arguments: json!({"command":"current-command"}).to_string(),
+                    name: "default::exec_command".into(),
+                    arguments: json!({"cmd":"current-command"}).to_string(),
                 },
             }])
         } else {
@@ -65,13 +65,13 @@ struct ProtectedTool {
 #[async_trait]
 impl Tool for ProtectedTool {
     fn name(&self) -> &str {
-        "Bash"
+        "exec_command"
     }
     fn description(&self) -> &str {
         "Exercise a strict Supervisor write after approval"
     }
     fn parameters_schema(&self) -> Value {
-        json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})
+        json!({"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]})
     }
     async fn invoke(&self, _args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
         assert!(!ctx.bypass_permissions && !ctx.auto_approve_permissions && !ctx.plan_read_only);

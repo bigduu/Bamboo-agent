@@ -161,7 +161,9 @@ impl LLMProvider for ObservationProvider {
                             tool_type: "function".into(),
                             function: FunctionCall {
                                 name: self.tool_name.into(),
-                                arguments: if round % 2 == 0 {
+                                arguments: if self.tool_name == "write_stdin" {
+                                    serde_json::json!({"session_id":"mock-polled-session", "chars":""}).to_string()
+                                } else if round % 2 == 0 {
                                     r#"{"path":"file","offset":1}"#.into()
                                 } else {
                                     r#"{"offset":1,"path":"file"}"#.into()
@@ -192,9 +194,18 @@ struct ObservationExecutor {
 impl ToolExecutor for ObservationExecutor {
     async fn execute(
         &self,
-        _: &ToolCall,
+        tool_call: &ToolCall,
     ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.tool_name == "write_stdin" {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments).unwrap(),
+                serde_json::json!({"session_id":"mock-polled-session", "chars":""}),
+            );
+            return Ok(ToolResult::text(true, serde_json::json!({
+                "status":"running", "session_id":"mock-polled-session", "output":"same evidence",
+            }).to_string()));
+        }
         let output = if self.changed_round == Some(call / 2) {
             "new evidence"
         } else {
@@ -569,7 +580,7 @@ async fn observation_progress_real_loop_resets_when_output_changes_and_leaves_po
     );
     let mut polling = Session::new("observation-progress-polling", "model");
     assert_eq!(
-        run_observation_loop(&mut polling, "BashOutput", None).await,
+        run_observation_loop(&mut polling, "write_stdin", None).await,
         [0; 7]
     );
     let mut mutation = Session::new("observation-progress-mutation", "model");

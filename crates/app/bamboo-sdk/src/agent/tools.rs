@@ -8,6 +8,11 @@
 //! [`BuiltinTool::tool`]. Custom tools (your own `impl Tool`) can be passed the
 //! same way.
 //!
+//! For model shell access, select both [`BuiltinTool::ExecCommand`] and
+//! [`BuiltinTool::WriteStdin`]. An explicit legacy [`BuiltinTool::Bash`]
+//! selection retains that host implementation only; it does not register the
+//! replacement pair. The legacy Bash family is hidden from model catalogs.
+//!
 //! The canonical source of truth for built-in tool *names* is
 //! [`bamboo_domain::tool_names::BUILTIN_TOOL_NAMES`]; [`BuiltinTool`] is kept in
 //! lock-step with it by a drift-guard test.
@@ -264,6 +269,45 @@ mod tests {
         ] {
             assert_eq!(BuiltinTool::from_name(name), Some(variant));
             assert_eq!(variant.tool().name(), name);
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_builder_shell_selection_registers_only_requested_tools() {
+        for (selected, expected) in [
+            (vec![BuiltinTool::Bash], vec!["Bash".to_owned()]),
+            (
+                vec![BuiltinTool::ExecCommand, BuiltinTool::WriteStdin],
+                vec!["exec_command".to_owned(), "write_stdin".to_owned()],
+            ),
+        ] {
+            let data_dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                data_dir.path().join("config.json"),
+                r#"{
+                    "provider": "anthropic",
+                    "providers": {
+                        "anthropic": { "api_key": "test-key", "model": "claude-test" }
+                    }
+                }"#,
+            )
+            .unwrap();
+            let agent = super::super::AgentBuilder::new()
+                .tools(selected.into_iter().map(BuiltinTool::tool))
+                .with_defaults_for_data_dir(data_dir.path().to_path_buf())
+                .await
+                .unwrap()
+                .build()
+                .unwrap();
+            let mut names: Vec<String> = agent
+                .inner
+                .default_tools()
+                .list_tools()
+                .into_iter()
+                .map(|schema| schema.function.name)
+                .collect();
+            names.sort();
+            assert_eq!(names, expected);
         }
     }
 

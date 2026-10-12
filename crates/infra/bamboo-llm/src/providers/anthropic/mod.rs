@@ -3444,12 +3444,13 @@ mod anthropic_request_building {
     #[test]
     fn progressive_tools_keep_full_catalog_defer_only_non_core_and_cache_search() {
         let tools = [
-            "Bash",
+            "exec_command",
             "Read",
             "Glob",
-            "bash",
+            "Exec_Command",
             "Workspace",
             "discover_capabilities",
+            "Bash",
         ]
         .into_iter()
         .map(tool_schema)
@@ -3474,14 +3475,15 @@ mod anthropic_request_building {
             5,
             "HostOnly is replaced by one search entry"
         );
-        assert_eq!(rendered[0]["name"], "Bash");
+        assert_eq!(rendered[0]["name"], "exec_command");
+        assert!(rendered.iter().all(|tool| tool["name"] != "Bash"));
         assert_eq!(rendered[1]["name"], "Read");
         assert_eq!(rendered[2]["name"], "Glob");
         assert_eq!(rendered[2]["defer_loading"], true);
-        assert_eq!(rendered[3]["name"], "bash");
+        assert_eq!(rendered[3]["name"], "Exec_Command");
         assert_eq!(
             rendered[3]["defer_loading"], true,
-            "a custom exact lowercase alias must not inherit Core policy"
+            "a custom exact case variant must not inherit Core policy"
         );
         assert!(rendered[0].get("defer_loading").is_none());
         assert!(rendered[1].get("defer_loading").is_none());
@@ -3512,7 +3514,11 @@ mod anthropic_request_building {
 
     #[test]
     fn progressive_cache_can_be_disabled_without_changing_deferred_catalog() {
-        let tools = vec![tool_schema("Bash"), tool_schema("Glob")];
+        let tools = vec![
+            tool_schema("exec_command"),
+            tool_schema("Bash"),
+            tool_schema("Glob"),
+        ];
         let plan = crate::cache::PromptCachePlan {
             cache_tools: false,
             ..Default::default()
@@ -3532,6 +3538,8 @@ mod anthropic_request_building {
             super::CapabilityLoadingMode::Progressive,
         );
         let rendered = body["tools"].as_array().unwrap();
+        assert_eq!(rendered[0]["name"], "exec_command");
+        assert!(rendered.iter().all(|tool| tool["name"] != "Bash"));
         assert_eq!(rendered[1]["defer_loading"], true);
         assert!(rendered
             .iter()
