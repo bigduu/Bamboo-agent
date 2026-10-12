@@ -171,15 +171,14 @@ impl ApplicationInputs {
                 failed.insert(section);
             }
         }
-        for consumer in [ConfigConsumer::ProviderRuntime] {
-            if requires_credential_document(consumer, config)
-                && !consumer.dependencies().iter().any(|id| failed.contains(id))
-                && self.credential_digests.get(&consumer)
-                    == Some(&credential_digest(consumer, &observed))
-            {
-                self.credentials
-                    .insert(consumer, CredentialBinding::Observed(revision));
-            }
+        let consumer = ConfigConsumer::ProviderRuntime;
+        if requires_credential_document(consumer, config)
+            && !consumer.dependencies().iter().any(|id| failed.contains(id))
+            && self.credential_digests.get(&consumer)
+                == Some(&credential_digest(consumer, &observed))
+        {
+            self.credentials
+                .insert(consumer, CredentialBinding::Observed(revision));
         }
     }
 
