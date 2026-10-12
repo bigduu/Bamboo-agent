@@ -2665,18 +2665,42 @@ mod hook_tests {
             "vendor::write_stdin",
         ]));
         let tools: Arc<dyn ToolExecutor> = concrete.clone();
-        let callable = effective_callable_set(
-            &["vendor::exec_command", "vendor::write_stdin"],
-            CapabilityLoadingMode::LegacyFullCatalog,
-            &[],
-        );
+        let schemas = tools.list_tools();
         for name in ["vendor::exec_command", "vendor::write_stdin"] {
             let mut call = probe_call(name);
             call.function.arguments = "{\"ordinary\":true".into();
-            assert!(execute_without_hooks(&callable, &tools, &call, &event_tx)
-                .await
-                .result
-                .is_ok());
+            // Exact foreign identities retain ordinary argument behavior after
+            // selection, independently of pre-promotion catalog eligibility.
+            let outcome = execute_tool_call_only_with_execution_name(
+                name,
+                ToolExecutionOnlyContext {
+                    vision_support: true,
+                    output_cap: None,
+                    executing_supervisor: None,
+                    tool_call: &call,
+                    event_tx: &event_tx,
+                    metrics_collector: None,
+                    session_id: "strict-shell-arguments",
+                    root_orchestration_only: false,
+                    root_session_id: "strict-shell-arguments",
+                    round_id: "round-1",
+                    round: 0,
+                    tools: &tools,
+                    config: &config,
+                    hook_session: None,
+                    hook_runtime_state: None,
+                    session_flags: ToolExecutionSessionFlags::from_session(&session),
+                    available_tool_schemas: &schemas,
+                },
+            )
+            .await
+            .expect("selected foreign execution is a per-call outcome");
+            assert!(
+                outcome.result.is_ok(),
+                "{name}: {:?}",
+                outcome.result.as_ref().err()
+            );
+            assert_eq!(outcome.portable_tool.unwrap().execution_name(), name);
         }
         assert_eq!(
             concrete.entered(),
