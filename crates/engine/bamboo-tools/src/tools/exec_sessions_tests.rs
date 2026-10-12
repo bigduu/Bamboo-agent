@@ -204,12 +204,30 @@ mod process_tests {
         )
     }
 
+    // Each new lifetime test has a unique owner. Request cleanup through the
+    // real child supervisor even if setup or an assertion panics early. This
+    // fallback is not a substitute for the explicit async cleanup checks below.
+    struct ExecTestCleanup<'a>(&'a str);
+
+    impl Drop for ExecTestCleanup<'_> {
+        fn drop(&mut self) {
+            for id in bash_runtime::uncollected_polled_shells_for_session(self.0) {
+                if let Some(shell) = bash_runtime::remove_shell(&id) {
+                    // kill() has no suspension point in either baseline. Poll
+                    // its existing request path without spawning cleanup work.
+                    let _ = futures::FutureExt::now_or_never(shell.kill());
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn cancelled_initial_exec_reaps_child_without_stopping_delivered_same_owner_handle() {
         let _environment = environment();
         assert!(crate::LocalTaskResources::current().is_none());
         let directory = tempfile::tempdir().unwrap();
         let owner = format!("cancel-initial-exec-{}", uuid::Uuid::new_v4());
+        let _cleanup = ExecTestCleanup(&owner);
         workspace_state::publish_resolved_workspace(&owner, directory.path().to_path_buf());
         struct AbortGate(PathBuf);
         impl Drop for AbortGate {
@@ -250,10 +268,12 @@ mod process_tests {
         let reaped_before_cleanup = state.process_exited();
         let result_before_cleanup = state.take(id, None).await;
         let removed_before_cleanup = bash_runtime::get_shell(id).is_none();
-        if !reaped_before_cleanup {
+        if !state.is_complete().await {
             shell.kill().await.unwrap();
             state.wait(2000).await;
         }
+        let cleanup_reaped = state.process_exited();
+        let cleanup_complete = state.is_complete().await;
         bash_runtime::remove_shell(id);
         let survivor_result = payload(
             WriteStdinTool::new()
@@ -264,6 +284,21 @@ mod process_tests {
                 .await
                 .unwrap(),
         );
+        // Expected-red runs must confirm both children are finished before
+        // asserting the earlier product observation. wait() alone can time out.
+        assert!(
+            cleanup_reaped,
+            "initial exec cleanup did not reap the child"
+        );
+        assert!(
+            cleanup_complete,
+            "initial exec cleanup did not finish capture"
+        );
+        assert_eq!(survivor_result["status"], "completed");
+        assert_eq!(survivor_result["exit_code"], 0);
+        assert!(survivor_result.get("session_id").is_none());
+        assert_eq!(survivor_result["output"], "still alive");
+        eprintln!("INITIAL_EXEC_CLEANUP_CONFIRMED owner={owner} reaped=true capture_complete=true survivor_completed=true");
         assert!(
             reaped_before_cleanup,
             "cancelled initial exec left its child alive"
@@ -273,15 +308,13 @@ mod process_tests {
             removed_before_cleanup,
             "an undelivered handle must not consume registry capacity"
         );
-        assert_eq!(survivor_result["status"], "completed");
-        assert_eq!(survivor_result["exit_code"], 0);
-        assert_eq!(survivor_result["output"], "still alive");
     }
 
     #[tokio::test]
     async fn cancelled_initial_exec_before_completion_task_first_poll_still_reaps_child() {
         let _environment = environment();
         let owner = format!("cancel-before-poll-{}", uuid::Uuid::new_v4());
+        let _cleanup = ExecTestCleanup(&owner);
         let tool = ExecCommandTool::new();
         let mut invocation = tool.invoke(json!({"cmd":"exec sleep 30"}), context(&owner));
         // The environment override is immediately ready. A single poll on
@@ -296,11 +329,20 @@ mod process_tests {
         state.wait(2000).await;
         let reaped_before_cleanup = state.process_exited();
         let result_before_cleanup = state.take(&shell.id, None).await;
-        if !reaped_before_cleanup {
+        if !state.is_complete().await {
             shell.kill().await.unwrap();
             state.wait(2000).await;
         }
+        assert!(
+            state.process_exited(),
+            "early cancellation cleanup did not reap the child"
+        );
+        assert!(
+            state.is_complete().await,
+            "early cancellation cleanup did not finish capture"
+        );
         bash_runtime::remove_shell(&shell.id);
+        eprintln!("INITIAL_EXEC_CLEANUP_CONFIRMED owner={owner} reaped=true capture_complete=true");
         assert!(
             reaped_before_cleanup,
             "initial cancellation notification was lost"
@@ -312,6 +354,7 @@ mod process_tests {
     async fn cancelled_later_poll_preserves_delivered_exec_handle() {
         let _environment = environment();
         let owner = format!("cancel-later-poll-{}", uuid::Uuid::new_v4());
+        let _cleanup = ExecTestCleanup(&owner);
         let first = start("cat".into(), &owner, true).await;
         let id = first["session_id"].as_str().unwrap();
         let tool = WriteStdinTool::new();
