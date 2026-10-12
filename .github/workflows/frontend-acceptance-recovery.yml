@@ -1,0 +1,175 @@
+name: Frozen frontend Test recovery
+
+# Refs #1810 / #1903. Controller R is separate from the immutable source C.
+# Original run 38274996158 remains cancelled; this does not relabel its result.
+# Keep the original dev build gate, then compile and run all default tests in
+# one fresh job. Cargo supplies CARGO_BIN_EXE_bamboo for the test profile;
+# binaries from the separate dev-profile build are deliberately not transferred.
+# No cache or artifact service is used. Both original 45-minute limits remain.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  EXPECTED_SOURCE_SHA: 1cda5e1dbae79769052300b26d134bd4ecccf9b3
+  EXPECTED_SOURCE_TREE: 1af37ea4e8b13a5b026b283a535c38f6dd84690c
+
+jobs:
+  build:
+    name: Frozen source dev build (recovery)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      source_tree: ${{ steps.source.outputs.tree }}
+      rustc_version: ${{ steps.toolchain.outputs.rustc_version }}
+      cargo_version: ${{ steps.toolchain.outputs.cargo_version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: bigduu/Bamboo-agent
+          ref: 1cda5e1dbae79769052300b26d134bd4ecccf9b3
+          persist-credentials: false
+
+      - name: Require the exact clean candidate source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'Controller R: %s; run: %s; attempt: %s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          printf 'Runner image: %s %s\n' "$ImageOS" "$ImageVersion"
+          source_sha="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse HEAD^{tree})"
+          test "$source_sha" = "$EXPECTED_SOURCE_SHA"
+          test "$source_tree" = "$EXPECTED_SOURCE_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          printf 'Source C: %s, tree: %s\n' "$source_sha" "$source_tree"
+          cat .cargo/config.toml
+          printf 'sha=%s\ntree=%s\n' "$source_sha" "$source_tree" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          package-manager-cache: false
+
+      - name: Test original CI policy
+        run: node --test scripts/ci-policy.test.cjs
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          components: rustfmt
+
+      - name: Require and record the original Linux Rust toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version --verbose
+          cargo --version --verbose
+          rustc_version="$(rustc --version)"
+          cargo_version="$(cargo --version)"
+          test "$rustc_version" = "rustc 1.99.0 (b940084d7 2026-09-28)"
+          test "$(rustc --version --verbose | sed -n 's/^commit-hash: //p')" = "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4"
+          test "$(rustc --version --verbose | sed -n 's/^host: //p')" = "x86_64-unknown-linux-gnu"
+          printf 'rustc_version=%s\ncargo_version=%s\n' "$rustc_version" "$cargo_version" >> "$GITHUB_OUTPUT"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build locked Rust workspace
+        run: cargo build --locked
+
+      - name: Record checked source identity
+        run: git rev-parse HEAD HEAD^{tree}
+
+      - name: Require source files to remain unchanged
+        run: git diff --exit-code
+
+  test:
+    name: Frozen source tests (recovery)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: bigduu/Bamboo-agent
+          ref: 1cda5e1dbae79769052300b26d134bd4ecccf9b3
+          persist-credentials: false
+
+      - name: Require the exact clean candidate source
+        env:
+          BUILD_SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+          BUILD_SOURCE_TREE: ${{ needs.build.outputs.source_tree }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'Controller R: %s; run: %s; attempt: %s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          printf 'Runner image: %s %s\n' "$ImageOS" "$ImageVersion"
+          source_sha="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse HEAD^{tree})"
+          test "$source_sha" = "$EXPECTED_SOURCE_SHA"
+          test "$source_tree" = "$EXPECTED_SOURCE_TREE"
+          test "$source_sha" = "$BUILD_SOURCE_SHA"
+          test "$source_tree" = "$BUILD_SOURCE_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          printf 'Source C: %s, tree: %s\n' "$source_sha" "$source_tree"
+          cat .cargo/config.toml
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          package-manager-cache: false
+
+      - name: Test original CI policy
+        run: node --test scripts/ci-policy.test.cjs
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          components: rustfmt
+
+      - name: Require and record the original Linux Rust toolchain
+        env:
+          BUILD_RUSTC_VERSION: ${{ needs.build.outputs.rustc_version }}
+          BUILD_CARGO_VERSION: ${{ needs.build.outputs.cargo_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version --verbose
+          cargo --version --verbose
+          rustc_version="$(rustc --version)"
+          cargo_version="$(cargo --version)"
+          test "$rustc_version" = "rustc 1.99.0 (b940084d7 2026-09-28)"
+          test "$(rustc --version --verbose | sed -n 's/^commit-hash: //p')" = "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4"
+          test "$(rustc --version --verbose | sed -n 's/^host: //p')" = "x86_64-unknown-linux-gnu"
+          test "$rustc_version" = "$BUILD_RUSTC_VERSION"
+          test "$cargo_version" = "$BUILD_CARGO_VERSION"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Compile locked Rust test targets
+        timeout-minutes: 15
+        run: cargo test --locked --no-run
+        env:
+          RUST_MIN_STACK: "8388608"
+
+      - name: Test locked Rust workspace
+        timeout-minutes: 30
+        run: cargo test --locked
+        env:
+          RUST_MIN_STACK: "8388608"
+
+      - name: Record checked source identity
+        run: git rev-parse HEAD HEAD^{tree}
+
+      - name: Require source files to remain unchanged
+        run: git diff --exit-code

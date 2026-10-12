@@ -311,3 +311,226 @@ test("CodeQL stays on the main and manual paths", () => {
   )
   assert.match(codeqlWorkflow, /build-mode: none/u)
 })
+
+// This controller tests fixed release source C, not its own head R. Its policy
+// lives here so normal required PR CI validates R without dispatching recovery.
+const recoveryWorkflow = readFileSync(
+  ".github/workflows/frontend-acceptance-recovery.yml", "utf8",
+)
+const recoverySha = "1cda5e1dbae79769052300b26d134bd4ecccf9b3"
+const recoveryTree = "1af37ea4e8b13a5b026b283a535c38f6dd84690c"
+const recoveryJobs = (source) => {
+  const parts = source.replace(/\r\n/gu, "\n").split("\njobs:\n")
+  assert.equal(parts.length, 2, "exactly one jobs block is required")
+  const sections = parts[1].split(/^  ([a-z][a-z-]*):\n/gmu)
+  assert.equal(sections.length, 5, "exactly the build and test jobs are allowed")
+  assert.deepEqual([sections[1], sections[3]], ["build", "test"])
+  return [sections[2], sections[4]].map((section) => {
+    const [settings, ...steps] = section.split(/(?=^      - )/mu)
+    return { settings, steps: steps.map((step) => step.trimEnd()) }
+  })
+}
+const recoveryStep = (job, name) => {
+  const matches = job.steps.filter((step) => step.startsWith(`      - name: ${name}\n`))
+  assert.equal(matches.length, 1, `exactly one ${name} step is required`)
+  return matches[0]
+}
+const recoveryScript = (step) => {
+  const match = step.match(/^        run: \|\n([\s\S]*)$/mu)
+  assert.ok(match, "guard must be an executable block")
+  return match[1].split("\n").map((line) => line.replace(/^          /u, "")).join("\n")
+}
+function assertRecoveryPolicy(source) {
+  source = source.replace(/\r\n/gu, "\n")
+  const header = source.slice(0, source.indexOf("\njobs:\n")).split("\n").filter((line) => line.trim() && !line.startsWith("#"))
+  assert.deepEqual(header, [
+    "name: Frozen frontend Test recovery", "on:", "  workflow_dispatch:", "permissions:", "  contents: read", "env:",
+    `  EXPECTED_SOURCE_SHA: ${recoverySha}`, `  EXPECTED_SOURCE_TREE: ${recoveryTree}`,
+  ], "the manual controller has no other triggers, inputs or environment overrides")
+  assert.match(source, /\non:\n  workflow_dispatch:\n\npermissions:\n  contents: read\n\nenv:\n/u)
+  assert.match(source, new RegExp(`^  EXPECTED_SOURCE_SHA: ${recoverySha}$`, "mu"))
+  assert.match(source, new RegExp(`^  EXPECTED_SOURCE_TREE: ${recoveryTree}$`, "mu"))
+  assert.doesNotMatch(source, /^\s*(?:if|continue-on-error|working-directory|defaults|strategy|container|services|secrets|environment):/mu)
+  assert.doesNotMatch(source, /(?:actions\/(?:cache|upload-artifact|download-artifact)|rust-cache)@|\b(?:git reset|git clean|git checkout|git switch|cargo install|cargo publish)\b/u)
+  assert.equal((source.match(/^permissions:/gmu) || []).length, 1)
+  assert.equal((source.match(/^[ \t]+permissions:/gmu) || []).length, 0)
+  assert.deepEqual([...source.matchAll(/^      - uses: (.*)$/gmu)].map((m) => m[1]), ["actions/checkout@v7", "actions/checkout@v7"])
+  assert.deepEqual([...source.matchAll(/^        uses: (.*)$/gmu)].map((m) => m[1]), ["actions/setup-node@v7", "dtolnay/rust-toolchain@stable", "actions/setup-node@v7", "dtolnay/rust-toolchain@stable"])
+  const jobs = recoveryJobs(source)
+  for (const [index, recoveryJob] of jobs.entries()) {
+    assert.doesNotMatch(recoveryJob.settings, /^    env:/mu, "job environments must not alter Cargo or test behavior")
+    assert.match(recoveryJob.settings, /^    runs-on: ubuntu-latest\n    timeout-minutes: 45$/mu)
+    if (index === 0) {
+      assert.doesNotMatch(recoveryJob.settings, /^    needs:/mu)
+      for (const [name, step, field] of [["source_sha", "source", "sha"], ["source_tree", "source", "tree"], ["rustc_version", "toolchain", "rustc_version"], ["cargo_version", "toolchain", "cargo_version"]]) {
+        assert.ok(recoveryJob.settings.includes(`      ${name}: \${{ steps.${step}.outputs.${field} }}`))
+      }
+    } else {
+      assert.match(recoveryJob.settings, /^    needs: build$/mu)
+    }
+    assert.equal(recoveryJob.steps[0], `      - uses: actions/checkout@v7\n        with:\n          repository: bigduu/Bamboo-agent\n          ref: ${recoverySha}\n          persist-credentials: false`)
+    const names = recoveryJob.steps.slice(1).map((step) => step.match(/^      - name: (.*)$/mu)?.[1])
+    assert.deepEqual(names, [
+      "Require the exact clean candidate source", "Setup Node.js", "Test original CI policy", "Install Rust",
+      "Require and record the original Linux Rust toolchain", "Check formatting",
+      ...(index === 0 ? ["Build locked Rust workspace"] : ["Compile locked Rust test targets", "Test locked Rust workspace"]),
+      "Record checked source identity", "Require source files to remain unchanged",
+    ])
+    assert.equal(recoveryStep(recoveryJob, "Setup Node.js"), "      - name: Setup Node.js\n        uses: actions/setup-node@v7\n        with:\n          node-version: lts/*\n          package-manager-cache: false")
+    assert.equal(recoveryStep(recoveryJob, "Install Rust"), "      - name: Install Rust\n        uses: dtolnay/rust-toolchain@stable\n        with:\n          toolchain: 1.99.0\n          components: rustfmt")
+    for (const [name, command, timeout] of [
+      ["Test original CI policy", "node --test scripts/ci-policy.test.cjs"],
+      ["Check formatting", "cargo fmt --all -- --check"],
+      ...(index === 0 ? [["Build locked Rust workspace", "cargo build --locked"]] : [
+        ["Compile locked Rust test targets", "cargo test --locked --no-run", 15],
+        ["Test locked Rust workspace", "cargo test --locked", 30],
+      ]),
+      ["Record checked source identity", "git rev-parse HEAD HEAD^{tree}"],
+      ["Require source files to remain unchanged", "git diff --exit-code"],
+    ]) {
+      assert.equal(recoveryStep(recoveryJob, name), `      - name: ${name}\n${timeout ? `        timeout-minutes: ${timeout}\n` : ""}        run: ${command}${timeout ? '\n        env:\n          RUST_MIN_STACK: "8388608"' : ""}`)
+    }
+    const guard = recoveryStep(recoveryJob, "Require the exact clean candidate source")
+    assert.equal(guard.split("        run: |\n")[0], "      - name: Require the exact clean candidate source\n" + (index === 0
+      ? "        id: source\n"
+      : "        env:\n          BUILD_SOURCE_SHA: ${{ needs.build.outputs.source_sha }}\n          BUILD_SOURCE_TREE: ${{ needs.build.outputs.source_tree }}\n") + "        shell: bash\n")
+    for (const line of ['test "$source_sha" = "$EXPECTED_SOURCE_SHA"', 'test "$source_tree" = "$EXPECTED_SOURCE_TREE"', 'test -z "$(git status --porcelain --untracked-files=all)"']) {
+      assert.ok(recoveryScript(guard).split("\n").includes(line), `missing source guard: ${line}`)
+    }
+    const toolchain = recoveryStep(recoveryJob, "Require and record the original Linux Rust toolchain")
+    assert.equal(toolchain.split("        run: |\n")[0], "      - name: Require and record the original Linux Rust toolchain\n" + (index === 0
+      ? "        id: toolchain\n"
+      : "        env:\n          BUILD_RUSTC_VERSION: ${{ needs.build.outputs.rustc_version }}\n          BUILD_CARGO_VERSION: ${{ needs.build.outputs.cargo_version }}\n") + "        shell: bash\n")
+    assert.match(toolchain, /test "\$rustc_version" = "rustc 1\.99\.0 \(b940084d7 2026-09-28\)"/u)
+    assert.ok(toolchain.includes('= "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4"'))
+    assert.ok(toolchain.includes('= "x86_64-unknown-linux-gnu"'))
+    if (index === 1) {
+      for (const [variable, output, actual] of [["BUILD_SOURCE_SHA", "source_sha", "source_sha"], ["BUILD_SOURCE_TREE", "source_tree", "source_tree"], ["BUILD_RUSTC_VERSION", "rustc_version", "rustc_version"], ["BUILD_CARGO_VERSION", "cargo_version", "cargo_version"]]) {
+        const step = variable.startsWith("BUILD_SOURCE") ? guard : toolchain
+        assert.ok(step.includes(`          ${variable}: \${{ needs.build.outputs.${output} }}`))
+        assert.ok(recoveryScript(step).split("\n").includes(`test "$${actual}" = "$${variable}"`))
+      }
+    }
+  }
+}
+
+test("frozen Test recovery preserves both original command gates and exact-C identity", () => {
+  assertRecoveryPolicy(recoveryWorkflow)
+  for (const [from, to] of [
+    ["  workflow_dispatch:", "  workflow_dispatch:\n    inputs:\n      source:\n        type: string"],
+    ["contents: read", "contents: write"],
+    ["env:\n", 'env:\n  RUST_TEST_THREADS: "1"\n'],
+    ["env:\n", 'env:\n  CARGO_PROFILE_TEST_OPT_LEVEL: "3"\n'],
+    ["    needs: build", '    env:\n      CARGO_PROFILE_TEST_OPT_LEVEL: "3"\n    needs: build'],
+    ["        id: source", '        env:\n          RUST_TEST_THREADS: "1"\n        id: source'],
+    [`ref: ${recoverySha}`, "ref: dev"],
+    ["needs: build", "needs: []"],
+    ["timeout-minutes: 45", "timeout-minutes: 60"],
+    ["timeout-minutes: 15", "timeout-minutes: 30"],
+    ["timeout-minutes: 30", "timeout-minutes: 45"],
+    ["package-manager-cache: false", "package-manager-cache: true"],
+    ["toolchain: 1.99.0", "toolchain: stable"],
+    ["run: cargo build --locked", "run: true"],
+    ["run: cargo test --locked\n", "run: cargo test --locked -- --skip slow\n"],
+    ['RUST_MIN_STACK: "8388608"', 'RUST_MIN_STACK: "16777216"'],
+    ["run: git diff --exit-code", "run: true"],
+    ['test "$source_tree" = "$EXPECTED_SOURCE_TREE"', "true"],
+    ['test "$source_sha" = "$BUILD_SOURCE_SHA"', "true"],
+    ['test "$cargo_version" = "$BUILD_CARGO_VERSION"', "true"],
+    ["        run: cargo test --locked --no-run", "        continue-on-error: true\n        run: cargo test --locked --no-run"],
+    ["    needs: build", "    if: always()\n    needs: build"],
+    ["      - name: Check formatting", "      - uses: actions/cache@v4\n      - name: Check formatting"],
+    ["      - name: Require source files to remain unchanged", "      - name: Reset source\n        run: git reset --hard\n      - name: Require source files to remain unchanged"],
+  ]) {
+    assert.ok(recoveryWorkflow.includes(from), `mutation target exists: ${from}`)
+    assert.throws(() => assertRecoveryPolicy(recoveryWorkflow.replace(from, to)), `reject unsafe recovery mutation: ${to}`)
+  }
+})
+
+test("frozen Test recovery source guards reject drift and dirty entries on both jobs", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-recovery-source-"))
+  const checkout = path.join(directory, "checkout")
+  require("node:fs").mkdirSync(path.join(checkout, ".cargo"), { recursive: true })
+  const git = (...args) => {
+    const result = spawnSync("git", args, { cwd: checkout, encoding: "utf8" })
+    assert.equal(result.status, 0, result.stderr)
+    return result.stdout.trim()
+  }
+  try {
+    git("init", "--quiet")
+    writeFileSync(path.join(checkout, ".cargo/config.toml"), "# fixture\n")
+    git("add", ".")
+    git("-c", "user.name=ci-policy", "-c", "user.email=ci-policy@example.invalid", "commit", "--quiet", "-m", "fixture")
+    const sha = git("rev-parse", "HEAD")
+    const tree = git("rev-parse", "HEAD^{tree}")
+    for (const source of [recoveryWorkflow, recoveryWorkflow.replace(/\n/gu, "\r\n")]) {
+      for (const [index, recoveryJob] of recoveryJobs(source).entries()) {
+        const script = recoveryScript(recoveryStep(recoveryJob, "Require the exact clean candidate source"))
+        const run = (env = {}) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", script], {
+          cwd: checkout, encoding: "utf8", env: { ...process.env,
+            EXPECTED_SOURCE_SHA: sha, EXPECTED_SOURCE_TREE: tree,
+            BUILD_SOURCE_SHA: sha, BUILD_SOURCE_TREE: tree,
+            GITHUB_OUTPUT: path.join(directory, "outputs"), GITHUB_SHA: "controller-R",
+            GITHUB_RUN_ID: "fixture-run", GITHUB_RUN_ATTEMPT: "1", ImageOS: "fixture", ImageVersion: "1",
+            ...env,
+          },
+        })
+        const accepted = run()
+        assert.equal(accepted.status, 0, accepted.stderr)
+        for (const env of [{ EXPECTED_SOURCE_SHA: "0".repeat(40) }, { EXPECTED_SOURCE_TREE: "1".repeat(40) },
+          ...(index === 1 ? [{ BUILD_SOURCE_SHA: "" }, { BUILD_SOURCE_TREE: "2".repeat(40) }] : [])]) {
+          assert.notEqual(run(env).status, 0, "mismatched or missing identity fails closed")
+        }
+        writeFileSync(path.join(checkout, ".cargo/config.toml"), "# dirty\n")
+        assert.notEqual(run().status, 0, "tracked changes fail closed")
+        git("checkout", "--", ".cargo/config.toml")
+        writeFileSync(path.join(checkout, "untracked.txt"), "fixture\n")
+        assert.notEqual(run().status, 0, "untracked changes fail closed")
+        rmSync(path.join(checkout, "untracked.txt"))
+        const finalDiff = recoveryStep(recoveryJob, "Require source files to remain unchanged").split("        run: ")[1]
+        assert.equal(spawnSync("bash", ["-e", "-c", finalDiff], { cwd: checkout }).status, 0)
+        writeFileSync(path.join(checkout, ".cargo/config.toml"), "# test changed source\n")
+        assert.notEqual(spawnSync("bash", ["-e", "-c", finalDiff], { cwd: checkout }).status, 0, "actual final diff rejects tested source changes")
+        git("checkout", "--", ".cargo/config.toml")
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test("frozen Test recovery toolchain guards reject changed compilers and cross-job tools", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-recovery-toolchain-"))
+  const rustcVersion = "rustc 1.99.0 (b940084d7 2026-09-28)"
+  const cargoVersion = "cargo 1.99.0 (fixture)"
+  writeFileSync(path.join(directory, "rustc"), [
+    "#!/bin/bash", 'printf "%s\\n" "$FIXTURE_RUSTC_VERSION"',
+    'if [[ "$*" == "--version --verbose" ]]; then',
+    '  printf "commit-hash: %s\\nhost: %s\\n" "$FIXTURE_RUSTC_HASH" "$FIXTURE_RUSTC_HOST"', "fi", "",
+  ].join("\n"), { mode: 0o755 })
+  writeFileSync(path.join(directory, "cargo"), '#!/bin/bash\nprintf "%s\\n" "$FIXTURE_CARGO_VERSION"\n', { mode: 0o755 })
+  try {
+    for (const [index, recoveryJob] of recoveryJobs(recoveryWorkflow).entries()) {
+      const script = recoveryScript(recoveryStep(recoveryJob, "Require and record the original Linux Rust toolchain"))
+      const run = (env = {}) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", script], {
+        encoding: "utf8", env: { ...process.env,
+          PATH: `${directory}${path.delimiter}${process.env.PATH}`,
+          GITHUB_OUTPUT: path.join(directory, "outputs"),
+          FIXTURE_RUSTC_VERSION: rustcVersion, FIXTURE_CARGO_VERSION: cargoVersion,
+          FIXTURE_RUSTC_HASH: "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4",
+          FIXTURE_RUSTC_HOST: "x86_64-unknown-linux-gnu",
+          BUILD_RUSTC_VERSION: rustcVersion, BUILD_CARGO_VERSION: cargoVersion, ...env,
+        },
+      })
+      const accepted = run()
+      assert.equal(accepted.status, 0, accepted.stderr)
+      for (const env of [{ FIXTURE_RUSTC_VERSION: "rustc 1.100.0" }, { FIXTURE_RUSTC_HASH: "0".repeat(40) },
+        { FIXTURE_RUSTC_HOST: "aarch64-unknown-linux-gnu" },
+        ...(index === 1 ? [{ BUILD_RUSTC_VERSION: "" }, { BUILD_CARGO_VERSION: "" }, { FIXTURE_CARGO_VERSION: "cargo changed" }] : [])]) {
+        assert.notEqual(run(env).status, 0, "changed or unbound toolchain fails closed")
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
