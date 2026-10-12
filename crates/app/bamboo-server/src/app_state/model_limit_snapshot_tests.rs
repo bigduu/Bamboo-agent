@@ -325,9 +325,51 @@ async fn compatibility_model_limit_writes_and_clear_reach_hosted_rounds_without_
         );
     }
 
+    // Queue overlapping compatibility mutations behind the same IO guard. The
+    // middle clear matches the pre-lock snapshot, but must still run after the
+    // first replacement. Both equality and revision reads belong inside IO.
+    let rows = |context, output| {
+        vec![json!({
+            "model_pattern": "legacy-hosted-model",
+            "max_context_tokens": context,
+            "max_output_tokens": output
+        })]
+    };
+    let io = state.config_io_lock.lock().await;
+    let (first, clear, last, ()) = tokio::join!(
+        biased;
+        state.replace_compatibility_model_limits(rows(96_000, 8_000)),
+        state.replace_compatibility_model_limits(Vec::new()),
+        state.replace_compatibility_model_limits(rows(144_000, 12_000)),
+        async {
+            tokio::task::yield_now().await;
+            drop(io);
+        },
+    );
+    first.unwrap();
+    clear.unwrap();
+    last.unwrap();
+    let snapshot = section.snapshot();
+    assert_eq!(snapshot.revision, initial_revision + 6);
+    assert_eq!(snapshot.data.0, rows(144_000, 12_000));
+    let mut session = Session::new(
+        "compatibility-model-limit-concurrent",
+        "legacy-hosted-model",
+    );
+    session.set_project_id_meta(project.id.to_string());
+    session.add_message(Message::user("finish this request"));
+    assert_eq!(
+        Box::pin(run_hosted_probe(&state, session, probe.clone())).await,
+        144_000
+    );
     assert_eq!(
         *probe.output_limits.lock().unwrap(),
-        [Some(4_000), Some(8_000), Some(DEFAULT_MAX_OUTPUT_TOKENS)]
+        [
+            Some(4_000),
+            Some(8_000),
+            Some(DEFAULT_MAX_OUTPUT_TOKENS),
+            Some(12_000)
+        ]
     );
     state.shutdown().await;
 }

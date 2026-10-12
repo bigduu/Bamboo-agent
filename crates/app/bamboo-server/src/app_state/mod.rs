@@ -514,6 +514,33 @@ impl AppState {
         self.title_gen_in_flight.remove(session_id);
     }
 
+    /// The compatibility API has no caller-provided revision. Serialize its
+    /// snapshot read with the commit so overlapping requests keep their
+    /// established last-writer-wins behavior without weakening typed CAS.
+    pub(crate) async fn replace_compatibility_model_limits(
+        &self,
+        rows: Vec<serde_json::Value>,
+    ) -> Result<(), ConfigSectionMutationError> {
+        let _io = self.config_io_lock.lock().await;
+        bamboo_config::ensure_provider_mcp_migration_ready(&self.app_data_dir)
+            .map_err(ConfigSectionMutationError::Store)?;
+        let facade = self.config_facade.as_ref().ok_or_else(|| {
+            ConfigSectionMutationError::Invalid(
+                "model-limit section writes require the modular configuration facade".to_string(),
+            )
+        })?;
+        let section = &facade.registry().model_limits;
+        let snapshot = section.snapshot();
+        if snapshot.status == bamboo_config::SectionStatus::Healthy && snapshot.data.0 == rows {
+            return Ok(());
+        }
+        let event = section
+            .commit(snapshot.revision, bamboo_config::ModelLimitsSection(rows))
+            .map_err(ConfigSectionMutationError::Store)?;
+        config_runtime::publish_registry_event(&self.account_sink, &event).await;
+        Ok(())
+    }
+
     /// Test-only synchronization point (see
     /// [`boot_reconcile_services_handle`](Self::boot_reconcile_services_handle)'s
     /// doc comment): wait for the background boot-time service reconcile

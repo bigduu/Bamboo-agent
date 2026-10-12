@@ -112,22 +112,17 @@ pub(super) async fn write_model_limits(
     app_state: &AppState,
     value: &Value,
 ) -> Result<(), AppError> {
-    let Some(facade) = app_state.config_facade.as_ref() else {
+    if app_state.config_facade.is_none() {
         let _io = app_state.config_io_lock.lock().await;
         return write_model_limits_file(&app_state.app_data_dir, Some(value)).await;
-    };
-    let limits: Vec<ModelLimit> = serde_json::from_value(value.clone())?;
-    let rows = serde_json::to_value(limits)?;
-    let snapshot = facade.registry().model_limits.snapshot();
-    if rows == Value::Array(snapshot.data.0.clone()) {
-        return Ok(());
     }
+    let limits: Vec<ModelLimit> = serde_json::from_value(value.clone())?;
+    let rows = serde_json::to_value(limits)?
+        .as_array()
+        .cloned()
+        .expect("model limits serialize as an array");
     app_state
-        .put_ordinary_section(
-            bamboo_config::SectionId::ModelLimits,
-            snapshot.revision,
-            rows,
-        )
+        .replace_compatibility_model_limits(rows)
         .await
         .map_err(|error| match error {
             ConfigSectionMutationError::Store(error) => map_config_store_error(error),
