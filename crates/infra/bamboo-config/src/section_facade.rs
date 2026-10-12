@@ -6095,16 +6095,17 @@ fn exact_section_credential_bindings(
 fn persist_facade_effective_config_inner(
     data_dir: impl AsRef<Path>,
     config: &Config,
+    source_facade: Option<&ConfigFacade>,
     process_facade: Option<&ConfigFacade>,
 ) -> ConfigStoreResult<(Vec<ConfigSectionEvent>, Option<FacadeConfigCommit>)> {
     let data_dir = data_dir.as_ref();
     let facade = ConfigFacade::open(data_dir)?;
     let durable = facade.registry.projection();
-    // A process-owned facade is the immutable source generation from which
-    // AppState built this compatibility candidate. Comparing against that
+    // The caller's facade is the immutable source generation from which it
+    // built this compatibility candidate. Comparing against that
     // source, rather than the freshly opened durable facade, distinguishes the
     // caller's one intended section change from unrelated external winners.
-    let source = process_facade
+    let source = source_facade
         .map(|facade| facade.registry.projection())
         .unwrap_or_else(|| durable.clone());
     let mut candidate = SectionProjection::from_config(config, source.model_limits.clone())?;
@@ -6184,7 +6185,7 @@ fn persist_facade_effective_config_inner(
             )));
         }
 
-        let source_registry = process_facade
+        let source_registry = source_facade
             .map(|facade| facade.registry.as_ref())
             .unwrap_or(facade.registry.as_ref());
         let (expected_revision, source_status, source_kind, _, source_value) =
@@ -6339,13 +6340,32 @@ pub fn persist_facade_effective_config(
     data_dir: impl AsRef<Path>,
     config: &Config,
 ) -> ConfigStoreResult<Vec<ConfigSectionEvent>> {
-    persist_facade_effective_config_inner(data_dir, config, None).map(|(events, _)| events)
+    persist_facade_effective_config_inner(data_dir, config, None, None).map(|(events, _)| events)
+}
+
+/// Persist one metadata section against the immutable facade from which the
+/// caller built `config`. Competing changes to that section conflict even if
+/// they reuse its revision; unrelated section changes remain untouched.
+///
+/// This does not adopt a runtime or grant the credential-backed section
+/// authority reserved for the dedicated APIs.
+pub fn persist_facade_effective_config_from_snapshot(
+    config: &Config,
+    source_facade: &ConfigFacade,
+) -> ConfigStoreResult<Vec<ConfigSectionEvent>> {
+    persist_facade_effective_config_inner(
+        source_facade.data_dir(),
+        config,
+        Some(source_facade),
+        None,
+    )
+    .map(|(events, _)| events)
 }
 
 /// Persist a compatibility [`Config`] through the active modular authorities
 /// and capture the exact changed-section runtime for `process_facade`.
 ///
-/// This is the bridge used by legacy root PATCH/CLI callers during the
+/// This is the bridge used by legacy root PATCH callers during the
 /// compatibility window: `config.json` is never recreated after activation,
 /// unchanged sections retain their own revisions, and the caller can install
 /// only the section it actually committed.
@@ -6354,8 +6374,12 @@ pub fn persist_facade_effective_config_with_adoption(
     config: &Config,
     process_facade: &ConfigFacade,
 ) -> ConfigStoreResult<FacadeConfigCommit> {
-    let (_, commit) =
-        persist_facade_effective_config_inner(data_dir, config, Some(process_facade))?;
+    let (_, commit) = persist_facade_effective_config_inner(
+        data_dir,
+        config,
+        Some(process_facade),
+        Some(process_facade),
+    )?;
     commit.ok_or_else(|| {
         crate::ConfigStoreError::Validation(
             "compatibility commit omitted process adoption result".to_string(),
@@ -11716,6 +11740,45 @@ mod tests {
         assert_eq!(reloaded.revision, 2);
         assert_eq!(reloaded.status, SectionStatus::Healthy);
         assert_eq!(reloaded.data.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_metadata_write_conflicts_with_same_revision_editor_change() {
+        let _key = crate::encryption::set_test_encryption_key([0x62; 32]);
+        let dir = TempDir::new().unwrap();
+        let source = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let mut candidate = source.effective_config();
+        candidate.tools.disabled.push("bash".to_string());
+        let path = dir.path().join("tools-skills.json");
+        let mut editor: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        editor["data"]["skills"]["disabled"] = serde_json::json!(["external-skill"]);
+        let winner = serde_json::to_vec_pretty(&editor).unwrap();
+        std::fs::write(&path, &winner).unwrap();
+
+        let error = persist_facade_effective_config_from_snapshot(&candidate, &source).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("changed without advancing revision"));
+        assert_eq!(std::fs::read(&path).unwrap(), winner);
+        assert_eq!(source.registry().tools_skills.snapshot().revision, 0);
+        assert!(source.effective_config().tools.disabled.is_empty());
+    }
+
+    #[test]
+    fn snapshot_metadata_write_does_not_grant_credential_section_authority() {
+        let _key = crate::encryption::set_test_encryption_key([0x63; 32]);
+        let dir = TempDir::new().unwrap();
+        let source = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let mut candidate = source.effective_config();
+        candidate.server.port = 22_262;
+        let path = dir.path().join("core.json");
+        let before = std::fs::read(&path).unwrap();
+
+        let error = persist_facade_effective_config_from_snapshot(&candidate, &source).unwrap_err();
+
+        assert!(error.to_string().contains("dedicated revisioned API"));
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
     #[test]

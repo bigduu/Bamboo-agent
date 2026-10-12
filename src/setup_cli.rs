@@ -1,10 +1,11 @@
 //! `bamboo init` / `bamboo doctor` / `bamboo config set` — first-run onboarding.
 //!
-//! These are local, server-less commands: they read and write `config.json`
-//! under the data dir directly (via [`bamboo_config::Config`]), so a fresh
+//! These are local, server-less commands: they read and write configuration
+//! under the data dir directly, so a fresh
 //! install can configure a provider + API key and self-diagnose **without** the
 //! web UI or hand-editing JSON. Provider keys go through the isolated
-//! credential store; configuration metadata is written via `Config::save_to_dir`.
+//! credential store; modular metadata writes retain their read-time section
+//! snapshot, while legacy layouts use `Config::save_to_dir`.
 
 use std::collections::BTreeSet;
 use std::io::{IsTerminal, Write};
@@ -246,6 +247,16 @@ pub fn run_config_set(
     data_dir: Option<PathBuf>,
     dry_run: bool,
 ) -> Result<()> {
+    run_config_set_before_persist(key, value, data_dir, dry_run, || {})
+}
+
+fn run_config_set_before_persist(
+    key: &str,
+    value: &str,
+    data_dir: Option<PathBuf>,
+    dry_run: bool,
+    before_persist: impl FnOnce(),
+) -> Result<()> {
     let data_dir = data_dir.unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
     let parts: Vec<&str> = key.split('.').collect();
     if matches!(parts.as_slice(), ["cluster_fabric", ..]) {
@@ -254,6 +265,25 @@ pub fn run_config_set(
         );
     }
     let mut config = Config::from_data_dir_without_env(Some(data_dir.clone()));
+    let dedicated_credential_key = matches!(
+        parts.as_slice(),
+        ["providers", _, "api_key"]
+            | ["provider_instances", _, "api_key"]
+            | ["notifications", "ntfy", "token"]
+            | ["notifications", "bark", "device_key"]
+    );
+    let source_facade = if !dedicated_credential_key
+        && bamboo_config::modular_authority_boundary_present(&data_dir)?
+    {
+        let facade = bamboo_config::ConfigFacade::open(&data_dir)
+            .context("failed to read modular configuration")?;
+        // The DTO and its CAS base must come from this same immutable read.
+        // A second Config load could observe a different section generation.
+        config = facade.effective_config();
+        Some(facade)
+    } else {
+        None
+    };
     let mut provider_credential_intents = BTreeSet::new();
     let mut provider_instance_credential_intents = BTreeSet::new();
     let mut notification_credential_intents = BTreeSet::new();
@@ -389,6 +419,7 @@ pub fn run_config_set(
         return Ok(());
     }
 
+    before_persist();
     let mut to_save = match outcome {
         Some(out) => out.config,
         None => config,
@@ -443,6 +474,9 @@ pub fn run_config_set(
             &provider_credential_intents,
             &provider_instance_credential_intents,
         )?;
+    } else if let Some(source_facade) = source_facade.as_ref() {
+        bamboo_config::persist_facade_effective_config_from_snapshot(&to_save, source_facade)
+            .context("failed to write configuration section")?;
     } else {
         to_save
             .save_to_dir(data_dir.clone())
@@ -822,6 +856,189 @@ mod tests {
         assert!(m.starts_with("sk-"));
         assert!(m.ends_with("chars)"));
         assert!(!m.contains("1234567890"));
+    }
+
+    #[test]
+    fn config_set_conflicts_with_same_section_winner_from_its_read_revision() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x64; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        bamboo_config::ConfigFacade::open_or_migrate(&data_dir).unwrap();
+        let path = data_dir.join("tools-skills.json");
+        let mut winner = Vec::new();
+
+        let error = run_config_set_before_persist(
+            "tools.disabled",
+            r#"["bash"]"#,
+            Some(data_dir.clone()),
+            false,
+            || {
+                run_config_set(
+                    "skills.disabled",
+                    r#"["external-skill"]"#,
+                    Some(data_dir.clone()),
+                    false,
+                )
+                .unwrap();
+                winner = std::fs::read(&path).unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("revision conflict"));
+        assert_eq!(std::fs::read(path).unwrap(), winner);
+        let reloaded = bamboo_config::ConfigFacade::open(&data_dir).unwrap();
+        assert_eq!(reloaded.registry().tools_skills.snapshot().revision, 1);
+        assert!(reloaded.effective_config().tools.disabled.is_empty());
+        assert_eq!(
+            reloaded.effective_config().skills.disabled,
+            ["external-skill"]
+        );
+    }
+
+    #[test]
+    fn config_set_conflicts_with_same_revision_editor_change() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x68; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        bamboo_config::ConfigFacade::open_or_migrate(&data_dir).unwrap();
+        let path = data_dir.join("tools-skills.json");
+        let mut winner = Vec::new();
+
+        let error = run_config_set_before_persist(
+            "tools.disabled",
+            r#"["bash"]"#,
+            Some(data_dir.clone()),
+            false,
+            || {
+                let mut editor: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                editor["data"]["skills"]["disabled"] = serde_json::json!(["external-skill"]);
+                winner = serde_json::to_vec_pretty(&editor).unwrap();
+                std::fs::write(&path, &winner).unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed without advancing revision"));
+        assert_eq!(std::fs::read(path).unwrap(), winner);
+    }
+
+    #[test]
+    fn config_set_unavailable_modular_authority_never_falls_back_to_legacy() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x69; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        bamboo_config::ConfigFacade::open_or_migrate(&data_dir).unwrap();
+        let path = data_dir.join("tools-skills.json");
+        let before = std::fs::read(&path).unwrap();
+        let marker = data_dir.join(bamboo_config::SECTION_LAYOUT_FILE);
+        std::fs::write(&marker, "{ corrupt").unwrap();
+
+        assert!(run_config_set(
+            "tools.disabled",
+            r#"["bash"]"#,
+            Some(data_dir.clone()),
+            false
+        )
+        .is_err());
+
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(std::fs::read(marker).unwrap(), b"{ corrupt");
+        assert!(!data_dir.join("config.json").exists());
+    }
+
+    #[test]
+    fn config_set_preserves_unrelated_section_winner() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x65; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        bamboo_config::ConfigFacade::open_or_migrate(&data_dir).unwrap();
+        let path = data_dir.join("model-policy.json");
+        let mut winner = Vec::new();
+
+        run_config_set_before_persist(
+            "tools.disabled",
+            r#"["bash"]"#,
+            Some(data_dir.clone()),
+            false,
+            || {
+                run_config_set(
+                    "anthropic_model_mapping.mappings",
+                    r#"{"sonnet":"external-model"}"#,
+                    Some(data_dir.clone()),
+                    false,
+                )
+                .unwrap();
+                winner = std::fs::read(&path).unwrap();
+            },
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), winner);
+        let reloaded = bamboo_config::ConfigFacade::open(&data_dir).unwrap();
+        assert_eq!(reloaded.registry().model_policy.snapshot().revision, 1);
+        assert_eq!(reloaded.registry().tools_skills.snapshot().revision, 1);
+        assert_eq!(
+            reloaded.effective_config().disabled_tool_references(),
+            BTreeSet::from(["bash".to_string()])
+        );
+    }
+
+    #[test]
+    fn config_set_modular_noop_preserves_same_section_winner() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x66; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        bamboo_config::ConfigFacade::open_or_migrate(&data_dir).unwrap();
+        let path = data_dir.join("tools-skills.json");
+        let mut winner = Vec::new();
+
+        run_config_set_before_persist(
+            "tools.disabled",
+            "[]",
+            Some(data_dir.clone()),
+            false,
+            || {
+                run_config_set(
+                    "skills.disabled",
+                    r#"["external-skill"]"#,
+                    Some(data_dir.clone()),
+                    false,
+                )
+                .unwrap();
+                winner = std::fs::read(&path).unwrap();
+            },
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), winner);
+        let reloaded = bamboo_config::ConfigFacade::open(&data_dir).unwrap();
+        assert_eq!(reloaded.registry().tools_skills.snapshot().revision, 1);
+    }
+
+    #[test]
+    fn config_set_modular_dry_run_does_not_persist_or_revise_sections() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x67; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        bamboo_config::ConfigFacade::open_or_migrate(&data_dir).unwrap();
+        let path = data_dir.join("tools-skills.json");
+        let before = std::fs::read(&path).unwrap();
+
+        run_config_set_before_persist(
+            "tools.disabled",
+            r#"["bash"]"#,
+            Some(data_dir.clone()),
+            true,
+            || panic!("a dry run must stop before persistence"),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        let reloaded = bamboo_config::ConfigFacade::open(&data_dir).unwrap();
+        assert_eq!(reloaded.registry().tools_skills.snapshot().revision, 0);
+        assert!(!data_dir.join("config.json").exists());
     }
 
     #[test]
