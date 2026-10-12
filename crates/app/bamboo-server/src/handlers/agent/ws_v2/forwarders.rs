@@ -60,10 +60,10 @@ use super::envelope::{
 use crate::app_state::actor_events::{
     ActorHubMessage, ActorReplay, ActorSubscription, SequencedActorChange,
 };
-use crate::app_state::{AgentStatus, AppState};
+use crate::app_state::AppState;
 use crate::handlers::agent::events::{
     has_running_child, reconcile_abandoned_startup, startup_reconcile_delay,
-    terminal_event_if_ready, Coalescer,
+    terminal_event_with_locked_runners, Coalescer,
 };
 use crate::handlers::agent::stream::{plan_replay, ReplayPlan};
 
@@ -789,6 +789,7 @@ pub(crate) fn spawn_agent_forwarder(
     budget_event_to_replay: Option<AgentEvent>,
     critical_events_to_replay: Vec<AgentEvent>,
     batch_ms: u64,
+    replay_terminal: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let seq = AgentSeq::default();
@@ -814,6 +815,21 @@ pub(crate) fn spawn_agent_forwarder(
             if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
                 return;
             }
+        }
+
+        if replay_terminal
+            && replay_terminal_if_still_ready(
+                &state,
+                &session_id,
+                TerminalReplaySource::Subscription(&receiver),
+                &out,
+                encoding,
+                &ch,
+                &seq,
+            )
+            .await
+        {
+            return;
         }
 
         let initial_reconcile_delay = startup_reconcile_delay(&state, &session_id).await;
@@ -1045,40 +1061,84 @@ pub(crate) fn spawn_agent_forwarder(
     })
 }
 
-/// Spawn a one-shot `agent.{sid}` replay for a session that was already
-/// terminal when the client subscribed. This mirrors the v1 SSE terminal
-/// response: cached critical state, budget state, synthesized terminal event,
-/// then exactly one terminal control before the per-channel queue closes.
-pub(crate) fn spawn_agent_terminal_forwarder(
-    out: OutboundTx,
+#[derive(Clone, Copy)]
+enum TerminalReplaySource<'a> {
+    Subscription(&'a broadcast::Receiver<AgentEvent>),
+    Lag { own_terminal_already_emitted: bool },
+}
+
+/// Linearize synthetic completion with Native Chat's durable Main+Inbox commit.
+/// Reserve outbound capacity *before* the persistence lock, so a slow socket
+/// cannot hold up Chat. No await separates the final ownership check from the
+/// two enqueues. If Chat wins the lock, the same receiver remains live; if this
+/// wins, the terminal is enqueued before a later Chat can ACK new work.
+async fn replay_terminal_if_still_ready(
+    state: &web::Data<AppState>,
+    session_id: &str,
+    source: TerminalReplaySource<'_>,
+    out: &OutboundTx,
     encoding: Encoding,
-    ch: String,
-    budget_event_to_replay: Option<AgentEvent>,
-    critical_events_to_replay: Vec<AgentEvent>,
-    terminal_event: AgentEvent,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let seq = AgentSeq::default();
-        for event in critical_events_to_replay {
-            if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
-                return;
+    ch: &str,
+    seq: &AgentSeq,
+) -> bool {
+    let control_only = matches!(
+        source,
+        TerminalReplaySource::Lag {
+            own_terminal_already_emitted: true
+        }
+    );
+    let Ok(mut permits) = out.reserve_many(if control_only { 1 } else { 2 }).await else {
+        return true;
+    };
+    loop {
+        let session_guard = state.persistence.acquire_lock(session_id).await;
+        let runners = match state.agent_runners.try_read() {
+            Ok(runners) => runners,
+            Err(_) => {
+                // Execute admission can hold a runner reader while waiting for
+                // this session guard. Never await another reader behind a queued
+                // writer while retaining the session guard (writer-fair deadlock).
+                drop(session_guard);
+                drop(state.agent_runners.read().await);
+                continue;
             }
+        };
+        let Some(event) = terminal_event_with_locked_runners(state, session_id, &runners).await
+        else {
+            return false;
+        };
+        let status = runners.get(session_id).map(|runner| &runner.status);
+        if matches!(source, TerminalReplaySource::Subscription(receiver)
+            if !super::can_attempt_terminal_replay(status, receiver))
+            || crate::handlers::agent::events::execute_startup_is_in_flight(state, session_id)
+        {
+            return false;
         }
-        if let Some(event) = budget_event_to_replay {
-            if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
-                return;
-            }
+        // Both guards stay owned until synchronous enqueue. There is no async
+        // publication window after the canonical work/runner/receiver recheck.
+        if !control_only {
+            let Ok(event) = serde_json::to_value(event) else {
+                return false;
+            };
+            let Some(frame) = ServerEnvelope::event(ch, seq.next(), event).encode(encoding) else {
+                return false;
+            };
+            permits
+                .next()
+                .expect("reserved terminal event slot")
+                .send(frame);
         }
-        if !emit_agent_event(&out, encoding, &ch, &seq, terminal_event).await {
-            return;
-        }
-        let _ = send_env(
-            &out,
-            encoding,
-            ServerEnvelope::control(&ch, seq.next(), terminal_control("complete")),
-        )
-        .await;
-    })
+        let Some(control) =
+            ServerEnvelope::control(ch, seq.next(), terminal_control("complete")).encode(encoding)
+        else {
+            return false;
+        };
+        permits
+            .next()
+            .expect("reserved terminal control slot")
+            .send(control);
+        return true;
+    }
 }
 
 /// What the agent forwarder should do after a broadcast-lag recovery attempt.
@@ -1114,7 +1174,7 @@ struct AgentLagContext<'a> {
 ///    the session's authoritative state via REST instead of trusting a
 ///    transcript with a hole in it.
 /// 2. Self-heal a swallowed terminal: if the runner is no longer `Running` and
-///    the one-shot predicate ([`terminal_event_if_ready`] — not suspended, no
+///    the one-shot predicate ([`terminal_event_with_locked_runners`] — not suspended, no
 ///    pending resume, no running child) says the run is over, the gap ate the
 ///    terminal event. Emit the synthesized terminal + the `terminal` control
 ///    and close, exactly as if the real one had been delivered — otherwise the
@@ -1156,39 +1216,27 @@ async fn handle_agent_lag(context: AgentLagContext<'_>) -> LagOutcome {
         return LagOutcome::Disconnected;
     }
 
-    let runner_status = {
-        let runners = state.agent_runners.read().await;
-        runners.get(session_id).map(|runner| runner.status.clone())
-    };
-    if matches!(runner_status, Some(AgentStatus::Running)) {
-        return LagOutcome::Continue;
-    }
-    let Some(terminal_event) = terminal_event_if_ready(state, session_id, runner_status).await
-    else {
-        return LagOutcome::Continue;
-    };
-
-    tracing::warn!(
-        "[{}] ws_v2 agent channel: lag gap swallowed the run's terminal \
-         (own_terminal_already_emitted={}); closing the channel",
+    if replay_terminal_if_still_ready(
+        state,
         session_id,
-        own_terminal_already_emitted
-    );
-    // Only synthesize a terminal EVENT when the client never saw the real one.
-    // In the awaiting-children window the parent's terminal was already
-    // delivered — a second one would be a spurious duplicate completion.
-    if !own_terminal_already_emitted
-        && !emit_agent_event(out, encoding, channel, seq, terminal_event).await
-    {
-        return LagOutcome::Disconnected;
-    }
-    let _ = send_env(
+        TerminalReplaySource::Lag {
+            own_terminal_already_emitted,
+        },
         out,
         encoding,
-        ServerEnvelope::control(channel, seq.next(), terminal_control("complete")),
+        channel,
+        seq,
     )
-    .await;
-    LagOutcome::Stop
+    .await
+    {
+        if out.is_closed() {
+            LagOutcome::Disconnected
+        } else {
+            LagOutcome::Stop
+        }
+    } else {
+        LagOutcome::Continue
+    }
 }
 
 /// Serialize an `AgentEvent` into an `{ch, seq, event}` envelope and push it,
@@ -1219,7 +1267,8 @@ fn is_terminal_event(event: &AgentEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_state::AgentRunner;
+    use crate::app_state::{AgentRunner, AgentStatus};
+    use crate::handlers::agent::events::terminal_event_if_ready;
     use std::collections::VecDeque;
 
     #[tokio::test]
@@ -1428,17 +1477,21 @@ mod tests {
     #[tokio::test]
     async fn completed_subscription_replays_state_then_one_terminal_control() {
         let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
-        let handle = spawn_agent_terminal_forwarder(
+        let (state, _tmp) = test_state("done").await;
+        let (_tx, receiver) = broadcast::channel(8);
+        let handle = spawn_agent_forwarder(
+            state,
+            "done".to_owned(),
             out_tx,
             Encoding::Json,
             "agent.done".to_string(),
+            receiver,
             None,
             vec![AgentEvent::Token {
                 content: "critical-state".into(),
             }],
-            AgentEvent::Complete {
-                usage: Default::default(),
-            },
+            0,
+            true,
         );
 
         let replay = next_json(&mut out_rx).await;
@@ -1500,6 +1553,249 @@ mod tests {
         session.add_message(bamboo_agent_core::Message::assistant("done", None));
         state.save_session(&mut session).await;
         (state, tmp)
+    }
+
+    async fn admit_native_input(state: &AppState, session_id: &str) {
+        let envelope = bamboo_domain::SessionMessageEnvelope::user_input(session_id, "new turn");
+        state
+            .session_inbox
+            .deliver_with_activation_intent(
+                &envelope,
+                bamboo_domain::SessionActivationPolicy::RespectSpecificWait,
+                None,
+            )
+            .await
+            .expect("canonical native Inbox ACK");
+    }
+
+    fn clarification() -> AgentEvent {
+        AgentEvent::NeedClarification {
+            question: "Allow the safe Bash command?".into(),
+            options: Some(vec!["Allow".into(), "Deny".into()]),
+            tool_call_id: Some("exact-request".into()),
+            tool_name: Some("Bash".into()),
+            allow_custom: false,
+            source: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn native_admission_wins_final_terminal_lock_and_preserves_receiver() {
+        let id = "terminal-native-commit-race";
+        let (state, _tmp) = test_state(id).await;
+        let (tx, receiver) = broadcast::channel(8);
+        let (out, mut frames) = mpsc::channel(8);
+        let seq = AgentSeq::default();
+        assert!(terminal_event_if_ready(&state, id, None).await.is_some());
+
+        // Chat owns the exact existing guard. Poll the terminal candidate to
+        // its lock barrier, commit+ACK native input, then let it revalidate.
+        {
+            let chat_guard = state.persistence.acquire_lock(id).await;
+            let candidate = replay_terminal_if_still_ready(
+                &state,
+                id,
+                TerminalReplaySource::Subscription(&receiver),
+                &out,
+                Encoding::Json,
+                "agent.race",
+                &seq,
+            );
+            tokio::pin!(candidate);
+            assert!(futures::poll!(&mut candidate).is_pending());
+            admit_native_input(&state, id).await;
+            drop(chat_guard);
+            assert!(
+                !candidate.await,
+                "a committed ACK invalidates the old terminal"
+            );
+        }
+        assert!(
+            frames.try_recv().is_err(),
+            "no synthetic terminal was enqueued"
+        );
+
+        let handle = spawn_agent_forwarder(
+            state,
+            id.into(),
+            out,
+            Encoding::Json,
+            "agent.race".into(),
+            receiver,
+            None,
+            Vec::new(),
+            0,
+            false,
+        );
+        tx.send(clarification()).unwrap();
+        let event = next_json(&mut frames).await;
+        assert_eq!(event["event"]["type"], "need_clarification");
+        assert_eq!(event["event"]["tool_call_id"], "exact-request");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn terminal_retry_releases_session_guard_behind_queued_runner_writer() {
+        let id = "terminal-writer-fair-lock-order";
+        let (state, _tmp) = test_state(id).await;
+        let (_tx, receiver) = broadcast::channel(8);
+        let (out, mut frames) = mpsc::channel(2);
+        let seq = AgentSeq::default();
+        // Model execute admission holding a reader while a publisher queues
+        // its writer. A subsequent read must queue behind that writer.
+        let execute_reader = state.agent_runners.read().await;
+        let publisher = state.agent_runners.write();
+        tokio::pin!(publisher);
+        assert!(futures::poll!(&mut publisher).is_pending());
+        let candidate = replay_terminal_if_still_ready(
+            &state,
+            id,
+            TerminalReplaySource::Subscription(&receiver),
+            &out,
+            Encoding::Json,
+            "agent.done",
+            &seq,
+        );
+        tokio::pin!(candidate);
+        assert!(futures::poll!(&mut candidate).is_pending());
+        let execute_guard =
+            tokio::time::timeout(Duration::from_secs(2), state.persistence.acquire_lock(id))
+                .await
+                .expect("candidate releases persistence before awaiting the queued writer");
+        drop(execute_guard);
+        drop(execute_reader);
+        drop(publisher.await);
+        assert!(tokio::time::timeout(Duration::from_secs(2), candidate)
+            .await
+            .expect("completed subscription retries after writer contention"));
+        assert_eq!(next_json(&mut frames).await["event"]["type"], "complete");
+        assert_eq!(next_json(&mut frames).await["control"]["type"], "terminal");
+    }
+
+    #[tokio::test]
+    async fn native_ack_also_invalidates_lag_synthetic_terminal_and_control_only() {
+        for own_terminal_already_emitted in [false, true] {
+            let id = if own_terminal_already_emitted {
+                "lag-native-control"
+            } else {
+                "lag-native-terminal"
+            };
+            let (state, _tmp) = test_state(id).await;
+            let (out, mut frames) = mpsc::channel(2);
+            let seq = AgentSeq::default();
+            let guard = state.persistence.acquire_lock(id).await;
+            let candidate = replay_terminal_if_still_ready(
+                &state,
+                id,
+                TerminalReplaySource::Lag {
+                    own_terminal_already_emitted,
+                },
+                &out,
+                Encoding::Json,
+                "agent.done",
+                &seq,
+            );
+            tokio::pin!(candidate);
+            assert!(futures::poll!(&mut candidate).is_pending());
+            admit_native_input(&state, id).await;
+            drop(guard);
+            assert!(!candidate.await);
+            assert!(frames.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_enqueue_wins_before_later_native_ack() {
+        let id = "terminal-before-native-ack";
+        let (state, _tmp) = test_state(id).await;
+        let (_tx, receiver) = broadcast::channel(8);
+        let (out, mut frames) = mpsc::channel(2);
+        let seq = AgentSeq::default();
+        assert!(
+            replay_terminal_if_still_ready(
+                &state,
+                id,
+                TerminalReplaySource::Subscription(&receiver),
+                &out,
+                Encoding::Json,
+                "agent.done",
+                &seq,
+            )
+            .await
+        );
+        // Both frames already exist when Chat can acquire the same guard.
+        let _chat_guard = state.persistence.acquire_lock(id).await;
+        assert_eq!(frames.len(), 2);
+        admit_native_input(&state, id).await;
+        assert_eq!(next_json(&mut frames).await["event"]["type"], "complete");
+        assert_eq!(next_json(&mut frames).await["control"]["type"], "terminal");
+    }
+
+    #[tokio::test]
+    async fn terminal_capacity_wait_does_not_block_native_commit() {
+        let id = "terminal-capacity-native-ack";
+        let (state, _tmp) = test_state(id).await;
+        let (_tx, receiver) = broadcast::channel(8);
+        let (out, mut frames) = mpsc::channel(2);
+        out.send(OutFrame::Text("occupied".into())).await.unwrap();
+        let seq = AgentSeq::default();
+        let candidate = replay_terminal_if_still_ready(
+            &state,
+            id,
+            TerminalReplaySource::Subscription(&receiver),
+            &out,
+            Encoding::Json,
+            "agent.done",
+            &seq,
+        );
+        tokio::pin!(candidate);
+        assert!(futures::poll!(&mut candidate).is_pending());
+        let chat_guard =
+            tokio::time::timeout(Duration::from_secs(2), state.persistence.acquire_lock(id))
+                .await
+                .expect("backpressure must not hold Chat's guard");
+        admit_native_input(&state, id).await;
+        drop(chat_guard);
+        frames.recv().await.unwrap();
+        assert!(!candidate.await);
+        assert!(frames.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn final_terminal_check_observes_new_runner_and_buffered_event() {
+        for running in [true, false] {
+            let id = if running {
+                "terminal-new-runner"
+            } else {
+                "terminal-buffered-event"
+            };
+            let (state, _tmp) = test_state(id).await;
+            let (tx, receiver) = broadcast::channel(8);
+            let (out, mut frames) = mpsc::channel(2);
+            let seq = AgentSeq::default();
+            let guard = state.persistence.acquire_lock(id).await;
+            let candidate = replay_terminal_if_still_ready(
+                &state,
+                id,
+                TerminalReplaySource::Subscription(&receiver),
+                &out,
+                Encoding::Json,
+                "agent.done",
+                &seq,
+            );
+            tokio::pin!(candidate);
+            assert!(futures::poll!(&mut candidate).is_pending());
+            if running {
+                let mut runner = AgentRunner::new();
+                runner.status = AgentStatus::Running;
+                state.agent_runners.write().await.insert(id.into(), runner);
+            } else {
+                tx.send(clarification()).unwrap();
+            }
+            drop(guard);
+            assert!(!candidate.await);
+            assert!(frames.try_recv().is_err());
+        }
     }
 
     #[tokio::test]
@@ -1742,6 +2038,7 @@ mod tests {
             None,
             Vec::new(),
             0,
+            false,
         );
 
         let gap = next_json(&mut out_rx).await;
@@ -1790,6 +2087,7 @@ mod tests {
             None,
             Vec::new(),
             0,
+            false,
         );
 
         let gap = next_json(&mut out_rx).await;
@@ -1846,6 +2144,7 @@ mod tests {
             None,
             Vec::new(),
             0,
+            false,
         );
 
         // The parent's REAL terminal: emitted to the client, and the running
@@ -1935,6 +2234,7 @@ mod tests {
                 None,
                 Vec::new(),
                 batch_ms,
+                false,
             );
 
             let token = next_json(&mut out_rx).await;
@@ -1975,6 +2275,7 @@ mod tests {
                 None,
                 Vec::new(),
                 batch_ms,
+                false,
             );
 
             tokio::time::sleep(Duration::from_millis(5)).await;

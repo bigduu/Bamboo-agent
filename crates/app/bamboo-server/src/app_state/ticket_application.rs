@@ -196,6 +196,120 @@ impl TicketApplication {
         let _ = self.messenger.set(messenger);
     }
 
+    /// Recover only the publication tail of an already completed native Child.
+    /// Discovery comes from the published Ticket ledger, never an unpublished
+    /// snapshot, session index, cached Child or abandoned activation. This runs
+    /// before startup can admit work and has no runner/adapter dependency.
+    pub(super) async fn reconcile_completed_native_results(&self) -> Result<()> {
+        if self.service.is_none() {
+            return Ok(());
+        }
+        let (service, _) = self.authority(Principal::Runtime).await?;
+        let snapshot = service.published()?.1;
+        let mut first_error = None;
+        for assignment in snapshot.assignments.values() {
+            if let Err(error) = self
+                .reconcile_completed_native_result(&service, assignment)
+                .await
+            {
+                tracing::warn!(assignment_id = %assignment.id, %error, "native Ticket result retained for reconciliation");
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn reconcile_completed_native_result(
+        &self,
+        service: &TicketService,
+        assignment: &Assignment,
+    ) -> Result<()> {
+        let Some(receipt) = &assignment.runtime else {
+            return Ok(());
+        };
+        let child_id = ticket_runtime::ticket_child_id(&assignment.dispatch_key);
+        let Some(child) = self.storage.load_runtime_control_plane(&child_id).await? else {
+            return Ok(());
+        };
+        if child.last_run_status().as_deref() != Some("completed")
+            || child
+                .metadata
+                .get("runtime.local_task.state")
+                .map(String::as_str)
+                != Some("stopped")
+        {
+            return Ok(());
+        }
+        let snapshot = service.published()?.1;
+        let intent = snapshot
+            .intents
+            .get(&assignment.dispatch_key)
+            .ok_or_else(|| Error::ScopeDenied("completed Ticket dispatch intent missing".into()))?;
+        let mut expected = ticket_runtime::dispatch_binding(
+            service,
+            &assignment.dispatch_key,
+            &intent.immutable_spec,
+        )?;
+        expected.receipt = Some(receipt.clone());
+        expected.receipt_created_at = Some(child.created_at);
+        if child.kind != bamboo_domain::SessionKind::Child
+            || child.id != child_id
+            || child.parent_session_id.as_deref()
+                != Some(snapshot.binding.supervisor_session_id.as_str())
+            || child.root_session_id != snapshot.binding.supervisor_session_id
+            || child
+                .metadata
+                .get(bamboo_engine::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+                != Some(&assignment.id)
+            || ticket_runtime::read_dispatch(&child)?.as_ref() != Some(&expected)
+            || receipt.session_id != child.id
+            || receipt.run_id.is_empty()
+            || child.metadata.get("runtime.local_task.run_id") != Some(&receipt.run_id)
+            || child.metadata.get("runtime.local_task.child_birth")
+                != Some(&child.created_at.to_rfc3339())
+            || child.metadata.get("external.agent_id").is_some_and(|id| {
+                id != bamboo_engine::external_agents::config::LOCAL_ACTOR_AGENT_ID
+            })
+        {
+            return Err(Error::ScopeDenied(
+                "completed native Ticket identity changed".into(),
+            ));
+        }
+        // Select the existing native proof variant only. This does not confer
+        // stop authority: checkpoint_ticket_result rereads canonical storage and
+        // validates the complete receipt, birth, task UUID and Ticket contract.
+        // In particular, process-backed receipts remain with broker recovery.
+        let raw = child
+            .metadata
+            .get("ticket.runtime.owned_stop.v1")
+            .ok_or_else(|| {
+                Error::AuthorityUnavailable("canonical native Ticket stop missing".into())
+            })?;
+        if raw.len() > 4096 {
+            return Err(Error::ScopeDenied("stop checkpoint exceeds limit".into()));
+        }
+        let stop: Value = serde_json::from_str(raw)?;
+        if !stop.get("pid").is_none_or(Value::is_null)
+            || stop.get("completed").and_then(Value::as_bool) != Some(true)
+            || stop.get("task_instance").and_then(Value::as_str).is_none()
+        {
+            return Err(Error::ScopeDenied(
+                "completed native Ticket stop required".into(),
+            ));
+        }
+        ticket_runtime::checkpoint_ticket_result(
+            service,
+            self.storage.as_ref(),
+            &child,
+            &receipt.run_id,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn authority(&self, principal: Principal) -> Result<(Arc<TicketService>, Authority)> {
         let service = self.service()?;
         let (binding, _) = ticket_runtime::verified_scope_binding(

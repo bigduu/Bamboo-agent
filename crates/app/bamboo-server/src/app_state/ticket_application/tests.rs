@@ -1230,3 +1230,528 @@ async fn committed_decision_wake_failure_retries_exact_receipt_and_one_inbox_mes
         }
     }
 }
+
+// Controlled canonical-store fixture for the startup publication boundary.
+// This does not claim that a task was executed or joined; the unchanged real
+// Host-exit test and engine's actual LocalTask runner tests establish that proof.
+struct NativeResultFixture {
+    root: tempfile::TempDir,
+    storage: Arc<SessionStoreV2>,
+    app: TicketApplication,
+    child: bamboo_domain::Session,
+    work_id: String,
+    assignment_id: String,
+}
+
+impl NativeResultFixture {
+    async fn new() -> Self {
+        use bamboo_domain::{Message, Session, SessionInboxLimits};
+        use bamboo_engine::execution::spawn::SessionInboxRuntimeBinding;
+        use bamboo_storage::{FileSessionInbox, LockedSessionStore};
+
+        let root = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            SessionStoreV2::new(root.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let app = TicketApplication::open(root.path(), storage.clone(), config(true)).await;
+        let (service, authority) = app
+            .authority(Principal::User {
+                user_id: "host-owner".into(),
+            })
+            .await
+            .unwrap();
+        let command = service
+            .prepare_command(
+                &authority,
+                "native-result-create",
+                vec![
+                    Operation::Create {
+                        temp_id: "work".into(),
+                        kind: TicketKind::Work,
+                        parent: None,
+                        contract: contract(),
+                        depends_on: BTreeSet::new(),
+                    },
+                    Operation::Ready {
+                        work_id: "work".into(),
+                    },
+                    Operation::Start {
+                        work_id: "work".into(),
+                        temp_id: "assignment".into(),
+                        workspace: None,
+                    },
+                ],
+            )
+            .unwrap();
+        let ids = service.execute(&authority, &command).unwrap().ids;
+        let snapshot = service.published().unwrap().1;
+        let assignment = &snapshot.assignments[&ids["assignment"]];
+        let intent = &snapshot.intents[&assignment.dispatch_key];
+        let dispatch = ticket_runtime::dispatch_binding(
+            &service,
+            &assignment.dispatch_key,
+            &intent.immutable_spec,
+        )
+        .unwrap();
+        let supervisor = storage
+            .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = Session::new_child_of(
+            ticket_runtime::ticket_child_id(&assignment.dispatch_key),
+            &supervisor,
+            "fixture-model",
+            "native result",
+        );
+        child.metadata.insert(
+            ticket_runtime::TICKET_DISPATCH_KEY.into(),
+            serde_json::to_string(&dispatch).unwrap(),
+        );
+        child.metadata.insert(
+            bamboo_engine::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
+            assignment.id.clone(),
+        );
+        child.set_last_run_status("pending");
+        storage.save_session(&child).await.unwrap();
+        let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
+        let inbox = Arc::new(FileSessionInbox::new(
+            storage.clone(),
+            SessionInboxLimits::default(),
+        ));
+        let router = bamboo_engine::SessionActivationRouter::new();
+        router.set_inbox(inbox.clone());
+        let runtime = SessionInboxRuntimeBinding {
+            router,
+            inbox,
+            storage: storage.clone(),
+            persistence: persistence.clone(),
+            parent_question_lock: Some(persistence),
+        };
+        let _registration = runtime
+            .router
+            .register_run(&child.id, "native-result-run")
+            .await
+            .unwrap();
+        ticket_runtime::admit_ticket_run(&service, &runtime, &mut child, "native-result-run")
+            .await
+            .unwrap();
+        let instance = uuid::Uuid::new_v4().to_string();
+        let receipt = ticket_runtime::read_dispatch(&child)
+            .unwrap()
+            .unwrap()
+            .receipt
+            .unwrap();
+        child
+            .metadata
+            .insert("runtime.local_task.state".into(), "stopped".into());
+        child
+            .metadata
+            .insert("runtime.local_task.instance".into(), instance.clone());
+        child
+            .metadata
+            .insert("runtime.local_task.run_id".into(), receipt.run_id.clone());
+        child.metadata.insert(
+            "runtime.local_task.child_birth".into(),
+            child.created_at.to_rfc3339(),
+        );
+        child.metadata.insert("ticket.runtime.owned_stop.v1".into(), json!({"receipt":receipt,"child_birth":child.created_at,"task_instance":instance,"completed":true}).to_string());
+        child.metadata_version += 1;
+        child.set_last_run_status("completed");
+        child.add_message(Message::assistant("canonical native result bytes", None));
+        storage.save_session(&child).await.unwrap();
+        Self {
+            root,
+            storage,
+            app,
+            child,
+            work_id: ids["work"].clone(),
+            assignment_id: assignment.id.clone(),
+        }
+    }
+
+    async fn restart(&mut self) {
+        self.app.service.take();
+        self.app =
+            TicketApplication::open(self.root.path(), self.storage.clone(), config(false)).await;
+    }
+
+    fn snapshot_bytes(&self) -> Vec<u8> {
+        canonical_bytes(&self.app.service().unwrap().published().unwrap()).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn native_result_recovery_replays_only_canonical_completed_publication() {
+    let mut f = NativeResultFixture::new().await;
+    f.restart().await;
+    let service = f.app.service().unwrap();
+    let before = service.published().unwrap().1;
+    assert_eq!(
+        before.assignments[&f.assignment_id].state,
+        AssignmentState::OutcomeUnknown
+    );
+    assert!(before.submissions.is_empty());
+    let child_before =
+        serde_json::to_value(f.storage.load_session(&f.child.id).await.unwrap()).unwrap();
+    f.app.reconcile_completed_native_results().await.unwrap();
+    let recovered = service.published().unwrap().1;
+    assert_eq!(recovered.tickets[&f.work_id].state, WorkState::Submitted);
+    assert!(recovered.assignments[&f.assignment_id].process_stopped);
+    assert_eq!(recovered.submissions.len(), 1);
+    let submission = recovered.submissions.values().next().unwrap();
+    assert!(!submission.stale);
+    let (_, authority) = f
+        .app
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .read_artifact(&authority, &submission.artifacts[0], 65536)
+            .unwrap(),
+        b"canonical native result bytes"
+    );
+    assert!(
+        bamboo_engine::ticket_worker_plan::TicketWorkerPlan::from_runtime_receipt(
+            service.clone(),
+            &f.assignment_id
+        )
+        .is_err()
+    );
+    let after = f.snapshot_bytes();
+    f.app.reconcile_completed_native_results().await.unwrap();
+    assert_eq!(f.snapshot_bytes(), after);
+    assert_eq!(
+        serde_json::to_value(f.storage.load_session(&f.child.id).await.unwrap()).unwrap(),
+        child_before
+    );
+    drop(service);
+    f.restart().await;
+    let reopened = f.snapshot_bytes();
+    f.app.reconcile_completed_native_results().await.unwrap();
+    assert_eq!(f.snapshot_bytes(), reopened);
+    assert_eq!(
+        f.app
+            .service()
+            .unwrap()
+            .published()
+            .unwrap()
+            .1
+            .submissions
+            .len(),
+        1
+    );
+    assert!(
+        f.app.adapter.get().is_none(),
+        "publication needs no runner or provider"
+    );
+}
+
+#[tokio::test]
+async fn native_result_recovery_rejects_incomplete_or_wrong_canonical_evidence() {
+    for case in [
+        "missing-stop",
+        "malformed-stop",
+        "oversized-stop",
+        "stop-birth",
+        "stop-run",
+        "stop-instance",
+        "nil-instance",
+        "missing-instance",
+        "process-stop",
+        "mixed-stop",
+        "incomplete-stop",
+        "active",
+        "active-task",
+        "missing-child",
+        "revoked-supervisor",
+        "native-run",
+        "native-birth",
+        "missing-dispatch",
+        "malformed-dispatch",
+        "dispatch-birth",
+        "dispatch-run",
+        "wrong-plan",
+        "wrong-parent",
+        "wrong-root",
+        "external-route",
+        "wrong-scope",
+    ] {
+        let mut f = NativeResultFixture::new().await;
+        f.restart().await;
+        let mut stop: Value =
+            serde_json::from_str(&f.child.metadata["ticket.runtime.owned_stop.v1"]).unwrap();
+        let mut dispatch = ticket_runtime::read_dispatch(&f.child).unwrap().unwrap();
+        match case {
+            "stop-birth" => {
+                stop["child_birth"] = json!(f.child.created_at - chrono::Duration::seconds(1))
+            }
+            "stop-run" => stop["receipt"]["run_id"] = json!("wrong-run"),
+            "stop-instance" => stop["task_instance"] = json!(uuid::Uuid::new_v4()),
+            "nil-instance" => {
+                stop["task_instance"] = json!(uuid::Uuid::nil());
+                f.child.metadata.insert(
+                    "runtime.local_task.instance".into(),
+                    uuid::Uuid::nil().to_string(),
+                );
+            }
+            "missing-instance" => {
+                stop.as_object_mut().unwrap().remove("task_instance");
+            }
+            "process-stop" => {
+                stop.as_object_mut().unwrap().remove("task_instance");
+                stop["pid"] = json!(1234);
+            }
+            "mixed-stop" => stop["pid"] = json!(1234),
+            "incomplete-stop" => stop["completed"] = json!(false),
+            "active" => {
+                f.child.set_last_run_status("running");
+                f.child
+                    .metadata
+                    .insert("runtime.local_task.state".into(), "running".into());
+            }
+            "native-run" => {
+                f.child
+                    .metadata
+                    .insert("runtime.local_task.run_id".into(), "wrong-run".into());
+            }
+            "native-birth" => {
+                f.child.metadata.insert(
+                    "runtime.local_task.child_birth".into(),
+                    (f.child.created_at - chrono::Duration::seconds(1)).to_rfc3339(),
+                );
+            }
+            "dispatch-birth" => {
+                dispatch.receipt_created_at =
+                    Some(f.child.created_at - chrono::Duration::seconds(1))
+            }
+            "dispatch-run" => dispatch.receipt.as_mut().unwrap().run_id = "wrong-run".into(),
+            "wrong-plan" => {
+                f.child.metadata.insert(
+                    bamboo_engine::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
+                    "another-assignment".into(),
+                );
+            }
+            "active-task" => {
+                f.child
+                    .metadata
+                    .insert("runtime.local_task.state".into(), "running".into());
+            }
+            "external-route" => {
+                f.child
+                    .metadata
+                    .insert("external.agent_id".into(), "process-worker".into());
+            }
+            "wrong-scope" => dispatch.binding.scope_id = "another-scope".into(),
+            _ => {}
+        }
+        f.child
+            .metadata
+            .insert("ticket.runtime.owned_stop.v1".into(), stop.to_string());
+        f.child.metadata.insert(
+            ticket_runtime::TICKET_DISPATCH_KEY.into(),
+            serde_json::to_string(&dispatch).unwrap(),
+        );
+        match case {
+            "missing-stop" => {
+                f.child.metadata.remove("ticket.runtime.owned_stop.v1");
+            }
+            "malformed-stop" => {
+                f.child
+                    .metadata
+                    .insert("ticket.runtime.owned_stop.v1".into(), "not-json".into());
+            }
+            "oversized-stop" => {
+                f.child
+                    .metadata
+                    .insert("ticket.runtime.owned_stop.v1".into(), " ".repeat(4097));
+            }
+            "missing-dispatch" => {
+                f.child.metadata.remove(ticket_runtime::TICKET_DISPATCH_KEY);
+            }
+            "malformed-dispatch" => {
+                f.child.metadata.insert(
+                    ticket_runtime::TICKET_DISPATCH_KEY.into(),
+                    "not-json".into(),
+                );
+            }
+            _ => {}
+        }
+        f.child.metadata_version += 1;
+        f.storage.save_session(&f.child).await.unwrap();
+        match case {
+            "wrong-parent" | "wrong-root" => {
+                // Ordinary writers correctly reject a Child lineage rewrite.
+                // Corrupt only this disposable canonical sidecar to exercise
+                // recovery's fail-closed read, without weakening that guard.
+                let mut changed = f.child.clone();
+                if case == "wrong-parent" {
+                    changed.parent_session_id = Some("another-parent".into());
+                } else {
+                    changed.root_session_id = "another-root".into();
+                }
+                assert!(f.storage.save_session(&changed).await.is_err());
+                let path = f
+                    .root
+                    .path()
+                    .join("sessions")
+                    .join(DEFAULT_SUPERVISOR_SESSION_ID)
+                    .join("children")
+                    .join(&f.child.id)
+                    .join("runtime.json");
+                let mut raw: Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                if case == "wrong-parent" {
+                    raw["parent_session_id"] = json!("another-parent");
+                } else {
+                    raw["root_session_id"] = json!("another-root");
+                }
+                std::fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
+            }
+            "missing-child" => {
+                assert!(f.storage.delete_session(&f.child.id).await.unwrap());
+            }
+            "revoked-supervisor" => {
+                let mut supervisor = f
+                    .storage
+                    .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                supervisor.set_root_orchestration_only(false).unwrap();
+                f.storage.save_session(&supervisor).await.unwrap();
+            }
+            _ => {}
+        }
+        let before = f.snapshot_bytes();
+        let _ = f.app.reconcile_completed_native_results().await;
+        assert_eq!(
+            f.snapshot_bytes(),
+            before,
+            "{case} must retain the exact Ticket HEAD"
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_result_recovery_cannot_revive_cancelled_work() {
+    let mut f = NativeResultFixture::new().await;
+    let (service, authority) = f
+        .app
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    let cancel = service
+        .prepare_command(
+            &authority,
+            "cancel-native-result",
+            vec![Operation::Cancel {
+                work_id: f.work_id.clone(),
+            }],
+        )
+        .unwrap();
+    service.execute(&authority, &cancel).unwrap();
+    drop(service);
+    f.restart().await;
+    f.app.reconcile_completed_native_results().await.unwrap();
+    let snapshot = f.app.service().unwrap().published().unwrap().1;
+    assert_eq!(snapshot.tickets[&f.work_id].state, WorkState::Cancelled);
+    assert!(snapshot.tickets[&f.work_id].current_submission.is_none());
+    assert!(snapshot
+        .submissions
+        .values()
+        .all(|submission| submission.stale));
+    assert!(snapshot.assignments[&f.assignment_id].process_stopped);
+}
+
+#[tokio::test]
+async fn native_result_startup_recovers_before_any_provider_or_child_activation() {
+    use async_trait::async_trait;
+    use bamboo_llm::{LLMError, LLMProvider, LLMStream};
+    #[derive(Default)]
+    struct NoExecution(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl LLMProvider for NoExecution {
+        async fn chat_stream(
+            &self,
+            _: &[bamboo_domain::Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> std::result::Result<LLMStream, LLMError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(LLMError::Api(
+                "startup result recovery must not execute a provider".into(),
+            ))
+        }
+    }
+    let mut f = NativeResultFixture::new().await;
+    f.app.service.take();
+    let provider = Arc::new(NoExecution::default());
+    let mut startup_config = config(false).read().await.clone();
+    // The new Supervisor is also an AutoDream candidate. Isolate that unrelated
+    // background model call while retaining the real startup recovery paths.
+    startup_config
+        .memory_mut()
+        .get_or_insert_with(Default::default)
+        .auto_dream_enabled = false;
+    let state = crate::AppState::new_with_provider(
+        f.root.path().to_path_buf(),
+        startup_config,
+        provider.clone(),
+    )
+    .await
+    .unwrap();
+    let snapshot = state.tickets.service().unwrap().published().unwrap().1;
+    assert_eq!(snapshot.tickets[&f.work_id].state, WorkState::Submitted);
+    assert_eq!(snapshot.submissions.len(), 1);
+    assert!(snapshot.assignments[&f.assignment_id].process_stopped);
+    assert!(state.agent_runners.read().await.is_empty());
+    assert!(state.embedded_broker.is_none());
+    state.shutdown().await;
+    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn native_result_recovery_never_submits_missing_or_nonfinal_output() {
+    for case in ["missing", "empty", "commentary", "tool"] {
+        let mut f = NativeResultFixture::new().await;
+        match case {
+            "missing" => f.child.messages.clear(),
+            "empty" => f.child.messages.last_mut().unwrap().content.clear(),
+            "commentary" => {
+                f.child.messages.last_mut().unwrap().phase =
+                    Some(bamboo_domain::MessagePhase::Commentary)
+            }
+            "tool" => f.child.messages.last_mut().unwrap().role = bamboo_domain::Role::Tool,
+            _ => unreachable!(),
+        }
+        f.storage.save_session(&f.child).await.unwrap();
+        f.restart().await;
+        assert!(
+            f.app.reconcile_completed_native_results().await.is_err(),
+            "{case}"
+        );
+        let snapshot = f.app.service().unwrap().published().unwrap().1;
+        assert!(snapshot.submissions.is_empty(), "{case}");
+        assert_ne!(
+            snapshot.tickets[&f.work_id].state,
+            WorkState::Submitted,
+            "{case}"
+        );
+        let stopped = f.snapshot_bytes();
+        assert!(f.app.reconcile_completed_native_results().await.is_err());
+        assert_eq!(
+            f.snapshot_bytes(),
+            stopped,
+            "{case} stop replay must be idempotent"
+        );
+    }
+}

@@ -10910,37 +10910,42 @@ for line in sys.stdin:
             started_rx.await.unwrap();
 
             let operation_state = state.clone();
+            let (dispatched_tx, dispatched_rx) = tokio::sync::oneshot::channel();
             let operation = tokio::spawn(async move {
-                operation_state
-                    .update_proxy_auth_credential(
-                        Some(bamboo_config::ProxyAuth {
-                            username: "cancel-user".to_string(),
-                            password: "cancel-secret".to_string(),
-                        }),
-                        0,
-                        ConfigUpdateEffects {
-                            reload_provider: bamboo_config::patch::ReloadMode::Strict,
-                            reconcile_mcp: bamboo_config::patch::ReloadMode::Strict,
-                        },
-                    )
-                    .await
+                let mutation = operation_state.update_proxy_auth_credential(
+                    Some(bamboo_config::ProxyAuth {
+                        username: "cancel-user".to_string(),
+                        password: "cancel-secret".to_string(),
+                    }),
+                    0,
+                    ConfigUpdateEffects {
+                        reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                        reconcile_mcp: bamboo_config::patch::ReloadMode::Strict,
+                    },
+                );
+                tokio::pin!(mutation);
+                // This API spawns its owned transaction before first suspending.
+                // Poll the real request before reporting dispatch; merely
+                // entering this caller task does not transfer mutation ownership.
+                std::future::poll_fn(|cx| {
+                    assert!(
+                        std::future::Future::poll(mutation.as_mut(), cx).is_pending(),
+                        "proxy mutation stays pending while the blocking worker is occupied"
+                    );
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                dispatched_tx.send(()).unwrap();
+                mutation.await
             });
 
-            // Wait until the owned mutation has acquired config_io_lock and
-            // queued its blocking transaction. Aborting the caller from this
-            // exact point reproduced the old detached-commit/live-publication
-            // split deterministically.
-            tokio::time::timeout(Duration::from_secs(1), async {
-                loop {
-                    if state.config_io_lock.try_lock().is_err() {
-                        break;
-                    }
-                    assert!(!operation.is_finished());
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("proxy mutation acquires the config IO lock");
+            // The config watcher also acquires config_io_lock, so observing
+            // that lock cannot prove this request dispatched its owned task.
+            // Wait for the exact request handoff while blocking work is held.
+            tokio::time::timeout(Duration::from_secs(1), dispatched_rx)
+                .await
+                .expect("proxy mutation dispatches its owned transaction")
+                .expect("proxy mutation caller reports its completed handoff");
             operation.abort();
             let _ = operation.await;
             release_tx.send(()).unwrap();
