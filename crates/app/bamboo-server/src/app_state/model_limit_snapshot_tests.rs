@@ -35,6 +35,7 @@ impl LLMProvider for ModelLimitProbe {
 async fn hosted_restart_loads_legacy_raw_model_limits_and_retains_them_until_repair() {
     let _key = bamboo_config::encryption::set_test_encryption_key([0x64; 32]);
     let dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
     let installed = bamboo_config::ConfigFacade::open_or_migrate(dir.path()).unwrap();
     let mut config = installed.effective_config();
     config.proxy_auth = Some(bamboo_config::ProxyAuth {
@@ -80,7 +81,12 @@ async fn hosted_restart_loads_legacy_raw_model_limits_and_retains_them_until_rep
     let probe = Arc::new(ModelLimitProbe::default());
     let project = state
         .project_store
-        .create("Legacy model limits", None)
+        .create_with_project_path(
+            "Legacy model limits",
+            None,
+            workspace.path().to_string_lossy().into_owned(),
+            Vec::new(),
+        )
         .unwrap();
     let mut contexts = Vec::new();
 

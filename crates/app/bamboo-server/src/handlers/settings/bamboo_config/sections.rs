@@ -5415,7 +5415,7 @@ mod tests {
                 .uri("/sections/model-limits")
                 .set_json(json!({
                     "expected_revision": 0,
-                    "data": [{"model": "custom", "max_tokens": 42}]
+                    "data": [{"model_pattern": "custom", "max_context_tokens": 42}]
                 }))
                 .to_request(),
         )
