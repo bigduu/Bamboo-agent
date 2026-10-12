@@ -20,6 +20,9 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[cfg(target_os = "macos")]
+mod darwin;
+
 #[cfg(windows)]
 mod windows;
 
@@ -420,18 +423,26 @@ impl ManagedBashChild {
                 task: tokio::spawn(async move {
                     let outcome = async {
                         tokio::select! {
-                            result = wait_without_reaping(pid) => result?,
+                            result = wait_without_reaping(pid) => result.map_err(|error| owned_group_error(pid, "WNOWAIT leader observation", error))?,
                             _ = requested.changed() => {},
                             _ = stop.changed() => {},
                         }
                         // Keep the leader unreaped until signalling its group.
                         // Never signal a group after its leader PID can be
                         // recycled for an unrelated process.
-                        signal_group(pid)?;
-                        let status = child.child.wait().await?;
+                        signal_owned_group(pid)
+                            .await
+                            .map_err(|error| owned_group_error(pid, "pre-reap group signal", error))?;
+                        let status = child
+                            .child
+                            .wait()
+                            .await
+                            .map_err(|error| owned_group_error(pid, "leader reap", error))?;
                         // A shell may exit before background descendants.
                         // Verify without sending any post-reap signals.
-                        drain_group(pid).await?;
+                        drain_group(pid)
+                            .await
+                            .map_err(|error| owned_group_error(pid, "post-reap group drain", error))?;
                         Ok::<_, io::Error>(status)
                     }
                     .await
@@ -571,6 +582,58 @@ fn signal_group(pid: u32) -> io::Result<()> {
     }
 }
 #[cfg(unix)]
+fn owned_group_error(pid: u32, phase: &str, error: io::Error) -> io::Error {
+    #[cfg(target_os = "macos")]
+    {
+        io::Error::new(
+            error.kind(),
+            format!("Darwin owned process group {pid} {phase}: {error}"),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (pid, phase);
+        error
+    }
+}
+
+#[cfg(unix)]
+async fn signal_owned_group(pid: u32) -> io::Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        signal_group(pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match signal_group(pid) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                    // Darwin excludes zombies from killpg's permission scan.
+                    // EPERM is only a reason to observe, never a stop receipt.
+                    // The caller retains the leader, so retries cannot target
+                    // a new owner's recycled PID or process group.
+                    if !darwin::has_running_members(pid, true).map_err(|error| {
+                        owned_group_error(pid, "pre-reap observation after SIGKILL EPERM", error)
+                    })? {
+                        return Ok(());
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("Darwin owned process group {pid} stop remains unconfirmed after SIGKILL EPERM"),
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
+
+#[cfg(unix)]
 async fn drain_group(pid: u32) -> io::Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -616,7 +679,12 @@ fn group_has_running_members(pid: u32) -> io::Result<bool> {
         }
         Ok(false)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // Read-only after reaping: never signal a possibly recycled group.
+        darwin::has_running_members(pid, false)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         // SAFETY: signal zero only checks for the owned group.
         if unsafe { libc::kill(-(pid as libc::pid_t), 0) } == 0 {
@@ -873,5 +941,142 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(second.status(), "completed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn local_task_resources_darwin_held_zombie_group_can_finalize() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("exit 0")
+            .process_group(0)
+            .kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        let mut leader = GroupLeader { child, pid };
+        tokio::time::timeout(Duration::from_secs(5), wait_without_reaping(pid))
+            .await
+            .unwrap()
+            .unwrap();
+        // The owned, unreaped leader pins this exact PGID. Darwin excludes
+        // zombies from killpg permission checks, even for their real parent.
+        let raw_result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+        let raw_error = io::Error::last_os_error();
+        let signal_result = signal_owned_group(pid).await;
+        let status = leader.child.wait().await.unwrap();
+        eprintln!("owned held-zombie PGID={pid} raw_signal={raw_result} raw_errno={:?} owner_signal={signal_result:?} reaped={status}", raw_error.raw_os_error());
+        assert_eq!(raw_result, -1);
+        assert_eq!(raw_error.raw_os_error(), Some(libc::EPERM));
+        assert!(status.success());
+        signal_result.expect("a positively verified zombie-only owned group is already stopped");
+        drain_group(pid).await.unwrap();
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn local_task_resources_darwin_full_window_live_group_is_killed_and_drained() {
+        let scope = resources("darwin-large-group");
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.current_dir(dir.path()).arg("-c").arg(
+            "i=0; while [ \"$i\" -lt 24 ]; do sleep 30 & printf '%s\\n' \"$!\" >> pids; i=$((i + 1)); done; : > ready; wait",
+        );
+        let mut child = scope
+            .scope(async { ManagedBashChild::spawn(&mut command).unwrap() })
+            .await;
+        let pid = match &child {
+            ManagedBashChild::Owned { .. } => {
+                // Each child PID is recorded by this owned shell before ready.
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while !dir.path().join("ready").exists() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("owned large-group fixture did not report ready");
+                let child_pid = std::fs::read_to_string(dir.path().join("pids"))
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .parse::<u32>()
+                    .unwrap();
+                let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                let bytes = unsafe {
+                    libc::proc_pidinfo(
+                        child_pid as libc::pid_t,
+                        libc::PROC_PIDTBSDINFO,
+                        1,
+                        (&mut info as *mut libc::proc_bsdinfo).cast(),
+                        std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+                    )
+                };
+                assert_eq!(bytes as usize, std::mem::size_of::<libc::proc_bsdinfo>());
+                assert_eq!(info.pbi_pid, child_pid);
+                assert_eq!(info.pbi_ppid, info.pbi_pgid);
+                info.pbi_pgid
+            }
+            _ => panic!("large-group fixture must use owned process containment"),
+        };
+        let recorded: Vec<u32> = std::fs::read_to_string(dir.path().join("pids"))
+            .unwrap()
+            .lines()
+            .map(|line| line.parse().unwrap())
+            .collect();
+        assert_eq!(recorded.len(), 24);
+        let mut unique = recorded.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 24);
+        let mut raw = [0 as libc::pid_t; 20];
+        let (count, error) = unsafe {
+            *libc::__error() = 0;
+            let count = libc::proc_listpgrppids(
+                pid as libc::pid_t,
+                raw.as_mut_ptr().cast(),
+                std::mem::size_of_val(&raw) as libc::c_int,
+            );
+            (count, *libc::__error())
+        };
+        assert_eq!(error, 0);
+        assert_eq!(count, 20, "fixture must actually fill the fixed PID window");
+        assert!(darwin::has_running_members(pid, true).unwrap());
+        eprintln!(
+            "owned large live PGID={pid} recorded_children={} raw_count={count}",
+            recorded.len()
+        );
+
+        tokio::time::timeout(Duration::from_secs(6), child.kill())
+            .await
+            .expect("owned large-group kill did not finalize")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(6), scope.close_and_drain())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!group_has_running_members(pid).unwrap());
+        for child_pid in recorded {
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let (bytes, error) = unsafe {
+                *libc::__error() = 0;
+                let bytes = libc::proc_pidinfo(
+                    child_pid as libc::pid_t,
+                    libc::PROC_PIDTBSDINFO,
+                    1,
+                    (&mut info as *mut libc::proc_bsdinfo).cast(),
+                    std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+                );
+                (bytes, *libc::__error())
+            };
+            if bytes == 0 && error == libc::ESRCH {
+                continue;
+            }
+            assert_eq!(bytes as usize, std::mem::size_of::<libc::proc_bsdinfo>());
+            assert!(
+                info.pbi_pgid != pid || info.pbi_status == libc::SZOMB,
+                "recorded PID {child_pid} remained live in owned group {pid}: status={}",
+                info.pbi_status
+            );
+        }
     }
 }
