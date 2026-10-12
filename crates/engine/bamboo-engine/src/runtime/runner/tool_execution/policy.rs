@@ -104,9 +104,15 @@ const STRICT_ARGUMENT_TOOL_NAMES: [&str; 11] = [
     "memory_note",
 ];
 
-fn normalize_tool_for_policy(raw_tool_name: &str) -> String {
-    let name = bamboo_tools::normalize_tool_ref(raw_tool_name)
-        .unwrap_or_else(|| normalize_tool_name(raw_tool_name).trim().to_string());
+fn normalize_tool_for_policy(raw_tool_name: &str, admitted_execution_name: Option<&str>) -> String {
+    let selected = admitted_execution_name.unwrap_or(raw_tool_name).trim();
+    let name = bamboo_tools::normalize_tool_ref(selected)
+        .unwrap_or_else(|| normalize_tool_name(selected).trim().to_string());
+    if matches!(name.as_str(), "exec_command" | "write_stdin") {
+        // Only the admitted exact identity can share a shell circuit. An exact
+        // custom vendor::exec_command keeps its ordinary outcome and own key.
+        return selected.to_owned();
+    }
     if bamboo_tools::resolve_alias(&name)
         .unwrap_or(&name)
         .eq_ignore_ascii_case("SubAgent")
@@ -117,11 +123,25 @@ fn normalize_tool_for_policy(raw_tool_name: &str) -> String {
     }
 }
 
+#[cfg(test)]
 pub(super) fn validate_tool_call_arguments(tool_call: &ToolCall) -> Result<(), String> {
-    let normalized_tool_name = normalize_tool_for_policy(&tool_call.function.name);
-    if !STRICT_ARGUMENT_TOOL_NAMES
-        .iter()
-        .any(|name| name.eq_ignore_ascii_case(&normalized_tool_name))
+    validate_tool_call_arguments_for_execution(tool_call, "")
+}
+
+pub(super) fn validate_tool_call_arguments_for_execution(
+    tool_call: &ToolCall,
+    execution_name: &str,
+) -> Result<(), String> {
+    let exact_shell = matches!(execution_name, "exec_command" | "write_stdin");
+    let normalized_tool_name = if exact_shell {
+        execution_name.to_owned()
+    } else {
+        normalize_tool_for_policy(&tool_call.function.name, None)
+    };
+    if !exact_shell
+        && !STRICT_ARGUMENT_TOOL_NAMES
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&normalized_tool_name))
     {
         return Ok(());
     }
@@ -271,12 +291,23 @@ impl ToolPolicyGuard {
         self.observation_progress = ObservationProgress::default();
     }
 
+    #[cfg(test)]
     pub(super) fn check_before_execution(
         &self,
         tool_call: &ToolCall,
         reserved_calls: usize,
     ) -> Result<(), ToolPolicyPrecheckViolation> {
-        let normalized_tool_name = normalize_tool_for_policy(&tool_call.function.name);
+        self.check_before_execution_for_name(tool_call, reserved_calls, None)
+    }
+
+    pub(super) fn check_before_execution_for_name(
+        &self,
+        tool_call: &ToolCall,
+        reserved_calls: usize,
+        admitted_execution_name: Option<&str>,
+    ) -> Result<(), ToolPolicyPrecheckViolation> {
+        let normalized_tool_name =
+            normalize_tool_for_policy(&tool_call.function.name, admitted_execution_name);
         let projected_executions = self.executed_calls.saturating_add(reserved_calls);
 
         if projected_executions >= self.max_tool_calls_per_round {
@@ -302,16 +333,56 @@ impl ToolPolicyGuard {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn observe_outcome(
         &mut self,
         tool_call: &ToolCall,
         outcome: &Result<ToolResult, String>,
     ) {
+        self.observe_accounted_outcome(
+            tool_call,
+            outcome,
+            None,
+            super::per_call::ShellAccountingOutcome::Ordinary,
+        );
+    }
+
+    pub(super) fn observe_execution_outcome(
+        &mut self,
+        tool_call: &ToolCall,
+        outcome: &super::per_call::ToolExecutionOutcome,
+        admitted_execution_name: Option<&str>,
+    ) {
+        self.observe_accounted_outcome(
+            tool_call,
+            &outcome.result,
+            admitted_execution_name,
+            super::per_call::shell_accounting_outcome(outcome, admitted_execution_name),
+        );
+    }
+
+    fn observe_accounted_outcome(
+        &mut self,
+        tool_call: &ToolCall,
+        outcome: &Result<ToolResult, String>,
+        admitted_execution_name: Option<&str>,
+        shell_accounting: super::per_call::ShellAccountingOutcome,
+    ) {
         self.executed_calls = self.executed_calls.saturating_add(1);
 
-        let normalized_tool_name = normalize_tool_for_policy(&tool_call.function.name);
+        let normalized_tool_name =
+            normalize_tool_for_policy(&tool_call.function.name, admitted_execution_name);
 
-        let succeeded = matches!(outcome, Ok(result) if result.success);
+        let succeeded = match shell_accounting {
+            super::per_call::ShellAccountingOutcome::Ordinary => {
+                matches!(outcome, Ok(result) if result.success)
+            }
+            super::per_call::ShellAccountingOutcome::Pending => {
+                self.observation_progress.current = None;
+                return;
+            }
+            super::per_call::ShellAccountingOutcome::Terminal(success) => success,
+        };
 
         // Compression/budget enforcement can turn raw success into failure.
         // Such a round must not produce a successful-observation advisory.
@@ -444,6 +515,61 @@ mod tests {
         );
 
         assert!(guard.check_before_execution(&call, 0).is_ok());
+    }
+
+    #[test]
+    fn pending_shell_calls_consume_round_allowance_without_resetting_failure_streaks() {
+        let call = tool_call("default::exec_command", "{}");
+        let outcome =
+            |status: &str, needs_human: bool| super::super::per_call::ToolExecutionOutcome {
+                output_cap: None,
+                portable_tool: None,
+                permission_replay_origin: None,
+                result: Ok(ToolResult::text(
+                    true,
+                    serde_json::json!({"status":status, "exit_code":7, "output":""}).to_string(),
+                )),
+                needs_human: needs_human.then(|| bamboo_agent_core::PendingQuestion {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.function.name.clone(),
+                    question: "Approve?".into(),
+                    options: vec![],
+                    allow_custom: false,
+                    source: bamboo_agent_core::PendingQuestionSource::PauseTool,
+                }),
+                post_tool_hook_eligible: false,
+                tool_duration: std::time::Duration::ZERO,
+            };
+        let mut guard = ToolPolicyGuard::new(4, 3);
+        for _ in 0..2 {
+            guard.observe_execution_outcome(
+                &call,
+                &outcome("completed", false),
+                Some("exec_command"),
+            );
+        }
+        guard.begin_observation_round(0);
+        guard.observe_raw_observation(
+            &tool_call("Read", "{}"),
+            &Ok(ToolResult::text(true, "same file")),
+        );
+        assert!(guard.observation_progress.current.is_some());
+        guard.observe_execution_outcome(&call, &outcome("running", false), Some("exec_command"));
+        assert!(guard.observation_progress.current.is_none());
+        guard.observe_execution_outcome(&call, &outcome("completed", true), Some("exec_command"));
+        assert_eq!(guard.consecutive_failures.get("exec_command"), Some(&2));
+        assert!(matches!(
+            guard.check_before_execution_for_name(&call, 0, Some("exec_command")),
+            Err(ToolPolicyPrecheckViolation::RoundToolLimit { .. })
+        ));
+        let mut error = outcome("completed", false);
+        error.result = Err("transport failed before dispatch".into());
+        guard.observe_execution_outcome(&call, &error, Some("exec_command"));
+        guard.max_tool_calls_per_round = 80;
+        assert!(matches!(
+            guard.check_before_execution_for_name(&call, 0, Some("exec_command")),
+            Err(ToolPolicyPrecheckViolation::ToolCircuitOpen { .. })
+        ));
     }
 
     #[test]

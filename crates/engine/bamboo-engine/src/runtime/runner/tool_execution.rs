@@ -169,6 +169,8 @@ async fn execute_and_apply_single_tool_call(
     let executing_supervisor =
         ExecutingSupervisorObservation::capture_from_executing_session(session);
     let root_orchestration_only = session.root_orchestration_only_enabled();
+    let admitted_execution_name =
+        effective_callable_set.resolve_callable_reference(&tool_call.function.name);
     // Plan mode gate: block mutating tools (except pause/clarification tools)
     if session_flags.plan_read_only {
         let tool_name = tool_call.function.name.trim();
@@ -189,7 +191,11 @@ async fn execute_and_apply_single_tool_call(
                 result: Err(format!("Plan mode: {} operation blocked", tool_name)),
                 tool_duration: std::time::Duration::ZERO,
             };
-            policy_guard.observe_outcome(tool_call, &outcome.result);
+            policy_guard.observe_execution_outcome(
+                tool_call,
+                &outcome,
+                admitted_execution_name.as_deref(),
+            );
             let task_hint = build_task_compression_hint(task_context);
             let outcome = output_compressor::maybe_compress(
                 &tool_call.function.name,
@@ -231,7 +237,11 @@ async fn execute_and_apply_single_tool_call(
     }
 
     let mut stop_round = false;
-    let outcome = match policy_guard.check_before_execution(tool_call, reserved_calls) {
+    let outcome = match policy_guard.check_before_execution_for_name(
+        tool_call,
+        reserved_calls,
+        admitted_execution_name.as_deref(),
+    ) {
         Ok(()) => {
             per_call::execute_model_requested_tool_call_only(
                 effective_callable_set,
@@ -309,7 +319,7 @@ async fn execute_and_apply_single_tool_call(
     .await;
     // The output budget may turn an otherwise successful browser download
     // into a bounded failure. Count the result the model actually receives.
-    policy_guard.observe_outcome(tool_call, &outcome.result);
+    policy_guard.observe_execution_outcome(tool_call, &outcome, admitted_execution_name.as_deref());
 
     let should_break = per_call::apply_tool_execution_outcome(
         per_call::ToolExecutionApplyContext {
@@ -544,10 +554,17 @@ pub(crate) async fn execute_round_tool_calls(
 
             let batch = &tool_calls[batch_start..next_index];
 
-            let policy_precheck_error = batch
-                .iter()
-                .enumerate()
-                .find_map(|(offset, call)| policy_guard.check_before_execution(call, offset).err());
+            let policy_precheck_error = batch.iter().enumerate().find_map(|(offset, call)| {
+                policy_guard
+                    .check_before_execution_for_name(
+                        call,
+                        offset,
+                        effective_callable_set
+                            .resolve_callable_reference(&call.function.name)
+                            .as_deref(),
+                    )
+                    .err()
+            });
 
             if policy_precheck_error.is_some() {
                 for batch_call in batch {
@@ -820,7 +837,13 @@ pub(crate) async fn execute_round_tool_calls(
                 .await;
 
             for (batch_call, outcome) in batch.iter().zip(compressed) {
-                policy_guard.observe_outcome(batch_call, &outcome.result);
+                policy_guard.observe_execution_outcome(
+                    batch_call,
+                    &outcome,
+                    effective_callable_set
+                        .resolve_callable_reference(&batch_call.function.name)
+                        .as_deref(),
+                );
 
                 let should_break = per_call::apply_tool_execution_outcome(
                     per_call::ToolExecutionApplyContext {

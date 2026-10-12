@@ -15,11 +15,30 @@ mod goal;
 mod success_path;
 mod workspace;
 
+pub(super) enum TaskProgressResult {
+    Ordinary,
+    Skip,
+    CommandOutcome(ToolResult),
+}
+
+impl TaskProgressResult {
+    pub(super) fn result<'a>(&'a self, ordinary: &'a ToolResult) -> Option<&'a ToolResult> {
+        match self {
+            Self::Ordinary => Some(ordinary),
+            Self::Skip => None,
+            Self::CommandOutcome(result) => Some(result),
+        }
+    }
+}
+
 pub(super) struct SuccessPathContext<'a> {
     pub permission_replay_origin:
         Option<&'a crate::session_app::approval_replay::PermissionReplayOrigin>,
     pub tool_call: &'a ToolCall,
     pub result: &'a ToolResult,
+    /// Task progress uses observed command completion rather than shell-tool
+    /// transport success. The model-visible result remains unchanged.
+    pub task_progress_result: TaskProgressResult,
     pub event_tx: &'a mpsc::Sender<AgentEvent>,
     pub metrics_collector: Option<&'a MetricsCollector>,
     pub session_id: &'a str,
