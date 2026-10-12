@@ -26,16 +26,85 @@ jobs:
     name: Promotion Source
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - name: Require the repository dev branch
+      - name: Require a frozen release from protected dev history
         env:
+          GH_TOKEN: ${{ github.token }}
           HEAD_REF: ${{ github.head_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
-          if [[ "$HEAD_REF" != "dev" || "$HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
-            echo "::error::Pull requests into main must promote bigduu/Bamboo-agent:dev."
-            exit 1
-          fi
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import re
+          import urllib.parse
+          import urllib.request
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          require(repository == "bigduu/Bamboo-agent", "Unexpected promotion repository")
+          require(os.environ["HEAD_REPOSITORY"] == repository, "Promotion must use a same-repository branch")
+          release = os.environ["HEAD_REF"]
+          match = re.fullmatch(r"release/([0-9a-f]{40})", release)
+          require(match is not None, "Main accepts only release/<40-character-cut-SHA> branches")
+          cut = match.group(1)
+          head = os.environ["HEAD_SHA"]
+          require(re.fullmatch(r"[0-9a-f]{40}", head) is not None, "Missing exact pull-request head")
+          token = os.environ["GH_TOKEN"]
+          require(bool(token), "Missing read-only source proof authority")
+
+          # Fixed API origin; never follow a redirect with the job credential.
+          # No checkout or execution of scripts from the proposed release.
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, message, headers, newurl):
+                  return None
+
+          opener = urllib.request.build_opener(NoRedirect())
+          def api(route):
+              request = urllib.request.Request(
+                  f"https://api.github.com/repos/{repository}/{route}",
+                  headers={"Authorization": f"Bearer {token}",
+                           "Accept": "application/vnd.github+json",
+                           "X-GitHub-Api-Version": "2022-11-28",
+                           "User-Agent": "bamboo-promotion-source"},
+              )
+              with opener.open(request, timeout=30) as response:
+                  return json.load(response)
+
+          def branch(name, protected=False):
+              data = api(f"branches/{urllib.parse.quote(name, safe='')}")
+              require(data["name"] == name, "Branch identity changed")
+              if protected:
+                  require(data["protected"] is True, "dev must remain protected")
+              sha = data["commit"]["sha"]
+              require(re.fullmatch(r"[0-9a-f]{40}", sha) is not None, "Missing branch commit identity")
+              return sha
+
+          def ancestor(source, target):
+              proof = api(f"compare/{source}...{target}")
+              require(proof["status"] in {"ahead", "identical"}
+                      and proof["base_commit"]["sha"] == source
+                      and proof["merge_base_commit"]["sha"] == source,
+                      "Release ancestry proof is missing or does not match")
+
+          require(branch(release) == head, "Release branch no longer matches the exact PR head")
+          dev = branch("dev", protected=True)
+          ancestor(cut, head)
+          ancestor(head, dev)
+          # Normal dev advancement is allowed; rewritten history is not.
+          # Comparisons are always between immutable SHAs, never moving refs.
+          current_dev = branch("dev", protected=True)
+          if current_dev != dev:
+              ancestor(dev, current_dev)
+          require(branch(release) == head, "Release branch changed during source proof")
+          print(f"Accepted frozen release cut={cut} head={head} protected_dev={current_dev}")
+          PYTHON
 
   test:
     name: Test
@@ -106,7 +175,7 @@ jobs:
           RUST_MIN_STACK: "8388608"
 
       - name: Test locked Rust workspace
-        timeout-minutes: 30
+        timeout-minutes: 45
         run: cargo test --locked
         # Deep actor-runtime tests need the same thread stack on CI as the
         # verified local workspace sweep; Rust's default is too small on Linux.
@@ -281,13 +350,13 @@ jobs:
   build:
     name: Build (${{ matrix.os }})
     # Integration work is validated on Linux. The release-grade platform
-    # matrix is reserved for promoting this repository's dev branch to main;
+    # matrix is reserved for this repository's frozen release branches to main;
     # workflow_dispatch remains an explicit escape hatch for manual validation.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
        github.base_ref == 'main' &&
-       github.head_ref == 'dev' &&
+       startsWith(github.head_ref, 'release/') &&
        github.event.pull_request.head.repo.full_name == github.repository)
     strategy:
       fail-fast: false

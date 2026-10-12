@@ -193,12 +193,65 @@ bamboo/
 
 ## Release Process
 
-Feature pull requests target `dev`. After a normal protected `dev → main`
-promotion, successful same-repository main push CI queues publication of its
-exact tested commit to crates.io and a GitHub Release. The workflow must first
-reach main through that normal promotion; do not promote unrelated development
-solely to activate it. Source manifests keep `0.0.0`; temporary publication
-stamps an unused `YYYY.M.N` UTC version and embeds the committed frontend lock.
+Feature pull requests target `dev`. Each release follows
+`dev → release/<40-character-cut-SHA> → main` in this repository. Never promote
+the moving `dev` branch directly to `main`.
+
+### Freeze the release scope
+
+1. After all changes and controls required for this release have normally merged
+   into protected `dev`, freshly read its actual current HEAD immediately before
+   creating the release branch. This is the cut; do not select an arbitrary
+   historical ancestor. Record the cut's UTC timestamp, full lowercase
+   40-character SHA, tree SHA, fresh branch-read receipt, and bounded release
+   scope in the release PR. Create `release/<cut-SHA>` at that exact recorded SHA.
+   Keep `dev` open for ongoing development after the cut.
+2. Open the release branch's PR into `main`. Freeze its scope: do not repeatedly
+   merge the latest `dev` tip or unrelated features into the release to chase
+   ongoing development. If a broader release is needed, explicitly choose and
+   record a new cut and scope on a new release branch.
+3. For a necessary release fix, branch from the frozen release head, keep the
+   change within the recorded release scope, and submit it to protected `dev`
+   through normal review and checks. Preserve that exact fix commit's ancestry
+   when merging into `dev` (do not squash or rebase it into a different commit).
+   Only then fast-forward the release branch to that reviewed fix head. Do not
+   merge `dev` back into the release. If ancestry cannot be preserved under the
+   existing branch rules, stop and choose a new accepted cut through the normal
+   process; never bypass protection.
+4. The required `Promotion Source` gate verifies the actual same-repository
+   release branch against the PR's exact head, proves cut → release-head
+   ancestry, and proves release-head → protected-`dev` ancestry. Missing proof,
+   source drift, or an unbackmerged fix fails closed. Later `dev` commits do not
+   invalidate a frozen release. Static CI cannot prove the historical timing of
+   branch creation or judge release scope. Review must verify the fresh cut
+   receipt and actual normal branch creation, as well as the recorded scope.
+5. Merge the release PR into `main` only after its current-head review, all
+   required checks, the full Linux/macOS/Windows matrix, and normal branch
+   protection pass. Main PR checks continue to test the synthetic merge result;
+   manual CI can additionally validate the exact release source. A new head or
+   changed base requires fresh review and checks, never relabeled old results.
+
+Release source and version tags are immutable: never move or replace a frozen
+tag. This process adds no publication or deployment authorization, credentials,
+permissions, or protection exceptions. Existing publication prerequisites still
+apply.
+
+After the normal protected release-branch promotion, successful same-repository
+main push CI queues publication of its exact tested commit to crates.io and a
+GitHub Release. The workflow must first reach main through that normal promotion;
+do not promote unrelated development solely to activate it. Source manifests
+keep `0.0.0`; temporary publication stamps an unused `YYYY.M.N` UTC version and
+embeds the committed frontend lock. Keep this successful-main-CI path as the
+single automatic Bamboo publisher. Once Bamboo is published, downstream Zenith
+runs should use `targets=bodhi`, verify the already-published Bamboo version and
+source, and consume that release instead of dispatching a duplicate Bamboo
+publication.
+
+Main pushes also trigger documentation publication to public GitHub Pages.
+GHCR image publication is triggered separately by `v*`/`bamboo-v*` tag pushes or
+an explicit Docker workflow dispatch, not by a main push. Account for these
+side effects under the existing authorization and release prerequisites; the
+branch policy does not change their workflows.
 
 Automatic runs and manual/Zenith dispatches using this workflow share one
 `bamboo-crate-publication` queue without canceling queued uploads. Previously
@@ -314,7 +367,7 @@ must finish before independent main publication is activated.
 
 Bamboo uses GitHub Actions for continuous integration and publishing:
 
-- **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run locked Rust build/test, formatting, and CI workflow policy checks in the required `Test` gate. Pull requests into `main`, pushes to `main`, and manual dispatches retain comprehensive validation, with the all-feature library and integration suite in the required `E2E Tests` job. Only promotion pull requests from this repository's `dev` branch into `main` add release builds on Linux, macOS, and Windows; manual dispatches also run that platform matrix. Linux TLS and frontend contract tests run in `Test`, while macOS and Windows run their platform-specific checks. Successful dev PR builds can reuse their own Rust cache until closure; `.github/workflows/pr-cache-cleanup.yml` then removes only that same-repository PR's merge-ref caches.
+- **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run locked Rust build/test, formatting, and CI workflow policy checks in the required `Test` gate. Pull requests into `main`, pushes to `main`, and manual dispatches retain comprehensive validation, with the all-feature library and integration suite in the required `E2E Tests` job. Only promotion pull requests from this repository's frozen `release/<40-character-cut-SHA>` branches into `main` add release builds on Linux, macOS, and Windows; manual dispatches also run that platform matrix. Linux TLS and frontend contract tests run in `Test`, while macOS and Windows run their platform-specific checks. Successful dev PR builds can reuse their own Rust cache until closure; `.github/workflows/pr-cache-cleanup.yml` then removes only that same-repository PR's merge-ref caches.
 - **CodeQL** (`.github/workflows/codeql.yml`) -- Runs the Actions, JavaScript/TypeScript, Python, and Rust analyses for pull requests into `main`, pushes to `main`, and explicit manual dispatches. Routine `dev` activity does not run CodeQL.
 - **Publish Crate** (`.github/workflows/publish-crate.yml`) -- Publishes successful main CI source commits to crates.io and GitHub Releases with verified same-source recovery. Manual/Zenith dispatches retain explicit versions, the exact locked frontend and `dry_run`.
   Its Cargo PATH entrypoint, including metadata invoked from Python, runs the
