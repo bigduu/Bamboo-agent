@@ -381,26 +381,17 @@ mod process_tests {
         let _environment = environment();
         let directory = tempfile::tempdir().unwrap();
         let release = directory.path().join("release");
-        let pid_file = directory.path().join("descendant.pid");
-        struct Cleanup(PathBuf, PathBuf);
+        struct Cleanup(PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) {
                 let _ = std::fs::write(&self.0, b"release");
-                if let Ok(pid) = std::fs::read_to_string(&self.1) {
-                    if let Ok(pid) = pid.trim().parse::<i32>() {
-                        unsafe {
-                            libc::kill(pid, libc::SIGKILL);
-                        }
-                    }
-                }
             }
         }
-        let _cleanup = Cleanup(release.clone(), pid_file.clone());
+        let _cleanup = Cleanup(release.clone());
         let first = start(
             format!(
-                "sleep 30 </dev/null & printf '%s' $! > '{}'; \
+                "sleep 30 </dev/null & \
                  while [ ! -f '{}' ]; do sleep 0.01; done; printf final; exit 7",
-                pid_file.display(),
                 release.display()
             ),
             "broken-stdin-drain-exec",
@@ -557,25 +548,7 @@ mod process_tests {
     #[tokio::test]
     async fn inherited_descendant_pipes_have_bounded_drain_and_explicit_incomplete_result() {
         let _environment = environment();
-        let directory = tempfile::tempdir().unwrap();
-        let pid_file = directory.path().join("descendant.pid");
-        struct CleanupDescendant(PathBuf);
-        impl Drop for CleanupDescendant {
-            fn drop(&mut self) {
-                if let Ok(pid) = std::fs::read_to_string(&self.0) {
-                    if let Ok(pid) = pid.trim().parse::<i32>() {
-                        unsafe {
-                            libc::kill(pid, libc::SIGKILL);
-                        }
-                    }
-                }
-            }
-        }
-        let _cleanup = CleanupDescendant(pid_file.clone());
-        let cmd = format!(
-            "sleep 30 & printf '%s' $! > '{}'; printf done",
-            pid_file.display()
-        );
+        let cmd = "sleep 30 & printf done".to_owned();
         let first = start(cmd, "inherited-pipes-exec", false).await;
         let id = first["session_id"].as_str().unwrap();
         let last = timeout(Duration::from_secs(5), poll(id, "inherited-pipes-exec"))
