@@ -10,7 +10,23 @@ use super::ChildSessionError;
 pub const NAMED_PROFILE_BINDING_KEY: &str = "child.named_profile.v1";
 /// Host creator signal derived from the existing explicit create.model input.
 pub const PROFILE_EXPLICIT_MODEL_KEY: &str = "child.named_profile.explicit_model.v1";
-const NATIVE_NAMES: [&str; 5] = ["Bash", "Edit", "Glob", "Read", "Write"];
+const NATIVE_NAMES: [&str; 7] = [
+    "Bash",
+    "exec_command",
+    "write_stdin",
+    "Edit",
+    "Glob",
+    "Read",
+    "Write",
+];
+
+/// Legacy Bash declarations cover starting and continuing model-polled shells.
+/// Apply only while resolving source declarations; frozen grants stay exact.
+fn declares_tool(declarations: &[String], tool: &str) -> bool {
+    declarations.iter().any(|name| {
+        name == tool || (name == "Bash" && matches!(tool, "exec_command" | "write_stdin"))
+    })
+}
 
 /// Only the host catalog producer constructs this value. No request decoder,
 /// serialization or Debug output exposes its private instruction body.
@@ -107,12 +123,8 @@ impl ResolvedChildProfile {
         let tools = NATIVE_NAMES
             .iter()
             .filter(|name| {
-                (definition.tool_allow().is_empty()
-                    || definition
-                        .tool_allow()
-                        .iter()
-                        .any(|allowed| allowed == **name))
-                    && !definition.tool_deny().iter().any(|denied| denied == **name)
+                (definition.tool_allow().is_empty() || declares_tool(definition.tool_allow(), name))
+                    && !declares_tool(definition.tool_deny(), name)
                     && (!read_only || matches!(**name, "Read" | "Glob"))
             })
             .map(|name| (*name).to_owned())
@@ -255,7 +267,7 @@ fn read_binding(session: &Session) -> Result<Option<Binding>, ChildSessionError>
         || binding.name.len() > 64
         || binding.revision.len() != 64
         || !binding.revision.bytes().all(|b| b.is_ascii_hexdigit())
-        || binding.tools.len() > 5
+        || binding.tools.len() > NATIVE_NAMES.len()
         || binding
             .tools
             .iter()
@@ -404,7 +416,10 @@ mod tests {
         for name in ["explorer", "reviewer", "independent-reviewer"] {
             std::fs::write(
                 home.join(format!("agents/{name}.md")),
-                definition(name, "tools:\n  allow: [Read, Glob, Write]"),
+                definition(
+                    name,
+                    "tools:\n  allow: [Read, Glob, Write, Bash, exec_command, write_stdin]",
+                ),
             )
             .unwrap();
             let child = bound(selected(&home, name, &parent), &parent);
@@ -424,6 +439,75 @@ mod tests {
                 assert!(validate_named_profile(&changed).is_err());
             }
         }
+    }
+
+    #[test]
+    fn legacy_bash_declarations_cover_exec_sessions_without_overriding_denials() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(home.join("agents")).unwrap();
+        let parent = Session::new("profile-parent", "parent-model");
+        for (declarations, expected) in [
+            (
+                "tools:\n  allow: [Bash, exec_command, write_stdin, Edit, Glob, Read, Write]",
+                vec![
+                    "Bash",
+                    "exec_command",
+                    "write_stdin",
+                    "Edit",
+                    "Glob",
+                    "Read",
+                    "Write",
+                ],
+            ),
+            (
+                "tools:\n  allow: [Bash]",
+                vec!["Bash", "exec_command", "write_stdin"],
+            ),
+            (
+                "tools:\n  allow: [exec_command, write_stdin]",
+                vec!["exec_command", "write_stdin"],
+            ),
+            (
+                "tools:\n  allow: [exec_command, write_stdin, Read]\n  deny: [Bash]",
+                vec!["Read"],
+            ),
+            (
+                "tools:\n  allow: [Bash]\n  deny: [exec_command]",
+                vec!["Bash", "write_stdin"],
+            ),
+        ] {
+            std::fs::write(
+                home.join("agents/implementer.md"),
+                definition("implementer", declarations),
+            )
+            .unwrap();
+            let child = bound(selected(&home, "implementer", &parent), &parent);
+            assert_eq!(named_profile_tool_names(&child).unwrap().unwrap(), expected);
+            validate_named_profile(&child).unwrap();
+        }
+    }
+
+    #[test]
+    fn frozen_legacy_bash_binding_remains_exact() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(home.join("agents")).unwrap();
+        std::fs::write(
+            home.join("agents/implementer.md"),
+            definition("implementer", "tools:\n  allow: [Bash]"),
+        )
+        .unwrap();
+        let parent = Session::new("profile-parent", "parent-model");
+        let mut child = bound(selected(&home, "implementer", &parent), &parent);
+        let mut binding = read_binding(&child).unwrap().unwrap();
+        binding.tools = vec!["Bash".into()];
+        child.metadata.insert(
+            NAMED_PROFILE_BINDING_KEY.into(),
+            serde_json::to_string(&binding).unwrap(),
+        );
+        assert_eq!(named_profile_tool_names(&child).unwrap().unwrap(), ["Bash"]);
+        validate_named_profile(&child).unwrap();
     }
 
     #[test]

@@ -3,7 +3,7 @@ schema_version: 1
 name: implementer
 description: Implement the assigned change within inherited authority and report validation.
 tools:
-  allow: [Bash, Edit, Glob, Read, Write]
+  allow: [Bash, exec_command, write_stdin, Edit, Glob, Read, Write]
 ---
 Builtin role package v1: implementer.
 

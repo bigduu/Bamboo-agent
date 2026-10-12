@@ -1854,8 +1854,8 @@ mod tests {
     #[test]
     fn framework_source_and_alias_metadata_require_exact_registered_identity() {
         let metadata = project_tool_capability_metadata(&[
-            schema("Bash", "canonical builtin", json!({})),
-            schema("bash", "custom lowercase", json!({})),
+            schema("exec_command", "canonical builtin", json!({})),
+            schema("Exec_Command", "custom mixed case", json!({})),
             schema("Project", "canonical server", json!({})),
             schema("browser", "server browser", json!({})),
             schema("project", "custom lowercase", json!({})),
@@ -1871,8 +1871,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {name}"))
         };
 
-        assert_eq!(entry("Bash").source, CapabilitySource::Builtin);
-        assert_eq!(entry("bash").source, CapabilitySource::Custom);
+        assert_eq!(entry("exec_command").source, CapabilitySource::Builtin);
+        assert_eq!(entry("Exec_Command").source, CapabilitySource::Custom);
         assert_eq!(entry("Project").source, CapabilitySource::Server);
         assert_eq!(entry("browser").source, CapabilitySource::Server);
         assert_eq!(entry("project").source, CapabilitySource::Custom);
@@ -1888,7 +1888,7 @@ mod tests {
     #[test]
     fn raw_and_classified_projections_exclude_host_only_and_keep_deferred_tools() {
         let schemas = [
-            schema("Bash", "inspect core", json!({})),
+            schema("exec_command", "inspect core", json!({})),
             schema("Glob", "inspect deferred", json!({})),
             schema("custom_tool", "inspect custom", json!({})),
             schema("mcp__alpha__inspect", "inspect mcp", json!({})),
@@ -1913,7 +1913,7 @@ mod tests {
         assert_eq!(
             names(&raw),
             BTreeSet::from([
-                "Bash".to_string(),
+                "exec_command".to_string(),
                 "Glob".to_string(),
                 "custom_tool".to_string(),
                 "mcp__alpha__inspect".to_string(),

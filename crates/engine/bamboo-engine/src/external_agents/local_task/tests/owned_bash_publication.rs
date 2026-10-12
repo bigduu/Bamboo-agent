@@ -2,13 +2,61 @@
 //! final publication barrier. The controlled provider only chooses the tool;
 //! it neither launches nor terminates the process on behalf of the runtime.
 use super::*;
-use bamboo_agent_core::tools::FunctionCall;
+use bamboo_agent_core::tools::{FunctionCall, ToolExecutionContext, ToolOutcome};
+
+const LEGACY_BASH_FIXTURE: &str = "legacy_bash_host_fixture";
+
+/// The model catalog hides Bash. This test-only host compatibility adapter
+/// preserves coverage of its actual SDK cancellation/publication lifecycle.
+/// Only the exposed fixture name changes; the builtin receives the same call
+/// arguments and execution context, including its LocalTask resource owner.
+struct LegacyBashHostFixture(bamboo_tools::BuiltinToolExecutor);
+
+impl LegacyBashHostFixture {
+    fn builtin_call(call: &ToolCall) -> Result<ToolCall, ToolError> {
+        if call.function.name != LEGACY_BASH_FIXTURE {
+            return Err(ToolError::NotFound(call.function.name.clone()));
+        }
+        let mut builtin_call = call.clone();
+        builtin_call.function.name = "Bash".into();
+        Ok(builtin_call)
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for LegacyBashHostFixture {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        self.0.execute(&Self::builtin_call(call)?).await
+    }
+
+    async fn execute_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        self.0
+            .execute_with_context_outcome(&Self::builtin_call(call)?, ctx)
+            .await
+    }
+
+    fn list_tools(&self) -> Vec<ToolSchema> {
+        self.0
+            .list_tools()
+            .into_iter()
+            .filter(|schema| schema.function.name == "Bash")
+            .map(|mut schema| {
+                schema.function.name = LEGACY_BASH_FIXTURE.into();
+                schema
+            })
+            .collect()
+    }
+}
 
 struct BashCeiling;
 #[async_trait]
 impl NativeToolCeilingSource for BashCeiling {
     async fn observe(&self, _: &Session) -> Result<Vec<String>, String> {
-        Ok(vec!["Bash".into()])
+        Ok(vec![LEGACY_BASH_FIXTURE.into()])
     }
 }
 
@@ -28,13 +76,16 @@ impl LLMProvider for BashProvider {
     ) -> Result<LLMStream, LLMError> {
         assert_eq!(model, MODEL);
         assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
-        assert!(tools.iter().any(|tool| tool.function.name == "Bash"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool.function.name == LEGACY_BASH_FIXTURE));
+        assert!(!tools.iter().any(|tool| tool.function.name == "Bash"));
         Ok(Box::pin(futures::stream::iter(vec![
             Ok(LLMChunk::ToolCalls(vec![ToolCall {
                 id: "owned-builtin-bash".into(),
                 tool_type: "function".into(),
                 function: FunctionCall {
-                    name: "Bash".into(),
+                    name: LEGACY_BASH_FIXTURE.into(),
                     arguments: serde_json::json!({
                         "command": self.command,
                         "workdir": self.workspace,
@@ -72,7 +123,9 @@ async fn sdk_owned_bash_stops_before_publication(shutdown: bool) {
         &root_id(),
         provider.clone(),
         1,
-        Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+        Arc::new(LegacyBashHostFixture(
+            bamboo_tools::BuiltinToolExecutor::new(),
+        )),
         Arc::new(BashCeiling),
     )
     .await;

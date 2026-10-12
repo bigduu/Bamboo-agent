@@ -575,7 +575,11 @@ mod native_ceiling_tests {
         let home = tempfile::tempdir().unwrap();
         let source = source(home.path());
         let parent = bamboo_domain::Session::new("profile-parent", "model");
-        for (tools, read_only) in [(vec!["Bash"], false), (vec!["Glob", "Read"], true)] {
+        for (tools, read_only) in [
+            (vec!["Bash"], false),
+            (vec!["exec_command", "write_stdin"], false),
+            (vec!["Glob", "Read"], true),
+        ] {
             let mut child =
                 bamboo_domain::Session::new_child_of("profile-child", &parent, "model", "role");
             child

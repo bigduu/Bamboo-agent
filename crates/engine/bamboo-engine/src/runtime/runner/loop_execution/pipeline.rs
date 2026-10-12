@@ -4306,7 +4306,14 @@ fn heuristic_complexity(
 ) -> crate::runtime::complexity_classifier::TaskComplexity {
     use crate::runtime::complexity_classifier::TaskComplexity;
 
-    let simple_tools = ["Read", "Glob", "Grep", "Bash"];
+    let simple_tools = [
+        "Read",
+        "Glob",
+        "Grep",
+        "Bash",
+        "exec_command",
+        "write_stdin",
+    ];
     let complex_tools = ["Agent", "Plan", "SubAgent", "TodoWrite"];
 
     let names: Vec<&str> = tool_calls
@@ -5921,7 +5928,7 @@ mod tests {
     fn anthropic_history_drives_progressive_round_membership_while_legacy_stays_full() {
         const BOUNDARY: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let tools = vec![
-            loading_test_schema("Bash"),
+            loading_test_schema("exec_command"),
             loading_test_schema("get_weather"),
             loading_test_schema("Glob"),
         ];
@@ -5939,7 +5946,7 @@ mod tests {
             &tools,
             bamboo_domain::CapabilityLoadingMode::Progressive,
         );
-        assert!(first_effective.contains_execution_name("Bash"));
+        assert!(first_effective.contains_execution_name("exec_command"));
         assert!(!first_effective.contains_execution_name("get_weather"));
 
         let assistant = Message::assistant("normalized", None);
@@ -5997,7 +6004,7 @@ mod tests {
             &tools,
             bamboo_domain::CapabilityLoadingMode::Progressive,
         );
-        assert!(loaded_effective.contains_execution_name("Bash"));
+        assert!(loaded_effective.contains_execution_name("exec_command"));
         assert!(loaded_effective.contains_execution_name("get_weather"));
         assert!(!loaded_effective.contains_execution_name("Glob"));
 
@@ -6007,7 +6014,7 @@ mod tests {
             &tools,
             bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         );
-        assert!(legacy_effective.contains_execution_name("Bash"));
+        assert!(legacy_effective.contains_execution_name("exec_command"));
         assert!(legacy_effective.contains_execution_name("get_weather"));
         assert!(legacy_effective.contains_execution_name("Glob"));
     }
@@ -6016,7 +6023,7 @@ mod tests {
     fn openai_search_output_drives_progressive_membership_across_resume() {
         const BOUNDARY: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         let tools = vec![
-            loading_test_schema("Bash"),
+            loading_test_schema("exec_command"),
             loading_test_schema("search_orders"),
             loading_test_schema("Glob"),
         ];
@@ -6033,7 +6040,7 @@ mod tests {
             &tools,
             bamboo_domain::CapabilityLoadingMode::Progressive,
         );
-        assert!(first.contains_execution_name("Bash"));
+        assert!(first.contains_execution_name("exec_command"));
         assert!(!first.contains_execution_name("search_orders"));
 
         let assistant = Message::assistant("", None);
@@ -6065,7 +6072,7 @@ mod tests {
             &tools,
             bamboo_domain::CapabilityLoadingMode::Progressive,
         );
-        assert!(loaded.contains_execution_name("Bash"));
+        assert!(loaded.contains_execution_name("exec_command"));
         assert!(loaded.contains_execution_name("search_orders"));
         assert!(!loaded.contains_execution_name("Glob"));
 
@@ -6084,7 +6091,7 @@ mod tests {
     fn hosted_search_output_enables_its_same_response_function_but_not_an_ordinary_call() {
         const BOUNDARY: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
         let tools = vec![
-            loading_test_schema("Bash"),
+            loading_test_schema("exec_command"),
             loading_test_schema("search_orders"),
             loading_test_schema("Glob"),
         ];
@@ -6153,7 +6160,7 @@ mod tests {
             &tools,
             bamboo_domain::CapabilityLoadingMode::Progressive,
         );
-        assert!(effective.contains_execution_name("Bash"));
+        assert!(effective.contains_execution_name("exec_command"));
         assert!(effective.contains_execution_name("search_orders"));
         assert!(
             !effective.contains_execution_name("Glob"),
@@ -13390,3 +13397,7 @@ mod tests {
 #[cfg(test)]
 #[path = "pipeline_final_evidence_tests.rs"]
 mod final_evidence_tests;
+
+#[cfg(all(test, unix))]
+#[path = "pipeline_exec_sessions_tests.rs"]
+mod exec_sessions_tests;

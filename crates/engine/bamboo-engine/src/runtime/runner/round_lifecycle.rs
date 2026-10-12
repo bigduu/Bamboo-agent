@@ -507,7 +507,7 @@ mod tests {
             schema("Read"),
             schema("ReadArchive"),
             schema("Workspace"),
-            schema("Bash"),
+            schema("exec_command"),
         ];
 
         let request_tools =
@@ -518,7 +518,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.function.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Read", "Bash", "discover_capabilities"]
+            vec!["Read", "exec_command", "discover_capabilities"]
         );
         assert!(request_tools.iter().all(|tool| {
             tool.function.name != "ReadArchive" && tool.function.name != "Workspace"
@@ -543,7 +543,7 @@ mod tests {
             schema("SubAgent"),
             schema("Plan"),
             schema("Task"),
-            schema("Bash"),
+            schema("exec_command"),
             schema("discover_capabilities"),
         ];
         let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
@@ -586,7 +586,7 @@ mod tests {
             schema("Read"),
             schema("ReadArchive"),
             schema("Workspace"),
-            schema("Bash"),
+            schema("exec_command"),
         ];
         let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
         let cancel = CancellationToken::new();
@@ -665,7 +665,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.function.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Read", "Bash", "discover_capabilities"]
+            vec!["Read", "exec_command", "discover_capabilities"]
         );
         assert_eq!(
             requests[0][2].function.parameters["properties"]["query"]["maxLength"],

@@ -1397,7 +1397,7 @@ mod task_progress_tests {
             let outcome = bamboo_tools::with_approval_proxy(
                 None,
                 // Exercise the real gate for an explicitly selected executor;
-                // pair model admission remains disabled until promotion.
+                // model admission is covered by the strict-argument test.
                 execute_tool_call_only_with_execution_name(
                     execution_name,
                     ToolExecutionOnlyContext {
@@ -2233,20 +2233,25 @@ mod hook_tests {
     #[tokio::test]
     async fn portable_hook_denies_resolved_aliases_but_preserves_exact_shadow_and_native_spelling()
     {
+        // Legacy Bash policy still governs canonical shell calls; an exact
+        // foreign tool with the same suffix keeps its own identity.
         let (_temp, mut config) = portable_alias_policy(r#"printf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Bash blocked"}}'"#, "Bash").await;
         let recorder = Arc::new(OriginalToolNameRecorder(Mutex::new(vec![])));
         Arc::make_mut(&mut config.hook_runner).register(recorder.clone());
         let concrete = Arc::new(ExactOwnerRecordingExecutor::default());
         let tools: Arc<dyn ToolExecutor> = concrete.clone();
         let (event_tx, _event_rx) = mpsc::channel(64);
-        let callable =
-            effective_callable_set(&["Bash"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
-        for name in ["Bash", "execute_command", "default::Bash"] {
+        let callable = effective_callable_set(
+            &["exec_command"],
+            CapabilityLoadingMode::LegacyFullCatalog,
+            &[],
+        );
+        for name in ["exec_command", "default::exec_command"] {
             let mut call = probe_call(name);
-            call.function.arguments = serde_json::json!({"command":"printf fixture"}).to_string();
+            call.function.arguments = serde_json::json!({"cmd":"printf fixture"}).to_string();
             assert_eq!(
                 callable.resolve_callable_reference(name).as_deref(),
-                Some("Bash")
+                Some("exec_command")
             );
             let (outcome, _) =
                 execute_portable_alias_call(&config, &tools, &callable, &call, &event_tx).await;
@@ -2258,31 +2263,30 @@ mod hook_tests {
         }
         assert!(concrete.exact_dispatches.lock().unwrap().is_empty());
         let shadow = effective_callable_set(
-            &["Bash", "execute_command"],
+            &["exec_command", "vendor::exec_command"],
             CapabilityLoadingMode::LegacyFullCatalog,
             &[],
         );
-        let call = probe_call("execute_command");
+        let call = probe_call("vendor::exec_command");
         assert_eq!(
             shadow
                 .resolve_callable_reference(&call.function.name)
                 .as_deref(),
-            Some("execute_command")
+            Some("vendor::exec_command")
         );
         let (outcome, _) =
             execute_portable_alias_call(&config, &tools, &shadow, &call, &event_tx).await;
         assert!(outcome.result.is_ok());
         assert_eq!(
             *concrete.exact_dispatches.lock().unwrap(),
-            vec![("execute_command".into(), "execute_command".into())]
+            vec![("vendor::exec_command".into(), "vendor::exec_command".into())]
         );
         assert_eq!(
             *recorder.0.lock().unwrap(),
             vec![
-                "Bash",
-                "execute_command",
-                "default::Bash",
-                "execute_command"
+                "exec_command",
+                "default::exec_command",
+                "vendor::exec_command"
             ]
         );
     }
@@ -2293,15 +2297,18 @@ mod hook_tests {
         let concrete = Arc::new(ExactOwnerRecordingExecutor::default());
         let tools: Arc<dyn ToolExecutor> = concrete;
         let (event_tx, _event_rx) = mpsc::channel(64);
-        let callable =
-            effective_callable_set(&["Bash"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
-        let mut call = probe_call("default::Bash");
-        let input = serde_json::json!({"command":"printf fixture"});
+        let callable = effective_callable_set(
+            &["exec_command"],
+            CapabilityLoadingMode::LegacyFullCatalog,
+            &[],
+        );
+        let mut call = probe_call("default::exec_command");
+        let input = serde_json::json!({"cmd":"printf fixture"});
         call.function.arguments = input.to_string();
         let (outcome, mut session) =
             execute_portable_alias_call(&config, &tools, &callable, &call, &event_tx).await;
         assert!(outcome.result.is_ok());
-        assert_eq!(outcome.portable_tool.as_ref().unwrap().name, "Bash");
+        assert_eq!(outcome.portable_tool.as_ref().unwrap().name, "exec_command");
         assert_eq!(outcome.portable_tool.as_ref().unwrap().input, input);
         apply_test_outcome(&config, &tools, &call, &mut session, &event_tx, outcome)
             .await
@@ -2360,10 +2367,13 @@ mod hook_tests {
 
         let concrete = Arc::new(ExactOwnerRecordingExecutor::default());
         let tools: Arc<dyn ToolExecutor> = concrete.clone();
-        let callable =
-            effective_callable_set(&["Bash"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
-        let mut call = probe_call("Bash");
-        call.function.arguments = serde_json::json!({"command":"printf fixture"}).to_string();
+        let callable = effective_callable_set(
+            &["exec_command"],
+            CapabilityLoadingMode::LegacyFullCatalog,
+            &[],
+        );
+        let mut call = probe_call("exec_command");
+        call.function.arguments = serde_json::json!({"cmd":"printf fixture"}).to_string();
         let mut session = Session::new("live-hook-review", "model");
         session.token_budget = cap.map(|n| bamboo_domain::TokenBudget {
             max_tool_output_tokens: n,
@@ -2428,7 +2438,7 @@ mod hook_tests {
         if sequential && allow {
             assert_eq!(outcome.output_cap, Some(cap));
             assert_eq!(outcome.result.as_ref().unwrap().result, "exact dispatch");
-            assert_eq!(outcome.portable_tool.as_ref().unwrap().name, "Bash");
+            assert_eq!(outcome.portable_tool.as_ref().unwrap().name, "exec_command");
             assert_eq!(*concrete.output_caps.lock().unwrap(), vec![cap]);
             assert!(session.metadata["runtime.plugin_hook_contexts"].contains("portable cap truth"));
             assert_eq!(
@@ -2593,29 +2603,27 @@ mod hook_tests {
         let temp = tempfile::tempdir().unwrap();
         let sentinel = temp.path().join("must-not-exist");
         let tools: Arc<dyn ToolExecutor> = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
-        let schemas = tools.list_tools();
-        let session = Session::new("strict-shell-arguments", "model");
-        let config = AgentLoopConfig::default();
+        let callable = effective_callable_set(
+            &["exec_command", "write_stdin"],
+            CapabilityLoadingMode::LegacyFullCatalog,
+            &[],
+        );
         let (event_tx, mut event_rx) = mpsc::channel(32);
-        for (name, execution_name, args) in [
+        for (name, args) in [
             (
-                "exec_command",
                 "exec_command",
                 serde_json::json!({"cmd":format!("touch '{}'", sentinel.display())}),
             ),
             (
                 "default::exec_command",
-                "exec_command",
                 serde_json::json!({"cmd":format!("touch '{}'", sentinel.display())}),
             ),
             (
-                "write_stdin",
                 "write_stdin",
                 serde_json::json!({"session_id":"not-owned", "chars":"yes\n"}),
             ),
             (
                 "default::write_stdin",
-                "write_stdin",
                 serde_json::json!({"session_id":"not-owned", "eof":true}),
             ),
         ] {
@@ -2625,32 +2633,7 @@ mod hook_tests {
             assert!(parse_tool_args_best_effort(&call.function.arguments)
                 .1
                 .is_some());
-            // The contract starts after exact identity selection, without
-            // promoting the HostOnly pair into a model callable catalog.
-            let outcome = execute_tool_call_only_with_execution_name(
-                execution_name,
-                ToolExecutionOnlyContext {
-                    vision_support: true,
-                    output_cap: None,
-                    executing_supervisor: None,
-                    tool_call: &call,
-                    event_tx: &event_tx,
-                    metrics_collector: None,
-                    session_id: "strict-shell-arguments",
-                    root_orchestration_only: false,
-                    root_session_id: "strict-shell-arguments",
-                    round_id: "round-1",
-                    round: 0,
-                    tools: &tools,
-                    config: &config,
-                    hook_session: None,
-                    hook_runtime_state: None,
-                    session_flags: ToolExecutionSessionFlags::from_session(&session),
-                    available_tool_schemas: &schemas,
-                },
-            )
-            .await
-            .expect("selected strict-argument rejection is a per-call outcome");
+            let outcome = execute_without_hooks(&callable, &tools, &call, &event_tx).await;
             assert!(
                 matches!(outcome.result, Err(ref error) if error.contains("invalid JSON arguments"))
             );
@@ -2665,42 +2648,18 @@ mod hook_tests {
             "vendor::write_stdin",
         ]));
         let tools: Arc<dyn ToolExecutor> = concrete.clone();
-        let schemas = tools.list_tools();
+        let callable = effective_callable_set(
+            &["vendor::exec_command", "vendor::write_stdin"],
+            CapabilityLoadingMode::LegacyFullCatalog,
+            &[],
+        );
         for name in ["vendor::exec_command", "vendor::write_stdin"] {
             let mut call = probe_call(name);
             call.function.arguments = "{\"ordinary\":true".into();
-            // Exact foreign identities retain ordinary argument behavior after
-            // selection, independently of pre-promotion catalog eligibility.
-            let outcome = execute_tool_call_only_with_execution_name(
-                name,
-                ToolExecutionOnlyContext {
-                    vision_support: true,
-                    output_cap: None,
-                    executing_supervisor: None,
-                    tool_call: &call,
-                    event_tx: &event_tx,
-                    metrics_collector: None,
-                    session_id: "strict-shell-arguments",
-                    root_orchestration_only: false,
-                    root_session_id: "strict-shell-arguments",
-                    round_id: "round-1",
-                    round: 0,
-                    tools: &tools,
-                    config: &config,
-                    hook_session: None,
-                    hook_runtime_state: None,
-                    session_flags: ToolExecutionSessionFlags::from_session(&session),
-                    available_tool_schemas: &schemas,
-                },
-            )
-            .await
-            .expect("selected foreign execution is a per-call outcome");
-            assert!(
-                outcome.result.is_ok(),
-                "{name}: {:?}",
-                outcome.result.as_ref().err()
-            );
-            assert_eq!(outcome.portable_tool.unwrap().execution_name(), name);
+            assert!(execute_without_hooks(&callable, &tools, &call, &event_tx)
+                .await
+                .result
+                .is_ok());
         }
         assert_eq!(
             concrete.entered(),
@@ -2712,7 +2671,8 @@ mod hook_tests {
     async fn selected_root_final_gate_rejects_stale_schema_and_exact_alias_before_tool_start() {
         let concrete_tools = Arc::new(NameRecordingExecutor::new(&[
             "Read",
-            "Bash",
+            "exec_command",
+            "write_stdin",
             "Edit",
             "apply_patch",
             "default::Read",
@@ -2721,14 +2681,22 @@ mod hook_tests {
         // Deliberately stale: the loaded callable set still contains names that
         // the live Root authority now denies.
         let stale = effective_callable_set(
-            &["Read", "Bash", "Edit", "apply_patch", "default::Read"],
+            &[
+                "Read",
+                "exec_command",
+                "write_stdin",
+                "Edit",
+                "apply_patch",
+                "default::Read",
+            ],
             CapabilityLoadingMode::LegacyFullCatalog,
             &[],
         );
         let (event_tx, mut event_rx) = mpsc::channel(32);
         for name in [
-            "Bash",
-            "default::Bash",
+            "exec_command",
+            "default::exec_command",
+            "write_stdin",
             "Edit",
             "apply_patch",
             "default::Read",
