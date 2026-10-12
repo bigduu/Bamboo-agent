@@ -94,7 +94,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             Ok(routing_key) => routing_key,
             Err(error) => {
                 let detail = format!("provider routing failed: {error}");
-                super::fail_pending_startup(
+                super::fail_reserved_pending_startup(
                     state,
                     session_id,
                     ready.startup_turn_id.as_deref(),
@@ -112,7 +112,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             Ok(provider) => Some(provider),
             Err(error) => {
                 let detail = format!("provider routing failed: {error}");
-                super::fail_pending_startup(
+                super::fail_reserved_pending_startup(
                     state,
                     session_id,
                     ready.startup_turn_id.as_deref(),
@@ -143,7 +143,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         &ready.effective_model,
         vision_override,
     ) {
-        super::fail_pending_startup(
+        super::fail_reserved_pending_startup(
             state,
             session_id,
             ready.startup_turn_id.as_deref(),
@@ -208,7 +208,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             Ok(binding) => Some(binding),
             Err(error) => {
                 execution_reservation.abandon().await;
-                super::fail_pending_startup(
+                super::fail_reserved_pending_startup(
                     state,
                     session_id,
                     ready.startup_turn_id.as_deref(),

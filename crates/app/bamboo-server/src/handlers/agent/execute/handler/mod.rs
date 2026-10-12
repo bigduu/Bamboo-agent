@@ -133,7 +133,7 @@ async fn handle_reserved_execute(
     let image_fallback = match resolve_image_fallback(&config_snapshot) {
         Ok(value) => value,
         Err(error) => {
-            fail_pending_startup(
+            fail_reserved_pending_startup(
                 &state,
                 &session_id,
                 startup_turn_id.as_deref(),
@@ -166,7 +166,7 @@ async fn handle_reserved_execute(
         Ok(provider) => provider,
         Err(error) => {
             let detail = format!("provider routing failed: {error}");
-            fail_pending_startup(
+            fail_reserved_pending_startup(
                 &state,
                 &session_id,
                 startup_turn_id.as_deref(),
@@ -252,7 +252,7 @@ async fn handle_reserved_execute(
     {
         Ok(outcome) => outcome,
         Err(error) => {
-            fail_pending_startup(
+            fail_reserved_pending_startup(
                 &state,
                 &session_id,
                 startup_turn_id.as_deref(),
@@ -359,7 +359,7 @@ async fn handle_reserved_execute(
         }
 
         bamboo_engine::session_app::types::ExecutePreparationOutcome::ModelRequired => {
-            fail_pending_startup(
+            fail_reserved_pending_startup(
                 &state,
                 &session_id,
                 startup_turn_id.as_deref(),
@@ -372,7 +372,7 @@ async fn handle_reserved_execute(
         }
 
         bamboo_engine::session_app::types::ExecutePreparationOutcome::ImageFallbackError(error) => {
-            fail_pending_startup(
+            fail_reserved_pending_startup(
                 &state,
                 &session_id,
                 startup_turn_id.as_deref(),
@@ -399,7 +399,7 @@ async fn abandon_admission_reservation(reservation: &mut Option<SessionExecution
     }
 }
 
-async fn fail_pending_startup(
+async fn fail_reserved_pending_startup(
     state: &web::Data<AppState>,
     session_id: &str,
     expected_turn_id: Option<&str>,
@@ -408,6 +408,16 @@ async fn fail_pending_startup(
     startup_guard: &mut crate::handlers::agent::events::ExecuteStartupGuard,
 ) {
     abandon_admission_reservation(admission_reservation).await;
+    fail_pending_startup(state, session_id, expected_turn_id, detail, startup_guard).await;
+}
+
+async fn fail_pending_startup(
+    state: &web::Data<AppState>,
+    session_id: &str,
+    expected_turn_id: Option<&str>,
+    detail: &str,
+    startup_guard: &mut crate::handlers::agent::events::ExecuteStartupGuard,
+) {
     let Some(expected_turn_id) = expected_turn_id else {
         return;
     };
