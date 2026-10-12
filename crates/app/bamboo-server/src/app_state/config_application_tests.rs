@@ -9,29 +9,31 @@ fn consumer<'a>(report: &'a Value, id: &str) -> &'a Value {
         .unwrap()
 }
 
-fn assert_uncaptured_consumers_remain_unknown(report: &Value) {
-    for consumer in report["consumers"].as_array().unwrap() {
-        if consumer["id"] != "provider-runtime" {
-            assert_eq!(consumer["state"], "unknown");
-            assert_eq!(consumer["applied_dependencies"], Value::Null);
-        }
-    }
-}
-
 #[test]
-fn user_named_provider_instances_remain_runtime_inputs() {
+fn user_named_instances_servers_and_environment_fields_remain_runtime_inputs() {
     let mut config = Config::default();
     config.provider_instances = serde_json::from_value(
         json!({"team-encrypted": {"provider_type":"openai", "api_key":"old-key"}}),
     )
     .unwrap();
+    config.mcp = serde_json::from_value(
+        json!({"svc-encrypted": {"command":"true", "env":{"TOKEN_encrypted":"old-value"}}}),
+    )
+    .unwrap();
     let before_provider = input_digest(ConfigConsumer::ProviderRuntime, &config);
+    let before_mcp = input_digest(ConfigConsumer::McpRuntime, &config);
     config
         .provider_instances
         .get_mut("team-encrypted")
         .unwrap()
         .api_key = "new-key".into();
+    if let bamboo_mcp::TransportConfig::Stdio(stdio) = &mut config.mcp.servers[0].transport {
+        stdio
+            .env
+            .insert("TOKEN_encrypted".into(), "new-value".into());
+    }
     assert!(before_provider != input_digest(ConfigConsumer::ProviderRuntime, &config));
+    assert!(before_mcp != input_digest(ConfigConsumer::McpRuntime, &config));
 }
 
 #[test]
@@ -103,6 +105,11 @@ async fn application_state_with_core(document: Value) -> (tempfile::TempDir, App
     }})).unwrap()).unwrap();
     let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
     state.stop_config_watcher_for_test();
+    let mcp = application_section(&state, SectionId::Mcp);
+    state
+        .put_mcp_section(mcp.revision, bamboo_mcp::McpConfig::default())
+        .await
+        .unwrap();
     (dir, state)
 }
 
@@ -184,10 +191,71 @@ fn environment_backed_inputs_remain_available_without_hiding_other_missing_crede
                     "not_required"
                 }
             );
-            assert_uncaptured_consumers_remain_unknown(&report);
             let serialized = serde_json::to_string(&report).unwrap();
             assert!(!serialized.contains("application-environment-secret-sentinel"));
             assert!(!serialized.contains("application-proxy-secret-sentinel"));
+
+            if stored_proxy {
+                // A sibling credential writer rotates Core's proxy secret.
+                // MCP's owned transaction adopts that document but leaves the
+                // running proxy inputs unchanged, so it cannot prove a source.
+                let store = bamboo_config::CredentialStore::open(dir.path());
+                store
+                    .replace(
+                        bamboo_config::CredentialRef::parse("proxy.application.auth").unwrap(),
+                        &serde_json::to_string(&bamboo_config::ProxyAuth {
+                            username: "application-proxy-user".into(),
+                            password: "application-proxy-rotated-sentinel".into(),
+                        })
+                        .unwrap(),
+                        bamboo_config::CredentialSource::User,
+                        store.revision().unwrap(),
+                    )
+                    .unwrap();
+                let candidate = serde_json::from_value(json!({"proof-only": {
+                    "command": "true", "enabled": false,
+                    "env": {"TOKEN": "application-mcp-secret-sentinel"}
+                }}))
+                .unwrap();
+                state
+                    .update_legacy_mcp_config(BTreeSet::new(), move |mcp| {
+                        *mcp = candidate;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    state
+                        .config
+                        .read()
+                        .await
+                        .proxy_auth
+                        .as_ref()
+                        .unwrap()
+                        .password,
+                    "application-proxy-secret-sentinel"
+                );
+                let adopted = application_report(&state).await;
+                let mcp = consumer(&adopted, "mcp-runtime");
+                assert_eq!(mcp["credential_source"]["status"], "unknown");
+                assert_eq!(mcp["applied_dependencies"]["credentials"], Value::Null);
+                assert_eq!(
+                    mcp["applied_dependencies"]["mcp"],
+                    application_section(&state, SectionId::Mcp).revision
+                );
+                assert_eq!(
+                    adopted["sections"]["credentials"]["revision"],
+                    store.revision().unwrap()
+                );
+                let serialized = serde_json::to_string(&adopted).unwrap();
+                for secret in [
+                    "application-proxy-secret-sentinel",
+                    "application-proxy-rotated-sentinel",
+                    "application-mcp-secret-sentinel",
+                ] {
+                    assert!(!serialized.contains(secret));
+                }
+            }
 
             let facade = state.config_facade.as_ref().unwrap();
             let mut providers = application_section(&state, SectionId::Providers);
@@ -217,18 +285,17 @@ fn environment_backed_inputs_remain_available_without_hiding_other_missing_crede
                 consumer(&unavailable, "provider-runtime")["applied_dependencies"],
                 provider["applied_dependencies"]
             );
-            assert_uncaptured_consumers_remain_unknown(&unavailable);
         }
     });
 }
 
 #[test]
-fn actual_provider_publications_preserve_unrelated_receipts_and_remain_secret_free() {
+fn actual_provider_and_mcp_publications_preserve_unrelated_receipts() {
     with_application_runtime(async {
         let (_dir, state) = application_state().await;
         let before = application_report(&state).await;
         assert_eq!(consumer(&before, "provider-runtime")["state"], "in_sync");
-        assert_uncaptured_consumers_remain_unknown(&before);
+        assert_eq!(consumer(&before, "mcp-runtime")["state"], "in_sync");
         let mut core = application_section(&state, SectionId::Core);
         core.data["server"]["port"] = json!(19876);
         state
@@ -236,16 +303,17 @@ fn actual_provider_publications_preserve_unrelated_receipts_and_remain_secret_fr
             .await
             .unwrap();
         let after = application_report(&state).await;
-        assert_eq!(consumer(&after, "provider-runtime")["state"], "in_sync");
-        assert_eq!(
-            consumer(&after, "provider-runtime")["applied_dependencies"],
-            consumer(&before, "provider-runtime")["applied_dependencies"]
-        );
-        assert_eq!(
-            consumer(&after, "provider-runtime")["last_applied_at"],
-            consumer(&before, "provider-runtime")["last_applied_at"]
-        );
-        assert_uncaptured_consumers_remain_unknown(&after);
+        for id in ["provider-runtime", "mcp-runtime"] {
+            assert_eq!(consumer(&after, id)["state"], "in_sync");
+            assert_eq!(
+                consumer(&after, id)["applied_dependencies"],
+                consumer(&before, id)["applied_dependencies"]
+            );
+            assert_eq!(
+                consumer(&after, id)["last_applied_at"],
+                consumer(&before, id)["last_applied_at"]
+            );
+        }
         let rev = application_section(&state, SectionId::Providers).revision;
         state
             .put_provider_settings(rev, |_old, candidate| {
@@ -266,7 +334,19 @@ fn actual_provider_publications_preserve_unrelated_receipts_and_remain_secret_fr
             .unwrap();
         let defaults = application_report(&state).await;
         assert_eq!(consumer(&defaults, "provider-runtime")["state"], "in_sync");
-        assert_uncaptured_consumers_remain_unknown(&defaults);
+        for id in [
+            "connect-manager",
+            "agent-loop-defaults",
+            "live-tool-filters",
+            "auxiliary-models",
+            "notification-sinks",
+            "listener",
+            "memory-background-cadence",
+            "broker-and-cluster",
+        ] {
+            assert_eq!(consumer(&defaults, id)["state"], "unknown");
+            assert_eq!(consumer(&defaults, id)["applied_dependencies"], Value::Null);
+        }
         let serialized = serde_json::to_string(&defaults).unwrap();
         for forbidden in [
             "application-secret-sentinel",
@@ -277,6 +357,102 @@ fn actual_provider_publications_preserve_unrelated_receipts_and_remain_secret_fr
             "9876",
         ] {
             assert!(!serialized.contains(forbidden));
+        }
+    });
+}
+
+#[test]
+fn mcp_reset_binds_committed_credentials_without_claiming_rotated_core_proxy() {
+    with_application_runtime(async {
+        for rotate_proxy in [false, true] {
+            let (dir, state) = application_state_with_core(json!({
+                "provider": "openai", "http_proxy": "http://127.0.0.1:19877",
+                "proxy_auth": {"username": "proxy-user", "password": "reset-proxy-original-sentinel"}
+            }))
+            .await;
+            let candidate = serde_json::from_value(json!({"reset-proof": {
+                "command": "true", "enabled": false,
+                "env": {"TOKEN": "reset-mcp-secret-sentinel"}
+            }}))
+            .unwrap();
+            state
+                .update_legacy_mcp_config(BTreeSet::new(), move |mcp| {
+                    *mcp = candidate;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let before = application_report(&state).await;
+            assert_eq!(consumer(&before, "mcp-runtime")["state"], "in_sync");
+            assert!(!state.config.read().await.mcp.servers.is_empty());
+
+            let store = bamboo_config::CredentialStore::open(dir.path());
+            if rotate_proxy {
+                let reference = state
+                    .config
+                    .read()
+                    .await
+                    .proxy_auth_credential_ref
+                    .clone()
+                    .unwrap();
+                store
+                    .replace(
+                        reference,
+                        &json!({"username": "proxy-user", "password": "reset-proxy-rotated-sentinel"})
+                            .to_string(),
+                        bamboo_config::CredentialSource::User,
+                        store.revision().unwrap(),
+                    )
+                    .unwrap();
+            }
+
+            let revision = state
+                .reset_mcp_section(application_section(&state, SectionId::Mcp).revision)
+                .await
+                .unwrap();
+            assert!(state.config.read().await.mcp.servers.is_empty());
+            assert!(state.mcp_manager.list_servers().is_empty());
+            assert!(state.mcp_manager.tool_index().all_aliases().is_empty());
+            assert_eq!(
+                state
+                    .config
+                    .read()
+                    .await
+                    .proxy_auth
+                    .as_ref()
+                    .unwrap()
+                    .password,
+                "reset-proxy-original-sentinel"
+            );
+            let reset = application_report(&state).await;
+            let mcp = consumer(&reset, "mcp-runtime");
+            assert_eq!(mcp["applied_dependencies"]["mcp"], revision);
+            assert_eq!(mcp["last_apply_error"], Value::Null);
+            if rotate_proxy {
+                assert_eq!(mcp["state"], "unknown");
+                assert_eq!(mcp["credential_source"]["status"], "unknown");
+                assert_eq!(mcp["applied_dependencies"]["credentials"], Value::Null);
+            } else {
+                assert_eq!(mcp["state"], "in_sync");
+                assert_eq!(mcp["credential_source"]["status"], "observed_inputs");
+                assert_eq!(
+                    mcp["credential_source"]["revision"],
+                    store.revision().unwrap()
+                );
+                assert_eq!(
+                    mcp["applied_dependencies"]["credentials"],
+                    reset["sections"]["credentials"]["revision"]
+                );
+            }
+            let repeated = application_report(&state).await;
+            assert_eq!(consumer(&repeated, "mcp-runtime"), mcp);
+            for secret in [
+                "reset-proxy-original-sentinel",
+                "reset-proxy-rotated-sentinel",
+                "reset-mcp-secret-sentinel",
+            ] {
+                assert!(!serde_json::to_string(&repeated).unwrap().contains(secret));
+            }
         }
     });
 }
@@ -340,7 +516,10 @@ fn actual_typed_provider_failure_keeps_receipt_and_repair_converges() {
             consumer(&repaired, "provider-runtime")["applied_dependencies"]["providers"],
             revision
         );
-        assert_uncaptured_consumers_remain_unknown(&repaired);
+        assert_eq!(
+            consumer(&repaired, "mcp-runtime")["applied_dependencies"],
+            consumer(&before, "mcp-runtime")["applied_dependencies"]
+        );
     });
 }
 
@@ -434,7 +613,6 @@ fn provider_owned_publication_cannot_attribute_old_core_proxy_to_new_credentials
         ] {
             assert!(!serde_json::to_string(&repeated).unwrap().contains(secret));
         }
-        assert_uncaptured_consumers_remain_unknown(&adopted);
     });
 }
 
