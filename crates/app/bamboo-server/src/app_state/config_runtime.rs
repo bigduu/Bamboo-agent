@@ -7826,6 +7826,45 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn compatibility_hooks_update_publishes_lifecycle_config_without_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let captured = state.config.read().await.clone();
+        let mut candidate = captured.clone();
+        let hooks: bamboo_config::HooksSection =
+            serde_json::from_value(lifecycle_hook_section("compatibility-lifecycle-generation"))
+                .unwrap();
+        candidate.lifecycle_hooks = hooks.lifecycle_hooks;
+        let expected = candidate.lifecycle_hooks.clone();
+        let published = state
+            .replace_config(candidate, ConfigUpdateEffects::default())
+            .await
+            .unwrap();
+        assert_eq!(published.lifecycle_hooks, expected);
+        assert_eq!(state.config.read().await.lifecycle_hooks, expected);
+        assert_ne!(captured.lifecycle_hooks, expected);
+        assert_eq!(published.server.port, captured.server.port);
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .effective_config()
+                .lifecycle_hooks,
+            expected
+        );
+
+        let mut reset = published;
+        reset.lifecycle_hooks = Default::default();
+        state
+            .replace_config(reset, ConfigUpdateEffects::default())
+            .await
+            .unwrap();
+        assert!(state.config.read().await.lifecycle_hooks.is_empty());
+    }
+
+    #[tokio::test]
     async fn typed_hooks_update_publishes_lifecycle_config_for_new_runs() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();

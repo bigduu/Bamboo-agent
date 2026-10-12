@@ -756,7 +756,10 @@ pub(crate) fn apply_runtime_section(id: SectionId, source: &Config, target: &mut
         SectionId::ClusterFabric => target.cluster_fabric = source.cluster_fabric.clone(),
         SectionId::Env => target.env_vars = source.env_vars.clone(),
         SectionId::AccessControl => target.access_control = source.access_control.clone(),
-        SectionId::Hooks => target.hooks = source.hooks.clone(),
+        SectionId::Hooks => {
+            target.hooks = source.hooks.clone();
+            target.lifecycle_hooks = source.lifecycle_hooks.clone();
+        }
         SectionId::ModelPolicy => {
             target.keyword_masking = source.keyword_masking.clone();
             target.anthropic_model_mapping = source.anthropic_model_mapping.clone();
@@ -6475,6 +6478,44 @@ mod tests {
 
     fn write_json(path: &Path, value: &Value) {
         std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn compatibility_hook_commit_installs_lifecycle_hooks_and_reset() {
+        let dir = TempDir::new().unwrap();
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let mut candidate = facade.effective_config();
+        candidate.lifecycle_hooks = serde_json::from_value(json!({
+            "enabled": true,
+            "PreToolUse": [{"matcher": "Bash", "hooks": [{
+                "type": "command", "command": "compat-lifecycle-generation"
+            }]}]
+        }))
+        .unwrap();
+        let commit =
+            persist_facade_effective_config_with_adoption(dir.path(), &candidate, &facade).unwrap();
+        assert!(matches!(commit.section_adoption.unwrap().unwrap(),
+            ConfigSectionEvent::Changed { section, .. } if section == "hooks"));
+        let mut installed = Config::default();
+        installed.server.port = 29_999;
+        commit
+            .runtime
+            .unwrap()
+            .unwrap()
+            .install_into(&mut installed);
+        assert_eq!(installed.lifecycle_hooks, candidate.lifecycle_hooks);
+        assert_eq!(installed.server.port, 29_999);
+        assert_eq!(
+            facade.effective_config().lifecycle_hooks,
+            candidate.lifecycle_hooks
+        );
+
+        candidate.lifecycle_hooks = Default::default();
+        let reset =
+            persist_facade_effective_config_with_adoption(dir.path(), &candidate, &facade).unwrap();
+        reset.runtime.unwrap().unwrap().install_into(&mut installed);
+        assert!(installed.lifecycle_hooks.is_empty());
+        assert_eq!(installed.server.port, 29_999);
     }
 
     #[test]
