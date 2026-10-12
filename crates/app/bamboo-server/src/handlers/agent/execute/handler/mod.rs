@@ -3,6 +3,7 @@ use actix_web::{web, HttpRequest, HttpResponse, ResponseError};
 use super::image_fallback::resolve_image_fallback;
 use super::{ExecuteRequest, ExecuteSyncInfo, ExecuteSyncReason};
 use crate::app_state::AppState;
+use bamboo_engine::execution::SessionExecutionReservation;
 use bamboo_engine::model_areas::resolve_global_area_models;
 use bamboo_engine::model_config_helper::{
     get_default_model_for_provider, get_reasoning_effort_for_provider, resolve_gold_config,
@@ -75,7 +76,35 @@ pub async fn handle_execute(
     // Bind rejection rollback to the exact turn observed by this request. A
     // delayed failure from turn A must never poison a newer turn B.
     drop(startup_lock);
-    let admission = match state.admit_chat_for_execute(&session_id).await {
+    let mut admission_reservation = match state.reserve_root_chat_for_execute(&session_id).await {
+        Ok(reservation) => reservation,
+        Err(response) => return *response,
+    };
+    let response = handle_reserved_execute(
+        state,
+        session_id,
+        req,
+        &mut startup_guard,
+        &mut admission_reservation,
+    )
+    .await;
+    // Await exact cleanup on every non-spawn return. The reservation's own
+    // cancellation-safe Drop remains the fallback if this HTTP future is lost.
+    abandon_admission_reservation(&mut admission_reservation).await;
+    response
+}
+
+async fn handle_reserved_execute(
+    state: web::Data<AppState>,
+    session_id: String,
+    req: web::Json<ExecuteRequest>,
+    startup_guard: &mut crate::handlers::agent::events::ExecuteStartupGuard,
+    admission_reservation: &mut Option<SessionExecutionReservation>,
+) -> HttpResponse {
+    let admission = match state
+        .admit_chat_for_execute_with_reservation(&session_id, admission_reservation.as_ref())
+        .await
+    {
         Ok(admission) => admission,
         Err(response) => return *response,
     };
@@ -109,7 +138,8 @@ pub async fn handle_execute(
                 &session_id,
                 startup_turn_id.as_deref(),
                 &error,
-                &mut startup_guard,
+                admission_reservation,
+                startup_guard,
             )
             .await;
             return internal_server_error_response(error);
@@ -141,7 +171,8 @@ pub async fn handle_execute(
                 &session_id,
                 startup_turn_id.as_deref(),
                 &detail,
-                &mut startup_guard,
+                admission_reservation,
+                startup_guard,
             )
             .await;
             return if explicit_provider.is_some() {
@@ -226,7 +257,8 @@ pub async fn handle_execute(
                 &session_id,
                 startup_turn_id.as_deref(),
                 &format!("execute preparation failed: {error}"),
-                &mut startup_guard,
+                admission_reservation,
+                startup_guard,
             )
             .await;
             return match error {
@@ -268,7 +300,8 @@ pub async fn handle_execute(
                 session_id: &session_id,
                 ready: ready::ReadyExecution {
                     session,
-                    startup_guard: &mut startup_guard,
+                    startup_guard,
+                    admission_reservation,
                     startup_turn_id: startup_turn_id.clone(),
                     untrusted_inputs,
                     native_main,
@@ -331,7 +364,8 @@ pub async fn handle_execute(
                 &session_id,
                 startup_turn_id.as_deref(),
                 "no model configured",
-                &mut startup_guard,
+                admission_reservation,
+                startup_guard,
             )
             .await;
             bad_request_error_response("no model configured for session or provider")
@@ -343,7 +377,8 @@ pub async fn handle_execute(
                 &session_id,
                 startup_turn_id.as_deref(),
                 &error,
-                &mut startup_guard,
+                admission_reservation,
+                startup_guard,
             )
             .await;
             bad_request_error_response(error)
@@ -358,13 +393,21 @@ fn resolve_requested_provider<'a>(
     explicit_provider.unwrap_or_else(|| config.effective_default_provider())
 }
 
+async fn abandon_admission_reservation(reservation: &mut Option<SessionExecutionReservation>) {
+    if let Some(reservation) = reservation.take() {
+        reservation.abandon().await;
+    }
+}
+
 async fn fail_pending_startup(
     state: &web::Data<AppState>,
     session_id: &str,
     expected_turn_id: Option<&str>,
     detail: &str,
+    admission_reservation: &mut Option<SessionExecutionReservation>,
     startup_guard: &mut crate::handlers::agent::events::ExecuteStartupGuard,
 ) {
+    abandon_admission_reservation(admission_reservation).await;
     let Some(expected_turn_id) = expected_turn_id else {
         return;
     };

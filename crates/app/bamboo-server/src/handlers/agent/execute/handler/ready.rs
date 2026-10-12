@@ -6,7 +6,8 @@
 //! reserve the runner, persist + cache, kick auto-title-gen, resolve the
 //! session-effective provider/area models, and spawn the agent loop.
 //!
-//! Image validation uses the routed provider before runner reservation.
+//! Image validation uses the routed provider before spawning. Native Root
+//! admission may already hold the exact reservation that reaches this path.
 
 use actix_web::{web, HttpResponse};
 use std::collections::BTreeSet;
@@ -34,6 +35,8 @@ use bamboo_llm::Config;
 pub(super) struct ReadyExecution<'a> {
     pub session: bamboo_agent_core::Session,
     pub startup_guard: &'a mut crate::handlers::agent::events::ExecuteStartupGuard,
+    pub admission_reservation:
+        &'a mut Option<bamboo_engine::execution::SessionExecutionReservation>,
     /// Durable message id owned by the pending execute handoff, if any.
     pub startup_turn_id: Option<String>,
     pub untrusted_inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
@@ -96,6 +99,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
                     session_id,
                     ready.startup_turn_id.as_deref(),
                     &detail,
+                    ready.admission_reservation,
                     &mut *ready.startup_guard,
                 )
                 .await;
@@ -113,6 +117,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
                     session_id,
                     ready.startup_turn_id.as_deref(),
                     &detail,
+                    ready.admission_reservation,
                     &mut *ready.startup_guard,
                 )
                 .await;
@@ -143,6 +148,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             session_id,
             ready.startup_turn_id.as_deref(),
             &error,
+            ready.admission_reservation,
             &mut *ready.startup_guard,
         )
         .await;
@@ -157,27 +163,30 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
 
     // ---- Reserve runner ----
     let session_tx = state.get_session_event_sender(session_id).await;
-    let (mut execution_reservation, run_id) =
-        match reserve_runner(state.get_ref(), session_id, &session_tx).await {
-            RunnerReservation::Started(reservation) => {
-                let rid = reservation.run_id().to_string();
-                tracing::debug!(
-                    "[{}] Execute Ready -> runner reserved & STARTING (run_id={})",
-                    session_id,
-                    rid
-                );
-                (reservation, rid)
-            }
-            RunnerReservation::AlreadyRunning(rid) => {
-                tracing::debug!(
-                    "[{}] Execute Ready -> runner AlreadyRunning (run_id={}); not spawning",
-                    session_id,
-                    rid
-                );
-                let sync_info = build_sync_info_from_session(&session);
-                return already_running_response(session_id, sync_info, Some(rid));
-            }
-        };
+    let reservation = match ready.admission_reservation.take() {
+        Some(reservation) => RunnerReservation::Started(reservation),
+        None => reserve_runner(state.get_ref(), session_id, &session_tx).await,
+    };
+    let (mut execution_reservation, run_id) = match reservation {
+        RunnerReservation::Started(reservation) => {
+            let rid = reservation.run_id().to_string();
+            tracing::debug!(
+                "[{}] Execute Ready -> runner reserved & STARTING (run_id={})",
+                session_id,
+                rid
+            );
+            (reservation, rid)
+        }
+        RunnerReservation::AlreadyRunning(rid) => {
+            tracing::debug!(
+                "[{}] Execute Ready -> runner AlreadyRunning (run_id={}); not spawning",
+                session_id,
+                rid
+            );
+            let sync_info = build_sync_info_from_session(&session);
+            return already_running_response(session_id, sync_info, Some(rid));
+        }
+    };
 
     if let Err(error) = execution_reservation
         .bind_root_actor(&state.agent, &session)
@@ -204,6 +213,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
                     session_id,
                     ready.startup_turn_id.as_deref(),
                     &error.to_string(),
+                    ready.admission_reservation,
                     ready.startup_guard,
                 )
                 .await;

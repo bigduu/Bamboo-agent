@@ -682,9 +682,167 @@ mod execution_input_http {
         assert_eq!(calls.len(), 1, "one execution provider call");
         assert_eq!(calls[0].iter().filter(|m| m.id == *input).count(), 1);
         drop(calls);
+        let activation =
+            bamboo_domain::ActorDirectoryPort::inspect_actor(state.session_store.as_ref(), id)
+                .await
+                .unwrap()
+                .activation
+                .unwrap();
+        assert_eq!(
+            activation.run_id, run,
+            "admission and execution keep the same Root owner"
+        );
+        assert_eq!(
+            activation.attempt, 2,
+            "one initial upgrade, one HTTP reservation; Ready cannot reserve again"
+        );
         let retry = state.admit_chat_for_execute(id).await.unwrap();
         assert!(retry.inputs.is_none());
         assert!(!retry.generate_title, "NoNew cannot manufacture title work");
+    }
+
+    #[actix_web::test]
+    async fn owned_root_http_existing_reservation_keeps_input_pending() {
+        let provider = Arc::new(OwnedRootProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "owned-root-http-active-owner";
+        let mut session = bamboo_agent_core::Session::new(id, "test-model");
+        session.title_generated = true;
+        state.storage.save_session(&session).await.unwrap();
+        let reservation = reserve_owned_root(&state, id).await;
+        let owner = reservation.root_actor_writer().unwrap();
+        let admission = reservation
+            .execution_persistence()
+            .unwrap()
+            .admit_root_inbox(
+                &mut session,
+                state.session_inbox.clone(),
+                Some(reservation.run_id()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(admission.admission_error.is_none());
+        queue_owned_root(&state, id).await;
+        let response = super::super::handler::handler(
+            state.clone(),
+            test::TestRequest::post().to_http_request(),
+            web::Path::from(id.to_owned()),
+            web::Json(serde_json::from_value(serde_json::json!({"model":"test-model"})).unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let activation =
+            bamboo_domain::ActorDirectoryPort::inspect_actor(state.session_store.as_ref(), id)
+                .await
+                .unwrap()
+                .activation
+                .unwrap();
+        assert_eq!(activation.fence(), owner.fence);
+        assert_eq!(
+            activation.status,
+            bamboo_domain::ActorActivationStatus::Running
+        );
+        assert_eq!(
+            state
+                .session_activation_router
+                .current_run_id(id)
+                .await
+                .as_deref(),
+            Some(reservation.run_id())
+        );
+        let runners = state.agent_runners.read().await;
+        assert_eq!(runners.get(id).unwrap().run_id, reservation.run_id());
+        assert!(matches!(
+            runners.get(id).unwrap().status,
+            AgentStatus::Running
+        ));
+        drop(runners);
+        assert!(!reservation.cancel_token().is_cancelled());
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+        assert!(!state
+            .storage
+            .load_session(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.role == bamboo_agent_core::Role::User));
+        assert!(provider.messages.lock().unwrap().is_empty());
+        reservation.abandon().await;
+    }
+
+    #[actix_web::test]
+    async fn owned_root_http_lost_bound_owner_fails_closed_before_admission() {
+        let provider = Arc::new(OwnedRootProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "owned-root-http-lost-owner";
+        let mut session = bamboo_agent_core::Session::new(id, "test-model");
+        session.title_generated = true;
+        state.storage.save_session(&session).await.unwrap();
+        let mut reservation = reserve_owned_root(&state, id).await;
+        let admission = reservation
+            .execution_persistence()
+            .unwrap()
+            .admit_root_inbox(
+                &mut session,
+                state.session_inbox.clone(),
+                Some(reservation.run_id()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(admission.admission_error.is_none());
+        queue_owned_root(&state, id).await;
+        let mismatched = state
+            .admit_chat_for_execute_with_reservation("another-root", Some(&reservation))
+            .await
+            .err()
+            .expect("an exact reservation cannot admit a different Root");
+        assert_eq!(mismatched.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // End the real fence through its owning reservation. The previously
+        // bound persistence is now stale; no watermark/fence bytes are forged.
+        reservation
+            .finish_root_actor(bamboo_domain::ActorActivationFinish::Cancelled)
+            .await;
+        let failure = state
+            .admit_chat_for_execute_with_reservation(id, Some(&reservation))
+            .await
+            .err()
+            .expect("lost Root owner must reject admission");
+        assert_eq!(failure.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+        assert!(!state
+            .storage
+            .load_session(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.role == bamboo_agent_core::Role::User));
+        assert!(provider.messages.lock().unwrap().is_empty());
+        reservation.abandon().await;
+        assert!(state
+            .agent_runners
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|runner| matches!(runner.status, AgentStatus::Cancelled)));
+        assert!(state
+            .session_activation_router
+            .current_run_id(id)
+            .await
+            .is_none());
     }
 
     #[actix_web::test]
@@ -1034,7 +1192,19 @@ mod execution_input_http {
                 input_taps().lock().unwrap().remove(&id).unwrap().is_empty(),
                 "failed startup has no execution handoff"
             );
-            assert!(!state.agent_runners.read().await.contains_key(&id));
+            // Early Native admission creates a real reservation. Its existing
+            // abandonment contract retains an exact Cancelled slot.
+            let runners = state.agent_runners.read().await;
+            if let Some(runner) = runners.get(&id) {
+                assert!(native);
+                assert!(matches!(runner.status, AgentStatus::Cancelled));
+            }
+            drop(runners);
+            assert!(state
+                .session_activation_router
+                .current_run_id(&id)
+                .await
+                .is_none());
             assert!(state
                 .session_inbox
                 .was_admitted(&id, &SessionMessageId::parse(rejected).unwrap())
@@ -1053,13 +1223,18 @@ mod execution_input_http {
                 },
             )
             .await;
+            let successor_reservation = state.reserve_root_chat_for_execute(&id).await.unwrap();
+            let successor_admission = state
+                .admit_chat_for_execute_with_reservation(&id, successor_reservation.as_ref())
+                .await
+                .unwrap();
             only_id(
-                &crate::handlers::agent::chat::admit_for_execute(&state, &id)
-                    .await
-                    .unwrap()
-                    .unwrap(),
+                &successor_admission.inputs.unwrap(),
                 successor["message_id"].as_str().unwrap(),
             );
+            if let Some(reservation) = successor_reservation {
+                reservation.abandon().await;
+            }
         }
     }
 
