@@ -427,7 +427,9 @@ function assertFrontendPolicy(source) {
   for (const [index, frontendJob] of jobs.entries()) {
     assert.ok(frontendJob.settings.startsWith(`    name: Original release ${index === 0 ? "Build" : "Test"} on frozen consumer source\n`))
     assert.doesNotMatch(frontendJob.settings, /^    env:/mu, "job environments must not alter Cargo or test behavior")
-    assert.match(frontendJob.settings, /^    runs-on: ubuntu-latest\n    timeout-minutes: 45$/mu)
+    assert.match(frontendJob.settings, index === 0
+      ? /^    runs-on: ubuntu-latest\n    timeout-minutes: 45$/mu
+      : /^    runs-on: ubuntu-latest\n    timeout-minutes: 60$/mu)
     if (index === 0) {
       assert.doesNotMatch(frontendJob.settings, /^    needs:/mu)
       for (const [name, step, field] of [["source_sha", "source", "sha"], ["source_tree", "source", "tree"], ["rustc_version", "toolchain", "rustc_version"], ["cargo_version", "toolchain", "cargo_version"]]) {
@@ -452,7 +454,7 @@ function assertFrontendPolicy(source) {
       ["Check formatting", "cargo fmt --all -- --check"],
       ...(index === 0 ? [["Build locked Rust workspace", "cargo build --locked"]] : [
         ["Compile locked Rust test targets", "cargo test --locked --no-run", 15],
-        ["Test locked Rust workspace", "cargo test --locked", 30],
+        ["Test locked Rust workspace", "cargo test --locked", 40],
       ]),
       ["Require source files to remain unchanged", "git diff --exit-code"],
     ]) {
@@ -512,8 +514,11 @@ test("frontend acceptance preserves both original command gates and actual-head 
     ["needs: build", "needs: []"],
     ["name: Original release Test on frozen consumer source", "name: Different Test"],
     ["timeout-minutes: 45", "timeout-minutes: 60"],
+    ["timeout-minutes: 60", "timeout-minutes: 45"],
+    ["timeout-minutes: 60", "timeout-minutes: 75"],
     ["timeout-minutes: 15", "timeout-minutes: 30"],
-    ["timeout-minutes: 30", "timeout-minutes: 45"],
+    ["timeout-minutes: 40", "timeout-minutes: 30"],
+    ["timeout-minutes: 40", "timeout-minutes: 45"],
     ["package-manager-cache: false", "package-manager-cache: true"],
     ["components: rustfmt\n", "toolchain: 1.99.0\n          components: rustfmt\n"],
     ["run: cargo build --locked", "run: true"],
@@ -536,6 +541,32 @@ test("frontend acceptance preserves both original command gates and actual-head 
   ]) {
     assert.ok(frontendWorkflow.includes(from), `mutation target exists: ${from}`)
     assert.throws(() => assertFrontendPolicy(frontendWorkflow.replace(from, to)), `reject unsafe frontend mutation: ${to}`)
+  }
+})
+
+test("frontend acceptance reserves setup and final source checks outside full test budgets", () => {
+  const assertBudget = (source) => {
+    const [, testJob] = frontendJobs(source)
+    const minutes = (text, indentation) => {
+      const matches = [...text.matchAll(new RegExp(`^${" ".repeat(indentation)}timeout-minutes: (\\d+)$`, "gmu"))]
+      assert.equal(matches.length, 1, "exactly one numeric time budget is required")
+      return Number(matches[0][1])
+    }
+    const jobMinutes = minutes(testJob.settings, 4)
+    const compileMinutes = minutes(frontendStep(testJob, "Compile locked Rust test targets"), 8)
+    const executionMinutes = minutes(frontendStep(testJob, "Test locked Rust workspace"), 8)
+    assert.ok(jobMinutes >= compileMinutes + executionMinutes + 5,
+      "the job must reserve five minutes beyond compile and complete-suite execution")
+  }
+  assertBudget(frontendWorkflow)
+  for (const [from, to] of [
+    ["timeout-minutes: 60", "timeout-minutes: 55"],
+    ["timeout-minutes: 15", "timeout-minutes: 20"],
+    ["timeout-minutes: 40", "timeout-minutes: 45"],
+  ]) {
+    assert.ok(frontendWorkflow.includes(from), `budget mutation target exists: ${from}`)
+    assert.throws(() => assertBudget(frontendWorkflow.replace(from, to)),
+      `reject a full-suite budget without setup and cleanup allowance: ${to}`)
   }
 })
 
