@@ -453,6 +453,228 @@ mod execution_input_http {
         assert_eq!(request.selections[0].args, serde_json::json!({}));
         assert!(request.selections[0].revision > 0);
     }
+    // Isolate manual HTTP execution without replacing the real Inbox, Actor
+    // directory, persistence, or reservation protocol.
+    struct ManualHttpOnly;
+    #[async_trait]
+    impl bamboo_engine::SessionActivationSpawner for ManualHttpOnly {
+        async fn reserve_activation(
+            &self,
+            _target: &str,
+            _generation: u64,
+        ) -> Result<
+            bamboo_engine::SessionActivationReserveOutcome,
+            bamboo_domain::SessionActivationError,
+        > {
+            Err(bamboo_domain::SessionActivationError::Internal(
+                "automatic launch unavailable in manual HTTP fixture".into(),
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct OwnedRootProvider {
+        messages: std::sync::Mutex<Vec<Vec<bamboo_agent_core::Message>>>,
+    }
+    #[async_trait]
+    impl LLMProvider for OwnedRootProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.messages.lock().unwrap().push(messages.to_vec());
+            Ok(Box::pin(futures::stream::iter([
+                Ok(LLMChunk::Token("owned Root finished".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    async fn reserve_owned_root(
+        state: &web::Data<crate::AppState>,
+        id: &str,
+    ) -> bamboo_engine::execution::SessionExecutionReservation {
+        use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
+        let sender = state.get_session_event_sender(id).await;
+        let mut reservation = match reserve_session_execution(
+            &state.agent,
+            &state.agent_runners,
+            &state.session_event_senders,
+            id,
+            &sender,
+        )
+        .await
+        {
+            SessionExecutionReserveOutcome::Reserved(reservation) => reservation,
+            _ => panic!("fixture must reserve its real idle Root"),
+        };
+        let session = state.storage.load_session(id).await.unwrap().unwrap();
+        reservation
+            .bind_root_actor(&state.agent, &session)
+            .await
+            .unwrap();
+        assert!(reservation.root_actor_writer().is_some());
+        assert!(reservation.execution_persistence().is_some());
+        reservation
+    }
+
+    async fn queue_owned_root(state: &web::Data<crate::AppState>, id: &str) {
+        let request = serde_json::from_value::<crate::handlers::agent::chat::ChatRequest>(
+            serde_json::json!({"session_id":id,"message":"one owned Root input", "model":"test-model"}),
+        ).unwrap();
+        let response = crate::handlers::agent::chat::handler(
+            state.clone(),
+            test::TestRequest::post().to_http_request(),
+            web::Json(request),
+        )
+        .await;
+        let status = response.status();
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let session = state.storage.load_session(id).await.unwrap().unwrap();
+        // Prepare only this Chat-published fixture workspace through the real
+        // SkillManager. Keep the original 15-second completion deadline.
+        state
+            .skill_manager
+            .store_for_workspace(session.workspace_path_meta().map(std::path::Path::new))
+            .await
+            .unwrap();
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+        assert!(state
+            .session_inbox
+            .inspect(id)
+            .await
+            .unwrap()
+            .activation_pending());
+        assert!(!session
+            .messages
+            .iter()
+            .any(|m| m.role == bamboo_agent_core::Role::User));
+    }
+
+    #[actix_web::test]
+    async fn owned_root_http_real_v3_admission_reaches_same_execution_once() {
+        let provider = Arc::new(OwnedRootProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "owned-root-http-real-v3";
+        let mut session = bamboo_agent_core::Session::new(id, "test-model");
+        // A previously titled Root isolates the single execution provider call.
+        session.title_generated = true;
+        state.storage.save_session(&session).await.unwrap();
+        let reservation = reserve_owned_root(&state, id).await;
+        let initial_run = reservation.run_id().to_owned();
+        let upgraded = reservation
+            .execution_persistence()
+            .unwrap()
+            .admit_root_inbox(
+                &mut session,
+                state.session_inbox.clone(),
+                Some(&initial_run),
+            )
+            .await
+            .unwrap()
+            .expect("real bound Root owned admission");
+        assert_eq!(upgraded.merged, 0);
+        assert!(upgraded.admission_error.is_none());
+        reservation.abandon().await;
+        assert!(!state.agent_runners.read().await.contains_key(id));
+        assert!(state
+            .session_activation_router
+            .current_run_id(id)
+            .await
+            .is_none());
+        let legacy = state.session_inbox.claim(id, 1).await.unwrap_err();
+        assert!(
+            legacy
+                .to_string()
+                .contains("owned Inbox claim API required"),
+            "{legacy}"
+        );
+        queue_owned_root(&state, id).await;
+        assert!(provider.messages.lock().unwrap().is_empty());
+        input_taps().lock().unwrap().insert(id.into(), Vec::new());
+        let response = super::super::handler::handler(
+            state.clone(),
+            test::TestRequest::post().to_http_request(),
+            web::Path::from(id.to_owned()),
+            web::Json(serde_json::from_value(serde_json::json!({"model":"test-model"})).unwrap()),
+        )
+        .await;
+        let status = response.status();
+        let body: serde_json::Value = serde_json::from_slice(
+            &actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "actual owned-v3 HTTP boundary: {body}"
+        );
+        let run = body["run_id"].as_str().unwrap();
+        assert_ne!(run, initial_run);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let runners = state.agent_runners.read().await;
+                let runner = runners.get(id).expect("same reserved runner reaches spawn");
+                assert_eq!(runner.run_id, run);
+                if !matches!(runner.status, AgentStatus::Pending | AgentStatus::Running) {
+                    assert!(
+                        matches!(runner.status, AgentStatus::Completed),
+                        "{:?}",
+                        runner.status
+                    );
+                    break;
+                }
+                drop(runners);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("actual owned Root completes within unchanged deadline");
+        let stored = state.storage.load_session(id).await.unwrap().unwrap();
+        let users: Vec<_> = stored
+            .messages
+            .iter()
+            .filter(|m| m.role == bamboo_agent_core::Role::User)
+            .collect();
+        assert_eq!(users.len(), 1, "one durable typed User checkpoint");
+        let input = &users[0].id;
+        assert_eq!(users[0].content, "one owned Root input");
+        assert!(state
+            .session_inbox
+            .was_admitted(id, &SessionMessageId::parse(input).unwrap())
+            .await
+            .unwrap());
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 0);
+        let taps = input_taps().lock().unwrap().remove(id).unwrap();
+        assert_eq!(taps.len(), 1, "one actual Ready/spawn handoff");
+        assert_eq!(taps[0].as_ref().unwrap().len(), 1);
+        assert_eq!(taps[0].as_ref().unwrap()[0].0, *input);
+        let calls = provider.messages.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one execution provider call");
+        assert_eq!(calls[0].iter().filter(|m| m.id == *input).count(), 1);
+        drop(calls);
+        let retry = state.admit_chat_for_execute(id).await.unwrap();
+        assert!(retry.inputs.is_none());
+        assert!(!retry.generate_title, "NoNew cannot manufacture title work");
+    }
+
     #[actix_web::test]
     async fn native_inbox_real_chat_receipt_checkpoint_ack_and_current_input_once() {
         let (_home, state, _fault) = state(None).await;
