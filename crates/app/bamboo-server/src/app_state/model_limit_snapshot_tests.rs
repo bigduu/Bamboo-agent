@@ -94,6 +94,122 @@ async fn write_limits_in_external_process(path: &std::path::Path, rows: &[serde_
     );
 }
 
+#[actix_web::test]
+async fn compatibility_model_limit_lock_wait_keeps_worker_responsive_after_cancellation() {
+    let _key = bamboo_config::encryption::set_test_encryption_key([0x65; 32]);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+    state.wait_for_boot_reconcile_services().await;
+    state.stop_config_watcher_for_test();
+    let state = Arc::new(state);
+    let section = state
+        .config_facade
+        .as_ref()
+        .unwrap()
+        .registry()
+        .model_limits
+        .clone();
+    let initial_revision = section.snapshot().revision;
+    let rows = vec![json!({
+        "model_pattern": "lock-wait-model",
+        "max_context_tokens": 48_000,
+        "max_output_tokens": 4_000,
+        "safety_margin": null
+    })];
+    let app = test::init_service(App::new().route(
+        "/responsive",
+        web::get().to(|| async { actix_web::HttpResponse::Ok().finish() }),
+    ))
+    .await;
+
+    // Hold the store's real advisory lock on an independent OS thread. A
+    // bounded safety release also lets the old synchronous implementation
+    // terminate and report a behavioral failure instead of hanging the suite.
+    let lock_path = dir.path().join("model_limits.json.lock");
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        lock.unlock().unwrap();
+    });
+    locked_rx.await.unwrap();
+
+    let operation_state = state.clone();
+    let requested_rows = rows.clone();
+    let (dispatched_tx, dispatched_rx) = tokio::sync::oneshot::channel();
+    let started = std::time::Instant::now();
+    let operation = tokio::spawn(async move {
+        let mutation = operation_state.replace_compatibility_model_limits(requested_rows);
+        tokio::pin!(mutation);
+        let first_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(mutation.as_mut(), cx))
+        })
+        .await;
+        let _ = dispatched_tx.send(());
+        match first_poll {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => mutation.await,
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), dispatched_rx)
+        .await
+        .expect("a held file lock must not block the single Actix worker")
+        .unwrap();
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/responsive").to_request(),
+    )
+    .await;
+    assert!(response.status().is_success());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(
+        !operation.is_finished(),
+        "the durable writer still waits for the file lock"
+    );
+    operation.abort();
+    assert!(operation.await.unwrap_err().is_cancelled());
+    assert!(
+        state.config_io_lock.try_lock().is_err(),
+        "the owner retains IO after cancellation"
+    );
+    assert_eq!(section.snapshot().revision, initial_revision);
+
+    release_tx.send(()).unwrap();
+    tokio::task::spawn_blocking(move || holder.join().unwrap())
+        .await
+        .unwrap();
+    let completed = tokio::time::timeout(Duration::from_secs(10), state.config_io_lock.lock())
+        .await
+        .expect("the cancelled request's owner completes durable and event publication");
+    let snapshot = section.snapshot();
+    assert_eq!(snapshot.revision, initial_revision + 1);
+    assert_eq!(snapshot.data.0, rows);
+    let durable: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("model_limits.json")).unwrap())
+            .unwrap();
+    assert_eq!(durable["revision"], json!(snapshot.revision));
+    assert_eq!(durable["data"], json!(rows));
+    let events =
+        bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        AgentEvent::ConfigChanged { section, revision }
+            if section == bamboo_config::SectionId::ModelLimits.descriptor().name
+                && *revision == snapshot.revision
+    )));
+    drop(completed);
+    state.shutdown().await;
+}
+
 async fn run_hosted_probe(
     state: &web::Data<AppState>,
     mut session: Session,

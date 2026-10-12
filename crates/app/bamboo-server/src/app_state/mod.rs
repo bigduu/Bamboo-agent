@@ -521,21 +521,42 @@ impl AppState {
         &self,
         rows: Vec<serde_json::Value>,
     ) -> Result<(), ConfigSectionMutationError> {
-        let _io = self.config_io_lock.lock().await;
-        bamboo_config::ensure_provider_mcp_migration_ready(&self.app_data_dir)
-            .map_err(ConfigSectionMutationError::Store)?;
-        let facade = self.config_facade.as_ref().ok_or_else(|| {
-            ConfigSectionMutationError::Invalid(
-                "model-limit section writes require the modular configuration facade".to_string(),
-            )
-        })?;
-        let event = facade
-            .replace_compatibility_model_limits(bamboo_config::ModelLimitsSection(rows))
-            .map_err(ConfigSectionMutationError::Store)?;
-        if let Some(event) = event {
-            config_runtime::publish_registry_event(&self.account_sink, &event).await;
-        }
-        Ok(())
+        let io = self.config_io_lock.clone().lock_owned().await;
+        let app_data_dir = self.app_data_dir.clone();
+        let facade = self.config_facade.clone();
+        let account_sink = self.account_sink.clone();
+        // The owner survives request cancellation and retains serialization
+        // through both durable publication and the account event. File locks
+        // and fsync belong on a blocking worker, never the HTTP worker.
+        let transaction = tokio::spawn(async move {
+            let _io = io;
+            let event = tokio::task::spawn_blocking(move || {
+                bamboo_config::ensure_provider_mcp_migration_ready(&app_data_dir)
+                    .map_err(ConfigSectionMutationError::Store)?;
+                let facade = facade.as_ref().ok_or_else(|| {
+                    ConfigSectionMutationError::Invalid(
+                        "model-limit section writes require the modular configuration facade"
+                            .to_string(),
+                    )
+                })?;
+                facade
+                    .replace_compatibility_model_limits(bamboo_config::ModelLimitsSection(rows))
+                    .map_err(ConfigSectionMutationError::Store)
+            })
+            .await
+            .map_err(|_| {
+                ConfigSectionMutationError::Runtime(
+                    "model-limit persistence task failed".to_string(),
+                )
+            })??;
+            if let Some(event) = event {
+                config_runtime::publish_registry_event(&account_sink, &event).await;
+            }
+            Ok(())
+        });
+        transaction.await.map_err(|_| {
+            ConfigSectionMutationError::Runtime("model-limit transaction task failed".to_string())
+        })?
     }
 
     /// Test-only synchronization point (see
