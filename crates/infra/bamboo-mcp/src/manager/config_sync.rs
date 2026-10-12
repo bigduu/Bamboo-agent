@@ -1,4 +1,4 @@
-use super::fingerprint::{effective_server_config, manager_proxy_fingerprint};
+use super::fingerprint::{effective_server_config, proxy_fingerprint};
 use super::lifecycle::RetiredRuntimeCleanup;
 use super::*;
 use std::collections::HashSet;
@@ -57,8 +57,58 @@ impl McpServerManager {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
+        self.reconcile_with_runtime_config_after_forcing(
+            config,
+            None,
+            force_replacements,
+            before_publish,
+        )
+        .await
+    }
+
+    /// Stage transports against one candidate network snapshot without changing
+    /// the live global configuration before the durable publication callback.
+    pub async fn reconcile_with_runtime_config_after<F, Fut>(
+        &self,
+        config: &McpConfig,
+        runtime_config: &Config,
+        before_publish: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        self.reconcile_with_runtime_config_after_forcing(
+            config,
+            Some(runtime_config),
+            &HashSet::new(),
+            before_publish,
+        )
+        .await
+    }
+
+    async fn reconcile_with_runtime_config_after_forcing<F, Fut>(
+        &self,
+        config: &McpConfig,
+        runtime_config: Option<&Config>,
+        force_replacements: &HashSet<String>,
+        before_publish: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         let sequence = self.event_sequence_lock.clone().lock_owned().await;
         let reconcile = self.reconcile_lock.lock().await;
+        let live_snapshot = if runtime_config.is_none() {
+            match self.config.as_ref() {
+                Some(config) => Some(config.read().await.clone()),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let runtime_config = runtime_config.or(live_snapshot.as_ref());
         let mut seen = HashSet::new();
         for server in &config.servers {
             if server.id.trim().is_empty() {
@@ -75,7 +125,7 @@ impl McpServerManager {
         }
 
         let base = self.authority.generation();
-        let desired_proxy_fingerprint = manager_proxy_fingerprint(self.config.as_ref()).await;
+        let desired_proxy_fingerprint = runtime_config.and_then(proxy_fingerprint);
         let mut prepared = Vec::new();
         for desired in config.servers.iter().filter(|server| server.enabled) {
             let needs_replacement = force_replacements.contains(&desired.id)
@@ -93,8 +143,13 @@ impl McpServerManager {
                     .unwrap_or(true);
             if needs_replacement {
                 prepared.push(
-                    self.prepare_server_runtime(desired.clone(), "config reload")
-                        .await?,
+                    self.prepare_server_runtime_with_snapshot(
+                        desired.clone(),
+                        "config reload",
+                        0,
+                        runtime_config,
+                    )
+                    .await?,
                 );
             }
         }

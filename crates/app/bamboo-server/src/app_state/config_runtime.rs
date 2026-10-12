@@ -390,6 +390,7 @@ struct ConfigPathChanges {
 /// Owned handles needed to publish provider and MCP effects for one committed
 /// configuration generation. Keeping them together makes it explicit that a
 /// detached transaction carries one immutable publication context end to end.
+#[derive(Clone)]
 struct ConfigRuntimeEffectContext {
     app_data_dir: PathBuf,
     config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
@@ -399,6 +400,169 @@ struct ConfigRuntimeEffectContext {
     account_sink: Arc<bamboo_engine::events::AccountEventSink>,
     config_live_health: Arc<std::sync::RwLock<ConfigLiveHealth>>,
     mcp_config_live_health: Arc<std::sync::RwLock<ConfigLiveHealth>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DependentRuntimeChanges {
+    provider: bool,
+    mcp: bool,
+}
+
+fn dependent_runtime_changes(previous: &Config, candidate: &Config) -> DependentRuntimeChanges {
+    fn proxy(config: &Config) -> (&str, Option<(&str, &str)>) {
+        let url = if config.http_proxy.trim().is_empty() {
+            config.https_proxy.trim()
+        } else {
+            config.http_proxy.trim()
+        };
+        (
+            url,
+            (!url.is_empty())
+                .then_some(config.proxy_auth.as_ref())
+                .flatten()
+                .map(|auth| (auth.username.as_str(), auth.password.as_str())),
+        )
+    }
+    let proxy_changed = proxy(previous) != proxy(candidate);
+    let before = &previous.keyword_masking.entries;
+    let after = &candidate.keyword_masking.entries;
+    let masking_changed = before.len() != after.len()
+        || before.iter().zip(after).any(|(before, after)| {
+            before.pattern != after.pattern
+                || before.match_type != after.match_type
+                || before.enabled != after.enabled
+        });
+    DependentRuntimeChanges {
+        provider: proxy_changed || masking_changed,
+        mcp: proxy_changed,
+    }
+}
+
+struct StagedDependentProvider {
+    registry: bamboo_llm::ProviderRegistry,
+    provider: Option<Arc<dyn LLMProvider>>,
+}
+
+async fn stage_dependent_provider(
+    context: &ConfigRuntimeEffectContext,
+    candidate: &Config,
+    changes: DependentRuntimeChanges,
+) -> Result<Option<StagedDependentProvider>, ConfigSectionMutationError> {
+    let existing = context.provider_registry.provider_names();
+    // An unconfigured installation must still allow network/policy settings.
+    // There is no configured client to rebuild until a provider is installed.
+    if !changes.provider || existing.is_empty() {
+        return Ok(None);
+    }
+    let default_was_available = context.provider_registry.get_default().is_some();
+    let registry =
+        bamboo_llm::ProviderRegistry::from_config(candidate, context.app_data_dir.clone())
+            .await
+            .map_err(|_| dependent_runtime_error())?;
+    let provider = registry.get_default();
+    if (default_was_available && provider.is_none())
+        || existing.iter().any(|name| registry.get(name).is_none())
+    {
+        // Registry construction intentionally skips invalid providers at boot.
+        // A dependent reload must not silently remove a previously usable one.
+        return Err(dependent_runtime_error());
+    }
+    Ok(Some(StagedDependentProvider { registry, provider }))
+}
+
+fn dependent_runtime_error() -> ConfigSectionMutationError {
+    ConfigSectionMutationError::Runtime(
+        "dependent provider or MCP initialization failed; retaining last-known-good runtime"
+            .to_string(),
+    )
+}
+
+/// The caller owns config_io_lock. Stage against an immutable candidate, then
+/// acquire publication guards before the synchronous durable callback. MCP's
+/// prevalidated swap follows the callback without another await/failure point.
+async fn publish_dependent_config<T>(
+    context: &ConfigRuntimeEffectContext,
+    config: &Arc<RwLock<Config>>,
+    previous: &Config,
+    candidate: Config,
+    commit: impl FnOnce() -> Result<T, ConfigSectionMutationError>,
+) -> Result<T, ConfigSectionMutationError> {
+    let changes = dependent_runtime_changes(previous, &candidate);
+    let staged = stage_dependent_provider(context, &candidate, changes).await?;
+    let mut receipt = None;
+    let mut commit_error = None;
+    let publish = || async {
+        let mut live_config = config.write().await;
+        let mut live_provider = context.provider.write().await;
+        match commit() {
+            Ok(committed) => receipt = Some(committed),
+            Err(error) => {
+                commit_error = Some(error);
+                return Err(bamboo_mcp::McpError::InvalidConfig(
+                    "configuration commit failed".to_string(),
+                ));
+            }
+        }
+        #[cfg(test)]
+        run_generic_before_provider_publish_test_hook(&context.app_data_dir);
+        *live_config = candidate.clone();
+        if let Some(staged) = staged {
+            context.provider_registry.replace_with(staged.registry);
+            if let Some(provider) = staged.provider {
+                *live_provider = provider;
+            }
+        }
+        Ok(())
+    };
+    let result = if changes.mcp {
+        context
+            .mcp_manager
+            .reconcile_with_runtime_config_after(&candidate.mcp, &candidate, publish)
+            .await
+    } else {
+        publish().await
+    };
+    if let Some(error) = commit_error {
+        return Err(error);
+    }
+    result.map_err(|_| dependent_runtime_error())?;
+    Ok(receipt.expect("successful publication ran the commit callback"))
+}
+
+fn project_dependent_section_candidate(
+    id: SectionId,
+    data: &Value,
+    previous: &Config,
+) -> Result<Config, ConfigSectionMutationError> {
+    let mut candidate = previous.clone();
+    match id {
+        SectionId::Core => {
+            let section: bamboo_config::CoreSection = serde_json::from_value(data.clone())
+                .map_err(ConfigStoreError::from)
+                .map_err(ConfigSectionMutationError::Store)?;
+            candidate.http_proxy = section.http_proxy;
+            candidate.https_proxy = section.https_proxy;
+            candidate.proxy_auth_credential_ref = section.proxy_auth_credential_ref;
+            candidate.headless_auth = section.headless_auth;
+            candidate.server = section.server;
+            candidate.default_work_area = section.default_work_area;
+            candidate.run_budget = section.run_budget;
+            candidate.stream_timeout = section.stream_timeout;
+            candidate.context_management = section.context_management;
+            candidate.extra = section.extra;
+        }
+        SectionId::ModelPolicy => {
+            let section: bamboo_config::ModelPolicySection = serde_json::from_value(data.clone())
+                .map_err(ConfigStoreError::from)
+                .map_err(ConfigSectionMutationError::Store)?;
+            candidate.keyword_masking = section.keyword_masking;
+            candidate.anthropic_model_mapping = section.anthropic_model_mapping;
+            candidate.gemini_model_mapping = section.gemini_model_mapping;
+        }
+        _ => unreachable!("only dependent ordinary sections are projected here"),
+    }
+    candidate.apply_runtime_env_overrides();
+    Ok(candidate)
 }
 
 impl ConfigWatcherRuntime {
@@ -555,6 +719,16 @@ impl ConfigWatcherRuntime {
 
         let apply_provider_health = provider_health.clone();
         let apply_mcp_health = mcp_health.clone();
+        let dependent_context = ConfigRuntimeEffectContext {
+            app_data_dir: data_dir.clone(),
+            config_facade: config_facade.clone(),
+            provider_registry: provider_registry.clone(),
+            provider: provider.clone(),
+            mcp_manager: mcp_manager.clone(),
+            account_sink: account_sink.clone(),
+            config_live_health: provider_health.clone(),
+            mcp_config_live_health: mcp_health.clone(),
+        };
         let catchup_changes = initial_changes.clone();
         let apply_task = tokio::spawn(async move {
             let mut reported_root_runtime_failures = BTreeSet::<(SectionId, u64)>::new();
@@ -835,6 +1009,7 @@ impl ConfigWatcherRuntime {
                             pending_root_publications: &mut pending_root_publications,
                             reported_root_runtime_failures: &mut reported_root_runtime_failures,
                         },
+                        &dependent_context,
                     )
                     .await;
                 }
@@ -1453,6 +1628,7 @@ async fn reload_and_apply_ordinary_sections(
     account_sink: &bamboo_engine::events::AccountEventSink,
     sections: impl IntoIterator<Item = SectionId>,
     state: OrdinarySectionReloadState<'_>,
+    dependent_context: &ConfigRuntimeEffectContext,
 ) -> bool {
     let OrdinarySectionReloadState {
         synthetic_events,
@@ -1492,6 +1668,7 @@ async fn reload_and_apply_ordinary_sections(
 
     let materialized = materialize_facade_effective_config(facade, data_dir);
     let mut current = config.read().await.clone();
+    let enforcement_was_off = current.plugin_trust.enforcement_is_off();
     let mut applied = Vec::new();
     for (id, event) in publishable {
         if materialized.failures.contains(&id) {
@@ -1518,7 +1695,41 @@ async fn reload_and_apply_ordinary_sections(
             retry_legacy_root_publication |= pending_root_publications.contains_key(&id);
             continue;
         }
-        apply_runtime_section(id, &materialized.config, &mut current);
+        let mut candidate = current.clone();
+        apply_runtime_section(id, &materialized.config, &mut candidate);
+        if matches!(id, SectionId::Core | SectionId::ModelPolicy) {
+            if publish_dependent_config(
+                dependent_context,
+                config,
+                &current,
+                candidate.clone(),
+                || Ok(()),
+            )
+            .await
+            .is_err()
+            {
+                let revision = config_section_event_revision(&event);
+                let invalid = facade.registry().mark_runtime_degraded(
+                    id,
+                    "dependent runtime initialization failed; retaining last-known-good runtime",
+                );
+                if let Some(invalid) = invalid {
+                    if pending_root_publications
+                        .get(&id)
+                        .is_some_and(|event| config_section_event_revision(event) == revision)
+                    {
+                        let _ =
+                            confirm_legacy_root_runtime_failure(data_dir, account_sink, &invalid)
+                                .await;
+                    } else if reported_root_runtime_failures.insert((id, revision)) {
+                        publish_registry_event(account_sink, &invalid).await;
+                    }
+                }
+                retry_legacy_root_publication |= pending_root_publications.contains_key(&id);
+                continue;
+            }
+        }
+        current = candidate;
         applied.push((id, event));
     }
     if applied.is_empty() {
@@ -1526,8 +1737,7 @@ async fn reload_and_apply_ordinary_sections(
     }
 
     let publishes_env = applied.iter().any(|(id, _)| *id == SectionId::Env);
-    let enforcement_newly_off = !config.read().await.plugin_trust.enforcement_is_off()
-        && current.plugin_trust.enforcement_is_off();
+    let enforcement_newly_off = !enforcement_was_off && current.plugin_trust.enforcement_is_off();
     *config.write().await = current.clone();
     if publishes_env {
         current.publish_env_vars();
@@ -2616,6 +2826,19 @@ pub(crate) enum CredentialBackedResetCommit {
 }
 
 impl AppState {
+    fn dependent_runtime_context(&self) -> ConfigRuntimeEffectContext {
+        ConfigRuntimeEffectContext {
+            app_data_dir: self.app_data_dir.clone(),
+            config_facade: self.config_facade.clone(),
+            provider_registry: self.provider_registry.clone(),
+            provider: self.provider.clone(),
+            mcp_manager: self.mcp_manager.clone(),
+            account_sink: self.account_sink.clone(),
+            config_live_health: self.config_live_health.clone(),
+            mcp_config_live_health: self.mcp_config_live_health.clone(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn stop_config_watcher_for_test(&mut self) {
         self.config_watcher.stop.store(true, Ordering::Relaxed);
@@ -2648,6 +2871,7 @@ impl AppState {
                 pending_root_publications: &mut pending_root_publications,
                 reported_root_runtime_failures: &mut reported_root_runtime_failures,
             },
+            &self.dependent_runtime_context(),
         )
         .await;
     }
@@ -2703,6 +2927,11 @@ impl AppState {
                 "this section requires its dedicated endpoint".to_string(),
             ));
         }
+        if matches!(id, SectionId::Core | SectionId::ModelPolicy) {
+            return self
+                .put_dependent_ordinary_section(id, expected_revision, candidate)
+                .await;
+        }
         let _io = self.config_io_lock.lock().await;
         ensure_provider_mcp_migration_ready(&self.app_data_dir)
             .map_err(ConfigSectionMutationError::Store)?;
@@ -2711,46 +2940,10 @@ impl AppState {
                 "typed section writes require the modular configuration facade".to_string(),
             )
         })?;
-        let current = if id == SectionId::Core {
-            let data_dir = self.app_data_dir.clone();
-            let exact = tokio::task::spawn_blocking(move || {
-                bamboo_config::read_exact_credential_section_snapshot(
-                    data_dir,
-                    SectionId::Core,
-                    Some(expected_revision),
-                )
-            })
-            .await
-            .map_err(|error| {
-                ConfigSectionMutationError::Runtime(format!(
-                    "Core exact inventory snapshot task failed: {error}"
-                ))
-            })?
+        let current = facade
+            .registry()
+            .envelope_value(id)
             .map_err(ConfigSectionMutationError::Store)?;
-            if let Some(reference) = exact
-                .section
-                .data
-                .get("proxy_auth_credential_ref")
-                .and_then(Value::as_str)
-            {
-                let configured = exact
-                    .credential_statuses
-                    .iter()
-                    .any(|status| status.credential_ref.as_str() == reference && status.configured);
-                if !configured {
-                    return Err(ConfigSectionMutationError::Invalid(
-                        "the active Core proxy credential is invalid; explicitly replace or clear it through the proxy-auth API"
-                            .to_string(),
-                    ));
-                }
-            }
-            exact.section
-        } else {
-            facade
-                .registry()
-                .envelope_value(id)
-                .map_err(ConfigSectionMutationError::Store)?
-        };
         if credential_reference_inventory(&current.data)
             != credential_reference_inventory(&candidate)
         {
@@ -2760,24 +2953,10 @@ impl AppState {
             ));
         }
 
-        let (event, committed) = if id == SectionId::Core {
-            // Exact Core GETs may be ahead of this process's watcher. Keep the
-            // shared credential transaction lock from durable-base validation
-            // through the content-aware Core CAS and jump directly to the
-            // committed revision; never consume or publish the intermediate
-            // generation before its runtime has been installed.
-            bamboo_config::commit_core_metadata_from_durable_base(
-                &self.app_data_dir,
-                facade,
-                expected_revision,
-                candidate,
-            )
-        } else {
-            facade
-                .registry()
-                .commit_value_with_envelope(id, expected_revision, candidate)
-        }
-        .map_err(ConfigSectionMutationError::Store)?;
+        let (event, committed) = facade
+            .registry()
+            .commit_value_with_envelope(id, expected_revision, candidate)
+            .map_err(ConfigSectionMutationError::Store)?;
         let materialized = materialize_facade_effective_config(facade, &self.app_data_dir);
         if materialized.failures.contains(&id) {
             let message =
@@ -2803,6 +2982,120 @@ impl AppState {
         }
         publish_registry_event(&self.account_sink, &event).await;
         Ok(committed)
+    }
+
+    async fn put_dependent_ordinary_section(
+        &self,
+        id: SectionId,
+        expected_revision: u64,
+        data: Value,
+    ) -> Result<bamboo_config::SectionEnvelope<Value>, ConfigSectionMutationError> {
+        let io = self.config_io_lock.clone().lock_owned().await;
+        let context = self.dependent_runtime_context();
+        let config = self.config.clone();
+        let transaction = tokio::spawn(async move {
+            let _io = io;
+            ensure_provider_mcp_migration_ready(&context.app_data_dir)
+                .map_err(ConfigSectionMutationError::Store)?;
+            let facade = context.config_facade.as_ref().ok_or_else(|| {
+                ConfigSectionMutationError::Invalid(
+                    "typed section writes require the modular configuration facade".to_string(),
+                )
+            })?;
+            let previous = config.read().await.clone();
+            let mut base = previous.clone();
+            let current = if id == SectionId::Core {
+                let data_dir = context.app_data_dir.clone();
+                let exact = tokio::task::spawn_blocking(move || {
+                    bamboo_config::read_exact_credential_section_snapshot(
+                        data_dir,
+                        SectionId::Core,
+                        Some(expected_revision),
+                    )
+                })
+                .await
+                .map_err(|_| {
+                    ConfigSectionMutationError::Runtime(
+                        "Core exact inventory snapshot task failed".to_string(),
+                    )
+                })?
+                .map_err(ConfigSectionMutationError::Store)?;
+                if let Some(reference) = exact
+                    .section
+                    .data
+                    .get("proxy_auth_credential_ref")
+                    .and_then(Value::as_str)
+                {
+                    let configured = exact.credential_statuses.iter().any(|status| {
+                        status.credential_ref.as_str() == reference && status.configured
+                    });
+                    if !configured {
+                        return Err(ConfigSectionMutationError::Invalid(
+                            "the active Core proxy credential is invalid; explicitly replace or clear it through the proxy-auth API"
+                                .to_string(),
+                        ));
+                    }
+                }
+                let section = exact.section.clone();
+                exact.install_into(&mut base);
+                section
+            } else {
+                facade
+                    .registry()
+                    .envelope_value(id)
+                    .map_err(ConfigSectionMutationError::Store)?
+            };
+            if credential_reference_inventory(&current.data)
+                != credential_reference_inventory(&data)
+            {
+                return Err(ConfigSectionMutationError::Invalid(
+                    "credential references are server-managed; use the credential or domain API"
+                        .to_string(),
+                ));
+            }
+            let candidate = project_dependent_section_candidate(id, &data, &base)?;
+            let committed =
+                publish_dependent_config(&context, &config, &previous, candidate, || {
+                    if id == SectionId::Core {
+                        // Exact reads can be ahead of this watcher's projection.
+                        // Revalidate the durable credential base under the
+                        // existing transaction lock before the content-aware CAS.
+                        bamboo_config::commit_core_metadata_from_durable_base(
+                            &context.app_data_dir,
+                            facade,
+                            expected_revision,
+                            data,
+                        )
+                    } else {
+                        facade
+                            .registry()
+                            .commit_value_with_envelope(id, expected_revision, data)
+                    }
+                    .map_err(ConfigSectionMutationError::Store)
+                })
+                .await;
+            let (event, envelope) = match committed {
+                Ok(committed) => committed,
+                Err(error) => {
+                    if matches!(error, ConfigSectionMutationError::Runtime(_)) {
+                        if let Some(event) = facade.registry().mark_runtime_degraded(
+                            id,
+                            "dependent runtime initialization failed; retaining last-known-good runtime",
+                        ) {
+                            publish_registry_event(&context.account_sink, &event).await;
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+            publish_registry_event(&context.account_sink, &event).await;
+            Ok(envelope)
+        });
+        transaction.await.map_err(|_| {
+            ConfigSectionMutationError::Runtime(
+                "dependent configuration transaction task failed".to_string(),
+            )
+        })?
     }
 
     /// Validate and stage a provider runtime before the first durable CAS
@@ -6637,6 +6930,10 @@ pub(crate) fn warn_plugin_trust_enforcement_off() {
          without host/signature/checksum verification (config.json plugin_trust.enforcement)"
     );
 }
+
+#[cfg(test)]
+#[path = "config_runtime_dependent_tests.rs"]
+mod dependent_runtime_tests;
 
 #[cfg(test)]
 mod live_reload_tests {
@@ -11941,6 +12238,7 @@ for line in sys.stdin:
                 pending_root_publications: &mut pending_root_publications,
                 reported_root_runtime_failures: &mut reported_root_runtime_failures,
             },
+            &state.dependent_runtime_context(),
         )
         .await;
 

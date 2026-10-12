@@ -1,7 +1,7 @@
 use tokio::sync::{oneshot, OwnedMutexGuard};
 use tokio::time::{interval, Duration};
 
-use super::fingerprint::desired_proxy_fingerprint;
+use super::fingerprint::proxy_fingerprint;
 use super::generation::{admit_resolved, AdmittedMcpCall};
 use super::*;
 use crate::protocol::models::JsonRpcNotification;
@@ -113,10 +113,30 @@ impl McpServerManager {
         phase: &'static str,
         restart_count: u32,
     ) -> Result<PreparedServerRuntime> {
+        let runtime_config = match self.config.as_ref() {
+            Some(config) => Some(config.read().await.clone()),
+            None => None,
+        };
+        self.prepare_server_runtime_with_snapshot(
+            config,
+            phase,
+            restart_count,
+            runtime_config.as_ref(),
+        )
+        .await
+    }
+
+    pub(super) async fn prepare_server_runtime_with_snapshot(
+        &self,
+        config: McpServerConfig,
+        phase: &'static str,
+        restart_count: u32,
+        runtime_config: Option<&Config>,
+    ) -> Result<PreparedServerRuntime> {
         let server_id = config.id.clone();
-        let runtime_proxy_fingerprint = desired_proxy_fingerprint(self.config.as_ref()).await;
+        let runtime_proxy_fingerprint = runtime_config.and_then(proxy_fingerprint);
         let (client, tools, instructions, notification_rx) = self
-            .bootstrap_server_client(&server_id, &config, phase)
+            .bootstrap_server_client(&server_id, &config, phase, runtime_config)
             .await?;
         let catalog = self.index.plan_server_tools(
             &server_id,
