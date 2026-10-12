@@ -64,11 +64,8 @@ async fn unavailable_mcp(state: &AppState) -> MockServer {
     let revision = section(state, SectionId::Mcp).revision;
     facade
         .registry()
-        .commit_value_with_envelope(
-            SectionId::Mcp,
-            revision,
-            serde_json::to_value(&mcp).unwrap(),
-        )
+        .mcp
+        .commit(revision, bamboo_config::McpSection(mcp.clone()))
         .unwrap();
     // Model a configured server whose bootstrap failed: its desired metadata
     // stays effective while the manager has no usable transport to publish.
