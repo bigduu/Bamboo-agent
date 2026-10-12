@@ -1061,11 +1061,14 @@ mod execution_input_http {
         let slow = format!("{id}-slow");
         let mut parent = bamboo_agent_core::Session::new(id, "test-model");
         parent.title_generated = true;
-        let wait = WaitingForChildrenState::for_children(
+        let mut wait = WaitingForChildrenState::for_children(
             vec![fast.clone(), slow.clone()],
             ChildWaitPolicy::All,
             chrono::Utc::now(),
         );
+        // This manual HTTP fixture carries an explicit persisted All wait.
+        // Untagged safety-net waits are cleared on an unprepared restart.
+        wait.registered_by_tool_call_id = Some(format!("{id}-wait"));
         let mut runtime = AgentRuntimeState::new("waiting-before-http-race");
         runtime.status = AgentStatusState::Suspended;
         runtime.waiting_for_children = Some(wait.clone());
