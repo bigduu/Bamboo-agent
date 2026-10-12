@@ -256,6 +256,26 @@ pub(crate) struct ExecuteAdmission {
     pub native_main: bool,
 }
 
+// Selection is not admission: only the HTTP owner can retain a newly acquired
+// reservation through Ready or awaited non-spawn cleanup.
+enum ExecuteAdmissionCheck {
+    Checked(ExecuteAdmission),
+    NeedsRootReservation,
+}
+
+impl ExecuteAdmissionCheck {
+    fn into_admission(self) -> ResponseResult<ExecuteAdmission> {
+        match self {
+            Self::Checked(admission) => Ok(admission),
+            Self::NeedsRootReservation => Err(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Native Root admission requires an execution reservation; retry execute",
+            )
+            .into()),
+        }
+    }
+}
+
 pub(crate) async fn admit_for_execute(
     state: &AppState,
     id: &str,
@@ -360,11 +380,55 @@ impl AppState {
         self.admit_chat_for_execute_inner(id, reservation).await
     }
 
+    pub(crate) async fn admit_chat_for_execute_with_http_reservation(
+        &self,
+        id: &str,
+        reservation: &mut Option<SessionExecutionReservation>,
+    ) -> ResponseResult<ExecuteAdmission> {
+        match self
+            .check_chat_for_execute_inner(id, reservation.as_ref(), true)
+            .await?
+        {
+            ExecuteAdmissionCheck::Checked(admission) => return Ok(admission),
+            ExecuteAdmissionCheck::NeedsRootReservation => {}
+        }
+        #[cfg(test)]
+        self.before_http_root_reservation_retry_for_test(id).await;
+        // The checked reader has dropped its runner guard. Reuse the existing
+        // reserve/bind protocol exactly once, keeping the acquired owner in the
+        // caller even if the second validation or later preparation fails.
+        // A stale Some never reaches this branch and is never upgraded.
+        *reservation = self.reserve_root_chat_for_execute(id).await?;
+        if reservation.is_none() {
+            // A collision or now-empty queue did not admit anything. Do not
+            // report completed/started and strand a sole pending ChildOutcome.
+            return Err(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Native Root admission changed before ownership; retry execute",
+            )
+            .into());
+        }
+        self.check_chat_for_execute_inner(id, reservation.as_ref(), true)
+            .await?
+            .into_admission()
+    }
+
     async fn admit_chat_for_execute_inner(
         &self,
         id: &str,
         reservation: Option<&SessionExecutionReservation>,
     ) -> ResponseResult<ExecuteAdmission> {
+        self.check_chat_for_execute_inner(id, reservation, false)
+            .await?
+            .into_admission()
+    }
+
+    async fn check_chat_for_execute_inner(
+        &self,
+        id: &str,
+        reservation: Option<&SessionExecutionReservation>,
+        require_native_owner: bool,
+    ) -> ResponseResult<ExecuteAdmissionCheck> {
         let runners = self.agent_runners.read().await;
         if let Some(reservation) = reservation {
             if reservation.session_id() != id
@@ -386,7 +450,7 @@ impl AppState {
                 crate::app_state::AgentStatus::Pending | crate::app_state::AgentStatus::Running
             )
         }) {
-            return Ok(ExecuteAdmission::default());
+            return Ok(ExecuteAdmissionCheck::Checked(ExecuteAdmission::default()));
         }
         let Some(mut session) = self
             .storage
@@ -394,7 +458,7 @@ impl AppState {
             .await
             .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?
         else {
-            return Ok(ExecuteAdmission::default());
+            return Ok(ExecuteAdmissionCheck::Checked(ExecuteAdmission::default()));
         };
         let queued_id = session.metadata.get("chat.queued_ingress.v1").cloned();
         // Inspection selects an attempt; it neither grants a sibling nor proves Fresh.
@@ -407,7 +471,18 @@ impl AppState {
                 .activation_pending()
         {
             recover_user_handoff(self, &session).await?;
-            return Ok(ExecuteAdmission::default());
+            return Ok(ExecuteAdmissionCheck::Checked(ExecuteAdmission::default()));
+        }
+        if require_native_owner
+            && reservation.is_none()
+            && queued_id.is_none()
+            && crate::skill_runtime::ordinary_main(&session)
+        {
+            // Eligibility was observed under this actual admission check, not
+            // the earlier HTTP selection. Never claim native owned-format work
+            // through unbound persistence. Reserving needs the registry writer.
+            drop(runners);
+            return Ok(ExecuteAdmissionCheck::NeedsRootReservation);
         }
         let persistence: std::sync::Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
             match reservation {
@@ -473,11 +548,11 @@ impl AppState {
             )
             .into());
         }
-        Ok(ExecuteAdmission {
+        Ok(ExecuteAdmissionCheck::Checked(ExecuteAdmission {
             inputs,
             generate_title,
             native_main,
-        })
+        }))
     }
 }
 

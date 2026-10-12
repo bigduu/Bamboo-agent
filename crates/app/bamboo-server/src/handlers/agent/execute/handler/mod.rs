@@ -105,7 +105,7 @@ async fn handle_reserved_execute(
     admission_reservation: &mut Option<SessionExecutionReservation>,
 ) -> HttpResponse {
     let admission = match state
-        .admit_chat_for_execute_with_reservation(&session_id, admission_reservation.as_ref())
+        .admit_chat_for_execute_with_http_reservation(&session_id, admission_reservation)
         .await
     {
         Ok(admission) => admission,
