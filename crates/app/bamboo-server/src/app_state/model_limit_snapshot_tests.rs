@@ -41,6 +41,59 @@ impl LLMProvider for ModelLimitProbe {
     }
 }
 
+// The parent test invokes only this helper in another OS process. Ordinary
+// suite execution has no path override and performs no filesystem operation.
+#[tokio::test]
+async fn model_limit_external_process_writer() {
+    let Some(path) = std::env::var_os("BAMBOO_MODEL_LIMIT_WRITER_TEST_PATH") else {
+        return;
+    };
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&std::env::var("BAMBOO_MODEL_LIMIT_WRITER_TEST_ROWS").unwrap())
+            .unwrap();
+    let _: Vec<bamboo_compression::limits::ModelLimit> =
+        serde_json::from_value(json!(rows)).unwrap();
+    let store = bamboo_config::AtomicJsonStore::<bamboo_config::ModelLimitsSection>::new(path, 1);
+    let revision = store.load().unwrap().unwrap().revision;
+    store
+        .commit(
+            revision,
+            bamboo_config::ModelLimitsSection(rows),
+            |_| Ok(()),
+        )
+        .unwrap();
+    println!("model-limit-external-writer: committed");
+}
+
+async fn write_limits_in_external_process(path: &std::path::Path, rows: &[serde_json::Value]) {
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "app_state::model_limit_snapshot_tests::model_limit_external_process_writer",
+            "--nocapture",
+        ])
+        .env("BAMBOO_MODEL_LIMIT_WRITER_TEST_PATH", path)
+        .env(
+            "BAMBOO_MODEL_LIMIT_WRITER_TEST_ROWS",
+            json!(rows).to_string(),
+        )
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+        .await
+        .expect("external model-limit writer must finish")
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "external writer failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("model-limit-external-writer: committed")
+    );
+}
+
 async fn run_hosted_probe(
     state: &web::Data<AppState>,
     mut session: Session,
@@ -362,13 +415,69 @@ async fn compatibility_model_limit_writes_and_clear_reach_hosted_rounds_without_
         Box::pin(run_hosted_probe(&state, session, probe.clone())).await,
         144_000
     );
+
+    // A separate process advances the durable document while this server's
+    // watcher is stopped. Cover a request matching stale local rows, different
+    // requested rows, and exact adoption when durable rows already match.
+    let path = dir.path().join("model_limits.json");
+    for (run, (external_rows, requested_rows, expected_context, needs_write)) in [
+        (rows(192_000, 16_000), rows(144_000, 12_000), 144_000, true),
+        (rows(192_000, 16_000), rows(240_000, 20_000), 240_000, true),
+        (rows(240_000, 20_000), rows(240_000, 20_000), 240_000, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let local_before = section.snapshot();
+        write_limits_in_external_process(&path, &external_rows).await;
+        assert_eq!(section.snapshot().revision, local_before.revision);
+        assert_eq!(section.snapshot().data.0, local_before.data.0);
+        let durable_before = std::fs::read(&path).unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&durable_before).unwrap();
+        let external_revision = document["revision"].as_u64().unwrap();
+        assert_eq!(external_revision, local_before.revision + 1);
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/bamboo/config")
+                .set_json(json!({"model_limits": requested_rows}))
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let expected_revision = external_revision + u64::from(needs_write);
+        assert_eq!(section.snapshot().revision, expected_revision);
+        assert_eq!(section.snapshot().data.0, requested_rows);
+        let durable_after = std::fs::read(&path).unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&durable_after).unwrap();
+        assert_eq!(document["revision"].as_u64(), Some(expected_revision));
+        assert_eq!(document["data"], json!(requested_rows));
+        if !needs_write {
+            assert_eq!(durable_after, durable_before);
+        }
+
+        let mut session = Session::new(
+            format!("compatibility-model-limit-external-{run}"),
+            "legacy-hosted-model",
+        );
+        session.set_project_id_meta(project.id.to_string());
+        session.add_message(Message::user("finish this request"));
+        assert_eq!(
+            Box::pin(run_hosted_probe(&state, session, probe.clone())).await,
+            expected_context
+        );
+    }
     assert_eq!(
         *probe.output_limits.lock().unwrap(),
         [
             Some(4_000),
             Some(8_000),
             Some(DEFAULT_MAX_OUTPUT_TOKENS),
-            Some(12_000)
+            Some(12_000),
+            Some(12_000),
+            Some(20_000),
+            Some(20_000)
         ]
     );
     state.shutdown().await;

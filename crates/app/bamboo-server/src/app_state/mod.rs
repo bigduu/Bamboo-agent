@@ -529,15 +529,12 @@ impl AppState {
                 "model-limit section writes require the modular configuration facade".to_string(),
             )
         })?;
-        let section = &facade.registry().model_limits;
-        let snapshot = section.snapshot();
-        if snapshot.status == bamboo_config::SectionStatus::Healthy && snapshot.data.0 == rows {
-            return Ok(());
-        }
-        let event = section
-            .commit(snapshot.revision, bamboo_config::ModelLimitsSection(rows))
+        let event = facade
+            .replace_compatibility_model_limits(bamboo_config::ModelLimitsSection(rows))
             .map_err(ConfigSectionMutationError::Store)?;
-        config_runtime::publish_registry_event(&self.account_sink, &event).await;
+        if let Some(event) = event {
+            config_runtime::publish_registry_event(&self.account_sink, &event).await;
+        }
         Ok(())
     }
 

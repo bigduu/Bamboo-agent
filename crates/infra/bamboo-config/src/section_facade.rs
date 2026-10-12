@@ -5644,6 +5644,16 @@ impl ConfigFacade {
         &self.registry
     }
 
+    /// Replace compatibility model limits against the latest durable section,
+    /// adopting that exact result into this facade before returning success.
+    pub fn replace_compatibility_model_limits(
+        &self,
+        candidate: ModelLimitsSection,
+    ) -> ConfigStoreResult<Option<ConfigSectionEvent>> {
+        crate::ensure_provider_mcp_migration_ready(&self.data_dir)?;
+        self.registry.model_limits.replace_from_durable(candidate)
+    }
+
     pub fn effective_config(&self) -> Config {
         self.registry.projection().into_config()
     }
