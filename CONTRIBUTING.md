@@ -210,21 +210,41 @@ the moving `dev` branch directly to `main`.
    merge the latest `dev` tip or unrelated features into the release to chase
    ongoing development. If a broader release is needed, explicitly choose and
    record a new cut and scope on a new release branch.
-3. For a necessary release fix, branch from the frozen release head, keep the
-   change within the recorded release scope, and submit it to protected `dev`
-   through normal review and checks. Preserve that exact fix commit's ancestry
-   when merging into `dev` (do not squash or rebase it into a different commit).
-   Only then fast-forward the release branch to that reviewed fix head. Do not
-   merge `dev` back into the release. If ancestry cannot be preserved under the
-   existing branch rules, stop and choose a new accepted cut through the normal
-   process; never bypass protection.
+3. For a necessary release fix, branch from the frozen release head and keep
+   the original fix head `F` within the recorded release scope. Record `F`'s
+   exact SHA/tree and bounded diff as the intended release target; independently
+   review and run the complete release-source gates on that exact `F`, including
+   full Linux/macOS/Windows coverage. Preserve `F` unchanged while admitting it
+   to protected `dev` (do not squash or rebase it into a different commit).
+   If `dev` has advanced, use a separate integration head `U` containing both
+   `F` and the current protected `dev` head. Keep `U` up to date as strict branch
+   protection requires, and submit it through normal current-head/base review
+   and required checks. Record `U`'s exact SHA/tree, review/check receipts, and
+   normal admission into `dev`, with exact `F` → `U` → accepted-`dev` ancestry.
+   Keep release-source and integration validation separate: `U`'s checks cannot
+   replace `F`'s complete release-source checks, and `F`'s checks cannot replace
+   `U`'s normal integration checks. Bind both receipts to their respective
+   SHA/tree, even if the two heads coincide when no dev update is needed.
+   Only after both pass and `F` is admitted through `U`, fast-forward the release
+   branch to the recorded original fix head `F`; never substitute `U` or its
+   dev merge result for recorded `F`. Review must reject any other repair target,
+   even if its ancestry gate passes. Do not merge unrelated `dev` work into the
+   release. A changed `F` requires fresh source evidence and normal admission.
+   Pending or failing checks block this route; fix and rerun them, never change
+   the cut to evade a gate. Only if existing branch rules cannot preserve exact
+   `F` ancestry, or the necessary repair cannot stay within the recorded scope,
+   stop and explicitly agree a new cut/scope through the normal process.
+   Never bypass protection.
 4. The required `Promotion Source` gate verifies the actual same-repository
    release branch against the PR's exact head, proves cut → release-head
    ancestry, and proves release-head → protected-`dev` ancestry. Missing proof,
    source drift, or an unbackmerged fix fails closed. Later `dev` commits do not
    invalidate a frozen release. Static CI cannot prove the historical timing of
-   branch creation or judge release scope. Review must verify the fresh cut
-   receipt and actual normal branch creation, as well as the recorded scope.
+   branch creation or judge release scope. In particular, an admitted `U` can
+   pass ancestry while containing unrelated `dev` work; this gate alone cannot
+   authorize `U` as the release target. Review must verify the fresh cut receipt
+   and actual normal branch creation, the recorded scope, and the separate `F`
+   release-source and `U` integration receipts before accepting a repair.
 5. Merge the release PR into `main` only after its current-head review, all
    required checks, the full Linux/macOS/Windows matrix, and normal branch
    protection pass. Main PR checks continue to test the synthetic merge result;
