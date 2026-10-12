@@ -37,6 +37,53 @@ fn user_named_instances_servers_and_environment_fields_remain_runtime_inputs() {
 }
 
 #[test]
+fn mcp_credential_proof_excludes_topology_but_tracks_referenced_values() {
+    let mut config = Config::default();
+    let empty_credentials = credential_digest(ConfigConsumer::McpRuntime, &config);
+    let empty_inputs = input_digest(ConfigConsumer::McpRuntime, &config);
+    config.mcp = serde_json::from_value(json!({
+        "stdio": {"command": "true", "enabled": false, "env": {"EMPTY": ""}},
+        "http": {"url": "http://127.0.0.1:19879/mcp", "enabled": false,
+            "headers": {"X-Optional": ""}}
+    }))
+    .unwrap();
+    assert!(credential_digest(ConfigConsumer::McpRuntime, &config) == empty_credentials);
+    assert!(input_digest(ConfigConsumer::McpRuntime, &config) != empty_inputs);
+
+    for server in &mut config.mcp.servers {
+        match &mut server.transport {
+            bamboo_mcp::TransportConfig::Stdio(stdio) => {
+                stdio
+                    .env
+                    .insert("TOKEN".into(), "stdio-old-sentinel".into());
+                stdio
+                    .env_credential_refs
+                    .insert("TOKEN".into(), "mcp.stdio.token".into());
+            }
+            bamboo_mcp::TransportConfig::StreamableHttp(http) => {
+                http.headers[0].credential_ref = Some("mcp.http.header".into());
+                http.headers[0].value = "http-old-sentinel".into();
+            }
+        }
+    }
+    assert!(credential_digest(ConfigConsumer::McpRuntime, &config) != empty_credentials);
+    for index in 0..config.mcp.servers.len() {
+        let before = credential_digest(ConfigConsumer::McpRuntime, &config);
+        match &mut config.mcp.servers[index].transport {
+            bamboo_mcp::TransportConfig::Stdio(stdio) => {
+                stdio
+                    .env
+                    .insert("TOKEN".into(), "stdio-new-sentinel".into());
+            }
+            bamboo_mcp::TransportConfig::StreamableHttp(http) => {
+                http.headers[0].value = "http-new-sentinel".into();
+            }
+        }
+        assert!(credential_digest(ConfigConsumer::McpRuntime, &config) != before);
+    }
+}
+
+#[test]
 fn legacy_and_uncaptured_consumers_do_not_claim_application() {
     let config = Config::default();
     let state = ConfigApplicationState::default();
@@ -357,6 +404,142 @@ fn actual_provider_and_mcp_publications_preserve_unrelated_receipts() {
             "9876",
         ] {
             assert!(!serialized.contains(forbidden));
+        }
+    });
+}
+
+#[test]
+fn credential_free_mcp_topology_preserves_proxy_proof_without_claiming_rotation() {
+    with_application_runtime(async {
+        for typed in [true, false] {
+            let (dir, state) = application_state_with_core(json!({
+                "provider": "openai", "http_proxy": "http://127.0.0.1:19877",
+                "proxy_auth": {"username": "proxy-user", "password": "topology-proxy-original-sentinel"}
+            }))
+            .await;
+            let store = bamboo_config::CredentialStore::open(dir.path());
+            let credentials = store.revision().unwrap();
+            let provider_before =
+                consumer(&application_report(&state).await, "provider-runtime").clone();
+            let stdio = json!({"credential-free-stdio": {"command": "true", "enabled": false}});
+            // An empty, unreferenced header is metadata, not a credential input.
+            let http = json!({"credential-free-http": {
+                "url": "http://127.0.0.1:19879/mcp", "enabled": false,
+                "headers": {"X-Optional": ""}
+            }});
+            for document in [stdio.clone(), json!({}), http, json!({})] {
+                let candidate: bamboo_mcp::McpConfig = serde_json::from_value(document).unwrap();
+                let expected = serde_json::to_value(&candidate).unwrap();
+                let previous = application_section(&state, SectionId::Mcp).revision;
+                if typed {
+                    state.put_mcp_section(previous, candidate).await.unwrap();
+                } else {
+                    state
+                        .update_legacy_mcp_config(BTreeSet::new(), move |mcp| {
+                            *mcp = candidate;
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                }
+                let revision = application_section(&state, SectionId::Mcp).revision;
+                assert!(revision > previous);
+                assert_eq!(
+                    serde_json::to_value(&state.config.read().await.mcp).unwrap(),
+                    expected
+                );
+                assert_eq!(store.revision().unwrap(), credentials);
+                let report = application_report(&state).await;
+                let mcp = consumer(&report, "mcp-runtime");
+                assert_eq!(mcp["state"], "in_sync");
+                assert_eq!(mcp["credential_source"]["status"], "observed_inputs");
+                assert_eq!(mcp["credential_source"]["revision"], credentials);
+                assert_eq!(mcp["applied_dependencies"]["mcp"], revision);
+                assert_eq!(mcp["applied_dependencies"]["credentials"], credentials);
+                assert_eq!(mcp["last_apply_error"], Value::Null);
+                assert_eq!(consumer(&report, "provider-runtime"), &provider_before);
+                assert_eq!(
+                    consumer(&application_report(&state).await, "mcp-runtime"),
+                    mcp
+                );
+                assert!(!serde_json::to_string(&report)
+                    .unwrap()
+                    .contains("topology-proxy-original-sentinel"));
+            }
+
+            // Observe a sibling writer's new credential document without
+            // replacing the already-running Core proxy inputs.
+            let reference = state
+                .config
+                .read()
+                .await
+                .proxy_auth_credential_ref
+                .clone()
+                .unwrap();
+            store.replace(reference,
+                &json!({"username": "proxy-user", "password": "topology-proxy-rotated-sentinel"}).to_string(),
+                bamboo_config::CredentialSource::User, credentials).unwrap();
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .credentials
+                .reload()
+                .unwrap();
+            let candidate = serde_json::from_value(stdio).unwrap();
+            if typed {
+                state
+                    .put_mcp_section(
+                        application_section(&state, SectionId::Mcp).revision,
+                        candidate,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                state
+                    .update_legacy_mcp_config(BTreeSet::new(), move |mcp| {
+                        *mcp = candidate;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                state
+                    .config
+                    .read()
+                    .await
+                    .proxy_auth
+                    .as_ref()
+                    .unwrap()
+                    .password,
+                "topology-proxy-original-sentinel"
+            );
+            let report = application_report(&state).await;
+            let mcp = consumer(&report, "mcp-runtime");
+            assert_eq!(mcp["state"], "unknown");
+            assert_eq!(mcp["credential_source"]["status"], "unknown");
+            assert_eq!(mcp["applied_dependencies"]["credentials"], Value::Null);
+            assert_eq!(
+                mcp["applied_dependencies"]["mcp"],
+                application_section(&state, SectionId::Mcp).revision
+            );
+            assert_eq!(
+                report["sections"]["credentials"]["revision"],
+                store.revision().unwrap()
+            );
+            assert_eq!(
+                consumer(&application_report(&state).await, "mcp-runtime"),
+                mcp
+            );
+            let serialized = serde_json::to_string(&report).unwrap();
+            for secret in [
+                "topology-proxy-original-sentinel",
+                "topology-proxy-rotated-sentinel",
+            ] {
+                assert!(!serialized.contains(secret));
+            }
         }
     });
 }

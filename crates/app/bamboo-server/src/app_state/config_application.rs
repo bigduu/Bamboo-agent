@@ -711,12 +711,17 @@ fn credential_digest(consumer: ConfigConsumer, config: &Config) -> InputDigest {
             "proxy_auth": config.proxy_auth,
         }),
         ConfigConsumer::McpRuntime => json!({
-            "servers": config.mcp.servers.iter().map(|server| {
+            // Topology and unreferenced fields belong to input_digest, not to
+            // proof of which credential document supplied the runtime secrets.
+            "servers": config.mcp.servers.iter().filter_map(|server| {
                 let values = match &server.transport {
-                    bamboo_mcp::TransportConfig::Stdio(stdio) => json!(stdio.env),
-                    bamboo_mcp::TransportConfig::StreamableHttp(http) => json!(http.headers.iter().map(|h| (&h.name, &h.value)).collect::<BTreeMap<_, _>>()),
+                    bamboo_mcp::TransportConfig::Stdio(stdio) => stdio.env_credential_refs.keys()
+                        .map(|name| (name, stdio.env.get(name))).collect::<BTreeMap<_, _>>(),
+                    bamboo_mcp::TransportConfig::StreamableHttp(http) => http.headers.iter()
+                        .filter(|header| header.credential_ref.is_some())
+                        .map(|header| (&header.name, Some(&header.value))).collect::<BTreeMap<_, _>>(),
                 };
-                (&server.id, values)
+                (!values.is_empty()).then_some((&server.id, values))
             }).collect::<BTreeMap<_, _>>(),
             "proxy_auth": config.proxy_auth,
         }),
