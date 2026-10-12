@@ -2099,7 +2099,10 @@ fn apply_runtime_section(id: SectionId, source: &Config, target: &mut Config) {
         SectionId::ClusterFabric => target.cluster_fabric = source.cluster_fabric.clone(),
         SectionId::Env => target.env_vars = source.env_vars.clone(),
         SectionId::AccessControl => target.access_control = source.access_control.clone(),
-        SectionId::Hooks => target.hooks = source.hooks.clone(),
+        SectionId::Hooks => {
+            target.hooks = source.hooks.clone();
+            target.lifecycle_hooks = source.lifecycle_hooks.clone();
+        }
         SectionId::ModelPolicy => {
             target.keyword_masking = source.keyword_masking.clone();
             target.anthropic_model_mapping = source.anthropic_model_mapping.clone();
@@ -7805,6 +7808,175 @@ for line in sys.stdin:
             &event.event,
             AgentEvent::ConfigChanged { section, .. } if section == "cluster-fabric"
         )));
+    }
+
+    fn lifecycle_hook_section(command: &str) -> Value {
+        serde_json::to_value(bamboo_config::HooksSection {
+            lifecycle_hooks: serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": command}]
+                }]
+            }))
+            .unwrap(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn compatibility_hooks_update_publishes_lifecycle_config_without_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let captured = state.config.read().await.clone();
+        let mut candidate = captured.clone();
+        let hooks: bamboo_config::HooksSection =
+            serde_json::from_value(lifecycle_hook_section("compatibility-lifecycle-generation"))
+                .unwrap();
+        candidate.lifecycle_hooks = hooks.lifecycle_hooks;
+        let expected = candidate.lifecycle_hooks.clone();
+        let published = state
+            .replace_config(candidate, ConfigUpdateEffects::default())
+            .await
+            .unwrap();
+        assert_eq!(published.lifecycle_hooks, expected);
+        assert_eq!(state.config.read().await.lifecycle_hooks, expected);
+        assert_ne!(captured.lifecycle_hooks, expected);
+        assert_eq!(published.server.port, captured.server.port);
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .effective_config()
+                .lifecycle_hooks,
+            expected
+        );
+
+        let mut reset = published;
+        reset.lifecycle_hooks = Default::default();
+        state
+            .replace_config(reset, ConfigUpdateEffects::default())
+            .await
+            .unwrap();
+        assert!(state.config.read().await.lifecycle_hooks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn typed_hooks_update_publishes_lifecycle_config_for_new_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let captured_run_config = state.config.read().await.clone();
+        let facade = state.config_facade.as_ref().unwrap();
+        let initial = facade.registry().envelope_value(SectionId::Hooks).unwrap();
+        let candidate = lifecycle_hook_section("hook-generation-one");
+        let expected: bamboo_config::HooksSection =
+            serde_json::from_value(candidate.clone()).unwrap();
+
+        let committed = state
+            .put_ordinary_section(SectionId::Hooks, initial.revision, candidate)
+            .await
+            .unwrap();
+
+        let next_run_config = state.config.read().await.clone();
+        assert_eq!(next_run_config.lifecycle_hooks, expected.lifecycle_hooks);
+        assert_eq!(next_run_config.server.port, captured_run_config.server.port);
+        assert_eq!(committed.revision, initial.revision + 1);
+        assert_ne!(
+            captured_run_config.lifecycle_hooks, next_run_config.lifecycle_hooks,
+            "already captured run inputs must retain their original generation"
+        );
+
+        let mut invalid = committed.data.clone();
+        invalid["lifecycle_hooks"]["enabled"] = Value::String("invalid".to_string());
+        assert!(state
+            .put_ordinary_section(SectionId::Hooks, committed.revision, invalid)
+            .await
+            .is_err());
+        assert_eq!(
+            state.config.read().await.lifecycle_hooks,
+            expected.lifecycle_hooks,
+            "rejected input must leave the active lifecycle hooks intact"
+        );
+
+        state
+            .put_ordinary_section(
+                SectionId::Hooks,
+                committed.revision,
+                serde_json::to_value(bamboo_config::HooksSection::default()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(state.config.read().await.lifecycle_hooks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn external_hooks_reload_keeps_lkg_and_recovers_lifecycle_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let facade = state.config_facade.as_ref().unwrap();
+        let path = dir.path().join("hooks.json");
+        let initial_revision = facade.registry().hooks.snapshot().revision;
+        let first = lifecycle_hook_section("external-generation-one");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "revision": initial_revision + 1,
+                "data": first
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        state
+            .reload_ordinary_section_for_test(SectionId::Hooks)
+            .await;
+        let first_config = state.config.read().await.clone();
+        assert!(first_config.lifecycle_hooks.enabled);
+        assert_eq!(
+            serde_json::to_value(&first_config.lifecycle_hooks).unwrap(),
+            first["lifecycle_hooks"]
+        );
+
+        std::fs::write(&path, b"{broken").unwrap();
+        state
+            .reload_ordinary_section_for_test(SectionId::Hooks)
+            .await;
+        assert_eq!(
+            state.config.read().await.lifecycle_hooks,
+            first_config.lifecycle_hooks
+        );
+        assert_ne!(
+            facade.registry().hooks.snapshot().status,
+            SectionStatus::Healthy
+        );
+
+        let repaired = lifecycle_hook_section("external-generation-two");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "revision": initial_revision + 2,
+                "data": repaired
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        state
+            .reload_ordinary_section_for_test(SectionId::Hooks)
+            .await;
+        assert_eq!(
+            serde_json::to_value(&state.config.read().await.lifecycle_hooks).unwrap(),
+            repaired["lifecycle_hooks"]
+        );
+        assert_eq!(
+            facade.registry().hooks.snapshot().status,
+            SectionStatus::Healthy
+        );
     }
 
     #[tokio::test]
