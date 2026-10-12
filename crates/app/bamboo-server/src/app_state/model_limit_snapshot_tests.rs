@@ -382,11 +382,17 @@ async fn compatibility_model_limit_writes_and_clear_reach_hosted_rounds_without_
     // middle clear matches the pre-lock snapshot, but must still run after the
     // first replacement. Both equality and revision reads belong inside IO.
     let rows = |context, output| {
-        vec![json!({
-            "model_pattern": "legacy-hosted-model",
-            "max_context_tokens": context,
-            "max_output_tokens": output
-        })]
+        // Use the public row serialization, including optional-field nulls,
+        // so the external writer and HTTP no-op case carry identical rows.
+        vec![
+            serde_json::to_value(bamboo_compression::limits::ModelLimit {
+                model_pattern: "legacy-hosted-model".into(),
+                max_context_tokens: context,
+                max_output_tokens: Some(output),
+                safety_margin: None,
+            })
+            .unwrap(),
+        ]
     };
     let io = state.config_io_lock.lock().await;
     let (first, clear, last, ()) = tokio::join!(
