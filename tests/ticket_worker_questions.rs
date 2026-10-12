@@ -73,7 +73,7 @@ async fn question_observation(store: &bamboo_storage::SessionStoreV2, row: &Valu
         "last_message": child.messages.last(),
         "revision_conflicts": child.messages.iter().filter(|message| {
             message.role == bamboo_domain::Role::Tool
-                && message.content == "authority_unavailable: revision_conflict"
+                && fixture::is_question_revision_conflict(&message.content)
         }).count(),
     });
     observation
@@ -388,11 +388,23 @@ async fn question_diagnostics_identify_each_missing_boundary_and_latest_child() 
 #[test]
 fn question_provider_rejects_non_conflict_and_successful_retries() {
     for result in [
+        "",
+        " ",
         "local_tool_history_unsupported",
         "scope_denied: missing permit",
         "waiting_for_answer",
+        r#"{"status":"waiting_for_answer","request":{"id":"question"}}"#,
         "not a revision_conflict",
+        " revision_conflict",
+        "revision_conflict ",
+        "revision_conflict\n",
+        "authority_unavailable: revision_conflict ",
+        " authority_unavailable: revision_conflict",
+        "authority_unavailable: revision_conflict: details",
+        "error: revision_conflict",
+        "authority_unavailable: authority_unavailable: revision_conflict",
     ] {
+        assert!(!fixture::is_question_revision_conflict(result));
         let probe = fixture::Probe::default();
         let messages =
             json!([{"role":"tool", "tool_call_id":"ticket-native-question-A-0", "content":result}]);
@@ -408,10 +420,127 @@ fn question_provider_rejects_non_conflict_and_successful_retries() {
     }
 }
 
+#[test]
+fn question_provider_rejects_wrong_letter_skipped_and_reused_call_ids() {
+    for ids in [
+        vec!["ticket-native-question-B-0"],
+        vec!["ticket-native-question-A-1"],
+        vec!["ticket-native-question-A-0", "ticket-native-question-A-2"],
+        vec!["ticket-native-question-A-0", "ticket-native-question-A-0"],
+        vec!["ticket-native-question-A-1", "ticket-native-question-A-0"],
+    ] {
+        for content in [
+            "revision_conflict",
+            "authority_unavailable: revision_conflict",
+        ] {
+            let probe = fixture::Probe::default();
+            let messages = json!(ids
+                .iter()
+                .map(|id| json!({
+                    "role":"tool", "tool_call_id":id, "content":content
+                }))
+                .collect::<Vec<_>>());
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fixture::question_call(&messages, "A", &probe)
+                }))
+                .is_err(),
+                "unexpected retry for {messages}"
+            );
+            assert_eq!(probe.questions.load(Ordering::SeqCst), 0);
+            assert_eq!(probe.question_retries.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[actix_web::test]
+async fn question_provider_and_diagnostics_count_only_exact_tool_conflicts() {
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_domain::{Message, Session, ToolCall};
+    let temp = tempfile::tempdir().unwrap();
+    let store = bamboo_storage::SessionStoreV2::new(temp.path().into())
+        .await
+        .unwrap();
+    let root = Session::new("retry-diagnostic-supervisor", "fixture-model");
+    store.save_session(&root).await.unwrap();
+    let mut child = Session::new_child("retry-diagnostic-child", &root.id, "fixture-model", "A");
+    let probe = fixture::Probe::default();
+    // Identical text outside a Tool result is never retry evidence.
+    for content in [
+        "revision_conflict",
+        "authority_unavailable: revision_conflict",
+    ] {
+        child.add_message(Message::system(content));
+        child.add_message(Message::user(content));
+        child.add_message(Message::assistant(content, None));
+    }
+    let mut arguments = None;
+    for (attempt, content) in [
+        "revision_conflict",
+        "authority_unavailable: revision_conflict",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let call: ToolCall = serde_json::from_value(fixture::question_call(
+            &serde_json::to_value(&child.messages).unwrap(),
+            "A",
+            &probe,
+        ))
+        .unwrap();
+        assert_eq!(call.id, format!("ticket-native-question-A-{attempt}"));
+        assert_eq!(call.function.name, "Task");
+        if let Some(original) = &arguments {
+            assert_eq!(&call.function.arguments, original);
+        } else {
+            arguments = Some(call.function.arguments.clone());
+        }
+        assert_eq!(probe.question_retries.load(Ordering::SeqCst), attempt);
+        child.add_message(Message::assistant("", Some(vec![call.clone()])));
+        child.add_message(Message::tool_result_with_status(&call.id, content, false));
+    }
+    let retry: ToolCall = serde_json::from_value(fixture::question_call(
+        &serde_json::to_value(&child.messages).unwrap(),
+        "A",
+        &probe,
+    ))
+    .unwrap();
+    assert_eq!(retry.id, "ticket-native-question-A-2");
+    assert_eq!(retry.function.name, "Task");
+    assert_eq!(retry.function.arguments, arguments.unwrap());
+    // Unrelated and successful Tool results are not persisted conflict counts.
+    child.add_message(Message::tool_result("success", "waiting_for_answer"));
+    child.add_message(Message::tool_result_with_status(
+        "unrelated",
+        "error: revision_conflict",
+        false,
+    ));
+    store.save_session(&child).await.unwrap();
+    let observed = question_observation(
+        &store,
+        &json!({
+            "assignments":[{"runtime":{"session_id":child.id}}]
+        }),
+    )
+    .await;
+    assert_eq!(observed["child"]["revision_conflicts"], 2);
+    assert_eq!(probe.questions.load(Ordering::SeqCst), 3);
+    assert_eq!(probe.question_retries.load(Ordering::SeqCst), 2);
+}
+
 // Deterministic adapter + controlled-provider regression. This does not inject a
 // conflict into the real Host: the five-Native-Worker test owns that evidence.
 #[test]
 fn question_provider_retries_real_revision_conflict_with_valid_local_history() {
+    assert_question_provider_retries_real_revision_conflict(false);
+}
+
+#[test]
+fn question_provider_retries_real_legacy_revision_conflict_with_valid_local_history() {
+    assert_question_provider_retries_real_revision_conflict(true);
+}
+
+fn assert_question_provider_retries_real_revision_conflict(legacy_bridge: bool) {
     use bamboo_domain::{AgentRuntimeState, Message, Role, Session, ToolCall};
     use bamboo_engine::ticket_worker_plan::{
         tickets::{
@@ -556,9 +685,15 @@ fn question_provider_retries_real_revision_conflict_with_valid_local_history() {
         .unwrap();
     let advance_receipt = service.execute(&supervisor, &advance).unwrap();
     assert!(advance_receipt.committed_seq > stale.expected_seq);
+    let before_conflict = service.published().unwrap().1;
     let error = service.execute(&worker, &stale).unwrap_err();
     assert!(matches!(&error, Error::RevisionConflict), "{error}");
     let after_conflict = service.published().unwrap().1;
+    assert_eq!(
+        serde_json::to_value(&after_conflict).unwrap(),
+        serde_json::to_value(&before_conflict).unwrap(),
+        "stale CAS must not publish a receipt, request, plan or yield"
+    );
     assert_eq!(after_conflict.seq, advance_receipt.committed_seq);
     assert!(after_conflict.requests.is_empty());
     assert_eq!(
@@ -567,13 +702,28 @@ fn question_provider_retries_real_revision_conflict_with_valid_local_history() {
             .plan_revision,
         0
     );
+    assert!(after_conflict.assignments[&assignment_id]
+        .plan
+        .steps
+        .is_empty());
+    assert!(after_conflict.assignments[&assignment_id]
+        .awaiting_request
+        .is_none());
     assert!(!after_conflict.receipts.contains_key(&failed_operation_id));
     assert!(!child.metadata.contains_key(TICKET_QUESTION_YIELD_KEY));
 
-    // RemoteWorkerPlan wraps a real HostBridge error as AuthorityUnavailable;
-    // result_handler persists this exact text with tool_success=false.
-    let conflict_result = Error::AuthorityUnavailable(error.to_string()).to_string();
-    assert_eq!(conflict_result, "authority_unavailable: revision_conflict");
+    // Native TicketWorkerPlan returns the real service error directly. Legacy
+    // RemoteWorkerPlan wraps it once at HostBridge; exercise both wire forms.
+    let conflict_result = if legacy_bridge {
+        let wrapped = Error::AuthorityUnavailable(error.to_string()).to_string();
+        assert_eq!(wrapped, "authority_unavailable: revision_conflict");
+        wrapped
+    } else {
+        let native = error.to_string();
+        assert_eq!(native, "revision_conflict");
+        native
+    };
+    assert!(fixture::is_question_revision_conflict(&conflict_result));
     child.add_message(Message::assistant("", Some(vec![first.clone()])));
     child.add_message(Message::tool_result_with_status(
         &first.id,
@@ -599,6 +749,7 @@ fn question_provider_retries_real_revision_conflict_with_valid_local_history() {
         .unwrap();
     let yielded = service.published().unwrap().1;
     assert_eq!(yielded.seq, after_conflict.seq + 1);
+    assert_eq!(yielded.receipts.len(), after_conflict.receipts.len() + 1);
     assert_eq!(yielded.requests.len(), 1);
     assert!(yielded.submissions.is_empty());
     assert!(!yielded.receipts.contains_key(&failed_operation_id));
@@ -629,6 +780,12 @@ fn question_provider_retries_real_revision_conflict_with_valid_local_history() {
     );
     assert_eq!(current_assignment.plan.plan_revision, 1);
     assert_eq!(current_assignment.plan.steps.len(), 1);
+    assert_eq!(current_assignment.plan.steps[0].id, "own-step");
+    assert_eq!(current_assignment.plan.steps[0].title, "Own private plan A");
+    assert_eq!(
+        serde_json::to_value(current_assignment.plan.steps[0].status).unwrap(),
+        "blocked"
+    );
     assert_eq!(yielded.tickets[&work_id].state, WorkState::Blocked);
     assert!(
         !current_assignment.process_stopped,
@@ -656,6 +813,13 @@ fn question_provider_retries_real_revision_conflict_with_valid_local_history() {
         messages: messages.clone(),
     };
     assert_eq!(history.validate().unwrap().len(), 4);
+    // A successful question result must never authorize another model attempt.
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture::question_call(&serde_json::to_value(&child.messages).unwrap(), "A", &probe)
+    }))
+    .is_err());
+    assert_eq!(probe.questions.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.question_retries.load(Ordering::SeqCst), 1);
     // Negative control: reproduce the old fixture's repeated tool-call ID while
     // leaving message IDs and every other field valid. Production must reject it.
     let mut duplicate = messages;
@@ -678,4 +842,13 @@ fn question_provider_retries_real_revision_conflict_with_valid_local_history() {
     assert_eq!(replayed.seq, yielded.seq);
     assert_eq!(replayed.requests.len(), 1);
     assert_eq!(replayed.assignments[&assignment_id].plan.plan_revision, 1);
+    assert_eq!(
+        serde_json::to_value(&replayed).unwrap(),
+        serde_json::to_value(&yielded).unwrap()
+    );
+    assert_eq!(
+        child.messages.len(),
+        4,
+        "callback replay is not a new provider round"
+    );
 }
