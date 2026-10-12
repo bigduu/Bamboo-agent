@@ -70,6 +70,7 @@ enum ApplicationStatus {
 #[serde(rename_all = "snake_case")]
 pub(super) enum ConfigApplyError {
     ProviderInitializationFailed,
+    McpInitializationFailed,
     RuntimeInputUnavailable,
 }
 
@@ -162,7 +163,7 @@ impl ApplicationInputs {
         observed.apply_runtime_env_overrides();
         let revision = facade.registry().credentials.snapshot().revision;
         let mut failed = BTreeSet::new();
-        for section in [SectionId::Core, SectionId::Providers] {
+        for section in [SectionId::Core, SectionId::Providers, SectionId::Mcp] {
             if facade
                 .hydrate_runtime_section_from_observed_credentials(section, &mut observed)
                 .ok()
@@ -171,7 +172,7 @@ impl ApplicationInputs {
                 failed.insert(section);
             }
         }
-        for consumer in [ConfigConsumer::ProviderRuntime] {
+        for consumer in [ConfigConsumer::ProviderRuntime, ConfigConsumer::McpRuntime] {
             if requires_credential_document(consumer, config)
                 && !consumer.dependencies().iter().any(|id| failed.contains(id))
                 && self.credential_digests.get(&consumer)
@@ -283,6 +284,10 @@ impl ConfigApplicationState {
         }
     }
 
+    pub(super) fn forget_applied(&mut self, consumer: ConfigConsumer) {
+        self.receipts.remove(&consumer);
+    }
+
     pub(super) fn record_published(&mut self, section: SectionId, revision: u64) {
         self.published_revisions.insert(section, revision);
     }
@@ -290,7 +295,10 @@ impl ConfigApplicationState {
     /// Call only after this consumer has actually published its staged runtime,
     /// while the existing config_io_lock still owns the publication generation.
     pub(super) fn record_applied(&mut self, consumer: ConfigConsumer, inputs: &ApplicationInputs) {
-        if !matches!(consumer, ConfigConsumer::ProviderRuntime) {
+        if !matches!(
+            consumer,
+            ConfigConsumer::ProviderRuntime | ConfigConsumer::McpRuntime
+        ) {
             return;
         }
         if (consumer == ConfigConsumer::ProviderRuntime && !inputs.provider_complete)
@@ -558,7 +566,7 @@ impl AppState {
         // variables, mutating health or executing any runtime effect on a GET.
         if let Some(facade) = self.config_facade.as_ref() {
             let revision = facade.registry().credentials.snapshot().revision;
-            for id in [SectionId::Core, SectionId::Providers] {
+            for id in [SectionId::Core, SectionId::Providers, SectionId::Mcp] {
                 if facade
                     .hydrate_runtime_section_from_observed_credentials(id, &mut desired)
                     .ok()
@@ -621,7 +629,7 @@ impl ConfigConsumer {
     }
 
     fn untracked(self) -> bool {
-        self != Self::ProviderRuntime
+        !matches!(self, Self::ProviderRuntime | Self::McpRuntime)
     }
 
     fn dependencies(self) -> &'static [SectionId] {
@@ -631,6 +639,7 @@ impl ConfigConsumer {
                 SectionId::Core,
                 SectionId::ModelPolicy,
             ],
+            Self::McpRuntime => &[SectionId::Mcp, SectionId::Core],
             _ => &[],
         }
     }
@@ -642,6 +651,7 @@ impl ConfigConsumer {
                 "core.proxy",
                 "model-policy.keyword_masking",
             ],
+            Self::McpRuntime => &["mcp.connections", "core.proxy"],
             _ => &[],
         }
     }
@@ -700,6 +710,16 @@ fn credential_digest(consumer: ConfigConsumer, config: &Config) -> InputDigest {
             "instances": config.provider_instances.iter().map(|(id, p)| (id, &p.api_key)).collect::<BTreeMap<_, _>>(),
             "proxy_auth": config.proxy_auth,
         }),
+        ConfigConsumer::McpRuntime => json!({
+            "servers": config.mcp.servers.iter().map(|server| {
+                let values = match &server.transport {
+                    bamboo_mcp::TransportConfig::Stdio(stdio) => json!(stdio.env),
+                    bamboo_mcp::TransportConfig::StreamableHttp(http) => json!(http.headers.iter().map(|h| (&h.name, &h.value)).collect::<BTreeMap<_, _>>()),
+                };
+                (&server.id, values)
+            }).collect::<BTreeMap<_, _>>(),
+            "proxy_auth": config.proxy_auth,
+        }),
         _ => Value::Null,
     };
     let mut hasher = Sha256::new();
@@ -735,6 +755,21 @@ fn requires_credential_document(consumer: ConfigConsumer, config: &Config) -> bo
                         && !bamboo_config::provider_instance_environment_override_active(p)
                 })
         }
+        ConfigConsumer::McpRuntime => {
+            proxy
+                || config
+                    .mcp
+                    .servers
+                    .iter()
+                    .any(|server| match &server.transport {
+                        bamboo_mcp::TransportConfig::Stdio(stdio) => {
+                            !stdio.env_credential_refs.is_empty()
+                        }
+                        bamboo_mcp::TransportConfig::StreamableHttp(http) => {
+                            http.headers.iter().any(|h| h.credential_ref.is_some())
+                        }
+                    })
+        }
         _ => false,
     }
 }
@@ -743,6 +778,9 @@ fn input_digest(consumer: ConfigConsumer, config: &Config) -> Option<InputDigest
     let projection = match consumer {
         ConfigConsumer::ProviderRuntime => {
             json!({"clients": provider_input(config), "proxy": proxy_input(config), "masking": config.keyword_masking})
+        }
+        ConfigConsumer::McpRuntime => {
+            json!({"mcp": mcp_input(config), "proxy": proxy_input(config)})
         }
         _ => return None,
     };
@@ -757,6 +795,24 @@ fn remove_storage_fields(value: &mut Value, fields: &[&str]) {
             object.remove(*field);
         }
     }
+}
+
+fn mcp_input(config: &Config) -> Value {
+    let mut value = json!(config.mcp);
+    if let Some(servers) = value.as_object_mut() {
+        for server in servers.values_mut() {
+            remove_storage_fields(
+                server,
+                &[
+                    "env_credential_refs",
+                    "header_credential_refs",
+                    "env_encrypted",
+                    "headers_encrypted",
+                ],
+            );
+        }
+    }
+    value
 }
 
 // Object order is not an input change (provider instances include HashMaps).

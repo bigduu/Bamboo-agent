@@ -521,6 +521,7 @@ struct DependentPublication<T> {
     value: T,
     inputs: ApplicationInputs,
     provider_swapped: bool,
+    mcp_swapped: bool,
 }
 
 impl<T> DependentPublication<T> {
@@ -538,6 +539,9 @@ impl<T> DependentPublication<T> {
         state.record_published(id, revision);
         if self.provider_swapped {
             state.record_applied(ConfigConsumer::ProviderRuntime, &self.inputs);
+        }
+        if self.mcp_swapped {
+            state.record_applied(ConfigConsumer::McpRuntime, &self.inputs);
         }
         self.value
     }
@@ -616,6 +620,15 @@ async fn publish_dependent_config<T>(
         return Err(error);
     }
     if result.is_err() {
+        context
+            .config_application
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .record_section_failure(
+                ConfigConsumer::McpRuntime,
+                ConfigApplyError::McpInitializationFailed,
+                adopted_section,
+            );
         return Err(dependent_runtime_error());
     }
     context
@@ -627,6 +640,7 @@ async fn publish_dependent_config<T>(
         value: receipt.expect("successful publication ran the commit callback"),
         inputs,
         provider_swapped,
+        mcp_swapped: changes.mcp,
     })
 }
 
@@ -1393,6 +1407,13 @@ impl ConfigWatcherRuntime {
                                         .await;
                                     } else {
                                         let next_mcp = materialized.config.mcp.clone();
+                                        let mut candidate = config.read().await.clone();
+                                        candidate.mcp = next_mcp.clone();
+                                        let inputs = capture_application_inputs(
+                                            &config_application,
+                                            &candidate,
+                                            config_facade.as_deref(),
+                                        );
                                         let publish_config = config.clone();
                                         match mcp_manager
                                             .reconcile_from_config_transactional_after(
@@ -1409,6 +1430,12 @@ impl ConfigWatcherRuntime {
                                                     section_is_unhealthy(&apply_mcp_health);
                                                 let snapshot = facade.registry().mcp.snapshot();
                                                 let revision = snapshot.revision;
+                                                record_application_success(
+                                                    &config_application,
+                                                    ConfigConsumer::McpRuntime,
+                                                    inputs,
+                                                    Some((SectionId::Mcp, revision)),
+                                                );
                                                 if forced_initial_mcp
                                                     && !startup_root_mcp
                                                     && !pending_root_publications
@@ -1484,6 +1511,11 @@ impl ConfigWatcherRuntime {
                                                 }
                                             }
                                             Err(_) => {
+                                                record_application_failure(
+                                                    &config_application,
+                                                    ConfigConsumer::McpRuntime,
+                                                    ConfigApplyError::McpInitializationFailed,
+                                                );
                                                 retry_legacy_root_publication |=
                                                 publish_staged_facade_section_failure(
                                                     &data_dir,
@@ -3677,6 +3709,13 @@ impl AppState {
                 )
             })?;
         let candidate = hydration_config.mcp.clone();
+        let mut actual = self.config.read().await.clone();
+        actual.mcp = candidate.clone();
+        let inputs = capture_application_inputs(
+            &self.config_application,
+            &actual,
+            self.config_facade.as_deref(),
+        );
         let mut revision = None;
         let mut store_error = None;
         let durable_candidate = credential_ref_mcp_document(&candidate)?;
@@ -3724,6 +3763,11 @@ impl AppState {
             return Err(ConfigSectionMutationError::Store(error));
         }
         if result.is_err() {
+            record_application_failure(
+                &self.config_application,
+                ConfigConsumer::McpRuntime,
+                ConfigApplyError::McpInitializationFailed,
+            );
             let message =
                 "MCP runtime initialization failed; retaining last-known-good runtime".to_string();
             publish_section_failure(
@@ -3737,6 +3781,12 @@ impl AppState {
             return Err(ConfigSectionMutationError::Runtime(message));
         }
         let revision = revision.expect("successful MCP reconcile commits a revision");
+        record_application_success(
+            &self.config_application,
+            ConfigConsumer::McpRuntime,
+            inputs,
+            Some((SectionId::Mcp, revision)),
+        );
         publish_section_success(
             &self.mcp_config_live_health,
             &self.account_sink,
@@ -3792,6 +3842,11 @@ impl AppState {
             let commit_facade = facade.clone();
             let mut durable_candidate = current;
             durable_candidate.mcp = runtime_candidate.clone();
+            let mut inputs = capture_application_inputs(
+                &config_application,
+                &durable_candidate,
+                config_facade.as_deref(),
+            );
             let result = mcp_manager
                 .reconcile_from_config_transactional_after(&runtime_candidate, || async {
                     let mut live_config = config.write().await;
@@ -3820,6 +3875,8 @@ impl AppState {
                                         ));
                                     }
                                 };
+                            inputs.bind_committed_credentials(&committed, installed.metadata.credential_health.revision, Some(facade.as_ref()));
+                            inputs.set_revision(SectionId::Mcp, installed.section.as_ref().expect("MCP commit section").revision);
                             *live_config = committed;
                             commit_events = installed.events;
                             Ok(())
@@ -3845,6 +3902,11 @@ impl AppState {
                 return Err(error);
             }
             if result.is_err() {
+                record_application_failure(
+                    &config_application,
+                    ConfigConsumer::McpRuntime,
+                    ConfigApplyError::McpInitializationFailed,
+                );
                 let message =
                     "MCP runtime initialization failed; retaining last-known-good runtime"
                         .to_string();
@@ -3859,6 +3921,12 @@ impl AppState {
                 return Err(ConfigSectionMutationError::Runtime(message));
             }
 
+            record_application_success(
+                &config_application,
+                ConfigConsumer::McpRuntime,
+                inputs,
+                None,
+            );
             publish_exact_facade_events(&account_sink, &commit_events)
                 .await
                 .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
@@ -3941,8 +4009,16 @@ impl AppState {
             let mut transaction_error = None;
             let mut commit_events = Vec::new();
             let mut published_config = None;
+            let mut committed_mcp_revision = None;
             let commit_dir = app_data_dir.clone();
             let commit_facade = facade.clone();
+            let mut diagnostic_candidate = candidate_config.clone();
+            diagnostic_candidate.mcp = runtime_candidate.clone();
+            let mut inputs = capture_application_inputs(
+                &config_application,
+                &diagnostic_candidate,
+                Some(facade.as_ref()),
+            );
             let result = mcp_manager
                 .reconcile_from_config_transactional_after_forcing(
                     &runtime_candidate,
@@ -3973,7 +4049,9 @@ impl AppState {
                                     );
                                     match install_credential_section_commit(commit, &mut committed, &config_application, SectionId::Mcp) {
                                         Ok(installed) => {
-                                            *live_config = committed.clone();
+                                            inputs.bind_committed_credentials(&committed, installed.metadata.credential_health.revision, Some(facade.as_ref()));
+                                            committed_mcp_revision = Some(installed.section.as_ref().expect("MCP commit section").revision);
+                                    *live_config = committed.clone();
                                             commit_events = installed.events;
                                             published_config = Some(committed);
                                         }
@@ -4011,7 +4089,10 @@ impl AppState {
                                     .mcp
                                     .commit(expected_revision, McpSection(durable_document))
                                 {
-                                    Ok(event) => commit_events.push(event),
+                                    Ok(event) => {
+                                        committed_mcp_revision = Some(config_section_event_revision(&event));
+                                        commit_events.push(event);
+                                    }
                                     Err(error) => {
                                         transaction_error =
                                             Some(map_exact_credential_store_error(error));
@@ -4034,6 +4115,11 @@ impl AppState {
                 return Err(error);
             }
             if result.is_err() {
+                record_application_failure(
+                    &config_application,
+                    ConfigConsumer::McpRuntime,
+                    ConfigApplyError::McpInitializationFailed,
+                );
                 tracing::warn!("legacy MCP runtime staging failed before durable commit");
                 let message =
                     "MCP runtime initialization failed before commit; retaining last-known-good generation"
@@ -4044,8 +4130,14 @@ impl AppState {
             // Runtime/tool-index publication is complete when transactional
             // reconcile returns. Event/health publication therefore cannot
             // prevent an already-committed generation from becoming runtime.
-            publish_exact_facade_events(&account_sink, &commit_events).await?;
             let snapshot = facade.registry().mcp.snapshot();
+            record_application_success(
+                &config_application,
+                ConfigConsumer::McpRuntime,
+                inputs,
+                committed_mcp_revision.map(|revision| (SectionId::Mcp, revision)),
+            );
+            publish_exact_facade_events(&account_sink, &commit_events).await?;
             set_live_health_revision(
                 &mcp_config_live_health,
                 snapshot.revision,
@@ -4081,6 +4173,11 @@ impl AppState {
         let candidate_mcp = McpConfig::default();
         let mut candidate_config = self.config.read().await.clone();
         candidate_config.mcp = candidate_mcp.clone();
+        let mut inputs = capture_application_inputs(
+            &config_application,
+            &candidate_config,
+            self.config_facade.as_deref(),
+        );
         let mut committed = false;
         let mut commit_events = Vec::new();
         let mut store_error = None;
@@ -4098,6 +4195,7 @@ impl AppState {
                     Ok(commit) => {
                         match install_credential_section_commit(commit, &mut candidate_config, &config_application, SectionId::Mcp) {
                             Ok(installed) => {
+                                inputs.set_revision(SectionId::Mcp, installed.section.as_ref().expect("MCP reset section").revision);
                                 *live_config = candidate_config.clone();
                                 commit_events = installed.events;
                                 committed = true;
@@ -4124,6 +4222,11 @@ impl AppState {
             return Err(ConfigSectionMutationError::Store(error));
         }
         if result.is_err() || !committed {
+            record_application_failure(
+                &config_application,
+                ConfigConsumer::McpRuntime,
+                ConfigApplyError::McpInitializationFailed,
+            );
             let message =
                 "MCP reset runtime initialization failed; retaining last-known-good runtime"
                     .to_string();
@@ -4137,10 +4240,16 @@ impl AppState {
             .await;
             return Err(ConfigSectionMutationError::Runtime(message));
         }
+        let revision = facade.registry().mcp.snapshot().revision;
+        record_application_success(
+            &config_application,
+            ConfigConsumer::McpRuntime,
+            inputs,
+            None,
+        );
         publish_exact_facade_events(&self.account_sink, &commit_events)
             .await
             .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
-        let revision = facade.registry().mcp.snapshot().revision;
         publish_section_success(
             &self.mcp_config_live_health,
             &self.account_sink,
@@ -4407,6 +4516,11 @@ impl AppState {
                     }
                 }
                 mcp_manager.reconcile_from_config(&candidate.mcp).await;
+                // This best-effort legacy manager API provides no publication result.
+                config_application
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .forget_applied(ConfigConsumer::McpRuntime);
             }
 
             Ok(commit)
@@ -7127,6 +7241,12 @@ impl AppState {
                 .await
             {
                 Ok(()) => {
+                    record_application_success(
+                        &config_application,
+                        ConfigConsumer::McpRuntime,
+                        inputs,
+                        None,
+                    );
                     if let Some(facade) = config_facade.as_ref() {
                         let snapshot = facade.registry().mcp.snapshot();
                         set_live_health_revision(
@@ -7145,6 +7265,11 @@ impl AppState {
                     }
                 }
                 Err(_) => {
+                    record_application_failure(
+                        &config_application,
+                        ConfigConsumer::McpRuntime,
+                        ConfigApplyError::McpInitializationFailed,
+                    );
                     tracing::warn!("committed MCP generation could not start");
                     let message =
                         "MCP runtime initialization failed; retaining last-known-good runtime"
@@ -9631,6 +9756,82 @@ for line in sys.stdin:
             state.mcp_manager.list_servers(),
             vec!["later-winner".to_string()]
         );
+        state.mcp_manager.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn actual_mcp_publication_receipts_survive_event_journal_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+
+        // Fail journal confirmation deterministically after real MCP publication.
+        // This sink is isolated from AppState's other background event producers.
+        let events_dir = dir.path().join("application-failed-events");
+        let sink = bamboo_engine::events::AccountEventSink::new(events_dir.clone()).unwrap();
+        let lock_path = events_dir.join(".account-journal.lock");
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::create_dir(&lock_path).unwrap();
+        state.account_sink = sink;
+
+        let facade = state.config_facade.as_ref().unwrap();
+        let mut previous_revision = facade.registry().mcp.snapshot().revision;
+        let candidate =
+            working_stdio_mcp_config(dir.path(), "published-before-event-failure", None);
+        for reset in [false, true] {
+            let error = if reset {
+                match state.reset_mcp_section(previous_revision).await {
+                    Err(ConfigSectionMutationError::Runtime(message)) => message,
+                    outcome => panic!("unexpected MCP reset outcome: {outcome:?}"),
+                }
+            } else {
+                let candidate = candidate.clone();
+                state
+                    .update_legacy_mcp_config(BTreeSet::new(), move |mcp| {
+                        *mcp = candidate;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap_err()
+                    .to_string()
+            };
+            assert!(error.contains("account journal"), "{error}");
+
+            let snapshot = facade.registry().mcp.snapshot();
+            assert!(snapshot.revision > previous_revision);
+            previous_revision = snapshot.revision;
+            let expected_servers = if reset {
+                Vec::<String>::new()
+            } else {
+                vec!["published-before-event-failure".to_string()]
+            };
+            assert_eq!(state.mcp_manager.list_servers(), expected_servers);
+            assert_eq!(
+                state
+                    .config
+                    .read()
+                    .await
+                    .mcp
+                    .servers
+                    .iter()
+                    .map(|server| server.id.clone())
+                    .collect::<Vec<_>>(),
+                expected_servers
+            );
+            let report = {
+                let _io = state.config_io_lock.lock().await;
+                serde_json::to_value(state.config_application_diagnostics_locked().await).unwrap()
+            };
+            let mcp = report["consumers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|consumer| consumer["id"] == "mcp-runtime")
+                .unwrap();
+            assert_eq!(mcp["state"], "in_sync");
+            assert_eq!(mcp["applied_dependencies"]["mcp"], snapshot.revision);
+            assert_eq!(mcp["last_apply_error"], Value::Null);
+        }
         state.mcp_manager.shutdown_all().await;
     }
 
