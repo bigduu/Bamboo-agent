@@ -50,7 +50,7 @@ async fn unavailable_mcp(state: &AppState) -> MockServer {
         .respond_with(ResponseTemplate::new(503))
         .mount(&endpoint)
         .await;
-    let mcp: bamboo_config::McpConfig = serde_json::from_value(serde_json::json!({
+    let mcp: bamboo_mcp::config::McpConfig = serde_json::from_value(serde_json::json!({
         "version":1,
         "servers":[{
             "id":"configured-but-unavailable",
