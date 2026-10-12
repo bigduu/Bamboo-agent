@@ -182,7 +182,8 @@ async fn dependent_metadata_only_edits_keep_provider_handles() {
         .await
         .unwrap();
     let mut policy = section(&state, SectionId::ModelPolicy);
-    policy.data["anthropic_model_mapping"] = serde_json::json!({"default_model": "gpt-4o"});
+    policy.data["anthropic_model_mapping"] =
+        serde_json::json!({"mappings":{"claude-alias":"claude-upstream"}});
     state
         .put_ordinary_section(SectionId::ModelPolicy, policy.revision, policy.data)
         .await
@@ -198,6 +199,10 @@ async fn dependent_metadata_only_edits_keep_provider_handles() {
         &state.provider_registry.get_default().unwrap()
     ));
     assert_eq!(state.config.read().await.server.port, 24_124);
+    assert_eq!(
+        state.config.read().await.anthropic_model_mapping.mappings["claude-alias"],
+        "claude-upstream"
+    );
 }
 
 #[tokio::test]
