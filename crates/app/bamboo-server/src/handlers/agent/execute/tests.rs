@@ -1097,7 +1097,7 @@ mod execution_input_http {
             let runners = state.agent_runners.read().await;
             let runner = runners.get(id).unwrap();
             assert_eq!(runner.run_id, run);
-            assert!(matches!(runner.status, AgentStatus::Pending));
+            assert!(matches!(runner.status, AgentStatus::Running));
             runner.cancel_token.clone()
         };
         assert!(!token.is_cancelled());
