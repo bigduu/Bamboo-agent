@@ -160,7 +160,8 @@ async fn admitted_peer_survives_preoutput_error_and_resumed_startup_logs_no_body
     let mut root = Session::new("startup-privacy-root", "startup-privacy-model");
     root.set_project_id_meta("startup-privacy-project");
     store.save_session(&root).await.unwrap();
-    let child = Session::new_child_of("PRIVATE_PEER_SOURCE", &root, "model", "source");
+    let mut child = Session::new_child_of("PRIVATE_PEER_SOURCE", &root, "model", "source");
+    child.set_project_id_meta("startup-privacy-project");
     store.save_session(&child).await.unwrap();
     let inbox = Arc::new(bamboo_storage::FileSessionInbox::new(
         store.clone(),
@@ -174,13 +175,21 @@ async fn admitted_peer_survives_preoutput_error_and_resumed_startup_logs_no_body
     .with_root_actor_directory(store.clone());
     let mut peer =
         SessionMessageEnvelope::user_input(&root.id, "PRIVATE_PEER_BODY 界\nsecond line");
-    peer.id = SessionMessageId::parse("PRIVATE_PEER_MESSAGE_ID").unwrap();
+    let operation_id = "aaaaaaaa-1856-4aab-8abc-0123456789ab";
+    peer.id = SessionMessageId::stable(
+        "session-peer-v1",
+        &serde_json::json!({
+            "source": child.id, "source_birth": child.created_at,
+            "target": root.id, "target_birth": root.created_at,
+            "operation_id": operation_id,
+        }),
+    );
     peer.source = SessionMessageSource::Session {
         session_id: child.id.clone(),
     };
     peer.kind = SessionMessageKind::PeerMessage;
-    peer.thread_id = Some("PRIVATE_PEER_THREAD".into());
-    peer.correlation_id = Some("PRIVATE_PEER_OPERATION".into());
+    peer.thread_id = Some(peer.id.to_string());
+    peer.correlation_id = Some(operation_id.into());
     peer.validate().unwrap();
     inbox
         .deliver_peer_message(
@@ -226,7 +235,17 @@ async fn admitted_peer_survives_preoutput_error_and_resumed_startup_logs_no_body
     // A new legitimate delivery can activate this errored Root. Keep it pending
     // until the real loop boundary, so startup selects the first admitted peer.
     let mut next = peer.clone();
-    next.id = SessionMessageId::new();
+    let next_operation_id = "bbbbbbbb-1856-4aab-8abc-0123456789ab";
+    next.id = SessionMessageId::stable(
+        "session-peer-v1",
+        &serde_json::json!({
+            "source": child.id, "source_birth": child.created_at,
+            "target": root.id, "target_birth": root.created_at,
+            "operation_id": next_operation_id,
+        }),
+    );
+    next.thread_id = Some(next.id.to_string());
+    next.correlation_id = Some(next_operation_id.into());
     next.created_at = chrono::Utc::now();
     next.body = bamboo_domain::SessionMessageBody::Content(
         bamboo_domain::SessionMessageContent::text("second valid peer"),
@@ -278,9 +297,9 @@ async fn admitted_peer_survives_preoutput_error_and_resumed_startup_logs_no_body
     for sentinel in [
         "PRIVATE_PEER_BODY",
         "PRIVATE_PEER_SOURCE",
-        "PRIVATE_PEER_MESSAGE_ID",
-        "PRIVATE_PEER_THREAD",
-        "PRIVATE_PEER_OPERATION",
+        peer.id.as_str(),
+        peer.thread_id.as_deref().unwrap(),
+        operation_id,
     ] {
         assert!(
             !logs.contains(sentinel),
