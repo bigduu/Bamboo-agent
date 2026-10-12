@@ -1038,18 +1038,196 @@ mod execution_input_http {
         (envelope, completion)
     }
 
-    async fn run_owned_http_child_selection_race(initially_running: bool, collide_on_retry: bool) {
-        use bamboo_domain::session::runtime_state::{
-            AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState,
-            WaitingForChildrenState,
+    // Exercise the coordinator's real locked preparation without launching its
+    // automatic Root. Dropping this unpublished launch must retire its exact
+    // Actor/registry reservation before the gated HTTP request continues.
+    async fn prepare_child_interrupt_for_http(
+        state: &web::Data<crate::AppState>,
+        id: &str,
+        initial_run: &str,
+        wait: &bamboo_domain::session::runtime_state::WaitingForChildrenState,
+    ) -> String {
+        use bamboo_domain::{ActorActivationStatus, ActorDirectoryPort};
+        use bamboo_engine::{SessionActivationReserveOutcome, SessionActivationSpawner};
+        let backlog = state.session_inbox.inspect(id).await.unwrap();
+        assert_eq!(backlog.pending, 1);
+        assert_eq!(backlog.claimed, 0);
+        assert!(backlog.activation_pending());
+        assert!(backlog.interrupt_pending());
+        assert_eq!(backlog.coordinator_generation, 0);
+        assert!(state
+            .session_activation_router
+            .current_run_id(id)
+            .await
+            .is_none());
+        let saved = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(!saved.has_pending_question());
+        assert_eq!(
+            saved
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .waiting_for_children
+                .as_ref(),
+            Some(wait)
+        );
+        let retired = state
+            .session_store
+            .inspect_actor(id)
+            .await
+            .unwrap()
+            .activation
+            .unwrap();
+        assert_eq!(retired.run_id, initial_run);
+        assert_eq!(retired.attempt, 1);
+        assert_eq!(retired.status, ActorActivationStatus::Cancelled);
+        assert!(retired.finished_at.is_some());
+        let launch = match state
+            .child_completion_coordinator
+            .reserve_activation(id, backlog.generation)
+            .await
+            .unwrap()
+        {
+            SessionActivationReserveOutcome::Reserved(launch) => launch,
+            _ => panic!("eligible ChildOutcome must reach real coordinator preparation"),
         };
-        use bamboo_engine::execution::ChildCompletionHandler;
+        let run = launch.run_id.clone();
+        assert_ne!(run, initial_run);
+        let token = {
+            let runners = state.agent_runners.read().await;
+            let runner = runners.get(id).unwrap();
+            assert_eq!(runner.run_id, run);
+            assert!(matches!(runner.status, AgentStatus::Pending));
+            runner.cancel_token.clone()
+        };
+        assert!(!token.is_cancelled());
+        let prepared_actor = state
+            .session_store
+            .inspect_actor(id)
+            .await
+            .unwrap()
+            .activation
+            .unwrap();
+        assert_eq!(prepared_actor.run_id, run);
+        assert_eq!(prepared_actor.attempt, 2);
+        assert_eq!(prepared_actor.status, ActorActivationStatus::Running);
+        drop(launch);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let actor = state
+                    .session_store
+                    .inspect_actor(id)
+                    .await
+                    .unwrap()
+                    .activation
+                    .unwrap();
+                assert_eq!(actor.fence(), prepared_actor.fence());
+                if actor.status == ActorActivationStatus::Cancelled
+                    && actor.finished_at.is_some()
+                    && !state.agent_runners.read().await.contains_key(id)
+                    && state
+                        .session_activation_router
+                        .current_run_id(id)
+                        .await
+                        .is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exact unpublished preparation rollback within 15 seconds");
+        assert!(token.is_cancelled());
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap(), backlog);
+        let prepared = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(prepared.messages.is_empty());
+        let runtime = prepared.agent_runtime_state.as_ref().unwrap();
+        assert_eq!(
+            runtime.status,
+            bamboo_domain::session::runtime_state::AgentStatusState::Idle
+        );
+        assert!(runtime.suspension.is_none());
+        assert_eq!(runtime.waiting_for_children.as_ref(), Some(wait));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&prepared.metadata["agent.runtime.state"])
+                .unwrap(),
+            serde_json::to_value(runtime).unwrap()
+        );
+        assert!(!prepared.metadata.contains_key("runtime.suspend_reason"));
+        run
+    }
+
+    async fn cleanup_child_http_race(
+        state: &web::Data<crate::AppState>,
+        ids: &[&str],
+    ) -> Result<(), String> {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            // AppState::shutdown stops Child/MCP runtimes, not Root tasks.
+            // Cancel only this fixture's actual tokens before awaiting both.
+            {
+                let runners = state.agent_runners.read().await;
+                for id in ids {
+                    if let Some(runner) = runners.get(*id) {
+                        if matches!(runner.status, AgentStatus::Pending | AgentStatus::Running) {
+                            runner.cancel_token.cancel();
+                        }
+                    }
+                }
+            }
+            state.shutdown().await;
+            loop {
+                let mut live = false;
+                for id in ids {
+                    live |= state
+                        .agent_runners
+                        .read()
+                        .await
+                        .get(*id)
+                        .is_some_and(|runner| {
+                            matches!(runner.status, AgentStatus::Pending | AgentStatus::Running)
+                        });
+                    live |= state
+                        .session_activation_router
+                        .current_run_id(id)
+                        .await
+                        .is_some();
+                }
+                // Only the parent is a native Root Actor. A panic before its
+                // creation has no Actor to retire; later failures must await it.
+                if state
+                    .storage
+                    .load_session(ids[0])
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .is_some()
+                {
+                    let actor = bamboo_domain::ActorDirectoryPort::inspect_actor(
+                        state.session_store.as_ref(),
+                        ids[0],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .activation;
+                    live |= actor
+                        .is_some_and(|actor| actor.status.is_live() || actor.finished_at.is_none());
+                }
+                if !live {
+                    return Ok(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            format!("fixture cleanup left a live runner/router/Actor after 15 seconds: {ids:?}")
+        })?
+    }
+
+    async fn run_owned_http_child_selection_race(initially_running: bool, collide_on_retry: bool) {
+        use futures::FutureExt;
         let provider = Arc::new(OwnedRootProvider::default());
         let (_home, state, _) = state_with_provider(None, provider.clone()).await;
-        state
-            .session_activation_router
-            .set_spawner(Arc::new(ManualHttpOnly))
-            .await;
         let id = if collide_on_retry {
             "owned-http-child-retry-collision"
         } else if initially_running {
@@ -1057,6 +1235,50 @@ mod execution_input_http {
         } else {
             "owned-http-empty-child-race"
         };
+        let result = std::panic::AssertUnwindSafe(run_owned_http_child_selection_race_body(
+            state.clone(),
+            provider,
+            id,
+            initially_running,
+            collide_on_retry,
+        ))
+        .catch_unwind()
+        .await;
+        let cleanup =
+            cleanup_child_http_race(&state, &[id, &format!("{id}-fast"), &format!("{id}-slow")])
+                .await;
+        if let Err(panic) = result {
+            if let Err(error) = cleanup {
+                eprintln!("Child HTTP fixture cleanup also failed: {error}");
+            }
+            std::panic::resume_unwind(panic);
+        }
+        cleanup.expect("Child HTTP fixture must finish cleanup before reporting its result");
+        if let Some((status, body)) = result.unwrap() {
+            assert_eq!(
+                status,
+                StatusCode::ACCEPTED,
+                "sole ChildOutcome must make owned HTTP progress: {body}"
+            );
+        }
+    }
+
+    async fn run_owned_http_child_selection_race_body(
+        state: web::Data<crate::AppState>,
+        provider: Arc<OwnedRootProvider>,
+        id: &str,
+        initially_running: bool,
+        collide_on_retry: bool,
+    ) -> Option<(StatusCode, serde_json::Value)> {
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState,
+            WaitingForChildrenState,
+        };
+        use bamboo_engine::execution::ChildCompletionHandler;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
         let fast = format!("{id}-fast");
         let slow = format!("{id}-slow");
         let mut parent = bamboo_agent_core::Session::new(id, "test-model");
@@ -1123,6 +1345,7 @@ mod execution_input_http {
         let (_probe, selected_rx, continue_tx) = selection_probe(id);
         let retry_gate = collide_on_retry.then(|| checked_selection_probe(id));
         let mut contender = None;
+        let mut prepared_run = None;
         let mut events = state.get_session_event_sender(id).await.subscribe();
         let http = super::super::handler::handler(
             state.clone(),
@@ -1168,6 +1391,37 @@ mod execution_input_http {
                     .as_ref(),
                 Some(&wait)
             );
+            let sibling_before =
+                serde_json::to_value(state.storage.load_session(&slow).await.unwrap().unwrap())
+                    .unwrap();
+            prepared_run =
+                Some(prepare_child_interrupt_for_http(&state, id, &initial_run, &wait).await);
+            let envelope = &outcome.as_ref().unwrap().0;
+            assert!(!state
+                .session_inbox
+                .was_admitted(id, &envelope.id)
+                .await
+                .unwrap());
+            let pending = state
+                .session_inbox
+                .pending_child_outcomes(id, &fast)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(pending).unwrap(),
+                serde_json::to_value(vec![envelope]).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(state.storage.load_session(&slow).await.unwrap().unwrap())
+                    .unwrap(),
+                sibling_before
+            );
+            assert_eq!(
+                provider.messages.lock().unwrap().len(),
+                1,
+                "unpublished preparation cannot call Root provider"
+            );
+            assert!(input_taps().lock().unwrap().get(id).unwrap().is_empty());
             continue_tx.send(()).unwrap();
             if let Some((checked_rx, continue_reserve)) = retry_gate {
                 assert!(
@@ -1205,6 +1459,9 @@ mod execution_input_http {
                     .activation
                     .unwrap();
             assert_eq!(actor.fence(), writer.fence);
+            assert_eq!(actor.attempt, 3);
+            assert_ne!(actor.run_id, initial_run);
+            assert_ne!(Some(actor.run_id.as_str()), prepared_run.as_deref());
             assert_eq!(actor.status, bamboo_domain::ActorActivationStatus::Running);
             assert_eq!(
                 state.agent_runners.read().await.get(id).unwrap().run_id,
@@ -1270,7 +1527,7 @@ mod execution_input_http {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         if status != StatusCode::ACCEPTED {
-            shutdown_rejected_race(&state, &[id, &fast, &slow]).await;
+            return Some((status, body));
         }
         assert_eq!(
             status,
@@ -1279,6 +1536,7 @@ mod execution_input_http {
         );
         let run = body["run_id"].as_str().unwrap();
         assert_ne!(run, initial_run);
+        assert_ne!(Some(run), prepared_run.as_deref());
         assert_ne!(Some(run), contender_run.as_deref());
         wait_for_owned_terminal(&state, id, run, &mut events).await;
         let (envelope, completion) = outcome.unwrap();
@@ -1336,7 +1594,7 @@ mod execution_input_http {
                 .activation
                 .unwrap();
         assert_eq!(actor.run_id, run);
-        assert_eq!(actor.attempt, if collide_on_retry { 3 } else { 2 });
+        assert_eq!(actor.attempt, if collide_on_retry { 4 } else { 3 });
         // Production duplicate completion must retain its permanent receipt,
         // not release the unfinished sibling or create another reasoning turn.
         state
@@ -1365,9 +1623,7 @@ mod execution_input_http {
                 .count(),
             1
         );
-        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
-            .await
-            .expect("HTTP race fixture shutdown");
+        None
     }
 
     #[actix_web::test]
