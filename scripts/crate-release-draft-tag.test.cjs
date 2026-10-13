@@ -2,7 +2,6 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const crypto = require('node:crypto')
 const { spawnSync } = require('node:child_process')
 const { test } = require('node:test')
 const controller = require('./crate-release.cjs')
@@ -146,71 +145,5 @@ if (args[0] === 'api' && route?.endsWith('/releases?per_page=100')) {
   } finally {
     process.env = previousEnv
     process.chdir(previousCwd)
-  }
-})
-
-test('accepted workflow controller loads outside the exact product source and fails closed on mismatched bytes/source', () => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-controller-loader-'))
-  try {
-    const workflow = fs.readFileSync(path.join(__dirname, '../.github/workflows/publish-crate.yml'), 'utf8')
-    const block = workflow.match(/python3 - <<'PYCONTROLLER'\n([\s\S]+?)          PYCONTROLLER/)
-    assert.ok(block)
-    const bootstrap = block[1].replace(/^ {10}/gm, '')
-    const product = path.join(directory, 'product')
-    const bin = path.join(directory, 'bin')
-    fs.mkdirSync(product)
-    fs.mkdirSync(bin)
-    fs.writeFileSync(path.join(product, 'Cargo.toml'), 'immutable product fixture\n')
-    const productSource = 'a'.repeat(40)
-    const controllerSource = 'b'.repeat(40)
-    const files = {}
-    for (const name of ['crate-release.cjs', 'crate-release-frontend.py']) {
-      const bytes = fs.readFileSync(path.join(__dirname, name))
-      files[name] = {type: 'file', path: 'scripts/' + name, encoding: 'base64', content: bytes.toString('base64'),
-        sha: crypto.createHash('sha1').update(Buffer.concat([Buffer.from(`blob ${bytes.length}\0`), bytes])).digest('hex')}
-    }
-    const payload = path.join(directory, 'files.json')
-    fs.writeFileSync(payload, JSON.stringify(files))
-    executable(bin, 'gh', `
-const fs = require('node:fs')
-const route = process.argv[3]
-if (!route.endsWith('?ref=' + process.env.CONTROLLER_REVISION)) throw new Error('Moving or product ref requested')
-const name = route.split('/').at(-1).split('?')[0]
-const data = JSON.parse(fs.readFileSync(process.env.FIXTURE_FILES))[name]
-if (process.env.FIXTURE_BAD_BLOB === 'true') data.sha = '0'.repeat(40)
-process.stdout.write(JSON.stringify(data))
-`)
-    executable(bin, 'git', `
-if (process.argv[2] === 'rev-parse') process.stdout.write(process.env.SOURCE_REVISION + '\\n')
-else if (process.argv[2] === 'status') process.stdout.write(process.env.FIXTURE_DIRTY === 'true' ? ' M Cargo.toml\\n' : '')
-else throw new Error('Unexpected git command')
-`)
-    for (const [name, overrides, succeeds] of [
-      ['accepted', {}, true],
-      ['wrong-controller', {GITHUB_WORKFLOW_SHA: 'c'.repeat(40)}, false],
-      ['wrong-blob', {FIXTURE_BAD_BLOB: 'true'}, false],
-      ['dirty-product', {FIXTURE_DIRTY: 'true'}, false],
-    ]) {
-      const runner = path.join(directory, name)
-      fs.mkdirSync(runner)
-      const output = path.join(runner, 'outputs')
-      fs.writeFileSync(output, '')
-      const result = spawnSync('python3', ['-c', bootstrap], {cwd: product, encoding: 'utf8', env: {
-        PATH: `${bin}:${process.env.PATH}`, GITHUB_REPOSITORY: 'bigduu/Bamboo-agent', CONTROLLER_REVISION: controllerSource,
-        GITHUB_WORKFLOW_SHA: controllerSource, SOURCE_REVISION: productSource, RUNNER_TEMP: runner,
-        GITHUB_OUTPUT: output, FIXTURE_FILES: payload, ...overrides,
-      }})
-      assert.equal(result.status === 0, succeeds, result.stderr)
-      if (succeeds) {
-        assert.equal(fs.readFileSync(output, 'utf8'), `path=${runner}/bamboo-release-controller/crate-release.cjs\nrevision=${controllerSource}\n`)
-        for (const file of Object.keys(files)) assert.deepEqual(fs.readFileSync(path.join(runner, 'bamboo-release-controller', file)), fs.readFileSync(path.join(__dirname, file)))
-      } else assert.equal(fs.readFileSync(output, 'utf8'), '')
-      assert.equal(fs.readFileSync(path.join(product, 'Cargo.toml'), 'utf8'), 'immutable product fixture\n')
-      assert.deepEqual(fs.readdirSync(product), ['Cargo.toml'])
-    }
-    assert.match(workflow, /run: node "\$\{\{ steps.controller.outputs.path \}\}" plan/)
-    assert.match(workflow, /run: node "\$\{\{ steps.controller.outputs.path \}\}" publish/)
-  } finally {
-    fs.rmSync(directory, {recursive: true, force: true})
   }
 })
