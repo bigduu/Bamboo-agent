@@ -206,7 +206,7 @@ impl InitialHandoff {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn retained_leader_has_exited(&self) -> io::Result<bool> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.phase != Phase::Pending {

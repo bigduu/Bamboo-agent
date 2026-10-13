@@ -226,7 +226,15 @@ mod process_tests {
         let state = shell.polled.as_ref().unwrap();
         state.wait(10_000).await;
         let reaped = state.process_exited();
-        let removed = bash_runtime::get_shell(&shell.id).is_none();
+        // Capture publication can wake us before the completion owner reaches
+        // its registry removal. Keep the actual wait/drain proof separate.
+        let removed = timeout(Duration::from_secs(2), async {
+            while bash_runtime::get_shell(&shell.id).is_some() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .is_ok();
         // Keep expected-red cleanup distinct from the product observation.
         if !state.is_complete().await {
             shell.kill().await.unwrap();
@@ -347,7 +355,7 @@ mod process_tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn cancelled_initial_exec_before_completion_first_poll_retains_cleanup_request() {
         let _environment = environment();
         let directory = tempfile::tempdir().unwrap();
@@ -363,7 +371,19 @@ mod process_tests {
         assert_eq!(ids.len(), 1);
         let shell = bash_runtime::get_shell(&ids[0]).unwrap();
         drop(invocation);
+        // No await has scheduled the completion task: Drop must retain the
+        // unpublished entry until that owner actually waits and drains.
+        let retained_before_completion = bash_runtime::get_shell(&shell.id).is_some();
+        let reaped_before_completion = shell.polled.as_ref().unwrap().process_exited();
         let (reaped_before_fallback, removed_after_cleanup) = await_initial_cleanup(&shell).await;
+        assert!(
+            retained_before_completion,
+            "initial Drop discarded authority before owned cleanup"
+        );
+        assert!(
+            !reaped_before_completion,
+            "completion unexpectedly ran before its first poll"
+        );
         assert!(
             reaped_before_fallback,
             "initial cancellation was lost before first owner poll"
