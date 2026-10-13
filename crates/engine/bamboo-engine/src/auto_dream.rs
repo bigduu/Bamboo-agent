@@ -1834,6 +1834,41 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             .map(|timestamp| timestamp.with_timezone(&Utc));
 
         for transaction in transactions {
+            // A completed transaction can outlive messages removed by retry or
+            // user-turn truncation. Validate its whole source before replaying
+            // any sink, and discard stale checkpoints without acknowledging
+            // their watermark so the current canonical input is re-extracted.
+            if transaction
+                .batches
+                .iter()
+                .any(|batch| !batch.source_message_ids.is_empty())
+            {
+                let source = ctx
+                    .storage
+                    .load_session(session_id)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "failed to verify checkpoint replay source for {session_id}: {error}"
+                        )
+                    })?;
+                let source_is_current = source.as_ref().is_some_and(|source| {
+                    transaction.batches.iter().all(|batch| {
+                        batch.source_message_ids.iter().all(|id| {
+                            source
+                                .messages
+                                .iter()
+                                .any(|message| message.id == *id && message.role != Role::System)
+                        })
+                    })
+                });
+                if !source_is_current {
+                    for checkpoint in &transaction.batches {
+                        remove_extraction_checkpoint(ctx, session_id, &checkpoint.batch_id).await;
+                    }
+                    continue;
+                }
+            }
             let source_watermark = DateTime::parse_from_rfc3339(&transaction.source_updated_at)
                 .expect("stored checkpoint timestamp was validated while loading")
                 .with_timezone(&Utc);
@@ -4883,6 +4918,150 @@ mod tests {
                 .as_deref(),
             Some(contexts[0].entry.updated_at.to_rfc3339().as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn truncated_checkpoint_source_is_discarded_and_current_input_is_reextracted() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let mut session = Session::new("truncated-checkpoint", "model");
+        session.title = "Truncated checkpoint".to_string();
+        session
+            .compression_events
+            .push(retrieval_event("event", session.created_at));
+        session.add_message(Message::user("A user turn later removed by retry."));
+        let removed_id = session.messages[0].id.clone();
+        storage.save_session(&session).await.expect("save source");
+        let first_response = serde_json::json!({
+            "candidates": [{"title":"Partially written old fact","type":"reference","scope":"global","content":"Old extracted fact","tags":[],"session_id":"source-session-0001","confidence":"high"}],
+            "ledger_candidates": [{"title":"Stale checkpoint todo","kind":"todo","excerpt":"A stale extracted todo","session_id":"source-session-0001","confidence":"high"}],
+            "source_exhausted":true
+        }).to_string();
+        let first_sequence = Arc::new(SequenceProvider::new(vec![first_response]));
+        let first_provider: Arc<dyn LLMProvider> = first_sequence.clone();
+        let memory = MemoryStore::new(temp_dir.path());
+        let context = AutoDreamContext {
+            session_store,
+            storage: storage.clone(),
+            memory: memory.clone(),
+            provider: first_provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let contexts = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].source_message_ids, vec![removed_id.clone()]);
+        let invalid_root = temp_dir.path().join("invalid-ledger-root");
+        std::fs::write(&invalid_root, "not a directory").expect("invalid ledger root");
+        let failing_ledger = LedgerStore::new(&invalid_root);
+        extract_and_persist_durable_candidates(
+            &context,
+            &first_provider,
+            &memory,
+            &failing_ledger,
+            "fast-model",
+            &contexts,
+        )
+        .await
+        .expect_err("retain completed checkpoint after partial sink failure");
+        let stored = load_extraction_checkpoint_transactions(&context, &session.id)
+            .await
+            .expect("stored checkpoint");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].batches[0].source_message_ids, vec![removed_id]);
+        assert!(memory
+            .read_session_state(&session.id)
+            .await
+            .unwrap()
+            .last_extracted_at
+            .is_none());
+
+        session.messages.clear();
+        session.add_message(Message::user("The replacement canonical user turn."));
+        session.updated_at = contexts[0].entry.updated_at + chrono::Duration::seconds(1);
+        let replacement_id = session.messages[0].id.clone();
+        storage
+            .save_session(&session)
+            .await
+            .expect("save truncation");
+        let current = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        assert_eq!(current[0].source_message_ids, vec![replacement_id.clone()]);
+        let fresh_sequence = Arc::new(SequenceProvider::new(vec![extraction_response(
+            "Fresh canonical fact",
+            "Fresh fact from the replacement turn",
+        )]));
+        let fresh_provider: Arc<dyn LLMProvider> = fresh_sequence.clone();
+        let ledger = LedgerStore::new(temp_dir.path().join("valid-ledger"));
+        let writes = extract_and_persist_durable_candidates(
+            &context,
+            &fresh_provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &current,
+        )
+        .await
+        .expect("stale checkpoint must not poison the next extraction");
+        assert_eq!(writes.memory, 1);
+        assert_eq!(writes.ledger, 0);
+        assert_eq!(fresh_sequence.recorded_prompts().len(), 1);
+        let documents = memory
+            .list_memory_documents(MemoryScope::Global, None)
+            .await
+            .unwrap();
+        let fresh = documents
+            .iter()
+            .find(|doc| doc.frontmatter.title == "Fresh canonical fact")
+            .expect("fresh extraction persisted");
+        assert_eq!(
+            fresh.frontmatter.sources[0].message_range,
+            vec![replacement_id]
+        );
+        assert!(
+            ledger
+                .list_records(LedgerScope::Global, None, &RecordFilter::default())
+                .await
+                .unwrap()
+                .is_empty(),
+            "stale unfinished Ledger sink must not be replayed"
+        );
+        assert!(
+            load_extraction_checkpoint_transactions(&context, &session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let no_call = Arc::new(SequenceProvider::new(Vec::new()));
+        let no_call_provider: Arc<dyn LLMProvider> = no_call.clone();
+        let retry = extract_and_persist_durable_candidates(
+            &context,
+            &no_call_provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &current,
+        )
+        .await
+        .expect("later poll must remain healthy");
+        assert_eq!(retry.memory, 0);
+        assert_eq!(retry.ledger, 0);
+        assert!(no_call.recorded_prompts().is_empty());
     }
 
     #[tokio::test]
