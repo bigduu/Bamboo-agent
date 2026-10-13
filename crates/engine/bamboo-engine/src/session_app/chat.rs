@@ -1178,6 +1178,8 @@ mod tests {
     fn resource_scope_cleanup_removes_recovery_bytes_without_widening_skill_ceiling() {
         let mut session = Session::new("scope-cleanup", "model");
         session.set_selected_skill_ids(vec!["review".into()]);
+        session.add_message(Message::user("Keep the prior request"));
+        session.add_message(Message::assistant("Keep the prior result", None));
         let history = session.messages.clone();
         session
             .metadata

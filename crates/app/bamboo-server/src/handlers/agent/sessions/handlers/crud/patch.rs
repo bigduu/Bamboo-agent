@@ -1775,6 +1775,13 @@ mod tests {
         let snapshot = store.export_activation_snapshot(session_id).await.unwrap();
         let entry = &snapshot.skills["review"].catalog_entry;
         session.set_selected_skill_ids(vec!["review".into()]);
+        if session.messages.is_empty() {
+            session.add_message(bamboo_agent_core::Message::user("Keep the prior request"));
+            session.add_message(bamboo_agent_core::Message::assistant(
+                "Keep the prior result",
+                None,
+            ));
+        }
         session.metadata.insert(
             bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY.into(),
             serde_json::to_string(&bamboo_skills::WorkflowSelection {
@@ -1785,14 +1792,23 @@ mod tests {
             })
             .unwrap(),
         );
+        let active: bamboo_skills::ActiveWorkflow = serde_json::from_value(serde_json::json!({
+            "id": entry.id, "source": entry.source, "revision": entry.revision,
+            "kind": "instruction", "args": {}, "invoked_by": "user",
+            "activated_at": chrono::Utc::now(), "status": "active",
+        }))
+        .unwrap();
         session.metadata.insert(
             bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY.into(),
-            serde_json::json!({
-                "id": entry.id, "source": entry.source, "revision": entry.revision,
-                "kind": "instruction", "args": {}, "invoked_by": "user",
-                "activated_at": chrono::Utc::now(), "status": "active",
+            serde_json::to_string(&active).unwrap(),
+        );
+        session.metadata.insert(
+            bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY.into(),
+            serde_json::to_string(&bamboo_skills::DurableWorkflowActivation {
+                active,
+                snapshot: snapshot.clone(),
             })
-            .to_string(),
+            .unwrap(),
         );
         session.metadata.insert(
             bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY.into(),
@@ -1871,6 +1887,11 @@ mod tests {
             )
             .await;
             let old_store = seed_scope_workflow(&state, id).await;
+            let before = state.storage.load_session(id).await.unwrap().unwrap();
+            assert!(before
+                .metadata
+                .contains_key(bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY));
+            assert!(!before.messages.is_empty());
             let app = test::init_service(
                 App::new()
                     .app_data(state.clone())
@@ -1902,10 +1923,19 @@ mod tests {
                 Some(display(target_workspace.path()))
             );
             assert!(old_store.activation_descriptor(id).await.is_none());
+            assert_eq!(
+                serde_json::to_value(&session.messages).unwrap(),
+                serde_json::to_value(&before.messages).unwrap()
+            );
             let restarted = bamboo_storage::SessionStoreV2::new(state.app_data_dir.clone())
                 .await
                 .unwrap();
-            assert_scope_workflow_retired(&restarted.load_session(id).await.unwrap().unwrap());
+            let restored = restarted.load_session(id).await.unwrap().unwrap();
+            assert_scope_workflow_retired(&restored);
+            assert_eq!(
+                serde_json::to_value(&restored.messages).unwrap(),
+                serde_json::to_value(&before.messages).unwrap()
+            );
         }
     }
 
@@ -2009,7 +2039,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn resource_scope_patch_cancellation_finishes_post_save_pin_and_cache_publication() {
+    async fn resource_scope_patch_cancellation_finishes_before_next_scope_activation() {
         let state = new_state().await;
         let original_workspace = tempdir().unwrap();
         let target_workspace = tempdir().unwrap();
@@ -2040,6 +2070,8 @@ mod tests {
         )
         .await;
         let old_store = seed_scope_workflow(&state, id).await;
+        let workspace_before = bamboo_agent_core::workspace_state::peek_workspace(id);
+        let mut feed = state.account_sink.subscribe();
         let hook = super::patch_test_hooks::install(&format!("scope-saved:{id}"));
         let app = test::init_service(
             App::new()
@@ -2064,15 +2096,29 @@ mod tests {
             .unwrap();
         assert_scope_workflow_retired(&state.storage.load_session(id).await.unwrap().unwrap());
         assert!(old_store.activation_descriptor(id).await.is_some());
+        assert_eq!(
+            bamboo_agent_core::workspace_state::peek_workspace(id),
+            workspace_before
+        );
+        assert!(feed.try_recv().is_err());
+        // Poll the same owner used by chat/execute while the durable commit is
+        // paused. Its later activation must wait for all old-scope cleanup.
+        let mut next_owner = Box::pin(state.persistence.acquire_lock(id));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(
+                    std::future::Future::poll(next_owner.as_mut(), cx).is_pending(),
+                )
+            })
+            .await,
+            "the post-save commit must still own the session"
+        );
         caller.abort();
         let _ = caller.await;
         hook.resume.notify_one();
-        let _guard = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            state.persistence.acquire_lock(id),
-        )
-        .await
-        .expect("detached commit must release its owner");
+        let guard = tokio::time::timeout(std::time::Duration::from_secs(5), next_owner)
+            .await
+            .expect("detached commit must release its owner");
         assert!(old_store.activation_descriptor(id).await.is_none());
         let cached = state.sessions.get(id).unwrap().read().clone();
         assert_scope_workflow_retired(&cached);
@@ -2083,6 +2129,35 @@ mod tests {
         assert_eq!(
             cached.workspace_path_meta(),
             Some(display(target_workspace.path()))
+        );
+        let expected_workspace = std::fs::canonicalize(target_workspace.path()).unwrap();
+        assert_eq!(
+            bamboo_agent_core::workspace_state::peek_workspace(id).as_deref(),
+            Some(expected_workspace.as_path())
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
+            .await
+            .expect("detached commit must publish its account event")
+            .unwrap();
+        assert!(matches!(
+            &event.event,
+            bamboo_agent_core::AgentEvent::SessionProjectUpdated {
+                session_id: event_session_id,
+                project_id: Some(event_project_id),
+                workspace_path: Some(event_workspace),
+                metadata_version: 1,
+            } if event_session_id == id
+                && event_project_id == target.id.as_str()
+                && event_workspace == &display(target_workspace.path())
+        ));
+        let new_store = seed_scope_workflow(&state, id).await;
+        assert!(!std::sync::Arc::ptr_eq(&old_store, &new_store));
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert!(old_store.activation_descriptor(id).await.is_none());
+        assert!(
+            new_store.activation_descriptor(id).await.is_some(),
+            "the completed old-scope commit must not retire the next activation"
         );
     }
 
