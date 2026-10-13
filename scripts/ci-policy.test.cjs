@@ -86,13 +86,13 @@ test("macOS link guard preserves Cargo failures and rejects lost or oversized di
   }
 })
 
-test("routine dev pull requests run locked Rust, formatting, and policy checks", () => {
+test("full snapshot and main gates preserve locked Rust, formatting, and policy checks", () => {
   assert.match(workflow, /push:\n\s+branches: \[ main \]/u)
   assert.match(workflow, /pull_request:\n\s+branches: \[ dev, main \]/u)
 
   const testJob = job("test")
   assert.match(testJob, /name: Test\n/u)
-  assert.match(testJob, /name: Test\n    runs-on: ubuntu-latest\n    timeout-minutes: 75\n/u)
+  assert.match(testJob, /runs-on: ubuntu-latest\n    timeout-minutes: 75\n/u)
   assert.match(testJob, /run: cargo build --locked\n/u)
   assert.match(
     testJob,
@@ -100,7 +100,7 @@ test("routine dev pull requests run locked Rust, formatting, and policy checks",
   )
   assert.match(
     testJob,
-    /- name: Test CI workflow policy\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs\n/u,
+    /- name: Test CI workflow policy\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs\n/u,
   )
   assert.match(
     testJob,
@@ -130,14 +130,15 @@ test("routine dev pull requests run locked Rust, formatting, and policy checks",
 
   assert.match(
     contributing,
-    /Pull requests into `dev` run locked Rust build\/test, formatting, and CI workflow policy checks in the required `Test` gate\./u,
+    /Pull requests into `dev` run `Quick Checks`/u,
   )
 })
 
 test("locked Rust test compilation has a separate budget before the complete suite", () => {
   const testJob = job("test")
   const [settings, ...steps] = testJob.split(/(?=^      - )/mu)
-  assert.doesNotMatch(settings, /^    (?:if|continue-on-error):/mu)
+  assert.doesNotMatch(settings, /^    continue-on-error:/mu)
+  assert.match(settings, /if: always\(\) && !cancelled\(\) && \(github\.event_name != 'pull_request' \|\| github\.base_ref == 'main'\)/u)
   assert.match(settings, /^    timeout-minutes: 75$/mu)
 
   const requiredSteps = [
@@ -284,19 +285,19 @@ test("expensive validation jobs stay off dev pull requests", () => {
     "security",
     "deny",
   ]) {
-    assert.ok(job(id).includes(comprehensiveOnly), `${id} must be comprehensive-only`)
+    assert.ok(job(id).includes("if: needs.validation-source.outputs.full == 'true'"), `${id} must be comprehensive-only`)
   }
 })
 
 test("main promotion and manual build policy stays intact", () => {
   const promotion = job("promotion-source")
   assert.match(promotion, /github\.base_ref == 'main'/u)
-  assert.match(promotion, /HEAD_REF.*dev/u)
+  assert.match(promotion, /HEAD_REF.*github\.head_ref/u)
 
   const build = job("build")
   assert.match(build, /github\.event_name == 'workflow_dispatch'/u)
   assert.match(build, /github\.base_ref == 'main'/u)
-  assert.match(build, /github\.head_ref == 'dev'/u)
+  assert.match(build, /startsWith\(github\.head_ref, 'release\/'\)/u)
   assert.match(build, /os: \[ubuntu-latest, macos-latest, windows-latest\]/u)
 })
 
@@ -310,4 +311,282 @@ test("CodeQL stays on the main and manual paths", () => {
     /language: \[ actions, javascript-typescript, python, rust \]/u,
   )
   assert.match(codeqlWorkflow, /build-mode: none/u)
+})
+
+const promotionScript = () => {
+  const block = job("promotion-source").match(/        run: \|\n([\s\S]*)$/u)
+  assert.ok(block, "source proof must stay inline before any checkout")
+  return block[1].split("\n").map((line) => line.replace(/^          /u, "")).join("\n")
+}
+
+test("frozen promotion bootstrap is read-only and leaves merge-tree validation intact", () => {
+  const promotion = job("promotion-source")
+  assert.match(promotion, /permissions:\n      contents: read\n/u)
+  assert.equal((promotion.match(/^      - /gmu) || []).length, 1)
+  assert.doesNotMatch(promotion, /uses:|environment:|continue-on-error:|contents: write|pull_request_target/u)
+  for (const binding of [
+    "GH_TOKEN: ${{ github.token }}",
+    "HEAD_REF: ${{ github.head_ref }}",
+    "HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
+    "HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}",
+  ]) assert.ok(promotion.includes(binding), `missing event binding: ${binding}`)
+  const bootstrap = promotionScript()
+  assert.doesNotMatch(bootstrap.replace(/^#.*$/gmu, ""), /\$\{\{|subprocess|eval\(|exec\(|checkout|https?:\/\/(?!api\.github\.com\/)/u)
+  assert.match(bootstrap, /class NoRedirect\(urllib\.request\.HTTPRedirectHandler\):/u)
+  assert.match(bootstrap, /urllib\.request\.build_opener\(NoRedirect\(\)\)/u)
+  assert.match(bootstrap, /opener\.open\(request, timeout=30\)/u)
+  // No source checkout is pinned over the PR's synthetic merge result.
+  for (const id of ["test", "lint", "e2e-test", "build"]) {
+    assert.match(job(id), /- uses: actions\/checkout@v7\n\n/u)
+  }
+  for (const context of ["Promotion Source", "Test", "Lint", "E2E Tests", "Build (${{ matrix.os }})"]) {
+    assert.ok(workflow.includes(`name: ${context}\n`), `retain required context: ${context}`)
+  }
+  assert.match(contributing, /dev → release\/<40-character-cut-SHA> → main/u)
+  assert.match(contributing, /freshly read its actual current HEAD immediately before/u)
+  assert.match(contributing, /UTC timestamp, full lowercase\n   40-character SHA, tree SHA, fresh branch-read receipt/u)
+  assert.match(contributing, /Static CI cannot prove the historical timing/u)
+  assert.doesNotMatch(contributing, /it need not be\s+the current tip/u)
+  assert.match(contributing, /do not squash or rebase/u)
+  assert.match(contributing, /original fix head `F` within the recorded release scope/u)
+  assert.match(contributing, /integration head `U` containing both\n   `F` and the current protected `dev` head/u)
+  assert.match(contributing, /exact `F` → `U` → accepted-`dev` ancestry/u)
+  assert.match(contributing, /Bind both receipts to their respective\n   SHA\/tree/u)
+  assert.match(contributing, /branch to the recorded original fix head `F`; never substitute `U`/u)
+  assert.match(contributing, /dev merge result for recorded `F`\. Review must reject any other repair target/u)
+  assert.match(contributing, /Pending or failing release-source or required integration checks block this/u)
+  assert.match(contributing, /Only if existing branch rules cannot preserve exact\n   `F` ancestry, or the necessary repair cannot stay within the recorded scope/u)
+  assert.match(contributing, /this gate alone cannot\n   authorize `U` as the release target/u)
+  assert.match(contributing, /Release source and version tags are immutable/u)
+  assert.match(readFileSync("AGENTS.md", "utf8"), /CONTRIBUTING\.md#release-process/u)
+})
+
+test("frozen promotion proves exact ancestry, accepts dev advancement, and rejects missing or changed proof", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-frozen-promotion-"))
+  const git = (...args) => {
+    const result = spawnSync("git", args, { cwd: directory, encoding: "utf8" })
+    assert.equal(result.status, 0, result.stderr)
+    return result.stdout.trim()
+  }
+  let sequence = 0
+  const commit = (label, file = `${++sequence}.txt`) => {
+    writeFileSync(path.join(directory, file), `${label}\n`)
+    git("add", ".")
+    git("commit", "--quiet", "-m", label)
+    return git("rev-parse", "HEAD")
+  }
+  try {
+    git("init", "--quiet")
+    git("config", "user.name", "ci-policy")
+    git("config", "user.email", "ci-policy@example.invalid")
+    commit("root")
+    const cut = commit("accepted cut")
+    git("switch", "--quiet", "-c", "dev")
+    const featureFile = "unrelated-dev-feature.txt"
+    const feature = commit("unrelated ongoing development", featureFile)
+    git("branch", `release/${cut}`, cut)
+    git("switch", "--quiet", "-c", "original-release-fix", cut)
+    const fixFile = "bounded-release-fix.txt"
+    const fix = commit("bounded release fix", fixFile)
+    const pending = commit("not yet backmerged")
+    const isAncestor = (source, target) => {
+      const result = spawnSync("git", ["merge-base", "--is-ancestor", source, target], {
+        cwd: directory, encoding: "utf8",
+      })
+      assert.ok([0, 1].includes(result.status), result.stderr)
+      return result.status === 0
+    }
+    assert.equal(isAncestor(feature, fix), false, "original F is not up to date with dev D1")
+    git("switch", "--quiet", "-c", "strict-dev-integration", feature)
+    git("merge", "--quiet", "--no-ff", "-m", "integration U preserves dev D1 and original F", fix)
+    const integration = git("rev-parse", "HEAD")
+    assert.equal(isAncestor(feature, integration), true, "U contains current dev for strict checks")
+    assert.equal(isAncestor(fix, integration), true, "U preserves exact original F ancestry")
+    git("switch", "--quiet", "dev")
+    // Model only the strict up-to-date ancestry prerequisite. This local merge
+    // does not claim live protected admission or actual review/check receipts.
+    assert.equal(isAncestor(git("rev-parse", "dev"), integration), true)
+    git("merge", "--quiet", "--no-ff", "-m", "model normal admission of reviewed U", integration)
+    const reviewed = git("rev-parse", "HEAD")
+    const advanced = commit("later dev work")
+
+    // Equal patches/trees do not substitute for the original F's ancestry.
+    git("switch", "--quiet", "-c", "cherry-pick-counterexample", feature)
+    git("cherry-pick", "--quiet", fix)
+    const cherryPicked = git("rev-parse", "HEAD")
+    git("switch", "--quiet", "-c", "squash-counterexample", feature)
+    git("merge", "--quiet", "--squash", fix)
+    git("commit", "--quiet", "-m", "squashed fix counterexample")
+    const squashed = git("rev-parse", "HEAD")
+    for (const replacement of [cherryPicked, squashed]) {
+      assert.equal(isAncestor(fix, replacement), false)
+      assert.equal(git("rev-parse", `${replacement}^{tree}`), git("rev-parse", `${integration}^{tree}`))
+    }
+
+    // This models the documented review contract, not a new production gate.
+    // F's release-source receipt and U's integration receipt are separate.
+    const sourceReceipt = { sha: fix, tree: git("rev-parse", `${fix}^{tree}`) }
+    const integrationReceipt = { sha: integration, tree: git("rev-parse", `${integration}^{tree}`), acceptedDev: reviewed }
+    const requireRecordedRepairTarget = (target) => {
+      assert.equal(target, sourceReceipt.sha, "review must require the recorded original fix head F")
+      assert.equal(git("rev-parse", `${target}^{tree}`), sourceReceipt.tree)
+      assert.equal(git("rev-parse", `${integrationReceipt.sha}^{tree}`), integrationReceipt.tree)
+      assert.equal(isAncestor(cut, target), true)
+      assert.equal(isAncestor(feature, integrationReceipt.sha), true)
+      assert.equal(isAncestor(target, integrationReceipt.sha), true)
+      assert.equal(isAncestor(integrationReceipt.sha, integrationReceipt.acceptedDev), true)
+    }
+    requireRecordedRepairTarget(fix)
+    for (const wrongTarget of [integration, reviewed, cherryPicked, squashed, pending]) {
+      assert.throws(() => requireRecordedRepairTarget(wrongTarget), /recorded original fix head F/u)
+    }
+    git("switch", "--quiet", `release/${cut}`)
+    git("merge", "--quiet", "--ff-only", fix)
+    assert.equal(git("rev-parse", "HEAD"), fix, "release advances only to original F")
+    assert.equal(isAncestor(feature, fix), false, "unrelated D1 stays outside the frozen release")
+    assert.equal(git("ls-tree", "--name-only", fix).split("\n").includes(featureFile), false)
+    assert.equal(git("ls-tree", "--name-only", integration).split("\n").includes(featureFile), true)
+    assert.equal(isAncestor(fix, advanced), true, "later dev advancement retains accepted F")
+    git("switch", "--quiet", "dev")
+
+    const bootstrap = promotionScript().match(/^python3 - <<'PYTHON'\n([\s\S]*)\nPYTHON\s*$/u)?.[1]
+    assert.ok(bootstrap, "extract the exact production Python bootstrap")
+    writeFileSync(path.join(directory, "bootstrap.py"), bootstrap)
+    // Execute the production bootstrap unchanged. Only the HTTPS transport is
+    // replaced; comparison results come from this real temporary Git DAG.
+    const fixtureProgram = String.raw`
+import io
+import json
+import os
+import re
+import runpy
+import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
+
+with open("fixture.json") as stream:
+    fixture = json.load(stream)
+counts = {"release": 0, "dev": 0, "compare": 0}
+
+def git(*args):
+    return subprocess.check_output(["git", *args], text=True).strip()
+
+class FixtureOpener:
+    def open(self, request, timeout):
+        assert timeout == 30
+        assert request.get_method() == "GET"
+        assert request.get_header("Authorization") == "Bearer fixture-read-only"
+        prefix = "https://api.github.com/repos/bigduu/Bamboo-agent/"
+        assert request.full_url.startswith(prefix), request.full_url
+        route = request.full_url.removeprefix(prefix)
+        if fixture.get("apiFailure"):
+            raise urllib.error.HTTPError(request.full_url, 403, "fixture denied", {}, None)
+        if fixture.get("redirect"):
+            raise urllib.error.HTTPError(request.full_url, 302, "fixture redirect", {"Location": "https://invalid.example/"}, None)
+        if route.startswith("branches/"):
+            name = urllib.parse.unquote(route.removeprefix("branches/"))
+            key = "dev" if name == "dev" else "release"
+            if key == "release":
+                assert re.fullmatch(r"branches/release%2F[0-9a-f]{40}", route)
+            index = counts[key]
+            counts[key] += 1
+            sha = fixture[key][min(index, len(fixture[key]) - 1)]
+            data = {"name": name, "commit": {"sha": sha}, "protected": True}
+            if key == "dev":
+                protections = fixture.get("protected", [True, True])
+                data["protected"] = protections[min(index, len(protections) - 1)]
+            data.update(fixture.get(key + "Metadata", {}))
+        else:
+            match = re.fullmatch(r"compare/([0-9a-f]{40})\.\.\.([0-9a-f]{40})", route)
+            assert match, route
+            source, target = match.groups()
+            counts["compare"] += 1
+            merge_base = git("merge-base", source, target)
+            status = "identical" if source == target else "ahead" if merge_base == source else "behind" if merge_base == target else "diverged"
+            data = {"status": status, "base_commit": {"sha": source}, "merge_base_commit": {"sha": merge_base}}
+            data.update(fixture.get("comparison", {}))
+        return io.BytesIO(json.dumps(data).encode())
+
+def build_opener(*handlers):
+    assert len(handlers) == 1
+    handler = handlers[0]
+    assert isinstance(handler, urllib.request.HTTPRedirectHandler)
+    assert type(handler) is not urllib.request.HTTPRedirectHandler
+    assert handler.redirect_request(None, None, 302, "redirect", {}, "https://invalid.example/") is None
+    return FixtureOpener()
+
+urllib.request.build_opener = build_opener
+runpy.run_path("bootstrap.py", run_name="__main__")
+assert counts == fixture.get("counts", {"release": 2, "dev": 2, "compare": 2}), counts
+`
+    const run = ({ env = {}, ...fixture } = {}) => {
+      writeFileSync(path.join(directory, "fixture.json"), JSON.stringify({
+        release: [fix, fix], dev: [reviewed, reviewed], ...fixture,
+      }))
+      return spawnSync("python3", ["-c", fixtureProgram], {
+        cwd: directory, encoding: "utf8", env: { ...process.env,
+          GITHUB_REPOSITORY: "bigduu/Bamboo-agent", GH_TOKEN: "fixture-read-only",
+          HEAD_REPOSITORY: "bigduu/Bamboo-agent", HEAD_REF: `release/${cut}`, HEAD_SHA: fix,
+          ...env,
+        },
+      })
+    }
+    for (const [name, fixture] of [
+      ["original F admitted through strict-compatible U excludes unrelated dev work", {}],
+      ["original cut remains accepted after dev advances", { release: [cut, cut], env: { HEAD_SHA: cut } }],
+      ["later dev tip", { dev: [advanced, advanced] }],
+      ["API origin cannot be changed by environment", { env: { GITHUB_API_URL: "https://invalid.example" } }],
+      ["dev advances between metadata reads", { dev: [reviewed, advanced], counts: { release: 2, dev: 2, compare: 3 } }],
+      ["dev and release head may initially be identical", { dev: [fix, fix] }],
+    ]) {
+      const result = run(fixture)
+      assert.equal(result.status, 0, `${name}: ${result.stderr}`)
+      assert.match(result.stdout, /Accepted frozen release/u)
+    }
+    // U also passes the ancestry-only controller after admission. It remains
+    // an invalid repair target under the separately required review contract;
+    // never present this scope decision as an automatic controller guarantee.
+    const integrationAsRelease = run({ release: [integration, integration], env: { HEAD_SHA: integration } })
+    assert.equal(integrationAsRelease.status, 0, integrationAsRelease.stderr)
+    assert.throws(() => requireRecordedRepairTarget(integration), /recorded original fix head F/u)
+
+    for (const [name, fixture] of [
+      ["original F not yet admitted through U", { dev: [feature, feature] }],
+      ["cherry-picked equivalent lacks original F ancestry", { dev: [cherryPicked, cherryPicked] }],
+      ["squashed equivalent lacks original F ancestry", { dev: [squashed, squashed] }],
+      ["fork", { env: { HEAD_REPOSITORY: "someone/Bamboo-agent" } }],
+      ["unexpected target repository", { env: { GITHUB_REPOSITORY: "someone/Bamboo-agent", HEAD_REPOSITORY: "someone/Bamboo-agent" } }],
+      ["direct dev", { env: { HEAD_REF: "dev" } }],
+      ["malformed cut", { env: { HEAD_REF: "release/latest" } }],
+      ["short cut", { env: { HEAD_REF: `release/${cut.slice(0, 12)}` } }],
+      ["uppercase cut", { env: { HEAD_REF: `release/${cut.toUpperCase()}` } }],
+      ["wrong cut ancestor", { env: { HEAD_REF: `release/${feature}` } }],
+      ["missing head", { env: { HEAD_SHA: "" } }],
+      ["missing token", { env: { GH_TOKEN: "" } }],
+      ["release head mismatches PR event", { release: [pending, pending] }],
+      ["release moves during proof", { release: [fix, pending] }],
+      ["unbackmerged release commit", { release: [pending, pending], env: { HEAD_SHA: pending } }],
+      ["dev rewrites to history that excludes the release fix", { dev: [reviewed, feature], counts: { release: 2, dev: 2, compare: 3 } }],
+      ["dev rewrites even though the release head remains an ancestor", { dev: [reviewed, pending], counts: { release: 2, dev: 2, compare: 3 } }],
+      ["dev initially unprotected", { protected: [false, false] }],
+      ["dev loses protection during proof", { protected: [true, false] }],
+      ["truthy protection is insufficient", { protected: ["true", "true"] }],
+      ["missing dev protection", { devMetadata: { protected: null } }],
+      ["branch identity mismatch", { releaseMetadata: { name: "dev" } }],
+      ["invalid branch SHA", { devMetadata: { commit: { sha: "dev" } } }],
+      ["missing ancestry identity", { comparison: { merge_base_commit: {} } }],
+      ["wrong base identity", { comparison: { base_commit: { sha: pending } } }],
+      ["unproven ancestry status", { comparison: { status: "unknown" } }],
+      ["API failure", { apiFailure: true }],
+      ["API redirect", { redirect: true }],
+    ]) {
+      const result = run(fixture)
+      assert.notEqual(result.status, 0, `reject ${name}: ${result.stdout}`)
+      assert.doesNotMatch(result.stdout, /Accepted frozen release/u, name)
+      assert.doesNotMatch(result.stderr, /fixture-read-only/u, "do not expose the credential on failure")
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
 })

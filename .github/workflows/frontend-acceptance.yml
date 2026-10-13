@@ -2,17 +2,19 @@ name: Frontend consumer acceptance
 
 on:
   workflow_dispatch:
+    inputs:
+      snapshot_sha:
+        description: Exact 40-character SHA of the selected ref for source acceptance
+        required: true
+        type: string
   pull_request:
-    branches: [dev]
-    paths:
-      - ".github/workflows/frontend-acceptance.yml"
-      - "scripts/frontend-package-lock.json"
-      - "scripts/release-frontend-policy.test.cjs"
-      - "crates/app/bamboo-server/frontend_package/**"
-      - "crates/app/bamboo-server/src/services/frontend_package.rs"
+    branches: [main]
 
 permissions:
   contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
   lint:
@@ -25,10 +27,17 @@ jobs:
 
       - name: Require the exact clean candidate source
         env:
+          EXPECTED_SNAPSHOT_SHA: ${{ inputs.snapshot_sha }}
           EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$EXPECTED_SNAPSHOT_SHA" =~ ^[0-9a-f]{40}$ ]]
+            test "$EXPECTED_SNAPSHOT_SHA" = "$GITHUB_SHA"
+          fi
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-          test -z "$(git status --porcelain --untracked-files=all)"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -81,10 +90,17 @@ jobs:
 
       - name: Require the exact clean candidate source
         env:
+          EXPECTED_SNAPSHOT_SHA: ${{ inputs.snapshot_sha }}
           EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$EXPECTED_SNAPSHOT_SHA" =~ ^[0-9a-f]{40}$ ]]
+            test "$EXPECTED_SNAPSHOT_SHA" = "$GITHUB_SHA"
+          fi
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-          test -z "$(git status --porcelain --untracked-files=all)"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
 
       - name: Setup Node.js
         uses: actions/setup-node@v7

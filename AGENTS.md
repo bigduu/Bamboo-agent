@@ -12,16 +12,17 @@ Jiandu owns canonical persistence, derived indexes, lexical recall, and Dream sn
 
 ## Parallel Development
 
-Follow [Parallel Development](./gitflow.md). Give each
-bounded Issue one owner, branch and isolated worktree. Related feature PRs feed
-one finite `integration/<batch>`; only its named integrator writes that branch
-and submits the combined candidate to `dev`. Freeze before full validation;
-queue admissions and do not separately merge already-included slices into
-`dev`. Keep scoped evidence separate from exact-head/base acceptance. Assign
-one release owner and one writer for each build output; do not cancel or clean
-another worker's resources. Existing review and protection gates still apply.
-CI deduplication requires the control-PR rollout in that document; these rules do
-not remove existing checks or excuse real failures.
+Follow [Parallel Development](./gitflow.md). Give each bounded Issue one owner,
+branch and isolated worktree; only the named integrator writes a shared batch
+branch. Dev admission uses required fast checks and current review; heavy
+compilation and full tests are advisory for dev, with failures owned and tracked.
+Freeze a recorded batch for complete release acceptance; `release → main` must
+pass the full required suite and platform matrix. Keep one release owner and one
+writer per build output. Preserve exact-source evidence and never cancel or
+clean another worker's resources. The new gate roles require verified workflow
+and separately approved protection configuration; never bypass current gates.
+Use the authoritative [Release Process](./CONTRIBUTING.md#release-process) for
+frozen cuts, repairs and publication.
 
 ## Pull Request Review
 
@@ -31,10 +32,10 @@ For the #791 multi-agent epic, the user's 2026-09-28 delivery instruction takes
 precedence over the per-Issue PR and review steps below. Inventory all related
 PR heads and existing work first, then merge implemented work into one local
 integration baseline. Review integration changes locally and use focused checks
-while assembling it. Run the complete affected regression once after the
-baseline is ready, then submit one PR to `dev` and satisfy its required GitHub
-checks. Do not request or wait for GitHub Codex PR review for this epic. Close
-superseded component PRs and clean only safely merged worktrees after the final
+while assembling it. Submit one PR to `dev` through its required fast GitHub
+checks under the current gate policy. Run the complete affected regression once
+on the frozen release snapshot before promotion to `main`. Do not request or
+wait for GitHub Codex PR review for this epic. Close superseded component PRs and clean only safely merged worktrees after the final
 integration is accepted. Preserve dirty or uncertain worktrees.
 
 - Every non-draft pull request that enters review must have a Codex review for
