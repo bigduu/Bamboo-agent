@@ -372,7 +372,7 @@ fn build_retrieval_window_extraction_batches(
 
 #[derive(Debug, Clone)]
 struct RetrievalExtractionSourceItem {
-    message_id: String,
+    message_id: Option<String>,
     source_item_ordinal: usize,
     session_message_ordinal: usize,
     role: &'static str,
@@ -657,7 +657,11 @@ fn build_retrieval_window_extraction_batches_with_ranges(
             .copied();
         for (segment_index, content) in segments.into_iter().enumerate() {
             source_items.push(RetrievalExtractionSourceItem {
-                message_id: message.id.clone(),
+                // Redacted fields and synthesized Session-note acknowledgements
+                // do not establish coverage of the original canonical message.
+                message_id: (!matches!(message.role, Role::Tool)
+                    && extraction_content == &message.content)
+                    .then(|| message.id.clone()),
                 source_item_ordinal: source_items.len() + 1,
                 session_message_ordinal: *message_index + 1,
                 role,
@@ -700,12 +704,17 @@ fn build_retrieval_window_extraction_batches_with_ranges(
         .map(|(batch_index, items)| {
             // Coverage is captured from host objects, never parsed from prose.
             let mut source_message_ids = Vec::new();
-            if let Some(item) = &previous_tail {
-                source_message_ids.push(item.message_id.clone());
+            if let Some(message_id) = previous_tail
+                .as_ref()
+                .and_then(|item| item.message_id.as_ref())
+            {
+                source_message_ids.push(message_id.clone());
             }
             for (item, _) in &items {
-                if !source_message_ids.contains(&item.message_id) {
-                    source_message_ids.push(item.message_id.clone());
+                if let Some(message_id) = &item.message_id {
+                    if !source_message_ids.contains(message_id) {
+                        source_message_ids.push(message_id.clone());
+                    }
                 }
             }
             let continuation_overlap = previous_tail
@@ -3905,6 +3914,76 @@ mod tests {
                 .1
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn sanitized_tail_has_unknown_coverage_in_batch_and_continuation_overlap() {
+        for tail_kind in ["credential", "session_note"] {
+            let mut session = Session::new("sanitized-source-range", "model");
+            session
+                .compression_events
+                .push(retrieval_event("event", test_time(10)));
+            let safe_ids = (0..RETRIEVAL_EXTRACTION_MAX_SOURCE_ITEMS - 1)
+                .map(|index| {
+                    let id = format!("safe-{index}");
+                    session.messages.push(message_at(
+                        Message::user(format!("Safe input {index}")),
+                        &id,
+                        test_time(11),
+                    ));
+                    id
+                })
+                .collect::<Vec<_>>();
+            if tail_kind == "session_note" {
+                session.messages.push(message_at(
+                    Message::assistant(
+                        "",
+                        Some(vec![ToolCall {
+                            id: "note-call".to_string(),
+                            tool_type: "function".to_string(),
+                            function: FunctionCall {
+                                name: "session_note".to_string(),
+                                arguments: serde_json::json!({"action":"read"}).to_string(),
+                            },
+                        }]),
+                    ),
+                    "note-call-message",
+                    test_time(11),
+                ));
+            }
+            let tail = if tail_kind == "credential" {
+                Message::user("OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz")
+            } else {
+                Message::tool_result(
+                    "note-call",
+                    serde_json::json!({"action":"read","exists":true,"content":"Synthetic Session note body","length_chars":27}).to_string(),
+                )
+            };
+            session
+                .messages
+                .push(message_at(tail, "withheld-tail", test_time(11)));
+            session.messages.push(message_at(
+                Message::user("Safe input after the batch boundary"),
+                "safe-after",
+                test_time(11),
+            ));
+            let batches =
+                build_retrieval_window_extraction_batches_with_ranges(&session, None, false);
+            assert_eq!(batches.len(), 2, "{tail_kind}");
+            assert_eq!(batches[0].1, safe_ids, "{tail_kind}");
+            assert_eq!(batches[1].1, vec!["safe-after".to_string()], "{tail_kind}");
+            assert!(batches[1].0.contains("Continuation overlap"));
+            assert!(!batches
+                .iter()
+                .any(|(_, ids)| ids.contains(&"withheld-tail".to_string())));
+            if tail_kind == "credential" {
+                assert!(batches[0].0.contains(REDACTED_EXTRACTION_SOURCE));
+                assert!(!batches[0].0.contains("sk-proj-abcdefghijklmnopqrstuvwxyz"));
+            } else {
+                assert!(batches[0].0.contains("session_note"));
+                assert!(!batches[0].0.contains("Synthetic Session note body"));
+            }
+        }
     }
 
     #[test]
