@@ -111,7 +111,9 @@ fn spawn_fixture(handler: Fixture, io: tokio::io::DuplexStream) -> tokio::task::
 }
 
 async fn finish_fixture(server: tokio::task::JoinHandle<()>) {
-    tokio::time::timeout(Duration::from_secs(5), server)
+    // The SDK may drain responses for five seconds on EOF; allow cleanup
+    // and task completion to finish after that drain window.
+    tokio::time::timeout(Duration::from_secs(10), server)
         .await
         .expect("fixture server did not stop after client disconnect")
         .expect("fixture server task failed");
