@@ -731,6 +731,95 @@ async fn malformed_inconsistent_or_permission_claiming_reports_are_rejected() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn exit_observation_holds_the_leader_and_nonchild_is_an_error() {
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .args(["-c", "exit 7"])
+        .process_group(0)
+        .kill_on_drop(false);
+    let mut owned = ProcessGroup {
+        child: command.spawn().unwrap(),
+        armed: true,
+    };
+    tokio::time::timeout(Duration::from_secs(2), owned.wait_without_reaping())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(observe_exit(owned.child.id().unwrap()).unwrap());
+    owned.stop().unwrap();
+    assert!(!owned.armed);
+    assert_eq!(owned.child.wait().await.unwrap().code(), Some(7));
+    assert!(owned.child.id().is_none());
+    assert_eq!(
+        observe_exit(std::process::id()).unwrap_err().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn successful_leader_exit_still_cleans_up_its_background_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let command = dir.path().join("nova");
+    let marker = dir.path().join("surviving-child");
+    script(
+        &command,
+        &format!(
+            "(sleep 1; printf survived > {}) >/dev/null 2>&1 &\nprintf '%s\\n' '{}'\nexit 0",
+            quoted(&marker),
+            missing()
+        ),
+    )
+    .await;
+    assert!(
+        run_fixture(&command, &[], STATUS_TIMEOUT, false)
+            .await
+            .unwrap()
+            .success
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(!marker.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_cleans_up_the_unreaped_leader_and_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let command = dir.path().join("nova");
+    let started = dir.path().join("started");
+    let marker = dir.path().join("surviving-child");
+    script(
+        &command,
+        &format!(
+            "(sleep 1; printf survived > {}) &\nprintf '%s' \"$$\" > {}\nexit 0",
+            quoted(&marker),
+            quoted(&started)
+        ),
+    )
+    .await;
+    let task = tokio::spawn(async move { run_fixture(&command, &[], STATUS_TIMEOUT, false).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let pid = tokio::fs::read_to_string(&started)
+                .await
+                .ok()
+                .and_then(|raw| raw.parse::<u32>().ok());
+            if pid.is_some_and(|pid| observe_exit(pid).unwrap()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(!marker.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn output_limits_and_timeout_clean_up_the_owned_process_group() {
     let dir = tempfile::tempdir().unwrap();
     let command = dir.path().join("nova");

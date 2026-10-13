@@ -403,17 +403,155 @@ async fn read_bounded(reader: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>
     Ok(bytes)
 }
 
-/// A separate group keeps timed-out helpers from surviving the owned CLI.
-struct ProcessGroup(Option<u32>);
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        let _ = self.0;
-        #[cfg(unix)]
-        if let Some(group) = self.0.and_then(|id| i32::try_from(id).ok()) {
-            // SAFETY: this is the dedicated process group created for our child.
-            let _ = unsafe { libc::killpg(group, libc::SIGKILL) };
+/// Own the unreaped leader until group cleanup can no longer signal its PGID.
+#[cfg(unix)]
+struct ProcessGroup {
+    child: tokio::process::Child,
+    armed: bool,
+}
+#[cfg(unix)]
+impl ProcessGroup {
+    async fn wait_without_reaping(&mut self) -> std::io::Result<()> {
+        let pid = self
+            .child
+            .id()
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?;
+        loop {
+            match observe_exit(pid) {
+                Ok(true) => return Ok(()),
+                Ok(false) => tokio::time::sleep(Duration::from_millis(25)).await,
+                Err(error) => {
+                    self.armed = false;
+                    return Err(error);
+                }
+            }
         }
     }
+
+    fn stop(&mut self) -> std::io::Result<()> {
+        if !std::mem::replace(&mut self.armed, false) {
+            return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+        }
+        let pid = self
+            .child
+            .id()
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?;
+        let exited = observe_exit(pid)?;
+        let group = i32::try_from(pid).map_err(std::io::Error::other)?;
+        // SAFETY: WNOWAIT proved this unreaped Child still pins our dedicated group.
+        if unsafe { libc::killpg(group, libc::SIGKILL) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) && exited {
+            return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(libc::EPERM) {
+            return confirm_zombie_group(pid);
+        }
+        Err(error)
+    }
+}
+#[cfg(unix)]
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+#[cfg(unix)]
+fn observe_exit(pid: u32) -> std::io::Result<bool> {
+    loop {
+        // This synchronous scope keeps platform siginfo pointers out of async state.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waitid initializes info without reaping our owned child.
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        // SAFETY: successful waitid initializes the SIGCHLD fields; zero means running.
+        return Ok(unsafe { info.si_pid() != 0 });
+    }
+}
+
+/// Darwin excludes zombies from killpg's permission scan. Never infer stop from EPERM.
+#[cfg(target_os = "macos")]
+fn confirm_zombie_group(group: u32) -> std::io::Result<()> {
+    use std::io;
+    let snapshot = || -> io::Result<Vec<(u32, u64, u64)>> {
+        // XNU's bounded list must not fill: a full window can hide truncation.
+        let mut pids = [0 as libc::pid_t; 20];
+        // SAFETY: the typed buffer matches the writable byte count; capture errno now.
+        let (count, error) = unsafe {
+            *libc::__error() = 0;
+            let count = libc::proc_listpgrppids(
+                group as libc::pid_t,
+                pids.as_mut_ptr().cast(),
+                std::mem::size_of_val(&pids) as libc::c_int,
+            );
+            (count, *libc::__error())
+        };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error));
+        }
+        if count <= 0 || count as usize >= pids.len() {
+            return Err(io::Error::other("incomplete owned group PID list"));
+        }
+        let mut pids = pids[..count as usize].to_vec();
+        pids.sort_unstable();
+        if !pids.contains(&(group as libc::pid_t))
+            || pids.iter().any(|pid| *pid <= 0)
+            || pids.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(io::Error::other("invalid owned group PID list"));
+        }
+        let mut identities = Vec::with_capacity(pids.len());
+        for pid in pids {
+            // SAFETY: libc's typed ABI; arg=1 includes the unreaped zombie leader.
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let (count, error) = unsafe {
+                *libc::__error() = 0;
+                let count = libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    1,
+                    (&mut info as *mut libc::proc_bsdinfo).cast(),
+                    std::mem::size_of_val(&info) as libc::c_int,
+                );
+                (count, *libc::__error())
+            };
+            if error != 0 {
+                return Err(io::Error::from_raw_os_error(error));
+            }
+            if count != std::mem::size_of_val(&info) as libc::c_int
+                || info.pbi_pid != pid as u32
+                || info.pbi_pgid != group
+                || info.pbi_status != libc::SZOMB
+                || info.pbi_start_tvsec == 0
+            {
+                return Err(io::Error::other("owned group is not verified zombie-only"));
+            }
+            identities.push((info.pbi_pid, info.pbi_start_tvsec, info.pbi_start_tvusec));
+        }
+        Ok(identities)
+    };
+    // All observed members are zombies and cannot fork. Recheck exact membership/birth.
+    if snapshot()? != snapshot()? {
+        return Err(io::Error::other("owned group changed during observation"));
+    }
+    Ok(())
 }
 
 async fn run_cli(
@@ -428,21 +566,41 @@ async fn run_cli(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(cfg!(not(unix)));
     #[cfg(unix)]
     process.process_group(0);
-    let mut child = process.spawn().map_err(|_| "status_failed")?;
-    let group = ProcessGroup(child.id());
-    let stdout = child.stdout.take().expect("piped Nova stdout");
-    let stderr = child.stderr.take().expect("piped Nova stderr");
+    let child = process.spawn().map_err(|_| "status_failed")?;
+    #[cfg(unix)]
+    let mut child = ProcessGroup { child, armed: true };
+    #[cfg(not(unix))]
+    let mut child = child;
+    #[cfg(unix)]
+    let pipes = &mut child.child;
+    #[cfg(not(unix))]
+    let pipes = &mut child;
+    let stdout = pipes.stdout.take().expect("piped Nova stdout");
+    let stderr = pipes.stderr.take().expect("piped Nova stderr");
     let result = tokio::time::timeout(timeout, async {
-        tokio::try_join!(read_bounded(stdout), read_bounded(stderr), child.wait())
+        #[cfg(unix)]
+        let wait = child.wait_without_reaping();
+        #[cfg(not(unix))]
+        let wait = child.wait();
+        tokio::try_join!(read_bounded(stdout), read_bounded(stderr), wait)
     })
     .await;
-    // Always finish child/group cleanup before releasing the plugin operation lock.
-    drop(group);
-    let _ = child.kill().await;
-    let _ = child.wait().await;
+    // Disarm group signaling before the only reaping wait, including cancellation.
+    #[cfg(unix)]
+    let status = {
+        child.stop().map_err(|_| "invalid_report")?;
+        child.child.wait().await.map_err(|_| "invalid_report")?
+    };
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    #[cfg(unix)]
+    let result = result.map(|joined| joined.map(|(stdout, stderr, ())| (stdout, stderr, status)));
     let (stdout, stderr, status) = result
         .map_err(|_| "status_timeout")?
         .map_err(|_| "invalid_report")?;
