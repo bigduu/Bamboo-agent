@@ -117,6 +117,14 @@ impl PolledShellState {
 
     async fn take(&self, shell_id: &str, max_output_tokens: Option<usize>) -> ExecSessionResult {
         let mut output = self.output.lock().await;
+        Self::take_locked(&mut output, shell_id, max_output_tokens)
+    }
+
+    fn take_locked(
+        output: &mut CapturedOutput,
+        shell_id: &str,
+        max_output_tokens: Option<usize>,
+    ) -> ExecSessionResult {
         let bytes = std::mem::take(&mut output.bytes);
         let decoded = String::from_utf8_lossy(&bytes);
         let budget = max_output_tokens
@@ -316,10 +324,30 @@ async fn poll_initial_result(
     } else {
         state.wait(yield_time_ms).await;
     }
-    let mut result = state.take(&shell.id, max_output_tokens).await;
-    // No await follows this commit. In the terminal case it performs the
-    // actual wait/reap while the still-pending leader identity is retained.
-    if let Some(status) = shell.deliver_initial().map_err(ToolError::Execution)? {
+    let result = take_initial_result(shell, max_output_tokens, &mut delivery, || {}).await?;
+    if result.session_id.is_none() {
+        bash_runtime::remove_shell(&shell.id);
+    }
+    Ok(result_outcome(&result))
+}
+
+/// The last await acquires capture, then ownership and its one output snapshot
+/// commit synchronously under that same lock. A writer cannot finish draining
+/// between a stale snapshot and terminal delivery. The observer is a private
+/// scheduling seam; it does not supply ownership readiness or an exit status.
+async fn take_initial_result(
+    shell: &bash_runtime::ShellSession,
+    max_output_tokens: Option<usize>,
+    delivery: &mut InitialDelivery<'_>,
+    before_commit: impl FnOnce(),
+) -> Result<ExecSessionResult, ToolError> {
+    let state = shell.polled.as_ref().expect("validated initial exec");
+    let mut output = state.output.lock().await;
+    before_commit();
+    // Delivery errors must leave the output cursor untouched for cleanup.
+    let terminal = shell.deliver_initial().map_err(ToolError::Execution)?;
+    let mut result = PolledShellState::take_locked(&mut output, &shell.id, max_output_tokens);
+    if let Some(status) = terminal {
         result.session_id = None;
         result.exit_code = status.code();
         result.status = if result.error.is_some() {
@@ -329,12 +357,15 @@ async fn poll_initial_result(
         } else {
             "completed"
         };
+    } else if shell.initial_handoff.is_some() {
+        // A not-yet-drained initial owner still has a retrievable result handle.
+        result.session_id = Some(shell.id.clone());
+        result.status = "running";
+        result.exit_code = None;
     }
     delivery.delivered = true;
-    if result.session_id.is_none() {
-        bash_runtime::remove_shell(&shell.id);
-    }
-    Ok(result_outcome(&result))
+    drop(output);
+    Ok(result)
 }
 
 #[derive(Deserialize)]
