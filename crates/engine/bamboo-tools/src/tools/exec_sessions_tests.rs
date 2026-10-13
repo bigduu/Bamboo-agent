@@ -204,6 +204,240 @@ mod process_tests {
         )
     }
 
+    struct InitialProcessCleanup<'a> {
+        owner: &'a str,
+        release: PathBuf,
+    }
+
+    impl Drop for InitialProcessCleanup<'_> {
+        fn drop(&mut self) {
+            // A failed setup/assertion still releases every test-owned fixture.
+            // Product PASS is checked before this fallback is used.
+            let _ = std::fs::write(&self.release, b"release");
+            for id in bash_runtime::uncollected_polled_shells_for_session(self.owner) {
+                if let Some(shell) = bash_runtime::get_shell(&id) {
+                    let _ = futures::FutureExt::now_or_never(shell.kill());
+                }
+            }
+        }
+    }
+
+    async fn await_initial_cleanup(shell: &bash_runtime::ShellSession) -> (bool, bool) {
+        let state = shell.polled.as_ref().unwrap();
+        state.wait(10_000).await;
+        let reaped = state.process_exited();
+        // Capture publication can wake us before the completion owner reaches
+        // its registry removal. Keep the actual wait/drain proof separate.
+        let removed = timeout(Duration::from_secs(2), async {
+            while bash_runtime::get_shell(&shell.id).is_some() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .is_ok();
+        // Keep expected-red cleanup distinct from the product observation.
+        if !state.is_complete().await {
+            shell.kill().await.unwrap();
+            state.wait(10_000).await;
+        }
+        assert!(
+            state.process_exited(),
+            "test cleanup did not actually reap its owned leader/group"
+        );
+        assert!(
+            state.is_complete().await,
+            "test cleanup did not finish capture"
+        );
+        bash_runtime::remove_shell(&shell.id);
+        (reaped, removed)
+    }
+
+    #[tokio::test]
+    async fn cancelled_initial_exec_terminates_descendants_before_registry_removal() {
+        let _environment = environment();
+        assert!(crate::LocalTaskResources::current().is_none());
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("initial-tree-{}", uuid::Uuid::new_v4());
+        workspace_state::publish_resolved_workspace(&owner, directory.path().to_path_buf());
+        let _cleanup = InitialProcessCleanup {
+            owner: &owner,
+            release: directory.path().join("release"),
+        };
+        let survivor = start("cat".into(), &owner, true).await;
+        let survivor_id = survivor["session_id"].as_str().unwrap();
+        let tool = ExecCommandTool::new();
+        let mut invocation = tool.invoke(json!({"cmd":
+            "sh -c 'printf started > descendant-started; while [ ! -f release ]; do sleep 0.01; done; printf escaped > late-write' & printf '%s' \"$!\" > descendant-pid; wait"
+        }), context(&owner));
+        assert!(futures::poll!(invocation.as_mut()).is_pending());
+        timeout(Duration::from_secs(3), async {
+            while !directory.path().join("descendant-started").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the real descendant must start before cancellation");
+        let ids = bash_runtime::uncollected_polled_shells_for_session(&owner);
+        let id = ids.iter().find(|id| id.as_str() != survivor_id).unwrap();
+        let shell = bash_runtime::get_shell(id).unwrap();
+        let descendant = std::fs::read_to_string(directory.path().join("descendant-pid")).unwrap();
+        assert!(descendant.parse::<u32>().unwrap() > 0);
+        drop(invocation);
+        let (reaped_before_fallback, removed_after_cleanup) = await_initial_cleanup(&shell).await;
+        std::fs::write(directory.path().join("release"), b"release").unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let late_write = directory.path().join("late-write").exists();
+        let survivor_result = payload(WriteStdinTool::new().invoke(
+            json!({"session_id":survivor_id,"chars":"still alive","eof":true,"yield_time_ms":2000}), context(&owner)
+        ).await.unwrap());
+        assert_eq!(survivor_result["status"], "completed");
+        assert_eq!(survivor_result["exit_code"], 0);
+        assert_eq!(survivor_result["output"], "still alive");
+        eprintln!("INITIAL_TREE_CLEANUP descendant={descendant} reaped={reaped_before_fallback} removed={removed_after_cleanup} late_write={late_write} survivor_completed=true");
+        assert!(
+            reaped_before_fallback,
+            "initial future cancellation did not reap the owned command tree"
+        );
+        assert!(
+            removed_after_cleanup,
+            "completed unpublished entry retained registry capacity"
+        );
+        assert!(
+            !late_write,
+            "a cancelled descendant executed after owned cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_initial_exec_after_natural_exit_retains_leader_until_tree_cleanup() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("initial-natural-exit-{}", uuid::Uuid::new_v4());
+        workspace_state::publish_resolved_workspace(&owner, directory.path().to_path_buf());
+        let _cleanup = InitialProcessCleanup {
+            owner: &owner,
+            release: directory.path().join("release"),
+        };
+        let tool = ExecCommandTool::new();
+        let mut invocation = tool.invoke(json!({"cmd":
+            "sh -c 'printf started > descendant-started; while [ ! -f release ]; do sleep 0.01; done; printf escaped > late-write' & printf '%s' \"$!\" > descendant-pid; exit 7"
+        }), context(&owner));
+        // Do not poll the invoking future again: it cannot deliver while its
+        // completion task reaches the real natural-exit/capture-ready boundary.
+        assert!(futures::poll!(invocation.as_mut()).is_pending());
+        let ids = bash_runtime::uncollected_polled_shells_for_session(&owner);
+        assert_eq!(ids.len(), 1);
+        let shell = bash_runtime::get_shell(&ids[0]).unwrap();
+        let handoff = shell.initial_handoff.as_ref().unwrap();
+        timeout(Duration::from_secs(5), handoff.capture_ready())
+            .await
+            .unwrap();
+        assert!(
+            handoff.retained_leader_has_exited().unwrap(),
+            "WNOWAIT must still observe our unreaped leader"
+        );
+        assert!(
+            !shell.polled.as_ref().unwrap().process_exited(),
+            "readiness is not an actual wait receipt"
+        );
+        assert!(directory.path().join("descendant-started").exists());
+        drop(invocation);
+        let (reaped_before_fallback, removed_after_cleanup) = await_initial_cleanup(&shell).await;
+        std::fs::write(directory.path().join("release"), b"release").unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let late_write = directory.path().join("late-write").exists();
+        eprintln!("INITIAL_NATURAL_EXIT_CLEANUP reaped={reaped_before_fallback} removed={removed_after_cleanup} late_write={late_write}");
+        assert!(reaped_before_fallback);
+        assert!(removed_after_cleanup);
+        assert!(
+            !late_write,
+            "naturally orphaned descendant survived initial cancellation"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_initial_exec_before_completion_first_poll_retains_cleanup_request() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("initial-before-poll-{}", uuid::Uuid::new_v4());
+        let _cleanup = InitialProcessCleanup {
+            owner: &owner,
+            release: directory.path().join("release"),
+        };
+        let tool = ExecCommandTool::new();
+        let mut invocation = tool.invoke(json!({"cmd":"sleep 30 & wait"}), context(&owner));
+        assert!(futures::poll!(invocation.as_mut()).is_pending());
+        let ids = bash_runtime::uncollected_polled_shells_for_session(&owner);
+        assert_eq!(ids.len(), 1);
+        let shell = bash_runtime::get_shell(&ids[0]).unwrap();
+        drop(invocation);
+        // No await has scheduled the completion task: Drop must retain the
+        // unpublished entry until that owner actually waits and drains.
+        let retained_before_completion = bash_runtime::get_shell(&shell.id).is_some();
+        let reaped_before_completion = shell.polled.as_ref().unwrap().process_exited();
+        let (reaped_before_fallback, removed_after_cleanup) = await_initial_cleanup(&shell).await;
+        assert!(
+            retained_before_completion,
+            "initial Drop discarded authority before owned cleanup"
+        );
+        assert!(
+            !reaped_before_completion,
+            "completion unexpectedly ran before its first poll"
+        );
+        assert!(
+            reaped_before_fallback,
+            "initial cancellation was lost before first owner poll"
+        );
+        assert!(removed_after_cleanup);
+    }
+
+    #[tokio::test]
+    async fn cancelled_later_poll_preserves_delivered_exec_handle() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("delivered-later-poll-{}", uuid::Uuid::new_v4());
+        let _cleanup = InitialProcessCleanup {
+            owner: &owner,
+            release: directory.path().join("release"),
+        };
+        let first = start("cat".into(), &owner, true).await;
+        let id = first["session_id"].as_str().unwrap();
+        let tool = WriteStdinTool::new();
+        let mut invocation = tool.invoke(json!({"session_id":id}), context(&owner));
+        assert!(futures::poll!(invocation.as_mut()).is_pending());
+        drop(invocation);
+        let shell = bash_runtime::get_shell(id).unwrap();
+        shell.polled.as_ref().unwrap().wait(250).await;
+        assert!(!shell.polled.as_ref().unwrap().process_exited());
+        let result = payload(
+            tool.invoke(
+                json!({"session_id":id,"chars":"next round","eof":true,"yield_time_ms":2000}),
+                context(&owner),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["exit_code"], 0);
+        assert_eq!(result["output"], "next round");
+    }
+
+    #[tokio::test]
+    async fn terminal_initial_delivery_reaps_before_returning_exact_exit_status() {
+        let _environment = environment();
+        let result = start(
+            "printf out; printf err >&2; exit 7".into(),
+            "initial-terminal-exact",
+            false,
+        )
+        .await;
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["exit_code"], 7);
+        assert!(result.get("session_id").is_none());
+        assert!(result["output"].as_str().unwrap().contains("out"));
+        assert!(result["output"].as_str().unwrap().contains("err"));
+    }
+
     #[tokio::test]
     async fn fast_completion_drains_stdout_and_stderr_before_returning_final_result() {
         let _environment = environment();
