@@ -97,20 +97,37 @@ fn fixture() -> Fixture {
     }
 }
 
-async fn duplex() -> (
-    McpProtocolClient,
-    rmcp::service::RunningService<RoleServer, Fixture>,
-) {
+// Discovery is a bootstrap probe: rmcp waits for a non-discover request
+// before returning a RunningService. Let the client send that first request
+// while the fixture server is still starting, rather than joining both starts.
+fn spawn_fixture(handler: Fixture, io: tokio::io::DuplexStream) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let server = handler
+            .serve(io)
+            .await
+            .expect("fixture server initialization");
+        server.waiting().await.expect("fixture server completion");
+    })
+}
+
+async fn finish_fixture(server: tokio::task::JoinHandle<()>) {
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("fixture server did not stop after client disconnect")
+        .expect("fixture server task failed");
+}
+
+async fn duplex() -> (McpProtocolClient, tokio::task::JoinHandle<()>) {
     let (client_io, server_io) = tokio::io::duplex(32 * 1024);
     let client = McpProtocolClient::new(client_io);
-    let (info, server) = tokio::join!(client.initialize(1_000), fixture().serve(server_io));
-    let info = info.unwrap();
+    let server = spawn_fixture(fixture(), server_io);
+    let info = client.initialize(1_000).await.unwrap();
     assert_eq!(info.protocol_version, ProtocolVersion::V_2026_07_28);
     assert_eq!(
         info.instructions.as_deref(),
         Some("SDK fixture instructions")
     );
-    (client, server.unwrap())
+    (client, server)
 }
 
 #[tokio::test]
@@ -136,7 +153,7 @@ async fn modern_sdk_discovery_pagination_and_structured_result() {
     client.ping(1_000).await.unwrap();
     client.disconnect().await.unwrap();
     assert!(!client.is_connected().await);
-    server.waiting().await.unwrap();
+    finish_fixture(server).await;
 }
 
 async fn assert_idn_output_schema_validation(draft: &str, format: &str, valid: &str) {
@@ -151,9 +168,8 @@ async fn assert_idn_output_schema_validation(draft: &str, format: &str, valid: &
     handler.output_schema = Some(schema.clone());
     let (client_io, server_io) = tokio::io::duplex(32 * 1024);
     let mut client = McpProtocolClient::new(client_io);
-    let (initialized, server) = tokio::join!(client.initialize(1_000), handler.serve(server_io));
-    initialized.unwrap();
-    let server = server.unwrap();
+    let server = spawn_fixture(handler, server_io);
+    client.initialize(1_000).await.unwrap();
 
     // Discover the advertised schema so production list_tools caches the validator.
     let tools = client.list_tools(1_000).await.unwrap();
@@ -184,7 +200,7 @@ async fn assert_idn_output_schema_validation(draft: &str, format: &str, valid: &
         McpStructuredContent::Value(valid)
     );
     client.disconnect().await.unwrap();
-    server.waiting().await.unwrap();
+    finish_fixture(server).await;
 }
 
 #[tokio::test]
@@ -223,7 +239,7 @@ async fn sdk_remote_error_code_and_data_survive_projection() {
         error => panic!("unexpected error {error}"),
     }
     client.disconnect().await.unwrap();
-    server.waiting().await.unwrap();
+    finish_fixture(server).await;
 }
 
 #[tokio::test]
@@ -235,7 +251,7 @@ async fn sdk_timeout_cancels_remote_call_and_keeps_connection_usable() {
     ));
     client.call_tool("echo", json!({}), 1_000).await.unwrap();
     client.disconnect().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(1), server.waiting())
+    tokio::time::timeout(Duration::from_secs(1), server)
         .await
         .unwrap()
         .unwrap();
@@ -250,7 +266,7 @@ async fn sdk_preserves_explicit_null_in_structured_content() {
         .unwrap();
     let content = result.structured_content;
     client.disconnect().await.unwrap();
-    server.waiting().await.unwrap();
+    finish_fixture(server).await;
     assert_eq!(content, McpStructuredContent::Null);
 }
 
@@ -354,8 +370,8 @@ async fn sdk_subscription_routes_tool_changes_and_does_not_duplicate_on_health_c
     handler.subscription_tx = Some(tx);
     let (client_io, server_io) = tokio::io::duplex(32 * 1024);
     let mut client = McpProtocolClient::new(client_io);
-    let (info, server) = tokio::join!(client.initialize(1_000), handler.serve(server_io));
-    info.unwrap();
+    let server = spawn_fixture(handler, server_io);
+    client.initialize(1_000).await.unwrap();
     let sink = rx.recv().await.unwrap();
     let mut notifications = client.take_notification_receiver().await.unwrap();
     sink.notify_tool_list_changed().await.unwrap();
@@ -370,7 +386,7 @@ async fn sdk_subscription_routes_tool_changes_and_does_not_duplicate_on_health_c
         "health checks retain the active subscription"
     );
     client.disconnect().await.unwrap();
-    server.unwrap().waiting().await.unwrap();
+    finish_fixture(server).await;
 }
 
 #[tokio::test]
@@ -379,8 +395,8 @@ async fn timeout_reaches_the_remote_sdk_handler_before_disconnect() {
     let cancelled = handler.cancelled.clone();
     let (client_io, server_io) = tokio::io::duplex(32 * 1024);
     let mut client = McpProtocolClient::new(client_io);
-    let (info, server) = tokio::join!(client.initialize(1_000), handler.serve(server_io));
-    info.unwrap();
+    let server = spawn_fixture(handler, server_io);
+    client.initialize(1_000).await.unwrap();
     assert!(matches!(
         client.call_tool("slow", json!({}), 25).await,
         Err(McpError::Timeout(_))
@@ -394,7 +410,7 @@ async fn timeout_reaches_the_remote_sdk_handler_before_disconnect() {
     .unwrap();
     assert_eq!(cancelled.load(Ordering::SeqCst), 1);
     client.disconnect().await.unwrap();
-    server.unwrap().waiting().await.unwrap();
+    finish_fixture(server).await;
 }
 
 #[tokio::test]
@@ -404,8 +420,8 @@ async fn aborting_bamboo_caller_cancels_remote_call_and_preserves_connection() {
     let cancelled = handler.cancelled.clone();
     let (client_io, server_io) = tokio::io::duplex(32 * 1024);
     let client = Arc::new(McpProtocolClient::new(client_io));
-    let (info, server) = tokio::join!(client.initialize(1_000), handler.serve(server_io));
-    info.unwrap();
+    let server = spawn_fixture(handler, server_io);
+    client.initialize(1_000).await.unwrap();
     let task = tokio::spawn({
         let client = client.clone();
         async move { client.call_tool("slow", json!({}), 10_000).await }
@@ -429,5 +445,5 @@ async fn aborting_bamboo_caller_cancels_remote_call_and_preserves_connection() {
     client.call_tool("echo", json!({}), 1_000).await.unwrap();
     let mut client = Arc::try_unwrap(client).ok().unwrap();
     client.disconnect().await.unwrap();
-    server.unwrap().waiting().await.unwrap();
+    finish_fixture(server).await;
 }
