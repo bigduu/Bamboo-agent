@@ -1,15 +1,15 @@
-# Provider configuration application diagnostics
+# Provider and MCP configuration application diagnostics
 
 `GET /api/v1/bamboo/config/live-health` retains its existing `providers` and
 `mcp` health objects and adds a secret-free `application` object. Health reports
 input validation and last-known-good recovery. Application receipts report the
 configuration actually used by a runtime consumer.
 
-This first slice ([#1891](https://github.com/bigduu/Bamboo-agent/issues/1891))
-tracks `provider-runtime`. MCP, Connect and future-use readers report `unknown`
-until their instrumentation in [#1892](https://github.com/bigduu/Bamboo-agent/issues/1892)
-and [#1893](https://github.com/bigduu/Bamboo-agent/issues/1893). Listeners and
-background services remain `unknown` and need separate instrumentation.
+The foundation ([#1891](https://github.com/bigduu/Bamboo-agent/issues/1891))
+tracks `provider-runtime`; [#1892](https://github.com/bigduu/Bamboo-agent/issues/1892)
+adds `mcp-runtime`. Connect and future-use readers remain explicitly `unknown`
+until their instrumentation in [#1893](https://github.com/bigduu/Bamboo-agent/issues/1893).
+Listeners and background services remain `unknown` and need separate instrumentation.
 
 `application.source` is `process_observed_facade`. Section revisions identify
 the effective snapshots observed by this process, including retained LKG. An
@@ -42,3 +42,17 @@ watcher, restart operation or second configuration authority. Legacy/injected
 states without a facade report `unknown`. Coverage is limited to the listed
 Provider fields; `core.headless_auth` is separately tracked in
 [#1876](https://github.com/bigduu/Bamboo-agent/issues/1876).
+
+MCP receipts acknowledge successful transactional manager/client/tool-index
+publication, including effective Core proxy inputs. They retain the exact MCP
+section revision installed by that transaction, not a later facade snapshot.
+A semantic no-op does not invent a new source version. Receipts are recorded
+before fallible event-journal confirmation: a journal error cannot undo a real
+runtime publication or leave its diagnostics on the old generation. This is a
+publication receipt, not continuous connection health.
+
+MCP credential bindings use the same whole-document proof as Provider. A
+compound MCP credential transaction does not materialize sibling Core proxy
+inputs, so a newly observed credential document alone cannot prove the running
+proxy uses a rotated secret. Failed staging preserves the prior receipt; real
+publication or restoration of already-applied inputs clears the matching error.
