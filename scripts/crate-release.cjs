@@ -586,7 +586,7 @@ function makeContext(env = process.env) {
     saveReceipt: async (release, receipt) => {
       signReceipt(receipt, env.BAMBOO_RELEASE_SIGNING_KEY)
       fs.writeFileSync(receiptFile, `${JSON.stringify(receipt, null, 2)}\n`)
-      github(repository, `releases/${release.id}`, { body: receiptBody(receipt) }, 'PATCH')
+      github(repository, `releases/${release.id}`, { tag_name: `v${receipt.version}`, body: receiptBody(receipt) }, 'PATCH')
     },
     ensureFrontend: async (release, receipt) => {
       const current = github(repository, `releases/${release.id}`)
@@ -628,7 +628,7 @@ function makeContext(env = process.env) {
     complete: async (release, receipt, makeLatest) => {
       command(['gh', 'release', 'upload', `v${receipt.version}`, receiptFile, '--clobber', '--repo', repository])
       return github(repository, `releases/${release.id}`, {
-        draft: false, make_latest: makeLatest ? 'true' : 'false', body: receiptBody(receipt),
+        tag_name: `v${receipt.version}`, draft: false, make_latest: makeLatest ? 'true' : 'false', body: receiptBody(receipt),
       }, 'PATCH')
     },
   }
