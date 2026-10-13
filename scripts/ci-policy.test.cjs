@@ -97,7 +97,7 @@ test("full snapshot and main gates preserve locked Rust, formatting, and policy 
   assert.match(testJob, /run: cargo build --locked\n/u)
   assert.match(
     testJob,
-    /- name: Test locked Rust workspace\n        if: needs\.validation-source\.outputs\.full == 'true'\n        timeout-minutes: 30\n        run: cargo test --locked\n/u,
+    /- name: Test locked Rust workspace\n        if: needs\.validation-source\.outputs\.full == 'true'\n        timeout-minutes: 45\n        run: cargo test --locked\n/u,
   )
   assert.match(
     testJob,
@@ -147,7 +147,7 @@ test("locked Rust test compilation has a separate budget before the complete sui
   const requiredSteps = [
     ["Build locked Rust workspace", "cargo build --locked", undefined],
     ["Compile locked Rust test targets", "cargo test --locked --no-run", "15"],
-    ["Test locked Rust workspace", "cargo test --locked", "30"],
+    ["Test locked Rust workspace", "cargo test --locked", "45"],
   ]
   let previousIndex = -1
   for (const [name, command, timeout] of requiredSteps) {
@@ -593,5 +593,409 @@ assert counts == fixture.get("counts", {"release": 2, "dev": 2, "compare": 2}), 
     }
   } finally {
     rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+// Keep one generic frontend controller. Every run is bound to its actual event
+// head; both profile gates remain required without sharing compiled products.
+const frontendWorkflow = readFileSync(
+  ".github/workflows/frontend-acceptance.yml", "utf8",
+)
+const frontendHead = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+const frontendJobs = (source) => {
+  const parts = source.replace(/\r\n/gu, "\n").split("\njobs:\n")
+  assert.equal(parts.length, 2, "exactly one jobs block is required")
+  const sections = parts[1].replace(/^  #.*(?:\n|$)/gmu, "").split(/^  ([a-z][a-z-]*):\n/gmu)
+  assert.equal(sections.length, 7, "exactly the original lint plus build and test jobs are allowed")
+  assert.deepEqual([sections[1], sections[3], sections[5]], ["lint", "build", "test"])
+  return [sections[4], sections[6]].map((section) => {
+    const [settings, ...steps] = section.split(/(?=^      - )/mu)
+    return { settings, steps: steps.map((step) => step.trimEnd()) }
+  })
+}
+const frontendStep = (job, name) => {
+  const matches = job.steps.filter((step) => step.startsWith(`      - name: ${name}\n`))
+  assert.equal(matches.length, 1, `exactly one ${name} step is required`)
+  return matches[0]
+}
+const frontendScript = (step) => {
+  const match = step.match(/^        run: \|\n([\s\S]*)$/mu)
+  assert.ok(match, "guard must be an executable block")
+  return match[1].split("\n").map((line) => line.replace(/^          /u, "")).join("\n")
+}
+function assertFrontendPolicy(source) {
+  source = source.replace(/\r\n/gu, "\n")
+  const header = source.slice(0, source.indexOf("\njobs:\n")).split("\n").filter((line) => line.trim() && !line.startsWith("#"))
+  assert.deepEqual(header, [
+    "name: Frontend consumer acceptance",
+    "on:",
+    "  workflow_dispatch:",
+    "    inputs:",
+    "      snapshot_sha:",
+    "        description: Exact 40-character SHA of the selected ref for source acceptance",
+    "        required: true",
+    "        type: string",
+    "  pull_request:",
+    "    branches: [main]",
+    "permissions:",
+    "  contents: read",
+    "env:",
+    "  PYTHONDONTWRITEBYTECODE: \"1\"",
+  ], "main and manual snapshot routing binds the actual source without Cargo environment overrides")
+  const lint = source.split("\n  lint:\n")[1].split("\n  build:\n")[0].replace(/^  #.*(?:\n|$)/gmu, "").trimEnd()
+  assert.equal(lint, [
+    "    name: Original release Clippy and frontend policy",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - uses: actions/checkout@v7",
+    "        with:",
+    "          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}",
+    "",
+    "      - name: Require the exact clean candidate source",
+    "        env:",
+    "          EXPECTED_SNAPSHOT_SHA: ${{ inputs.snapshot_sha }}",
+    "          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}",
+    "        run: |",
+    "          set -euo pipefail",
+    "          if [[ \"$GITHUB_EVENT_NAME\" == workflow_dispatch ]]; then",
+    "            [[ \"$EXPECTED_SNAPSHOT_SHA\" =~ ^[0-9a-f]{40}$ ]]",
+    "            test \"$EXPECTED_SNAPSHOT_SHA\" = \"$GITHUB_SHA\"",
+    "          fi",
+    "          test \"$(git rev-parse HEAD)\" = \"$EXPECTED_SHA\"",
+    "          source_status=\"$(git status --porcelain --untracked-files=all)\"",
+    "          test -z \"$source_status\"",
+    "",
+    "      - name: Setup Node.js",
+    "        uses: actions/setup-node@v7",
+    "        with:",
+    "          node-version: lts/*",
+    "",
+    "      - name: Verify exact committed frontend and release policies",
+    "        run: |",
+    "          node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs",
+    "          node scripts/frontend-package.cjs verify",
+    "",
+    "      - name: Install Rust",
+    "        uses: dtolnay/rust-toolchain@stable",
+    "        with:",
+    "          components: rustfmt, clippy",
+    "",
+    "      - name: Rust cache",
+    "        uses: swatinem/rust-cache@v2",
+    "        with:",
+    "          shared-key: bamboo-ci-lint-${{ runner.os }}",
+    "          save-if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'dev') }}",
+    "",
+    "      - name: Check formatting",
+    "        run: cargo fmt --all -- --check",
+    "",
+    "      - name: Run clippy",
+    "        run: |",
+    "          cargo clippy --all-features -- \\",
+    "            -D warnings \\",
+    "            -A deprecated \\",
+    "            -A clippy::module_inception \\",
+    "            -A clippy::incompatible_msrv \\",
+    "            -A clippy::needless_borrows_for_generic_args \\",
+    "            -A clippy::too-many-arguments \\",
+    "            -A clippy::while-let-loop \\",
+    "            -A clippy::type_complexity \\",
+    "            -A dead-code",
+    "",
+    "      - name: Require source files to remain unchanged",
+    "        run: git diff --exit-code",
+  ].join("\n"), "the current lint job, snapshot guard, Clippy arguments and cache policy remain unchanged")
+  const jobs = frontendJobs(source)
+  source = "  build:\n" + source.split("  build:\n")[1]
+  const withoutFinalConditions = source.replaceAll(
+    "      - name: Require the exact clean source after execution\n        if: always()\n",
+    "      - name: Require the exact clean source after execution\n",
+  )
+  assert.doesNotMatch(withoutFinalConditions, /^\s*(?:if|continue-on-error|working-directory|defaults|strategy|container|services|secrets|environment):/mu)
+  assert.doesNotMatch(source, /(?:actions\/(?:cache|upload-artifact|download-artifact)|rust-cache)@|\b(?:git reset|git clean|git checkout|git switch|cargo install|cargo publish)\b/u)
+  assert.doesNotMatch(source, /^\s*permissions:/mu)
+  assert.deepEqual([...source.matchAll(/^      - uses: (.*)$/gmu)].map((m) => m[1]), ["actions/checkout@v7", "actions/checkout@v7"])
+  assert.deepEqual([...source.matchAll(/^        uses: (.*)$/gmu)].map((m) => m[1]), ["actions/setup-node@v7", "dtolnay/rust-toolchain@stable", "actions/setup-node@v7", "dtolnay/rust-toolchain@stable"])
+  for (const [index, frontendJob] of jobs.entries()) {
+    assert.ok(frontendJob.settings.startsWith(`    name: Original release ${index === 0 ? "Build" : "Test"} on frozen consumer source\n`))
+    assert.doesNotMatch(frontendJob.settings, /^    env:/mu, "job environments must not alter Cargo or test behavior")
+    assert.match(frontendJob.settings, new RegExp(`^    runs-on: ubuntu-latest\n    timeout-minutes: ${index === 0 ? 45 : 75}$`, "mu"))
+    if (index === 0) {
+      assert.doesNotMatch(frontendJob.settings, /^    needs:/mu)
+      for (const [name, step, field] of [["source_sha", "source", "sha"], ["source_tree", "source", "tree"], ["rustc_version", "toolchain", "rustc_version"], ["cargo_version", "toolchain", "cargo_version"]]) {
+        assert.ok(frontendJob.settings.includes(`      ${name}: \${{ steps.${step}.outputs.${field} }}`))
+      }
+    } else {
+      assert.match(frontendJob.settings, /^    needs: build$/mu)
+    }
+    assert.equal(frontendJob.steps[0], `      - uses: actions/checkout@v7\n        with:\n          ref: ${frontendHead}\n          persist-credentials: false`)
+    const names = frontendJob.steps.slice(1).map((step) => step.match(/^      - name: (.*)$/mu)?.[1])
+    assert.deepEqual(names, [
+      "Require the exact clean candidate source", "Setup Node.js", "Test original CI policy", "Install Rust",
+      "Record and bind the actual Rust toolchain", "Check formatting",
+      ...(index === 0 ? ["Build locked Rust workspace"] : ["Compile locked Rust test targets", "Test locked Rust workspace"]),
+      "Require source files to remain unchanged",
+      "Require the exact clean source after execution",
+    ])
+    assert.equal(frontendStep(frontendJob, "Setup Node.js"), "      - name: Setup Node.js\n        uses: actions/setup-node@v7\n        with:\n          node-version: lts/*\n          package-manager-cache: false")
+    assert.equal(frontendStep(frontendJob, "Install Rust"), "      - name: Install Rust\n        uses: dtolnay/rust-toolchain@stable\n        with:\n          components: rustfmt")
+    for (const [name, command, timeout] of [
+      ["Test original CI policy", "node --test scripts/ci-policy.test.cjs"],
+      ["Check formatting", "cargo fmt --all -- --check"],
+      ...(index === 0 ? [["Build locked Rust workspace", "cargo build --locked"]] : [
+        ["Compile locked Rust test targets", "cargo test --locked --no-run", 15],
+        ["Test locked Rust workspace", "cargo test --locked", 45],
+      ]),
+      ["Require source files to remain unchanged", "git diff --exit-code"],
+    ]) {
+      assert.equal(frontendStep(frontendJob, name), `      - name: ${name}\n${timeout ? `        timeout-minutes: ${timeout}\n` : ""}        run: ${command}${timeout ? '\n        env:\n          RUST_MIN_STACK: "8388608"' : ""}`)
+    }
+    assert.equal(frontendStep(frontendJob, "Require the exact clean source after execution"), [
+      "      - name: Require the exact clean source after execution", "        if: always()", "        env:",
+      `          EXPECTED_SHA: ${frontendHead}`, "          EXPECTED_TREE: ${{ steps.source.outputs.tree }}",
+      "        shell: bash", "        run: |",
+      "          set -euo pipefail",
+      '          source_sha="$(git rev-parse HEAD)"',
+      '          source_tree="$(git rev-parse \'HEAD^{tree}\')"',
+      '          source_status="$(git status --porcelain --untracked-files=all)"',
+      `          printf 'Final source: %s, tree: %s\\n' "$source_sha" "$source_tree"`,
+      `          printf '%s\\n' "$source_status"`,
+      '          test "$source_sha" = "$EXPECTED_SHA"',
+      '          test "$source_tree" = "$EXPECTED_TREE"',
+      '          test -z "$source_status"',
+    ].join("\n"))
+    const guard = frontendStep(frontendJob, "Require the exact clean candidate source")
+    assert.equal(guard.split("        run: |\n")[0], "      - name: Require the exact clean candidate source\n        id: source\n        env:\n" +
+      "          EXPECTED_SNAPSHOT_SHA: ${{ inputs.snapshot_sha }}\n" +
+      `          EXPECTED_SHA: ${frontendHead}\n` + (index === 0 ? "" :
+        "          BUILD_SOURCE_SHA: ${{ needs.build.outputs.source_sha }}\n          BUILD_SOURCE_TREE: ${{ needs.build.outputs.source_tree }}\n") + "        shell: bash\n")
+    for (const line of ['if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then', '  [[ "$EXPECTED_SNAPSHOT_SHA" =~ ^[0-9a-f]{40}$ ]]', '  test "$EXPECTED_SNAPSHOT_SHA" = "$GITHUB_SHA"', 'fi', 'test "$source_sha" = "$EXPECTED_SHA"', 'source_status="$(git status --porcelain --untracked-files=all)"', 'test -z "$source_status"']) {
+      assert.ok(frontendScript(guard).split("\n").includes(line), `missing source guard: ${line}`)
+    }
+    const toolchain = frontendStep(frontendJob, "Record and bind the actual Rust toolchain")
+    assert.equal(toolchain.split("        run: |\n")[0], "      - name: Record and bind the actual Rust toolchain\n        id: toolchain\n" + (index === 0 ? "" :
+      "        env:\n          BUILD_RUSTC_VERSION: ${{ needs.build.outputs.rustc_version }}\n          BUILD_CARGO_VERSION: ${{ needs.build.outputs.cargo_version }}\n") + "        shell: bash\n")
+    for (const line of ['rustc --version --verbose', 'cargo --version --verbose', 'test -n "$rustc_version"', 'test -n "$cargo_version"']) {
+      assert.ok(frontendScript(toolchain).split("\n").includes(line))
+    }
+    if (index === 1) {
+      for (const [variable, output, actual] of [["BUILD_SOURCE_SHA", "source_sha", "source_sha"], ["BUILD_SOURCE_TREE", "source_tree", "source_tree"], ["BUILD_RUSTC_VERSION", "rustc_version", "rustc_version"], ["BUILD_CARGO_VERSION", "cargo_version", "cargo_version"]]) {
+        const step = variable.startsWith("BUILD_SOURCE") ? guard : toolchain
+        assert.ok(step.includes(`          ${variable}: \${{ needs.build.outputs.${output} }}`))
+        assert.ok(frontendScript(step).split("\n").includes(`test "$${actual}" = "$${variable}"`))
+      }
+    }
+  }
+}
+
+test("frontend acceptance preserves both original command gates and actual-head identity", () => {
+  assert.equal(require("node:fs").existsSync(".github/workflows/frontend-acceptance-recovery.yml"), false,
+    "the unused fixed-source recovery controller must not coexist with the generic workflow")
+  assertFrontendPolicy(frontendWorkflow)
+  for (const [from, to] of [
+    ["  workflow_dispatch:", "  workflow_dispatch:\n    inputs:\n      source:\n        type: string"],
+    ["    branches: [main]", "    branches: [dev]"],
+    ['PYTHONDONTWRITEBYTECODE: "1"', 'PYTHONDONTWRITEBYTECODE: "0"'],
+    ["contents: read", "contents: write"],
+    ["permissions:\n", 'env:\n  RUST_TEST_THREADS: "1"\npermissions:\n'],
+    ["permissions:\n", 'env:\n  CARGO_PROFILE_TEST_OPT_LEVEL: "3"\npermissions:\n'],
+    ["    needs: build", '    env:\n      CARGO_PROFILE_TEST_OPT_LEVEL: "3"\n    needs: build'],
+    ["        id: source", '        env:\n          RUST_TEST_THREADS: "1"\n        id: source'],
+    [`ref: ${frontendHead}`, "ref: dev"],
+    [`ref: ${frontendHead}`, "ref: 1cda5e1dbae79769052300b26d134bd4ecccf9b3"],
+    ["needs: build", "needs: []"],
+    ["name: Original release Test on frozen consumer source", "name: Different Test"],
+    ["timeout-minutes: 45", "timeout-minutes: 60"],
+    ["timeout-minutes: 15", "timeout-minutes: 30"],
+    ["timeout-minutes: 75", "timeout-minutes: 45"],
+    ["name: Test locked Rust workspace\n        timeout-minutes: 45", "name: Test locked Rust workspace\n        timeout-minutes: 30"],
+    ["name: Test locked Rust workspace\n        timeout-minutes: 45", "name: Test locked Rust workspace\n        timeout-minutes: 60"],
+    ["package-manager-cache: false", "package-manager-cache: true"],
+    ["components: rustfmt\n", "toolchain: 1.99.0\n          components: rustfmt\n"],
+    ["run: cargo build --locked", "run: true"],
+    ["run: cargo test --locked\n", "run: cargo test --locked -- --skip slow\n"],
+    ['RUST_MIN_STACK: "8388608"', 'RUST_MIN_STACK: "16777216"'],
+    ["run: git diff --exit-code", "run: true"],
+    ["        if: always()\n", ""],
+    ["        if: always()", "        if: success()"],
+    ['source_status="$(git status --porcelain --untracked-files=all)"', 'source_status="$(git diff --name-only)"'],
+    ['source_status="$(git status --porcelain --untracked-files=all)"', 'source_status="$(git status --porcelain --untracked-files=no)"'],
+    ['test -z "$source_status"', "true"],
+    ['test "$source_tree" = "$EXPECTED_TREE"', "true"],
+    ['test "$source_sha" = "$BUILD_SOURCE_SHA"', "true"],
+    ['test "$cargo_version" = "$BUILD_CARGO_VERSION"', "true"],
+    ["        run: cargo test --locked --no-run", "        continue-on-error: true\n        run: cargo test --locked --no-run"],
+    ["    needs: build", "    if: always()\n    needs: build"],
+    ["      - name: Check formatting", "      - uses: actions/cache@v4\n      - name: Check formatting"],
+    ["      - name: Require source files to remain unchanged", "      - name: Reset source\n        run: git reset --hard\n      - name: Require source files to remain unchanged"],
+  ]) {
+    assert.ok(frontendWorkflow.includes(from), `mutation target exists: ${from}`)
+    assert.throws(() => assertFrontendPolicy(frontendWorkflow.replace(from, to)), `reject unsafe frontend mutation: ${to}`)
+  }
+})
+
+test("frontend acceptance source guards reject drift and dirty entries on both jobs", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-frontend-source-"))
+  const checkout = path.join(directory, "checkout")
+  require("node:fs").mkdirSync(path.join(checkout, ".cargo"), { recursive: true })
+  const git = (...args) => {
+    const result = spawnSync("git", args, { cwd: checkout, encoding: "utf8" })
+    assert.equal(result.status, 0, result.stderr)
+    return result.stdout.trim()
+  }
+  try {
+    git("init", "--quiet")
+    writeFileSync(path.join(checkout, ".cargo/config.toml"), "# fixture\n")
+    git("add", ".")
+    git("-c", "user.name=ci-policy", "-c", "user.email=ci-policy@example.invalid", "commit", "--quiet", "-m", "fixture")
+    const sha = git("rev-parse", "HEAD")
+    const tree = git("rev-parse", "HEAD^{tree}")
+    for (const source of [frontendWorkflow, frontendWorkflow.replace(/\n/gu, "\r\n")]) {
+      for (const [index, frontendJob] of frontendJobs(source).entries()) {
+        const script = frontendScript(frontendStep(frontendJob, "Require the exact clean candidate source"))
+        const run = (env = {}) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", script], {
+          cwd: checkout, encoding: "utf8", env: { ...process.env,
+            EXPECTED_SHA: sha,
+            GITHUB_SHA: sha, GITHUB_EVENT_NAME: "pull_request", EXPECTED_SNAPSHOT_SHA: "",
+            BUILD_SOURCE_SHA: sha, BUILD_SOURCE_TREE: tree,
+            GITHUB_OUTPUT: path.join(directory, "outputs"),
+            ...env,
+          },
+        })
+        writeFileSync(path.join(directory, "outputs"), "")
+        const accepted = run()
+        assert.equal(accepted.status, 0, accepted.stderr)
+        assert.equal(readFileSync(path.join(directory, "outputs"), "utf8"), `sha=${sha}\ntree=${tree}\n`)
+        writeFileSync(path.join(directory, "outputs"), "")
+        assert.equal(run({ GITHUB_EVENT_NAME: "workflow_dispatch", EXPECTED_SNAPSHOT_SHA: sha }).status, 0,
+          "an exact manual snapshot is accepted")
+        for (const snapshot of ["", "a".repeat(39), "A".repeat(40), "0".repeat(40)]) {
+          assert.notEqual(run({ GITHUB_EVENT_NAME: "workflow_dispatch", EXPECTED_SNAPSHOT_SHA: snapshot }).status, 0,
+            "missing, malformed or mismatched manual snapshots fail closed")
+        }
+        assert.notEqual(run({ GITHUB_EVENT_NAME: "workflow_dispatch", EXPECTED_SNAPSHOT_SHA: sha, GITHUB_SHA: "0".repeat(40) }).status, 0,
+          "manual snapshot must bind the actual dispatch source")
+        assert.equal(readFileSync(path.join(directory, "outputs"), "utf8"), `sha=${sha}\ntree=${tree}\n`)
+        for (const env of [{ EXPECTED_SHA: "0".repeat(40) },
+          ...(index === 1 ? [{ BUILD_SOURCE_SHA: "" }, { BUILD_SOURCE_TREE: "2".repeat(40) }] : [])]) {
+          assert.notEqual(run(env).status, 0, "mismatched or missing identity fails closed")
+        }
+        writeFileSync(path.join(checkout, ".cargo/config.toml"), "# dirty\n")
+        assert.notEqual(run().status, 0, "tracked changes fail closed")
+        git("checkout", "--", ".cargo/config.toml")
+        writeFileSync(path.join(checkout, "untracked.txt"), "fixture\n")
+        assert.notEqual(run().status, 0, "untracked changes fail closed")
+        rmSync(path.join(checkout, "untracked.txt"))
+        const finalDiff = frontendStep(frontendJob, "Require source files to remain unchanged").split("        run: ")[1]
+        assert.equal(spawnSync("bash", ["-e", "-c", finalDiff], { cwd: checkout }).status, 0)
+        writeFileSync(path.join(checkout, ".cargo/config.toml"), "# test changed source\n")
+        assert.notEqual(spawnSync("bash", ["-e", "-c", finalDiff], { cwd: checkout }).status, 0, "actual final diff rejects tested source changes")
+        git("checkout", "--", ".cargo/config.toml")
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test("frontend acceptance toolchain guards reject changed compilers and cross-job tools", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-frontend-toolchain-"))
+  const rustcVersion = "rustc current-fixture"
+  const cargoVersion = "cargo current-fixture"
+  writeFileSync(path.join(directory, "rustc"), [
+    "#!/bin/bash", 'printf "%s\\n" "$FIXTURE_RUSTC_VERSION"', "",
+  ].join("\n"), { mode: 0o755 })
+  writeFileSync(path.join(directory, "cargo"), '#!/bin/bash\nprintf "%s\\n" "$FIXTURE_CARGO_VERSION"\n', { mode: 0o755 })
+  try {
+    for (const [index, frontendJob] of frontendJobs(frontendWorkflow).entries()) {
+      const script = frontendScript(frontendStep(frontendJob, "Record and bind the actual Rust toolchain"))
+      const run = (env = {}) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", script], {
+        encoding: "utf8", env: { ...process.env,
+          PATH: `${directory}${path.delimiter}${process.env.PATH}`,
+          GITHUB_OUTPUT: path.join(directory, "outputs"),
+          FIXTURE_RUSTC_VERSION: rustcVersion, FIXTURE_CARGO_VERSION: cargoVersion,
+          BUILD_RUSTC_VERSION: rustcVersion, BUILD_CARGO_VERSION: cargoVersion, ...env,
+        },
+      })
+      const accepted = run()
+      assert.equal(accepted.status, 0, accepted.stderr)
+      for (const env of [{ FIXTURE_RUSTC_VERSION: "" }, { FIXTURE_CARGO_VERSION: "" },
+        ...(index === 1 ? [{ FIXTURE_RUSTC_VERSION: "rustc changed" }, { BUILD_RUSTC_VERSION: "" }, { BUILD_CARGO_VERSION: "" }, { FIXTURE_CARGO_VERSION: "cargo changed" }] : [])]) {
+        assert.notEqual(run(env).status, 0, "changed or unbound toolchain fails closed")
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test("frontend acceptance final guards inspect actual HEAD, index and untracked files", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-frontend-final-source-"))
+  const statusTools = mkdtempSync(path.join(os.tmpdir(), "bamboo-frontend-status-failure-"))
+  const realGit = spawnSync("bash", ["-c", "command -v git"], { encoding: "utf8" })
+  assert.equal(realGit.status, 0, realGit.stderr)
+  writeFileSync(path.join(statusTools, "git"), [
+    "#!/bin/bash", 'if [[ "$1" == status ]]; then exit 23; fi', 'exec "$FIXTURE_REAL_GIT" "$@"', "",
+  ].join("\n"), { mode: 0o755 })
+  const git = (...args) => {
+    const result = spawnSync("git", args, { cwd: directory, encoding: "utf8" })
+    assert.equal(result.status, 0, result.stderr)
+    return result.stdout.trim()
+  }
+  try {
+    git("init", "--quiet")
+    writeFileSync(path.join(directory, "source.txt"), "accepted\n")
+    git("add", "source.txt")
+    const commit = (...args) => git("-c", "user.name=ci-policy", "-c", "user.email=ci-policy@example.invalid", "commit", "--quiet", ...args)
+    commit("-m", "accepted fixture")
+    const sha = git("rev-parse", "HEAD")
+    const tree = git("rev-parse", "HEAD^{tree}")
+    for (const source of [frontendWorkflow, frontendWorkflow.replace(/\n/gu, "\r\n")]) {
+      for (const frontendJob of frontendJobs(source)) {
+        const finalScript = frontendScript(frontendStep(frontendJob, "Require the exact clean source after execution"))
+        const run = (env = {}) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", finalScript], {
+          cwd: directory, encoding: "utf8",
+          env: { ...process.env, EXPECTED_SHA: sha, EXPECTED_TREE: tree, ...env },
+        })
+        assert.equal(run().status, 0, "unchanged source is admitted")
+        assert.equal(run({
+          PATH: `${statusTools}${path.delimiter}${process.env.PATH}`,
+          FIXTURE_REAL_GIT: realGit.stdout.trim(),
+        }).status, 23, "git status failure must not be mistaken for a clean checkout")
+        assert.notEqual(run({ EXPECTED_SHA: "0".repeat(40) }).status, 0)
+        assert.notEqual(run({ EXPECTED_TREE: "1".repeat(40) }).status, 0)
+        writeFileSync(path.join(directory, "source.txt"), "changed by test\n")
+        assert.notEqual(run().status, 0, "unstaged source changes fail")
+        git("add", "source.txt")
+        git("diff", "--exit-code") // The original gate alone misses staged changes.
+        assert.notEqual(run().status, 0, "staged source changes fail")
+        assert.equal(git("diff", "--cached", "--name-only"), "source.txt", "guard must not erase staged evidence")
+        git("restore", "--source=HEAD", "--staged", "--worktree", "source.txt")
+        writeFileSync(path.join(directory, "unexpected.txt"), "test residue\n")
+        git("diff", "--exit-code") // The original gate alone also misses untracked files.
+        assert.notEqual(run().status, 0, "untracked files fail")
+        assert.equal(readFileSync(path.join(directory, "unexpected.txt"), "utf8"), "test residue\n", "guard must not clean untracked evidence")
+        git("add", "unexpected.txt")
+        git("diff", "--exit-code")
+        assert.notEqual(run().status, 0, "new staged files fail")
+        git("rm", "--cached", "unexpected.txt")
+        rmSync(path.join(directory, "unexpected.txt"))
+        commit("--allow-empty", "-m", "unexpected HEAD with identical tree")
+        assert.equal(git("rev-parse", "HEAD^{tree}"), tree)
+        assert.notEqual(run().status, 0, "a different clean HEAD with the same tree fails")
+        git("checkout", "--detach", sha)
+        writeFileSync(path.join(directory, "source.txt"), "new clean source\n")
+        git("add", "source.txt")
+        commit("-m", "unexpected changed tree")
+        assert.notEqual(run({ EXPECTED_SHA: git("rev-parse", "HEAD") }).status, 0, "a changed tree fails even if its HEAD is supplied")
+        assert.equal(run({ EXPECTED_SHA: git("rev-parse", "HEAD"), EXPECTED_TREE: git("rev-parse", "HEAD^{tree}") }).status, 0,
+          "a subsequent genuine event head and its recorded tree are accepted without a fixed source pin")
+        git("checkout", "--detach", sha)
+        assert.equal(run().status, 0, "restored accepted fixture is admitted")
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+    rmSync(statusTools, { recursive: true, force: true })
   }
 })

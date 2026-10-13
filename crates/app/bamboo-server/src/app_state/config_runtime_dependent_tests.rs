@@ -279,6 +279,7 @@ async fn dependent_external_failure_retains_effective_generation_and_recovers() 
     let replacement = request_sink().await;
     let (dir, state) = configured_state(&sink.uri()).await;
     let before_provider = application_consumer(&state, "provider-runtime").await;
+    let before_mcp = application_consumer(&state, "mcp-runtime").await;
     let _unavailable = unavailable_mcp(&state).await;
     let provider = state.provider_registry.get_default().unwrap();
     external_edit(dir.path(), SectionId::Core, |data| {
@@ -308,11 +309,21 @@ async fn dependent_external_failure_retains_effective_generation_and_recovers() 
         SectionStatus::Degraded
     );
     let failed_provider = application_consumer(&state, "provider-runtime").await;
+    let failed_mcp = application_consumer(&state, "mcp-runtime").await;
     assert_eq!(
         failed_provider["applied_dependencies"],
         before_provider["applied_dependencies"]
     );
+    assert_eq!(
+        failed_mcp["applied_dependencies"],
+        before_mcp["applied_dependencies"]
+    );
     assert_eq!(failed_provider["state"], "pending_apply");
+    assert_eq!(failed_mcp["state"], "failed");
+    assert_eq!(
+        failed_mcp["last_apply_error"]["code"],
+        "mcp_initialization_failed"
+    );
     request(&state).await;
     external_edit(dir.path(), SectionId::Core, |data| {
         data["http_proxy"] = Value::String(sink.uri());
@@ -331,6 +342,20 @@ async fn dependent_external_failure_retains_effective_generation_and_recovers() 
     assert_eq!(
         repaired_provider["applied_dependencies"],
         before_provider["applied_dependencies"]
+    );
+    // The bootstrap-failure fixture still has an unavailable desired MCP server.
+    // Repair that consumer through its real transactional publication.
+    let mcp = section(&state, SectionId::Mcp);
+    state
+        .put_mcp_section(mcp.revision, bamboo_mcp::McpConfig::default())
+        .await
+        .unwrap();
+    let repaired_mcp = application_consumer(&state, "mcp-runtime").await;
+    assert_eq!(repaired_mcp["state"], "in_sync");
+    assert_eq!(repaired_mcp["last_apply_error"], Value::Null);
+    assert_eq!(
+        repaired_mcp["applied_dependencies"],
+        repaired_mcp["desired_dependencies"]
     );
 }
 

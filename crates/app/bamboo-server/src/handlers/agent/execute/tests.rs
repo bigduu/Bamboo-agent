@@ -146,6 +146,49 @@ pub(super) fn observe_inputs(
     }
 }
 
+// Test-only one-shot gate at the real HTTP selection/admission boundary.
+// There is no callback, wait or map in production builds.
+type AdmissionSelectionGate = (
+    tokio::sync::oneshot::Sender<bool>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+fn admission_selection_gates(
+) -> &'static std::sync::Mutex<std::collections::HashMap<(String, bool), AdmissionSelectionGate>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(String, bool), AdmissionSelectionGate>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(std::sync::Mutex::default)
+}
+pub(super) async fn after_root_admission_selection(id: &str, reserved: bool) {
+    let gate = {
+        admission_selection_gates()
+            .lock()
+            .unwrap()
+            .remove(&(id.to_owned(), false))
+    };
+    if let Some((selected, continue_admission)) = gate {
+        let _ = selected.send(reserved);
+        let _ = continue_admission.await;
+    }
+}
+
+// Reachable only on the repaired HTTP ownership path. Baseline counterfactual
+// runs target the four early-selection races, never this secondary-only gate.
+impl crate::AppState {
+    pub(crate) async fn before_http_root_reservation_retry_for_test(&self, id: &str) {
+        let gate = {
+            admission_selection_gates()
+                .lock()
+                .unwrap()
+                .remove(&(id.to_owned(), true))
+        };
+        if let Some((selected, continue_reservation)) = gate {
+            let _ = selected.send(false);
+            let _ = continue_reservation.await;
+        }
+    }
+}
+
 mod execution_input_http {
     use super::*;
     use actix_web::{http::StatusCode, test, web};
@@ -453,6 +496,1429 @@ mod execution_input_http {
         assert_eq!(request.selections[0].args, serde_json::json!({}));
         assert!(request.selections[0].revision > 0);
     }
+    // Isolate manual HTTP execution without replacing the real Inbox, Actor
+    // directory, persistence, or reservation protocol.
+    struct ManualHttpOnly;
+    #[async_trait]
+    impl bamboo_engine::SessionActivationSpawner for ManualHttpOnly {
+        async fn reserve_activation(
+            &self,
+            _target: &str,
+            _generation: u64,
+        ) -> Result<
+            bamboo_engine::SessionActivationReserveOutcome,
+            bamboo_domain::SessionActivationError,
+        > {
+            Err(bamboo_domain::SessionActivationError::Internal(
+                "automatic launch unavailable in manual HTTP fixture".into(),
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct OwnedRootProvider {
+        messages: std::sync::Mutex<Vec<Vec<bamboo_agent_core::Message>>>,
+    }
+    #[async_trait]
+    impl LLMProvider for OwnedRootProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.messages.lock().unwrap().push(messages.to_vec());
+            Ok(Box::pin(futures::stream::iter([
+                Ok(LLMChunk::Token("owned Root finished".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    async fn reserve_owned_root(
+        state: &web::Data<crate::AppState>,
+        id: &str,
+    ) -> bamboo_engine::execution::SessionExecutionReservation {
+        use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
+        let sender = state.get_session_event_sender(id).await;
+        let mut reservation = match reserve_session_execution(
+            &state.agent,
+            &state.agent_runners,
+            &state.session_event_senders,
+            id,
+            &sender,
+        )
+        .await
+        {
+            SessionExecutionReserveOutcome::Reserved(reservation) => reservation,
+            _ => panic!("fixture must reserve its real idle Root"),
+        };
+        let session = state.storage.load_session(id).await.unwrap().unwrap();
+        reservation
+            .bind_root_actor(&state.agent, &session)
+            .await
+            .unwrap();
+        assert!(reservation.root_actor_writer().is_some());
+        assert!(reservation.execution_persistence().is_some());
+        reservation
+    }
+
+    async fn queue_owned_root(state: &web::Data<crate::AppState>, id: &str) {
+        let request = serde_json::from_value::<crate::handlers::agent::chat::ChatRequest>(
+            serde_json::json!({"session_id":id,"message":"one owned Root input", "model":"test-model"}),
+        ).unwrap();
+        let response = crate::handlers::agent::chat::handler(
+            state.clone(),
+            test::TestRequest::post().to_http_request(),
+            web::Json(request),
+        )
+        .await;
+        let status = response.status();
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let session = state.storage.load_session(id).await.unwrap().unwrap();
+        // Prepare only this Chat-published fixture workspace through the real
+        // SkillManager. Keep the original 15-second completion deadline.
+        state
+            .skill_manager
+            .store_for_workspace(
+                session
+                    .workspace_path_meta()
+                    .as_deref()
+                    .map(std::path::Path::new),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+        assert!(state
+            .session_inbox
+            .inspect(id)
+            .await
+            .unwrap()
+            .activation_pending());
+        assert!(!session
+            .messages
+            .iter()
+            .any(|m| m.role == bamboo_agent_core::Role::User));
+    }
+
+    // Own every session-keyed test tap so a timeout/panic cannot contaminate
+    // another test. The gate itself is removed before any await.
+    struct SelectionProbe(String);
+    impl Drop for SelectionProbe {
+        fn drop(&mut self) {
+            admission_selection_gates()
+                .lock()
+                .unwrap()
+                .retain(|(id, _), _| id != &self.0);
+            input_taps().lock().unwrap().remove(&self.0);
+        }
+    }
+    fn selection_probe(
+        id: &str,
+    ) -> (
+        SelectionProbe,
+        tokio::sync::oneshot::Receiver<bool>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (selected_tx, selected_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        assert!(admission_selection_gates()
+            .lock()
+            .unwrap()
+            .insert((id.into(), false), (selected_tx, continue_rx))
+            .is_none());
+        assert!(input_taps()
+            .lock()
+            .unwrap()
+            .insert(id.into(), Vec::new())
+            .is_none());
+        (SelectionProbe(id.into()), selected_rx, continue_tx)
+    }
+
+    fn checked_selection_probe(
+        id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<bool>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (selected_tx, selected_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        assert!(admission_selection_gates()
+            .lock()
+            .unwrap()
+            .insert((id.into(), true), (selected_tx, continue_rx))
+            .is_none());
+        (selected_rx, continue_tx)
+    }
+
+    async fn shutdown_rejected_race(state: &web::Data<crate::AppState>, ids: &[&str]) {
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .expect("rejected HTTP race fixture shutdown");
+        for id in ids {
+            assert!(
+                !state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(*id)
+                    .is_some_and(|runner| matches!(
+                        runner.status,
+                        AgentStatus::Pending | AgentStatus::Running
+                    )),
+                "rejected fixture must leave no live runner for {id}"
+            );
+            assert!(
+                state
+                    .session_activation_router
+                    .current_run_id(id)
+                    .await
+                    .is_none(),
+                "rejected fixture must leave no router owner for {id}"
+            );
+        }
+    }
+
+    async fn wait_for_owned_terminal(
+        state: &web::Data<crate::AppState>,
+        id: &str,
+        run: &str,
+        events: &mut tokio::sync::broadcast::Receiver<bamboo_agent_core::AgentEvent>,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if matches!(events.recv().await.unwrap(),
+                    bamboo_agent_core::AgentEvent::SessionHistoryCommitted { session_id } if session_id == id)
+                {
+                    break;
+                }
+            }
+            // The durable publication barrier intentionally precedes exact
+            // runner/Actor retirement. Wait for that real terminal state too.
+            loop {
+                let terminal = {
+                    let runners = state.agent_runners.read().await;
+                    let runner = runners.get(id).unwrap();
+                    assert_eq!(runner.run_id, run);
+                    if matches!(runner.status, AgentStatus::Pending | AgentStatus::Running) {
+                        false
+                    } else {
+                        assert!(matches!(runner.status, AgentStatus::Completed), "{:?}", runner.status);
+                        true
+                    }
+                };
+                let actor = bamboo_domain::ActorDirectoryPort::inspect_actor(state.session_store.as_ref(), id)
+                    .await.unwrap().activation.unwrap();
+                assert_eq!(actor.run_id, run);
+                if terminal && actor.status == bamboo_domain::ActorActivationStatus::Succeeded
+                    && state.session_activation_router.current_run_id(id).await.is_none()
+                {
+                    assert!(actor.finished_at.is_some());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("owned Root durable publication and exact retirement within 15 seconds");
+    }
+
+    async fn run_owned_http_selection_race(initially_running: bool) {
+        let provider = Arc::new(OwnedRootProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = if initially_running {
+            "owned-http-owner-retires-after-selection"
+        } else {
+            "owned-http-input-arrives-after-selection"
+        };
+        let mut session = bamboo_agent_core::Session::new(id, "test-model");
+        session.title_generated = true;
+        state.storage.save_session(&session).await.unwrap();
+        let mut owner = Some(reserve_owned_root(&state, id).await);
+        let reservation = owner.as_ref().unwrap();
+        let initial_run = reservation.run_id().to_owned();
+        let upgrade = reservation
+            .execution_persistence()
+            .unwrap()
+            .admit_root_inbox(
+                &mut session,
+                state.session_inbox.clone(),
+                Some(&initial_run),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(upgrade.merged, 0);
+        assert!(upgrade.admission_error.is_none());
+        let legacy = state.session_inbox.claim(id, 1).await.unwrap_err();
+        assert!(
+            legacy
+                .to_string()
+                .contains("owned Inbox claim API required"),
+            "{legacy}"
+        );
+        if initially_running {
+            // The first selector must see this exact bound owner as Busy.
+            queue_owned_root(&state, id).await;
+        } else {
+            owner.take().unwrap().abandon().await;
+            assert!(!state
+                .session_inbox
+                .inspect(id)
+                .await
+                .unwrap()
+                .activation_pending());
+        }
+        let (_probe, selected_rx, continue_tx) = selection_probe(id);
+        let mut events = state.get_session_event_sender(id).await.subscribe();
+        let http = super::super::handler::handler(
+            state.clone(),
+            test::TestRequest::post().to_http_request(),
+            web::Path::from(id.to_owned()),
+            web::Json(serde_json::from_value(serde_json::json!({"model":"test-model"})).unwrap()),
+        );
+        let transition = async {
+            assert!(
+                !selected_rx.await.unwrap(),
+                "early selector must return None"
+            );
+            if initially_running {
+                owner.take().unwrap().abandon().await;
+            } else {
+                // Real Chat publication happens only after the empty inspect.
+                queue_owned_root(&state, id).await;
+            }
+            assert!(state
+                .session_activation_router
+                .current_run_id(id)
+                .await
+                .is_none());
+            assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+            assert!(provider.messages.lock().unwrap().is_empty());
+            continue_tx.send(()).unwrap();
+        };
+        let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            tokio::join!(http, transition)
+        })
+        .await
+        .expect("oneshot gates establish the interleaving without sleeps");
+        let status = response.status();
+        let bytes = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            assert!(
+                String::from_utf8_lossy(&bytes).contains("SessionInbox claim unresolved"),
+                "{body}"
+            );
+            assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+            assert!(provider.messages.lock().unwrap().is_empty());
+        }
+        if status != StatusCode::ACCEPTED {
+            shutdown_rejected_race(&state, &[id]).await;
+        }
+        // This same assertion is the natural counterfactual RED on d21.
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "actual HTTP selection race: {body}"
+        );
+        let run = body["run_id"].as_str().unwrap();
+        assert_ne!(run, initial_run);
+        wait_for_owned_terminal(&state, id, run, &mut events).await;
+        let stored = state.storage.load_session(id).await.unwrap().unwrap();
+        let users: Vec<_> = stored
+            .messages
+            .iter()
+            .filter(|m| m.role == bamboo_agent_core::Role::User)
+            .collect();
+        assert_eq!(users.len(), 1, "one durable typed User checkpoint");
+        let input = &users[0].id;
+        assert_eq!(users[0].content, "one owned Root input");
+        let proof = &users[0].metadata.as_ref().unwrap()["session_message"];
+        let envelope: SessionMessageEnvelope = serde_json::from_value(proof.clone()).unwrap();
+        assert!(bamboo_domain::is_matching_session_message(
+            users[0], &envelope
+        ));
+        assert_eq!(envelope.target_session_id, id);
+        assert!(state
+            .session_inbox
+            .was_admitted(id, &envelope.id)
+            .await
+            .unwrap());
+        let backlog = state.session_inbox.inspect(id).await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 0);
+        let taps = input_taps().lock().unwrap().remove(id).unwrap();
+        assert_eq!(taps.len(), 1, "one actual Ready/spawn handoff");
+        assert_eq!(taps[0].as_ref().unwrap().len(), 1);
+        assert_eq!(taps[0].as_ref().unwrap()[0].0, *input);
+        let calls = provider.messages.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one execution provider call");
+        assert_eq!(calls[0].iter().filter(|m| m.id == *input).count(), 1);
+        drop(calls);
+        let actor =
+            bamboo_domain::ActorDirectoryPort::inspect_actor(state.session_store.as_ref(), id)
+                .await
+                .unwrap()
+                .activation
+                .unwrap();
+        assert_eq!(actor.run_id, run);
+        assert_eq!(
+            actor.attempt, 2,
+            "one upgrade and exactly one successor; no Ready re-reserve"
+        );
+        assert_eq!(stored.last_run_status().as_deref(), Some("completed"));
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .expect("HTTP race fixture shutdown");
+    }
+
+    #[actix_web::test]
+    async fn owned_root_http_retired_owner_after_selection_stays_owned() {
+        run_owned_http_selection_race(true).await;
+    }
+
+    #[actix_web::test]
+    async fn owned_root_http_late_input_after_selection_stays_owned() {
+        run_owned_http_selection_race(false).await;
+    }
+
+    #[actix_web::test]
+    async fn owned_root_http_empty_selection_without_transition_does_not_acquire() {
+        let provider = Arc::new(OwnedRootProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "owned-http-no-selection-transition";
+        let mut session = bamboo_agent_core::Session::new(id, "test-model");
+        session.title_generated = true;
+        state.storage.save_session(&session).await.unwrap();
+        let owner = reserve_owned_root(&state, id).await;
+        let initial_run = owner.run_id().to_owned();
+        owner
+            .execution_persistence()
+            .unwrap()
+            .admit_root_inbox(
+                &mut session,
+                state.session_inbox.clone(),
+                Some(&initial_run),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        owner.abandon().await;
+        let (_probe, selected_rx, continue_tx) = selection_probe(id);
+        let http = execute(&state, id, None);
+        let transition = async {
+            assert!(!selected_rx.await.unwrap());
+            assert!(!state
+                .session_inbox
+                .inspect(id)
+                .await
+                .unwrap()
+                .activation_pending());
+            continue_tx.send(()).unwrap();
+        };
+        let ((status, body), ()) =
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                tokio::join!(http, transition)
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "completed");
+        let actor =
+            bamboo_domain::ActorDirectoryPort::inspect_actor(state.session_store.as_ref(), id)
+                .await
+                .unwrap()
+                .activation
+                .unwrap();
+        assert_eq!(actor.run_id, initial_run);
+        assert_eq!(actor.attempt, 1);
+        assert!(provider.messages.lock().unwrap().is_empty());
+        assert!(input_taps().lock().unwrap().get(id).unwrap().is_empty());
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .expect("HTTP race fixture shutdown");
+    }
+
+    // Produce a genuine terminal source through the real child HTTP runner.
+    // Its installed production completion coordinator publishes the only Root
+    // input. No User-string stand-in, raw fence, receipt or source is fabricated.
+    async fn complete_http_race_child(
+        state: &web::Data<crate::AppState>,
+        parent: &str,
+        child: &str,
+    ) -> (
+        SessionMessageEnvelope,
+        bamboo_engine::execution::ChildCompletion,
+    ) {
+        use bamboo_engine::execution::{ChildCompletion, ChildCompletionSource};
+        use sha2::{Digest, Sha256};
+        let (status, body) = execute(state, child, None).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "real Child execution: {body}");
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let outcomes = state
+                    .session_inbox
+                    .pending_child_outcomes(parent, child)
+                    .await
+                    .unwrap();
+                if let Some(envelope) = outcomes.into_iter().next() {
+                    if state
+                        .session_inbox
+                        .inspect(parent)
+                        .await
+                        .unwrap()
+                        .activation_pending()
+                    {
+                        break envelope;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real Child terminal coordinator must publish eligible outcome");
+        let saved = state.storage.load_session(child).await.unwrap().unwrap();
+        let source: ChildCompletionSource =
+            serde_json::from_str(&saved.metadata["runtime.child_completion_source_v1"]).unwrap();
+        assert_eq!(source.activation_run_id, body["run_id"].as_str().unwrap());
+        assert_eq!(source.child_session_id, child);
+        assert_eq!(source.parent_session_id, parent);
+        assert_eq!(source.status, "completed");
+        assert_eq!(
+            source.result_message_id.as_deref(),
+            saved.messages.last().map(|m| m.id.as_str())
+        );
+        let assistant = saved.messages.last().unwrap();
+        let sealed = source.last_assistant.as_ref().unwrap();
+        assert_eq!(sealed.message_id, assistant.id);
+        assert_eq!(
+            sealed.message_sha256,
+            hex::encode(Sha256::digest(serde_json::to_vec(assistant).unwrap()))
+        );
+        assert_eq!(
+            envelope.kind,
+            bamboo_domain::SessionMessageKind::ChildOutcome
+        );
+        assert_eq!(envelope.target_session_id, parent);
+        let bamboo_domain::SessionMessageBody::ChildOutcome(outcome) = &envelope.body else {
+            panic!("production coordinator must emit typed ChildOutcome");
+        };
+        assert_eq!(outcome.child_session_id, child);
+        assert_eq!(outcome.status, "completed");
+        assert_eq!(outcome.result.as_deref(), Some("owned Root finished"));
+        assert_eq!(
+            outcome.provider_message.as_ref().unwrap().metadata["child_completion_source"],
+            serde_json::to_value(&source).unwrap()
+        );
+        let completion = ChildCompletion {
+            parent_session_id: parent.into(),
+            child_session_id: child.into(),
+            status: "completed".into(),
+            error: None,
+            completed_at: saved.updated_at,
+            source: Some(source),
+        };
+        (envelope, completion)
+    }
+
+    // Exercise the coordinator's real locked preparation without launching its
+    // automatic Root. Dropping this unpublished launch must retire its exact
+    // Actor/registry reservation before the gated HTTP request continues.
+    async fn prepare_child_interrupt_for_http(
+        state: &web::Data<crate::AppState>,
+        id: &str,
+        initial_run: &str,
+        wait: &bamboo_domain::session::runtime_state::WaitingForChildrenState,
+    ) -> String {
+        use bamboo_domain::{ActorActivationStatus, ActorDirectoryPort};
+        use bamboo_engine::{SessionActivationReserveOutcome, SessionActivationSpawner};
+        let backlog = state.session_inbox.inspect(id).await.unwrap();
+        assert_eq!(backlog.pending, 1);
+        assert_eq!(backlog.claimed, 0);
+        assert!(backlog.activation_pending());
+        assert!(backlog.interrupt_pending());
+        assert_eq!(backlog.coordinator_generation, 0);
+        assert!(state
+            .session_activation_router
+            .current_run_id(id)
+            .await
+            .is_none());
+        let saved = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(!saved.has_pending_question());
+        assert_eq!(
+            saved
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .waiting_for_children
+                .as_ref(),
+            Some(wait)
+        );
+        let retired = state
+            .session_store
+            .inspect_actor(id)
+            .await
+            .unwrap()
+            .activation
+            .unwrap();
+        assert_eq!(retired.run_id, initial_run);
+        assert_eq!(retired.attempt, 1);
+        assert_eq!(retired.status, ActorActivationStatus::Cancelled);
+        assert!(retired.finished_at.is_some());
+        let launch = match state
+            .child_completion_coordinator
+            .reserve_activation(id, backlog.generation)
+            .await
+            .unwrap()
+        {
+            SessionActivationReserveOutcome::Reserved(launch) => launch,
+            _ => panic!("eligible ChildOutcome must reach real coordinator preparation"),
+        };
+        let run = launch.run_id.clone();
+        assert_ne!(run, initial_run);
+        let token = {
+            let runners = state.agent_runners.read().await;
+            let runner = runners.get(id).unwrap();
+            assert_eq!(runner.run_id, run);
+            assert!(matches!(runner.status, AgentStatus::Running));
+            runner.cancel_token.clone()
+        };
+        assert!(!token.is_cancelled());
+        let prepared_actor = state
+            .session_store
+            .inspect_actor(id)
+            .await
+            .unwrap()
+            .activation
+            .unwrap();
+        assert_eq!(prepared_actor.run_id, run);
+        assert_eq!(prepared_actor.attempt, 2);
+        assert_eq!(prepared_actor.status, ActorActivationStatus::Running);
+        drop(launch);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let actor = state
+                    .session_store
+                    .inspect_actor(id)
+                    .await
+                    .unwrap()
+                    .activation
+                    .unwrap();
+                assert_eq!(actor.fence(), prepared_actor.fence());
+                if actor.status == ActorActivationStatus::Cancelled
+                    && actor.finished_at.is_some()
+                    && !state.agent_runners.read().await.contains_key(id)
+                    && state
+                        .session_activation_router
+                        .current_run_id(id)
+                        .await
+                        .is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exact unpublished preparation rollback within 15 seconds");
+        assert!(token.is_cancelled());
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap(), backlog);
+        let prepared = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(prepared.messages.is_empty());
+        let runtime = prepared.agent_runtime_state.as_ref().unwrap();
+        assert_eq!(
+            runtime.status,
+            bamboo_domain::session::runtime_state::AgentStatusState::Idle
+        );
+        assert!(runtime.suspension.is_none());
+        assert_eq!(runtime.waiting_for_children.as_ref(), Some(wait));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&prepared.metadata["agent.runtime.state"])
+                .unwrap(),
+            serde_json::to_value(runtime).unwrap()
+        );
+        assert!(!prepared.metadata.contains_key("runtime.suspend_reason"));
+        run
+    }
+
+    async fn cleanup_child_http_race(
+        state: &web::Data<crate::AppState>,
+        ids: &[&str],
+    ) -> Result<(), String> {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            // AppState::shutdown stops Child/MCP runtimes, not Root tasks.
+            // Cancel only this fixture's actual tokens before awaiting both.
+            {
+                let runners = state.agent_runners.read().await;
+                for id in ids {
+                    if let Some(runner) = runners.get(*id) {
+                        if matches!(runner.status, AgentStatus::Pending | AgentStatus::Running) {
+                            runner.cancel_token.cancel();
+                        }
+                    }
+                }
+            }
+            state.shutdown().await;
+            loop {
+                let mut live = false;
+                for id in ids {
+                    live |= state
+                        .agent_runners
+                        .read()
+                        .await
+                        .get(*id)
+                        .is_some_and(|runner| {
+                            matches!(runner.status, AgentStatus::Pending | AgentStatus::Running)
+                        });
+                    live |= state
+                        .session_activation_router
+                        .current_run_id(id)
+                        .await
+                        .is_some();
+                }
+                // Only the parent is a native Root Actor. A panic before its
+                // creation has no Actor to retire; later failures must await it.
+                if state
+                    .storage
+                    .load_session(ids[0])
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .is_some()
+                {
+                    let actor = bamboo_domain::ActorDirectoryPort::inspect_actor(
+                        state.session_store.as_ref(),
+                        ids[0],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .activation;
+                    live |= actor
+                        .is_some_and(|actor| actor.status.is_live() || actor.finished_at.is_none());
+                }
+                if !live {
+                    return Ok(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            format!("fixture cleanup left a live runner/router/Actor after 15 seconds: {ids:?}")
+        })?
+    }
+
+    async fn run_owned_http_child_selection_race(initially_running: bool, collide_on_retry: bool) {
+        use futures::FutureExt;
+        let provider = Arc::new(OwnedRootProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        let id = if collide_on_retry {
+            "owned-http-child-retry-collision"
+        } else if initially_running {
+            "owned-http-busy-child-race"
+        } else {
+            "owned-http-empty-child-race"
+        };
+        let result = std::panic::AssertUnwindSafe(run_owned_http_child_selection_race_body(
+            state.clone(),
+            provider,
+            id,
+            initially_running,
+            collide_on_retry,
+        ))
+        .catch_unwind()
+        .await;
+        let cleanup =
+            cleanup_child_http_race(&state, &[id, &format!("{id}-fast"), &format!("{id}-slow")])
+                .await;
+        if let Err(panic) = result {
+            if let Err(error) = cleanup {
+                eprintln!("Child HTTP fixture cleanup also failed: {error}");
+            }
+            std::panic::resume_unwind(panic);
+        }
+        cleanup.expect("Child HTTP fixture must finish cleanup before reporting its result");
+        if let Some((status, body)) = result.unwrap() {
+            assert_eq!(
+                status,
+                StatusCode::ACCEPTED,
+                "sole ChildOutcome must make owned HTTP progress: {body}"
+            );
+        }
+    }
+
+    async fn run_owned_http_child_selection_race_body(
+        state: web::Data<crate::AppState>,
+        provider: Arc<OwnedRootProvider>,
+        id: &str,
+        initially_running: bool,
+        collide_on_retry: bool,
+    ) -> Option<(StatusCode, serde_json::Value)> {
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState,
+            WaitingForChildrenState,
+        };
+        use bamboo_engine::execution::ChildCompletionHandler;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let fast = format!("{id}-fast");
+        let slow = format!("{id}-slow");
+        let mut parent = bamboo_agent_core::Session::new(id, "test-model");
+        parent.title_generated = true;
+        let wait = WaitingForChildrenState::for_children(
+            vec![fast.clone(), slow.clone()],
+            ChildWaitPolicy::All,
+            chrono::Utc::now(),
+        );
+        let mut runtime = AgentRuntimeState::new("waiting-before-http-race");
+        runtime.status = AgentStatusState::Suspended;
+        runtime.waiting_for_children = Some(wait.clone());
+        runtime.suspension = Some(SuspensionState {
+            reason: "waiting_for_children".into(),
+            suspended_at: chrono::Utc::now(),
+            resumable: true,
+            hook_point: Some("ChildCompletion".into()),
+        });
+        parent.agent_runtime_state = Some(runtime);
+        parent.metadata.insert(
+            "runtime.suspend_reason".into(),
+            "waiting_for_children".into(),
+        );
+        state.storage.save_session(&parent).await.unwrap();
+        let mut child = bamboo_agent_core::Session::new_child(&fast, id, "test-model", "Child");
+        child.title_generated = true;
+        child.add_message(bamboo_agent_core::Message::user(
+            "complete the real race child",
+        ));
+        state.storage.save_session(&child).await.unwrap();
+        let mut sibling = bamboo_agent_core::Session::new_child(&slow, id, "test-model", "Child");
+        sibling.set_last_run_status("running");
+        state.storage.save_session(&sibling).await.unwrap();
+        state.skill_manager.store_for_workspace(None).await.unwrap();
+        let mut owner = Some(reserve_owned_root(&state, id).await);
+        let initial_run = owner.as_ref().unwrap().run_id().to_owned();
+        let upgrade = owner
+            .as_ref()
+            .unwrap()
+            .execution_persistence()
+            .unwrap()
+            .admit_root_inbox(&mut parent, state.session_inbox.clone(), Some(&initial_run))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(upgrade.merged, 0);
+        assert!(upgrade.admission_error.is_none());
+        let legacy = state.session_inbox.claim(id, 1).await.unwrap_err();
+        assert!(legacy
+            .to_string()
+            .contains("owned Inbox claim API required"));
+        let mut outcome = if initially_running {
+            Some(complete_http_race_child(&state, id, &fast).await)
+        } else {
+            owner.take().unwrap().abandon().await;
+            assert!(!state
+                .session_inbox
+                .inspect(id)
+                .await
+                .unwrap()
+                .activation_pending());
+            None
+        };
+        let (_probe, selected_rx, continue_tx) = selection_probe(id);
+        let retry_gate = collide_on_retry.then(|| checked_selection_probe(id));
+        let mut contender = None;
+        let mut prepared_run = None;
+        let mut events = state.get_session_event_sender(id).await.subscribe();
+        let http = super::super::handler::handler(
+            state.clone(),
+            test::TestRequest::post().to_http_request(),
+            web::Path::from(id.to_owned()),
+            web::Json(serde_json::from_value(serde_json::json!({"model":"test-model"})).unwrap()),
+        );
+        let transition = async {
+            assert!(!selected_rx.await.unwrap());
+            if initially_running {
+                owner.take().unwrap().abandon().await;
+            } else {
+                outcome = Some(complete_http_race_child(&state, id, &fast).await);
+            }
+            assert!(state
+                .session_activation_router
+                .current_run_id(id)
+                .await
+                .is_none());
+            let backlog = state.session_inbox.inspect(id).await.unwrap();
+            assert_eq!(backlog.pending, 1);
+            assert!(backlog.activation_pending());
+            assert_eq!(
+                backlog.coordinator_generation, 0,
+                "partial All wait has no blanket prefix grant"
+            );
+            assert_eq!(
+                provider.messages.lock().unwrap().len(),
+                1,
+                "only the actual Child has run"
+            );
+            let saved = state.storage.load_session(id).await.unwrap().unwrap();
+            assert!(
+                saved.messages.is_empty(),
+                "sole pending work is the real ChildOutcome"
+            );
+            assert_eq!(
+                saved
+                    .agent_runtime_state
+                    .as_ref()
+                    .unwrap()
+                    .waiting_for_children
+                    .as_ref(),
+                Some(&wait)
+            );
+            let sibling_before =
+                serde_json::to_value(state.storage.load_session(&slow).await.unwrap().unwrap())
+                    .unwrap();
+            prepared_run =
+                Some(prepare_child_interrupt_for_http(&state, id, &initial_run, &wait).await);
+            let envelope = &outcome.as_ref().unwrap().0;
+            assert!(!state
+                .session_inbox
+                .was_admitted(id, &envelope.id)
+                .await
+                .unwrap());
+            let pending = state
+                .session_inbox
+                .pending_child_outcomes(id, &fast)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(pending).unwrap(),
+                serde_json::to_value(vec![envelope]).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(state.storage.load_session(&slow).await.unwrap().unwrap())
+                    .unwrap(),
+                sibling_before
+            );
+            assert_eq!(
+                provider.messages.lock().unwrap().len(),
+                1,
+                "unpublished preparation cannot call Root provider"
+            );
+            assert!(input_taps().lock().unwrap().get(id).unwrap().is_empty());
+            continue_tx.send(()).unwrap();
+            if let Some((checked_rx, continue_reserve)) = retry_gate {
+                assert!(
+                    !checked_rx.await.unwrap(),
+                    "checked admission needs a missing owner"
+                );
+                // The reader must have released its guard: a genuine contender
+                // now reserves/binds through the registry writer without deadlock.
+                contender = Some(reserve_owned_root(&state, id).await);
+                continue_reserve.send(()).unwrap();
+            }
+        };
+        let (mut response, ()) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            tokio::join!(http, transition)
+        })
+        .await
+        .expect("bounded real Child transition while Root HTTP is gated");
+        let mut contender_run = None;
+        if collide_on_retry {
+            let status = response.status();
+            let bytes = actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(String::from_utf8_lossy(&bytes)
+                .contains("Native Root admission changed before ownership; retry execute"));
+            let contender = contender.take().unwrap();
+            let writer = contender.root_actor_writer().unwrap();
+            contender_run = Some(contender.run_id().to_owned());
+            assert!(!contender.cancel_token().is_cancelled());
+            let actor =
+                bamboo_domain::ActorDirectoryPort::inspect_actor(state.session_store.as_ref(), id)
+                    .await
+                    .unwrap()
+                    .activation
+                    .unwrap();
+            assert_eq!(actor.fence(), writer.fence);
+            assert_eq!(actor.attempt, 3);
+            assert_ne!(actor.run_id, initial_run);
+            assert_ne!(Some(actor.run_id.as_str()), prepared_run.as_deref());
+            assert_eq!(actor.status, bamboo_domain::ActorActivationStatus::Running);
+            assert_eq!(
+                state.agent_runners.read().await.get(id).unwrap().run_id,
+                contender.run_id()
+            );
+            assert_eq!(
+                state
+                    .session_activation_router
+                    .current_run_id(id)
+                    .await
+                    .as_deref(),
+                Some(contender.run_id())
+            );
+            let backlog = state.session_inbox.inspect(id).await.unwrap();
+            assert_eq!(backlog.pending, 1);
+            assert_eq!(backlog.claimed, 0);
+            assert_eq!(backlog.coordinator_generation, 0);
+            let envelope = &outcome.as_ref().unwrap().0;
+            assert!(!state
+                .session_inbox
+                .was_admitted(id, &envelope.id)
+                .await
+                .unwrap());
+            assert!(state
+                .storage
+                .load_session(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .messages
+                .is_empty());
+            assert_eq!(
+                provider.messages.lock().unwrap().len(),
+                1,
+                "collision cannot call Root provider"
+            );
+            assert!(input_taps().lock().unwrap().get(id).unwrap().is_empty());
+            contender.abandon().await;
+            assert!(state
+                .session_activation_router
+                .current_run_id(id)
+                .await
+                .is_none());
+            // A new real HTTP request, not a loop or unowned fallback in the
+            // rejected request, must progress the exact same permanent input.
+            response = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                super::super::handler::handler(
+                    state.clone(),
+                    test::TestRequest::post().to_http_request(),
+                    web::Path::from(id.to_owned()),
+                    web::Json(
+                        serde_json::from_value(serde_json::json!({"model":"test-model"})).unwrap(),
+                    ),
+                ),
+            )
+            .await
+            .expect("fresh owned HTTP retry after exact contender retirement");
+        }
+        let status = response.status();
+        let bytes = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if status != StatusCode::ACCEPTED {
+            return Some((status, body));
+        }
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "sole ChildOutcome must make owned HTTP progress: {body}"
+        );
+        let run = body["run_id"].as_str().unwrap();
+        assert_ne!(run, initial_run);
+        assert_ne!(Some(run), prepared_run.as_deref());
+        assert_ne!(Some(run), contender_run.as_deref());
+        wait_for_owned_terminal(&state, id, run, &mut events).await;
+        let (envelope, completion) = outcome.unwrap();
+        let saved = state.storage.load_session(id).await.unwrap().unwrap();
+        let matches: Vec<_> = saved
+            .messages
+            .iter()
+            .filter(|m| m.id == envelope.id.as_str())
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert!(bamboo_domain::is_matching_session_message(
+            matches[0], &envelope
+        ));
+        let source = completion.source.as_ref().unwrap();
+        let durable_source = &matches[0].metadata.as_ref().unwrap()["child_completion_source"];
+        assert_eq!(*durable_source, serde_json::to_value(source).unwrap());
+        assert!(state
+            .session_inbox
+            .was_admitted(id, &envelope.id)
+            .await
+            .unwrap());
+        assert_eq!(
+            saved
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .waiting_for_children
+                .as_ref(),
+            Some(&wait)
+        );
+        let taps = input_taps().lock().unwrap().remove(id).unwrap();
+        assert_eq!(taps.len(), 1, "same reservation reaches one Ready/spawn");
+        assert!(
+            taps[0].is_none(),
+            "Child outcome cannot manufacture current User input authority"
+        );
+        let calls = provider.messages.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            2,
+            "one Child plus one successor Root provider call"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|messages| messages.iter().any(|m| m.id == envelope.id.as_str()))
+                .count(),
+            1
+        );
+        drop(calls);
+        let actor =
+            bamboo_domain::ActorDirectoryPort::inspect_actor(state.session_store.as_ref(), id)
+                .await
+                .unwrap()
+                .activation
+                .unwrap();
+        assert_eq!(actor.run_id, run);
+        assert_eq!(actor.attempt, if collide_on_retry { 4 } else { 3 });
+        // Production duplicate completion must retain its permanent receipt,
+        // not release the unfinished sibling or create another reasoning turn.
+        state
+            .child_completion_coordinator
+            .on_child_completed(completion)
+            .await;
+        let backlog = state.session_inbox.inspect(id).await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 0);
+        assert_eq!(backlog.coordinator_generation, 0);
+        assert_eq!(provider.messages.lock().unwrap().len(), 2);
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            after
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .waiting_for_children
+                .as_ref(),
+            Some(&wait)
+        );
+        assert_eq!(
+            after
+                .messages
+                .iter()
+                .filter(|m| m.id == envelope.id.as_str())
+                .count(),
+            1
+        );
+        None
+    }
+
+    #[actix_web::test]
+    async fn owned_root_http_retired_owner_child_outcome_stays_owned() {
+        run_owned_http_child_selection_race(true, false).await;
+    }
+
+    #[actix_web::test]
+    async fn owned_root_http_late_child_outcome_stays_owned() {
+        run_owned_http_child_selection_race(false, false).await;
+    }
+
+    #[actix_web::test]
+    async fn owned_root_http_secondary_collision_preserves_child_for_fresh_retry() {
+        run_owned_http_child_selection_race(false, true).await;
+    }
+
+    #[actix_web::test]
+    async fn owned_root_http_real_v3_admission_reaches_same_execution_once() {
+        let provider = Arc::new(OwnedRootProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "owned-root-http-real-v3";
+        let mut session = bamboo_agent_core::Session::new(id, "test-model");
+        // A previously titled Root isolates the single execution provider call.
+        session.title_generated = true;
+        state.storage.save_session(&session).await.unwrap();
+        let reservation = reserve_owned_root(&state, id).await;
+        let initial_run = reservation.run_id().to_owned();
+        let upgraded = reservation
+            .execution_persistence()
+            .unwrap()
+            .admit_root_inbox(
+                &mut session,
+                state.session_inbox.clone(),
+                Some(&initial_run),
+            )
+            .await
+            .unwrap()
+            .expect("real bound Root owned admission");
+        assert_eq!(upgraded.merged, 0);
+        assert!(upgraded.admission_error.is_none());
+        reservation.abandon().await;
+        {
+            let runners = state.agent_runners.read().await;
+            let retired = runners
+                .get(id)
+                .expect("exact reservation cleanup retains its terminal slot");
+            assert_eq!(retired.run_id, initial_run);
+            assert!(matches!(retired.status, AgentStatus::Cancelled));
+        }
+        assert!(state
+            .session_activation_router
+            .current_run_id(id)
+            .await
+            .is_none());
+        let legacy = state.session_inbox.claim(id, 1).await.unwrap_err();
+        assert!(
+            legacy
+                .to_string()
+                .contains("owned Inbox claim API required"),
+            "{legacy}"
+        );
+        queue_owned_root(&state, id).await;
+        assert!(provider.messages.lock().unwrap().is_empty());
+        input_taps().lock().unwrap().insert(id.into(), Vec::new());
+        let response = super::super::handler::handler(
+            state.clone(),
+            test::TestRequest::post().to_http_request(),
+            web::Path::from(id.to_owned()),
+            web::Json(serde_json::from_value(serde_json::json!({"model":"test-model"})).unwrap()),
+        )
+        .await;
+        let status = response.status();
+        let body: serde_json::Value = serde_json::from_slice(
+            &actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "actual owned-v3 HTTP boundary: {body}"
+        );
+        let run = body["run_id"].as_str().unwrap();
+        assert_ne!(run, initial_run);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let runners = state.agent_runners.read().await;
+                let runner = runners.get(id).expect("same reserved runner reaches spawn");
+                assert_eq!(runner.run_id, run);
+                if !matches!(runner.status, AgentStatus::Pending | AgentStatus::Running) {
+                    assert!(
+                        matches!(runner.status, AgentStatus::Completed),
+                        "{:?}",
+                        runner.status
+                    );
+                    break;
+                }
+                drop(runners);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("actual owned Root completes within unchanged deadline");
+        let stored = state.storage.load_session(id).await.unwrap().unwrap();
+        let users: Vec<_> = stored
+            .messages
+            .iter()
+            .filter(|m| m.role == bamboo_agent_core::Role::User)
+            .collect();
+        assert_eq!(users.len(), 1, "one durable typed User checkpoint");
+        let input = &users[0].id;
+        assert_eq!(users[0].content, "one owned Root input");
+        assert!(state
+            .session_inbox
+            .was_admitted(id, &SessionMessageId::parse(input).unwrap())
+            .await
+            .unwrap());
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 0);
+        let taps = input_taps().lock().unwrap().remove(id).unwrap();
+        assert_eq!(taps.len(), 1, "one actual Ready/spawn handoff");
+        assert_eq!(taps[0].as_ref().unwrap().len(), 1);
+        assert_eq!(taps[0].as_ref().unwrap()[0].0, *input);
+        let calls = provider.messages.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one execution provider call");
+        assert_eq!(calls[0].iter().filter(|m| m.id == *input).count(), 1);
+        drop(calls);
+        let activation =
+            bamboo_domain::ActorDirectoryPort::inspect_actor(state.session_store.as_ref(), id)
+                .await
+                .unwrap()
+                .activation
+                .unwrap();
+        assert_eq!(
+            activation.run_id, run,
+            "admission and execution keep the same Root owner"
+        );
+        assert_eq!(
+            activation.attempt, 2,
+            "one initial upgrade, one HTTP reservation; Ready cannot reserve again"
+        );
+        let retry = state.admit_chat_for_execute(id).await.unwrap();
+        assert!(retry.inputs.is_none());
+        assert!(!retry.generate_title, "NoNew cannot manufacture title work");
+    }
+
+    #[actix_web::test]
+    async fn owned_root_http_existing_reservation_keeps_input_pending() {
+        let provider = Arc::new(OwnedRootProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "owned-root-http-active-owner";
+        let mut session = bamboo_agent_core::Session::new(id, "test-model");
+        session.title_generated = true;
+        state.storage.save_session(&session).await.unwrap();
+        let reservation = reserve_owned_root(&state, id).await;
+        let owner = reservation.root_actor_writer().unwrap();
+        let admission = reservation
+            .execution_persistence()
+            .unwrap()
+            .admit_root_inbox(
+                &mut session,
+                state.session_inbox.clone(),
+                Some(reservation.run_id()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(admission.admission_error.is_none());
+        queue_owned_root(&state, id).await;
+        let response = super::super::handler::handler(
+            state.clone(),
+            test::TestRequest::post().to_http_request(),
+            web::Path::from(id.to_owned()),
+            web::Json(serde_json::from_value(serde_json::json!({"model":"test-model"})).unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let activation =
+            bamboo_domain::ActorDirectoryPort::inspect_actor(state.session_store.as_ref(), id)
+                .await
+                .unwrap()
+                .activation
+                .unwrap();
+        assert_eq!(activation.fence(), owner.fence);
+        assert_eq!(
+            activation.status,
+            bamboo_domain::ActorActivationStatus::Running
+        );
+        assert_eq!(
+            state
+                .session_activation_router
+                .current_run_id(id)
+                .await
+                .as_deref(),
+            Some(reservation.run_id())
+        );
+        let runners = state.agent_runners.read().await;
+        assert_eq!(runners.get(id).unwrap().run_id, reservation.run_id());
+        assert!(matches!(
+            runners.get(id).unwrap().status,
+            AgentStatus::Running
+        ));
+        drop(runners);
+        assert!(!reservation.cancel_token().is_cancelled());
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+        assert!(!state
+            .storage
+            .load_session(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.role == bamboo_agent_core::Role::User));
+        assert!(provider.messages.lock().unwrap().is_empty());
+        reservation.abandon().await;
+    }
+
+    #[actix_web::test]
+    async fn owned_root_http_lost_bound_owner_fails_closed_before_admission() {
+        let provider = Arc::new(OwnedRootProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "owned-root-http-lost-owner";
+        let mut session = bamboo_agent_core::Session::new(id, "test-model");
+        session.title_generated = true;
+        state.storage.save_session(&session).await.unwrap();
+        let mut reservation = reserve_owned_root(&state, id).await;
+        let admission = reservation
+            .execution_persistence()
+            .unwrap()
+            .admit_root_inbox(
+                &mut session,
+                state.session_inbox.clone(),
+                Some(reservation.run_id()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(admission.admission_error.is_none());
+        queue_owned_root(&state, id).await;
+        let mismatched = state
+            .admit_chat_for_execute_with_reservation("another-root", Some(&reservation))
+            .await
+            .err()
+            .expect("an exact reservation cannot admit a different Root");
+        assert_eq!(mismatched.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // End the real fence through its owning reservation. The previously
+        // bound persistence is now stale; no watermark/fence bytes are forged.
+        reservation
+            .finish_root_actor(bamboo_domain::ActorActivationFinish::Cancelled)
+            .await;
+        let failure = state
+            .admit_chat_for_execute_with_reservation(id, Some(&reservation))
+            .await
+            .err()
+            .expect("lost Root owner must reject admission");
+        assert_eq!(failure.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+        assert!(!state
+            .storage
+            .load_session(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.role == bamboo_agent_core::Role::User));
+        assert!(provider.messages.lock().unwrap().is_empty());
+        reservation.abandon().await;
+        assert!(state
+            .agent_runners
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|runner| matches!(runner.status, AgentStatus::Cancelled)));
+        assert!(state
+            .session_activation_router
+            .current_run_id(id)
+            .await
+            .is_none());
+    }
+
     #[actix_web::test]
     async fn native_inbox_real_chat_receipt_checkpoint_ack_and_current_input_once() {
         let (_home, state, _fault) = state(None).await;
@@ -735,6 +2201,12 @@ mod execution_input_http {
             (true, "sync"),
         ] {
             let (_home, state, _fault) = state(None).await;
+            // A rejected early reservation has already activated this Root.
+            // Keep its later Chat input for this fixture's manual HTTP owner.
+            state
+                .session_activation_router
+                .set_spawner(Arc::new(ManualHttpOnly))
+                .await;
             let id = format!("execution-input-http-reject-{native}-{reason}");
             if !native {
                 bootstrap(&state, &id).await;
@@ -800,10 +2272,22 @@ mod execution_input_http {
                 input_taps().lock().unwrap().remove(&id).unwrap().is_empty(),
                 "failed startup has no execution handoff"
             );
-            assert!(!state.agent_runners.read().await.contains_key(&id));
+            // Early Native admission creates a real reservation. Its existing
+            // abandonment contract retains an exact Cancelled slot.
+            let runners = state.agent_runners.read().await;
+            if let Some(runner) = runners.get(&id) {
+                assert!(native);
+                assert!(matches!(runner.status, AgentStatus::Cancelled));
+            }
+            drop(runners);
+            assert!(state
+                .session_activation_router
+                .current_run_id(&id)
+                .await
+                .is_none());
             assert!(state
                 .session_inbox
-                .was_admitted(&id, &SessionMessageId::parse(rejected).unwrap())
+                .was_admitted(&id, &SessionMessageId::parse(&rejected).unwrap())
                 .await
                 .unwrap());
             let no_new = state.admit_chat_for_execute(&id).await.unwrap();
@@ -819,13 +2303,45 @@ mod execution_input_http {
                 },
             )
             .await;
-            only_id(
-                &crate::handlers::agent::chat::admit_for_execute(&state, &id)
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                successor["message_id"].as_str().unwrap(),
+            let successor_reservation = state.reserve_root_chat_for_execute(&id).await.unwrap();
+            let successor_admission = state
+                .admit_chat_for_execute_with_reservation(&id, successor_reservation.as_ref())
+                .await
+                .unwrap();
+            let stored = state.storage.load_session(&id).await.unwrap().unwrap();
+            let user = stored
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == bamboo_agent_core::Role::User)
+                .expect("successor has a canonical typed User checkpoint");
+            let proof = &user.metadata.as_ref().unwrap()["session_message"];
+            assert_eq!(proof["source"]["type"], "user");
+            assert_eq!(proof["kind"], "user_input");
+            assert_eq!(proof["target_session_id"], id);
+            let envelope: SessionMessageEnvelope = serde_json::from_value(proof.clone()).unwrap();
+            assert!(bamboo_domain::is_matching_session_message(user, &envelope));
+            assert_ne!(
+                user.id, rejected,
+                "a successor cannot reuse rejected current data"
             );
+            if let Some(receipt) = successor["message_id"].as_str() {
+                assert_eq!(user.id, receipt);
+            } else {
+                assert!(
+                    native,
+                    "only activated Native Root Chat may omit its receipt"
+                );
+            }
+            assert!(state
+                .session_inbox
+                .was_admitted(&id, &envelope.id)
+                .await
+                .unwrap());
+            only_id(&successor_admission.inputs.unwrap(), &user.id);
+            if let Some(reservation) = successor_reservation {
+                reservation.abandon().await;
+            }
         }
     }
 
