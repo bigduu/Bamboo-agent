@@ -516,12 +516,21 @@ fn spawn_completion_poll(
                 child.wait().await
             }
         };
-        let waited = wait_result.is_ok();
         if wait_result.is_ok() {
             if let Some((state, _)) = &polled {
                 state.mark_process_exited();
             }
         }
+        // Test-only failure is injected after actual OS cleanup and reap.
+        // It exercises readout without replacing real process ownership.
+        #[cfg(test)]
+        let wait_result = wait_result.and_then(|status| {
+            if let Some((state, _)) = &polled {
+                state.test_cleanup_after_reap()?;
+            }
+            Ok(status)
+        });
+        let waited = wait_result.is_ok();
         let wait_error = wait_result.as_ref().err().map(ToString::to_string);
         let (status_str, exit_code_value) = match wait_result {
             Ok(status) => {
@@ -542,7 +551,7 @@ fn spawn_completion_poll(
         if let Some((state, stdin)) = &polled {
             if let Some(error) = wait_error {
                 state
-                    .record_error(format!("Shell wait failed: {error}"))
+                    .record_cleanup_error(format!("Shell wait failed: {error}"))
                     .await;
             }
             // Publish terminal status only after both streams reach EOF. The
@@ -615,18 +624,23 @@ fn spawn_completion_poll(
             });
         }
 
-        if polled.is_some() && initial_cancelled.load(Ordering::Acquire) {
-            // Notification is not proof. Failed cleanup remains observable.
-            if waited {
+        if polled.is_some() {
+            let cancelled = initial_cancelled.load(Ordering::Acquire);
+            if cancelled && waited {
+                // Notification is not proof; discard only after real cleanup.
                 let _ = remove_shell(&session_id_for_gc);
+            } else {
+                if cancelled {
+                    // Never include command text or captured output here.
+                    warn!(bash_id = %session_id_for_gc, "Initial exec cleanup failed; terminal error retained for write_stdin until the existing cache TTL");
+                }
+                // Failed initial cleanup uses the same bounded terminal cache
+                // as a delivered result, retaining only its display/result key.
+                tokio::spawn(async move {
+                    sleep(Duration::from_secs(COMPLETED_SESSION_TTL_SECS)).await;
+                    let _ = remove_shell(&session_id_for_gc);
+                });
             }
-        } else if polled.is_some() {
-            // This task retains only a display/result cache key, never process
-            // ownership or a LocalTaskResources scope across the cache TTL.
-            tokio::spawn(async move {
-                sleep(Duration::from_secs(COMPLETED_SESSION_TTL_SECS)).await;
-                let _ = remove_shell(&session_id_for_gc);
-            });
         } else if owned {
             // Resource finalization must not wait for a display-cache TTL.
             let _ = remove_shell(&session_id_for_gc);

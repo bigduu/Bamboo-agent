@@ -35,6 +35,8 @@ pub(crate) struct PolledShellState {
     // A reaped parent may still have descendants holding its output pipes.
     // This observation does not publish a terminal capture result.
     process_exited: AtomicBool,
+    #[cfg(test)]
+    fail_cleanup_after_reap: AtomicBool,
     capture_stop: watch::Sender<bool>,
     pub(crate) interaction: Mutex<()>,
     _permit: OwnedSemaphorePermit,
@@ -52,6 +54,8 @@ impl PolledShellState {
             output: Mutex::new(CapturedOutput::default()),
             completed: Notify::new(),
             process_exited: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_cleanup_after_reap: AtomicBool::new(false),
             capture_stop: watch::channel(false).0,
             interaction: Mutex::new(()),
             _permit: permit,
@@ -73,6 +77,21 @@ impl PolledShellState {
 
     pub(crate) async fn record_error(&self, error: String) {
         self.output.lock().await.error.get_or_insert(error);
+    }
+
+    pub(crate) async fn record_cleanup_error(&self, error: String) {
+        // A real wait/group-drain failure takes priority over an earlier
+        // capture timeout so the retained continuation explains failed cleanup.
+        self.output.lock().await.error = Some(error);
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_cleanup_after_reap(&self) -> std::io::Result<()> {
+        if self.fail_cleanup_after_reap.swap(false, Ordering::AcqRel) {
+            Err(std::io::Error::other("controlled post-reap cleanup error"))
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn stop_capture(&self) {
@@ -484,3 +503,7 @@ impl Tool for ExecCommandTool {
 #[cfg(test)]
 #[path = "exec_sessions_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "initial_exec_cleanup_tests.rs"]
+mod initial_cleanup_tests;
