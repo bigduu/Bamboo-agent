@@ -269,14 +269,72 @@ pub(crate) async fn poll_result(
     if result.session_id.is_none() {
         bash_runtime::remove_shell(&shell.id);
     }
+    result_outcome(&result)
+}
+
+fn result_outcome(result: &ExecSessionResult) -> ToolOutcome {
     ToolOutcome::Completed(ToolResult {
         // A command's nonzero exit is an observed outcome, not tool transport
         // failure. Models inspect exit_code/status to decide their next step.
         success: true,
-        result: serde_json::to_string(&result).expect("exec result is serializable"),
+        result: serde_json::to_string(result).expect("exec result is serializable"),
         display_preference: Some("Collapsible".into()),
         images: Vec::new(),
     })
+}
+
+/// Exists only during the first invocation. The completion owner, not Drop,
+/// performs and certifies cleanup before discarding an unpublished entry.
+struct InitialDelivery<'a> {
+    shell: &'a bash_runtime::ShellSession,
+    delivered: bool,
+}
+
+impl Drop for InitialDelivery<'_> {
+    fn drop(&mut self) {
+        if !self.delivered {
+            self.shell.cancel_initial();
+        }
+    }
+}
+
+async fn poll_initial_result(
+    shell: &bash_runtime::ShellSession,
+    yield_time_ms: u64,
+    max_output_tokens: Option<usize>,
+) -> Result<ToolOutcome, ToolError> {
+    let mut delivery = InitialDelivery {
+        shell,
+        delivered: false,
+    };
+    let state = shell.polled.as_ref().expect("validated initial exec");
+    if let Some(owner) = &shell.initial_handoff {
+        tokio::select! {
+            _ = state.wait(yield_time_ms) => {},
+            _ = owner.capture_ready() => {},
+        }
+    } else {
+        state.wait(yield_time_ms).await;
+    }
+    let mut result = state.take(&shell.id, max_output_tokens).await;
+    // No await follows this commit. In the terminal case it performs the
+    // actual wait/reap while the still-pending leader identity is retained.
+    if let Some(status) = shell.deliver_initial().map_err(ToolError::Execution)? {
+        result.session_id = None;
+        result.exit_code = status.code();
+        result.status = if result.error.is_some() {
+            "error"
+        } else if status.code().is_none() {
+            "killed"
+        } else {
+            "completed"
+        };
+    }
+    delivery.delivered = true;
+    if result.session_id.is_none() {
+        bash_runtime::remove_shell(&shell.id);
+    }
+    Ok(result_outcome(&result))
 }
 
 #[derive(Deserialize)]
@@ -383,12 +441,12 @@ impl Tool for ExecCommandTool {
         )
         .await
         .map_err(ToolError::Execution)?;
-        Ok(poll_result(
+        poll_initial_result(
             &shell,
             yield_duration(parsed.yield_time_ms),
             parsed.max_output_tokens,
         )
-        .await)
+        .await
     }
 }
 
