@@ -2346,7 +2346,7 @@ fn message_content_fingerprint(message: &Message) -> String {
     let mut digest = Sha256::new();
     digest.update(format!("{:?}\0", message.role).as_bytes());
     digest.update(message.content.as_bytes());
-    format!("{:x}", digest.finalize())
+    hex::encode(digest.finalize())
 }
 
 fn capture_source_fingerprints(session: &Session, ids: &[String]) -> BTreeMap<String, String> {
