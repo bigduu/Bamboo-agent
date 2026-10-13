@@ -19,10 +19,68 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bamboo_subagent::{ActorEventBatch, ActorEventQos, InboxMessage, Mailbox, MsgId};
-use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
+use bamboo_subagent::{
+    ActorEventBatch, ActorEventQos, Delivered, InboxKind, InboxMessage, Mailbox, MsgId,
+};
+use chrono::{DateTime, Utc};
+use tokio::sync::{mpsc, Mutex, OnceCell, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use crate::error::{BrokerError, BrokerResult};
+use crate::proto::{FencedRunEnvelope, WorkerHostObservation};
+
+fn fenced_run_for_observation(
+    message: &InboxMessage,
+    to: &str,
+    observation: Option<&WorkerHostObservation>,
+) -> bool {
+    if message.kind != InboxKind::FencedRun {
+        return true;
+    }
+    serde_json::from_value::<FencedRunEnvelope>(message.body.clone())
+        .ok()
+        .zip(observation)
+        .is_some_and(|(envelope, observation)| envelope.matches_observation(to, observation))
+}
+
+fn stale_fenced_run() -> BrokerError {
+    BrokerError::Protocol("fenced Run target connection changed or is unavailable".into())
+}
+
+/// A replacement authenticated connection proves the old generation can no
+/// longer receive a Run. Validate the full old envelope before retiring it;
+/// malformed or current-generation messages remain untouched for diagnosis.
+fn confirmed_stale_fenced_run_generation(
+    message: &InboxMessage,
+    to: &str,
+    current: &WorkerHostObservation,
+) -> Option<String> {
+    if message.kind != InboxKind::FencedRun
+        || current.mailbox != to
+        || current.connection_generation.is_empty()
+    {
+        return None;
+    }
+    let envelope = serde_json::from_value::<FencedRunEnvelope>(message.body.clone()).ok()?;
+    if envelope.recipient_connection_generation == current.connection_generation {
+        return None;
+    }
+    // Check the old envelope's own destination and Run lease constraints with
+    // the current credential's validity. Only the new generation is trusted
+    // as live; the old host and role here are validation inputs, not authority.
+    let old_target = WorkerHostObservation {
+        host_ref: envelope.recipient_host_ref.clone(),
+        mailbox: to.to_owned(),
+        role: Some(envelope.recipient_role.clone()),
+        credential_expires_at: current.credential_expires_at,
+        connection_generation: envelope.recipient_connection_generation.clone(),
+        host_capabilities: None,
+        max_slots: None,
+        environment_lease_v1: true,
+    };
+    envelope
+        .matches_observation(to, &old_target)
+        .then_some(envelope.recipient_connection_generation)
+}
 
 fn is_ordered_actor_message(message: &InboxMessage) -> bool {
     matches!(
@@ -88,6 +146,16 @@ struct Subscriber {
     /// Role announced in the `Hello` (`subagent_type`), if any — lets the bus
     /// answer "which connected actors serve role X" without a separate registry.
     role: Option<String>,
+    /// Only set after a scoped Subscribe has completed its backlog preload.
+    host_observation: Option<WorkerHostObservation>,
+}
+
+/// The host identity comes only from an authenticated operator PeerPolicy.
+pub(crate) struct AuthenticatedHost {
+    pub host_ref: String,
+    pub credential_expires_at: DateTime<Utc>,
+    pub host_capabilities: Option<bamboo_domain::WorkerHostCapabilities>,
+    pub max_slots: Option<u16>,
 }
 
 /// Opaque proof that one server connection installed the current subscriber.
@@ -105,6 +173,8 @@ pub(crate) struct SubscriptionStreams {
 /// In-process routing engine: owns the mailbox root and the live subscriber table.
 pub struct BrokerCore {
     root: PathBuf,
+    /// Exactly one durable identity publication/read per server process.
+    identity: OnceCell<String>,
     /// session_id -> live subscriber. Present only while a client is subscribed.
     subscribers: RwLock<HashMap<String, Subscriber>>,
     /// Per-mailbox pending-message cap (#53); see
@@ -122,18 +192,100 @@ pub struct BrokerCore {
     pending_counts: Mutex<HashMap<String, usize>>,
     event_queue_capacity: usize,
     dropped_event_batches: AtomicU64,
+    retired_fenced_runs: AtomicU64,
 }
 
 impl BrokerCore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            identity: OnceCell::new(),
             subscribers: RwLock::new(HashMap::new()),
             max_pending_per_mailbox: DEFAULT_MAX_PENDING_PER_MAILBOX,
             pending_counts: Mutex::new(HashMap::new()),
             event_queue_capacity: DEFAULT_EVENT_QUEUE_CAPACITY,
             dropped_event_batches: AtomicU64::new(0),
+            retired_fenced_runs: AtomicU64::new(0),
         }
+    }
+
+    /// Stable identity of this Maildir namespace. Publish a fully synced
+    /// temporary file with a no-replace hard link: concurrent handshakes must
+    /// never observe an empty identity between create_new and write_all.
+    pub async fn broker_identity(&self) -> BrokerResult<String> {
+        self.identity
+            .get_or_try_init(|| async {
+                let root = self.root.clone();
+                tokio::task::spawn_blocking(move || -> BrokerResult<String> {
+                    use std::io::Write;
+                    std::fs::create_dir_all(&root).map_err(|error| {
+                        BrokerError::Transport(format!("broker identity directory: {error}"))
+                    })?;
+                    let path = root.join(".broker-maildir-identity-v1");
+                    if !path.exists() {
+                        let candidate = uuid::Uuid::new_v4().to_string();
+                        let temporary = root.join(format!(
+                            ".broker-maildir-identity-v1.{}.tmp",
+                            uuid::Uuid::new_v4()
+                        ));
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&temporary)
+                            .map_err(|error| {
+                                BrokerError::Transport(format!(
+                                    "broker identity temp create: {error}"
+                                ))
+                            })?;
+                        let write_result = file
+                            .write_all(candidate.as_bytes())
+                            .and_then(|_| file.sync_all());
+                        drop(file);
+                        if let Err(error) = write_result {
+                            let _ = std::fs::remove_file(&temporary);
+                            return Err(BrokerError::Transport(format!(
+                                "broker identity temp write: {error}"
+                            )));
+                        }
+                        let published = std::fs::hard_link(&temporary, &path);
+                        let _ = std::fs::remove_file(&temporary);
+                        match published {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                            Err(error) => {
+                                return Err(BrokerError::Transport(format!(
+                                    "broker identity publish: {error}"
+                                )));
+                            }
+                        }
+                    }
+                    // Also sync on the losing side of a concurrent publish. Neither
+                    // connection may advertise a root identity before its directory
+                    // entry is durable.
+                    #[cfg(unix)]
+                    std::fs::File::open(&root)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|error| {
+                            BrokerError::Transport(format!("broker identity sync: {error}"))
+                        })?;
+                    let raw = std::fs::read_to_string(&path).map_err(|error| {
+                        BrokerError::Transport(format!("broker identity read: {error}"))
+                    })?;
+                    let parsed = uuid::Uuid::parse_str(&raw).map_err(|_| {
+                        BrokerError::Protocol("invalid persistent broker identity".into())
+                    })?;
+                    Ok(parsed.to_string())
+                })
+                .await
+                .map_err(|error| BrokerError::Transport(format!("broker identity task: {error}")))?
+            })
+            .await
+            .cloned()
+    }
+
+    /// Disjoint transport namespace; no legacy backlog adoption or migration.
+    pub fn new_scoped(root: impl Into<PathBuf>) -> Self {
+        Self::new(root.into().join("scoped-peers-v1"))
     }
 
     /// Override the per-mailbox pending-message cap (#53) from
@@ -164,6 +316,31 @@ impl BrokerCore {
     /// over the cap land before the count is next observed); it is a
     /// best-effort bound, not a hard invariant.
     pub async fn deliver(&self, to: &str, msg: &InboxMessage) -> BrokerResult<MsgId> {
+        if msg.kind == InboxKind::LeasedRun {
+            return Err(BrokerError::Protocol(
+                "legacy leased Run lacks a WorkerHost connection fence".into(),
+            ));
+        }
+        if msg.kind == InboxKind::Run
+            && serde_json::from_value::<bamboo_subagent::RunSpec>(msg.body.clone())
+                .ok()
+                .and_then(|run| run.permission_policy)
+                .and_then(|policy| policy.environment_lease)
+                .is_some()
+        {
+            return Err(BrokerError::Protocol(
+                "remote EnvironmentLease Run requires a WorkerHost connection fence".into(),
+            ));
+        }
+        if msg.kind == InboxKind::FencedRun {
+            let subscribers = self.subscribers.read().await;
+            let observation = subscribers
+                .get(to)
+                .and_then(|subscriber| subscriber.host_observation.as_ref());
+            if !fenced_run_for_observation(msg, to, observation) {
+                return Err(stale_fenced_run());
+            }
+        }
         let pending = self.pending_count_for(to).await?;
         if pending >= self.max_pending_per_mailbox {
             return Err(BrokerError::MailboxFull {
@@ -205,6 +382,65 @@ impl BrokerCore {
         Ok(*counts.entry(session_id.to_string()).or_insert(scanned))
     }
 
+    /// Route a FencedRun using the current subscriber, with validation and
+    /// enqueue under one read lock. A replacement cannot take ownership
+    /// between the generation check and the send. Preload supplies its own
+    /// sink and candidate observation while its public observation is hidden;
+    /// a superseded preload may neither send nor retire a message.
+    async fn route_fenced_run(
+        &self,
+        session_id: &str,
+        delivered: &Delivered,
+        preload_sink: Option<&mpsc::UnboundedSender<PushItem>>,
+        preload_observation: Option<&WorkerHostObservation>,
+    ) -> BrokerResult<()> {
+        debug_assert!(preload_observation.is_none() || preload_sink.is_some());
+        let subscribers = self.subscribers.read().await;
+        let Some(current) = subscribers.get(session_id) else {
+            return Ok(());
+        };
+        if preload_sink.is_some_and(|sink| !current.control_sink.same_channel(sink)) {
+            return Ok(());
+        }
+        let observation = current.host_observation.as_ref().or(preload_observation);
+        if fenced_run_for_observation(&delivered.msg, session_id, observation) {
+            let _ = current
+                .control_sink
+                .send(PushItem::Message(delivered.msg.clone()));
+            return Ok(());
+        }
+        let Some(observation) = observation else {
+            return Ok(());
+        };
+        let Some(old_generation) =
+            confirmed_stale_fenced_run_generation(&delivered.msg, session_id, observation)
+        else {
+            return Ok(());
+        };
+        // Seed before removal, just as ACK does, then decrement exactly once
+        // only if this particular cur/ entry was actually deleted.
+        self.pending_count_for(session_id).await?;
+        if self
+            .mailbox(session_id)
+            .ack_delivered_if_present(delivered)
+            .await?
+        {
+            if let Some(count) = self.pending_counts.lock().await.get_mut(session_id) {
+                *count = count.saturating_sub(1);
+            }
+            let total = self.retired_fenced_runs.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(
+                mailbox = session_id,
+                message_id = %delivered.msg.id.0,
+                old_generation = %old_generation,
+                current_generation = %observation.connection_generation,
+                retired_total = total,
+                "Retired FencedRun for superseded WorkerHost connection"
+            );
+        }
+        Ok(())
+    }
+
     /// Register a subscriber for `session_id` and return the stream of pushed
     /// messages. Immediately re-pushes crash leftovers (`recover`) then any
     /// pending backlog (`drain`). A prior subscriber for the same id is replaced.
@@ -213,7 +449,7 @@ impl BrokerCore {
         session_id: &str,
         role: Option<&str>,
     ) -> BrokerResult<mpsc::UnboundedReceiver<PushItem>> {
-        self.subscribe_streams(session_id, role, false)
+        self.subscribe_streams(session_id, role, false, None, false)
             .await
             .map(|(streams, _lease)| streams.control)
     }
@@ -226,7 +462,28 @@ impl BrokerCore {
         session_id: &str,
         role: Option<&str>,
     ) -> BrokerResult<(SubscriptionStreams, SubscriptionLease)> {
-        self.subscribe_streams(session_id, role, true).await
+        self.subscribe_streams(session_id, role, true, None, false)
+            .await
+    }
+
+    pub(crate) async fn subscribe_scoped_with_lease(
+        &self,
+        session_id: &str,
+        role: Option<&str>,
+        host: AuthenticatedHost,
+    ) -> BrokerResult<(SubscriptionStreams, SubscriptionLease)> {
+        self.subscribe_streams(session_id, role, true, Some(host), false)
+            .await
+    }
+
+    pub(crate) async fn subscribe_scoped_environment_lease_v1(
+        &self,
+        session_id: &str,
+        role: Option<&str>,
+        host: AuthenticatedHost,
+    ) -> BrokerResult<(SubscriptionStreams, SubscriptionLease)> {
+        self.subscribe_streams(session_id, role, true, Some(host), true)
+            .await
     }
 
     async fn subscribe_streams(
@@ -234,6 +491,8 @@ impl BrokerCore {
         session_id: &str,
         role: Option<&str>,
         ordered_actor_events: bool,
+        host: Option<AuthenticatedHost>,
+        environment_lease_v1: bool,
     ) -> BrokerResult<(SubscriptionStreams, SubscriptionLease)> {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -241,6 +500,18 @@ impl BrokerCore {
         let lease = SubscriptionLease {
             control_sink: control_tx.clone(),
         };
+        // Generate the trusted connection identity before replay. Do not make
+        // it observable to senders until backlog preload completes.
+        let host_observation = host.map(|host| WorkerHostObservation {
+            host_ref: host.host_ref,
+            mailbox: session_id.to_owned(),
+            role: role.map(str::to_string),
+            credential_expires_at: host.credential_expires_at,
+            connection_generation: MsgId::new().0,
+            host_capabilities: host.host_capabilities,
+            max_slots: host.max_slots,
+            environment_lease_v1,
+        });
         self.subscribers.write().await.insert(
             session_id.to_string(),
             Subscriber {
@@ -249,6 +520,7 @@ impl BrokerCore {
                 live_event_capacity,
                 ordered_actor_events,
                 role: role.map(str::to_string),
+                host_observation: None,
             },
         );
 
@@ -257,6 +529,19 @@ impl BrokerCore {
         // then newly delivered, all in time order.
         let preload: BrokerResult<()> = async {
             for d in mb.recover().await? {
+                if d.msg.kind == InboxKind::LeasedRun {
+                    continue;
+                }
+                if d.msg.kind == InboxKind::FencedRun {
+                    self.route_fenced_run(
+                        session_id,
+                        &d,
+                        Some(&control_tx),
+                        host_observation.as_ref(),
+                    )
+                    .await?;
+                    continue;
+                }
                 if ordered_actor_events && is_ordered_actor_message(&d.msg) {
                     let _ = event_tx.send(EventPush::Durable(d.msg));
                 } else {
@@ -264,6 +549,19 @@ impl BrokerCore {
                 }
             }
             for d in mb.drain().await? {
+                if d.msg.kind == InboxKind::LeasedRun {
+                    continue;
+                }
+                if d.msg.kind == InboxKind::FencedRun {
+                    self.route_fenced_run(
+                        session_id,
+                        &d,
+                        Some(&control_tx),
+                        host_observation.as_ref(),
+                    )
+                    .await?;
+                    continue;
+                }
                 if ordered_actor_events && is_ordered_actor_message(&d.msg) {
                     let _ = event_tx.send(EventPush::Durable(d.msg));
                 } else {
@@ -276,6 +574,14 @@ impl BrokerCore {
         if let Err(error) = preload {
             self.unsubscribe_if_owner(session_id, &lease).await;
             return Err(error);
+        }
+        if let Some(host_observation) = host_observation {
+            let mut subscribers = self.subscribers.write().await;
+            if let Some(current) = subscribers.get_mut(session_id) {
+                if current.control_sink.same_channel(&lease.control_sink) {
+                    current.host_observation = Some(host_observation);
+                }
+            }
         }
         Ok((
             SubscriptionStreams {
@@ -328,6 +634,12 @@ impl BrokerCore {
 
     pub fn dropped_event_batches(&self) -> u64 {
         self.dropped_event_batches.load(Ordering::Relaxed)
+    }
+
+    /// Number of obsolete FencedRuns physically removed by this broker process.
+    /// Each removal is also logged with the mailbox and message identity.
+    pub fn retired_fenced_runs(&self) -> u64 {
+        self.retired_fenced_runs.load(Ordering::Relaxed)
     }
 
     /// Out-of-band cancel: if `to` is currently subscribed, push an ephemeral
@@ -388,6 +700,26 @@ impl BrokerCore {
             }
         }
         Ok(())
+    }
+
+    /// Authorize the current connection at admission only. An admitted remove
+    /// may finish after subscriber replacement; this is not a filesystem lease.
+    pub(crate) async fn ack_current(
+        &self,
+        session_id: &str,
+        id: &MsgId,
+        lease: &SubscriptionLease,
+    ) -> BrokerResult<()> {
+        let owns = self
+            .subscribers
+            .read()
+            .await
+            .get(session_id)
+            .is_some_and(|s| s.control_sink.same_channel(&lease.control_sink));
+        if !owns {
+            return Err(BrokerError::Auth("scoped peer admission denied".into()));
+        }
+        self.ack(session_id, id).await
     }
 
     /// True if a client is currently subscribed to `session_id`.
@@ -518,6 +850,24 @@ impl BrokerCore {
             .collect()
     }
 
+    /// Current trusted scoped connection only. Ordinary presence never grants
+    /// a host identity, and an expired credential is unavailable immediately.
+    pub(crate) async fn current_host_observation(
+        &self,
+        mailbox: &str,
+        role: &str,
+    ) -> Option<WorkerHostObservation> {
+        let subscribers = self.subscribers.read().await;
+        subscribers
+            .get(mailbox)
+            .and_then(|subscriber| subscriber.host_observation.as_ref())
+            .filter(|observation| {
+                observation.role.as_deref() == Some(role)
+                    && observation.credential_expires_at > Utc::now()
+            })
+            .cloned()
+    }
+
     /// Claim newly-delivered messages for `session_id` and push to its live
     /// subscriber. No-op when no one is subscribed (the message stays durably in
     /// `new/` until someone subscribes). Does NOT `recover` — in-flight `cur/`
@@ -536,6 +886,13 @@ impl BrokerCore {
             }
         };
         for d in self.mailbox(session_id).drain().await? {
+            if d.msg.kind == InboxKind::LeasedRun {
+                continue;
+            }
+            if d.msg.kind == InboxKind::FencedRun {
+                self.route_fenced_run(session_id, &d, None, None).await?;
+                continue;
+            }
             if ordered_actor_events && is_ordered_actor_message(&d.msg) {
                 let _ = event_tx.send(EventPush::Durable(d.msg));
             } else {
@@ -543,6 +900,53 @@ impl BrokerCore {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod broker_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn identity_survives_core_restart_and_changes_with_maildir() {
+        let same_root = tempfile::tempdir().unwrap();
+        let first = BrokerCore::new(same_root.path());
+        let id = first.broker_identity().await.unwrap();
+        assert_eq!(
+            BrokerCore::new(same_root.path())
+                .broker_identity()
+                .await
+                .unwrap(),
+            id
+        );
+        let other_root = tempfile::tempdir().unwrap();
+        assert_ne!(
+            BrokerCore::new(other_root.path())
+                .broker_identity()
+                .await
+                .unwrap(),
+            id
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_cores_publish_one_complete_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let path = root.path().to_path_buf();
+            tasks.push(tokio::spawn(async move {
+                BrokerCore::new(path).broker_identity().await.unwrap()
+            }));
+        }
+        let first = tasks.remove(0).await.unwrap();
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), first);
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(".broker-maildir-identity-v1")).unwrap(),
+            first
+        );
     }
 }
 
@@ -834,6 +1238,325 @@ mod tests {
             c.connected_by_role("explorer").await,
             vec!["w2".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn trusted_host_observation_tracks_only_current_scoped_subscription() {
+        let (dir, core) = core();
+        let deadline = Utc::now() + chrono::Duration::minutes(1);
+        let host = |name: &str, expiry| AuthenticatedHost {
+            host_ref: name.into(),
+            credential_expires_at: expiry,
+            host_capabilities: None,
+            max_slots: None,
+        };
+        let (_first_streams, first_lease) = core
+            .subscribe_scoped_with_lease("worker", Some("gpu"), host("host-a", deadline))
+            .await
+            .unwrap();
+        let first = core
+            .current_host_observation("worker", "gpu")
+            .await
+            .unwrap();
+        assert_eq!(first.host_ref, "host-a");
+        assert_eq!(first.mailbox, "worker");
+        assert_eq!(first.role.as_deref(), Some("gpu"));
+        assert_eq!(first.credential_expires_at, deadline);
+        assert!(!first.connection_generation.is_empty());
+        assert!(core
+            .current_host_observation("worker", "other")
+            .await
+            .is_none());
+
+        let (_replacement_streams, replacement_lease) = core
+            .subscribe_scoped_with_lease("worker", Some("gpu"), host("host-b", deadline))
+            .await
+            .unwrap();
+        let replacement = core
+            .current_host_observation("worker", "gpu")
+            .await
+            .unwrap();
+        assert_eq!(replacement.host_ref, "host-b");
+        assert_ne!(
+            replacement.connection_generation,
+            first.connection_generation
+        );
+        assert!(!core.unsubscribe_if_owner("worker", &first_lease).await);
+        assert_eq!(
+            core.current_host_observation("worker", "gpu").await,
+            Some(replacement)
+        );
+        assert!(
+            core.unsubscribe_if_owner("worker", &replacement_lease)
+                .await
+        );
+        assert!(core
+            .current_host_observation("worker", "gpu")
+            .await
+            .is_none());
+
+        let (_lease_streams, lease_owner) = core
+            .subscribe_scoped_environment_lease_v1(
+                "worker",
+                Some("gpu"),
+                host("lease-host", deadline),
+            )
+            .await
+            .unwrap();
+        assert!(
+            core.current_host_observation("worker", "gpu")
+                .await
+                .unwrap()
+                .environment_lease_v1
+        );
+        assert!(core.unsubscribe_if_owner("worker", &lease_owner).await);
+
+        let (_legacy, legacy_lease) = core
+            .subscribe_with_lease("worker", Some("gpu"))
+            .await
+            .unwrap();
+        assert!(core
+            .current_host_observation("worker", "gpu")
+            .await
+            .is_none());
+        assert!(core.unsubscribe_if_owner("worker", &legacy_lease).await);
+        core.subscribe_scoped_with_lease(
+            "worker",
+            Some("gpu"),
+            host("expired", Utc::now() - chrono::Duration::seconds(1)),
+        )
+        .await
+        .unwrap();
+        assert!(core
+            .current_host_observation("worker", "gpu")
+            .await
+            .is_none());
+        assert!(BrokerCore::new(dir.path())
+            .current_host_observation("worker", "gpu")
+            .await
+            .is_none());
+    }
+
+    fn test_host() -> AuthenticatedHost {
+        AuthenticatedHost {
+            host_ref: "same-host".into(),
+            credential_expires_at: Utc::now() + chrono::Duration::minutes(5),
+            host_capabilities: None,
+            max_slots: None,
+        }
+    }
+
+    fn test_fenced_run(observation: &WorkerHostObservation) -> InboxMessage {
+        let run: bamboo_subagent::RunSpec = serde_json::from_value(serde_json::json!({
+            "assignment":"bounded work",
+            "logical_session":{
+                "session_id":"logical-child","parent_session_id":"logical-parent",
+                "root_session_id":"logical-root",
+                "creation":{"created_at":Utc::now(),"spawn_depth":1}
+            },
+            "activation_run_id":"activation-1","execution_epoch":1,
+            "permission_policy":{
+                "revision":1,"bypass_permissions":false,
+                "session_id":"logical-child","policy":{},
+                "environment_lease":{
+                    "version":1,"actor_id":"logical-child",
+                    "activation_run_id":"activation-1","execution_epoch":1,
+                    "admit_before":Utc::now()+chrono::Duration::minutes(2),
+                    "git_commit":"a".repeat(40),"content_sha256":"b".repeat(64),
+                    "workspace_relpath":"."
+                }
+            }
+        }))
+        .unwrap();
+        InboxMessage {
+            id: MsgId::new(),
+            from: AgentRef {
+                session_id: "parent".into(),
+                role: Some("host".into()),
+            },
+            kind: InboxKind::FencedRun,
+            body: serde_json::to_value(
+                FencedRunEnvelope::for_observation(run, observation).unwrap(),
+            )
+            .unwrap(),
+            created_at: Utc::now(),
+            correlation_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn broker_restart_retires_unacked_fenced_run_from_old_generation() {
+        let (dir, original) = core();
+        let (mut first_streams, _first_lease) = original
+            .subscribe_scoped_environment_lease_v1("worker", Some("worker"), test_host())
+            .await
+            .unwrap();
+        let first = original
+            .current_host_observation("worker", "worker")
+            .await
+            .unwrap();
+        let old_run = test_fenced_run(&first);
+        original.deliver("worker", &old_run).await.unwrap();
+        assert_eq!(
+            expect_message(first_streams.control.recv().await.unwrap()).id,
+            old_run.id
+        );
+        // The Run is durably claimed but has no ACK when the broker restarts.
+        drop(first_streams);
+        drop(original);
+
+        let restarted = BrokerCore::new(dir.path());
+        let (mut successor_streams, _successor_lease) = restarted
+            .subscribe_scoped_environment_lease_v1("worker", Some("worker"), test_host())
+            .await
+            .unwrap();
+        let successor = restarted
+            .current_host_observation("worker", "worker")
+            .await
+            .unwrap();
+        assert_eq!(successor.host_ref, first.host_ref);
+        assert_ne!(successor.connection_generation, first.connection_generation);
+        assert!(successor_streams.control.try_recv().is_err());
+        assert_eq!(restarted.pending_count_for("worker").await.unwrap(), 0);
+        assert_eq!(
+            restarted.mailbox("worker").pending_count().await.unwrap(),
+            0
+        );
+        assert_eq!(restarted.retired_fenced_runs(), 1);
+    }
+
+    #[tokio::test]
+    async fn push_new_retires_only_old_generation_and_frees_mailbox_capacity() {
+        let (dir, original) = core();
+        original
+            .subscribe_scoped_environment_lease_v1("worker", Some("worker"), test_host())
+            .await
+            .unwrap();
+        let old = original
+            .current_host_observation("worker", "worker")
+            .await
+            .unwrap();
+        drop(original);
+
+        let current = BrokerCore::new(dir.path()).with_max_pending_per_mailbox(1);
+        let (mut streams, _lease) = current
+            .subscribe_scoped_environment_lease_v1("worker", Some("worker"), test_host())
+            .await
+            .unwrap();
+        let observation = current
+            .current_host_observation("worker", "worker")
+            .await
+            .unwrap();
+        assert_ne!(old.connection_generation, observation.connection_generation);
+
+        // Model a Run published before replacement but first claimed by the
+        // new subscriber's push path. It must not consume the only quota slot.
+        current
+            .mailbox("worker")
+            .deliver(&test_fenced_run(&old))
+            .await
+            .unwrap();
+        current.push_new("worker").await.unwrap();
+        assert_eq!(current.pending_count_for("worker").await.unwrap(), 0);
+        assert_eq!(current.mailbox("worker").pending_count().await.unwrap(), 0);
+        assert_eq!(current.retired_fenced_runs(), 1);
+        assert!(streams.control.try_recv().is_err());
+
+        let active = test_fenced_run(&observation);
+        current.deliver("worker", &active).await.unwrap();
+        assert_eq!(
+            expect_message(streams.control.recv().await.unwrap()).id,
+            active.id
+        );
+        assert_eq!(current.pending_count_for("worker").await.unwrap(), 1);
+        assert_eq!(current.mailbox("worker").pending_count().await.unwrap(), 1);
+        assert_eq!(current.retired_fenced_runs(), 1);
+    }
+
+    #[tokio::test]
+    async fn replaced_preload_cannot_send_or_retire_current_fenced_run() {
+        let (_dir, core) = core();
+        // Keep a completed successor subscription aside so the replacement
+        // can be interleaved precisely after the first connection claims a Run.
+        let (mut successor_streams, _successor_lease) = core
+            .subscribe_scoped_environment_lease_v1("worker", Some("worker"), test_host())
+            .await
+            .unwrap();
+        let successor = core
+            .current_host_observation("worker", "worker")
+            .await
+            .unwrap();
+        let successor_subscriber = core.subscribers.write().await.remove("worker").unwrap();
+
+        let (mut first_streams, first_lease) = core
+            .subscribe_scoped_environment_lease_v1("worker", Some("worker"), test_host())
+            .await
+            .unwrap();
+        let first = core
+            .current_host_observation("worker", "worker")
+            .await
+            .unwrap();
+        let current_run = test_fenced_run(&successor);
+        core.mailbox("worker").deliver(&current_run).await.unwrap();
+        let claimed = core.mailbox("worker").drain().await.unwrap().pop().unwrap();
+
+        core.subscribers
+            .write()
+            .await
+            .insert("worker".into(), successor_subscriber);
+        // The first preload holds its old candidate observation, but its sink
+        // no longer owns the mailbox. It cannot send or retire this Run.
+        core.route_fenced_run(
+            "worker",
+            &claimed,
+            Some(&first_lease.control_sink),
+            Some(&first),
+        )
+        .await
+        .unwrap();
+        assert!(first_streams.control.try_recv().is_err());
+        assert!(successor_streams.control.try_recv().is_err());
+        assert_eq!(core.retired_fenced_runs(), 0);
+        assert_eq!(core.mailbox("worker").pending_count().await.unwrap(), 1);
+
+        // A push that claimed this message before replacement now consults
+        // the current subscriber, so the successor receives its own Run.
+        core.route_fenced_run("worker", &claimed, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            expect_message(successor_streams.control.recv().await.unwrap()).id,
+            current_run.id
+        );
+        assert!(first_streams.control.try_recv().is_err());
+        assert_eq!(core.mailbox("worker").pending_count().await.unwrap(), 1);
+
+        let obsolete_run = test_fenced_run(&first);
+        core.mailbox("worker").deliver(&obsolete_run).await.unwrap();
+        core.push_new("worker").await.unwrap();
+        assert!(first_streams.control.try_recv().is_err());
+        assert!(successor_streams.control.try_recv().is_err());
+        assert_eq!(core.retired_fenced_runs(), 1);
+        assert_eq!(core.mailbox("worker").pending_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_fenced_run_is_never_retired_as_a_stale_generation() {
+        let (dir, core) = core();
+        let mut unknown = msg(1);
+        unknown.kind = InboxKind::FencedRun;
+        unknown.body = serde_json::json!({ "version": 1 });
+        core.mailbox("worker").deliver(&unknown).await.unwrap();
+
+        let (mut streams, _lease) = core
+            .subscribe_scoped_environment_lease_v1("worker", Some("worker"), test_host())
+            .await
+            .unwrap();
+        assert!(streams.control.try_recv().is_err());
+        assert_eq!(core.retired_fenced_runs(), 0);
+        assert_eq!(core.pending_count_for("worker").await.unwrap(), 1);
+        assert_eq!(core.mailbox("worker").recover().await.unwrap().len(), 1);
+        assert_eq!(BrokerCore::new(dir.path()).retired_fenced_runs(), 0);
     }
 
     #[tokio::test]

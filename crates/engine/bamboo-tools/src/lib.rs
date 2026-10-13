@@ -8,12 +8,17 @@ pub mod events;
 pub mod executor;
 pub mod exposure;
 pub mod guide;
+pub mod local_task_resources;
+pub use local_task_resources::{
+    DrainedLocalTaskResources, LocalTaskResourceIdentity, LocalTaskResources,
+};
 pub mod orchestrator;
 pub mod output_manager;
 pub mod parallel;
 mod permission_override;
 pub use bamboo_permission as permission;
 pub mod slash_commands;
+pub mod tool_search;
 #[allow(clippy::module_inception)]
 pub mod tools;
 

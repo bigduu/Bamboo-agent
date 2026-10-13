@@ -840,6 +840,159 @@ fn current_platform_key() -> &'static str {
     }
 }
 
+async fn assert_url_manifest_rejected_before_artifact_fetch(
+    absolute_id: bool,
+    archive_bundle: bool,
+) {
+    let server = wiremock::MockServer::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let existing_dir = plugins_root.join("hello-plugin");
+    write_hello_plugin_dir(&existing_dir, "hello-plugin").await;
+    let registry_path = plugins_root.join("installed.json");
+    InstalledPlugins {
+        plugins: vec![InstalledPlugin {
+            id: "hello-plugin".to_string(),
+            version: "0.1.0".to_string(),
+            source: PluginSource::LocalDir {
+                path: existing_dir.clone(),
+            },
+            plugin_dir: existing_dir.clone(),
+            installed_at: Utc::now(),
+            status: PluginInstallStatus::Installed,
+            registered: Default::default(),
+        }],
+    }
+    .save(&registry_path)
+    .await
+    .unwrap();
+    let protected_paths = [
+        registry_path,
+        existing_dir.join("plugin.json"),
+        existing_dir.join("skills/hello-world/SKILL.md"),
+    ];
+    let mut protected_bytes = Vec::new();
+    for path in &protected_paths {
+        protected_bytes.push(tokio::fs::read(path).await.unwrap());
+    }
+
+    // Only this fixture-owned file is outside plugins_root. With an absolute
+    // id, the old artifact path joins select this same file as source and
+    // destination, then chmod it before the late manifest validation fails.
+    let sentinel_id = root.path().join("outside-victim");
+    let sentinel = if cfg!(target_os = "windows") {
+        PathBuf::from(format!("{}.exe", sentinel_id.display()))
+    } else {
+        sentinel_id.clone()
+    };
+    let sentinel_bytes = b"existing file outside the plugin installation";
+    tokio::fs::write(&sentinel, sentinel_bytes).await.unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+    }
+    let invalid_id = if absolute_id {
+        sentinel_id.to_str().unwrap().to_string()
+    } else {
+        "../outside-victim".to_string()
+    };
+    let artifact_bytes = build_targz(&[]);
+    let manifest_body = manifest_with_artifact(
+        &invalid_id,
+        current_platform_key(),
+        &sha256_hex_of(&artifact_bytes),
+        &format!("{}/artifact.tar.gz", server.uri()),
+    );
+    let (bundle_path, bundle_bytes) = if archive_bundle {
+        (
+            "/bundle.tar.gz",
+            build_targz(&[("plugin.json", manifest_body.as_bytes())]),
+        )
+    } else {
+        ("/plugin.json", manifest_body.into_bytes())
+    };
+    let bundle_sha256 = sha256_hex_of(&bundle_bytes);
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(bundle_path))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(bundle_bytes))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/artifact.tar.gz"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(artifact_bytes))
+        .mount(&server)
+        .await;
+
+    let error = stage_plugin_source(
+        url_input(
+            &format!("{}{bundle_path}", server.uri()),
+            Some(&bundle_sha256),
+            false,
+        ),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+    )
+    .await
+    .expect_err("an invalid plugin id must be refused");
+    assert!(
+        matches!(error, PluginError::InvalidManifest(_)),
+        "{error:?}"
+    );
+    let received = server.received_requests().await.unwrap();
+    let artifact_requests = received
+        .iter()
+        .filter(|request| request.url.path() == "/artifact.tar.gz")
+        .count();
+    assert_eq!(tokio::fs::read(&sentinel).await.unwrap(), sentinel_bytes);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            tokio::fs::metadata(&sentinel)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "invalid id changed an external file's mode; artifact requests: {artifact_requests}, error: {error}"
+        );
+    }
+    assert_eq!(
+        artifact_requests, 0,
+        "invalid manifest downloaded an artifact"
+    );
+    assert!(
+        matches!(&error, PluginError::InvalidManifest(message) if message.contains("invalid plugin id")),
+        "expected plugin ID validation, got: {error}"
+    );
+    for (path, expected) in protected_paths.iter().zip(protected_bytes) {
+        assert_eq!(tokio::fs::read(path).await.unwrap(), expected);
+    }
+    let names = plugin_root_entry_names(&plugins_root).await;
+    assert_eq!(names.len(), 3, "only inert staging may be added: {names:?}");
+    assert!(names
+        .iter()
+        .any(|name| name.starts_with(".rejected-staging-")));
+}
+
+#[tokio::test]
+async fn url_manifest_with_absolute_id_is_rejected_before_artifact_fetch() {
+    for archive_bundle in [false, true] {
+        assert_url_manifest_rejected_before_artifact_fetch(true, archive_bundle).await;
+    }
+}
+
+#[tokio::test]
+async fn url_manifest_with_traversal_id_is_rejected_before_artifact_fetch() {
+    for archive_bundle in [false, true] {
+        assert_url_manifest_rejected_before_artifact_fetch(false, archive_bundle).await;
+    }
+}
+
 #[tokio::test]
 async fn fetches_verifies_and_places_platform_artifact_binary() {
     let server = wiremock::MockServer::start().await;
@@ -895,6 +1048,10 @@ async fn fetches_verifies_and_places_platform_artifact_binary() {
         "binary should be placed at {:?}",
         expected_bin
     );
+    assert_eq!(
+        tokio::fs::read(&expected_bin).await.unwrap(),
+        b"#!/bin/sh\necho hi\n"
+    );
 
     #[cfg(unix)]
     {
@@ -903,7 +1060,11 @@ async fn fetches_verifies_and_places_platform_artifact_binary() {
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(mode & 0o111, 0o111, "binary should be executable");
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "binary should have executable permissions"
+        );
     }
 
     // Provenance records the verified BUNDLE sha256, not the binary
@@ -924,6 +1085,549 @@ async fn fetches_verifies_and_places_platform_artifact_binary() {
     staged.commit().await;
 }
 
+#[tokio::test]
+async fn artifact_preserves_optional_root_license_tar() {
+    assert_artifact_preserves_optional_root_license(ArchiveKind::TarGz).await;
+}
+
+#[tokio::test]
+async fn artifact_preserves_optional_root_license_zip() {
+    assert_artifact_preserves_optional_root_license(ArchiveKind::Zip).await;
+}
+
+async fn assert_artifact_preserves_optional_root_license(kind: ArchiveKind) {
+    let server = wiremock::MockServer::start().await;
+    let binary_name = if cfg!(target_os = "windows") {
+        "hello-plugin.exe"
+    } else {
+        "hello-plugin"
+    };
+    let binary = b"test executable bytes";
+    let notice = b"MIT notice\r\nraw bytes stay unchanged\r\n";
+    let entries = [
+        (binary_name, binary.as_slice()),
+        ("LICENSE", notice.as_slice()),
+    ];
+    let (archive_bytes, extension) = match kind {
+        ArchiveKind::TarGz => (build_targz(&entries), "tar.gz"),
+        ArchiveKind::Zip => (build_zip(&entries), "zip"),
+    };
+    let artifact_path = format!("/artifact.{extension}");
+    let manifest = manifest_with_artifact(
+        "hello-plugin",
+        current_platform_key(),
+        &sha256_hex_of(&archive_bytes),
+        &format!("{}{artifact_path}", server.uri()),
+    );
+    let outer_notice = b"independent bundle notice\n";
+    let bundle = build_targz(&[
+        ("plugin.json", manifest.as_bytes()),
+        ("LICENSE", outer_notice),
+    ]);
+    let bundle_sha = sha256_hex_of(&bundle);
+    wiremock::Mock::given(wiremock::matchers::path("/bundle.tar.gz"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(bundle))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::path(artifact_path))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(archive_bytes))
+        .mount(&server)
+        .await;
+    let root = tempfile::tempdir().unwrap();
+    let staged = stage_plugin_source(
+        url_input(
+            &format!("{}/bundle.tar.gz", server.uri()),
+            Some(&bundle_sha),
+            false,
+        ),
+        &root.path().join("plugins"),
+        &PluginTrustConfig::default(),
+    )
+    .await
+    .expect("regular root executable plus LICENSE should stage");
+    let platform_dir = staged.plugin_dir.join("bin").join(current_platform_key());
+    assert_eq!(
+        std::fs::read(platform_dir.join(binary_name)).unwrap(),
+        binary
+    );
+    assert_eq!(std::fs::read(platform_dir.join("LICENSE")).unwrap(), notice);
+    assert_eq!(
+        std::fs::read(staged.plugin_dir.join("LICENSE")).unwrap(),
+        outer_notice
+    );
+    assert!(!staged
+        .plugin_dir
+        .join(format!(".artifact-scratch-{}", current_platform_key()))
+        .exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(platform_dir.join(binary_name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(platform_dir.join("LICENSE"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+    staged.commit().await;
+}
+
+fn artifact_zip_with_duplicate(name: &str) -> Vec<u8> {
+    // ZipWriter itself rejects duplicate names, whereas hostile ZIP bytes do not.
+    // Replace an equal-length placeholder in both local and central headers.
+    let replacement = format!("{}X", &name[..name.len() - 1]);
+    let mut entries = vec![
+        (name, b"first".as_slice()),
+        (replacement.as_str(), b"second".as_slice()),
+    ];
+    if name == "LICENSE" {
+        entries.insert(0, ("tool", b"binary"));
+    }
+    let mut bytes = build_zip(&entries);
+    for offset in 0..=bytes.len() - replacement.len() {
+        if &bytes[offset..offset + replacement.len()] == replacement.as_bytes() {
+            bytes[offset..offset + replacement.len()].copy_from_slice(name.as_bytes());
+        }
+    }
+    assert_eq!(
+        zip::ZipArchive::new(std::io::Cursor::new(&bytes))
+            .unwrap()
+            .len(),
+        if name == "LICENSE" { 2 } else { 1 },
+        "zip2 de-duplicates raw central names; the artifact guard must still reject them"
+    );
+    bytes
+}
+
+#[tokio::test]
+async fn artifact_rejects_raw_duplicate_executable_tar() {
+    assert_artifact_rejects_raw_duplicate_executable(ArchiveKind::TarGz).await;
+}
+
+#[tokio::test]
+async fn artifact_rejects_raw_duplicate_executable_zip() {
+    assert_artifact_rejects_raw_duplicate_executable(ArchiveKind::Zip).await;
+}
+
+async fn assert_artifact_rejects_raw_duplicate_executable(kind: ArchiveKind) {
+    let binary_name = if cfg!(target_os = "windows") {
+        "hello-plugin.exe"
+    } else {
+        "hello-plugin"
+    };
+    let (artifact, extension) = match kind {
+        ArchiveKind::TarGz => (
+            build_targz(&[(binary_name, b"first"), (binary_name, b"second")]),
+            "tar.gz",
+        ),
+        ArchiveKind::Zip => (artifact_zip_with_duplicate(binary_name), "zip"),
+    };
+    let server = wiremock::MockServer::start().await;
+    let path = format!("/artifact.{extension}");
+    let manifest: PluginManifest = serde_json::from_str(&manifest_with_artifact(
+        "hello-plugin",
+        current_platform_key(),
+        &sha256_hex_of(&artifact),
+        &format!("{}{path}", server.uri()),
+    ))
+    .unwrap();
+    wiremock::Mock::given(wiremock::matchers::path(path))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(artifact))
+        .mount(&server)
+        .await;
+    let root = tempfile::tempdir().unwrap();
+    fetch_and_place_artifact(&manifest, root.path(), 1024)
+        .await
+        .expect_err("raw duplicate executable must fail");
+    assert!(!root
+        .path()
+        .join("bin")
+        .join(current_platform_key())
+        .join(binary_name)
+        .exists());
+}
+
+// Artifact fixtures use the real archive readers. These helpers deliberately encode
+// metadata the general bundle extractor tolerates, so the narrower artifact policy
+// cannot accidentally be inferred from the regular files left on disk.
+fn artifact_targz_with_type(name: &str, entry_type: tar::EntryType) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut bytes);
+        let mut header = tar::Header::new_gnu();
+        header.set_path(name).unwrap();
+        header.set_entry_type(entry_type);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_cksum();
+        builder.append(&header, std::io::empty()).unwrap();
+        builder.finish().unwrap();
+    }
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn artifact_zip_with_mode(name: &str, mode: Option<u32>) -> Vec<u8> {
+    let mut bytes = build_zip(&[(name, b"payload")]);
+    let archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+    let offset = archive.clone().by_index(0).unwrap().central_header_start() as usize;
+    // Test-only central metadata: Unix types cannot be supplied through the
+    // writer's regular-file permissions API. None mirrors Windows Compress-Archive.
+    bytes[offset + 5] = if mode.is_some() { 3 } else { 0 };
+    bytes[offset + 38..offset + 42].copy_from_slice(&(mode.unwrap_or(0) << 16).to_le_bytes());
+    bytes
+}
+
+#[tokio::test]
+async fn artifact_rejects_extra_nested_unsafe_and_duplicate_members() {
+    for kind in [ArchiveKind::TarGz, ArchiveKind::Zip] {
+        let cases: &[&[(&str, &[u8])]] = &[
+            &[],
+            &[("LICENSE", b"missing executable")],
+            &[("tool", b"binary"), ("README", b"extra")],
+            &[("tool", b"binary"), ("NOTICE", b"extra")],
+            &[("tool", b"binary"), ("nested/LICENSE", b"nested")],
+            &[("tool", b"binary"), ("directory/", b"")],
+            &[("tool", b"binary"), ("../LICENSE", b"unsafe")],
+            &[("tool", b"binary"), ("/LICENSE", b"unsafe")],
+            &[("tool", b"binary"), ("nested/../LICENSE", b"unsafe")],
+            &[
+                ("tool", b"binary"),
+                ("LICENSE", b"one"),
+                ("./LICENSE", b"two"),
+            ],
+            &[("tool", b"one"), ("./tool", b"two")],
+        ];
+        for entries in cases {
+            let bytes = match kind {
+                ArchiveKind::TarGz => build_malicious_targz(entries),
+                ArchiveKind::Zip => build_zip(entries),
+            };
+            let root = tempfile::tempdir().unwrap();
+            let error = extract_artifact_archive(
+                bytes,
+                kind,
+                root.path().join("scratch"),
+                "tool".into(),
+                1024,
+            )
+            .await
+            .expect_err(&format!("{kind:?} must reject {entries:?}"));
+            assert!(
+                matches!(error, PluginError::InvalidManifest(_)),
+                "{error:?}"
+            );
+            assert!(
+                !root.path().join("LICENSE").exists(),
+                "unsafe member must not escape scratch"
+            );
+        }
+        for name in ["tool", "LICENSE"] {
+            let bytes = match kind {
+                ArchiveKind::TarGz if name == "LICENSE" => {
+                    build_targz(&[("tool", b"binary"), (name, b"one"), (name, b"two")])
+                }
+                ArchiveKind::TarGz => build_targz(&[(name, b"one"), (name, b"two")]),
+                ArchiveKind::Zip => artifact_zip_with_duplicate(name),
+            };
+            let root = tempfile::tempdir().unwrap();
+            extract_artifact_archive(
+                bytes,
+                kind,
+                root.path().join("scratch"),
+                "tool".into(),
+                1024,
+            )
+            .await
+            .expect_err("raw duplicate must be rejected");
+        }
+    }
+}
+
+#[tokio::test]
+async fn artifact_rejects_tar_non_regular_types_before_writing() {
+    for entry_type in [
+        tar::EntryType::Directory,
+        tar::EntryType::Symlink,
+        tar::EntryType::Link,
+        tar::EntryType::Fifo,
+        tar::EntryType::Char,
+        tar::EntryType::Block,
+        tar::EntryType::GNULongName,
+        tar::EntryType::XHeader,
+    ] {
+        for name in ["tool", "LICENSE"] {
+            let root = tempfile::tempdir().unwrap();
+            let scratch = root.path().join("scratch");
+            extract_artifact_archive(
+                artifact_targz_with_type(name, entry_type),
+                ArchiveKind::TarGz,
+                scratch.clone(),
+                "tool".into(),
+                1024,
+            )
+            .await
+            .expect_err("artifact member must be regular");
+            assert!(!scratch.join(name).exists());
+        }
+    }
+}
+
+#[tokio::test]
+async fn artifact_rejects_zip_non_regular_types_but_accepts_dos_files() {
+    for mode in [0o040755, 0o120777, 0o010644, 0o020644, 0o060644, 0o140644] {
+        for name in ["tool", "LICENSE"] {
+            let root = tempfile::tempdir().unwrap();
+            let scratch = root.path().join("scratch");
+            extract_artifact_archive(
+                artifact_zip_with_mode(name, Some(mode)),
+                ArchiveKind::Zip,
+                scratch.clone(),
+                "tool".into(),
+                1024,
+            )
+            .await
+            .expect_err("encoded special ZIP type must fail");
+            assert!(!scratch.join(name).exists());
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let scratch = root.path().join("scratch");
+    extract_artifact_archive(
+        artifact_zip_with_mode("tool", None),
+        ArchiveKind::Zip,
+        scratch.clone(),
+        "tool".into(),
+        1024,
+    )
+    .await
+    .expect("DOS file without Unix mode remains compatible");
+    assert_eq!(std::fs::read(scratch.join("tool")).unwrap(), b"payload");
+}
+
+#[tokio::test]
+async fn artifact_decompression_cap_includes_license_and_accepts_exact_total() {
+    for kind in [ArchiveKind::TarGz, ArchiveKind::Zip] {
+        let entries = [
+            ("tool", b"1234".as_slice()),
+            ("LICENSE", b"5678".as_slice()),
+        ];
+        let bytes = match kind {
+            ArchiveKind::TarGz => build_targz(&entries),
+            ArchiveKind::Zip => build_zip(&entries),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let error = extract_artifact_archive(
+            bytes.clone(),
+            kind,
+            root.path().join("too-small"),
+            "tool".into(),
+            7,
+        )
+        .await
+        .expect_err("cumulative binary + LICENSE exceeds cap");
+        assert!(error.to_string().contains("decompressed size cap"));
+        extract_artifact_archive(bytes, kind, root.path().join("exact"), "tool".into(), 8)
+            .await
+            .expect("exact total fits cap");
+    }
+}
+
+#[tokio::test]
+async fn artifact_accepts_bare_and_safe_root_aliases_for_both_formats() {
+    for kind in [ArchiveKind::TarGz, ArchiveKind::Zip] {
+        for entries in [
+            &[("tool", b"binary".as_slice())][..],
+            &[
+                ("./tool", b"binary".as_slice()),
+                ("./LICENSE", b"notice".as_slice()),
+            ][..],
+        ] {
+            let bytes = match kind {
+                ArchiveKind::TarGz => build_malicious_targz(entries),
+                ArchiveKind::Zip => build_zip(entries),
+            };
+            let root = tempfile::tempdir().unwrap();
+            let scratch = root.path().join("scratch");
+            extract_artifact_archive(bytes, kind, scratch.clone(), "tool".into(), 1024)
+                .await
+                .expect("bare executable and safe root ./ aliases remain supported");
+            assert_eq!(std::fs::read(scratch.join("tool")).unwrap(), b"binary");
+        }
+    }
+}
+
+#[tokio::test]
+async fn artifact_case_aliases_never_overwrite_each_other() {
+    let root = tempfile::tempdir().unwrap();
+    let insensitive_probe = root.path().join("case-probe");
+    std::fs::write(&insensitive_probe, b"probe").unwrap();
+    let insensitive = root.path().join("CASE-PROBE").exists();
+    for kind in [ArchiveKind::TarGz, ArchiveKind::Zip] {
+        let bare_entries = [("license", b"bare binary".as_slice())];
+        let bare = match kind {
+            ArchiveKind::TarGz => build_targz(&bare_entries),
+            ArchiveKind::Zip => build_zip(&bare_entries),
+        };
+        let bare_scratch = root.path().join(format!("bare-{kind:?}"));
+        let has_license =
+            extract_artifact_archive(bare, kind, bare_scratch.clone(), "license".into(), 1024)
+                .await
+                .expect("bare lowercase license executable remains supported");
+        assert!(
+            !has_license,
+            "filesystem case alias must not invent an optional companion"
+        );
+        assert_eq!(
+            std::fs::read(bare_scratch.join("license")).unwrap(),
+            b"bare binary"
+        );
+        let entries = [
+            ("license", b"binary".as_slice()),
+            ("LICENSE", b"notice".as_slice()),
+        ];
+        let bytes = match kind {
+            ArchiveKind::TarGz => build_targz(&entries),
+            ArchiveKind::Zip => build_zip(&entries),
+        };
+        let scratch = root.path().join(format!("{kind:?}"));
+        let result =
+            extract_artifact_archive(bytes, kind, scratch.clone(), "license".into(), 1024).await;
+        if insensitive {
+            result.expect_err("case-insensitive collision must reject, never overwrite executable");
+        } else {
+            result.expect("distinct regular files are allowed on case-sensitive filesystems");
+            assert_eq!(std::fs::read(scratch.join("LICENSE")).unwrap(), b"notice");
+        }
+        assert_eq!(std::fs::read(scratch.join("license")).unwrap(), b"binary");
+    }
+}
+
+#[tokio::test]
+async fn artifact_destination_collision_preserves_previous_installation() {
+    for destination_name in ["LICENSE", "hello-plugin"] {
+        let server = wiremock::MockServer::start().await;
+        let binary_name = if cfg!(target_os = "windows") {
+            "hello-plugin.exe"
+        } else {
+            "hello-plugin"
+        };
+        let collision_name = if destination_name == "LICENSE" {
+            "LICENSE"
+        } else {
+            binary_name
+        };
+        let artifact = build_targz(&[
+            (binary_name, b"candidate binary"),
+            ("LICENSE", b"candidate notice"),
+        ]);
+        let manifest = manifest_with_artifact(
+            "hello-plugin",
+            current_platform_key(),
+            &sha256_hex_of(&artifact),
+            &format!("{}/artifact.tar.gz", server.uri()),
+        );
+        let collision_path = format!("bin/{}/{collision_name}", current_platform_key());
+        let bundle = build_targz(&[
+            ("plugin.json", manifest.as_bytes()),
+            (&collision_path, b"signed bundle member"),
+        ]);
+        let bundle_sha = sha256_hex_of(&bundle);
+        wiremock::Mock::given(wiremock::matchers::path("/bundle.tar.gz"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(bundle))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/artifact.tar.gz"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(artifact))
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let plugins_root = root.path().join("plugins");
+        let previous = plugins_root.join("hello-plugin");
+        write_hello_plugin_dir(&previous, "hello-plugin").await;
+        std::fs::write(previous.join("MARKER"), b"previous install").unwrap();
+        stage_plugin_source(
+            url_input(
+                &format!("{}/bundle.tar.gz", server.uri()),
+                Some(&bundle_sha),
+                false,
+            ),
+            &plugins_root,
+            &PluginTrustConfig::default(),
+        )
+        .await
+        .expect_err("artifact cannot replace bundled destination");
+        assert_eq!(
+            std::fs::read(previous.join("MARKER")).unwrap(),
+            b"previous install"
+        );
+        let names = plugin_root_entry_names(&plugins_root).await;
+        assert_eq!(
+            names.len(),
+            2,
+            "only previous install and inert rejected staging remain"
+        );
+        let quarantine = plugins_root.join(
+            names
+                .iter()
+                .find(|name| name.starts_with(".rejected-staging-"))
+                .unwrap(),
+        );
+        assert_eq!(
+            std::fs::read(quarantine.join(collision_path)).unwrap(),
+            b"signed bundle member"
+        );
+        // Both destination checks precede either move.
+        if collision_name == "LICENSE" {
+            assert!(!quarantine
+                .join("bin")
+                .join(current_platform_key())
+                .join(binary_name)
+                .exists());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn artifact_move_refuses_existing_files_and_broken_symlinks() {
+    use std::os::unix::fs::symlink;
+    for broken_link in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("LICENSE");
+        std::fs::write(&source, b"new notice").unwrap();
+        if broken_link {
+            symlink(root.path().join("missing-target"), &destination).unwrap();
+        } else {
+            std::fs::write(&destination, b"existing notice").unwrap();
+        }
+        move_artifact_file(&source, &destination, 0o644)
+            .await
+            .expect_err("create_new must refuse collision");
+        assert_eq!(std::fs::read(&source).unwrap(), b"new notice");
+        if broken_link {
+            assert!(std::fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        } else {
+            assert_eq!(std::fs::read(&destination).unwrap(), b"existing notice");
+        }
+    }
+}
 #[tokio::test]
 async fn artifact_sha256_mismatch_is_rejected_before_unpacking() {
     let server = wiremock::MockServer::start().await;
@@ -1130,6 +1834,231 @@ async fn valid_signature_from_a_trusted_key_verifies_and_supersedes_the_checksum
         "a verified signature is recorded in provenance and needs no bundle sha256"
     );
     staged.commit().await;
+}
+
+// A pooled HTTP connection is driven by the runtime that created it, even
+// when a request using that connection is polled by a different runtime.
+fn assert_signed_staging_survives_another_runtime_shutdown(allow_unsigned: bool) {
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    // These bounds guard deadlocks; channel/gate events establish ordering.
+    const GUARD: Duration = Duration::from_secs(30);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let manifest_body = hello_manifest_json("hello-plugin");
+    let signing_key = test_signing_key(7);
+    let signature = hex::encode(signing_key.sign(manifest_body.as_bytes()).to_bytes());
+    let trust = PluginTrustConfig {
+        trusted_hosts: Vec::new(),
+        trusted_keys: vec![trusted_key_for("test-key", &signing_key)],
+        enforcement: PluginTrustEnforcement::Strict,
+    };
+    let (signature_received_tx, signature_received_rx) = mpsc::channel();
+    let response_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let responder_gate = Arc::clone(&response_gate);
+    // Keep a dedicated server alive throughout both client runtimes. Its
+    // own runtime cannot disappear or be recycled when runtime A exits.
+    let server = runtime.block_on(async {
+        let server = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/plugin.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string(manifest_body.clone()),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/plugin.json.sig"))
+            .respond_with(move |_: &wiremock::Request| {
+                let _ = signature_received_tx.send(());
+                let (lock, ready) = &*responder_gate;
+                let (released, _) = ready
+                    .wait_timeout_while(lock.lock().unwrap(), GUARD, |released| !*released)
+                    .unwrap();
+                if *released {
+                    wiremock::ResponseTemplate::new(200).set_body_string(signature.clone())
+                } else {
+                    wiremock::ResponseTemplate::new(503)
+                }
+            })
+            .mount(&server)
+            .await;
+        server
+    });
+    let url = format!("{}/plugin.json", server.uri());
+    let warm_url = url.clone();
+    let (warm_tx, warm_rx) = mpsc::channel();
+    let (stop_a_tx, stop_a_rx) = tokio::sync::oneshot::channel();
+    let runtime_a = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let client = if allow_unsigned {
+                http_client_no_redirects()
+            } else {
+                http_client_following_redirects()
+            };
+            let warm = tokio::time::timeout(
+                GUARD,
+                download_bytes(&client, &warm_url, MAX_DOWNLOAD_BYTES),
+            )
+            .await;
+            let warmed = matches!(warm, Ok(Ok(ref bytes)) if bytes == manifest_body.as_bytes());
+            let _ = warm_tx.send(warmed);
+            if warmed {
+                let _ = stop_a_rx.await;
+            }
+        });
+        // Returning drops the runtime, including its connection driver.
+    });
+    let warmed = warm_rx.recv_timeout(GUARD);
+    if !matches!(warmed, Ok(true)) {
+        let _ = stop_a_tx.send(());
+        let stopped = runtime_a.join();
+        assert!(stopped.is_ok(), "warm-up runtime panicked");
+        panic!("manifest warm-up failed: {warmed:?}");
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let stage_url = url.clone();
+    let runtime_b = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                GUARD,
+                stage_plugin_source(
+                    url_input_full(&stage_url, None, allow_unsigned, true, allow_unsigned),
+                    &plugins_root,
+                    &trust,
+                ),
+            )
+            .await
+        })
+    });
+    let signature_received = signature_received_rx.recv_timeout(GUARD);
+    let _ = stop_a_tx.send(());
+    let stopped_a = runtime_a.join();
+    // Release even on a worker failure, before joining B or asserting.
+    let (lock, ready) = &*response_gate;
+    *lock.lock().unwrap() = true;
+    ready.notify_all();
+    let staged = runtime_b.join();
+
+    assert!(stopped_a.is_ok(), "runtime A panicked");
+    assert!(
+        signature_received.is_ok(),
+        "staging must reach the signature request before runtime A exits"
+    );
+    let staged = staged
+        .expect("staging runtime panicked")
+        .expect("staging exceeded the deadlock guard")
+        .expect("a trusted signature must survive another runtime shutting down");
+    assert_eq!(staged.manifest.id, "hello-plugin");
+    assert_eq!(
+        staged.source,
+        PluginSource::Url {
+            url,
+            sha256: None,
+            allow_unverified: allow_unsigned,
+            allow_untrusted_host: true,
+            allow_unsigned,
+            signed_by: Some("test-key".to_string()),
+            insecure: false,
+        }
+    );
+    let requests = runtime.block_on(server.received_requests()).unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.url.path())
+            .collect::<Vec<_>>(),
+        ["/plugin.json", "/plugin.json", "/plugin.json.sig"],
+        "warm-up and staging must make exactly the intended requests"
+    );
+    runtime.block_on(staged.commit());
+}
+
+#[test]
+fn signed_staging_survives_another_runtime_shutdown_with_redirects() {
+    assert_signed_staging_survives_another_runtime_shutdown(false);
+}
+
+#[test]
+fn signed_staging_survives_another_runtime_shutdown_without_redirects() {
+    assert_signed_staging_survives_another_runtime_shutdown(true);
+}
+
+#[tokio::test]
+async fn malformed_tampered_and_oversized_signatures_are_refused() {
+    let manifest_body = hello_manifest_json("hello-plugin");
+    let signing_key = test_signing_key(7);
+    let valid_signature = hex::encode(signing_key.sign(manifest_body.as_bytes()).to_bytes());
+    let oversized_signature = format!(
+        "{valid_signature}{}",
+        " ".repeat(MAX_SIGNATURE_DOWNLOAD_BYTES as usize)
+    );
+    assert_eq!(oversized_signature.trim(), valid_signature);
+    assert!(oversized_signature.len() > MAX_SIGNATURE_DOWNLOAD_BYTES as usize);
+    let cases = [
+        ("invalid UTF-8", vec![0xff]),
+        ("non-hex", b"not a hex signature".to_vec()),
+        ("wrong length", hex::encode([0_u8; 63]).into_bytes()),
+        (
+            "tampered manifest",
+            hex::encode(signing_key.sign(b"tampered manifest").to_bytes()).into_bytes(),
+        ),
+        (
+            "valid signature exceeding the cap",
+            oversized_signature.into_bytes(),
+        ),
+    ];
+    let trust = PluginTrustConfig {
+        trusted_hosts: Vec::new(),
+        trusted_keys: vec![trusted_key_for("test-key", &signing_key)],
+        enforcement: PluginTrustEnforcement::Strict,
+    };
+    for (case, signature) in cases {
+        let server = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/plugin.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string(manifest_body.clone()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/plugin.json.sig"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(signature))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let plugins_root = root.path().join("plugins");
+        let url = format!("{}/plugin.json", server.uri());
+        let error = stage_plugin_source(
+            url_input_full(&url, None, false, true, false),
+            &plugins_root,
+            &trust,
+        )
+        .await
+        .expect_err(case);
+        assert!(
+            matches!(error, PluginError::UnsignedOrUntrustedSignature(_)),
+            "{case}: expected UnsignedOrUntrustedSignature, got {error:?}"
+        );
+        assert!(!plugins_root.join("hello-plugin").exists(), "{case}");
+        assert_single_rejected_staging(&plugins_root, case).await;
+    }
 }
 
 #[tokio::test]

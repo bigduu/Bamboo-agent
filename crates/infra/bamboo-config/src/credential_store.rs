@@ -1148,13 +1148,6 @@ impl CredentialStore {
                         }
                     }
                 }
-                bamboo_domain::mcp_config::TransportConfig::Sse(http) => {
-                    collect_mcp_header_secrets(
-                        http.headers.as_slice(),
-                        intents,
-                        &mut secrets_by_ref,
-                    )?
-                }
                 bamboo_domain::mcp_config::TransportConfig::StreamableHttp(http) => {
                     collect_mcp_header_secrets(
                         http.headers.as_slice(),
@@ -1223,9 +1216,6 @@ impl CredentialStore {
                     for name in stdio.env_credential_refs.keys() {
                         stdio.env.remove(name);
                     }
-                }
-                bamboo_domain::mcp_config::TransportConfig::Sse(http) => {
-                    clear_mcp_header_plaintext(&mut http.headers)
                 }
                 bamboo_domain::mcp_config::TransportConfig::StreamableHttp(http) => {
                     clear_mcp_header_plaintext(&mut http.headers)
@@ -3066,15 +3056,6 @@ pub(crate) fn config_credential_ref_counts(
                     add(&CredentialRef::parse(raw_reference.clone())?);
                 }
             }
-            bamboo_domain::mcp_config::TransportConfig::Sse(config) => {
-                for raw_reference in config
-                    .headers
-                    .iter()
-                    .filter_map(|header| header.credential_ref.as_ref())
-                {
-                    add(&CredentialRef::parse(raw_reference.clone())?);
-                }
-            }
             bamboo_domain::mcp_config::TransportConfig::StreamableHttp(config) => {
                 for raw_reference in config
                     .headers
@@ -3201,7 +3182,6 @@ pub fn credentials_path(data_dir: impl AsRef<Path>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fs2::FileExt;
     use std::fs::OpenOptions;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -3511,7 +3491,7 @@ mod tests {
             .write(true)
             .open(dir.path().join(".config-credential-migration.lock"))
             .unwrap();
-        migration_lock.lock_exclusive().unwrap();
+        migration_lock.lock().unwrap();
         std::fs::write(
             dir.path().join("config-credential-migration.json"),
             b"manifest-commit-window",

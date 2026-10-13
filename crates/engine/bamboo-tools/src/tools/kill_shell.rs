@@ -83,7 +83,7 @@ impl Tool for KillShellTool {
                 "KillShell requires 'shell_id' (or legacy alias 'bash_id') from Bash run_in_background".to_string(),
             )
         })?;
-        let shell = bash_runtime::get_shell(shell_id).ok_or_else(|| {
+        let shell = bash_runtime::get_shell(shell_id).filter(|shell| !shell.is_model_polled()).ok_or_else(|| {
             ToolError::Execution(format!(
                 "Background shell '{}' not found. Use the bash_id returned by Bash(run_in_background=true), not chat session_id.",
                 shell_id

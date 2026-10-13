@@ -160,6 +160,7 @@ pub async fn preflight_install(
     plugin_dir: &Path,
 ) -> PluginResult<Vec<bamboo_domain::mcp_config::McpServerConfig>> {
     manifest.validate()?;
+    crate::hooks::registrations(manifest, plugin_dir)?;
 
     let current_platform = Platform::current();
     if let Some(platforms) = &manifest.platforms {

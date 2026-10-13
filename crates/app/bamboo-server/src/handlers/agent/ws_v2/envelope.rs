@@ -213,6 +213,17 @@ pub(crate) fn gap_control(skipped: u64) -> Value {
     serde_json::json!({ "type": "gap", "skipped": skipped })
 }
 
+/// A canonical Actor channel has no durable event journal. After a fresh
+/// subscription or a lost replay window, fetch its authorized subtree snapshot
+/// while keeping the channel subscribed; later events remain buffered.
+pub(crate) fn actor_snapshot_required_control(reason: &str, cursor: u64) -> Value {
+    serde_json::json!({
+        "type": "actor_snapshot_required",
+        "reason": reason,
+        "cursor": cursor,
+    })
+}
+
 /// The app-level keepalive envelope sent on every ping tick (#533):
 /// `{ch:"sys", seq:0, control:{type:"keepalive"}}`.
 ///
@@ -247,6 +258,13 @@ pub(crate) enum ClientFrame {
         #[serde(default)]
         since: Option<u64>,
     },
+    /// Root tree continuity uses an opaque, scope-bound durable cursor rather
+    /// than the numeric process-local Actor event sequence.
+    SubscribeTree {
+        ch: String,
+        #[serde(default)]
+        cursor: Option<String>,
+    },
     /// Unsubscribe from a channel.
     Unsubscribe { ch: String },
     /// Cancel a running session (the only `control` uplink in P1).
@@ -267,6 +285,12 @@ pub(crate) enum Channel {
     Feed,
     /// A per-session agent event stream.
     Agent(String),
+    /// Redacted, Directory-fenced Actor changes (separate from legacy agent).
+    Actor(String),
+    /// Durable, snapshot-based public tree revision for one Root.
+    Tree(String),
+    /// A strictly message-only visible assistant text stream.
+    Message(String),
 }
 
 impl Channel {
@@ -279,6 +303,24 @@ impl Channel {
                 None
             } else {
                 Some(Channel::Agent(sid.to_string()))
+            }
+        } else if let Some(actor_id) = ch.strip_prefix("actor.") {
+            if actor_id.is_empty() {
+                None
+            } else {
+                Some(Channel::Actor(actor_id.to_string()))
+            }
+        } else if let Some(root_id) = ch.strip_prefix("tree.") {
+            if root_id.is_empty() {
+                None
+            } else {
+                Some(Channel::Tree(root_id.to_string()))
+            }
+        } else if let Some(sid) = ch.strip_prefix("message.") {
+            if sid.is_empty() {
+                None
+            } else {
+                Some(Channel::Message(sid.to_string()))
             }
         } else {
             None
@@ -358,6 +400,16 @@ mod tests {
     }
 
     #[test]
+    fn message_channel_parser_requires_a_session_id() {
+        assert_eq!(
+            Channel::parse("message.s1"),
+            Some(Channel::Message("s1".to_string()))
+        );
+        assert_eq!(Channel::parse("message."), None);
+        assert_eq!(Channel::parse("message"), None);
+    }
+
+    #[test]
     fn client_frame_subscribe_parses_with_and_without_cursor() {
         let f: ClientFrame =
             serde_json::from_str(r#"{"type":"subscribe","ch":"feed","since":1006}"#).unwrap();
@@ -366,6 +418,17 @@ mod tests {
             ClientFrame::Subscribe {
                 ch: "feed".to_string(),
                 since: Some(1006)
+            }
+        );
+        let tree: ClientFrame = serde_json::from_str(
+            r#"{"type":"subscribe_tree","ch":"tree.root","cursor":"at1-token-7"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            tree,
+            ClientFrame::SubscribeTree {
+                ch: "tree.root".into(),
+                cursor: Some("at1-token-7".into()),
             }
         );
         let f: ClientFrame =
@@ -556,6 +619,10 @@ mod tests {
                 ch: "agent.s1".into(),
                 since: None,
             },
+            ClientFrame::SubscribeTree {
+                ch: "tree.root".into(),
+                cursor: Some("at1-token-7".into()),
+            },
             ClientFrame::Unsubscribe {
                 ch: "agent.s1".into(),
             },
@@ -572,6 +639,9 @@ mod tests {
                 }
                 ClientFrame::Subscribe { ch, since } => {
                     json!({ "type": "subscribe", "ch": ch, "since": since })
+                }
+                ClientFrame::SubscribeTree { ch, cursor } => {
+                    json!({ "type": "subscribe_tree", "ch": ch, "cursor": cursor })
                 }
                 ClientFrame::Unsubscribe { ch } => json!({ "type": "unsubscribe", "ch": ch }),
                 ClientFrame::Stop { session_id } => {
@@ -631,6 +701,11 @@ mod tests {
             Some(Channel::Agent("sess_abc".to_string()))
         );
         assert_eq!(Channel::parse("agent."), None);
+        assert_eq!(
+            Channel::parse("tree.root"),
+            Some(Channel::Tree("root".into()))
+        );
+        assert_eq!(Channel::parse("tree."), None);
         assert_eq!(Channel::parse("sys"), None, "sys is connection-reserved");
         assert_eq!(Channel::parse("bogus"), None);
     }

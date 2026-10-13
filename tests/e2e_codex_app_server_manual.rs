@@ -96,6 +96,7 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
                     auto_approve_permissions: false,
                     session_id: "manual-codex-app-server".to_string(),
                     workspace_path: Some(workspace.path().to_string_lossy().into_owned()),
+                    environment_lease: None,
                     inherit_session_grants: false,
                     policy: serde_json::to_value(
                         bamboo_tools::permission::SerializablePermissionConfig::default(),
@@ -154,6 +155,7 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
                     auto_approve_permissions: false,
                     session_id: "manual-codex-app-server".to_string(),
                     workspace_path: Some(workspace.path().to_string_lossy().into_owned()),
+                    environment_lease: None,
                     inherit_session_grants: false,
                     policy: serde_json::to_value(
                         bamboo_tools::permission::SerializablePermissionConfig::default(),

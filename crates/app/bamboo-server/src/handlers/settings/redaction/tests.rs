@@ -328,7 +328,7 @@ fn redact_config_redacts_legacy_mcp_and_falls_back_to_runtime_env_keys() {
                 {
                     "id": "legacy-sse",
                     "transport": {
-                        "type": "sse",
+                        "type": "streamable_http",
                         "headers": [
                             {
                                 "name": "Authorization",

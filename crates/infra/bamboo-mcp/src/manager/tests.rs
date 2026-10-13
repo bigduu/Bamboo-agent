@@ -1,11 +1,10 @@
 use super::fingerprint::proxy_fingerprint;
 use super::*;
-use crate::config::{ReconnectConfig, SseConfig, StdioConfig};
+use crate::config::{ReconnectConfig, StdioConfig, StreamableHttpConfig};
 use crate::error::ToolRegistrationError;
 use crate::executor::McpToolExecutor;
 use crate::manager::generation::FenceState;
 use crate::protocol::models::JsonRpcNotification;
-use async_trait::async_trait;
 use bamboo_agent_core::{FunctionCall, ToolCall, ToolExecutor};
 use bamboo_domain::ClassifiedToolIdentity;
 use std::collections::{BTreeSet, HashMap};
@@ -52,7 +51,6 @@ fn tool(name: &str, description: &str) -> McpTool {
 }
 
 struct MockTransport {
-    connected: AtomicBool,
     message_rx: tokio::sync::Mutex<Option<mpsc::Receiver<String>>>,
     message_tx: mpsc::Sender<String>,
     tools: Arc<StdMutex<Vec<McpTool>>>,
@@ -94,7 +92,6 @@ impl MockTransport {
         let call_release = block_call.then(|| Arc::new(Semaphore::new(0)));
         (
             Self {
-                connected: AtomicBool::new(false),
                 message_rx: tokio::sync::Mutex::new(Some(message_rx)),
                 message_tx: message_tx.clone(),
                 tools: tools.clone(),
@@ -115,15 +112,6 @@ impl MockTransport {
             },
         )
     }
-
-    async fn respond(&self, request: &serde_json::Value, result: serde_json::Value) {
-        let response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": request["id"].clone(),
-            "result": result,
-        });
-        let _ = self.message_tx.send(response.to_string()).await;
-    }
 }
 
 impl Drop for MockTransport {
@@ -132,72 +120,62 @@ impl Drop for MockTransport {
     }
 }
 
-#[async_trait]
-impl McpTransport for MockTransport {
-    async fn connect(&mut self) -> Result<()> {
-        self.connected.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-
-    async fn disconnect(&mut self) -> Result<()> {
-        self.connected.store(false, Ordering::SeqCst);
-        Ok(())
-    }
-
-    async fn send(&self, message: String) -> Result<()> {
-        let request: serde_json::Value = serde_json::from_str(&message)?;
-        match request["method"].as_str() {
-            Some("tools/list") => {
-                let tools = self
-                    .tools
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .iter()
-                    .map(|tool| {
-                        serde_json::json!({
-                            "name": tool.name,
-                            "description": tool.description,
-                            "inputSchema": tool.parameters,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                self.respond(&request, serde_json::json!({"tools": tools}))
-                    .await;
+impl rmcp::transport::Transport<rmcp::RoleClient> for MockTransport {
+    type Error = McpError;
+    fn send(
+        &mut self,
+        message: rmcp::model::ClientJsonRpcMessage,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
+        let request = serde_json::to_value(message).unwrap();
+        let tx = self.message_tx.clone();
+        let tools = self.tools.clone();
+        let marker = self.marker.clone();
+        let started = self.call_started.clone();
+        let release = self.call_release.clone();
+        let calls = self.calls.clone();
+        let is_error = self.call_is_error;
+        async move {
+            if request.get("id").is_none() {
+                return Ok(());
             }
-            Some("tools/call") => {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                if let Some(started) = &self.call_started {
-                    let _ = started.send(());
+            let result = match request["method"].as_str() {
+                Some("server/discover") => {
+                    tx.send(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32601,"message":"legacy fixture"}}).to_string()).await.unwrap();
+                    return Ok(());
                 }
-                if let Some(release) = &self.call_release {
-                    let permit = release.acquire().await.expect("call gate stays open");
-                    permit.forget();
+                Some("initialize") => {
+                    serde_json::json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"fixture","version":"1"}})
                 }
-                self.respond(
-                    &request,
-                    serde_json::json!({
-                        "content": [{"type": "text", "text": self.marker}],
-                        "isError": self.call_is_error,
-                    }),
-                )
-                .await;
-            }
-            Some("ping") => self.respond(&request, serde_json::json!({})).await,
-            _ => self.respond(&request, serde_json::json!({})).await,
+                Some("tools/list") => {
+                    let tools = tools.lock().unwrap().iter().map(|tool| serde_json::json!({"name":tool.name,"description":tool.description,"inputSchema":tool.parameters})).collect::<Vec<_>>();
+                    serde_json::json!({"tools":tools})
+                }
+                Some("tools/call") => {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if let Some(started) = started {
+                        let _ = started.send(());
+                    }
+                    if let Some(release) = release {
+                        release.acquire().await.unwrap().forget();
+                    }
+                    serde_json::json!({"content":[{"type":"text","text":marker}],"isError":is_error})
+                }
+                _ => serde_json::json!({}),
+            };
+            tx.send(
+                serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string(),
+            )
+            .await
+            .map_err(|_| McpError::Disconnected)
         }
+    }
+    async fn receive(&mut self) -> Option<rmcp::model::ServerJsonRpcMessage> {
+        let message = self.message_rx.get_mut().as_mut()?.recv().await?;
+        Some(serde_json::from_str(&message).expect("valid fixture message"))
+    }
+    async fn close(&mut self) -> Result<()> {
+        self.message_rx.get_mut().take();
         Ok(())
-    }
-
-    async fn take_message_receiver(&self) -> Option<mpsc::Receiver<String>> {
-        self.message_rx.lock().await.take()
-    }
-
-    async fn receive(&self) -> Result<Option<String>> {
-        Err(McpError::Disconnected)
-    }
-
-    fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::SeqCst)
     }
 }
 
@@ -216,8 +194,11 @@ async fn prepare_mock_with_config(
     tools: Vec<McpTool>,
     transport: MockTransport,
 ) -> PreparedServerRuntime {
-    let mut client = McpProtocolClient::new(Box::new(transport));
-    client.connect().await.expect("connect mock transport");
+    let client = McpProtocolClient::new(transport);
+    client
+        .initialize(5_000)
+        .await
+        .expect("initialize mock transport");
     let notification_rx = client.take_notification_receiver().await;
     let server_id = config.id.clone();
     let catalog = manager
@@ -562,16 +543,16 @@ fn proxy_fingerprint_changes_on_proxy_or_auth_change() {
 }
 
 #[tokio::test]
-async fn sse_transport_respects_proxy_settings_when_available() {
+async fn streamable_http_transport_respects_proxy_settings_when_available() {
     let mut config = Config::default();
     config.http_proxy = "http://".to_string();
     let manager = McpServerManager::new_with_config(Arc::new(tokio::sync::RwLock::new(config)));
     let server = McpServerConfig {
-        id: "sse-test".to_string(),
-        name: Some("SSE test".to_string()),
+        id: "http-test".to_string(),
+        name: Some("HTTP test".to_string()),
         enabled: true,
-        transport: TransportConfig::Sse(SseConfig {
-            url: "http://localhost:9999/sse".to_string(),
+        transport: TransportConfig::StreamableHttp(StreamableHttpConfig {
+            url: "http://localhost:9999/mcp".to_string(),
             headers: Vec::new(),
             connect_timeout_ms: 100,
         }),
@@ -594,6 +575,115 @@ async fn sse_transport_respects_proxy_settings_when_available() {
         ),
         other => panic!("expected InvalidConfig, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn candidate_proxy_failure_precedes_commit_and_preserves_live_network_config() {
+    let live = Arc::new(tokio::sync::RwLock::new(Config::default()));
+    let manager = McpServerManager::new_with_config(live.clone());
+    let mut candidate = Config::default();
+    candidate.http_proxy = "http://".to_string();
+    let mut server = test_config("candidate-http");
+    server.transport = TransportConfig::StreamableHttp(StreamableHttpConfig {
+        url: "http://localhost:9999/mcp".to_string(),
+        headers: Vec::new(),
+        connect_timeout_ms: 100,
+    });
+    let config = McpConfig {
+        version: 1,
+        servers: vec![server],
+    };
+    let committed = AtomicBool::new(false);
+    let error = manager
+        .reconcile_with_runtime_config_after(&config, &candidate, || async {
+            committed.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, McpError::InvalidConfig(_)));
+    assert!(!committed.load(Ordering::SeqCst));
+    assert!(live.read().await.http_proxy.is_empty());
+    assert!(manager.authority.generation().servers.is_empty());
+}
+
+#[tokio::test]
+async fn candidate_proxy_snapshot_replaces_http_runtime_before_live_config_changes() {
+    use rmcp::model::{ListToolsResult, ServerCapabilities, ServerConfig};
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    };
+
+    #[derive(Clone)]
+    struct Fixture;
+    impl rmcp::ServerHandler for Fixture {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> std::result::Result<ListToolsResult, rmcp::ErrorData> {
+            Ok(ListToolsResult::with_all_items(Vec::new()))
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = StreamableHttpService::new(
+        || Ok(Fixture),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default().with_json_response(true),
+    );
+    let task = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new().nest_service("/mcp", service))
+            .await
+            .unwrap();
+    });
+    let live = Arc::new(tokio::sync::RwLock::new(Config::default()));
+    let manager = McpServerManager::new_with_config(live.clone());
+    let mut server = test_config("candidate-http");
+    server.transport = TransportConfig::StreamableHttp(StreamableHttpConfig {
+        url: format!("http://{address}/mcp"),
+        headers: Vec::new(),
+        connect_timeout_ms: 1_000,
+    });
+    let config = McpConfig {
+        version: 1,
+        servers: vec![server],
+    };
+    manager
+        .reconcile_from_config_transactional(&config)
+        .await
+        .unwrap();
+    let before = manager.authority.generation();
+    let mut candidate = live.read().await.clone();
+    candidate.http_proxy = "http://127.0.0.1:12345".to_string();
+    manager
+        .reconcile_with_runtime_config_after(&config, &candidate, || async {
+            assert!(live.read().await.http_proxy.is_empty());
+            assert!(Arc::ptr_eq(&before, &manager.authority.generation()));
+            *live.write().await = candidate.clone();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let after = manager.authority.generation();
+    assert!(!Arc::ptr_eq(
+        &before.servers["candidate-http"],
+        &after.servers["candidate-http"]
+    ));
+    assert_eq!(
+        after.servers["candidate-http"]
+            .runtime
+            .runtime
+            .proxy_fingerprint,
+        proxy_fingerprint(&candidate)
+    );
+    manager.stop_server("candidate-http").await.unwrap();
+    task.abort();
 }
 
 #[tokio::test]
@@ -929,8 +1019,8 @@ async fn install_collision_preserves_existing_generation_and_drops_candidate() {
     catalog.replace_first_canonical_alias_for_test(old_alias.clone());
     let (candidate_transport, controls) =
         MockTransport::new(vec![candidate_tool.clone()], "candidate");
-    let mut client = McpProtocolClient::new(Box::new(candidate_transport));
-    client.connect().await.unwrap();
+    let client = McpProtocolClient::new(candidate_transport);
+    client.initialize(5_000).await.unwrap();
     let runtime = TransportRuntime::new(
         manager.allocate_runtime_id().unwrap(),
         ServerRuntime {
@@ -979,6 +1069,13 @@ async fn install_collision_preserves_existing_generation_and_drops_candidate() {
         &manager.current_expected("stable").unwrap().publication,
         &old
     ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while controls.drops.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("SDK closes the rejected runtime asynchronously");
     assert_eq!(controls.drops.load(Ordering::SeqCst), 1);
 }
 
@@ -1170,6 +1267,13 @@ async fn stale_reconnect_candidate_cannot_overwrite_successor() {
         .publish_reconnected_runtime_if_current(stale, candidate)
         .await
         .unwrap());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while controls.drops.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("SDK closes the rejected runtime asynchronously");
     assert_eq!(controls.drops.load(Ordering::SeqCst), 1);
     assert!(Arc::ptr_eq(
         &manager.current_expected("stable").unwrap().publication,
@@ -2372,5 +2476,12 @@ async fn rejected_staged_runtime_drops_transport_without_snapshot_retention() {
     drop(staged);
     assert_eq!(runtime.fence_state(), FenceState::Closed);
     assert_eq!(runtime.active_calls(), 0);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while controls.drops.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("SDK closes the rejected runtime asynchronously");
     assert_eq!(controls.drops.load(Ordering::SeqCst), 1);
 }

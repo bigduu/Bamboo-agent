@@ -14,14 +14,88 @@ use bamboo_agent_core::tools::ToolError;
 use bamboo_agent_core::Session;
 use bamboo_domain::ProjectId;
 
+mod assembly;
+mod catalog;
 mod load_skill;
+mod output_budget;
 mod read_resource;
 
 #[cfg(test)]
 mod tests;
 
+pub use assembly::{assemble_legacy_skill_tools, LegacySkillContextRegistry};
+pub use catalog::{
+    SelectedSkillSource, SkillInputFactory, SkillInputSession, SkillsListTool, SkillsReadTool,
+    MAX_SKILLS_LIST_BYTES,
+};
 pub use load_skill::LoadSkillTool;
+pub use output_budget::skill_response_byte_budget;
 pub use read_resource::ReadSkillResourceTool;
+
+/// Trusted, ephemeral invocation intent tied to one accepted host input.
+#[derive(Clone, serde::Serialize)]
+pub struct SkillCatalogInvocation {
+    pub input_id: String,
+    pub skills: std::collections::BTreeSet<String>,
+}
+
+/// Fresh actual-caller view. Ceiling is SDK/host authority, not UI selection.
+/// None is unrestricted only after successful resolution of a known caller.
+#[derive(Clone, serde::Serialize)]
+pub struct SkillCatalogCaller {
+    pub caller_id: String,
+    pub session_id: String,
+    pub input_id: String,
+    pub ceiling: Option<std::collections::BTreeSet<String>>,
+    pub invocation: Option<SkillCatalogInvocation>,
+    pub mode: Option<String>,
+    pub context_window: Option<i64>,
+    pub metadata_tokens: Option<std::num::NonZeroUsize>,
+    pub response_bytes: usize,
+}
+
+/// The host must resolve its actual caller and accepted Input N on every call.
+/// Unknown, stale or unavailable bindings return Err; no runtime is wired here.
+#[async_trait]
+pub trait SkillCatalogCallerResolver: Send + Sync {
+    async fn resolve(
+        &self,
+        ctx: &bamboo_agent_core::tools::ToolCtx,
+    ) -> Result<SkillCatalogCaller, ToolError>;
+
+    /// Resolve the actual preappend caller while its existing Session owner is
+    /// borrowed. Implementations must read actual authority nonblockingly and
+    /// never acquire/reenter Session or Config owners. Unknown, stale, busy or
+    /// unavailable bindings deny. This is not an accepted-input or Source grant.
+    /// Only the unwired borrowed-owner factory uses this additive contract;
+    /// existing list/read and self-owned preparation retain async `resolve`.
+    fn resolve_preappend(
+        &self,
+        _ctx: &bamboo_agent_core::tools::ToolCtx,
+    ) -> Result<SkillCatalogCaller, ToolError> {
+        Err(ToolError::Execution(
+            "Current preappend caller resolution is unavailable".into(),
+        ))
+    }
+
+    /// Synchronous acceptance check for the unwired preappend factory only.
+    /// Read the same actual authority source nonblockingly and compare its full
+    /// current caller/input binding, ceiling, invocation, mode and limits with
+    /// `expected`. Unknown, changed, busy or unavailable authority must deny.
+    /// Do not trust `expected` alone, block, await or reenter Config/Session
+    /// owners: those owners remain held, but Source publication has released.
+    /// This is an acceptance instant, not a lease for subsequent consumption.
+    /// Existing list/read paths continue to use `resolve` exclusively.
+    fn validate_current(
+        &self,
+        _ctx: &bamboo_agent_core::tools::ToolCtx,
+        _expected: &SkillCatalogCaller,
+    ) -> Result<(), ToolError> {
+        Err(ToolError::Execution(
+            "Current Skill caller authority validation is unavailable".into(),
+        ))
+    }
+}
 
 pub(super) const MAX_RESOURCE_CONTENT_CHARS: usize = 50_000;
 
@@ -69,6 +143,22 @@ impl SkillToolAccess {
         session_id: Option<&str>,
     ) -> Result<Arc<SkillStore>, ToolError> {
         let scope = self.session_skill_scope(session_id).await?;
+        self.store_for_scope(scope).await
+    }
+
+    /// Resolve using the same owned Session already validated by the caller.
+    pub(super) async fn skill_store_for_session(
+        &self,
+        session: &Session,
+    ) -> Result<Arc<SkillStore>, ToolError> {
+        let scope = self.skill_scope_for_session(session)?;
+        self.store_for_scope(scope).await
+    }
+
+    async fn store_for_scope(
+        &self,
+        scope: SessionSkillScope,
+    ) -> Result<Arc<SkillStore>, ToolError> {
         match scope.project {
             Some((project_id, project_home)) => {
                 self.skill_manager
@@ -107,6 +197,11 @@ impl SkillToolAccess {
                     "Session '{session_id}' not found while resolving skill workspace"
                 ))
             })?;
+        self.skill_scope_for_session(&session)
+    }
+
+    fn skill_scope_for_session(&self, session: &Session) -> Result<SessionSkillScope, ToolError> {
+        let session_id = &session.id;
         let workspace = session.workspace_path_meta().map(PathBuf::from);
         let project = match session.project_id_meta() {
             Some(raw_project_id) => {
@@ -260,3 +355,6 @@ pub(super) fn skill_access_error_to_tool_error(error: SkillAccessError) -> ToolE
         | SkillAccessError::PersistenceError(msg) => ToolError::Execution(msg),
     }
 }
+
+#[cfg(test)]
+mod catalog_tests;

@@ -17,6 +17,10 @@ struct RecordingVisionProvider {
 
 #[async_trait]
 impl LLMProvider for RecordingVisionProvider {
+    async fn vision_support_override(&self, model: &str) -> Option<bool> {
+        (model == "text-only").then_some(false)
+    }
+
     async fn chat_stream(
         &self,
         _messages: &[Message],
@@ -265,4 +269,36 @@ async fn image_fallback_vision_without_llm_leaves_images_intact() {
     .expect("vision fallback without llm should not fail");
 
     assert!(messages[0].content_parts.is_some());
+}
+
+#[tokio::test]
+async fn image_fallback_vision_rejects_disabled_target_before_any_dispatch_or_rewrite() {
+    let mut messages = vec![Message::tool_result_with_images(
+        "view-image-call",
+        "local image",
+        true,
+        vec![ToolResultImage {
+            mime_type: "image/png".to_string(),
+            data: "iVBORw0KGgo=".to_string(),
+        }],
+    )];
+    let before = serde_json::to_value(&messages).unwrap();
+    let recording = Arc::new(RecordingVisionProvider::default());
+    let llm: Arc<dyn LLMProvider> = recording.clone();
+    let error = apply_image_fallback_to_llm_messages(
+        &mut messages,
+        ImageFallbackConfig {
+            mode: ImageFallbackMode::Vision,
+            vision_model: Some("text-only".to_string()),
+        },
+        None,
+        Some(&llm),
+    )
+    .await
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("fallback model 'text-only' does not support Vision"));
+    assert!(recording.models.lock().unwrap().is_empty());
+    assert_eq!(serde_json::to_value(&messages).unwrap(), before);
 }

@@ -415,6 +415,13 @@ fn apply_pending_response(
         .take()
         .ok_or(RespondError::NoPendingQuestion)?;
 
+    if pending.source == bamboo_agent_core::PendingQuestionSource::DirectParent {
+        session.pending_question = Some(pending);
+        return Err(RespondError::InvalidResponse(
+            "Direct-parent clarification requires a canonical ParentRequest reply".into(),
+        ));
+    }
+
     if session
         .messages
         .iter()
@@ -471,6 +478,16 @@ fn apply_pending_response(
             session.pending_question = Some(pending);
             return Err(RespondError::InvalidResponse(error_message));
         }
+    }
+
+    let no_progress_question = super::no_progress::is_no_progress_question(session, &pending);
+    if no_progress_question
+        && (response_source != ResponseSource::Human || permission_receipt.is_some())
+    {
+        session.pending_question = Some(pending);
+        return Err(RespondError::InvalidResponse(
+            "A progress pause requires a Human response".into(),
+        ));
     }
 
     let tool_call_id = pending.tool_call_id.clone();
@@ -532,12 +549,23 @@ fn apply_pending_response(
     }
 
     // ---- Update or append tool result message ----
-    let found = update_or_append_tool_result_message(
-        session,
-        &tool_call_id,
-        &input.user_response,
-        response_source,
-    );
+    let found = if no_progress_question {
+        // Runtime questions have no ToolCall. Keep every real tool result and
+        // append the Human's direction as an ordinary User turn.
+        let mut direction = Message::user(input.user_response.clone());
+        if input.user_response == super::no_progress::CONTINUE_OPTION {
+            direction.metadata = Some(serde_json::json!({"runtime_kind": "no_progress_continue"}));
+        }
+        session.add_message(direction);
+        true
+    } else {
+        update_or_append_tool_result_message(
+            session,
+            &tool_call_id,
+            &input.user_response,
+            response_source,
+        )
+    };
     if let Some(receipt) = permission_receipt {
         if !persist_permission_decision_receipt(session, &tool_call_id, receipt) {
             return Err(RespondError::InvalidResponse(
@@ -566,6 +594,10 @@ fn apply_pending_response(
     session.clear_pending_question();
     record_consumed_clarification(session, &tool_call_id);
     session.metadata.remove("runtime.suspend_reason");
+    if no_progress_question && input.user_response == super::no_progress::STOP_OPTION {
+        super::no_progress::stop_after_response(session);
+        return Ok((input.user_response.clone(), None, Vec::new()));
+    }
     session.metadata.insert(
         CLARIFICATION_RESUME_PENDING_KEY.to_string(),
         "true".to_string(),
@@ -1421,6 +1453,32 @@ mod tests {
     }
 
     #[test]
+    fn direct_parent_pending_cannot_be_answered_by_human_respond_text() {
+        let mut session = Session::new("direct-parent-child", "test-model");
+        session.set_pending_question_with_source(
+            "question-call".into(),
+            "AskUserQuestion".into(),
+            "Which option?".into(),
+            vec!["A".into(), "B".into()],
+            true,
+            bamboo_agent_core::PendingQuestionSource::DirectParent,
+        );
+        let input = RespondInput {
+            session_id: session.id.clone(),
+            user_response: "A".into(),
+            model: None,
+            model_ref: None,
+            provider: None,
+            reasoning_effort: None,
+        };
+        assert!(matches!(
+            apply_pending_response(&mut session, &input, Some("question-call"), ResponseSource::Human, None),
+            Err(RespondError::InvalidResponse(message)) if message.contains("Direct-parent")
+        ));
+        assert!(session.pending_question.is_some());
+    }
+
+    #[test]
     fn reused_tool_call_id_requires_current_permission_generation() {
         let mut session = Session::new("sess-1", "test-model");
         for generation in ["generation-old", "generation-current"] {
@@ -1635,6 +1693,9 @@ mod tests {
         assert!(legacy.pending_question.is_some());
     }
 }
+
+#[cfg(test)]
+mod no_progress_tests;
 
 #[cfg(test)]
 mod receipt_persistence_tests {

@@ -8,43 +8,98 @@ use tracing::{debug, warn};
 
 use crate::types::{SkillDefinition, SkillError, SkillResult};
 
+use super::codex_frontmatter::{self, SkillFrontmatter as CodexFrontmatter};
+
 static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
     LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SkillFrontmatter {
-    name: String,
-    description: String,
+    #[serde(flatten)]
+    core: CodexFrontmatter,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "optional_text")]
     license: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "optional_text")]
     compatibility: Option<String>,
     #[serde(default)]
-    #[serde(rename = "allowed-tools", skip_serializing_if = "Vec::is_empty")]
-    allowed_tools: Vec<String>,
+    #[serde(
+        rename = "allowed-tools",
+        alias = "allowed_tools",
+        skip_serializing_if = "AllowedTools::is_empty"
+    )]
+    allowed_tools: AllowedTools,
     #[serde(
         default,
         rename = "argument-hint",
         alias = "argument_hint",
         skip_serializing_if = "Option::is_none"
     )]
-    argument_hint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    metadata: Option<serde_json::Value>,
+    argument_hint: Option<serde_json::Value>,
+}
+
+fn optional_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = Option::<serde_yaml::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| value.as_str().map(str::to_string)))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum AllowedTools {
+    Sequence(Vec<String>),
+    Scalar(String),
+}
+
+impl Default for AllowedTools {
+    fn default() -> Self {
+        Self::Sequence(Vec::new())
+    }
+}
+
+impl AllowedTools {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Sequence(tools) => tools.is_empty(),
+            Self::Scalar(tools) => tools.is_empty(),
+        }
+    }
+
+    fn into_refs(self) -> Vec<String> {
+        match self {
+            Self::Sequence(tools) => tools,
+            Self::Scalar(tools) => tools
+                .split(|c: char| c.is_whitespace() || c == ',')
+                .filter(|tool| !tool.is_empty())
+                .map(str::to_string)
+                .collect(),
+        }
+    }
 }
 
 pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefinition> {
     let (frontmatter_raw, body) = split_frontmatter(content)?;
-    let frontmatter: SkillFrontmatter = serde_yaml::from_str(&frontmatter_raw)?;
+    let frontmatter: SkillFrontmatter = codex_frontmatter::parse_frontmatter(
+        &frontmatter_raw,
+        &[
+            "allowed-tools",
+            "allowed_tools",
+            "metadata",
+            "legacy_manual_only",
+            "legacy_adapter",
+            "legacy_migration",
+            "legacy_import",
+        ],
+    )
+    .map_err(|error| SkillError::Validation(error.to_string()))?;
     let SkillFrontmatter {
-        name,
-        description,
+        core,
         license,
         compatibility,
         allowed_tools,
         argument_hint: _argument_hint,
-        metadata,
     } = frontmatter;
 
     // Skill ID comes from directory name.
@@ -60,36 +115,29 @@ pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefi
         )));
     }
 
-    let name = name.trim();
-    if name.is_empty() {
+    if core.metadata.as_ref().is_some_and(|metadata| {
+        [
+            "legacy_manual_only",
+            "legacy_adapter",
+            "legacy_migration",
+            "legacy_import",
+        ]
+        .iter()
+        .any(|flag| metadata.get(*flag).is_some_and(|value| !value.is_boolean()))
+    }) {
         return Err(SkillError::Validation(
-            "Skill name cannot be empty".to_string(),
+            "Invalid host control flag in metadata".to_string(),
         ));
-    }
-    validate_skill_name(name)?;
-    if !matches_skill_name_directory(name, dir_name) {
-        return Err(SkillError::Validation(format!(
-            "Skill name '{}' must match directory name '{}' or '<namespace>:{}'",
-            name, dir_name, dir_name
-        )));
     }
 
-    let description = description.trim();
-    if description.is_empty() {
-        return Err(SkillError::Validation(
-            "Skill description cannot be empty".to_string(),
-        ));
-    }
-    validate_skill_description(description)?;
+    let parsed = codex_frontmatter::normalize_metadata(&core, || dir_name.to_string())
+        .map_err(|error| SkillError::Validation(error.to_string()))?;
 
     let compatibility = compatibility
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    if let Some(value) = compatibility.as_deref() {
-        validate_compatibility(value)?;
-    }
 
     let license = license
         .as_deref()
@@ -98,7 +146,7 @@ pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefi
         .map(str::to_string);
 
     let mut tool_refs = Vec::new();
-    for tool_ref in allowed_tools {
+    for tool_ref in allowed_tools.into_refs() {
         let trimmed = tool_ref.trim();
         if trimmed.is_empty() {
             continue;
@@ -126,137 +174,34 @@ pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefi
 
     Ok(SkillDefinition {
         id: dir_name.to_string(),
-        name: name.to_string(),
-        description: description.to_string(),
+        name: parsed.name,
+        description: parsed.description,
+        short_description: parsed.short_description,
         license,
         compatibility,
-        metadata,
+        metadata: core.metadata,
         prompt: body.trim().to_string(),
         tool_refs,
     })
 }
 
 pub fn split_frontmatter(content: &str) -> SkillResult<(String, String)> {
-    let mut lines = content.lines();
-    match lines.next() {
-        Some("---") => {}
-        _ => {
-            return Err(SkillError::Validation(
-                "Missing YAML frontmatter".to_string(),
-            ))
-        }
-    }
-
-    let mut frontmatter_lines = Vec::new();
-    let mut found_closing = false;
-    for line in lines.by_ref() {
-        if line == "---" {
-            found_closing = true;
-            break;
-        }
-        frontmatter_lines.push(line);
-    }
-    if !found_closing {
-        return Err(SkillError::Validation(
-            "Invalid frontmatter format".to_string(),
-        ));
-    }
-
-    let frontmatter = frontmatter_lines.join("\n");
-    let body = lines.collect::<Vec<_>>().join("\n");
-    Ok((frontmatter, body))
-}
-
-fn validate_skill_name(name: &str) -> SkillResult<()> {
-    if name.chars().any(char::is_whitespace) {
-        return Err(SkillError::Validation(format!(
-            "Name '{}' cannot contain whitespace",
-            name
-        )));
-    }
-    if name.len() > 128 {
-        return Err(SkillError::Validation(format!(
-            "Name is too long ({} characters). Maximum is 128 characters.",
-            name.len()
-        )));
-    }
-
-    let mut segments = name.split(':');
-    let primary = segments.next().unwrap_or_default();
-    let secondary = segments.next();
-    let extra = segments.next();
-
-    if extra.is_some() {
-        return Err(SkillError::Validation(format!(
-            "Name '{}' supports at most one namespace separator ':'",
-            name
-        )));
-    }
-
-    if !is_valid_skill_name_segment(primary) {
-        return Err(SkillError::Validation(format!(
-            "Name '{}' must use ASCII letters and digits separated by single hyphens, optionally as '<namespace>:<name>'",
-            name
-        )));
-    }
-
-    if let Some(suffix) = secondary {
-        if !is_valid_skill_name_segment(suffix) {
-            return Err(SkillError::Validation(format!(
-                "Name '{}' must use ASCII letters and digits separated by single hyphens, optionally as '<namespace>:<name>'",
-                name
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn is_valid_skill_name_segment(segment: &str) -> bool {
-    is_valid_skill_id(&segment.to_ascii_lowercase())
-}
-
-fn matches_skill_name_directory(name: &str, dir_name: &str) -> bool {
-    name.eq_ignore_ascii_case(dir_name)
-        || name
-            .rsplit_once(':')
-            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case(dir_name))
-}
-
-fn validate_skill_description(description: &str) -> SkillResult<()> {
-    if description.contains('<') || description.contains('>') {
-        return Err(SkillError::Validation(
-            "Description cannot contain angle brackets (< or >)".to_string(),
-        ));
-    }
-    if description.len() > 1024 {
-        return Err(SkillError::Validation(format!(
-            "Description is too long ({} characters). Maximum is 1024 characters.",
-            description.len()
-        )));
-    }
-    Ok(())
-}
-
-fn validate_compatibility(compatibility: &str) -> SkillResult<()> {
-    if compatibility.len() > 500 {
-        return Err(SkillError::Validation(format!(
-            "Compatibility is too long ({} characters). Maximum is 500 characters.",
-            compatibility.len()
-        )));
-    }
-    Ok(())
+    codex_frontmatter::split_frontmatter(content)
+        .map(|(frontmatter, body)| (frontmatter, body.to_string()))
+        .map_err(|error| SkillError::Validation(error.to_string()))
 }
 
 pub fn render_skill_markdown(skill: &SkillDefinition) -> SkillResult<String> {
     let frontmatter = SkillFrontmatter {
-        name: skill.name.clone(),
-        description: skill.description.clone(),
+        core: CodexFrontmatter {
+            name: Some(skill.name.clone()),
+            description: Some(skill.description.clone()),
+            metadata: skill.metadata.clone(),
+        },
         license: skill.license.clone(),
         compatibility: skill.compatibility.clone(),
-        allowed_tools: skill.tool_refs.clone(),
+        allowed_tools: AllowedTools::Sequence(skill.tool_refs.clone()),
         argument_hint: None,
-        metadata: skill.metadata.clone(),
     };
 
     let yaml = serde_yaml::to_string(&frontmatter)?;
@@ -359,6 +304,30 @@ Use this skill when users want to create skills.
 
     #[test]
     fn repeated_static_warning_for_same_key_and_error_downgrades_to_debug() {
+        const CHILD_ENV: &str = "BAMBOO_SKILLS_PARSER_WARN_DEDUP_ISOLATED_CHILD_1751";
+        if std::env::var(CHILD_ENV).as_deref() != Ok("1") {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "store::parser::tests::repeated_static_warning_for_same_key_and_error_downgrades_to_debug",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env_remove(CHILD_ENV)
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("run isolated static warning fixture");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+                "isolated static warning fixture failed or selected no test ({}):\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let levels = Arc::new(Mutex::new(Vec::new()));
         let subscriber = LevelSubscriber(levels.clone());
         let content = r#"---
@@ -433,7 +402,7 @@ Use this skill for document work.
     }
 
     #[test]
-    fn parse_skill_rejects_malformed_mixed_case_name() {
+    fn parse_skill_accepts_display_name_independent_of_safe_id() {
         let content = r#"---
 name: Skill_Creator
 description: Helps create and improve skills.
@@ -441,28 +410,27 @@ description: Helps create and improve skills.
 Use this skill when users want to create skills.
 "#;
 
-        let error = parse_markdown_skill(Path::new("skill-creator/SKILL.md"), content)
-            .expect_err("mixed case must not make malformed names valid");
-        assert!(error.to_string().contains("ASCII letters and digits"));
+        let skill = parse_markdown_skill(Path::new("skill-creator/SKILL.md"), content).unwrap();
+        assert_eq!(skill.name, "Skill_Creator");
+        assert_eq!(skill.id, "skill-creator");
     }
 
     #[test]
-    fn parse_skill_rejects_unexpected_id_field() {
+    fn parse_skill_ignores_external_id_field() {
         let content = r#"---
-id: skill-creator
+id: ../../unsafe
 name: skill-creator
 description: Helps create and improve skills.
 ---
 Use this skill when users want to create skills.
 "#;
 
-        let error = parse_markdown_skill(Path::new("skill-creator/SKILL.md"), content)
-            .expect_err("id should be rejected by strict schema");
-        assert!(error.to_string().contains("unknown field"));
+        let skill = parse_markdown_skill(Path::new("skill-creator/SKILL.md"), content).unwrap();
+        assert_eq!(skill.id, "skill-creator");
     }
 
     #[test]
-    fn parse_skill_rejects_name_directory_mismatch() {
+    fn parse_skill_accepts_name_directory_mismatch() {
         let content = r#"---
 name: ckm:another-name
 description: Helps create and improve skills.
@@ -470,10 +438,147 @@ description: Helps create and improve skills.
 Use this skill when users want to create skills.
 "#;
 
-        let error = parse_markdown_skill(Path::new("skill-creator/SKILL.md"), content)
-            .expect_err("name mismatch should be rejected");
-        assert!(error
-            .to_string()
-            .contains("must match directory name 'skill-creator'"));
+        let skill = parse_markdown_skill(Path::new("skill-creator/SKILL.md"), content).unwrap();
+        assert_eq!(skill.name, "ckm:another-name");
+        assert_eq!(skill.id, "skill-creator");
+    }
+    #[test]
+    fn codex_adapter_preserves_body_bytes_and_arbitrary_metadata() {
+        let content = "  ---  \r\nname: 文件  助手\r\ndescription: >-\r\n  Process <files>\r\n  safely\r\nlicense: MIT\r\ncompatibility: Any host\r\nmetadata:\r\n  short-description:  File   work\r\n  custom: [a, b]\r\nallowed-tools: Bash, Read mcp__test__lookup\r\nunknown: ignored\r\n --- \r\n\r\nFirst line  \r\n\tCode  stays\r\nLast line\r\n";
+        let skill = parse_markdown_skill(Path::new("safe-id/SKILL.md"), content).unwrap();
+        assert_eq!(skill.id, "safe-id");
+        assert_eq!(skill.name, "文件 助手");
+        assert_eq!(skill.description, "Process <files> safely");
+        assert_eq!(skill.short_description.as_deref(), Some("File work"));
+        assert_eq!(
+            skill.metadata.as_ref().unwrap()["short-description"],
+            "File   work"
+        );
+        assert_eq!(
+            skill.metadata.as_ref().unwrap()["custom"],
+            serde_json::json!(["a", "b"])
+        );
+        assert_eq!(skill.prompt, "First line  \r\n\tCode  stays\r\nLast line");
+        assert_eq!(skill.license.as_deref(), Some("MIT"));
+        assert_eq!(skill.compatibility.as_deref(), Some("Any host"));
+        assert_eq!(skill.tool_refs, ["Bash", "Read", "mcp__test__lookup"]);
+    }
+
+    #[test]
+    fn codex_adapter_supports_fallback_unicode_limits_and_long_prose() {
+        for name in [None, Some("'  '"), Some("'分析 专家'")] {
+            let name_line = name
+                .map(|name| format!("name: {name}\n"))
+                .unwrap_or_default();
+            let content = format!(
+                "---\n{name_line}description: {}\ncompatibility: {}\n---\nBody",
+                "💡<>".repeat(1100),
+                "x".repeat(600)
+            );
+            let skill = parse_markdown_skill(Path::new("safe-id/SKILL.md"), &content).unwrap();
+            assert_eq!(
+                skill.name,
+                if name == Some("'分析 专家'") {
+                    "分析 专家"
+                } else {
+                    "safe-id"
+                }
+            );
+            assert_eq!(skill.description.chars().count(), 3300);
+            assert_eq!(skill.compatibility.unwrap().len(), 600);
+        }
+        for (length, accepted) in [(64, true), (65, false)] {
+            let content = format!(
+                "---\nname: {}\ndescription: Description\n---\n",
+                "文".repeat(length)
+            );
+            assert_eq!(
+                parse_markdown_skill(Path::new("safe-id/SKILL.md"), &content).is_ok(),
+                accepted
+            );
+        }
+        let valid = "---\ndescription: Description\n---\nBody";
+        assert!(parse_markdown_skill(Path::new("unsafe_id/SKILL.md"), valid).is_err());
+        assert!(parse_markdown_skill(
+            Path::new("safe-id/SKILL.md"),
+            "---\nname: Display\n---\nBody"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn codex_adapter_tolerates_descriptive_extra_shapes() {
+        let skill = parse_markdown_skill(Path::new("portable/SKILL.md"), "---\ndescription: Demo\nlicense: [optional]\ncompatibility: {host: optional}\nargument-hint: [one, two]\nmetadata: [arbitrary, data]\n---\nBody").unwrap();
+        assert!(skill.license.is_none());
+        assert!(skill.compatibility.is_none());
+        assert_eq!(
+            skill.metadata,
+            Some(serde_json::json!(["arbitrary", "data"]))
+        );
+    }
+
+    #[test]
+    fn codex_adapter_repairs_once_without_dropping_tool_restrictions() {
+        let content = "---\ndescription: Deploy to AWS: ECS\nallowed-tools:\n  - Bash\n  - default::private\nmetadata:\n  legacy_manual_only: true\nargument-hint: <duration: 7d>\n---\nUnchanged: body\n";
+        let skill = parse_markdown_skill(Path::new("deploy/SKILL.md"), content).unwrap();
+        assert_eq!(skill.description, "Deploy to AWS: ECS");
+        assert_eq!(skill.tool_refs, ["Bash", "default::private"]);
+        assert_eq!(skill.metadata.unwrap()["legacy_manual_only"], true);
+        assert_eq!(skill.prompt, "Unchanged: body");
+        for bad in [
+            "allowed_tools: [",
+            "metadata: {legacy_manual_only: true,",
+            "metadata: {legacy_manual_only: wrong}",
+            "allowed-tools: 7",
+            "allowed-tools: [Read, 7]",
+            "allowed-tools: [",
+            "metadata: [",
+        ] {
+            let content = format!("---\ndescription: Deploy\n{bad}\n---\nBody");
+            assert!(
+                parse_markdown_skill(Path::new("deploy/SKILL.md"), &content).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_adapter_quoted_host_controls_cannot_be_repaired_into_prose() {
+        for key in [
+            "'metadata'",
+            "\"metadata\"",
+            "\"\\u006detadata\"",
+            "!!str metadata",
+            "&host_key metadata",
+        ] {
+            let malformed =
+                format!("---\ndescription: Demo\n{key}: {{legacy_manual_only: true,\n---\nBody");
+            assert!(
+                parse_markdown_skill(Path::new("safe-id/SKILL.md"), &malformed).is_err(),
+                "malformed host container was accepted for {key}"
+            );
+            let valid = format!(
+                "---\ndescription: Deploy to AWS: ECS\n{key}:\n  legacy_manual_only: true\n---\nBody"
+            );
+            let skill = parse_markdown_skill(Path::new("safe-id/SKILL.md"), &valid).unwrap();
+            assert_eq!(skill.description, "Deploy to AWS: ECS");
+            assert_eq!(skill.metadata.unwrap()["legacy_manual_only"], true);
+        }
+        for key in [
+            "'allowed-tools'",
+            "\"allowed_tools\"",
+            "\"allowed\\u002dtools\"",
+        ] {
+            let malformed = format!("---\ndescription: Demo\n{key}: [\n---\nBody");
+            assert!(
+                parse_markdown_skill(Path::new("safe-id/SKILL.md"), &malformed).is_err(),
+                "malformed tool restriction was accepted for {key}"
+            );
+        }
+        let valid_alias = "---\ndescription: Demo\nkey_name: &host_key metadata\n*host_key:\n  legacy_manual_only: true\n---\nBody";
+        let skill = parse_markdown_skill(Path::new("safe-id/SKILL.md"), valid_alias).unwrap();
+        assert_eq!(skill.metadata.unwrap()["legacy_manual_only"], true);
+        let malformed_alias = "---\ndescription: Demo\nkey_name: &host_key metadata\n*host_key: {legacy_manual_only: true,\n---\nBody";
+        assert!(parse_markdown_skill(Path::new("safe-id/SKILL.md"), malformed_alias).is_err());
     }
 }

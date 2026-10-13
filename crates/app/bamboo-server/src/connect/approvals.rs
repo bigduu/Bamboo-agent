@@ -24,8 +24,8 @@ use tokio::sync::broadcast;
 use bamboo_agent_core::tools::ToolExecutionContext;
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_engine::execution::{
-    create_event_forwarder_with_history_commit_barrier, get_or_create_event_sender,
-    reserve_session_execution, SessionExecutionReserveOutcome,
+    create_event_forwarder_with_root_actor, get_or_create_event_sender, reserve_session_execution,
+    SessionExecutionReserveOutcome,
 };
 use bamboo_engine::runtime::execution::agent_spawn::{
     spawn_session_execution, SessionExecutionArgs,
@@ -36,6 +36,7 @@ use bamboo_engine::session_app::approval_replay::{
     validate_permission_replay_authority, ApprovalReplayDecision, PermissionReplayTarget,
 };
 use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
+use bamboo_engine::session_app::repository::SessionAccess;
 use bamboo_engine::session_app::resolution::resolve_resume_config_snapshot;
 use bamboo_engine::session_app::respond::{
     acquire_pending_response_guard, inspect_pending_response_guarded,
@@ -404,7 +405,7 @@ impl Responder for EngineResponder {
         let port = ConnectResumePort {
             ctx: self.ctx.clone(),
         };
-        let handoff = bamboo_engine::session_app::resume::reserve_response_resume_handoff(
+        let mut handoff = bamboo_engine::session_app::resume::reserve_response_resume_handoff(
             &port,
             session_id,
             std::time::Duration::from_secs(15),
@@ -431,8 +432,23 @@ impl Responder for EngineResponder {
             reasoning_effort: None,
         };
 
+        let bound_access = match self
+            .ctx
+            .session_repo
+            .bind_response_writer(handoff.root_actor_writer())
+        {
+            Ok(access) => access,
+            Err(error) => {
+                handoff.abandon().await;
+                return Err(ResponderError::Other(format!(
+                    "Response writer unavailable: {error}"
+                )));
+            }
+        };
+        let response_access: &dyn SessionAccess =
+            bound_access.as_deref().unwrap_or(&self.ctx.session_repo);
         let submission = submit_pending_response_checked_guarded(
-            &self.ctx.session_repo,
+            response_access,
             input,
             expected_tool_call_id.map(str::to_string),
             &response_guard,
@@ -551,6 +567,25 @@ struct ConnectResumePort {
 
 #[async_trait::async_trait]
 impl ResumeExecutionPort for ConnectResumePort {
+    async fn prepare_response_execution(
+        &self,
+        reservation: &mut bamboo_engine::execution::SessionExecutionReservation,
+    ) -> std::io::Result<()> {
+        let session = self
+            .ctx
+            .session_repo
+            .inspect_for_response(reservation.session_id())
+            .await
+            .map_err(std::io::Error::other)?
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "response session missing")
+            })?;
+        self.ctx
+            .bind_root_execution(reservation, &session)
+            .await
+            .map(|_| ())
+    }
+
     async fn load_session(&self, session_id: &str) -> Option<Session> {
         self.ctx.session_repo.load_merged(session_id).await
     }
@@ -608,6 +643,18 @@ impl ResumeExecutionPort for ConnectResumePort {
             );
             return;
         }
+        let root_publication = match self
+            .ctx
+            .bind_root_execution(&mut execution_reservation, &session)
+            .await
+        {
+            Ok(publication) => publication,
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "Root Connect resume binding rejected");
+                execution_reservation.abandon().await;
+                return;
+            }
+        };
 
         let model = session.model.clone();
         let reasoning_effort = session.reasoning_effort;
@@ -626,14 +673,32 @@ impl ResumeExecutionPort for ConnectResumePort {
             ),
         };
 
-        let (mpsc_tx, _forwarder_handle, history_commit_barrier) =
-            create_event_forwarder_with_history_commit_barrier(
+        let (mpsc_tx, _forwarder_handle, mut history_commit_barrier) =
+            create_event_forwarder_with_root_actor(
                 session_id.clone(),
                 execution_reservation.run_id().to_string(),
                 event_sender,
                 self.ctx.agent_runners.clone(),
                 self.ctx.account_feed_inbox.clone(),
+                root_publication,
             );
+        let response_events = execution_reservation.take_root_response_events();
+        if !response_events.is_empty() {
+            for event in response_events {
+                if mpsc_tx.send(event).await.is_err() {
+                    execution_reservation.abandon().await;
+                    return;
+                }
+            }
+            if !history_commit_barrier
+                .send_and_wait(&mpsc_tx, session_id.clone())
+                .await
+            {
+                tracing::warn!(%session_id, "Root Connect response publication was not confirmed");
+                execution_reservation.abandon().await;
+                return;
+            }
+        }
 
         // If the user just approved a permission prompt, the gated tool call
         // was intercepted before it ran — its recorded result is only a
@@ -722,12 +787,15 @@ impl ResumeExecutionPort for ConnectResumePort {
                 let executor = ctx.tools.clone();
                 let replay_owner = bamboo_domain::resolve_tool_reference_name(&tool_name, |name| {
                     executor.owns_exact_tool(name)
-                })
-                .unwrap_or_else(|| tool_name.clone());
+                });
+                if replay_owner.is_none() && reexecute_request_generation.is_some() {
+                    tracing::error!(%session_id, %tool_name, "connect approved replay has no registered execution owner; markers retained");
+                    return;
+                }
                 let executing_supervisor = match validate_permission_replay_authority(
                     &session,
                     &replay_target,
-                    &replay_owner,
+                    replay_owner.as_deref().unwrap_or(&tool_name),
                 ) {
                     Ok(observation) => observation,
                     Err(error) => {
@@ -744,7 +812,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                     ctx.session_repo.storage().as_ref(),
                     &mut session,
                     configured_mode,
-                    &tool_name,
+                    replay_owner.as_deref(),
                 )
                 .await
                 {
@@ -759,6 +827,11 @@ impl ResumeExecutionPort for ConnectResumePort {
                         return;
                     }
                 };
+                let blocked_by_tool_authority = matches!(
+                    decision,
+                    ApprovalReplayDecision::BlockedByRootToolAuthority
+                        | ApprovalReplayDecision::BlockedByUnavailableTool
+                );
                 session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
                 session
                     .metadata
@@ -771,7 +844,22 @@ impl ResumeExecutionPort for ConnectResumePort {
                         ),
                         false,
                     ),
+                    ApprovalReplayDecision::BlockedByRootToolAuthority => (
+                        format!(
+                            "Root orchestration policy blocked approved tool '{tool_name}'; the stale approval was not executed"
+                        ),
+                        false,
+                    ),
+                    ApprovalReplayDecision::BlockedByUnavailableTool => (
+                        format!(
+                            "Approved tool '{tool_name}' is no longer available; the stale approval was not executed"
+                        ),
+                        false,
+                    ),
                     ApprovalReplayDecision::Execute(flags) => {
+                        let replay_owner = replay_owner
+                            .as_deref()
+                            .expect("Execute requires a registered execution owner");
                         let Some(permission_config) =
                             ctx.permission_checker.permission_config()
                         else {
@@ -786,7 +874,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                             permission_config.as_ref(),
                             &session,
                             &replay_target,
-                            &replay_owner,
+                            replay_owner,
                         ) {
                             tracing::error!(
                                 %session_id,
@@ -798,6 +886,15 @@ impl ResumeExecutionPort for ConnectResumePort {
                         }
                         let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
                             == bamboo_tools::orchestrator::ToolMutability::Mutating;
+                        if let Some(persistence) = execution_reservation.execution_persistence() {
+                            match persistence.load_runtime_session(&session_id).await {
+                                Ok(Some(_)) => {}
+                                result => {
+                                    tracing::warn!(%session_id, ?result, "Root Connect replay lost its owner before tool handoff");
+                                    return;
+                                }
+                            }
+                        }
                         let mut emitter = bamboo_tools::ToolEmitter::new(
                             &tool_call.id,
                             &tool_name,
@@ -813,7 +910,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                             reexecute_request_generation.as_deref(),
                             executor.execute_exact_with_context_outcome(
                                 &tool_call,
-                                &replay_owner,
+                                replay_owner,
                                 ToolExecutionContext {
                                     executing_supervisor,
                                     session_id: Some(session.id.as_str()),
@@ -844,7 +941,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                                     &mut session,
                                     &replay_target,
                                     &tool_result,
-                                    &replay_owner,
+                                    replay_owner,
                                 ) {
                                     Ok(Some(reparked)) => {
                                         let _ = mpsc_tx
@@ -877,7 +974,18 @@ impl ResumeExecutionPort for ConnectResumePort {
                                                 ),
                                             })
                                             .await;
-                                        ctx.session_repo.save_and_cache(&mut session).await;
+                                        if let Some(persistence) = execution_reservation.execution_persistence() {
+                                            if let Err(error) = persistence.save_runtime_session(&mut session).await {
+                                                tracing::warn!(%session_id, %error, "Root Connect repark checkpoint rejected");
+                                                return;
+                                            }
+                                        } else { ctx.session_repo.save_and_cache(&mut session).await; }
+                                        if !history_commit_barrier.send_and_wait(&mpsc_tx, session_id.clone()).await {
+                                            tracing::warn!(%session_id, "Root Connect repark history publication was not confirmed");
+                                            return;
+                                        }
+                                        execution_reservation.finish_root_actor(bamboo_domain::ActorActivationFinish::Succeeded).await;
+                                        execution_reservation.abandon().await;
                                         return;
                                     }
                                     Ok(None) => {}
@@ -938,7 +1046,20 @@ impl ResumeExecutionPort for ConnectResumePort {
                     );
                     return;
                 }
-                ctx.session_repo.save_and_cache(&mut session).await;
+                if let Some(persistence) = execution_reservation.execution_persistence() {
+                    if let Err(error) = persistence.save_runtime_session(&mut session).await {
+                        tracing::warn!(%session_id, %error, "Root Connect replay checkpoint rejected before continuation");
+                        return;
+                    }
+                } else if blocked_by_tool_authority {
+                    if let Err(error) = ctx.session_repo.save_replay_resolution(&mut session).await
+                    {
+                        tracing::error!(%session_id, %error, "connect blocked approval replay result failed to persist; refusing to resume");
+                        return;
+                    }
+                } else {
+                    ctx.session_repo.save_and_cache(&mut session).await;
+                }
             } else {
                 tracing::error!(
                     %session_id,
@@ -1023,6 +1144,7 @@ mod tests {
             agent_runners: state.agent_runners.clone(),
             session_event_senders: state.session_event_senders.clone(),
             account_feed_inbox: None,
+            root_account_sink: Some(state.account_sink.clone()),
             app_data_dir: Some(state.app_data_dir.clone()),
             config: state.config.clone(),
             provider_registry: state.provider_registry.clone(),
@@ -1063,6 +1185,46 @@ mod tests {
             ));
             fixture.settled(usize::from(!corrupt), corrupt).await;
         }
+    }
+
+    #[tokio::test]
+    async fn connect_resume_consumes_approved_call_after_root_tool_tightening() {
+        use crate::app_state::resume_adapter::supervisor_tests::{Fixture, CALL};
+        let fixture = Box::pin(Fixture::pending()).await;
+        fixture.prepare_workspace_catalog().await;
+        fixture.formal_approve().await;
+        let mut selected = fixture.reload().await;
+        selected.set_root_orchestration_only(true).unwrap();
+        fixture.state.storage.save_session(&selected).await.unwrap();
+
+        let ctx = supervisor_context(&fixture.state);
+        let session = fixture.reload().await;
+        let config = resolve_resume_config_snapshot(
+            &*ctx.config.read().await,
+            &ctx.provider_registry,
+            &session,
+            None,
+        );
+        let outcome = bamboo_engine::session_app::resume::resume_session_execution(
+            &ConnectResumePort { ctx },
+            &session.id,
+            config,
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            bamboo_engine::session_app::types::ResumeOutcome::Started { .. }
+        ));
+        fixture.settled(0, false).await;
+        let saved = fixture.reload().await;
+        let result = saved
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+            .unwrap();
+        assert_eq!(result.tool_success, Some(false));
+        assert!(result.content.contains("Root orchestration policy blocked"));
     }
 
     #[tokio::test]

@@ -287,15 +287,16 @@ async fn wait_for_pressure_output(path: &Path) {
 }
 
 fn mutation_root() -> tempfile::TempDir {
-    let target = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("example package must live under the workspace examples directory")
-        .join("target");
-    std::fs::create_dir_all(&target).unwrap();
+    // Neither the checkout (possibly under `.codex`) nor ambient Temp
+    // (normally under AppData on Windows) is an observable-path fixture root.
+    // Create only a uniquely owned child; TempDir cleans up that child alone.
+    #[cfg(windows)]
+    let base = PathBuf::from(std::env::var_os("USERPROFILE").expect("Windows user profile"));
+    #[cfg(not(windows))]
+    let base = PathBuf::from("/tmp");
     tempfile::Builder::new()
         .prefix("tool-event-recorder-e2e-")
-        .tempdir_in(target)
+        .tempdir_in(base)
         .unwrap()
 }
 
@@ -501,25 +502,35 @@ async fn native_recorder_lifecycle_is_bounded_and_generation_safe() {
         upgraded.policy_generation
     );
 
-    let sensitive_path = mutation_dir.path().join(".env");
-    execute_write(
-        state.get_ref(),
-        "sensitive-path-write",
-        &sensitive_path,
-        "SENTINEL_SECRET=must-not-leak",
-    )
-    .await;
-    let sensitive = wait_for_event(&files.output, "sensitive-path-write").await;
-    assert!(sensitive.data.path.is_none());
-    assert_eq!(
-        sensitive.data.path_redaction_reason.as_deref(),
-        Some(TOOL_EVENT_PATH_REDACTION_SENSITIVE)
-    );
-    assert!(sensitive.data.diff.is_none());
-    assert!(sensitive.data.content.is_none());
-    let sensitive_wire = serde_json::to_string(&sensitive).unwrap();
-    assert!(!sensitive_wire.contains("SENTINEL_SECRET"));
-    assert!(!sensitive_wire.contains(".env"));
+    for (call_id, relative_path) in [
+        ("sensitive-path-write", ".env"),
+        ("protected-checkout-write", ".codex/authorized.txt"),
+        ("windows-temp-write", "AppData/Local/Temp/authorized.txt"),
+    ] {
+        let sensitive_path = mutation_dir.path().join(relative_path);
+        execute_write(
+            state.get_ref(),
+            call_id,
+            &sensitive_path,
+            "SENTINEL_SECRET=must-not-leak",
+        )
+        .await;
+        let sensitive = wait_for_event(&files.output, call_id).await;
+        assert!(sensitive.data.path.is_none());
+        assert_eq!(
+            sensitive.data.path_redaction_reason.as_deref(),
+            Some(TOOL_EVENT_PATH_REDACTION_SENSITIVE)
+        );
+        assert_eq!(
+            sensitive.observation_policy_generation,
+            upgraded.policy_generation
+        );
+        assert!(sensitive.data.diff.is_none());
+        assert!(sensitive.data.content.is_none());
+        let sensitive_wire = serde_json::to_string(&sensitive).unwrap();
+        assert!(!sensitive_wire.contains("SENTINEL_SECRET"));
+        assert!(!sensitive_wire.contains(relative_path));
+    }
 
     installer.uninstall(PLUGIN_ID).await.unwrap();
     assert!(!state.service_manager.is_running(SERVICE_ID));

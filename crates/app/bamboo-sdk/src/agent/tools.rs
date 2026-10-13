@@ -8,6 +8,11 @@
 //! [`BuiltinTool::tool`]. Custom tools (your own `impl Tool`) can be passed the
 //! same way.
 //!
+//! For model shell access, select both [`BuiltinTool::ExecCommand`] and
+//! [`BuiltinTool::WriteStdin`]. An explicit legacy [`BuiltinTool::Bash`]
+//! selection retains that host implementation only; it does not register the
+//! replacement pair. The legacy Bash family is hidden from model catalogs.
+//!
 //! The canonical source of truth for built-in tool *names* is
 //! [`bamboo_domain::tool_names::BUILTIN_TOOL_NAMES`]; [`BuiltinTool`] is kept in
 //! lock-step with it by a drift-guard test.
@@ -103,6 +108,8 @@ pub enum BuiltinTool {
     Bash,
     BashInput,
     BashOutput,
+    ExecCommand,
+    WriteStdin,
     Edit,
     ExitPlanMode,
     GetFileInfo,
@@ -123,10 +130,12 @@ pub enum BuiltinTool {
 
 impl BuiltinTool {
     /// Every built-in tool, in the canonical order of [`BUILTIN_TOOL_NAMES`].
-    pub const ALL: [BuiltinTool; 19] = [
+    pub const ALL: [BuiltinTool; 21] = [
         BuiltinTool::Bash,
         BuiltinTool::BashInput,
         BuiltinTool::BashOutput,
+        BuiltinTool::ExecCommand,
+        BuiltinTool::WriteStdin,
         BuiltinTool::Edit,
         BuiltinTool::ExitPlanMode,
         BuiltinTool::GetFileInfo,
@@ -151,6 +160,8 @@ impl BuiltinTool {
             BuiltinTool::Bash => "Bash",
             BuiltinTool::BashInput => "BashInput",
             BuiltinTool::BashOutput => "BashOutput",
+            BuiltinTool::ExecCommand => "exec_command",
+            BuiltinTool::WriteStdin => "write_stdin",
             BuiltinTool::Edit => "Edit",
             BuiltinTool::ExitPlanMode => "ExitPlanMode",
             BuiltinTool::GetFileInfo => "GetFileInfo",
@@ -244,6 +255,60 @@ mod tests {
             assert_eq!(BuiltinTool::from_name(tool.name()), Some(tool));
         }
         assert_eq!(BuiltinTool::from_name("NotARealTool"), None);
+    }
+
+    #[test]
+    fn exec_session_catalog_preserves_legacy_shell_variants() {
+        for (name, variant) in [
+            ("exec_command", BuiltinTool::ExecCommand),
+            ("write_stdin", BuiltinTool::WriteStdin),
+            ("Bash", BuiltinTool::Bash),
+            ("BashInput", BuiltinTool::BashInput),
+            ("BashOutput", BuiltinTool::BashOutput),
+            ("KillShell", BuiltinTool::KillShell),
+        ] {
+            assert_eq!(BuiltinTool::from_name(name), Some(variant));
+            assert_eq!(variant.tool().name(), name);
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_builder_shell_selection_registers_only_requested_tools() {
+        for (selected, expected) in [
+            (vec![BuiltinTool::Bash], vec!["Bash".to_owned()]),
+            (
+                vec![BuiltinTool::ExecCommand, BuiltinTool::WriteStdin],
+                vec!["exec_command".to_owned(), "write_stdin".to_owned()],
+            ),
+        ] {
+            let data_dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                data_dir.path().join("config.json"),
+                r#"{
+                    "provider": "anthropic",
+                    "providers": {
+                        "anthropic": { "api_key": "test-key", "model": "claude-test" }
+                    }
+                }"#,
+            )
+            .unwrap();
+            let agent = super::super::AgentBuilder::new()
+                .tools(selected.into_iter().map(BuiltinTool::tool))
+                .with_defaults_for_data_dir(data_dir.path().to_path_buf())
+                .await
+                .unwrap()
+                .build()
+                .unwrap();
+            let mut names: Vec<String> = agent
+                .inner
+                .default_tools()
+                .list_tools()
+                .into_iter()
+                .map(|schema| schema.function.name)
+                .collect();
+            names.sort();
+            assert_eq!(names, expected);
+        }
     }
 
     #[test]

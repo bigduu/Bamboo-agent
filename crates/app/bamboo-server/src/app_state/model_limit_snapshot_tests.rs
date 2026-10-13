@@ -1,0 +1,606 @@
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use actix_web::{test, web, App};
+use async_trait::async_trait;
+use bamboo_agent_core::tools::ToolSchema;
+use bamboo_agent_core::{AgentEvent, Message, Session};
+use bamboo_engine::execution::{
+    reserve_session_execution, AgentStatus, SessionExecutionReserveOutcome,
+};
+use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
+use futures::stream;
+use serde_json::json;
+
+use super::AppState;
+use crate::handlers::agent::execute::runtime::{
+    spawn_agent_execution, spawn_event_forwarder_with_root_actor, SpawnAgentExecution,
+};
+
+#[derive(Default)]
+struct ModelLimitProbe {
+    output_limits: Mutex<Vec<Option<u32>>>,
+}
+
+#[async_trait]
+impl LLMProvider for ModelLimitProbe {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        self.output_limits.lock().unwrap().push(max_output_tokens);
+        Ok(Box::pin(stream::iter([
+            Ok(LLMChunk::Token("finished".into())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+// The parent test invokes only this helper in another OS process. Ordinary
+// suite execution has no path override and performs no filesystem operation.
+#[tokio::test]
+async fn model_limit_external_process_writer() {
+    let Some(path) = std::env::var_os("BAMBOO_MODEL_LIMIT_WRITER_TEST_PATH") else {
+        return;
+    };
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&std::env::var("BAMBOO_MODEL_LIMIT_WRITER_TEST_ROWS").unwrap())
+            .unwrap();
+    let _: Vec<bamboo_compression::limits::ModelLimit> =
+        serde_json::from_value(json!(rows)).unwrap();
+    let store = bamboo_config::AtomicJsonStore::<bamboo_config::ModelLimitsSection>::new(path, 1);
+    let revision = store.load().unwrap().unwrap().revision;
+    store
+        .commit(
+            revision,
+            bamboo_config::ModelLimitsSection(rows),
+            |_| Ok(()),
+        )
+        .unwrap();
+    println!("model-limit-external-writer: committed");
+}
+
+async fn write_limits_in_external_process(path: &std::path::Path, rows: &[serde_json::Value]) {
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "app_state::model_limit_snapshot_tests::model_limit_external_process_writer",
+            "--nocapture",
+        ])
+        .env("BAMBOO_MODEL_LIMIT_WRITER_TEST_PATH", path)
+        .env(
+            "BAMBOO_MODEL_LIMIT_WRITER_TEST_ROWS",
+            json!(rows).to_string(),
+        )
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+        .await
+        .expect("external model-limit writer must finish")
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "external writer failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("model-limit-external-writer: committed")
+    );
+}
+
+#[actix_web::test]
+async fn compatibility_model_limit_lock_wait_keeps_worker_responsive_after_cancellation() {
+    let _key = bamboo_config::encryption::set_test_encryption_key([0x65; 32]);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+    state.wait_for_boot_reconcile_services().await;
+    state.stop_config_watcher_for_test();
+    let state = Arc::new(state);
+    let section = state
+        .config_facade
+        .as_ref()
+        .unwrap()
+        .registry()
+        .model_limits
+        .clone();
+    let initial_revision = section.snapshot().revision;
+    let rows = vec![json!({
+        "model_pattern": "lock-wait-model",
+        "max_context_tokens": 48_000,
+        "max_output_tokens": 4_000,
+        "safety_margin": null
+    })];
+    let app = test::init_service(App::new().route(
+        "/responsive",
+        web::get().to(|| async { actix_web::HttpResponse::Ok().finish() }),
+    ))
+    .await;
+
+    // Hold the store's real advisory lock on an independent OS thread. A
+    // bounded safety release also lets the old synchronous implementation
+    // terminate and report a behavioral failure instead of hanging the suite.
+    let lock_path = dir.path().join("model_limits.json.lock");
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        lock.unlock().unwrap();
+    });
+    locked_rx.await.unwrap();
+
+    let operation_state = state.clone();
+    let requested_rows = rows.clone();
+    let (dispatched_tx, dispatched_rx) = tokio::sync::oneshot::channel();
+    let started = std::time::Instant::now();
+    let operation = tokio::spawn(async move {
+        let mutation = operation_state.replace_compatibility_model_limits(requested_rows);
+        tokio::pin!(mutation);
+        let first_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(mutation.as_mut(), cx))
+        })
+        .await;
+        let _ = dispatched_tx.send(());
+        match first_poll {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => mutation.await,
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), dispatched_rx)
+        .await
+        .expect("a held file lock must not block the single Actix worker")
+        .unwrap();
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/responsive").to_request(),
+    )
+    .await;
+    assert!(response.status().is_success());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(
+        !operation.is_finished(),
+        "the durable writer still waits for the file lock"
+    );
+    operation.abort();
+    assert!(operation.await.unwrap_err().is_cancelled());
+    assert!(
+        state.config_io_lock.try_lock().is_err(),
+        "the owner retains IO after cancellation"
+    );
+    assert_eq!(section.snapshot().revision, initial_revision);
+
+    release_tx.send(()).unwrap();
+    tokio::task::spawn_blocking(move || holder.join().unwrap())
+        .await
+        .unwrap();
+    let completed = tokio::time::timeout(Duration::from_secs(10), state.config_io_lock.lock())
+        .await
+        .expect("the cancelled request's owner completes durable and event publication");
+    let snapshot = section.snapshot();
+    assert_eq!(snapshot.revision, initial_revision + 1);
+    assert_eq!(snapshot.data.0, rows);
+    let durable: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("model_limits.json")).unwrap())
+            .unwrap();
+    assert_eq!(durable["revision"], json!(snapshot.revision));
+    assert_eq!(durable["data"], json!(rows));
+    let events =
+        bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        AgentEvent::ConfigChanged { section, revision }
+            if section == bamboo_config::SectionId::ModelLimits.descriptor().name
+                && *revision == snapshot.revision
+    )));
+    drop(completed);
+    state.shutdown().await;
+}
+
+async fn run_hosted_probe(
+    state: &web::Data<AppState>,
+    mut session: Session,
+    probe: Arc<ModelLimitProbe>,
+) -> u32 {
+    state
+        .agent
+        .prepare_external_session_for_execution(&mut session)
+        .await
+        .unwrap();
+    state.storage.save_session(&session).await.unwrap();
+    let session_id = session.id.clone();
+    let session_tx = state.get_session_event_sender(&session_id).await;
+    let mut events = session_tx.subscribe();
+    let mut reservation = match reserve_session_execution(
+        &state.agent,
+        &state.agent_runners,
+        &state.session_event_senders,
+        &session_id,
+        &session_tx,
+    )
+    .await
+    {
+        SessionExecutionReserveOutcome::Reserved(reservation) => reservation,
+        SessionExecutionReserveOutcome::AlreadyRunning { run_id } => {
+            panic!("fresh hosted probe already has a run: {run_id}")
+        }
+    };
+    reservation
+        .bind_root_actor(&state.agent, &session)
+        .await
+        .unwrap();
+    let writer = reservation
+        .root_actor_writer()
+        .expect("hosted Root must have its real Actor writer");
+    let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel(128);
+    let history_commit_barrier = spawn_event_forwarder_with_root_actor(
+        state.clone(),
+        session_id.clone(),
+        reservation.run_id().to_string(),
+        mpsc_rx,
+        session_tx,
+        None,
+        Some(writer),
+    );
+    spawn_agent_execution(SpawnAgentExecution {
+        state: state.clone(),
+        session_id: session_id.clone(),
+        session,
+        execution_reservation: reservation,
+        is_child_session: false,
+        provider_name: state.config.read().await.provider.clone(),
+        provider_override: Some(probe),
+        model_roster: bamboo_engine::ModelRoster {
+            model: Some("legacy-hosted-model".into()),
+            ..Default::default()
+        },
+        reasoning_effort: None,
+        reasoning_effort_source: "test".into(),
+        disabled_tools: Default::default(),
+        disabled_skill_ids: Default::default(),
+        mpsc_tx,
+        history_commit_barrier,
+        image_fallback: None,
+        gold_config: None,
+        app_data_dir: Some(state.app_data_dir.clone()),
+        run_budget: None,
+    });
+    // Resolved budgets are deliberately not persisted. Observe the actual
+    // hosted event route, then wait for its durable history and finalization.
+    let context = tokio::time::timeout(Duration::from_secs(60), async {
+        let mut context = None;
+        loop {
+            match events.recv().await.unwrap() {
+                AgentEvent::TokenBudgetUpdated { usage } => {
+                    context = Some(usage.max_context_tokens);
+                }
+                AgentEvent::SessionHistoryCommitted {
+                    session_id: committed,
+                } => {
+                    assert_eq!(committed, session_id);
+                    break context.expect("hosted provider run must publish its resolved budget");
+                }
+                AgentEvent::Error { message } => panic!("hosted probe failed: {message}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("hosted probe must publish its durable history");
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let status = state
+                .agent_runners
+                .read()
+                .await
+                .get(&session_id)
+                .map(|runner| runner.status.clone());
+            match status {
+                Some(AgentStatus::Completed) => break,
+                Some(AgentStatus::Error(error)) => panic!("hosted probe failed: {error}"),
+                Some(AgentStatus::Cancelled) => panic!("hosted probe was cancelled"),
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("hosted probe must finalize its reserved runner");
+    context
+}
+
+#[tokio::test]
+async fn hosted_restart_loads_legacy_raw_model_limits_and_retains_them_until_repair() {
+    let _key = bamboo_config::encryption::set_test_encryption_key([0x64; 32]);
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let installed = bamboo_config::ConfigFacade::open_or_migrate(dir.path()).unwrap();
+    let mut config = installed.effective_config();
+    config.proxy_auth = Some(bamboo_config::ProxyAuth {
+        username: "test-user".into(),
+        password: "test-password".into(),
+    });
+    bamboo_config::persist_proxy_auth_credential_transaction_at_revision(
+        dir.path(),
+        &mut config,
+        installed.registry().core.snapshot().revision,
+    )
+    .unwrap();
+    drop(installed);
+    let path = dir.path().join("model_limits.json");
+    let write_limit = |context, output| {
+        std::fs::write(
+            &path,
+            json!([{
+                "model_pattern": "legacy-hosted-model",
+                "max_context_tokens": context,
+                "max_output_tokens": output
+            }])
+            .to_string(),
+        )
+        .unwrap();
+    };
+    write_limit(48_000, 4_000);
+
+    // Use the real hosted constructor: it must inject the section reopened
+    // from an already-installed modular layout into its assembled Agent.
+    let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+    let section = state
+        .config_facade
+        .as_ref()
+        .unwrap()
+        .registry()
+        .model_limits
+        .clone();
+    assert_eq!(
+        section.snapshot().status,
+        bamboo_config::SectionStatus::Healthy
+    );
+    let probe = Arc::new(ModelLimitProbe::default());
+    let project = state
+        .project_store
+        .create_with_project_path(
+            "Legacy model limits",
+            None,
+            workspace.path().to_string_lossy().into_owned(),
+            Vec::new(),
+        )
+        .unwrap();
+    let mut contexts = Vec::new();
+
+    for (run, invalid) in [None, Some("{invalid"), Some("[{}]"), None]
+        .into_iter()
+        .enumerate()
+    {
+        if let Some(invalid) = invalid {
+            std::fs::write(&path, invalid).unwrap();
+            section.reload();
+            assert_ne!(
+                section.snapshot().status,
+                bamboo_config::SectionStatus::Healthy
+            );
+        } else if run > 0 {
+            write_limit(96_000, 8_000);
+            section.reload();
+            assert_eq!(
+                section.snapshot().status,
+                bamboo_config::SectionStatus::Healthy
+            );
+        }
+        let mut session = Session::new(format!("legacy-model-limit-{run}"), "legacy-hosted-model");
+        session.set_project_id_meta(project.id.to_string());
+        session.add_message(Message::user("finish this request"));
+        contexts.push(Box::pin(run_hosted_probe(&state, session, probe.clone())).await);
+    }
+
+    assert_eq!(contexts, [48_000, 48_000, 48_000, 96_000]);
+    assert_eq!(
+        *probe.output_limits.lock().unwrap(),
+        [Some(4_000), Some(4_000), Some(4_000), Some(8_000)]
+    );
+    state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn compatibility_model_limit_writes_and_clear_reach_hosted_rounds_without_watcher() {
+    use bamboo_compression::limits::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS};
+
+    let _key = bamboo_config::encryption::set_test_encryption_key([0x64; 32]);
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+    state.stop_config_watcher_for_test();
+    let state = web::Data::new(state);
+    let section = state
+        .config_facade
+        .as_ref()
+        .unwrap()
+        .registry()
+        .model_limits
+        .clone();
+    let initial_revision = section.snapshot().revision;
+    let app = test::init_service(App::new().app_data(state.clone()).route(
+        "/bamboo/config",
+        web::post().to(crate::handlers::settings::set_bamboo_config),
+    ))
+    .await;
+    let project = state
+        .project_store
+        .create_with_project_path(
+            "Compatibility model limits",
+            None,
+            workspace.path().to_string_lossy().into_owned(),
+            Vec::new(),
+        )
+        .unwrap();
+    let probe = Arc::new(ModelLimitProbe::default());
+
+    for (run, (rows, expected_context)) in [
+        (
+            json!([{
+                "model_pattern": "legacy-hosted-model",
+                "max_context_tokens": 48_000,
+                "max_output_tokens": 4_000
+            }]),
+            48_000,
+        ),
+        (
+            json!([{
+                "model_pattern": "legacy-hosted-model",
+                "max_context_tokens": 96_000,
+                "max_output_tokens": 8_000
+            }]),
+            96_000,
+        ),
+        (json!([]), DEFAULT_MAX_CONTEXT_TOKENS),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/bamboo/config")
+                .set_json(json!({"model_limits": rows}))
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let snapshot = section.snapshot();
+        assert_eq!(snapshot.revision, initial_revision + run as u64 + 1);
+        assert_eq!(snapshot.data.0.len(), if run == 2 { 0 } else { 1 });
+
+        let mut session = Session::new(
+            format!("compatibility-model-limit-{run}"),
+            "legacy-hosted-model",
+        );
+        session.set_project_id_meta(project.id.to_string());
+        session.add_message(Message::user("finish this request"));
+        assert_eq!(
+            Box::pin(run_hosted_probe(&state, session, probe.clone())).await,
+            expected_context
+        );
+    }
+
+    // Queue overlapping compatibility mutations behind the same IO guard. The
+    // middle clear matches the pre-lock snapshot, but must still run after the
+    // first replacement. Both equality and revision reads belong inside IO.
+    let rows = |context, output| {
+        // Use the public row serialization, including optional-field nulls,
+        // so the external writer and HTTP no-op case carry identical rows.
+        vec![
+            serde_json::to_value(bamboo_compression::limits::ModelLimit {
+                model_pattern: "legacy-hosted-model".into(),
+                max_context_tokens: context,
+                max_output_tokens: Some(output),
+                safety_margin: None,
+            })
+            .unwrap(),
+        ]
+    };
+    let io = state.config_io_lock.lock().await;
+    let (first, clear, last, ()) = tokio::join!(
+        biased;
+        state.replace_compatibility_model_limits(rows(96_000, 8_000)),
+        state.replace_compatibility_model_limits(Vec::new()),
+        state.replace_compatibility_model_limits(rows(144_000, 12_000)),
+        async {
+            tokio::task::yield_now().await;
+            drop(io);
+        },
+    );
+    first.unwrap();
+    clear.unwrap();
+    last.unwrap();
+    let snapshot = section.snapshot();
+    assert_eq!(snapshot.revision, initial_revision + 6);
+    assert_eq!(snapshot.data.0, rows(144_000, 12_000));
+    let mut session = Session::new(
+        "compatibility-model-limit-concurrent",
+        "legacy-hosted-model",
+    );
+    session.set_project_id_meta(project.id.to_string());
+    session.add_message(Message::user("finish this request"));
+    assert_eq!(
+        Box::pin(run_hosted_probe(&state, session, probe.clone())).await,
+        144_000
+    );
+
+    // A separate process advances the durable document while this server's
+    // watcher is stopped. Cover a request matching stale local rows, different
+    // requested rows, and exact adoption when durable rows already match.
+    let path = dir.path().join("model_limits.json");
+    for (run, (external_rows, requested_rows, expected_context, needs_write)) in [
+        (rows(192_000, 16_000), rows(144_000, 12_000), 144_000, true),
+        (rows(192_000, 16_000), rows(240_000, 20_000), 240_000, true),
+        (rows(240_000, 20_000), rows(240_000, 20_000), 240_000, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let local_before = section.snapshot();
+        write_limits_in_external_process(&path, &external_rows).await;
+        assert_eq!(section.snapshot().revision, local_before.revision);
+        assert_eq!(section.snapshot().data.0, local_before.data.0);
+        let durable_before = std::fs::read(&path).unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&durable_before).unwrap();
+        let external_revision = document["revision"].as_u64().unwrap();
+        assert_eq!(external_revision, local_before.revision + 1);
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/bamboo/config")
+                .set_json(json!({"model_limits": requested_rows}))
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let expected_revision = external_revision + u64::from(needs_write);
+        assert_eq!(section.snapshot().revision, expected_revision);
+        assert_eq!(section.snapshot().data.0, requested_rows);
+        let durable_after = std::fs::read(&path).unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&durable_after).unwrap();
+        assert_eq!(document["revision"].as_u64(), Some(expected_revision));
+        assert_eq!(document["data"], json!(requested_rows));
+        if !needs_write {
+            assert_eq!(durable_after, durable_before);
+        }
+
+        let mut session = Session::new(
+            format!("compatibility-model-limit-external-{run}"),
+            "legacy-hosted-model",
+        );
+        session.set_project_id_meta(project.id.to_string());
+        session.add_message(Message::user("finish this request"));
+        assert_eq!(
+            Box::pin(run_hosted_probe(&state, session, probe.clone())).await,
+            expected_context
+        );
+    }
+    assert_eq!(
+        *probe.output_limits.lock().unwrap(),
+        [
+            Some(4_000),
+            Some(8_000),
+            Some(DEFAULT_MAX_OUTPUT_TOKENS),
+            Some(12_000),
+            Some(12_000),
+            Some(20_000),
+            Some(20_000)
+        ]
+    );
+    state.shutdown().await;
+}

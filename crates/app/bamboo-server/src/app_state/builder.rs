@@ -96,6 +96,24 @@ impl AppState {
         bamboo_home_dir: PathBuf,
         memory_store: bamboo_memory::memory_store::MemoryStore,
     ) -> Result<Self, AppError> {
+        Self::new_with_memory_store_and_inbox_recovery(bamboo_home_dir, memory_store, true).await
+    }
+
+    /// Isolate the synchronous legacy Inbox consumer from background recovery.
+    /// Normal constructors and owned-Root/recovery fixtures keep recovery enabled.
+    #[cfg(test)]
+    pub(crate) async fn new_for_legacy_queued_ingress_test(
+        bamboo_home_dir: PathBuf,
+    ) -> Result<Self, AppError> {
+        let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
+        Self::new_with_memory_store_and_inbox_recovery(bamboo_home_dir, memory_store, false).await
+    }
+
+    async fn new_with_memory_store_and_inbox_recovery(
+        bamboo_home_dir: PathBuf,
+        memory_store: bamboo_memory::memory_store::MemoryStore,
+        start_inbox_reconciler: bool,
+    ) -> Result<Self, AppError> {
         // Ensure all helpers that rely on `core::paths::bamboo_dir()` see the same
         // directory as the server runtime.
         bamboo_config::paths::init_bamboo_dir(bamboo_home_dir.clone());
@@ -167,6 +185,7 @@ impl AppState {
                 }
             };
 
+        let boot_provider_handle_available = provider_registry.get_default().is_some();
         let provider = provider_registry.get_default().unwrap_or_else(|| {
             let default_provider_name = provider_registry.default_provider_name();
             let message = if config.has_provider_instances() {
@@ -187,9 +206,11 @@ impl AppState {
             bamboo_home_dir,
             config,
             provider,
+            boot_provider_handle_available,
             config_facade,
             Arc::new(NoopToolEventPublisher),
             memory_store,
+            start_inbox_reconciler,
         )
         .await
     }
@@ -218,9 +239,11 @@ impl AppState {
             bamboo_home_dir,
             config,
             provider,
+            false,
             None,
             Arc::new(NoopToolEventPublisher),
             memory_store,
+            true,
         )
         .await
     }
@@ -238,9 +261,11 @@ impl AppState {
             bamboo_home_dir,
             config,
             provider,
+            false,
             None,
             tool_event_publisher,
             memory_store,
+            true,
         )
         .await
     }
@@ -249,10 +274,17 @@ impl AppState {
         bamboo_home_dir: PathBuf,
         config: Config,
         provider: Arc<dyn LLMProvider>,
+        boot_provider_handle_available: bool,
         config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
         tool_event_publisher: Arc<dyn ToolEventPublisher>,
         memory_store: bamboo_memory::memory_store::MemoryStore,
+        start_inbox_reconciler: bool,
     ) -> Result<Self, AppError> {
+        let boot_application_inputs =
+            super::config_application::ApplicationInputs::boot(&config, config_facade.as_deref());
+        let config_application = Arc::new(std::sync::RwLock::new(
+            super::config_application::ConfigApplicationState::new(&boot_application_inputs),
+        ));
         // Wire the configured-default-workspace resolver into agent-core. This keeps
         let data_dir = bamboo_home_dir.clone();
         let (session_store, storage) = init_storage(&data_dir).await?;
@@ -300,16 +332,26 @@ impl AppState {
         // In-memory session cache (shared across handlers and background jobs).
         let sessions: bamboo_engine::SessionCache = Arc::default();
 
-        // Embed the mailbox bus (broker) in-process unless an external one is
-        // configured. Mutates `config.subagents.broker` to point at the loopback
-        // bus BEFORE it is wrapped/read downstream, so ask_agent / deploy_agent /
-        // cluster all wire to it — and a standalone `bamboo broker serve` is no
-        // longer required for sub-agent dispatch. (Foundation for routing local
-        // actors onto the bus.)
+        // Native Children use the same-process Tokio runtime and need no broker.
+        // Only existing explicit process/remote configuration enables the legacy
+        // mailbox bus; a stale broker.json or fabric directory does not opt in.
         let mut config = config;
         let embedded_broker = maybe_embed_broker(&mut config, &data_dir).await;
 
         let config = Arc::new(RwLock::new(config));
+        let tickets = Arc::new(
+            super::ticket_application::TicketApplication::open(
+                &data_dir,
+                storage.clone(),
+                config.clone(),
+            )
+            .await,
+        );
+        // Native completion can outlive a Host exit at Ticket HEAD publication.
+        // Recover its durable result before any startup path can admit work.
+        if let Err(error) = tickets.reconcile_completed_native_results().await {
+            tracing::warn!(%error, "failed to reconcile completed native Ticket results on startup");
+        }
 
         // Build one coherent configured-default/root provider pair. The process
         // globals below intentionally remain first-registration-wins, while
@@ -448,6 +490,20 @@ impl AppState {
                 )
             }
         };
+        if boot_provider_handle_available
+            && super::config_application::boot_provider_is_complete(
+                &config_snapshot,
+                &provider_registry,
+            )
+        {
+            config_application
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .record_applied(
+                    super::config_application::ConfigConsumer::ProviderRuntime,
+                    &boot_application_inputs,
+                );
+        }
         drop(config_snapshot);
 
         let provider_router = Arc::new(bamboo_llm::ProviderModelRouter::new(
@@ -463,6 +519,7 @@ impl AppState {
         // session's live channel — see `app_state::tools::build_base_tools`.
         let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let actor_event_hub = Arc::new(super::actor_events::ActorEventHub::default());
 
         // Shared bundle of always-on notification relay deps (see
         // `session_events::NotificationRelayDeps`). Built once and cloned into
@@ -488,7 +545,8 @@ impl AppState {
             sessions.clone(),
             storage.clone(),
             persistence.clone(),
-        );
+        )
+        .with_root_actor_directory(session_store.clone());
 
         // Account-scoped durable change feed. It is initialized before the
         // Project tool surface so non-HTTP Project mutations publish the same
@@ -510,7 +568,7 @@ impl AppState {
             ))
         })?;
 
-        let base_tools = build_base_tools(
+        let (base_tools, native_tool_ceiling) = build_base_tools(
             config.clone(),
             permission_checker.clone(),
             mcp_manager.clone(),
@@ -528,6 +586,7 @@ impl AppState {
             workspace_resolver.clone(),
             tool_event_publisher.clone(),
             memory_store.clone(),
+            session_messenger.clone(),
         );
 
         // The workflow engine executes against the base tool surface. The
@@ -642,6 +701,10 @@ impl AppState {
             .memory_store(memory_store.clone())
             .default_tools(base_tools.clone())
             .project_context_resolver(project_context_resolver.clone());
+        if let Some(facade) = &config_facade {
+            agent_builder =
+                agent_builder.model_limits_section(facade.registry().model_limits.clone());
+        }
         if let Some(permission_config) = permission_checker.permission_config() {
             agent_builder = agent_builder.permission_config(permission_config);
         }
@@ -651,8 +714,8 @@ impl AppState {
                 .expect("agent runtime should be fully configured"),
         );
 
-        let child_completion_coordinator =
-            Arc::new(bamboo_engine::ChildCompletionCoordinator::new(
+        let child_completion_coordinator = Arc::new(
+            bamboo_engine::ChildCompletionCoordinator::new(
                 storage.clone(),
                 persistence.clone(),
                 sessions.clone(),
@@ -664,7 +727,9 @@ impl AppState {
                 provider_router.clone(),
                 data_dir.clone(),
                 Some(account_sink.inbox()),
-            ));
+            )
+            .with_root_account_sink(account_sink.clone()),
+        );
         session_activation_router
             .set_spawner(child_completion_coordinator.clone())
             .await;
@@ -754,21 +819,39 @@ impl AppState {
                 });
             }
         }
+        let parent_question_coordinator = Arc::new(
+            super::parent_question_reconcile::ParentQuestionCoordinator::new(
+                session_store.clone(),
+                session_repo.clone(),
+                session_messenger.clone(),
+                project_store.clone(),
+                mcp_proxy_shutdown.clone(),
+            ),
+        );
         let parent_approval_reviewer = Arc::new(
             crate::app_state::parent_approval_reviewer::ParentAgentApprovalReviewer::new(
                 session_repo.clone(),
                 provider_router.clone(),
-            ),
+                session_messenger.clone(),
+                project_store.clone(),
+            )
+            .with_canonical_store(
+                session_store.clone(),
+                permission_checker.permission_config(),
+            )
+            .with_shutdown_token(mcp_proxy_shutdown.clone())
+            .with_question_coordinator(parent_question_coordinator.clone()),
         );
         let codex_run_tokens = Arc::new(crate::codex_run_tokens::CodexRunTokenRegistry::default());
         let external_runner =
-            bamboo_engine::external_agents::runtime::build_external_child_runner_with_live_config_and_codex_tokens(
+            bamboo_engine::external_agents::runtime::build_external_child_runner_with_native_tool_ceiling(
                 &config_snapshot,
                 config.clone(),
                 Some(approval_registry.clone()),
-                Some(parent_approval_reviewer),
+                Some(parent_approval_reviewer.clone()),
                 permission_checker.permission_config(),
                 Some(codex_run_tokens.clone()),
+                native_tool_ceiling,
             );
         external_runner.set_session_inbox_runtime(Some(
             bamboo_engine::execution::spawn::SessionInboxRuntimeBinding {
@@ -776,15 +859,90 @@ impl AppState {
                 inbox: session_inbox.clone(),
                 storage: storage.clone(),
                 persistence: persistence.clone(),
+                parent_question_lock: Some(persistence.clone()),
             },
         ));
+        external_runner.set_local_task_runtime(Some(
+            bamboo_engine::external_agents::local_task::LocalTaskRuntime {
+                agent: agent.clone(),
+                tools: child_tools.clone(),
+                provider_router: Some(provider_router.clone()),
+                app_data_dir: Some(data_dir.clone()),
+                sessions_cache: sessions.clone(),
+            },
+        ));
+        external_runner.set_actor_directory_store(Some(session_store.clone()));
+        external_runner.set_ticket_service(tickets.service().ok());
+        external_runner.set_actor_event_observer(Some(actor_event_hub.clone()));
+        // Broker receipts belong only to explicitly configured legacy routes.
+        // The default local runtime must not scan/reconnect old broker receipts.
+        if config_snapshot
+            .subagents()
+            .broker
+            .as_ref()
+            .is_some_and(|broker| !broker.endpoint.trim().is_empty())
+        {
+            // Recover Host-checkpointed broker terminal receipts before launching
+            // pending children. The scan uses the physical canonical Child tree;
+            // each ACK is bound to the saved broker identity and parent mailbox.
+            // A bounded startup pass keeps an unavailable remote broker from
+            // delaying the HTTP server indefinitely. The periodic pass retries
+            // receipts left after that bound or a transient broker failure.
+            let broker_receipt_reconciler = Arc::new(
+                bamboo_engine::external_agents::actor_adapter::BrokerTerminalReceiptReconciler::new(
+                    session_store.clone(),
+                    &config_snapshot,
+                )
+                .with_ticket_service(tickets.service().ok()),
+            );
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                broker_receipt_reconciler.reconcile_once(),
+            )
+            .await
+            {
+                Ok(report) if report.candidates > 0 || report.blocked > 0 => {
+                    tracing::info!(
+                        candidates = report.candidates,
+                        repaired = report.repaired,
+                        blocked = report.blocked,
+                        "startup broker terminal receipt repair completed"
+                    );
+                }
+                Err(_) => tracing::warn!(
+                    "startup broker terminal receipt repair exceeded 15 seconds; pending receipts retained for periodic retry"
+                ),
+                _ => {}
+            }
+            {
+                let reconciler = broker_receipt_reconciler.clone();
+                let shutdown = mcp_proxy_shutdown.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                        }
+                        let report = reconciler.reconcile_once().await;
+                        if report.candidates > 0 || report.blocked > 0 {
+                            tracing::info!(
+                                candidates = report.candidates,
+                                repaired = report.repaired,
+                                blocked = report.blocked,
+                                "periodic broker terminal receipt repair completed"
+                            );
+                        }
+                    }
+                });
+            }
+        }
         let spawn_scheduler = build_spawn_scheduler(
             agent.clone(),
             child_tools,
             sessions.clone(),
             agent_runners.clone(),
             session_event_senders.clone(),
-            external_runner,
+            external_runner.clone(),
             Some(provider_router.clone()),
             Some(child_completion_coordinator.clone()),
             Some(data_dir.clone()),
@@ -823,9 +981,11 @@ impl AppState {
             provider_registry.clone(),
             Some(data_dir.clone()),
             Some(account_sink.inbox()),
+            Some(account_sink.clone()),
             notification_relay_deps.clone(),
             project_store.clone(),
             workspace_resolver.clone(),
+            workflow_runs.clone(),
         );
 
         bamboo_engine::auto_dream::spawn_auto_dream_task_with_project_resolver(
@@ -925,24 +1085,36 @@ impl AppState {
                 }),
             );
         }
-        if let Err(error) = fabric_deployer.reconcile_stale_nodes_on_boot().await {
-            tracing::warn!(
-                error = %error,
-                "cluster-fabric boot reconcile failed; retaining the last adopted state"
-            );
+        if !config_snapshot.cluster_fabric.nodes.is_empty() {
+            if let Err(error) = fabric_deployer.reconcile_stale_nodes_on_boot().await {
+                tracing::warn!(
+                    error = %error,
+                    "cluster-fabric boot reconcile failed; retaining the last adopted state"
+                );
+            }
         }
         let fabric_deployer = Arc::new(fabric_deployer);
         // Cluster health monitor: periodically probe deployed workers on the bus and
         // flip node status live (Running↔Unreachable) + auto-recover. Server-scoped
         // — it runs under BOTH the embedded and an external broker (it reads the
         // broker endpoint lazily each tick), and is aborted when the server drops.
-        let health_monitor = fabric_deployer
-            .clone()
-            .spawn_health_monitor()
-            .await
-            .map(HealthMonitor);
+        let health_monitor = if config_snapshot
+            .subagents()
+            .broker
+            .as_ref()
+            .is_some_and(|broker| !broker.endpoint.trim().is_empty())
+            && !config_snapshot.cluster_fabric.nodes.is_empty()
+        {
+            fabric_deployer
+                .clone()
+                .spawn_health_monitor()
+                .await
+                .map(HealthMonitor)
+        } else {
+            None
+        };
 
-        let tools = build_root_tools(
+        let (tools, canonical_subagent_tool) = build_root_tools(
             tools_with_task.clone(),
             schedule_store.clone(),
             schedule_manager.clone(),
@@ -961,7 +1133,10 @@ impl AppState {
             fabric_deployer.clone(),
             project_store.clone(),
             workspace_resolver.clone(),
+            parent_approval_reviewer,
         );
+        external_runner.set_canonical_subagent_tool(Some(canonical_subagent_tool));
+        let tools = crate::tools::ticket_tools::overlay(tools, tickets.clone());
         let workflow_run_tool =
             Arc::new(crate::workflow::WorkflowRunTool::new(workflow_runs.clone()));
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(
@@ -983,36 +1158,6 @@ impl AppState {
             .set_root_tools(tools.clone())
             .await;
 
-        // Process restart recovery: only backlog covered by its producer's
-        // durable activation watermark requests a run. A child/Bash coordinator
-        // may intentionally stage sibling outcomes while a specific wait remains
-        // armed; admission by itself is not permission to execute.
-        for entry in session_store.list_index_entries().await {
-            match session_inbox.inspect(&entry.id).await {
-                Ok(backlog) if backlog.activation_pending() => {
-                    if let Err(error) = bamboo_domain::SessionActivationPort::request_activation(
-                        session_activation_router.as_ref(),
-                        &entry.id,
-                        backlog.activation_generation,
-                    )
-                    .await
-                    {
-                        tracing::error!(
-                            session_id = %entry.id,
-                            %error,
-                            "failed to reactivate durable SessionInbox backlog during startup"
-                        );
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => tracing::warn!(
-                    session_id = %entry.id,
-                    %error,
-                    "failed to inspect SessionInbox during startup recovery"
-                ),
-            }
-        }
-
         let tool_factory =
             crate::tools::ToolSurfaceFactory::new(base_tools, tools_with_task, tools);
 
@@ -1020,7 +1165,78 @@ impl AppState {
             sessions.clone(),
             storage.clone(),
             persistence.clone(),
-        );
+        )
+        .with_root_actor_directory(session_store.clone());
+
+        let skill_producer = crate::skill_runtime::ServerMainSkillProducer::new(
+            skill_manager.clone(),
+            config.clone(),
+            session_repo.clone(),
+            project_store.clone(),
+            storage.clone(),
+            permission_checker.clone(),
+            tool_factory.clone(),
+        )
+        .with_runners(agent_runners.clone())
+        .with_root_observer(child_completion_coordinator.root_tool_surface_observer());
+        child_completion_coordinator.set_reserved_root_execution_adapter(Arc::new(
+            move |agent, session, reservation, tools| {
+                if !crate::skill_runtime::ordinary_main(session) {
+                    return Ok((agent, tools));
+                }
+                skill_producer
+                    .bind(agent, session, reservation, tools)
+                    .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))
+            },
+        ));
+
+        // Resolve expired, canonical direct-parent forced asks before any
+        // SessionInbox reactivation can admit an old parent request. A restart
+        // cannot restore the previous process's live approval scope, so this
+        // pass only records Deny terminals; it never sends a child grant.
+        let parent_permission_report = super::parent_permission_reconcile::reconcile_startup(
+            &session_store,
+            &session_repo,
+            &mcp_proxy_shutdown,
+        )
+        .await;
+        if parent_permission_report.denied > 0 || parent_permission_report.errors > 0 {
+            tracing::info!(
+                denied = parent_permission_report.denied,
+                errors = parent_permission_report.errors,
+                "reconciled direct-parent forced permission deadlines at startup"
+            );
+        }
+
+        // A Child checkpoint is the durable outbox. The first paced pass
+        // begins immediately and retries stable parent Inbox delivery and
+        // terminal fanout after process restart.
+        parent_question_coordinator.spawn();
+
+        if start_inbox_reconciler {
+            // Reconcile exact Inbox wake readiness before serving, then pace
+            // runtime recovery for due leases and missed activation handoffs.
+            let wake_report = super::wake_reconciler::reconcile_startup(
+                session_store.clone(),
+                session_activation_router.clone(),
+                mcp_proxy_shutdown.clone(),
+            )
+            .await;
+            if wake_report.attempted > 0
+                || wake_report.retrying > 0
+                || wake_report.blocked > 0
+                || wake_report.queued > 0
+            {
+                tracing::info!(
+                    checked = wake_report.checked,
+                    queued = wake_report.queued,
+                    attempted = wake_report.attempted,
+                    retrying = wake_report.retrying,
+                    blocked = wake_report.blocked,
+                    "started durable SessionInbox wake reconciliation"
+                );
+            }
+        }
 
         // bamboo-connect (#452 / epic #447): drives bamboo sessions from IM
         // platforms (Telegram first). Fully inert when `config.connect.platforms`
@@ -1034,6 +1250,7 @@ impl AppState {
                 agent_runners.clone(),
                 session_event_senders.clone(),
                 Some(account_sink.inbox()),
+                Some(account_sink.clone()),
                 Some(data_dir.clone()),
                 config.clone(),
                 provider_registry.clone(),
@@ -1044,7 +1261,6 @@ impl AppState {
             .await
             .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?,
         );
-
         // Dedicated child-session adapter backing the guardian review spawner.
         // The guardian path passes an explicit model (no subagent_type routing)
         // and registers its parent wait at the terminal gate (not via the
@@ -1065,13 +1281,26 @@ impl AppState {
             project_store: Some(project_store.clone()),
             workspace_resolver: workspace_resolver.clone(),
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+            recovered_launches: Arc::new(dashmap::DashMap::new()),
         });
+        workflow_runs
+            .bind_child_adapter(child_adapter.clone())
+            .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
         let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();
+        tickets.bind_adapter(child_adapter.clone());
+        tickets.bind_messenger(session_messenger.clone());
         // Wire the spawner into the completion coordinator too, so a resumed run
         // can re-spawn a guardian to re-review a fix after a reject verdict.
         child_completion_coordinator
             .set_guardian_spawner(guardian_spawner.clone())
             .await;
+
+        // Recover an accepted auto-run after a crash between its durable save,
+        // queue admission, and worker reservation. Draft children have no
+        // launch intent, and the scheduler fences any stale generation again.
+        if let Err(error) = child_adapter.reconcile_pending_child_launches().await {
+            tracing::warn!(%error, "failed to reconcile pending child launches on startup");
+        }
 
         // The completion coordinator doubles as the bash self-resume hook
         // (issue #84 Phase 2b): it polls the live shell registry and resumes a
@@ -1127,6 +1356,7 @@ impl AppState {
                 provider_lock.clone(),
                 mcp_manager.clone(),
                 account_sink.clone(),
+                config_application.clone(),
             );
         Ok(Self {
             browser,
@@ -1137,6 +1367,7 @@ impl AppState {
             config,
             config_facade,
             config_io_lock,
+            config_application,
             config_live_health,
             mcp_config_live_health,
             config_watcher,
@@ -1161,6 +1392,8 @@ impl AppState {
             session_activation_router,
             session_messenger,
             spawn_scheduler,
+            external_child_runner: external_runner,
+            tickets,
             child_completion_coordinator,
             guardian_spawner,
             bash_resume_hook,
@@ -1187,6 +1420,7 @@ impl AppState {
             agent_runners,
             execute_startups: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_event_senders,
+            actor_event_hub,
             account_sink,
             process_registry,
             metrics_bus: None, // Will be set by server if needed
@@ -1229,36 +1463,30 @@ impl Drop for HealthMonitor {
     }
 }
 
-/// Start an in-process broker on `127.0.0.1:<auto>` and point
-/// `config.subagents.broker` (RUNTIME-ONLY, `#[serde(skip)]`) at it — UNLESS a
-/// user-managed external broker is configured in `<data_dir>/broker.json` and
-/// reachable (then use that). Returns `None` when an external broker is used or
-/// the bind fails (sub-agent dispatch then degrades exactly as before).
-///
-/// The broker's endpoint deliberately lives in EITHER the in-memory config (for
-/// the embedded case, regenerated each boot) or its own `broker.json` (for the
-/// external case) — NEVER in `config.json`. That is what stops a prior run's
-/// ephemeral auto-port from leaking into the user's config and being dialed dead
-/// on the next boot (every sub-agent + the MCP proxy would hit "connect refused").
+/// Enable the mailbox bus only for existing explicit process/remote routes.
+/// Native Children return without opening a socket or reading legacy broker
+/// credentials. An explicit external broker is honored without a reachability
+/// fallback: an unavailable or invalid endpoint never starts another broker.
 async fn maybe_embed_broker(
     config: &mut bamboo_llm::Config,
     data_dir: &std::path::Path,
 ) -> Option<EmbeddedBroker> {
-    // A user-managed EXTERNAL broker (multi-host / shared standalone bus) lives in
-    // its OWN file, `<data_dir>/broker.json` — separate from config.json. Honour
-    // it ONLY if actually REACHABLE; a dead endpoint (standalone broker not up)
-    // falls through to a fresh in-process broker so dispatch still works.
-    if let Some(external) = load_external_broker(data_dir) {
-        let endpoint = external.endpoint.trim().to_string();
-        if broker_endpoint_reachable(&endpoint).await {
-            tracing::info!(%endpoint, "using external broker from broker.json");
-            config.subagents_mut().broker = Some(external);
-            return None;
+    if !bamboo_engine::external_agents::runtime::requires_legacy_child_runtime(config) {
+        config.subagents_mut().broker = None;
+        return None;
+    }
+
+    if config.subagents().broker.is_some() {
+        return None;
+    }
+    if data_dir.join("broker.json").try_exists().unwrap_or(true) {
+        config.subagents_mut().broker = load_external_broker(data_dir);
+        if config.subagents().broker.is_none() {
+            tracing::warn!(
+                "explicit broker.json is unavailable; legacy broker dispatch remains disabled"
+            );
         }
-        tracing::warn!(
-            %endpoint,
-            "broker.json endpoint is unreachable — embedding a fresh in-process broker instead"
-        );
+        return None;
     }
 
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
@@ -1308,7 +1536,7 @@ async fn maybe_embed_broker(
 /// This file is the SEPARATE, persisted home for a standalone/remote broker —
 /// deliberately NOT `config.json`, so the embedded broker's ephemeral runtime
 /// port can never leak into the user's config (the stale-dead-port bug). An
-/// absent file or a parse error yields `None` (embed a fresh in-process broker).
+/// absent file or a parse error yields `None`; it never selects another broker.
 ///
 /// Durable format carries only endpoint plus credential metadata. Legacy
 /// plaintext/ciphertext tokens are migrated before this reader proceeds.
@@ -1352,31 +1580,6 @@ fn parse_external_broker_snapshot(
     }
     cfg.hydrate_credential_from_store(data_dir)?;
     Ok(cfg)
-}
-
-/// Best-effort TCP reachability probe of a `ws[s]://host:port[/path]` broker
-/// endpoint. Used to tell a LIVE external/standalone broker (keep) apart from a
-/// DEAD persisted endpoint (a prior run's embedded auto-port that leaked into
-/// config.json — re-embed). A short timeout keeps boot fast when it's dead.
-async fn broker_endpoint_reachable(endpoint: &str) -> bool {
-    let host_port = endpoint
-        .trim()
-        .trim_start_matches("wss://")
-        .trim_start_matches("ws://")
-        .split('/')
-        .next()
-        .unwrap_or("");
-    if host_port.is_empty() {
-        return false;
-    }
-    matches!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            tokio::net::TcpStream::connect(host_port),
-        )
-        .await,
-        Ok(Ok(_))
-    )
 }
 
 #[cfg(test)]
@@ -1486,13 +1689,17 @@ mod fabric_boot_reconcile_tests {
 
 #[cfg(test)]
 mod broker_embed_tests {
-    use super::{broker_endpoint_reachable, load_external_broker, parse_external_broker_snapshot};
+    use super::{load_external_broker, maybe_embed_broker, parse_external_broker_snapshot};
+    use bamboo_engine::external_agents::runtime::{
+        requires_legacy_child_runtime, uses_legacy_default_child_runtime,
+    };
+    use bamboo_llm::Config;
 
     #[test]
     fn load_external_broker_reads_broker_json_not_config() {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x57; 32]);
         let dir = tempfile::tempdir().unwrap();
-        // Absent file ⇒ None (embed a fresh in-process broker).
+        // An absent file does not select a broker.
         assert!(load_external_broker(dir.path()).is_none());
 
         // A well-formed broker.json ⇒ parsed external broker.
@@ -1582,22 +1789,150 @@ mod broker_embed_tests {
         assert!(error.to_string().contains("appeared after migration"));
     }
 
+    #[test]
+    fn only_explicit_process_configuration_changes_the_default_child_route() {
+        let mut config = Config::default();
+        assert!(!uses_legacy_default_child_runtime(&config));
+        assert!(!requires_legacy_child_runtime(&config));
+
+        let subagents = config.subagents_mut();
+        subagents.executor = Some("bamboo_runtime".into());
+        subagents.fabric_dir = Some("left-over-worker-discovery".into());
+        subagents.max_concurrent = Some(3);
+        subagents.max_spawn_depth = Some(2);
+        assert!(!requires_legacy_child_runtime(&config));
+
+        config.subagents_mut().worker_bin = Some("custom-worker".into());
+        assert!(uses_legacy_default_child_runtime(&config));
+        assert!(requires_legacy_child_runtime(&config));
+        config.subagents_mut().worker_bin = None;
+        config.subagents_mut().worker_args = Some(Vec::new());
+        assert!(uses_legacy_default_child_runtime(&config));
+        config.subagents_mut().worker_args = None;
+        for executor in ["echo", "claude_code", "codex", "invalid-explicit-executor"] {
+            config.subagents_mut().executor = Some(executor.into());
+            assert!(uses_legacy_default_child_runtime(&config), "{executor}");
+        }
+    }
+
+    #[test]
+    fn explicit_remote_roles_and_profiles_do_not_replace_the_native_default() {
+        let mut config = Config::default();
+        config
+            .subagents_mut()
+            .remote_placements
+            .push(bamboo_config::RemoteActorPlacement {
+                role: "remote-review".into(),
+                endpoint: "wss://broker.example:9600".into(),
+                ..Default::default()
+            });
+        assert!(requires_legacy_child_runtime(&config));
+        assert!(!uses_legacy_default_child_runtime(&config));
+        config.subagents_mut().remote_placements.clear();
+        config
+            .subagents_mut()
+            .schedulable_placements
+            .push(bamboo_config::SchedulablePlacement {
+                role: "pool-review".into(),
+                pool: "reviewers".into(),
+                ..Default::default()
+            });
+        assert!(requires_legacy_child_runtime(&config));
+        assert!(!uses_legacy_default_child_runtime(&config));
+        config.subagents_mut().schedulable_placements.clear();
+        config.extra.insert(
+            "externalAgents".into(),
+            serde_json::json!({
+                "custom": {
+                    "agent_id": "custom",
+                    "protocol": "actor",
+                    "permission_profile": "default",
+                    "worker_bin": "custom-worker"
+                }
+            }),
+        );
+        assert!(requires_legacy_child_runtime(&config));
+        assert!(!uses_legacy_default_child_runtime(&config));
+        config.extra.get_mut("externalAgents").unwrap()["custom"]["protocol"] =
+            serde_json::json!("a2a_jsonrpc");
+        assert!(!requires_legacy_child_runtime(&config));
+    }
+
     #[tokio::test]
-    async fn reachability_probe_distinguishes_live_from_dead() {
-        // Bound-then-dropped port: nothing listening ⇒ unreachable (a stale
-        // persisted embedded endpoint must NOT be trusted).
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead = l.local_addr().unwrap();
-        drop(l);
-        assert!(!broker_endpoint_reachable(&format!("ws://{dead}")).await);
+    async fn native_defaults_ignore_stale_broker_configuration_without_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker_path = dir.path().join("broker.json");
+        let stale = "not valid json; must not be read or migrated by native defaults";
+        std::fs::write(&broker_path, stale).unwrap();
+        let mut config = Config::default();
+        config.subagents_mut().fabric_dir = Some("stale-discovery".into());
+        config.subagents_mut().broker = Some(bamboo_config::BrokerClientConfig {
+            endpoint: "ws://127.0.0.1:1".into(),
+            token: "stale-runtime-token".into(),
+            token_encrypted: None,
+            credential_ref: None,
+            configured: false,
+        });
+        assert!(maybe_embed_broker(&mut config, dir.path()).await.is_none());
+        assert!(config.subagents().broker.is_none());
+        assert!(!dir.path().join("broker").exists());
+        assert_eq!(std::fs::read_to_string(&broker_path).unwrap(), stale);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
-        // Empty / malformed ⇒ never trusted.
-        assert!(!broker_endpoint_reachable("").await);
-        assert!(!broker_endpoint_reachable("ws://").await);
+    #[tokio::test]
+    async fn unavailable_explicit_broker_never_falls_back_to_an_embedded_bus() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x5a; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("broker.json"),
+            r#"{ "endpoint": "ws://127.0.0.1:1", "token": "test-token" }"#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.subagents_mut().executor = Some("echo".into());
+        assert!(maybe_embed_broker(&mut config, dir.path()).await.is_none());
+        assert_eq!(
+            config.subagents().broker.as_ref().unwrap().endpoint,
+            "ws://127.0.0.1:1"
+        );
+        assert!(!dir.path().join("broker").exists());
 
-        // A LIVE listener (with a path) ⇒ reachable (a real external broker is kept).
-        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = live.local_addr().unwrap();
-        assert!(broker_endpoint_reachable(&format!("ws://{addr}/stream")).await);
+        config.subagents_mut().broker = None;
+        std::fs::write(dir.path().join("broker.json"), "invalid").unwrap();
+        assert!(maybe_embed_broker(&mut config, dir.path()).await.is_none());
+        assert!(config.subagents().broker.is_none());
+        assert!(!dir.path().join("broker").exists());
+    }
+
+    #[tokio::test]
+    async fn default_app_state_has_no_broker_or_cluster_background_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = super::AppState::new_with_provider(
+            dir.path().to_path_buf(),
+            Config::default(),
+            std::sync::Arc::new(super::UnconfiguredProvider {
+                message: "assembly test must not call a model".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(state.embedded_broker.is_none());
+        assert!(state.health_monitor.is_none());
+        assert!(state.config.read().await.subagents().broker.is_none());
+        assert!(!dir.path().join("broker").exists());
+        let child_tools = state.tools_for(crate::tools::ToolSurface::Child);
+        for name in ["Read", "Write", "Edit", "Bash", "Task"] {
+            assert!(
+                child_tools.owns_exact_tool(name),
+                "missing native tool {name}"
+            );
+        }
+        for name in ["ask_agent", "deploy_agent", "cluster"] {
+            assert!(!state
+                .tools_for(crate::tools::ToolSurface::Root)
+                .owns_exact_tool(name));
+        }
+        state.shutdown().await;
     }
 }

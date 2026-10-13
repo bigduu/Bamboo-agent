@@ -547,22 +547,6 @@ impl Config {
                         }
                     }
                 }
-                bamboo_domain::mcp_config::TransportConfig::Sse(sse) => {
-                    for header in sse.headers.iter_mut() {
-                        if !header.value.trim().is_empty() {
-                            continue;
-                        }
-                        let Some(encrypted) = header.value_encrypted.as_deref() else {
-                            continue;
-                        };
-                        match crate::encryption::decrypt(encrypted) {
-                            Ok(value) => header.value = value,
-                            Err(e) => {
-                                tracing::warn!("Failed to decrypt MCP SSE header value: {}", e)
-                            }
-                        }
-                    }
-                }
                 bamboo_domain::mcp_config::TransportConfig::StreamableHttp(sh) => {
                     for header in sh.headers.iter_mut() {
                         if !header.value.trim().is_empty() {
@@ -623,9 +607,6 @@ impl Config {
                         stdio.env.insert(name.clone(), secret.expose().to_string());
                     }
                 }
-                bamboo_domain::mcp_config::TransportConfig::Sse(config) => {
-                    hydrate_header_credentials(resolver, &mut config.headers)?;
-                }
                 bamboo_domain::mcp_config::TransportConfig::StreamableHttp(config) => {
                     hydrate_header_credentials(resolver, &mut config.headers)?;
                 }
@@ -644,18 +625,6 @@ impl Config {
                             format!("Failed to encrypt MCP stdio env var '{key}'")
                         })?;
                         stdio.env_encrypted.insert(key.clone(), encrypted);
-                    }
-                }
-                bamboo_domain::mcp_config::TransportConfig::Sse(sse) => {
-                    for header in sse.headers.iter_mut() {
-                        let configured = !header.value.trim().is_empty();
-                        header.value_encrypted = if !configured {
-                            None
-                        } else {
-                            Some(crate::encryption::encrypt(&header.value).with_context(|| {
-                                format!("Failed to encrypt MCP SSE header '{}'", header.name)
-                            })?)
-                        };
                     }
                 }
                 bamboo_domain::mcp_config::TransportConfig::StreamableHttp(sh) => {
@@ -695,14 +664,6 @@ impl Config {
                     {
                         stdio.env.remove(&name);
                         stdio.env_encrypted.remove(&name);
-                    }
-                }
-                bamboo_domain::mcp_config::TransportConfig::Sse(config) => {
-                    for header in &mut config.headers {
-                        if header.credential_ref.is_some() {
-                            header.value.clear();
-                            header.value_encrypted = None;
-                        }
                     }
                 }
                 bamboo_domain::mcp_config::TransportConfig::StreamableHttp(config) => {

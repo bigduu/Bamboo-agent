@@ -1,6 +1,18 @@
 # Sub-Agent 运行时设计:虚拟 Actor 模型
 
-> 本文是 sub-agent 体系的**设计**(非实施步骤)。取代旧的 `subagent-subprocess-refactor-plan.md`——子进程只是本设计的一种 runtime 实现,不再是主题。
+> 本文保留 sub-agent 体系的原始**设计**与历史实施记录,不是 #791 的实时验收清单。取代旧的 `subagent-subprocess-refactor-plan.md`——子进程只是本设计的一种 runtime 实现,不再是主题。当前交付边界以紧接下方的状态说明为准。
+
+> #791 当前交付范围与现成 Actor 库评估见 [actor-library-evaluation.md](actor-library-evaluation.md)。
+
+---
+
+## #791 当前实现边界（2026-09-29）
+
+- **逻辑身份与权限**：`ActorSession` 由持久 `Session.id`、创建时间、直接父级、Root、Project 和深度确定；`ActorActivation` 是可更换的 Run/租约，`WorkerHost` 是物理容量。`ActorDirectory` 持久记录 Host 解析的有效权限策略修订与 placement intent；Worker 自报信息不能改写这些身份字段。`SessionInbox` 是逻辑消息的持久准入面，物理 broker mailbox 不是第二份 Session history。
+- **编排与父子通信**：当前 `SubAgent` 提供创建、纠偏、等待、控制、递归树与有界检查；角色含 explorer、implementer、reviewer，Plan 子任务由只读运行时约束。直接父级的强制权限请求使用类型化、持久的 `ParentRequest`，澄清问题使用 `ParentQuestion`；回复须绑定请求、双方 Session 出生时间、谱系、Project 与期限。`inspect` 的 `diagnostics` 视图提供有界队列、租约、dead-letter、激活、等待和待处理请求状态；HostOwner 可通过管理接口检查并按精确消息 ID、generation、Session 出生时间重试 dead-letter。
+- **Broker 与 Host receipt**：broker 保留持久 Maildir 消息、经认证的作用域 PeerPolicy、当前 WorkerHost 观测及物理连接代际。Worker Event/Outcome 由 Host 验证当前 ActorActivation 后进入规范 Child Session；Host 私有 receipt 在最终 Session 保存前准备、保存后确认，只有收到关联的 broker ACK 结果才清理。重连时必须匹配同一 broker Maildir 身份、Run、Child 出生时间及 transcript 前缀；不确定的旧 Run 阻止后继误认其结果。
+- **有界远端能力**：固定远端的 scoped WSS `Run` 路径和 `EnvironmentLease` v1 已有实现。Host 按 Run 捕获干净 Git 工作区的提交与内容摘要，Worker 在执行前核验本机工作区；HostRegistry/placement scheduler 已能记录经 broker 认证的容量并预留 slot。这些是准入基础，并不表示通用远端 Actor 管理已完成。
+- **仍未交付**：自动化的通用 remote Run 生命周期与跨 Host 迁移/故障转移，超出固定远端路径的环境取得与隔离语义，以及 broker receipt 在失联或 ACK 不确定后的活性修复，仍需独立验收。当前 receipt 遇到不能证明的状态会保留/阻断，而非推断成功。以下项目目录、Tier-1/Tier-2 注册表与按需激活章节是原方案或历史进度，不能据此推断这些剩余能力已交付。
 
 ---
 

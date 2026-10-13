@@ -22,6 +22,13 @@ use thiserror::Error;
 /// Result type alias for server operations
 pub type Result<T, E = AppError> = std::result::Result<T, E>;
 
+/// Internal validation or preparation that already has its exact HTTP response.
+///
+/// Keep the error branch small even when Actix adds fields to `HttpResponse`.
+/// Unlike `AppError`, this boundary owns the existing response and moves it back
+/// to the handler without rebuilding its body, headers, or extensions.
+pub(crate) type ResponseResult<T> = std::result::Result<T, Box<HttpResponse>>;
+
 /// Application error enum with HTTP status code mapping
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -165,6 +172,57 @@ impl ResponseError for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[actix_web::test]
+    async fn prepared_response_error_preserves_original_http_contract() {
+        fn reject(response: HttpResponse) -> ResponseResult<()> {
+            Err(response.into())
+        }
+
+        let body = serde_json::json!({
+            "error": {"type": "api_error", "code": "project_workspace_conflict"},
+            "workspace": "/project/workspace",
+            "owner_project_id": "owner",
+        })
+        .to_string();
+        let chunks = [
+            actix_web::web::Bytes::copy_from_slice(&body.as_bytes()[..7]),
+            actix_web::web::Bytes::copy_from_slice(&body.as_bytes()[7..]),
+        ];
+        let mut response = HttpResponse::Conflict()
+            .insert_header(("content-type", "application/json"))
+            .insert_header(("retry-after", "2"))
+            .append_header(("x-error-detail", "first"))
+            .append_header(("x-error-detail", "second"))
+            .streaming(futures::stream::iter(
+                chunks.into_iter().map(Ok::<_, std::io::Error>),
+            ));
+        let extension = std::rc::Rc::new("retained response extension".to_owned());
+        response.extensions_mut().insert(extension.clone());
+
+        let restored = *reject(response).unwrap_err();
+
+        assert_eq!(restored.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            restored.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        assert_eq!(restored.headers().get("retry-after").unwrap(), "2");
+        let details: Vec<_> = restored
+            .headers()
+            .get_all("x-error-detail")
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(details, ["first", "second"]);
+        assert!(std::rc::Rc::ptr_eq(
+            restored.extensions().get::<std::rc::Rc<String>>().unwrap(),
+            &extension,
+        ));
+        let restored_body = actix_web::body::to_bytes(restored.into_body())
+            .await
+            .unwrap();
+        assert_eq!(restored_body.as_ref(), body.as_bytes());
+    }
 
     #[test]
     fn test_app_error_bad_request() {

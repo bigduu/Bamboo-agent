@@ -87,6 +87,7 @@ pub async fn close(state: web::Data<AppState>, path: web::Path<String>) -> HttpR
 #[serde(deny_unknown_fields)]
 pub struct TabCreateRequest {
     expected_epoch: u64,
+    url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -105,15 +106,14 @@ pub async fn tab_create(
     if !known_session(&state, &session_id).await {
         return missing_session();
     }
-    match state
-        .browser
-        .command(
-            &session_id,
-            "tab_create",
-            json!({"expected_epoch":body.expected_epoch}),
-        )
-        .await
-    {
+    let mut args = json!({"expected_epoch":body.expected_epoch});
+    if let Some(raw_url) = &body.url {
+        match http_browser_url(raw_url) {
+            Ok(url) => args["url"] = json!(url.as_str()),
+            Err(error) => return error_response(error),
+        }
+    }
+    match state.browser.command(&session_id, "tab_create", args).await {
         Ok(value) => HttpResponse::Ok().json(value),
         Err(error) => error_response(error),
     }
@@ -182,6 +182,21 @@ pub struct NavigateRequest {
     expected_epoch: u64,
 }
 
+fn http_browser_url(raw: &str) -> Result<url::Url, BrowserError> {
+    match url::Url::parse(raw) {
+        Ok(url)
+            if matches!(url.scheme(), "http" | "https")
+                && url.username().is_empty()
+                && url.password().is_none() =>
+        {
+            Ok(url)
+        }
+        _ => Err(BrowserError::Invalid(
+            "navigation requires an http(s) URL without credentials".into(),
+        )),
+    }
+}
+
 pub async fn navigate(
     state: web::Data<AppState>,
     path: web::Path<String>,
@@ -191,19 +206,9 @@ pub async fn navigate(
     if !known_session(&state, &session_id).await {
         return missing_session();
     }
-    let url = match url::Url::parse(&body.url) {
-        Ok(url)
-            if matches!(url.scheme(), "http" | "https")
-                && url.username().is_empty()
-                && url.password().is_none() =>
-        {
-            url
-        }
-        _ => {
-            return error_response(BrowserError::Invalid(
-                "navigation requires an http(s) URL without credentials".into(),
-            ))
-        }
+    let url = match http_browser_url(&body.url) {
+        Ok(url) => url,
+        Err(error) => return error_response(error),
     };
     match state
         .browser

@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bamboo_agent_core::AgentEvent;
+use bamboo_domain::{RootActorRuntimeWrite, Storage};
 use chrono::Utc;
 use fs2::FileExt;
 use tokio::sync::oneshot;
@@ -47,6 +48,16 @@ const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// event)`. The session id is the caller's known routing context.
 pub type PendingEvent = (Option<String>, AgentEvent);
 
+enum QueuedEvent {
+    Legacy(PendingEvent),
+    RootActor {
+        storage: Arc<dyn Storage>,
+        owner: RootActorRuntimeWrite,
+        pending: PendingEvent,
+        receipt: oneshot::Sender<bool>,
+    },
+}
+
 type ConfirmationWaiter = (u64, oneshot::Sender<bool>);
 type ConfirmationWaiters = Arc<Mutex<HashMap<String, Vec<ConfirmationWaiter>>>>;
 type LatestConfigStates = Arc<Mutex<HashMap<String, ConfigEventKind>>>;
@@ -64,7 +75,8 @@ pub struct AccountEventSink {
     /// for diagnostics ([`Self::latest_seq`]).
     seq: Arc<AtomicU64>,
     /// Inbox to the writer task.
-    tx: mpsc::Sender<PendingEvent>,
+    tx: mpsc::Sender<QueuedEvent>,
+    legacy_inbox: mpsc::Sender<PendingEvent>,
     /// Live account tail. `Arc` keeps fan-out to many subscribers cheap.
     broadcast: broadcast::Sender<Arc<ChangeEvent>>,
     /// Journal directory, for stateless replay reads on the `/stream` path.
@@ -99,6 +111,19 @@ impl AccountEventSink {
             .collect::<HashSet<_>>();
         let seq = Arc::new(AtomicU64::new(max_seq));
         let (tx, rx) = mpsc::channel(INBOX_CAPACITY);
+        let (legacy_inbox, mut legacy_rx) = mpsc::channel(INBOX_CAPACITY);
+        let legacy_writer = tx.clone();
+        tokio::spawn(async move {
+            while let Some(event) = legacy_rx.recv().await {
+                if legacy_writer
+                    .send(QueuedEvent::Legacy(event))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let (btx, _brx) = broadcast::channel(BROADCAST_CAPACITY);
         let confirmation_waiters = Arc::new(Mutex::new(HashMap::new()));
         let latest_config_states = Arc::new(Mutex::new(durable_config_states));
@@ -107,6 +132,7 @@ impl AccountEventSink {
         let sink = Arc::new(Self {
             seq: seq.clone(),
             tx,
+            legacy_inbox,
             broadcast: btx.clone(),
             events_dir,
             dropped: Arc::new(AtomicU64::new(0)),
@@ -144,10 +170,48 @@ impl AccountEventSink {
         let sid = session_id
             .map(|s| s.to_string())
             .or_else(|| event.session_id().map(|s| s.to_string()));
-        if self.tx.try_send((sid, event.clone())).is_err() {
+        if self
+            .tx
+            .try_send(QueuedEvent::Legacy((sid, event.clone())))
+            .is_err()
+        {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("account change-feed inbox full or closed; event dropped");
         }
+    }
+
+    /// Queue an immutable Host-created Root capability with the durable frame.
+    /// The receipt confirms the actual journal and live publication, never
+    /// queue admission. Dropping it does not cancel or retry the owned job.
+    pub fn record_root_actor(
+        &self,
+        storage: Arc<dyn Storage>,
+        owner: RootActorRuntimeWrite,
+        session_id: Option<&str>,
+        event: &AgentEvent,
+    ) -> Option<oneshot::Receiver<bool>> {
+        if !event.is_durable_change() {
+            return None;
+        }
+        let sid = session_id
+            .map(str::to_string)
+            .or_else(|| event.session_id().map(str::to_string));
+        let (receipt, confirmation) = oneshot::channel();
+        if self
+            .tx
+            .try_send(QueuedEvent::RootActor {
+                storage,
+                owner,
+                pending: (sid, event.clone()),
+                receipt,
+            })
+            .is_err()
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("Root account change-feed inbox full or closed; event rejected");
+            return None;
+        }
+        Some(confirmation)
     }
 
     /// Enqueue one event and wait until the single writer has either appended
@@ -183,7 +247,12 @@ impl AccountEventSink {
         // One deadline bounds both queue admission and journal confirmation.
         // A full inbox must not hold a session-create idempotency claim forever.
         let durable = tokio::time::timeout(timeout, async {
-            if self.tx.send((sid, event.clone())).await.is_err() {
+            if self
+                .tx
+                .send(QueuedEvent::Legacy((sid, event.clone())))
+                .await
+                .is_err()
+            {
                 return false;
             }
             confirmation.await.unwrap_or(false)
@@ -203,7 +272,7 @@ impl AccountEventSink {
     /// callers must filter with [`AgentEvent::is_durable_change`] before
     /// sending so ephemeral token traffic never crosses the channel.
     pub fn inbox(&self) -> mpsc::Sender<PendingEvent> {
-        self.tx.clone()
+        self.legacy_inbox.clone()
     }
 
     /// Subscribe to the live account tail. Subscribe *before* reading the
@@ -411,20 +480,13 @@ fn load_durable_snapshot(events_dir: &std::path::Path) -> std::io::Result<(Vec<C
     result
 }
 
-/// Serialize durable journal publication across rolling Bamboo processes.
-/// Confirmation-bearing events are re-checked from disk while the claim is
-/// held, then a fresh disk-derived sequence is appended, flushed, and synced.
-/// Events without a confirmation id share the append/sequence boundary but do
-/// not gain semantic deduplication.
-async fn append_with_global_claim(
-    events_dir: PathBuf,
-    session_id: Option<String>,
-    event: AgentEvent,
-    known_max_seq: u64,
-    known_config_state: Option<ConfigEventKind>,
-) -> std::io::Result<GlobalAppend> {
-    tokio::task::spawn_blocking(move || {
-        std::fs::create_dir_all(&events_dir)?;
+/// A journal claim is acquired before Root authority guards. A blocked account
+/// journal must not prevent a replacement Host from reclaiming an expired Root.
+struct JournalClaim(std::fs::File);
+
+impl JournalClaim {
+    fn acquire(events_dir: &std::path::Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(events_dir)?;
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -432,149 +494,221 @@ async fn append_with_global_claim(
             .write(true)
             .open(events_dir.join(JOURNAL_LOCK_FILE))?;
         FileExt::lock_exclusive(&lock)?;
+        Ok(Self(lock))
+    }
+}
 
-        let result = (|| {
-            let (mut journal, max_seq) = EventJournal::open_for_locked_append(events_dir.clone())?;
-            let observed_events = if max_seq > known_max_seq {
-                super::journal::read_since(&events_dir, known_max_seq)?
-            } else {
-                Vec::new()
-            };
-            if duplicate_after_observed_delta(&event, known_config_state, &observed_events) {
-                return Ok(GlobalAppend::Existing {
-                    max_seq,
-                    observed_events,
-                });
-            }
+impl Drop for JournalClaim {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
 
-            let ce = ChangeEvent {
-                seq: max_seq
-                    .checked_add(1)
-                    .ok_or_else(|| std::io::Error::other("account journal sequence exhausted"))?,
-                ts: Utc::now(),
-                session_id,
-                event,
-            };
-            journal.append_synced(&ce)?;
-            Ok(GlobalAppend::Appended {
-                event: Box::new(ce),
-                observed_events,
-            })
-        })();
-        let _ = FileExt::unlock(&lock);
-        result
+/// Reuse the existing global sequence/dedupe/append protocol. The caller owns
+/// the journal claim; Root callers additionally retain physical authority guards.
+fn append_under_global_claim(
+    events_dir: &std::path::Path,
+    session_id: Option<String>,
+    event: AgentEvent,
+    known_max_seq: u64,
+    known_config_state: Option<ConfigEventKind>,
+    check_current: &dyn Fn() -> std::io::Result<()>,
+) -> std::io::Result<GlobalAppend> {
+    check_current()?;
+    let (mut journal, max_seq) = EventJournal::open_for_locked_append(events_dir.to_path_buf())?;
+    let observed_events = if max_seq > known_max_seq {
+        super::journal::read_since(events_dir, known_max_seq)?
+    } else {
+        Vec::new()
+    };
+    // The scan can take time. Validate at the actual append/dedupe boundary.
+    check_current()?;
+    if duplicate_after_observed_delta(&event, known_config_state, &observed_events) {
+        return Ok(GlobalAppend::Existing {
+            max_seq,
+            observed_events,
+        });
+    }
+    let ce = ChangeEvent {
+        seq: max_seq
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("account journal sequence exhausted"))?,
+        ts: Utc::now(),
+        session_id,
+        event,
+    };
+    journal.append_synced(&ce)?;
+    Ok(GlobalAppend::Appended {
+        event: Box::new(ce),
+        observed_events,
     })
-    .await
-    .map_err(|error| std::io::Error::other(format!("join account journal task: {error}")))?
+}
+
+async fn acquire_journal_claim(events_dir: PathBuf) -> std::io::Result<Arc<JournalClaim>> {
+    tokio::task::spawn_blocking(move || JournalClaim::acquire(&events_dir).map(Arc::new))
+        .await
+        .map_err(|error| std::io::Error::other(format!("join account journal claim: {error}")))?
+}
+
+fn publish_global_append(
+    append: GlobalAppend,
+    seq: &AtomicU64,
+    broadcast: &broadcast::Sender<Arc<ChangeEvent>>,
+    state: &mut WriterDedupState,
+    check_current: &dyn Fn() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let (max_seq, observed_events, appended) = match append {
+        GlobalAppend::Existing {
+            max_seq,
+            observed_events,
+        } => (max_seq, observed_events, None),
+        GlobalAppend::Appended {
+            event,
+            observed_events,
+        } => (event.seq, observed_events, Some(*event)),
+    };
+    publish_observed_events(
+        observed_events,
+        seq,
+        broadcast,
+        &mut state.delivered_lifecycle_ids,
+        &state.latest_config_states,
+        &mut state.delivered_changed_ids,
+    );
+    seq.fetch_max(max_seq, Ordering::SeqCst);
+    if let Some(ce) = appended {
+        check_current()?;
+        if let Some(id) = lifecycle_event_id(&ce.event) {
+            state.delivered_lifecycle_ids.insert(id);
+        }
+        if let Some((key, kind)) = config_event_state(&ce.event) {
+            state
+                .latest_config_states
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(key, kind);
+        }
+        if let Some(id) = config_event_id(&ce.event) {
+            state.delivered_changed_ids.insert(id);
+        }
+        let _ = broadcast.send(Arc::new(ce));
+    }
+    Ok(())
 }
 
 async fn writer_loop(
-    mut rx: mpsc::Receiver<PendingEvent>,
+    mut rx: mpsc::Receiver<QueuedEvent>,
     events_dir: PathBuf,
     seq: Arc<AtomicU64>,
     broadcast: broadcast::Sender<Arc<ChangeEvent>>,
     state: WriterDedupState,
 ) {
-    let WriterDedupState {
-        mut delivered_lifecycle_ids,
-        latest_config_states,
-        mut delivered_changed_ids,
-        confirmation_waiters,
-    } = state;
-    while let Some((session_id, event)) = rx.recv().await {
-        let lifecycle_id = lifecycle_event_id(&event);
-        let config_id = config_event_id(&event);
-        let config_state = config_event_state(&event);
+    let state = Arc::new(Mutex::new(state));
+    while let Some(queued) = rx.recv().await {
+        let (pending, root) = match queued {
+            QueuedEvent::Legacy(pending) => (pending, None),
+            QueuedEvent::RootActor {
+                storage,
+                owner,
+                pending,
+                receipt,
+            } => (pending, Some((storage, owner, receipt))),
+        };
+        let (session_id, event) = pending;
         let confirmation_id = event_confirmation_id(&event);
-        if lifecycle_id
-            .as_ref()
-            .is_some_and(|id| delivered_lifecycle_ids.contains(id))
-            || config_id
-                .as_ref()
-                .is_some_and(|id| delivered_changed_ids.contains(id))
-        {
-            tracing::debug!("duplicate durable change event suppressed");
-            if let Some(confirmation_id) = confirmation_id.as_deref() {
-                complete_confirmation_waiters(&confirmation_waiters, confirmation_id, true);
+        let (known_config_state, already_delivered, waiters) = {
+            let state = state.lock().unwrap_or_else(|p| p.into_inner());
+            let duplicate = lifecycle_event_id(&event)
+                .is_some_and(|id| state.delivered_lifecycle_ids.contains(&id))
+                || config_event_id(&event)
+                    .is_some_and(|id| state.delivered_changed_ids.contains(&id));
+            let known_config = config_event_state(&event).and_then(|(key, _)| {
+                state
+                    .latest_config_states
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&key)
+                    .copied()
+            });
+            (known_config, duplicate, state.confirmation_waiters.clone())
+        };
+        if root.is_none() && already_delivered {
+            if let Some(id) = confirmation_id.as_deref() {
+                complete_confirmation_waiters(&waiters, id, true);
             }
             continue;
         }
-        let append = append_with_global_claim(
-            events_dir.clone(),
-            session_id,
-            event,
-            seq.load(Ordering::SeqCst),
-            config_state.as_ref().and_then(|(key, _)| {
-                latest_config_states
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .get(key)
-                    .copied()
-            }),
-        )
-        .await;
-        let ce = match append {
-            Ok(GlobalAppend::Existing {
-                max_seq,
-                observed_events,
-            }) => {
-                publish_observed_events(
-                    observed_events,
-                    seq.as_ref(),
-                    &broadcast,
-                    &mut delivered_lifecycle_ids,
-                    &latest_config_states,
-                    &mut delivered_changed_ids,
-                );
-                seq.fetch_max(max_seq, Ordering::SeqCst);
-                if let Some(confirmation_id) = confirmation_id.as_deref() {
-                    complete_confirmation_waiters(&confirmation_waiters, confirmation_id, true);
+        let claim = acquire_journal_claim(events_dir.clone()).await;
+        let result = match claim {
+            Err(error) => Err(error),
+            Ok(claim) => {
+                let events_dir = events_dir.clone();
+                let seq = seq.clone();
+                let broadcast = broadcast.clone();
+                let state = state.clone();
+                let publish: bamboo_domain::storage::RootActorRuntimeEventPublisher =
+                    Box::new(move |check_current| {
+                        let _claim = claim;
+                        check_current()?;
+                        // Root duplicates still prove current ownership; they must
+                        // not turn an obsolete producer's receipt into acceptance.
+                        let append = if already_delivered {
+                            GlobalAppend::Existing {
+                                max_seq: seq.load(Ordering::SeqCst),
+                                observed_events: Vec::new(),
+                            }
+                        } else {
+                            append_under_global_claim(
+                                &events_dir,
+                                session_id,
+                                event,
+                                seq.load(Ordering::SeqCst),
+                                known_config_state,
+                                check_current,
+                            )?
+                        };
+                        check_current()?;
+                        publish_global_append(
+                            append,
+                            &seq,
+                            &broadcast,
+                            &mut state.lock().unwrap_or_else(|p| p.into_inner()),
+                            check_current,
+                        )
+                    });
+                if let Some((storage, owner, _)) = root.as_ref() {
+                    storage
+                        .publish_root_actor_runtime_event(owner, publish)
+                        .await
+                } else {
+                    tokio::task::spawn_blocking(move || publish(&|| Ok(())))
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(std::io::Error::other(format!(
+                                "join account journal task: {error}"
+                            )))
+                        })
                 }
-                continue;
-            }
-            Ok(GlobalAppend::Appended {
-                event,
-                observed_events,
-            }) => {
-                publish_observed_events(
-                    observed_events,
-                    seq.as_ref(),
-                    &broadcast,
-                    &mut delivered_lifecycle_ids,
-                    &latest_config_states,
-                    &mut delivered_changed_ids,
-                );
-                seq.fetch_max(event.seq, Ordering::SeqCst);
-                *event
-            }
-            Err(e) => {
-                tracing::error!("failed to append durable change event to journal: {e}");
-                if let Some(confirmation_id) = confirmation_id.as_deref() {
-                    complete_confirmation_waiters(&confirmation_waiters, confirmation_id, false);
-                }
-                continue;
             }
         };
-        if let Some(id) = lifecycle_id {
-            delivered_lifecycle_ids.insert(id);
+        if let Err(error) = &result {
+            tracing::error!(%error, "failed to publish durable account event");
         }
-        if let Some((key, kind)) = config_state {
-            latest_config_states
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(key, kind);
+        let durable = result.is_ok();
+        if root.is_none() || durable {
+            if let Some(id) = confirmation_id.as_deref() {
+                complete_confirmation_waiters(&waiters, id, durable);
+            }
         }
-        if let Some(id) = config_id.as_ref() {
-            delivered_changed_ids.insert(id.clone());
-        }
-        // Lossy by design: with no live subscribers, or if all lag, the durable
-        // journal remains the source of truth for resume.
-        let _ = broadcast.send(Arc::new(ce));
-        if let Some(confirmation_id) = confirmation_id.as_deref() {
-            complete_confirmation_waiters(&confirmation_waiters, confirmation_id, true);
+        if let Some((_, _, receipt)) = root {
+            let _ = receipt.send(durable);
         }
     }
 }
+
+#[cfg(test)]
+#[path = "account_sink_root_actor_tests.rs"]
+mod root_actor_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1057,13 +1191,14 @@ mod tests {
     async fn confirmed_record_bounds_full_inbox_wait_and_cleans_waiter() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, _paused_rx) = mpsc::channel(1);
-        tx.try_send((None, session_created("inbox-filler")))
+        tx.try_send(QueuedEvent::Legacy((None, session_created("inbox-filler"))))
             .unwrap();
         let (broadcast, _receiver) = broadcast::channel(1);
         let confirmation_waiters = Arc::new(Mutex::new(HashMap::new()));
         let sink = AccountEventSink {
             seq: Arc::new(AtomicU64::new(0)),
             tx,
+            legacy_inbox: mpsc::channel(1).0,
             broadcast,
             events_dir: dir.path().to_path_buf(),
             dropped: Arc::new(AtomicU64::new(0)),

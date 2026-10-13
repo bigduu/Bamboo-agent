@@ -4,11 +4,11 @@
 //! It selects complete, provider-safe logical turns that a later lifecycle step
 //! may archive after capability and persistence invariants have been verified.
 
+use crate::skill_history::{is_skill_tool_name, SkillNameMatch};
 use crate::{TiktokenTokenCounter, TokenBudget, TokenCounter};
 use bamboo_domain::{
-    canonical_tool_name, sha256_hex, CompressionEvent, CompressionEventKind,
-    CompressionTriggerType, Message, MessagePart, ModelContextResetReason, Role, Session,
-    TokenBudgetUsage,
+    sha256_hex, CompressionEvent, CompressionEventKind, CompressionTriggerType, Message,
+    MessagePart, ModelContextResetReason, Role, Session, TokenBudgetUsage,
 };
 use chrono::Utc;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1690,10 +1690,9 @@ fn mark_protocol_safety(groups: &mut [LogicalGroup<'_>]) {
 fn logical_group_has_protected_skill(group: &LogicalGroup<'_>) -> bool {
     group.messages.iter().any(|indexed| {
         indexed.message.tool_calls.as_ref().is_some_and(|calls| {
-            calls.iter().any(|call| {
-                let tool_name = canonical_tool_name(&call.function.name);
-                matches!(tool_name.as_str(), "load_skill" | "read_skill_resource")
-            })
+            calls
+                .iter()
+                .any(|call| is_skill_tool_name(&call.function.name, SkillNameMatch::Canonical))
         })
     })
 }
@@ -3131,6 +3130,91 @@ mod tests {
             assert_eq!(
                 serde_json::to_vec(&session).expect("session should serialize"),
                 before
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_skill_retrieval_canonical_names_do_not_narrow_roles() {
+        for role in [Role::Assistant, Role::User, Role::Tool, Role::System] {
+            for (name, expected) in [
+                ("load_skill", true),
+                ("read_skill_resource", true),
+                ("default::LoAd_SkIlL", true),
+                ("outer::inner::READ_SKILL_RESOURCE", true),
+                ("mcp__server__load_skill", false),
+                ("load_skill_extra", false),
+            ] {
+                let mut message = tool_call("candidate", "candidate-call", 1, name);
+                message.role = role.clone();
+                let group = LogicalGroup::preamble(IndexedMessage {
+                    session_index: 0,
+                    message: &message,
+                });
+                assert_eq!(
+                    logical_group_has_protected_skill(&group),
+                    expected,
+                    "{role:?}/{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_skill_mixed_retrieval_rejects_protected_and_incomplete_groups_without_mutation() {
+        let mut session = Session::new("mixed-retrieval-skill", "test-model");
+        session.add_message(system("system", 5));
+        session.add_message(user("old-u", 10));
+        let mut mixed = tool_call("mixed-call", "skill-call", 10, "Read");
+        mixed.tool_calls.as_mut().unwrap().push(ToolCall {
+            id: "other-call".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "Grep".into(),
+                arguments: "{}".into(),
+            },
+        });
+        session.add_message(mixed);
+        session.add_message(tool_result("skill-result", "skill-call", 10));
+        session.add_message(tool_result("other-result", "other-call", 10));
+        session.add_message(assistant("old-final", 10));
+        add_turn(&mut session, "recent", 10);
+        let plan = plan_with_counter(&session, 50, 1, 0).unwrap();
+        assert_eq!(
+            plan.message_ids_to_archive,
+            [
+                "old-u",
+                "mixed-call",
+                "skill-result",
+                "other-result",
+                "old-final"
+            ]
+        );
+        for name in ["namespace::LoAd_SkIlL", "READ_SKILL_RESOURCE"] {
+            let mut candidate = session.clone();
+            candidate.messages[2].tool_calls.as_mut().unwrap()[0]
+                .function
+                .name = name.into();
+            assert_apply_error_without_mutation(
+                &mut candidate,
+                &plan,
+                RetrievalWindowApplyError::ProtectedSkillChain,
+            );
+            let mut partial = plan.clone();
+            partial
+                .message_ids_to_archive
+                .retain(|id| id != "other-result");
+            partial.archive_message_count -= 1;
+            assert_apply_error_without_mutation(
+                &mut candidate,
+                &partial,
+                RetrievalWindowApplyError::IncompleteLogicalGroup,
+            );
+            candidate.messages[4].tool_call_id = Some("missing-call".into());
+            assert_apply_error_without_mutation(
+                &mut candidate,
+                &plan,
+                RetrievalWindowApplyError::UnsafeToolProtocol,
             );
         }
     }

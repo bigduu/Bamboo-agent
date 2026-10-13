@@ -1,3 +1,4 @@
+use crate::providers::common::{http_error_kind, llm_error_kind, log_identity};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::json;
@@ -548,12 +549,12 @@ impl CopilotProvider {
 
                     let delay_ms = COPILOT_TRANSPORT_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1));
                     tracing::warn!(
-                        "[{}] Copilot transport error during {} (attempt {}/{}): {}. Retrying in {}ms",
-                        session_log_id,
+                        "[session_hash={}] Copilot transport error during {} (attempt {}/{}): error_kind={}. Retrying in {}ms",
+                        log_identity(session_log_id),
                         operation,
                         attempt,
                         COPILOT_TRANSPORT_MAX_ATTEMPTS,
-                        error,
+                        http_error_kind(&error),
                         delay_ms
                     );
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -584,8 +585,8 @@ impl CopilotProvider {
         let mut effective_responses_options = responses_options.cloned().unwrap_or_default();
         if effective_responses_options.store == Some(true) {
             tracing::warn!(
-                "[{}] Copilot /responses does not support store=true; forcing store=false",
-                session_log_id
+                "[session_hash={}] Copilot /responses does not support store=true; forcing store=false",
+                log_identity(session_log_id)
             );
         }
         effective_responses_options.store = Some(false);
@@ -629,14 +630,14 @@ impl CopilotProvider {
         crate::masking::mask_outbound_body(&mut body, &self.masking_config);
 
         tracing::debug!(
-            "[{}] Copilot provider using Responses API model: {}",
-            session_log_id,
-            model
+            "[session_hash={}] Copilot provider using Responses API model_hash={}",
+            log_identity(session_log_id),
+            log_identity(model)
         );
         tracing::info!(
-            "[{}] Copilot request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} input_source={} input_messages_before={} input_messages_after={} duplicate_system_fallback={} purpose={}",
-            session_log_id,
-            model,
+            "[session_hash={}] Copilot request protocol=responses model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} input_source={} input_messages_before={} input_messages_after={} duplicate_system_fallback={} purpose_hash={}",
+            log_identity(session_log_id),
+            log_identity(model),
             reasoning_effort
                 .map(ReasoningEffort::as_str)
                 .unwrap_or("none"),
@@ -649,7 +650,7 @@ impl CopilotProvider {
             input_selection.original_len,
             input_selection.effective_len,
             input_selection.fallback_removed_duplicate_system,
-            request_purpose
+            log_identity(request_purpose)
         );
 
         let request_headers = self.build_llm_headers(
@@ -710,32 +711,16 @@ impl CopilotProvider {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("-")
                     .to_string();
-                let response_headers_debug: String = response
-                    .headers()
-                    .iter()
-                    .filter(|(k, _)| {
-                        let name = k.as_str();
-                        !matches!(
-                            name,
-                            "set-cookie"
-                                | "cookie"
-                                | "authorization"
-                                | "accept-ranges"
-                                | "access-control-allow-origin"
-                        )
-                    })
-                    .map(|(k, v)| format!("{}={}", k, v.to_str().unwrap_or("<binary>")))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let response_header_count = response.headers().len();
                 let text = response.text().await.unwrap_or_default();
 
                 if reasoning_effort.is_some()
                     && Self::looks_like_reasoning_unsupported_error(status, &text)
                 {
                     tracing::warn!(
-                        "[{}] Copilot /responses rejected reasoning for model '{}'; retrying without reasoning_effort",
-                        session_log_id,
-                        model
+                        "[session_hash={}] Copilot /responses rejected reasoning for model_hash {}; retrying without reasoning_effort",
+                        log_identity(session_log_id),
+                        log_identity(model)
                     );
                     let mut fallback_options = effective_responses_options.clone();
                     fallback_options.reasoning_summary = None;
@@ -854,12 +839,12 @@ impl CopilotProvider {
 
                 let request_body_bytes = serde_json::to_vec(&body).map(|v| v.len()).unwrap_or(0);
                 tracing::error!(
-                    "[{}] Copilot Responses API error: HTTP {} - {} (request_id={}, model='{}', input_source={}, input_messages_before={}, input_messages_after={}, duplicate_system_fallback={}, tools={}, request_body_bytes={}, max_output_tokens={:?}, reasoning_effort={:?})",
-                    session_log_id,
+                    "[session_hash={}] Copilot Responses API error: HTTP {} response_bytes={} (request_id_hash={}, model_hash={}, input_source={}, input_messages_before={}, input_messages_after={}, duplicate_system_fallback={}, tools={}, request_body_bytes={}, max_output_tokens={:?}, reasoning_effort={:?})",
+                    log_identity(session_log_id),
                     status,
-                    text,
-                    request_id,
-                    model,
+                    text.len(),
+                    log_identity(&request_id),
+                    log_identity(model),
                     input_source,
                     input_selection.original_len,
                     input_selection.effective_len,
@@ -870,9 +855,9 @@ impl CopilotProvider {
                     reasoning_effort
                 );
                 tracing::debug!(
-                    "[{}] Copilot Responses API error response headers: [{}]",
-                    session_log_id,
-                    response_headers_debug
+                    "[session_hash={}] Copilot Responses API error response_header_count={}",
+                    log_identity(session_log_id),
+                    response_header_count
                 );
                 return Err(LLMError::Api(format!(
                     "HTTP {} (request_id={}): {}",
@@ -1066,7 +1051,11 @@ impl CopilotProvider {
                     )));
                 }
 
-                tracing::error!("Copilot API error: HTTP {} - {}", status, text);
+                tracing::error!(
+                    status = status.as_u16(),
+                    response_bytes = text.len(),
+                    "Copilot models API error"
+                );
                 return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
             }
         }
@@ -1095,8 +1084,8 @@ impl CopilotProvider {
             Err(error) => {
                 if let Some(cache) = cached {
                     tracing::warn!(
-                        "Failed to refresh Copilot model metadata; using stale cache: {}",
-                        error
+                        "Failed to refresh Copilot model metadata; using stale cache: error_kind={}",
+                        llm_error_kind(&error)
                     );
                     return Ok(cache.models);
                 }
@@ -1186,9 +1175,9 @@ impl LLMProvider for CopilotProvider {
         }
 
         tracing::debug!(
-            "[{}] Copilot provider using upstream model: {}",
-            session_log_id,
-            upstream_model
+            "[session_hash={}] Copilot provider using upstream model_hash={}",
+            log_identity(session_log_id),
+            log_identity(upstream_model)
         );
 
         // Some models only support Responses API.
@@ -1245,9 +1234,9 @@ impl LLMProvider for CopilotProvider {
         }
         crate::masking::mask_outbound_body(&mut body, &self.masking_config);
         tracing::info!(
-            "[{}] Copilot request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} [{}]",
-            session_log_id,
-            upstream_model,
+            "[session_hash={}] Copilot request protocol=chat_completions model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose_hash={}",
+            log_identity(session_log_id),
+            log_identity(upstream_model),
             reasoning_effort
                 .map(ReasoningEffort::as_str)
                 .unwrap_or("none"),
@@ -1256,12 +1245,12 @@ impl LLMProvider for CopilotProvider {
             max_output_tokens
                 .map(|tokens| tokens.to_string())
                 .unwrap_or_else(|| "none".to_string()),
-            request_purpose
+            log_identity(request_purpose)
         );
 
         tracing::debug!(
-            "[{}] Sending request to Copilot API with {} messages and {} tools",
-            session_log_id,
+            "[session_hash={}] Sending request to Copilot API with {} messages and {} tools",
+            log_identity(session_log_id),
             messages.len(),
             tools.len()
         );
@@ -1328,24 +1317,7 @@ impl LLMProvider for CopilotProvider {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("-")
                     .to_string();
-                let response_headers_debug: String = response
-                    .headers()
-                    .iter()
-                    .filter(|(k, _)| {
-                        let name = k.as_str();
-                        // Include error/debug-relevant headers, skip noisy ones.
-                        !matches!(
-                            name,
-                            "set-cookie"
-                                | "cookie"
-                                | "authorization"
-                                | "accept-ranges"
-                                | "access-control-allow-origin"
-                        )
-                    })
-                    .map(|(k, v)| format!("{}={}", k, v.to_str().unwrap_or("<binary>")))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let response_header_count = response.headers().len();
                 let text = response.text().await.unwrap_or_default();
 
                 // Check for auth errors
@@ -1360,9 +1332,9 @@ impl LLMProvider for CopilotProvider {
                     && Self::looks_like_reasoning_unsupported_error(status, &text)
                 {
                     tracing::warn!(
-                        "[{}] Copilot /chat/completions rejected reasoning for model '{}'; retrying without reasoning_effort",
-                        session_log_id,
-                        upstream_model
+                        "[session_hash={}] Copilot /chat/completions rejected reasoning for model_hash {}; retrying without reasoning_effort",
+                        log_identity(session_log_id),
+                        log_identity(upstream_model)
                     );
 
                     let mut body_no_reasoning = json!({
@@ -1462,9 +1434,9 @@ impl LLMProvider for CopilotProvider {
                 // If this model only supports Responses API, retry with /responses.
                 if Self::looks_like_responses_only_error(status, &text) {
                     tracing::info!(
-                        "[{}] Copilot chat/completions rejected model '{}'; retrying via /responses",
-                        session_log_id,
-                        upstream_model
+                        "[session_hash={}] Copilot chat/completions rejected model_hash {}; retrying via /responses",
+                        log_identity(session_log_id),
+                        log_identity(upstream_model)
                     );
                     return self
                         .chat_stream_via_responses(
@@ -1486,12 +1458,12 @@ impl LLMProvider for CopilotProvider {
 
                 let request_body_bytes = serde_json::to_vec(&body).map(|v| v.len()).unwrap_or(0);
                 tracing::error!(
-                    "[{}] Copilot API error: HTTP {} - {} (request_id={}, model='{}', messages={}, tools={}, request_body_bytes={}, max_output_tokens={:?}, reasoning_effort={:?})",
-                    session_log_id,
+                    "[session_hash={}] Copilot API error: HTTP {} response_bytes={} (request_id_hash={}, model_hash={}, messages={}, tools={}, request_body_bytes={}, max_output_tokens={:?}, reasoning_effort={:?})",
+                    log_identity(session_log_id),
                     status,
-                    text,
-                    request_id,
-                    upstream_model,
+                    text.len(),
+                    log_identity(&request_id),
+                    log_identity(upstream_model),
                     messages.len(),
                     tools.len(),
                     request_body_bytes,
@@ -1499,9 +1471,9 @@ impl LLMProvider for CopilotProvider {
                     reasoning_effort
                 );
                 tracing::debug!(
-                    "[{}] Copilot API error response headers: [{}]",
-                    session_log_id,
-                    response_headers_debug
+                    "[session_hash={}] Copilot API error response_header_count={}",
+                    log_identity(session_log_id),
+                    response_header_count
                 );
                 return Err(LLMError::Api(format!(
                     "HTTP {} (request_id={}): {}",
@@ -1554,9 +1526,9 @@ impl LLMProvider for CopilotProvider {
                 && (requested_reasoning.is_some() || observed_reasoning_signal)
             {
                 tracing::info!(
-                    "[{}] Copilot chat_completions reasoning summary: model='{}' requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
-                    session_for_log,
-                    model_for_log,
+                    "[session_hash={}] Copilot chat_completions reasoning summary: model_hash={} requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
+                    log_identity(&session_for_log),
+                    log_identity(&model_for_log),
                     requested_reasoning
                         .map(ReasoningEffort::as_str)
                         .unwrap_or("none"),
@@ -2314,5 +2286,42 @@ mod tests {
         // Model is passed to chat_stream() as a parameter (resolved by the caller per request).
 
         assert!(provider.is_authenticated());
+    }
+}
+
+#[cfg(test)]
+mod operational_log_privacy_tests {
+    use super::CopilotProvider;
+    use crate::provider::LLMError;
+    use crate::providers::common::log_privacy_tests::EventCapture;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_operational_logs_copilot_retry_keep_url_private_and_error_intact() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{address}/private-path-999-sentinel?key=credential-999-sentinel");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let provider = CopilotProvider::new();
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        tracing::callsite::rebuild_interest_cache();
+        let error = provider
+            .send_with_transport_retry(
+                || client.get(&url),
+                "responses",
+                Some("private-session-999-sentinel"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, LLMError::Http(error) if error.url().unwrap().as_str() == url));
+        capture.assert_private(
+            "transport error",
+            &[
+                "private-path-999-sentinel",
+                "credential-999-sentinel",
+                "private-session-999-sentinel",
+            ],
+        );
     }
 }

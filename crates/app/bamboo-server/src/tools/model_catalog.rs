@@ -3,17 +3,11 @@
 //! (`SubAgent` tool `action=list_models` / `create.model`).
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 
 use bamboo_engine::session_app::child_session::{ModelCatalogPort, ProviderModelList};
 use bamboo_llm::ProviderRegistry;
-
-/// How long one provider's `list_models` call may take before we report it as
-/// timed out (the listing is best-effort; a slow provider must not stall the
-/// tool call).
-const PER_PROVIDER_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Model catalog backed by the live provider registry.
 pub struct RegistryModelCatalog {
@@ -32,47 +26,74 @@ impl ModelCatalogPort for RegistryModelCatalog {
         let mut names = self.registry.provider_names();
         names.sort();
 
-        // Query all providers concurrently; tolerate individual failures.
-        let futures = names.into_iter().map(|name| {
-            let provider = self.registry.get(&name);
-            async move {
-                let Some(provider) = provider else {
-                    return ProviderModelList {
-                        provider: name,
-                        models: Vec::new(),
-                        error: Some("provider not initialized".to_string()),
-                    };
-                };
-                match tokio::time::timeout(PER_PROVIDER_TIMEOUT, provider.list_models()).await {
-                    Ok(Ok(mut models)) => {
-                        models.sort();
-                        ProviderModelList {
-                            provider: name,
-                            models,
-                            error: None,
-                        }
-                    }
-                    Ok(Err(e)) => ProviderModelList {
-                        provider: name,
-                        models: Vec::new(),
-                        error: Some(e.to_string()),
-                    },
-                    Err(_) => ProviderModelList {
-                        provider: name,
-                        models: Vec::new(),
-                        error: Some(format!(
-                            "timed out after {}s",
-                            PER_PROVIDER_TIMEOUT.as_secs()
-                        )),
-                    },
-                }
-            }
-        });
-
-        futures::future::join_all(futures).await
+        names
+            .into_iter()
+            .map(|name| ProviderModelList {
+                models: self
+                    .registry
+                    .runtime_models_for_provider(&name)
+                    .unwrap_or_default(),
+                provider: name,
+                error: None,
+            })
+            .collect()
     }
 
     fn default_provider(&self) -> String {
         self.registry.default_provider_name()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_llm::{LLMProvider, LLMStream};
+    use std::collections::HashMap;
+
+    struct DiscoveryMustNotRun;
+
+    #[async_trait]
+    impl LLMProvider for DiscoveryMustNotRun {
+        async fn chat_stream(
+            &self,
+            _messages: &[bamboo_domain::Message],
+            _tools: &[bamboo_domain::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            unreachable!("listing must not execute a model")
+        }
+
+        async fn list_models(&self) -> bamboo_llm::provider::Result<Vec<String>> {
+            panic!("SubAgent runtime listing must not discover upstream candidates")
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_model_listing_uses_only_admission_without_upstream_discovery() {
+        let registry = Arc::new(ProviderRegistry::new(
+            HashMap::from([
+                (
+                    "relay".into(),
+                    Arc::new(DiscoveryMustNotRun) as Arc<dyn LLMProvider>,
+                ),
+                (
+                    "empty".into(),
+                    Arc::new(DiscoveryMustNotRun) as Arc<dyn LLMProvider>,
+                ),
+            ]),
+            "relay".into(),
+        ));
+        registry.set_runtime_models(HashMap::from([
+            ("relay".into(), vec!["private/custom-id".into()]),
+            ("empty".into(), Vec::new()),
+        ]));
+        let catalog = RegistryModelCatalog::new(registry);
+        let providers = catalog.list_models().await;
+        assert_eq!(providers[0].provider, "empty");
+        assert!(providers[0].models.is_empty());
+        assert_eq!(providers[1].provider, "relay");
+        assert_eq!(providers[1].models, ["private/custom-id"]);
+        assert!(providers.iter().all(|provider| provider.error.is_none()));
     }
 }

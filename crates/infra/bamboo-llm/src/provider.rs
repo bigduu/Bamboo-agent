@@ -269,6 +269,18 @@ pub(crate) fn required_tool_from_options<'a>(
 /// ```
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
+    /// Effective Vision support. Missing declarations default to enabled;
+    /// only an explicit false disables it. Never infer from model names.
+    async fn supports_vision(&self, model: &str) -> bool {
+        self.vision_support_override(model).await.unwrap_or(true)
+    }
+
+    /// Explicit per-model policy, used to distinguish a user's override from
+    /// their separately configured legacy image fallback. None is default-on.
+    async fn vision_support_override(&self, _model: &str) -> Option<bool> {
+        None
+    }
+
     /// Select the provider's callable-catalog policy for one model request.
     ///
     /// Providers must opt in explicitly. The default preserves the complete
@@ -376,6 +388,8 @@ pub trait LLMProvider: Send + Sync {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
+        crate::image_budget::validate_tool_image_budget(ir.body_chat_iter())
+            .map_err(LLMError::Api)?;
         let messages = if ir.continuation.is_some() {
             ir.continuation_delta()
         } else {

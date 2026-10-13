@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 use crate::store::storage::SkillDirectorySource;
 use crate::types::SkillDefinition;
 
+mod codex_metadata;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowKind {
@@ -225,6 +227,7 @@ pub(crate) struct BundleMetadata {
     pub invocation_policy: serde_json::Value,
     pub argument_schema: serde_json::Value,
     pub definition_revision: Option<u64>,
+    pub short_description: Option<String>,
 }
 
 impl Default for BundleMetadata {
@@ -235,6 +238,7 @@ impl Default for BundleMetadata {
             invocation_policy: serde_json::json!({"explicit": true, "automatic": true}),
             argument_schema: serde_json::json!({"type": "object", "additionalProperties": true}),
             definition_revision: None,
+            short_description: None,
         }
     }
 }
@@ -265,28 +269,122 @@ fn public_validation_error(display_name: &str, error: impl std::fmt::Display) ->
 }
 
 pub(crate) async fn load_bundle_metadata(root: &Path) -> Result<BundleMetadata, String> {
-    let workflow_path = root.join("workflow.yaml");
-    let bamboo_path = root.join("agents").join("bamboo.yaml");
-    let path = if tokio::fs::try_exists(&workflow_path).await.unwrap_or(false) {
-        Some(workflow_path)
-    } else if tokio::fs::try_exists(&bamboo_path).await.unwrap_or(false) {
-        Some(bamboo_path)
-    } else {
-        None
-    };
-
-    let Some(path) = path else {
-        return Ok(BundleMetadata::default());
-    };
-    let display_name = if path.ends_with("workflow.yaml") {
-        "workflow.yaml"
-    } else {
-        "agents/bamboo.yaml"
-    };
-    let raw = tokio::fs::read(&path)
+    // Read-only legacy Workflow adapters use the .md source itself as their
+    // root. They have no bundle sidecars; their host flags are applied below.
+    if tokio::fs::metadata(root)
         .await
-        .map_err(|error| format!("{display_name}: {error}"))?;
-    parse_bundle_metadata_bytes(display_name, &raw, path.ends_with("workflow.yaml"))
+        .is_ok_and(|metadata| metadata.is_file())
+    {
+        return Ok(BundleMetadata::default());
+    }
+    let workflow = read_host_metadata(root, "workflow.yaml").await?;
+    let bamboo = read_host_metadata(root, "agents/bamboo.yaml").await?;
+    let mut metadata = bundle_metadata_from_bytes(workflow.as_deref(), bamboo.as_deref())?;
+    // Optional OpenAI metadata is fail-open, but cannot override a host deny.
+    if let Some(raw) = read_openai_metadata(root).await {
+        metadata.apply_openai_metadata(&raw);
+    }
+    Ok(metadata)
+}
+
+async fn read_openai_metadata(root: &Path) -> Option<Vec<u8>> {
+    let root = tokio::fs::canonicalize(root).await.ok()?;
+    let limit = crate::store::SkillSnapshotLimits::default().max_file_bytes;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // Reuse the existing agents/ descriptor reader: neither a file link nor
+        // an agents-directory link can import metadata from outside this root.
+        tokio::task::spawn_blocking(move || {
+            let directory = crate::named_agents::SkillAgentDirectory::open(&root).ok()??;
+            directory
+                .read(std::ffi::OsStr::new("openai.yaml"), limit, limit)
+                .ok()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        read_openai_metadata_through_resources(&root, limit).await
+    }
+}
+
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
+pub(crate) async fn read_openai_metadata_through_resources(
+    root: &Path,
+    limit: usize,
+) -> Option<Vec<u8>> {
+    // Named-agent descriptors are unsupported on these platforms. Reuse the
+    // store's resource eligibility and no-follow file open instead.
+    use tokio::io::AsyncReadExt;
+    let paths = crate::resource_helpers::list_skill_resource_paths_bounded(
+        root,
+        crate::store::MAX_WORKFLOW_RESOURCES_PER_SKILL,
+        crate::store::MAX_WORKFLOW_RESOURCE_PATH_BYTES,
+    )
+    .ok()?;
+    if !paths.iter().any(|path| path == "agents/openai.yaml") {
+        return None;
+    }
+    let file = crate::store::storage::open_skill_file_no_follow(&root.join("agents/openai.yaml"))
+        .await
+        .ok()?;
+    let mut raw = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut raw)
+        .await
+        .ok()?;
+    (raw.len() <= limit).then_some(raw)
+}
+
+async fn read_host_metadata(root: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
+    match tokio::fs::read(root.join(name)).await {
+        Ok(raw) => Ok(Some(raw)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{name}: {error}")),
+    }
+}
+
+pub(crate) fn bundle_metadata_from_bytes(
+    workflow: Option<&[u8]>,
+    bamboo: Option<&[u8]>,
+) -> Result<BundleMetadata, String> {
+    let mut metadata = match workflow {
+        Some(raw) => parse_bundle_metadata_bytes("workflow.yaml", raw, true)?,
+        None => match bamboo {
+            Some(raw) => parse_bundle_metadata_bytes("agents/bamboo.yaml", raw, false)?,
+            None => BundleMetadata::default(),
+        },
+    };
+    if workflow.is_some() {
+        if let Some(raw) = bamboo {
+            let host = parse_bundle_metadata_bytes("agents/bamboo.yaml", raw, false)?;
+            for field in ["explicit", "automatic"] {
+                if host.invocation_policy[field].as_bool() != Some(true) {
+                    metadata.invocation_policy[field] = serde_json::Value::Bool(false);
+                }
+            }
+        }
+    }
+    Ok(metadata)
+}
+
+impl BundleMetadata {
+    pub(crate) fn apply_openai_metadata(&mut self, raw: &[u8]) {
+        let optional = codex_metadata::parse_openai_metadata(raw);
+        if optional.allow_implicit_invocation == Some(false) {
+            self.invocation_policy["automatic"] = serde_json::Value::Bool(false);
+        }
+        self.short_description = optional.short_description;
+    }
+
+    pub(crate) fn apply_to_skill(&self, skill: &mut SkillDefinition) {
+        // Core frontmatter metadata wins; the interface summary is a fallback.
+        if skill.short_description.is_none() {
+            skill.short_description.clone_from(&self.short_description);
+        }
+    }
 }
 
 pub(crate) fn parse_bundle_metadata_bytes(
@@ -336,6 +434,13 @@ pub(crate) fn parse_bundle_metadata_bytes(
         result.version = version;
     }
     if let Some(policy) = metadata.invocation_policy {
+        if !policy.is_object()
+            || ["explicit", "automatic"]
+                .iter()
+                .any(|field| policy.get(*field).is_some_and(|value| !value.is_boolean()))
+        {
+            return Err(format!("{display_name}: invalid invocation policy"));
+        }
         result.invocation_policy = policy;
     }
     if let Some(schema) = metadata.argument_schema {
@@ -383,7 +488,7 @@ pub(crate) fn entry_from_skill(
             .and_then(serde_json::Value::as_bool)
             == Some(true)
     }) {
-        metadata.invocation_policy = serde_json::json!({"explicit": true, "automatic": false});
+        metadata.invocation_policy["automatic"] = serde_json::Value::Bool(false);
     }
     WorkflowCatalogEntry {
         id: skill.id.clone(),

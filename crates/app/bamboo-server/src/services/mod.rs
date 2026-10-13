@@ -6,4 +6,5 @@
 pub mod frontend_package;
 pub mod gemini_model_mapping_service;
 pub mod gold_auto_answer;
+pub(crate) mod named_agent_catalog;
 pub mod skill_service;

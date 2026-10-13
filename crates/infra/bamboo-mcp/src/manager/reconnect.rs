@@ -165,30 +165,23 @@ impl McpServerManager {
         server_id: &str,
         config: &McpServerConfig,
         phase: &'static str,
+        runtime_config: Option<&Config>,
     ) -> Result<(
         McpProtocolClient,
         Vec<McpTool>,
         Option<String>,
         Option<tokio::sync::mpsc::Receiver<JsonRpcNotification>>,
     )> {
-        let transport = self.build_transport(&config.transport).await?;
-        let mut client = McpProtocolClient::new(transport);
-        client.connect().await.map_err(|error| {
-            error!(
-                "Failed to connect MCP server '{}' during {}: {}",
-                server_id, phase, error
-            );
-            error
-        })?;
+        let client = self.build_client(&config.transport, runtime_config)?;
         let init_result = client
             .initialize(config.request_timeout_ms)
             .await
-            .map_err(|error| {
+            .inspect_err(|error| {
                 error!(
-                    "Failed to initialize MCP server '{}' during {}: {}",
-                    server_id, phase, error
+                    server_id = %diagnostic_id("server", &[server_id]), phase,
+                    error_kind = error_kind(error), error_text_len = error_text_len(error),
+                    "Failed to initialize MCP server"
                 );
-                error
             })?;
         let instructions = init_result
             .instructions
@@ -199,46 +192,21 @@ impl McpServerManager {
         Ok((client, tools, instructions, notification_rx))
     }
 
-    async fn build_transport(&self, config: &TransportConfig) -> Result<Box<dyn McpTransport>> {
-        match config {
-            TransportConfig::Stdio(stdio_config) => {
-                Ok(Box::new(StdioTransport::new(stdio_config.clone())))
+    fn build_client(
+        &self,
+        transport: &TransportConfig,
+        runtime_config: Option<&Config>,
+    ) -> Result<McpProtocolClient> {
+        let http_client = if matches!(transport, TransportConfig::StreamableHttp(_)) {
+            match runtime_config {
+                Some(config) => Some(bamboo_llm::http_client::build_http_client(config).map_err(
+                    |_| McpError::InvalidConfig("Failed to build MCP HTTP client".to_string()),
+                )?),
+                None => None,
             }
-            TransportConfig::Sse(sse_config) => {
-                if let Some(config_handle) = self.config.as_ref() {
-                    let config = config_handle.read().await.clone();
-                    let client =
-                        bamboo_llm::http_client::build_http_client(&config).map_err(|error| {
-                            McpError::InvalidConfig(format!(
-                                "Failed to build HTTP client for MCP SSE transport: {error}"
-                            ))
-                        })?;
-                    Ok(Box::new(SseTransport::new_with_client(
-                        sse_config.clone(),
-                        client,
-                    )))
-                } else {
-                    Ok(Box::new(SseTransport::new(sse_config.clone())))
-                }
-            }
-            TransportConfig::StreamableHttp(http_config) => {
-                if let Some(config_handle) = self.config.as_ref() {
-                    let config = config_handle.read().await.clone();
-                    let client = bamboo_llm::http_client::build_http_client(&config).map_err(
-                        |error| {
-                            McpError::InvalidConfig(format!(
-                                "Failed to build HTTP client for MCP StreamableHTTP transport: {error}"
-                            ))
-                        },
-                    )?;
-                    Ok(Box::new(StreamableHttpTransport::new_with_client(
-                        http_config.clone(),
-                        client,
-                    )))
-                } else {
-                    Ok(Box::new(StreamableHttpTransport::new(http_config.clone())))
-                }
-            }
-        }
+        } else {
+            None
+        };
+        crate::transports::build_client(transport, http_client)
     }
 }

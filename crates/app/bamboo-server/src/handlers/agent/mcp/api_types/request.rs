@@ -10,6 +10,7 @@ pub enum ServerRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MainstreamServerRequest {
     /// Server id (required for POST; ignored for PUT where path param wins)
     pub id: String,
@@ -36,13 +37,16 @@ pub struct MainstreamServerRequest {
     #[serde(default)]
     pub startup_timeout_ms: Option<u64>,
 
-    // sse transport
+    // Streamable HTTP transport
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
     pub headers: Vec<bamboo_mcp::HeaderConfig>,
     #[serde(default)]
     pub connect_timeout_ms: Option<u64>,
+
+    #[serde(default)]
+    pub transport_kind: Option<String>,
 
     // Bamboo extras
     #[serde(default)]
@@ -66,6 +70,15 @@ impl MainstreamServerRequest {
             self.id = id;
         }
 
+        if self
+            .transport_kind
+            .as_deref()
+            .is_some_and(|kind| kind != "streamable_http")
+            || (self.command.is_some() && self.transport_kind.is_some())
+        {
+            return Err("Unsupported MCP transport_kind".to_string());
+        }
+
         let enabled = self.enabled.unwrap_or(!self.disabled);
         let request_timeout_ms = self
             .request_timeout_ms
@@ -87,19 +100,21 @@ impl MainstreamServerRequest {
                     .startup_timeout_ms
                     .unwrap_or(bamboo_mcp::config::default_startup_timeout()),
             }),
-            (None, Some(url)) => bamboo_mcp::TransportConfig::Sse(bamboo_mcp::SseConfig {
-                url,
-                headers: self.headers,
-                connect_timeout_ms: self
-                    .connect_timeout_ms
-                    .unwrap_or(bamboo_mcp::config::default_connect_timeout()),
-            }),
+            (None, Some(url)) => {
+                bamboo_mcp::TransportConfig::StreamableHttp(bamboo_mcp::StreamableHttpConfig {
+                    url,
+                    headers: self.headers,
+                    connect_timeout_ms: self
+                        .connect_timeout_ms
+                        .unwrap_or(bamboo_mcp::config::default_connect_timeout()),
+                })
+            }
             (Some(_), Some(_)) => {
                 return Err("MCP server config cannot contain both 'command' and 'url'".to_string());
             }
             (None, None) => {
                 return Err(
-                    "MCP server config must contain either 'command' (stdio) or 'url' (sse)"
+                    "MCP server config must contain either 'command' (stdio) or 'url' (streamable_http)"
                         .to_string(),
                 );
             }

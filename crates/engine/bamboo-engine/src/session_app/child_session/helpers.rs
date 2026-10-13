@@ -302,7 +302,7 @@ pub fn compute_status_guidance(
             parts.join(" ")
         }
         Some("error") => "Child failed. Use send_message with corrected instructions to retry in place, or create a new child only if the approach needs to change completely.".to_string(),
-        Some("completed") => "Child finished. Use get to read results, or send_message for follow-up work.".to_string(),
+        Some("completed") => "Child finished. Use get with view=result for bounded answer slices, or send_message for follow-up work.".to_string(),
         Some("pending") => "Child is waiting to run. Use action=run to start execution.".to_string(),
         Some("cancelled") => "Child was cancelled. Use send_message to resume, or action=run to restart.".to_string(),
         Some("skipped") => "Child had no pending message. Use send_message to add work, then action=run.".to_string(),

@@ -4,7 +4,24 @@
 >
 > **如何让一个 actor 不在本机进程里跑,而在远程主机上拉起并运行?**
 >
-> 本文是**设计**(非实施步骤)。落地分 P0 / P1 / P2 三阶段,见 §6。
+> 本文第 2–7 节保留最初的 P0/P1/P2 接缝设计。下面的 #791 当前边界优先于历史示例；
+> 尤其不能把 direct WebSocket 的 `ConnectLauncher` 图示当作规范远端 Actor Run。
+
+## #791 当前边界（2026-09-29）
+
+规范 Child 的身份是 Host 持久化的 `ActorSession`（`Session.id`），一次执行是有
+activation/lease fence 的 `ActorActivation`，worker、broker mailbox 和 endpoint 只是容量与
+传输。**已交付**：本地 Child 的 broker Run；固定远端 Child 经 scoped WSS broker Run；
+Host 对每次固定远端 Run 捕获 `EnvironmentLease` v1（干净 Git commit 与实际文件内容摘要），
+Worker 在执行前核验自己的 checkout；经认证的 HostRegistry 容量观测和原子 slot 预留基础。
+固定远端路径的端到端测试见 `tests/remote_broker_activation.rs`。
+
+**仍待验收**：把 HostRegistry/PlacementScheduler 接入通用 auto/pinned Run 生命周期，
+在 Host 失联或容量变化后跨 Host 迁移/重试并保留 ActorId、SessionInbox 和 transcript；
+Docker、SSH 与调度池的统一 ActorActivation；干净 Git checkout 以外的隔离工作区、
+snapshot/patch、Artifact Store 与主机工具代理；以及失联或 ACK 不确定时的 broker
+receipt 活性修复。旧 `deploy_agent`/`ask_agent` 物理 worker 路径仍是兼容能力，不能作为
+规范 Actor 的身份或恢复证明。用户界面与模型都不直接接触 worker/broker endpoint。
 
 ---
 
@@ -18,7 +35,7 @@
 
 ---
 
-## 2. 现状盘点:什么已远程就绪,什么是本地死结
+## 2. 历史接缝盘点:什么已远程就绪,什么曾是本地死结
 
 ### 2.1 已经远程就绪(无需改协议 / 契约)
 
@@ -30,11 +47,12 @@
 | **父端连接** `ChildClient` | `transport.rs:232` | `connect(endpoint)` / `send()` / `next_frame()` 已是干净抽象,底层走 `MaybeTlsStream`——**`wss://` 开箱即用** |
 | **执行引擎** `ChildExecutor` trait | `executor.rs` | `run(spec, events, steer, cancel)` 完全不知道"进程在哪跑"。引擎是 Echo / BambooRuntime / CliAdapter 三选一,与位置正交 |
 | **引导契约** `ProvisionSpec` | `provision.rs` | 版本化 JSON、**前向兼容**(未知字段忽略、缺省字段兜底)。新增字段不破坏老 worker,父与 worker 二进制不必同步升级 |
-| **发现记录** `AgentRecord.endpoint` | `proto.rs` | **endpoint 字段早已存在**,只是当前恒为 `ws://127.0.0.1:<port>`。改成 `wss://gpu-host:8443` 即可 |
+| **发现记录** `AgentRecord.endpoint` | `proto.rs` | 旧 direct 路径以 loopback endpoint 为默认；规范固定远端 Run 已转向 broker，endpoint 不再是 ActorId |
 
 ### 2.2 三个本地死结(必须改造)
 
-仅有三处把 actor 钉死在本机:
+以下三处描述最初的 direct WebSocket actor 路径；现有规范固定远端 Child 走 broker，
+通用远端缺口是可恢复的 Host 选择与 Run 准入，不再只是网络连接问题。
 
 #### 死结 ① 启动 —— `spawn_worker()` `fleet.rs:45`
 
@@ -58,17 +76,22 @@ pub async fn bind_loopback() -> TransportResult<Self> {
 }
 ```
 
-worker 侧只听 `127.0.0.1`,外部不可达。`ws_endpoint()` 本身没问题,只是绑的地址不对。
+这是早期 worker 的 loopback 默认值；后续的 TLS/WSS 连接能力不能代替规范 broker
+路径中的 Host 身份、activation fence 和持久回执。
 
 #### 死结 ③ 发现 —— `Fabric` `discovery.rs`
 
 本地目录里的 `*.json` 文件 + lease 过期做活性(`lease_expires_at` + `gc()`)。**跨机不可见**——远程 worker 无法把记录写进父端的本地目录。
 
-> **核心洞察:把这三处抽象成 trait,远程化就完成了 90%。** 其余(线协议、ProvisionSpec、ChildClient、executor)一行都不用改。
+这些 trait 降低了 transport 迁移成本，但不提供 ActorSession 身份、跨 Host fencing、
+SessionInbox 准入或 EnvironmentLease；#791 的完整远端验收必须覆盖这些控制面契约。
 
 ---
 
-## 3. 核心设计:抽象出四个接缝
+## 3. 历史 direct WebSocket 设计:四个接缝
+
+下图只描述早期 launcher/Discovery 设计。规范固定远端执行已经改由 Host 通过 scoped
+broker 投递有 ActorActivation fence 的 Run；后续调度也须复用这一控制面。
 
 ```
 ┌──────────────────────── 父端(本地 server / CLI)────────────────────────┐
@@ -158,7 +181,7 @@ pub trait Discovery: Send + Sync {
 | 实现 | 行为 | 阶段 |
 |---|---|---|
 | `FileFabric` | 现状,本地目录 `*.json` + lease 活性。单机默认 | P0 |
-| `RegistryFabric` | HTTP 调用 bamboo-server / 独立 broker 的 `/v1/agents` 端点,复用 `lease_expires_at` 语义 | P2 |
+| `RegistryFabric` | 原方案的公开 `/v1/agents` 端点；#791 改用内部 HostRegistry 和 broker 认证观测，故此项不再是交付路径 | 历史方案 |
 
 ### 3.4 接缝 ④ 放置策略 + 鉴权(新增)
 
@@ -190,9 +213,9 @@ pub enum Placement {
 
 ---
 
-## 4. 远程运行时的端到端流程
+## 4. 历史直连流程与规范 broker 流程
 
-以 **P1(远程常驻 worker)** 为例——这是最小可行远程,也是最有代表性的:
+下列 P1 流程保留为早期直连设计，不是 #791 规范 Child 的运行协议：
 
 ```
 1. 远程主机(一次性):
@@ -215,7 +238,12 @@ pub enum Placement {
    worker.client.close().await;
 ```
 
-> **步骤 2 之后到 4,与本地模式逐字节相同**——`ParentFrame`/`ChildFrame`/`RunSpec`/`ChildClient` 全部复用。唯一区别:`launch` 内部是 `Command::new` 还是 `connect`。
+规范固定远端路径是：Host 先持久化 Child Session/ActorDirectory，并持有唯一
+ActorActivation；从本机干净 Git checkout 捕获绑定该 Run 的 EnvironmentLease；通过
+scoped WSS broker 向已认证 worker 投递 Run；worker 核验本机 checkout 并执行；Host
+验证 Event/Outcome、保存规范 transcript/status、提交私有 receipt，再以关联的 broker
+ACK 结果确认物理消息删除。若旧 Run 的 receipt 状态无法证明，当前实现保持阻断，
+不把新 Run 当作已完成的故障转移。
 
 ---
 
@@ -225,19 +253,23 @@ pub enum Placement {
 
 | 风险 | 现状 | 远程化要求 |
 |---|---|---|
-| **投递面暴露** | loopback,信任本机 | `wss://` TLS + `Bearer` token,否则任何人可投递 `Run` |
+| **投递面暴露** | 旧直连 loopback 信任 | 固定远端规范路径已使用 WSS 和 scoped broker `PeerPolicy`；通用远端仍需绑定每次 activation 的权限 |
 | **凭证泄露** | stdin 传 spec,本机内 | TLS 加密链路 + `ProvisionSpec.secrets` 保持 scoped envelope(按需,非全量 config) |
 | **证书信任** | 无 | worker 自带 identity(`bind_tls`),或 mTLS 双向校验 |
-| **活性伪造** | 本地文件,本机信任 | 注册需持 token;`lease_expires_at` + `gc()` 复用,过期即摘除 |
-| **资源隔离** | 本机进程 | 远程 worker 的工作目录 / 凭证仍按 `spec.workspace` / `spec.secrets` 隔离,不继承远程主机全量环境 |
+| **活性伪造** | 本地文件或旧物理 mailbox | HostRegistry 仅接受 broker 认证的连接代际与 operator PeerPolicy 容量；过期 slot 不授权 Run |
+| **资源隔离** | 本机进程 | 固定远端只核验干净 Git 环境；隔离 mount、dirty snapshot、artifact 与能力代理仍待验收 |
 
-**纪律保持**:`provision.rs` 现有原则——"凭证从不在 argv(可见于 `ps`)或 env(被子进程继承),只走 stdin 一次性 envelope"——远程化同样适用:token 走 WS 握手 / spec envelope,不进远程主机的环境变量。
+规范 Actor 的模型结果、Session 历史和浏览器状态不得暴露 broker 凭证或 worker
+endpoint。当前 PeerPolicy 的凭证按物理 peer/mailbox 授权且可设置过期时间；#791
+要求的按 actor/activation 缩窄授权仍需实现和验证。
 
 ---
 
 ## 6. 分阶段落地
 
-每阶段**独立可交付、可测试、无行为回退**:
+下述 P0/P1/P2 是原方案的阶段划分。当前固定远端规范 Run 的 broker 路径已经跨过
+P1 的直连形态；P2 的公开 `/v1/agents` 注册/调度端点不再是 #791 的实现方案。
+Agent 通信和调度在 Bamboo 内部完成，浏览器只访问经认证的 Bamboo gateway。
 
 ### P0 — 抽象(不增能力)
 
@@ -250,6 +282,8 @@ pub enum Placement {
 
 **验收**:现有 e2e 测试(`tests/subagent_worker_e2e.rs`、`tests/subagent_actor_via_server.rs`)全绿,**无行为变化**。`cargo test -p bamboo-subagent` + server 集成测试通过。
 
+状态：基础接缝与本地路径已存在。其完成不证明远端 Actor 的持久身份或故障转移。
+
 ### P1 — 远程常驻 worker(最小可行远程)
 
 - worker 端:`bamboo actor serve --bind 0.0.0.0:PORT --tls --token`
@@ -258,13 +292,20 @@ pub enum Placement {
 
 **验收**:跨机器——远程 `serve` → 本地父端 `Run` → `Terminal` 回流;`cargo test` 新增 `remote_connect_e2e`(两进程,模拟跨机)。
 
-### P2 — Control Plane(可选,规模化)
+当前规范实现使用 scoped WSS **broker** Run，而不是把直连 `ConnectLauncher` 作为
+Actor 权威。`tests/remote_broker_activation.rs` 验证固定远端、取消与旧 Run ACK 后的
+显式替换；它尚未验证主机失联后的自动重新放置。
 
-- bamboo-server 增 `/v1/agents` 注册 / 调度端点
-- `RegistryFabric` + `Placement::Schedulable`
-- 调度器:按 `role` / `capacity` / 健康分配 endpoint
+### P2 — 内部 HostRegistry 与 PlacementScheduler（#791 未完成）
 
-**验收**:两个 worker 节点注册,父端按 role 自动路由;节点下线后 lease 过期、`gc()` 摘除。
+现有 `FileHostRegistry`/`PlacementScheduler` 可以记录 broker 认证的 Host 容量、按
+Project/trust/workspace/executor/tool/network 硬约束筛选，并在跨进程锁内预留 slot。
+这些 API 目前是调度基础；规范 Run 仍由角色配置选择固定 broker peer。
+
+剩余交付须把 auto/pinned 选择和 slot lease 接入同一 ActorActivation/SessionInbox
+准入与续租流程，在 worker/Host 故障后重新选择合格 Host，保持 ActorId、上下文和
+有效权限，拒绝敏感任务跨边界的静默 fallback。验收需要两台不同 Host 的真实
+broker Run、断线重启、旧 ACK/Event/Cancel fencing 和同一 ActorId 的恢复证据。
 
 ---
 
@@ -273,7 +314,7 @@ pub enum Placement {
 | # | 问题 | 倾向 |
 |---|---|---|
 | 1 | `Placement` 放 `SubagentProfile`(角色级静态)还是运行时配置(按需覆盖)? | profile 设默认 + 运行时可覆盖 |
-| 2 | TLS 证书:worker 自带 identity vs mTLS 双向校验? | P1 先单向(P0→P1 最小化),P2 按需 mTLS |
+| 2 | 远端 Host 身份如何绑定 activation? | 当前 WSS + scoped PeerPolicy 认证物理 peer；按 actor/activation 缩窄凭证仍待验收 |
 | 3 | 远程 worker 的 `reusable` 池化:复用现有 `serve_reusable_with_idle_timeout`,还是 control plane 托管池? | P1 复用现有池化逻辑,P2 托管 |
 | 4 | `SshLauncher` 是否纳入主线? | 可选,优先 `ConnectLauncher`(常驻)与 `RegistryLauncher`(调度) |
 

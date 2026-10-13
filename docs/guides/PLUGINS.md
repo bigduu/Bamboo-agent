@@ -37,7 +37,7 @@ layers**, secure by default:
    `plugin_trust.trusted_hosts` (config.json; defaults to
    `github.com/bigduu/`) unless you pass `--allow-untrusted-host`.
 2. **Signature** — the bundle's `<url>.sig` must verify against a key in
-   `plugin_trust.trusted_keys` (defaults trust nova's and magpie's official
+   `plugin_trust.trusted_keys` (defaults trust Jiandu's, Nova's and Magpie's official
    signing keys) unless you pass `--allow-unsigned`.
 3. **Checksum** — `--sha256 <hex>` pins the downloaded bundle. Without it, a
    `url` install is refused unless you pass `--allow-unverified` — **or** the
@@ -78,6 +78,48 @@ bamboo config set plugin_trust.enforcement off
 This makes every `url` install/update behave as if `--insecure` were passed,
 with no per-install flag needed. It's an explicit opt-in (`enforcement`
 defaults to `"strict"`) and the server logs a startup warning while it's set.
+
+## Optional Jiandu connector
+
+Bamboo/Bodhi's built-in memory remains enabled without installing the standalone
+Jiandu plugin. The optional connector lets another MCP client use the same
+canonical store. It registers no additional memory MCP inside Bamboo.
+
+`GET /api/v1/plugins/jiandu/setup` is passive. It reports the **server process**
+OS/architecture and runtime glibc compatibility, publisher/source trust, accepted
+immutable release, installed state, and optional `external_client` configuration.
+The producer supports macOS x86_64/aarch64, Windows x86_64, and Linux x86_64 with
+glibc 2.35 or newer. Unknown hosts and unavailable artifacts stay unavailable.
+
+`POST /api/v1/plugins/official/jiandu/install` takes exactly `{}`. The server
+selects the reviewed source and checksum, requires the Jiandu publisher key,
+and uses the existing installer with strict trust, even if generic manual plugin
+enforcement was switched off. It does not add a key to a custom trust list or
+accept caller URLs, paths, commands or bypass flags.
+
+Only a completed, verified managed installation exposes `external_client`:
+an absolute `command` and `args: ["--data-dir", "<active canonical root>"]`.
+The root comes from the running MemoryStore, including an explicitly selected
+root. The server checks provenance, exact manifest/executable digests and managed
+paths before export. Incomplete, tampered, symlinked or untrusted installations
+do not provide a command. Do not add an `mcp` subcommand or fabricate Project or
+Session identities; those identities are authorized by the external MCP host.
+
+Wrap that object as `{"mcpServers":{"jiandu": <external_client>}}` for clients
+using that configuration shape. Removal uses the existing plugin delete action;
+it removes the connector without deleting canonical memory.
+
+The active memory root must be outside the managed `plugins/jiandu` directory.
+Setup and installation refuse an equal or nested root with
+`memory_root_overlaps_plugin`; paths that cannot be resolved safely report
+`memory_root_unavailable`. Existing filesystem aliases are resolved without
+creating a store. If a later server selects a root inside an installed Jiandu
+connector, removal also refuses before changing capabilities, provenance or
+files. Select an independent memory root before retrying; this check never moves
+memory automatically. Sibling directories and a shared ancestor do not count
+as an overlapping memory root.
+On macOS, missing path components with only ASCII case differences are treated
+as potentially overlapping until their real filesystem identity is established.
 
 ## List, update, remove
 

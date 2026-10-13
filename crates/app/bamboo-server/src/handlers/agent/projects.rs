@@ -5,6 +5,8 @@
 //! responses are counts/revisions only and never include file contents,
 //! environment values, headers, or credentials.
 
+use crate::error::ResponseResult;
+
 use std::path::Path;
 
 use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse, Result};
@@ -164,12 +166,13 @@ fn enrich_legacy_dry_run_sessions(
     (sessions, diagnostics)
 }
 
-fn parse_if_match(req: &HttpRequest) -> std::result::Result<u64, HttpResponse> {
+fn parse_if_match(req: &HttpRequest) -> ResponseResult<u64> {
     let Some(raw) = req.headers().get(actix_web::http::header::IF_MATCH) else {
         return Err(crate::error::json_error(
             StatusCode::PRECONDITION_REQUIRED,
             "If-Match with the current Project revision is required",
-        ));
+        )
+        .into());
     };
     let value = raw
         .to_str()
@@ -183,12 +186,13 @@ fn parse_if_match(req: &HttpRequest) -> std::result::Result<u64, HttpResponse> {
             StatusCode::BAD_REQUEST,
             "If-Match must be a Project revision integer or quoted ETag",
         )
+        .into()
     })
 }
 
-fn parse_id(raw: &str) -> std::result::Result<ProjectId, HttpResponse> {
+fn parse_id(raw: &str) -> ResponseResult<ProjectId> {
     raw.parse::<ProjectId>()
-        .map_err(|_| crate::error::json_error(StatusCode::BAD_REQUEST, "invalid Project id"))
+        .map_err(|_| crate::error::json_error(StatusCode::BAD_REQUEST, "invalid Project id").into())
 }
 
 fn project_error(error: ProjectStoreError) -> HttpResponse {
@@ -328,7 +332,7 @@ pub async fn get_project(
 ) -> Result<HttpResponse> {
     let id = match parse_id(&path) {
         Ok(id) => id,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     match state.project_store.get(&id) {
         Ok(project) => Ok(with_etag(&project, StatusCode::OK)),
@@ -344,11 +348,11 @@ pub async fn patch_project(
 ) -> Result<HttpResponse> {
     let id = match parse_id(&path) {
         Ok(id) => id,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let expected = match parse_if_match(&http_request) {
         Ok(revision) => revision,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let mutate = |project: &mut ProjectManifest| {
         if let Some(name) = request.name.as_ref() {
@@ -401,11 +405,11 @@ pub async fn bind_workspace(
 ) -> Result<HttpResponse> {
     let id = match parse_id(&path) {
         Ok(id) => id,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let expected = match parse_if_match(&http_request) {
         Ok(revision) => revision,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let project = match state.project_store.bind_workspace(
         &id,
@@ -437,11 +441,11 @@ pub async fn unbind_workspace(
 ) -> Result<HttpResponse> {
     let id = match parse_id(&path) {
         Ok(id) => id,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let expected = match parse_if_match(&http_request) {
         Ok(revision) => revision,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let project = match state
         .project_store
@@ -466,7 +470,7 @@ pub async fn project_resources(
 ) -> Result<HttpResponse> {
     let id = match parse_id(&path) {
         Ok(id) => id,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     match state.project_store.resource_summary(&id) {
         Ok(summary) => Ok(HttpResponse::Ok().json(summary)),
@@ -481,11 +485,11 @@ pub async fn archive_project(
 ) -> Result<HttpResponse> {
     let id = match parse_id(&path) {
         Ok(id) => id,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let expected = match parse_if_match(&http_request) {
         Ok(revision) => revision,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let project = match state.project_store.archive(&id, expected) {
         Ok(project) => project,
@@ -508,11 +512,11 @@ pub async fn unarchive_project(
 ) -> Result<HttpResponse> {
     let id = match parse_id(&path) {
         Ok(id) => id,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let expected = match parse_if_match(&http_request) {
         Ok(revision) => revision,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let project = match state.project_store.unarchive(&id, expected) {
         Ok(project) => project,

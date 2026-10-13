@@ -22,11 +22,13 @@ pub mod dot_path;
 pub mod encryption;
 pub mod keyword_masking;
 pub mod memory_config;
+pub mod model_capabilities;
 pub mod model_mapping;
 pub mod patch;
 pub mod paths;
 pub mod provider_configs;
 pub mod provider_instance;
+pub mod runtime_models;
 pub mod section_facade;
 pub mod settings;
 pub mod settings_loader;
@@ -41,6 +43,7 @@ pub use credential_store::*;
 pub use encryption::*;
 pub use keyword_masking::*;
 pub use memory_config::MemoryConfigModule;
+pub use model_capabilities::*;
 pub use model_mapping::*;
 pub use paths::*;
 pub use provider_configs::ProviderConfigsModule;
@@ -49,6 +52,7 @@ pub use provider_instance::{
     provider_instance_api_key_from_env, provider_instance_environment_override_active,
     synthesize_legacy_instances, PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY,
 };
+pub use runtime_models::*;
 pub use section_facade::*;
 pub use settings::PermissionMode;
 pub use subagents_config::SubagentsConfigModule;

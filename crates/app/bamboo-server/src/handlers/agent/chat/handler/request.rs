@@ -1,3 +1,4 @@
+use crate::error::ResponseResult;
 use actix_web::HttpResponse;
 use uuid::Uuid;
 
@@ -17,18 +18,20 @@ pub(super) fn resolve_session_id(session_id: Option<&str>) -> String {
 pub(super) fn resolve_model(
     requested_model: Option<&str>,
     default_model: Option<&str>,
-) -> Result<String, HttpResponse> {
+) -> ResponseResult<String> {
     if let Some(model) = optional_non_empty(requested_model) {
         return Ok(model.to_string());
     }
 
     match optional_non_empty(default_model) {
         Some(model) => Ok(model.to_string()),
-        None => Err(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": crate::error::error_value(
-                "model is required and no default model is configured on this server"
-            )
-        }))),
+        None => Err(HttpResponse::BadRequest()
+            .json(serde_json::json!({
+                "error": crate::error::error_value(
+                    "model is required and no default model is configured on this server"
+                )
+            }))
+            .into()),
     }
 }
 

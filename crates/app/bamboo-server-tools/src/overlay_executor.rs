@@ -45,10 +45,20 @@ impl OverlayToolExecutor {
             // Browser calls can carry typed input or in-memory file bytes, and
             // browser_eval can carry page source. A repaired preview must not
             // reach logs, including for namespaced calls resolved here.
-            let private_browser = ["browser", "browser_eval"]
-                .iter()
-                .any(|name| self.overlay.name().eq_ignore_ascii_case(name));
-            let warning_for_log = if private_browser {
+            let private_arguments = [
+                "browser",
+                "browser_eval",
+                "session_message",
+                "work_overview",
+                "work_search",
+                "work_inspect",
+                "work_changes",
+                "work_update",
+                "work_dispatch",
+            ]
+            .iter()
+            .any(|name| self.overlay.name().eq_ignore_ascii_case(name));
+            let warning_for_log = if private_arguments {
                 "[redacted]"
             } else {
                 warning.as_str()
@@ -213,6 +223,14 @@ impl ToolExecutor for OverlayToolExecutor {
         self.base
             .check_permissions_for_resolved(call, execution_name, args, ctx)
             .await
+    }
+
+    fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+        if name == self.overlay.name() {
+            Some(self)
+        } else {
+            self.base.exact_tool_owner(name)
+        }
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
@@ -1140,14 +1158,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_eval_overlay_reparse_warning_hides_page_source_and_url() {
+    async fn private_overlay_reparse_warning_hides_page_source_and_peer_text() {
         let raw = r#"{"code":"private-page-source","expected_url":"https://example.test/?token=private-query","expected_epoch":1"#;
-        for name in ["browser_eval", "default::browser_eval"] {
+        for (tool_name, name, raw, field, private_text) in [
+            (
+                "browser_eval",
+                "browser_eval",
+                raw,
+                "code",
+                "private-page-source",
+            ),
+            (
+                "browser_eval",
+                "default::browser_eval",
+                raw,
+                "code",
+                "private-page-source",
+            ),
+            (
+                "session_message",
+                "session_message",
+                r#"{"action":"send","message":"private-peer-text""#,
+                "message",
+                "private-peer-text",
+            ),
+            (
+                "session_message",
+                "default::session_message",
+                r#"{"action":"send","message":"private-peer-text""#,
+                "message",
+                "private-peer-text",
+            ),
+        ] {
             let seen = std::sync::Arc::new(StdMutex::new(None));
             let overlay = OverlayToolExecutor::new(
                 std::sync::Arc::new(BaseExecutor),
                 std::sync::Arc::new(ArgsRecordingOverlayTool {
-                    name: "browser_eval",
+                    name: tool_name,
                     seen: seen.clone(),
                 }),
             );
@@ -1161,13 +1208,10 @@ mod tests {
                     .await
                     .expect("repaired overlay call should run");
             }
-            assert_eq!(
-                seen.lock().unwrap().as_ref().unwrap()["code"],
-                "private-page-source"
-            );
+            assert_eq!(seen.lock().unwrap().as_ref().unwrap()[field], private_text);
             let event = events.lock().unwrap().join("\n");
             assert!(event.contains("warning=[redacted]"), "{event}");
-            assert!(!event.contains("private-page-source"), "{event}");
+            assert!(!event.contains(private_text), "{event}");
             assert!(!event.contains("private-query"), "{event}");
         }
     }

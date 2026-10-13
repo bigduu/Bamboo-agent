@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use rustls::pki_types::pem::{Error as PemError, PemObject};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
@@ -32,6 +34,7 @@ use crate::executor::{
 use crate::poison::PoisonRecover;
 use crate::proto::{
     ActorEventBatch, ActorEventBatcher, ActorEventQos, ChildFrame, ParentFrame, RunSpec,
+    TerminalStatus,
 };
 
 /// Direct actor links use separate bounded data/control queues. A slow parent
@@ -41,6 +44,12 @@ const DIRECT_EVENT_QUEUE_CAPACITY: usize = 64;
 const DIRECT_CONTROL_QUEUE_CAPACITY: usize = 32;
 const ACTOR_EVENT_BATCH_LATENCY: std::time::Duration = std::time::Duration::from_millis(20);
 const DIRECT_RUN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[cfg(test)]
+mod history_delivery_tests;
+
+#[cfg(test)]
+mod tls_tests;
 
 /// Every connection/run owns its spawned helpers. A cancelled owner must not
 /// detach children merely because Tokio's plain JoinHandle was dropped.
@@ -91,6 +100,7 @@ impl ActiveRun {
                         status: crate::proto::TerminalStatus::Cancelled,
                         result: None,
                         error: None,
+                        final_event_watermark: None,
                         transcript: Vec::new(),
                     }),
                 )
@@ -464,16 +474,14 @@ pub fn build_server_config(
     key_file: &Path,
 ) -> Result<rustls::ServerConfig, String> {
     use std::fs::File;
-    use std::io::BufReader;
 
     let cert_path = cert_file.display();
     let key_path = key_file.display();
 
     let cf = File::open(cert_file).map_err(|e| format!("open cert_file '{cert_path}': {e}"))?;
-    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut BufReader::new(cf))
-            .collect::<Result<_, _>>()
-            .map_err(|e| format!("parse cert_file '{cert_path}': {e}"))?;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(cf)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("parse cert_file '{cert_path}': {e}"))?;
     if certs.is_empty() {
         return Err(format!(
             "no certificates in cert_file '{cert_path}' (expected PEM CERTIFICATE blocks)"
@@ -481,9 +489,9 @@ pub fn build_server_config(
     }
 
     let kf = File::open(key_file).map_err(|e| format!("open key_file '{key_path}': {e}"))?;
-    let key = match rustls_pemfile::private_key(&mut BufReader::new(kf)) {
-        Ok(Some(k)) => k,
-        Ok(None) => {
+    let key = match PrivateKeyDer::from_pem_reader(kf) {
+        Ok(k) => k,
+        Err(PemError::NoItemsFound) => {
             return Err(format!(
                 "no private key in key_file '{key_path}' (expected PKCS#8/RSA/SEC1)"
             ))
@@ -511,14 +519,12 @@ pub fn build_server_config(
 /// [`ChildClient::connect_with_auth`] (default webpki roots) instead.
 pub fn client_config_trusting_cert(cert_file: &Path) -> Result<rustls::ClientConfig, String> {
     use std::fs::File;
-    use std::io::BufReader;
 
     let cert_path = cert_file.display();
     let cf = File::open(cert_file).map_err(|e| format!("open cert_file '{cert_path}': {e}"))?;
-    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut BufReader::new(cf))
-            .collect::<Result<_, _>>()
-            .map_err(|e| format!("parse cert_file '{cert_path}': {e}"))?;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(cf)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("parse cert_file '{cert_path}': {e}"))?;
     if certs.is_empty() {
         return Err(format!(
             "no certificates in cert_file '{cert_path}' (expected PEM CERTIFICATE blocks)"
@@ -585,6 +591,16 @@ where
                         let _ = reply.send(serde_json::json!({ "approved": approved }));
                     }
                 }
+                Ok(ParentFrame::OwnedTreeReply { id, page }) => {
+                    if let Some(reply) = pending.lock().recover_poison().remove(&id) {
+                        let _ = reply.send(serde_json::json!({ "page": page }));
+                    }
+                }
+                Ok(ParentFrame::SubAgentReply { id, result }) => {
+                    if let Some(reply) = pending.lock().recover_poison().remove(&id) {
+                        let _ = reply.send(result);
+                    }
+                }
                 Ok(ParentFrame::Run(spec)) => {
                     // A new run supersedes any active run: cancel the previous
                     // task *before* starting the new one so the old run stops
@@ -619,6 +635,11 @@ where
                     // executor admits it at its next safe point.
                     if let Some(steer) = &active_steer {
                         let _ = steer.send(SteerMessage::Text(text));
+                    }
+                }
+                Ok(ParentFrame::InitialInputRelease { release }) => {
+                    if let Some(steer) = &active_steer {
+                        let _ = steer.send(SteerMessage::InitialInputRelease(release));
                     }
                 }
                 Ok(ParentFrame::SessionMessage { delivery }) => {
@@ -686,6 +707,53 @@ async fn writer_task<S>(
     let _ = ws_tx.close().await;
 }
 
+async fn forward_direct_events(
+    mut ev_rx: mpsc::Receiver<serde_json::Value>,
+    mut batcher: ActorEventBatcher,
+    legacy_event_wire: bool,
+    event_fwd: mpsc::Sender<ChildFrame>,
+) -> Result<Option<crate::ActorEventWatermark>, ()> {
+    let mut flush = tokio::time::interval(ACTOR_EVENT_BATCH_LATENCY);
+    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    flush.tick().await;
+    let mut open = true;
+    while open {
+        tokio::select! {
+            event = ev_rx.recv() => match event {
+                Some(event) => {
+                    if legacy_event_wire {
+                        if event_fwd.send(ChildFrame::Event { event }).await.is_err() {
+                            return Err(());
+                        }
+                        continue;
+                    }
+                    for batch in batcher.push(event) {
+                        if !send_direct_event_batch(&event_fwd, batch).await {
+                            return Err(());
+                        }
+                    }
+                }
+                None => open = false,
+            },
+            _ = flush.tick(), if !legacy_event_wire && batcher.has_pending() => {
+                if let Some(batch) = batcher.flush() {
+                    if !send_direct_event_batch(&event_fwd, batch).await {
+                        return Err(());
+                    }
+                }
+            }
+        }
+    }
+    if !legacy_event_wire {
+        if let Some(batch) = batcher.flush() {
+            if !send_direct_event_batch(&event_fwd, batch).await {
+                return Err(());
+            }
+        }
+    }
+    Ok(batcher.final_watermark())
+}
+
 fn start_run<E: ChildExecutor + ?Sized>(
     executor: Arc<E>,
     spec: RunSpec,
@@ -695,55 +763,31 @@ fn start_run<E: ChildExecutor + ?Sized>(
     event_tx: mpsc::Sender<ChildFrame>,
     pending: PendingReplies,
 ) -> ActiveRun {
-    let (sink, mut ev_rx, mut control_rx) = EventSink::channel_with_control();
+    let (sink, ev_rx, mut control_rx) = EventSink::channel_with_control();
     let legacy_event_wire = spec.execution_epoch == 0;
-    let mut batcher = ActorEventBatcher::for_run(&spec, None, None);
+    let batcher = ActorEventBatcher::for_run(&spec, None, None)
+        .with_durable_events(executor.requires_contiguous_events());
     let event_fwd = event_tx.clone();
     // All event batches share one ordered data lane. Durable batches wait for
-    // capacity; lossy data uses `try_send`, making overload observable as a
+    // capacity, including the complete trace of a strict history executor.
+    // Ordinary lossy data uses `try_send`, making overload observable as a
     // sequence gap. Approval/admission controls remain independent.
-    let mut fwd = OwnedTask::new(tokio::spawn(async move {
-        let mut flush = tokio::time::interval(ACTOR_EVENT_BATCH_LATENCY);
-        flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        flush.tick().await;
-        let mut open = true;
-        while open {
-            tokio::select! {
-                event = ev_rx.recv() => match event {
-                    Some(event) => {
-                        if legacy_event_wire {
-                            if event_fwd.send(ChildFrame::Event { event }).await.is_err() {
-                                return;
-                            }
-                            continue;
-                        }
-                        for batch in batcher.push(event) {
-                            if !send_direct_event_batch(&event_fwd, batch).await {
-                                return;
-                            }
-                        }
-                    }
-                    None => open = false,
-                },
-                _ = flush.tick(), if !legacy_event_wire && batcher.has_pending() => {
-                    if let Some(batch) = batcher.flush() {
-                        if !send_direct_event_batch(&event_fwd, batch).await {
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-        if !legacy_event_wire {
-            if let Some(batch) = batcher.flush() {
-                let _ = send_direct_event_batch(&event_fwd, batch).await;
-            }
-        }
-    }));
+    let mut fwd = OwnedTask::new(tokio::spawn(forward_direct_events(
+        ev_rx,
+        batcher,
+        legacy_event_wire,
+        event_fwd,
+    )));
     let out_control = control_tx.clone();
     let mut control = OwnedTask::new(tokio::spawn(async move {
         while let Some(control) = control_rx.recv().await {
             let frame = match control {
+                ExecutorControl::InitialInputReleaseRequest(request) => ChildFrame::Event {
+                    event: serde_json::to_value(crate::proto::InitialInputControl::Request {
+                        request,
+                    })
+                    .expect("typed initial control"),
+                },
                 ExecutorControl::SessionMessageAdmitted(confirmation) => {
                     ChildFrame::SessionMessageAdmitted { confirmation }
                 }
@@ -780,6 +824,24 @@ fn start_run<E: ChildExecutor + ?Sized>(
             registrations.ids.push(id.clone());
             let frame = match req.kind {
                 HostRequestKind::Approval => ChildFrame::ApprovalRequest { id, body: req.body },
+                HostRequestKind::OwnedTree => ChildFrame::OwnedTreeRequest {
+                    id,
+                    cursor: req
+                        .body
+                        .get("cursor")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                },
+                HostRequestKind::SubAgent => ChildFrame::SubAgentRequest {
+                    id,
+                    tool_call_id: req
+                        .body
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    args: req.body.get("args").cloned().unwrap_or_default(),
+                },
             };
             if out_req.send(frame).await.is_err() {
                 break;
@@ -794,7 +856,12 @@ fn start_run<E: ChildExecutor + ?Sized>(
             .catch_unwind()
             .await
             .unwrap_or_else(|_| crate::executor::ChildOutcome::error("actor executor panicked"));
-        let _ = fwd.join().await; // flush all events before the terminal frame
+        // A failed/panicked forwarder cannot certify complete history or send
+        // successful Terminal. The connection close remains retryable.
+        let Ok(Ok(final_event_watermark)) = fwd.join().await else {
+            pump.abort();
+            return;
+        };
         let _ = control.join().await; // flush durable-admission confirmations first
         pump.abort(); // no more host callbacks after the run ends
                       // Terminal follows every accepted event batch on the bounded event
@@ -802,6 +869,7 @@ fn start_run<E: ChildExecutor + ?Sized>(
         let _ = event_tx
             .send(ChildFrame::Terminal {
                 status: outcome.status,
+                final_event_watermark,
                 result: outcome.result,
                 error: outcome.error,
                 transcript: outcome.transcript,
@@ -928,12 +996,67 @@ impl ChildClient {
 /// ([`ChildClient`]) or over the mailbox bus
 /// (`bamboo_broker::BrokerChildLink`). This trait is the seam where the two
 /// sub-agent families (PULL direct / PUSH broker) collapse into one drive path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableChildDeliveryReceipt {
+    /// Stable identity of the broker Maildir that owns these MsgIds.
+    pub broker_identity: String,
+    /// Host-owned mailbox where the broker stored these Event/Outcome MsgIds.
+    /// Recovery must reconnect to this exact mailbox before confirming ACKs.
+    pub parent_mailbox: String,
+    /// Exact broker Run message id that correlated these frames.
+    pub correlation_id: String,
+    /// Exact Event and Outcome mailbox message ids, in delivery order.
+    pub message_ids: Vec<String>,
+    /// Worker terminal accepted by the Host frame pump, before SDK final save.
+    pub terminal_status: TerminalStatus,
+}
+
 #[async_trait::async_trait]
 pub trait ChildLink: Send {
     /// Send a parent→child frame (Run / Cancel / steer / approval reply).
     async fn send(&mut self, frame: ParentFrame) -> TransportResult<()>;
     /// Next child→parent frame, or `None` once the run is terminal / the link closes.
     async fn next_frame(&mut self) -> TransportResult<Option<ChildFrame>>;
+
+    /// Called only after the Host frame pump has validated and consumed the
+    /// terminal frame. A surfaced Outcome alone is not checkpoint authority.
+    fn accept_durable_terminal(&mut self, _status: TerminalStatus) {}
+
+    /// Whether this link holds a broker Outcome receipt for a fully processed
+    /// terminal frame. Direct WebSocket links have no mailbox receipt.
+    fn has_pending_durable_terminal(&self) -> bool {
+        false
+    }
+
+    fn durable_delivery_receipt(&self) -> Option<DurableChildDeliveryReceipt> {
+        None
+    }
+
+    /// The authenticated parent mailbox subscribed by this broker link.
+    /// Recovery must match it to the Host checkpoint before ACKing frames.
+    fn broker_parent_mailbox(&self) -> Option<&str> {
+        None
+    }
+
+    /// Confirm the exact durable broker frames only after the Host has saved
+    /// the logical Child transcript and terminal status. A failed confirmation
+    /// leaves remaining mailbox receipts unconfirmed for replay.
+    async fn acknowledge_durable_frames(&mut self) -> TransportResult<()> {
+        Ok(())
+    }
+
+    /// Delete a previously Host-committed Run's frames on a newly connected
+    /// link. Unsupported transports must fail closed instead of claiming a
+    /// receipt was processed.
+    async fn acknowledge_recovered_durable_frames(
+        &mut self,
+        _broker_identity: &str,
+        _message_ids: &[String],
+    ) -> TransportResult<()> {
+        Err(TransportError::Protocol(
+            "recovered durable ACK is unavailable on this transport".into(),
+        ))
+    }
 }
 
 #[async_trait::async_trait]
@@ -1192,7 +1315,9 @@ mod tests {
                     saw_batch = true;
                     events.extend(batch.events);
                 }
-                ChildFrame::ApprovalRequest { .. } => {}
+                ChildFrame::ApprovalRequest { .. }
+                | ChildFrame::OwnedTreeRequest { .. }
+                | ChildFrame::SubAgentRequest { .. } => {}
                 ChildFrame::SessionMessageAdmitted { confirmation } => {
                     panic!(
                         "echo run emitted unexpected SessionInbox confirmation: {confirmation:?}"
@@ -1303,6 +1428,7 @@ mod tests {
             .send(ParentFrame::Run(RunSpec {
                 assignment: assignment.into(),
                 logical_session: Some(crate::proto::LogicalSessionIdentity {
+                    creation: None,
                     session_id: logical_session_id.to_string(),
                     parent_session_id: Some("logical-parent".to_string()),
                     root_session_id: "logical-root".to_string(),
@@ -1486,6 +1612,7 @@ mod tests {
                 assert_eq!(
                     spec.logical_session,
                     Some(crate::proto::LogicalSessionIdentity {
+                        creation: None,
                         session_id: "logical-child".to_string(),
                         parent_session_id: Some("logical-parent".to_string()),
                         root_session_id: "logical-root".to_string(),
@@ -1516,6 +1643,7 @@ mod tests {
             .send(ParentFrame::Run(RunSpec {
                 assignment: "wait".into(),
                 logical_session: Some(crate::proto::LogicalSessionIdentity {
+                    creation: None,
                     session_id: "logical-child".to_string(),
                     parent_session_id: Some("logical-parent".to_string()),
                     root_session_id: "logical-root".to_string(),
@@ -1744,7 +1872,9 @@ mod tests {
                             .filter_map(|event| event["content"].as_str().map(ToString::to_string)),
                     );
                 }
-                ChildFrame::ApprovalRequest { .. } => {}
+                ChildFrame::ApprovalRequest { .. }
+                | ChildFrame::OwnedTreeRequest { .. }
+                | ChildFrame::SubAgentRequest { .. } => {}
                 ChildFrame::SessionMessageAdmitted { confirmation } => {
                     panic!(
                         "echo run emitted unexpected SessionInbox confirmation: {confirmation:?}"

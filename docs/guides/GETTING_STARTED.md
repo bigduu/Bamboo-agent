@@ -31,7 +31,7 @@ rest](../config-reference.md#encryption-at-rest)). Verify the install is
 sound at any point with:
 
 ```bash
-bamboo doctor    # config present, provider keyed, server reachable — exits non-zero on a blocking problem
+bamboo doctor    # checks config/credentials; reports server reachability; exits non-zero on config/credential errors
 ```
 
 ## 3. Your first agent turn — three ways
@@ -48,22 +48,30 @@ conversation.
 
 ### b) HTTP server + curl
 
-```bash
-bamboo serve &
+With the server running, create the session and subscribe in terminal A:
 
+```bash
 SID=$(curl -s http://127.0.0.1:9562/api/v1/chat \
   -H 'Content-Type: application/json' \
   -d '{"message":"List the files here and tell me what this project does.","model":"claude-sonnet-4-6"}' \
   | jq -r .session_id)
 
-curl -s -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
-  -H 'Content-Type: application/json' -d '{}'
+printf 'Session: %s\n' "$SID"
+curl -iNfsS "http://127.0.0.1:9562/api/v1/events/$SID"
+```
 
-curl -N "http://127.0.0.1:9562/api/v1/events/$SID"   # watch the run live (SSE)
+Keep terminal A open. Wait for its HTTP 200 response headers, then copy the
+printed session ID into terminal B and start execution:
+
+```bash
+SID="<session-id printed in terminal A>"
+curl -fsS -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
+  -H 'Content-Type: application/json' -d '{}'
 ```
 
 `chat` only **persists** the turn; `execute` is what actually **runs** the
-loop; `events` streams it. See [`docs/guides/API.md`](../guides/API.md) for
+loop; `events` streams it live. Subscribe before executing to avoid missing
+response tokens. See [`docs/guides/API.md`](../guides/API.md) for
 the full HTTP/SSE surface.
 
 ### c) In-process Rust SDK (no server)

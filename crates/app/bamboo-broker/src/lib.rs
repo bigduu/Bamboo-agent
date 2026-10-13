@@ -27,6 +27,7 @@ pub mod deploy;
 pub mod deploy_russh;
 pub mod mcp;
 pub mod mux;
+mod peer_auth;
 pub mod proto;
 pub mod serve;
 pub mod server;
@@ -56,6 +57,7 @@ pub use crate::mcp::{
     ProxiedResult, RoleToolAllowlist,
 };
 pub use crate::mux::MultiplexedClient;
+pub use crate::peer_auth::{PeerPolicy, MAX_PEER_POLICY_BYTES};
 pub use crate::proto::{BrokerFrame, ClientFrame};
 pub use crate::serve::{
     serve_executor, serve_executor_full, serve_executor_with_lifecycle,

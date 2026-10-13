@@ -328,6 +328,8 @@ pub struct GeminiRequestBuilder;
 
 impl ToProvider<GeminiRequest> for Vec<Message> {
     fn to_provider(&self) -> ProtocolResult<GeminiRequest> {
+        crate::image_budget::validate_tool_image_budget(self)
+            .map_err(ProtocolError::InvalidContent)?;
         let mut system_texts = Vec::new();
         let mut contents = Vec::new();
 
@@ -378,21 +380,33 @@ impl ToProvider<GeminiContent> for Message {
                 .clone()
                 .ok_or_else(|| ProtocolError::MissingField("tool_call_id".to_string()))?;
 
+            let mut parts = vec![GeminiPart {
+                text: None,
+                inline_data: None,
+                file_data: None,
+                function_call: None,
+                function_response: Some(GeminiFunctionResponse {
+                    name: tool_name,
+                    // Gemini's functionResponse.response field is a protobuf
+                    // Struct, so scalar, array, and plain-text tool results
+                    // must be wrapped in an object before serialization.
+                    response: normalize_function_response(&self.content),
+                }),
+            }];
+            // Relay tool images alongside the function response using the
+            // same native image parts as user attachments. The result text
+            // already lives inside functionResponse, so do not duplicate it.
+            if let Some(content_parts) = self.content_parts.as_ref() {
+                parts.extend(content_parts.iter().filter_map(|part| match part {
+                    bamboo_domain::MessagePart::ImageUrl { .. } => {
+                        message_content_part_to_gemini_part(part)
+                    }
+                    _ => None,
+                }));
+            }
             return Ok(GeminiContent {
                 role: "user".to_string(),
-                parts: vec![GeminiPart {
-                    text: None,
-                    inline_data: None,
-                    file_data: None,
-                    function_call: None,
-                    function_response: Some(GeminiFunctionResponse {
-                        name: tool_name,
-                        // Gemini's functionResponse.response field is a protobuf
-                        // Struct, so scalar, array, and plain-text tool results
-                        // must be wrapped in an object before serialization.
-                        response: normalize_function_response(&self.content),
-                    }),
-                }],
+                parts,
             });
         }
 
@@ -658,6 +672,33 @@ mod tests {
         assert_eq!(gemini.role, "user");
         assert_eq!(gemini.parts.len(), 1);
         assert_eq!(gemini.parts[0].text, Some("Hello".to_string()));
+    }
+
+    #[test]
+    fn vision_tool_images_reach_native_gemini_request() {
+        let messages = vec![Message::tool_result_with_images(
+            "view-image",
+            "loaded two images",
+            true,
+            vec![
+                bamboo_domain::ToolResultImage {
+                    mime_type: "image/png".into(),
+                    data: "FIRST".into(),
+                },
+                bamboo_domain::ToolResultImage {
+                    mime_type: "image/jpeg".into(),
+                    data: "SECOND".into(),
+                },
+            ],
+        )];
+        let request: GeminiRequest = messages.to_provider().unwrap();
+        let wire = serde_json::to_value(request).unwrap();
+        let parts = wire["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["functionResponse"]["name"], "view-image");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "FIRST");
+        assert_eq!(parts[2]["inlineData"]["data"], "SECOND");
     }
 
     #[test]

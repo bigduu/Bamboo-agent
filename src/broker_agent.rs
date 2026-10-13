@@ -425,7 +425,7 @@ fn build_spec(args: &BrokerAgentArgs) -> Result<ProvisionSpec, String> {
     Ok(spec)
 }
 
-/// The portable (URL-based: SSE / streamable-http) enabled MCP servers — the ones
+/// The portable (URL-based: Streamable HTTP) enabled MCP servers — the ones
 /// a worker can connect to directly wherever it runs. Host-bound `stdio` servers
 /// (a local binary, e.g. nova) are excluded; P2 proxies those over the broker.
 fn portable_mcp(
@@ -496,9 +496,9 @@ mod tests {
         let mcp: bamboo_domain::mcp_config::McpConfig = serde_json::from_value(serde_json::json!({
             "version": 1,
             "servers": [
-                { "id": "web",  "enabled": true,  "transport": { "type": "sse", "url": "https://w/sse" } },
+                { "id": "web",  "enabled": true,  "transport": { "type": "streamable_http", "url": "https://w/mcp" } },
                 { "id": "nova", "enabled": true,  "transport": { "type": "stdio", "command": "nova" } },
-                { "id": "off",  "enabled": false, "transport": { "type": "sse", "url": "https://o/sse" } },
+                { "id": "off",  "enabled": false, "transport": { "type": "streamable_http", "url": "https://o/mcp" } },
             ]
         }))
         .expect("mcp config deserializes");

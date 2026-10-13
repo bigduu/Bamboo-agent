@@ -4,6 +4,7 @@
 pub mod bounded_dedup;
 pub mod capability_discovery;
 pub mod capability_loading;
+pub mod child_context_packet;
 pub mod poison;
 pub mod reasoning;
 pub mod token_usage;
@@ -39,6 +40,7 @@ pub mod prompt_markers;
 // Flat re-exports for backward-compatible access
 pub use capability_discovery::*;
 pub use capability_loading::*;
+pub use child_context_packet::*;
 pub use ledger::*;
 pub use mcp_config::*;
 pub use project::*;

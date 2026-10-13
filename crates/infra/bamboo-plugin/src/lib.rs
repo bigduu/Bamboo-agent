@@ -36,6 +36,7 @@
 //! (one skill + one prompt preset, no binary, no MCP server).
 
 pub mod error;
+pub mod hooks;
 pub mod installer;
 pub mod manifest;
 pub mod registry;

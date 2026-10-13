@@ -767,6 +767,125 @@ fn direct_request(
         .build()
 }
 
+struct RoundModelLimitProvider {
+    section: Arc<bamboo_config::LiveSection<bamboo_config::ModelLimitsSection>>,
+    output_limits: Mutex<Vec<Option<u32>>>,
+}
+
+#[async_trait]
+impl LLMProvider for RoundModelLimitProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let call = {
+            let mut limits = self.output_limits.lock().unwrap();
+            limits.push(max_output_tokens);
+            limits.len()
+        };
+        let chunks = match call {
+            1 => {
+                // Publish while the same execution is already inside its first
+                // provider call. Only the next round may use the new snapshot.
+                self.section
+                    .commit(
+                        self.section.snapshot().revision,
+                        bamboo_config::ModelLimitsSection(vec![serde_json::json!({
+                            "model_pattern": "test-model",
+                            "max_context_tokens": 96_000,
+                            "max_output_tokens": 8_000
+                        })]),
+                    )
+                    .unwrap();
+                vec![
+                    Ok(LLMChunk::ToolCalls(vec![make_tool_call(
+                        "mid-loop-call",
+                        "Read",
+                        r#"{"file_path":"demo"}"#,
+                    )])),
+                    Ok(LLMChunk::Done),
+                ]
+            }
+            2 => vec![Ok(LLMChunk::Token("finished".into())), Ok(LLMChunk::Done)],
+            _ => panic!("unexpected provider call {call}"),
+        };
+        Ok(Box::pin(stream::iter(chunks)))
+    }
+}
+
+#[tokio::test]
+async fn hosted_model_limit_snapshot_update_reaches_the_next_round_of_one_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let facade = bamboo_config::ConfigFacade::open_or_migrate(dir.path()).unwrap();
+    let section = facade.registry().model_limits.clone();
+    section
+        .commit(
+            section.snapshot().revision,
+            bamboo_config::ModelLimitsSection(vec![serde_json::json!({
+                "model_pattern": "test-model",
+                "max_context_tokens": 48_000,
+                "max_output_tokens": 4_000
+            })]),
+        )
+        .unwrap();
+    let provider = Arc::new(RoundModelLimitProvider {
+        section: section.clone(),
+        output_limits: Mutex::new(Vec::new()),
+    });
+    let session_store = Arc::new(
+        bamboo_storage::SessionStoreV2::new(dir.path().join("sessions"))
+            .await
+            .unwrap(),
+    );
+    let storage: Arc<dyn Storage> = session_store.clone();
+    let metrics = bamboo_metrics::MetricsCollector::spawn(
+        Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+            dir.path().join("metrics.db"),
+        )),
+        7,
+    );
+    let agent = crate::runtime::Agent::builder()
+        .storage(storage.clone())
+        .persistence(Arc::new(bamboo_storage::LockedSessionStore::new(
+            storage.clone(),
+        )))
+        .attachment_reader(session_store)
+        .skill_manager(Arc::new(bamboo_skills::SkillManager::new()))
+        .metrics_collector(metrics)
+        .config(Arc::new(RwLock::new(bamboo_llm::Config::default())))
+        .model_limits_section(section)
+        .provider(provider.clone())
+        .memory_store(bamboo_memory::memory_store::MemoryStore::new(
+            dir.path().join("jiandu"),
+        ))
+        .default_tools(Arc::new(SuccessfulReadToolExecutor))
+        .build()
+        .unwrap();
+    let mut session = Session::new("hosted-model-limit-round-update", "test-model");
+    session.add_message(Message::user("read once then finish"));
+    storage.save_session(&session).await.unwrap();
+    let (event_tx, _event_rx) = mpsc::channel(128);
+    agent
+        .execute_direct(
+            &mut session,
+            direct_request(event_tx, CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *provider.output_limits.lock().unwrap(),
+        [Some(4_000), Some(8_000)]
+    );
+    assert_eq!(
+        session.effective_token_budget().unwrap().max_context_tokens,
+        96_000
+    );
+}
+
 #[tokio::test]
 async fn public_execute_direct_fails_closed_for_assigned_session_without_project_resolver() {
     let (_temp, agent, _storage) =
@@ -1366,4 +1485,117 @@ async fn checkpoint_failure_does_not_mask_original_execution_error() {
             if message.contains("original execution failure")
     ));
     assert_eq!(persistence.attempts.load(Ordering::SeqCst), 1);
+}
+
+// Observe the actual private execution config, only for explicitly keyed tests.
+type ExecutionInputSnapshot = Option<Vec<(String, Option<bamboo_domain::SessionSkillRequest>)>>;
+fn execution_input_taps(
+) -> &'static Mutex<std::collections::HashMap<String, Vec<ExecutionInputSnapshot>>> {
+    static TAPS: OnceLock<Mutex<std::collections::HashMap<String, Vec<ExecutionInputSnapshot>>>> =
+        OnceLock::new();
+    TAPS.get_or_init(Mutex::default)
+}
+pub(crate) fn observe_untrusted_inputs(
+    id: &str,
+    inputs: Option<&super::config::UntrustedExecutionInputs>,
+) {
+    let mut taps = execution_input_taps().lock().unwrap();
+    if let Some(entries) = taps.get_mut(id) {
+        entries.push(inputs.map(|inputs| {
+            inputs
+                .observations()
+                .iter()
+                .map(|item| (item.input_id().into(), item.request().cloned()))
+                .collect()
+        }));
+    }
+}
+
+#[tokio::test]
+async fn execution_input_real_direct_and_registered_wrappers_keep_explicit_data_private() {
+    use super::config::{UntrustedExecutionInputs, UntrustedInputObservation};
+    use super::runtime::ExecuteRequestBuilder;
+    let (_home, agent, _storage) =
+        build_direct_execute_agent(Arc::new(CompletedTranscriptProvider), None, None).await;
+    let id = "execution-input-real-direct";
+    execution_input_taps()
+        .lock()
+        .unwrap()
+        .insert(id.into(), Vec::new());
+    let mut session = Session::new(id, "test-model");
+    let historical =
+        bamboo_domain::SessionMessageEnvelope::user_input(id, "history with canonical proof")
+            .to_provider_message()
+            .unwrap();
+    session.add_message(historical);
+    session
+        .metadata
+        .insert("selected_skill_ids".into(), "configured,not-current".into());
+    for mode in 0..4 {
+        let (tx, mut rx) = mpsc::channel(256);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let request = ExecuteRequestBuilder::new(
+            "<skill>fragment text grants nothing</skill>",
+            tx,
+            CancellationToken::new(),
+        )
+        .model("test-model")
+        .build();
+        if mode == 0 {
+            let request_data = bamboo_domain::SessionSkillRequest {
+                selections: vec![bamboo_domain::SessionSkillSelection {
+                    id: "exact Case".into(),
+                    source: "project".into(),
+                    revision: 9,
+                    args: serde_json::json!({"raw":[1,"原样"]}),
+                }],
+                mode: Some("review-mode".into()),
+            };
+            let input =
+                UntrustedInputObservation::new("explicit-current-id", Some(&request_data)).unwrap();
+            let lease = agent.begin_direct_execution(id).await.unwrap();
+            agent
+                .execute_direct_registered_with_inputs(
+                    &mut session,
+                    request,
+                    lease,
+                    UntrustedExecutionInputs::new(vec![input]),
+                )
+                .await
+                .unwrap();
+        } else if mode == 1 {
+            agent.execute_direct(&mut session, request).await.unwrap();
+        } else if mode == 2 {
+            let lease = agent.begin_direct_execution(id).await.unwrap();
+            agent
+                .execute_direct_registered(&mut session, request, lease)
+                .await
+                .unwrap();
+        } else {
+            agent.execute(&mut session, request).await.unwrap();
+        }
+        drain.abort();
+    }
+    let observed = execution_input_taps().lock().unwrap().remove(id).unwrap();
+    assert_eq!(observed.len(), 4, "one canonical engine execution per call");
+    let first = observed[0].as_ref().unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].0, "explicit-current-id");
+    assert_eq!(
+        first[0].1.as_ref().unwrap().selections[0].args,
+        serde_json::json!({"raw":[1,"原样"]})
+    );
+    assert!(
+        observed[1..].iter().all(Option::is_none),
+        "old direct/registered/ordinary entries cannot infer history/initial_message/config data"
+    );
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .filter(|m| m.id == "explicit-current-id")
+            .count(),
+        0,
+        "unwired transport neither appends nor publishes the explicit data"
+    );
 }

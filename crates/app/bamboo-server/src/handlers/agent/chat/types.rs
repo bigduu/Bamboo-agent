@@ -1,4 +1,4 @@
-use bamboo_domain::{reasoning::ReasoningEffort, ProviderModelRef};
+use bamboo_domain::{reasoning::ReasoningEffort, ProviderModelRef, RootThinkingMode};
 use serde::{Deserialize, Serialize};
 
 /// Request payload for creating a new chat message.
@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 /// * `session_id` - Optional session ID. If not provided, a new UUID will be generated
 /// * `system_prompt` - Optional custom system prompt. If empty, uses the default
 /// * `enhance_prompt` - Optional additional prompt instructions appended to the system prompt
+/// * `root_orchestration_prompt` - Explicit root-only delegation guidance selection
+/// * `root_orchestration_only` - Explicit Root tool authority selection
 /// * `workspace_path` - Optional workspace path to include in the system prompt
 /// * `selected_skill_ids` - Optional explicit skill IDs selected for this request
 /// * `model` - Optional model identifier (e.g., "gpt-4o-mini", "claude-3-opus").
@@ -17,6 +19,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChatRequest {
     pub message: String,
+    /// Optional stable delivery ID. Omission preserves legacy chat behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// Grouping, citation and tracing are data, never approval authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
     pub session_id: Option<String>,
     /// Stable first-class Project membership for a newly-created session.
     /// Existing sessions cannot be reassigned through chat.
@@ -26,6 +38,18 @@ pub struct ChatRequest {
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub enhance_prompt: Option<String>,
+    /// Set `true` or `false` to change the durable root delegation mode;
+    /// omission keeps the Session's prior selection.
+    #[serde(default)]
+    pub root_orchestration_prompt: Option<bool>,
+    /// Set `true` or `false` to change the durable Root tool surface;
+    /// omission keeps the prior selection. Child sessions cannot set it.
+    #[serde(default)]
+    pub root_orchestration_only: Option<bool>,
+    /// Root product selection for first chat. Existing Roots use the
+    /// recoverable mode operation; per-call reasoning remains independent.
+    #[serde(default, deserialize_with = "RootThinkingMode::deserialize_selection")]
+    pub thinking_mode: Option<RootThinkingMode>,
     #[serde(default)]
     pub workspace_path: Option<String>,
     #[serde(default)]
@@ -80,6 +104,10 @@ pub struct ChatImage {
 /// * `goal_command` - Present when the message was a `/goal` control command
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingress_seq: Option<u64>,
     /// Unique session identifier for this conversation
     pub session_id: String,
     /// SSE endpoint URL to receive real-time agent events
@@ -104,6 +132,32 @@ mod tests {
         assert!(req.session_id.is_none());
         assert!(req.system_prompt.is_none());
         assert!(req.images.is_none());
+        assert!(req.root_orchestration_prompt.is_none());
+        assert!(req.root_orchestration_only.is_none());
+    }
+
+    #[test]
+    fn root_orchestration_prompt_requires_an_explicit_boolean_selection() {
+        let enabled: ChatRequest =
+            serde_json::from_str(r#"{"message":"delegate","root_orchestration_prompt":true}"#)
+                .expect("enable selection");
+        assert_eq!(enabled.root_orchestration_prompt, Some(true));
+        let disabled: ChatRequest =
+            serde_json::from_str(r#"{"message":"continue","root_orchestration_prompt":false}"#)
+                .expect("disable selection");
+        assert_eq!(disabled.root_orchestration_prompt, Some(false));
+    }
+
+    #[test]
+    fn root_orchestration_only_requires_an_explicit_boolean_selection() {
+        let enabled: ChatRequest =
+            serde_json::from_str(r#"{"message":"delegate","root_orchestration_only":true}"#)
+                .expect("enable selection");
+        assert_eq!(enabled.root_orchestration_only, Some(true));
+        let disabled: ChatRequest =
+            serde_json::from_str(r#"{"message":"continue","root_orchestration_only":false}"#)
+                .expect("disable selection");
+        assert_eq!(disabled.root_orchestration_only, Some(false));
     }
 
     #[test]
@@ -160,11 +214,18 @@ mod tests {
     #[test]
     fn test_chat_request_debug() {
         let req = ChatRequest {
+            message_id: None,
+            thread_id: None,
+            in_reply_to: None,
+            correlation_id: None,
             message: "Test".to_string(),
             session_id: None,
             project_id: None,
             system_prompt: None,
             enhance_prompt: None,
+            root_orchestration_prompt: None,
+            root_orchestration_only: None,
+            thinking_mode: None,
             workspace_path: None,
             selected_skill_ids: None,
             workflow_selection: None,
@@ -197,6 +258,8 @@ mod tests {
     #[test]
     fn test_chat_response_serialization() {
         let resp = ChatResponse {
+            message_id: None,
+            ingress_seq: None,
             session_id: "sess-456".to_string(),
             stream_url: "/stream/sess-456".to_string(),
             status: "streaming".to_string(),
@@ -212,6 +275,8 @@ mod tests {
     #[test]
     fn test_chat_response_debug() {
         let resp = ChatResponse {
+            message_id: None,
+            ingress_seq: None,
             session_id: "test".to_string(),
             stream_url: "/stream".to_string(),
             status: "active".to_string(),

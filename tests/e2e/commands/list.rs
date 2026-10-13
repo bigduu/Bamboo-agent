@@ -46,18 +46,7 @@ async fn test_list_commands_returns_json() {
 
 #[actix_web::test]
 async fn test_list_commands_includes_workflows_and_skills() {
-    let state = crate::e2e::common::create_test_app().await;
-
-    // Create a test workflow
-    let workflows_dir = state.app_data_dir.join("workflows");
-    tokio::fs::create_dir_all(&workflows_dir)
-        .await
-        .expect("Failed to create workflows dir");
-
-    let workflow_path = workflows_dir.join("example.md");
-    tokio::fs::write(&workflow_path, "# Example Workflow")
-        .await
-        .expect("Failed to write workflow");
+    let state = crate::e2e::common::create_test_app_with_workflows().await;
 
     let app = test::init_service(
         App::new()
@@ -65,6 +54,23 @@ async fn test_list_commands_includes_workflows_and_skills() {
             .route("/v1/commands", web::get().to(command::list_commands)),
     )
     .await;
+
+    let req = test::TestRequest::get().uri("/v1/commands").to_request();
+    let resp = test::call_service(&app, req).await;
+    assert!(resp.status().is_success());
+    let result: Value = serde_json::from_slice(&test::read_body(resp).await)
+        .expect("Response should be valid JSON");
+    assert!(result["commands"]
+        .as_array()
+        .expect("commands should be an array")
+        .iter()
+        .all(|command| command["name"] != "example"));
+
+    // Publish a new source after watcher startup; it cannot come from the initial snapshot.
+    let workflow_path = state.app_data_dir.join("workflows/example.md");
+    tokio::fs::write(&workflow_path, "# Example Workflow")
+        .await
+        .expect("Failed to write workflow");
 
     let command = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {

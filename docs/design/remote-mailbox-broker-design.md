@@ -8,6 +8,45 @@
 > maildir**, **Bearer** auth; also lay the **remote-actor-plan.md P0 seams** now;
 > not-live target → **auto-activate**; answer modes = **`query` + `steer`**.
 
+> The Phase 0–2 flow and the historical SHIPPED section below describe the
+> original broker-agent design. The #791 boundary here is current as of
+> 2026-09-29 and takes precedence where the earlier flow differs.
+
+## #791 current boundary (2026-09-29)
+
+- The broker still owns the durable Maildir transport. Scoped peers authenticate
+  against operator `PeerPolicy`; their connection generation and trusted
+  capability/capacity observation feed `FileHostRegistry`. A worker's claimed
+  role, mailbox, or capacity never creates logical Actor authority. The durable
+  `ActorSession` is the canonical `Session.id` and history; the
+  `ActorActivation` and `WorkerHost` are replaceable execution state.
+- For canonical Child Runs, Event/Outcome frames are not completion receipts by
+  themselves. The Host validates the current activation and saves the canonical
+  Child transcript/status, using its private `broker-terminal-receipts.v1.json`
+  to prepare, commit, recover, and guard the exact Run's transcript prefix.
+  `AckWithReceipt`/`AckResult` then confirm deletion in the same durable broker
+  namespace before the Host clears that receipt. An uncertain old Run blocks
+  successor consumption rather than being counted as a completed Run.
+- `SubAgent` is the logical Child interface for create, correction, inspection,
+  control, direct-parent `ParentRequest` replies, and child clarification via
+  `ParentQuestion`. Its bounded diagnostics expose queue, lease, dead-letter,
+  activation and pending-request status without worker credentials or payloads.
+  The legacy `ask_agent` tool remains a compatibility route: an exact directly
+  owned canonical Child ID supports only durable `status`/`progress` query;
+  canonical Child steering uses `SubAgent target`. Physical cluster-worker
+  query/steer retains the broker semantics. Legacy `ask_agent`/`deploy_agent`
+  are excluded from the model's normal tool catalog.
+- A fixed remote scoped WSS `Run` and `EnvironmentLease` v1 path exists. The
+  Host captures a clean Git workspace identity for the exact Run; the Worker
+  validates its own checkout before execution. Broker authenticated capacity
+  observation and slot reservation are present, but they do not authorize a
+  Run on their own.
+- General remote Run orchestration, cross-Host migration/failover, broader
+  environment acquisition/isolation, and the remaining receipt-liveness fix
+  are **not yet delivered**. Current recovery deliberately fails closed when
+  receipt or ACK evidence is uncertain; do not read the fixed-remote path as
+  completion of those wider contracts.
+
 Why not a file mailbox under a shared dir: it is local-filesystem-only and cannot
 reach a remote worker. The broker puts the durable `Mailbox` behind a network
 endpoint so parent and worker — local or remote — reach it over WS, getting
@@ -115,7 +154,7 @@ Tool: `SubAgentArgs::Ask { child_session_id?|resident_name?, question, mode?, ti
 
 ---
 
-## SHIPPED (what actually landed)
+## Historical SHIPPED record (original broker-agent slice)
 
 Branch `feat/subagent-actor-only`. All additive over Change A (actor-only) + Phase 0
 (remote-worker seams). Everything below is implemented and tested.
@@ -151,7 +190,7 @@ is lower-risk; `OverlayToolExecutor` routes by tool name so no `SERVER_TOOL_NAME
 the literal file mailbox is the broker's storage substrate. `ParentFrame::DrainAsks` (the
 interim file-nudge) was dropped.
 
-**Tests (all green):** broker 14 lib + ws_roundtrip 3 + serve/ask integration; `ask_agent_tool`
+**Tests (recorded for that historical slice, not current #791 evidence):** broker 14 lib + ws_roundtrip 3 + serve/ask integration; `ask_agent_tool`
 2; deploy e2e 3 (real `broker-agent --echo` subprocess via LocalProcessDeployer: single query+steer,
 two-agent independent command, gated live-Docker). Regression: config 110, subagent 41 + e2e 2,
 engine 789, server 850, server-tools 26, actor e2e 3 (server→real worker), session_history 4.

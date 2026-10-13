@@ -25,6 +25,11 @@ use crate::manifest::{
     PluginManifest,
 };
 
+/// Shared process-wide installation boundary. Portable command execution holds
+/// this existing operation lock from final trust verification through process
+/// cleanup, so managed bundle replacement cannot race a trusted spawn.
+pub static PLUGIN_OPERATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Where a plugin's installed bundle came from. Recorded verbatim so
 /// `update`/reinstall can re-fetch from the same place.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +134,8 @@ pub type EventSinkPermissionGrants = BTreeMap<String, Vec<ObservationPermissionI
 /// (uninstall would leak orphaned registrations).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisteredCapabilities {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<crate::hooks::HookRegistration>,
     /// Ids registered into `config.json`'s `mcpServers` map.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_server_ids: Vec<String>,
@@ -162,7 +169,8 @@ pub struct RegisteredCapabilities {
 
 impl RegisteredCapabilities {
     pub fn is_empty(&self) -> bool {
-        self.mcp_server_ids.is_empty()
+        self.hooks.is_empty()
+            && self.mcp_server_ids.is_empty()
             && self.skill_dirs.is_empty()
             && self.preset_ids.is_empty()
             && self.workflow_filenames.is_empty()
@@ -182,6 +190,12 @@ impl RegisteredCapabilities {
     /// Order-preserving relative to `old` (stable output for diffing/logging).
     pub fn removed_since(&self, old: &RegisteredCapabilities) -> RegisteredCapabilities {
         RegisteredCapabilities {
+            hooks: old
+                .hooks
+                .iter()
+                .filter(|old| !self.hooks.iter().any(|new| new.config == old.config))
+                .cloned()
+                .collect(),
             mcp_server_ids: subtract(&old.mcp_server_ids, &self.mcp_server_ids),
             skill_dirs: subtract(&old.skill_dirs, &self.skill_dirs),
             preset_ids: subtract(&old.preset_ids, &self.preset_ids),
@@ -800,6 +814,7 @@ mod tests {
                 .with_timezone(&Utc),
             status: PluginInstallStatus::Installed,
             registered: RegisteredCapabilities {
+                hooks: vec![],
                 mcp_server_ids: vec![],
                 skill_dirs: vec!["hello-world".to_string()],
                 preset_ids: vec!["hello_preset".to_string()],
@@ -1019,6 +1034,7 @@ mod tests {
     #[test]
     fn removed_since_computes_dropped_capabilities_per_kind() {
         let old = RegisteredCapabilities {
+            hooks: vec![],
             mcp_server_ids: vec!["srv-a".to_string(), "srv-b".to_string()],
             skill_dirs: vec!["skill-a".to_string()],
             preset_ids: vec!["preset-a".to_string(), "preset-b".to_string()],
@@ -1032,6 +1048,7 @@ mod tests {
         };
         // New version drops srv-b, preset-a, and svc-b; keeps the rest; adds srv-c.
         let new = RegisteredCapabilities {
+            hooks: vec![],
             mcp_server_ids: vec!["srv-a".to_string(), "srv-c".to_string()],
             skill_dirs: vec!["skill-a".to_string()],
             preset_ids: vec!["preset-b".to_string()],

@@ -140,7 +140,9 @@ async fn real_bamboo_binary_serves_a_subagent_run() {
                     saw_token = true;
                 }
             }
-            ChildFrame::ApprovalRequest { .. } => {}
+            ChildFrame::ApprovalRequest { .. }
+            | ChildFrame::OwnedTreeRequest { .. }
+            | ChildFrame::SubAgentRequest { .. } => {}
             ChildFrame::SessionMessageAdmitted { .. } => {
                 panic!("worker must not confirm an empty initial SessionInbox batch")
             }

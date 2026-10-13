@@ -8,24 +8,6 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-fn configure_macos_test_unwinding() {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
-        return;
-    }
-
-    // The monolithic bamboo-server lib-test has more than 16 MiB of DWARF
-    // unwind records. Apple's compact-unwind format cannot encode offsets that
-    // large and otherwise emits an oversized-__eh_frame warning on every test
-    // link. Disable compact-unwind synthesis for this library package's
-    // directly linked artifacts. `rustc-link-arg-tests` does not cover a
-    // library's own `#[cfg(test)]` harness, while the general form does. The
-    // argument has no final-link effect while rustc creates the rlib and Cargo
-    // does not propagate it to consumer links, so downstream dev/release
-    // binaries do not inherit it. The linker keeps __eh_frame, preserving Rust
-    // panic unwinding, backtraces, and line-table debugging.
-    println!("cargo:rustc-link-arg=-Wl,-no_compact_unwind");
-}
-
 fn write_disabled_embed(file: &mut fs::File) -> io::Result<()> {
     writeln!(
         file,
@@ -107,8 +89,9 @@ fn write_frontend_package_embed(manifest_dir: &Path, out_dir: &Path) -> io::Resu
 }
 
 fn main() -> io::Result<()> {
-    configure_macos_test_unwinding();
-
+    // Keep the platform's default unwind tables. Disabling compact unwind to
+    // hide Apple's large-__eh_frame warning aborts caught panics in the macOS
+    // library-test harness instead of preserving the scheduler recovery path.
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 

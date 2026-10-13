@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use russh::client::{self, Handle, Msg};
-use russh::keys::{ssh_key, HashAlg, PrivateKey, PrivateKeyWithHashAlg};
+use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{Channel, ChannelMsg};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
@@ -68,8 +68,9 @@ pub struct RusshDeployer {
     pub port: u16,
     pub username: String,
     pub auth: RusshAuth,
-    /// Pinned host-key fingerprint (`SHA256:…`). `None` ⇒ trust-on-first-use:
+    /// Pinned raw host-key fingerprint (`SHA256:…`). `None` ⇒ trust-on-first-use:
     /// accept and record (read it back via [`RusshDeployer::observed_fingerprint`]).
+    /// Host certificates are rejected: this deployer has no CA/principal policy.
     pub expected_fingerprint: Option<String>,
     /// Binary to upload before launch; when set, the worker runs it.
     pub upload: Option<UploadSpec>,
@@ -241,9 +242,15 @@ impl client::Handler for FabricHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &ssh_key::PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        let fp = server_public_key.fingerprint(HashAlg::Sha256).to_string();
+        // Only raw host keys participate in our existing fingerprint/TOFU
+        // policy. A certificate needs CA and host-principal validation; using
+        // its subject key here would silently introduce a different trust path.
+        let PublicKeyOrCertificate::PublicKey { key, .. } = server_public_key else {
+            return Ok(false);
+        };
+        let fp = key.fingerprint(HashAlg::Sha256).to_string();
         *self.observed.lock().await = Some(fp.clone());
         match &self.expected {
             // Known host: the key must match the pin (reject a changed key = MITM).
@@ -765,6 +772,147 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use russh::client::Handler;
+    use russh::keys::ssh_key;
+
+    fn host_key(seed: u8) -> PrivateKey {
+        ssh_key::private::Ed25519Keypair::from_seed(&[seed; 32]).into()
+    }
+
+    fn host_key_handler(expected: Option<String>) -> FabricHandler {
+        FabricHandler {
+            expected,
+            observed: Arc::new(Mutex::new(None)),
+            broker_local: "127.0.0.1:9600".into(),
+            forwarded_connections: Arc::new(ForwardedConnections::default()),
+        }
+    }
+
+    fn host_certificate(subject: &PrivateKey, ca: &PrivateKey) -> ssh_key::Certificate {
+        let mut builder = ssh_key::certificate::Builder::new(
+            vec![0x42; 16],
+            subject.public_key().clone(),
+            0,
+            u64::MAX,
+        )
+        .expect("host certificate builder");
+        builder
+            .cert_type(ssh_key::certificate::CertType::Host)
+            .expect("host certificate type")
+            .valid_principal("localhost")
+            .expect("host certificate principal");
+        let certificate = builder.sign(ca).expect("signed host certificate");
+        certificate
+            .verify_signature()
+            .expect("valid host certificate signature");
+        certificate
+    }
+
+    #[tokio::test]
+    async fn host_key_tofu_accepts_and_records_raw_key_fingerprint() {
+        let key = host_key(1);
+        let fingerprint = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+        let mut handler = host_key_handler(None);
+
+        assert!(handler
+            .check_server_key(&key.public_key().clone().into())
+            .await
+            .expect("host key check"));
+        assert_eq!(handler.observed.lock().await.as_ref(), Some(&fingerprint));
+    }
+
+    #[tokio::test]
+    async fn host_key_pin_accepts_only_the_same_raw_key() {
+        let key = host_key(1);
+        let fingerprint = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+        let mut handler = host_key_handler(Some(fingerprint.clone()));
+
+        assert!(handler
+            .check_server_key(&key.public_key().clone().into())
+            .await
+            .expect("pinned host key check"));
+        assert_eq!(handler.observed.lock().await.as_ref(), Some(&fingerprint));
+
+        let changed_key = host_key(2);
+        assert!(!handler
+            .check_server_key(&changed_key.public_key().clone().into())
+            .await
+            .expect("changed host key check"));
+        assert_eq!(
+            handler.observed.lock().await.as_ref(),
+            Some(
+                &changed_key
+                    .public_key()
+                    .fingerprint(HashAlg::Sha256)
+                    .to_string()
+            ),
+            "a rejected raw key must still report the actual observed fingerprint"
+        );
+        assert_eq!(handler.expected.as_ref(), Some(&fingerprint));
+    }
+
+    #[tokio::test]
+    async fn host_key_mismatched_pin_rejects_and_records_raw_key() {
+        let key = host_key(1);
+        let fingerprint = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+        let mut handler = host_key_handler(Some("SHA256:untrusted".into()));
+
+        assert!(!handler
+            .check_server_key(&key.public_key().clone().into())
+            .await
+            .expect("mismatched host key check"));
+        assert_eq!(handler.observed.lock().await.as_ref(), Some(&fingerprint));
+    }
+
+    #[tokio::test]
+    async fn host_certificate_rejected_without_ca_policy_even_when_subject_or_ca_is_pinned() {
+        let subject = host_key(1);
+        let ca = host_key(3);
+        let certificate: PublicKeyOrCertificate = host_certificate(&subject, &ca).into();
+        for pin in [
+            None,
+            Some(
+                subject
+                    .public_key()
+                    .fingerprint(HashAlg::Sha256)
+                    .to_string(),
+            ),
+            Some(ca.public_key().fingerprint(HashAlg::Sha256).to_string()),
+            Some("SHA256:untrusted".into()),
+        ] {
+            let mut handler = host_key_handler(pin);
+            assert!(!handler
+                .check_server_key(&certificate)
+                .await
+                .expect("host certificate check"));
+            assert_eq!(
+                *handler.observed.lock().await,
+                None,
+                "a rejected certificate must not become a TOFU raw-key pin"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_host_certificate_does_not_replace_observed_raw_key() {
+        let subject = host_key(1);
+        let fingerprint = subject
+            .public_key()
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
+        let mut handler = host_key_handler(Some(fingerprint.clone()));
+        assert!(handler
+            .check_server_key(&subject.public_key().clone().into())
+            .await
+            .expect("raw host key check"));
+
+        let certificate = host_certificate(&subject, &host_key(3)).into();
+        assert!(!handler
+            .check_server_key(&certificate)
+            .await
+            .expect("host certificate check"));
+        assert_eq!(handler.observed.lock().await.as_ref(), Some(&fingerprint));
+    }
 
     fn dep() -> AgentDeployment {
         AgentDeployment {

@@ -17,10 +17,10 @@
 //! provider already resolved in the workspace lockfile.
 
 use std::fs::File;
-use std::io::BufReader;
 use std::sync::Arc;
 
 use rustls::crypto::ring;
+use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 
@@ -41,7 +41,7 @@ pub(super) fn build_rustls_config(tls: &TlsConfig) -> Result<ServerConfig, Strin
     // --- certificate chain ---
     let cert_file = File::open(&tls.cert_file)
         .map_err(|e| format!("TLS: failed to open cert_file '{cert_path}': {e}"))?;
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(cert_file)
         .collect::<Result<_, _>>()
         .map_err(|e| format!("TLS: failed to parse certificates from '{cert_path}': {e}"))?;
     if certs.is_empty() {
@@ -50,7 +50,7 @@ pub(super) fn build_rustls_config(tls: &TlsConfig) -> Result<ServerConfig, Strin
         ));
     }
 
-    // --- private key (PKCS#8, then PKCS#1/RSA, then SEC1/EC) ---
+    // --- first supported private key in file order ---
     let key = load_private_key(&tls.key_file)
         .map_err(|e| format!("TLS: failed to load key_file '{key_path}': {e}"))?;
 
@@ -76,15 +76,13 @@ pub(super) fn build_rustls_config(tls: &TlsConfig) -> Result<ServerConfig, Strin
     Ok(config)
 }
 
-/// Load the first usable private key from a PEM file, trying PKCS#8, then
-/// PKCS#1/RSA, then SEC1/EC. Returns a clear error if none is present.
+/// Load the first PKCS#8, PKCS#1/RSA, or SEC1/EC private key in file order.
+/// Returns a clear error if none is present.
 fn load_private_key(path: &std::path::Path) -> Result<PrivateKeyDer<'static>, String> {
-    // rustls_pemfile::private_key understands all three PEM key kinds and
-    // returns the first one found, so a single pass covers PKCS#8 / RSA / SEC1.
     let file = File::open(path).map_err(|e| format!("open: {e}"))?;
-    match rustls_pemfile::private_key(&mut BufReader::new(file)) {
-        Ok(Some(key)) => Ok(key),
-        Ok(None) => {
+    match PrivateKeyDer::from_pem_reader(file) {
+        Ok(key) => Ok(key),
+        Err(PemError::NoItemsFound) => {
             Err("no private key found (expected a PKCS#8, RSA, or SEC1 PEM block)".to_string())
         }
         Err(e) => Err(format!("parse: {e}")),
@@ -209,6 +207,77 @@ mod tests {
             err.contains("/nonexistent/bamboo-tls/cert.pem"),
             "error should include the path: {err}"
         );
+    }
+
+    #[test]
+    fn load_private_key_accepts_supported_formats_and_keeps_first_key_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = dir.path().join("key.pem");
+        for label in ["RSA PRIVATE KEY", "PRIVATE KEY", "EC PRIVATE KEY"] {
+            // The loader decodes PEM; rustls validates the key DER later.
+            // Distinct payloads prove that another supported block is not
+            // preferred over the first one encountered in the file.
+            std::fs::write(
+                &key,
+                format!(
+                    "-----BEGIN CERTIFICATE-----\nBAUG\n-----END CERTIFICATE-----\n\
+                     -----BEGIN {label}-----\nAQID\n-----END {label}-----\n\
+                     -----BEGIN PRIVATE KEY-----\nBAUG\n-----END PRIVATE KEY-----\n"
+                ),
+            )
+            .unwrap();
+            let loaded = load_private_key(&key).expect("supported PEM key label");
+            assert_eq!(loaded.secret_der(), &[1, 2, 3]);
+            assert!(match label {
+                "RSA PRIVATE KEY" => matches!(loaded, PrivateKeyDer::Pkcs1(_)),
+                "PRIVATE KEY" => matches!(loaded, PrivateKeyDer::Pkcs8(_)),
+                "EC PRIVATE KEY" => matches!(loaded, PrivateKeyDer::Sec1(_)),
+                _ => unreachable!(),
+            });
+        }
+    }
+
+    #[test]
+    fn load_private_key_rejects_absent_and_malformed_key_blocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = dir.path().join("key.pem");
+        for absent in [
+            "",
+            "not a PEM key",
+            "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+        ] {
+            std::fs::write(&key, absent).unwrap();
+            assert!(load_private_key(&key)
+                .unwrap_err()
+                .contains("no private key found"));
+        }
+        for malformed in [
+            "-----BEGIN PRIVATE KEY-----\n!invalid!\n-----END PRIVATE KEY-----\n",
+            "-----BEGIN RSA PRIVATE KEY-----\nAQID\n",
+            "-----BEGIN EC PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n",
+        ] {
+            std::fs::write(&key, malformed).unwrap();
+            assert!(load_private_key(&key).unwrap_err().contains("parse:"));
+        }
+    }
+
+    #[test]
+    fn build_rustls_config_rejects_malformed_certificate_blocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = dir.path().join("cert.pem");
+        for malformed in [
+            "-----BEGIN CERTIFICATE-----\n!invalid!\n-----END CERTIFICATE-----\n",
+            "-----BEGIN CERTIFICATE-----\nAQID\n",
+        ] {
+            std::fs::write(&cert, malformed).unwrap();
+            let tls = TlsConfig {
+                cert_file: cert.clone(),
+                key_file: dir.path().join("unused.pem"),
+            };
+            assert!(build_rustls_config(&tls)
+                .unwrap_err()
+                .contains("failed to parse certificates"));
+        }
     }
 
     #[test]

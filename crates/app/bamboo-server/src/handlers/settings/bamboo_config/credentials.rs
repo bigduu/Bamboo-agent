@@ -117,6 +117,7 @@ pub async fn reset_credentials(
 pub async fn get_live_config_health(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
+    let _io = app_state.config_io_lock.lock().await;
     let providers = app_state
         .config_live_health
         .read()
@@ -127,9 +128,11 @@ pub async fn get_live_config_health(
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    let application = app_state.config_application_diagnostics_locked().await;
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "providers": providers,
         "mcp": mcp,
+        "application": application,
     })))
 }
 

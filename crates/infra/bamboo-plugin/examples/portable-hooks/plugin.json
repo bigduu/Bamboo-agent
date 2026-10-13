@@ -1,0 +1,8 @@
+{
+  "id": "portable-hook-example",
+  "name": "Portable command hook example",
+  "version": "0.1.0",
+  "provides": {
+    "hooks": [{"config": "hooks/hooks.json", "scripts": ["hooks/policy.py"]}]
+  }
+}

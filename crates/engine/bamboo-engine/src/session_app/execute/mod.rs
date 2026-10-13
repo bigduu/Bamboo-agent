@@ -31,7 +31,7 @@ pub use sync::evaluate_client_sync;
 
 pub use sync::is_hidden_from_ui;
 
-use validation::validate_image_fallback_for_session;
+pub use validation::validate_image_fallback_for_session;
 
 /// Prepare an execute: load session, resolve model/reasoning, validate,
 /// update metadata, return outcome.
@@ -111,12 +111,8 @@ pub async fn prepare_execute(
         (effort, source.as_str())
     };
 
-    // ---- Image fallback validation ----
-    if let Err(error) =
-        validate_image_fallback_for_session(&session, config.image_fallback.as_ref())
-    {
-        return Ok(ExecutePreparationOutcome::ImageFallbackError(error));
-    }
+    // Image capability/fallback validation happens after the caller resolves
+    // the actual provider handle, before reserving or spawning execution.
 
     // ---- Check for pending user message ----
     if !server_snapshot.has_pending_user_message {

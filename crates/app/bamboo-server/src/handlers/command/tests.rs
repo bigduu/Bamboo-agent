@@ -228,6 +228,7 @@ async fn command_palette_keeps_skill_and_workflow_sources_separate() {
 fn project_command_root_cannot_escape_through_symlink() {
     use std::os::unix::fs::symlink;
     let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir(workspace.path().join(".git")).expect("project git marker");
     let outside = tempfile::tempdir().expect("outside");
     std::fs::create_dir_all(workspace.path().join(".bamboo")).expect("bamboo dir");
     symlink(outside.path(), workspace.path().join(".bamboo/commands")).expect("symlink");
@@ -349,6 +350,7 @@ async fn get_command_rejects_path_traversal_in_workflow_id() {
 async fn project_command_is_listed_and_namespace_route_expands_arguments() {
     let data = tempfile::tempdir().expect("data dir");
     let project = tempfile::tempdir().expect("project dir");
+    std::fs::create_dir(project.path().join(".git")).expect("project git marker");
     let commands_dir = bamboo_config::paths::project_commands_dir(project.path());
     std::fs::create_dir_all(commands_dir.join("db")).expect("commands dir");
     std::fs::write(

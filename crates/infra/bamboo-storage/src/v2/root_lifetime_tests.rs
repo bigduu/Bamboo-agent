@@ -641,7 +641,7 @@ async fn child_runtime_lifetime_probe_fails_closed_without_publishing_unavailabl
 }
 
 #[tokio::test]
-async fn startup_isolates_a_corrupt_recreated_root_and_preserves_full_save_repair() {
+async fn startup_isolates_a_corrupt_recreated_root_until_canonical_pair_is_restored() {
     for rebuild in [false, true] {
         for corrupt_runtime in [false, true] {
             let home = tempfile::tempdir().unwrap();
@@ -670,6 +670,8 @@ async fn startup_isolates_a_corrupt_recreated_root_and_preserves_full_save_repai
             let before_evidence = fs::read(&evidence).await.unwrap();
             let runtime_path = directory.join(RUNTIME_SIDECAR_FILE);
             let before_runtime = fs::read(&runtime_path).await.unwrap();
+            let main_path = directory.join("session.json");
+            let before_main = fs::read(&main_path).await.unwrap();
             let child_main = directory
                 .join("children")
                 .join(&child.id)
@@ -696,15 +698,16 @@ async fn startup_isolates_a_corrupt_recreated_root_and_preserves_full_save_repai
             assert_eq!(fs::read(&damaged_path).await.unwrap(), b"{invalid");
             assert_eq!(fs::read(&child_main).await.unwrap(), before_child);
 
-            // Main-only corruption retains the exact-runtime full-save repair
-            // contract. Missing/corrupt runtime authority cannot be restored by
-            // an ordinary writer; the fixture must explicitly repair that
-            // canonical evidence before any full save can proceed.
+            // Either damaged half of the canonical pair must be restored from
+            // independent evidence before an ordinary writer can proceed.
+            // A parseable older runtime could otherwise overwrite a newer
+            // Root tool restriction hidden by corrupt main bytes.
+            reject(&restarted, &recreated).await;
             if corrupt_runtime {
-                reject(&restarted, &recreated).await;
                 fs::write(&runtime_path, &before_runtime).await.unwrap();
             } else {
                 assert_eq!(fs::read(&runtime_path).await.unwrap(), before_runtime);
+                fs::write(&main_path, &before_main).await.unwrap();
             }
             restarted.save_session(&recreated).await.unwrap();
             let repaired = restarted

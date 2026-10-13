@@ -609,6 +609,14 @@ async fn supervisor_management_capacity_and_overflow_fail_before_publication() {
     fs::write(&path, serde_json::to_vec(&full).unwrap())
         .await
         .unwrap();
+    // This synthetic capacity fixture represents an already committed bounded
+    // authority state; an unproved sidecar edit must be rejected instead.
+    SessionStoreV2::write_staged_supervisor_proof(
+        &store.sessions_root_dir().join(&reference.session_id),
+        &full,
+    )
+    .await
+    .unwrap();
     let before = files(&store, &reference.session_id).await;
     assert!(change(&store, &reference, 2, attach("new-target"))
         .await
@@ -630,6 +638,12 @@ async fn supervisor_management_capacity_and_overflow_fail_before_publication() {
     fs::write(&path, serde_json::to_vec(&full).unwrap())
         .await
         .unwrap();
+    SessionStoreV2::write_staged_supervisor_proof(
+        &store.sessions_root_dir().join(&reference.session_id),
+        &full,
+    )
+    .await
+    .unwrap();
     let before = files(&store, &reference.session_id).await;
     assert!(change(&store, &reference, u64::MAX, detach("new-target"))
         .await

@@ -23,9 +23,11 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tracing::warn;
 
+use crate::command_executor::{
+    CapturedHookOutput as CapturedOutput, HookCommandOutput as CommandOutput,
+    HOOK_COMMAND_OUTPUT_LIMIT_BYTES as HOOK_OUTPUT_LIMIT_BYTES,
+};
 use crate::HookDispatcher;
-
-const HOOK_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 
 /// User-facing lifecycle events that currently map to engine hook seams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +168,12 @@ impl ShellCommandHook {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(executor) = crate::command_executor::current() {
+            return executor
+                .execute(command, input, self.timeout)
+                .await
+                .map_err(|e| e.to_string());
+        }
         configure_hook_process(&mut command);
 
         let child = command
@@ -892,6 +900,21 @@ impl ScriptHook {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            if let Some(executor) = crate::command_executor::current() {
+                match executor.execute(command, input.clone(), self.timeout).await {
+                    Ok(output) => return Ok(output),
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        missing_runtimes.push(invocation.program.to_string_lossy().into_owned());
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to execute owned lifecycle script runtime '{}': {error}",
+                            invocation.program.to_string_lossy()
+                        ))
+                    }
+                }
+            }
             configure_hook_process(&mut command);
 
             match command.spawn() {
@@ -1388,20 +1411,6 @@ fn interpret_response(response: HookResponse) -> HookResult {
     }
 }
 
-#[derive(Debug)]
-struct CommandOutput {
-    exit_code: Option<i32>,
-    stdout: CapturedOutput,
-    stderr: CapturedOutput,
-    timed_out: bool,
-}
-
-#[derive(Debug, Default)]
-struct CapturedOutput {
-    bytes: Vec<u8>,
-    truncated: bool,
-}
-
 async fn read_capped(mut reader: impl AsyncRead + Unpin) -> Result<CapturedOutput, std::io::Error> {
     let mut captured = CapturedOutput::default();
     let mut chunk = [0_u8; 8192];
@@ -1503,12 +1512,95 @@ pub(super) fn register_configured_hooks(
     }
 }
 
+/// Portable hooks share native capture, output bounds and process-tree cleanup,
+/// but have a separate wire protocol and never use native response interpretation.
+pub(crate) async fn execute_portable_command(
+    command_text: &str,
+    input: Vec<u8>,
+    timeout_seconds: u64,
+    cwd: &Path,
+    plugin_root: &Path,
+    plugin_data: &Path,
+) -> Result<LifecycleHookTestOutput, String> {
+    let shell = preferred_bash_shell();
+    let overrides = bamboo_llm::Config::current_env_vars();
+    let prepared_env = build_command_environment(&overrides).await;
+    let mut command = Command::new(&shell.program);
+    prepared_env.apply_to_tokio_command(&mut command);
+    command
+        .arg(shell.arg)
+        .arg(command_text)
+        .current_dir(cwd)
+        .env("PLUGIN_ROOT", plugin_root)
+        .env("CLAUDE_PLUGIN_ROOT", plugin_root)
+        .env("PLUGIN_DATA", plugin_data)
+        .env("CLAUDE_PLUGIN_DATA", plugin_data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = if let Some(executor) = crate::command_executor::current() {
+        executor
+            .execute(command, input, Duration::from_secs(timeout_seconds))
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        configure_hook_process(&mut command);
+        let child = HookChild::new(command.spawn().map_err(|e| e.to_string())?)?;
+        capture_hook_child(
+            child,
+            input,
+            Duration::from_secs(timeout_seconds),
+            "plugin-command",
+        )
+        .await?
+    };
+    Ok(LifecycleHookTestOutput {
+        exit_code: output.exit_code,
+        stdout: String::from_utf8(output.stdout.bytes).map_err(|e| e.to_string())?,
+        stderr: String::from_utf8(output.stderr.bytes).map_err(|e| e.to_string())?,
+        timed_out: output.timed_out,
+        stdout_truncated: output.stdout.truncated,
+        stderr_truncated: output.stderr.truncated,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS;
     use serde_json::json;
     use std::time::Instant;
+
+    #[tokio::test]
+    async fn portable_command_uses_prepared_environment_then_plugin_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let prepared = build_command_environment(&std::collections::HashMap::new()).await;
+        let mut env = prepared.env;
+        env.insert(
+            "BAMBOO_PORTABLE_ENV_FIXTURE".into(),
+            "prepared value".into(),
+        );
+        env.insert("PLUGIN_ROOT".into(), "wrong imported root".into());
+        let _guard = bamboo_infrastructure::test_support::override_command_environment(
+            env,
+            prepared.diagnostics,
+        );
+        let output = execute_portable_command(
+            r#"printf '%s\n%s' "$BAMBOO_PORTABLE_ENV_FIXTURE" "$PLUGIN_ROOT""#,
+            vec![],
+            1,
+            temp.path(),
+            temp.path(),
+            temp.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(
+            output.stdout,
+            format!("prepared value\n{}", temp.path().display())
+        );
+    }
 
     fn command(command: impl Into<String>, timeout_ms: u64) -> LifecycleHookHandler {
         LifecycleHookHandler::command(command, timeout_ms)

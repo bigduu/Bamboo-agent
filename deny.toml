@@ -71,6 +71,7 @@ feature-depth = 1
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing sidechannel — no fixed release exists (incl. the 0.10-rc pulled by russh 0.62's ssh-key RSA support); bamboo's only RSA use is operator-initiated SSH deploy. See .cargo/audit.toml." },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained (informational, not a vulnerability); repo archived 2025-08. Transitive via the TLS stack. See .cargo/audit.toml." },
+    { id = "RUSTSEC-2025-0057", reason = "INFO Unmaintained fxhash 0.2.1 via exact-pinned bm25 2.3.2 for Codex-derived tool search; no published bm25 release drops fxhash. Reviewed 2026-10-06 (#1606). This ID-wide exception is not dependency-path-enforced. Recheck every lock update/new fxhash path and before #1537; remove with an accepted upstream release dropping fxhash. See .cargo/audit.toml." },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

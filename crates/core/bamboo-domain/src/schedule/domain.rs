@@ -209,6 +209,8 @@ pub struct ScheduleRunRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_lag_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_duration_ms: Option<u64>,
@@ -237,6 +239,17 @@ mod tests {
     }
 }
 
+/// Explicit Workflow catalog revision requested by a human-configured schedule.
+/// The existing Workflow admission boundary pins the definition when it fires.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduledWorkflowTarget {
+    pub workflow_id: String,
+    pub revision: u64,
+    #[serde(default)]
+    pub args: serde_json::Value,
+}
+
 /// Runtime configuration for schedule-executed sessions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ScheduleRunConfig {
@@ -250,6 +263,8 @@ pub struct ScheduleRunConfig {
     /// Optional task message to add to the new session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_target: Option<ScheduledWorkflowTarget>,
     /// Model used when auto-executing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -262,7 +277,33 @@ pub struct ScheduleRunConfig {
     /// Optional enhancement prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enhance_prompt: Option<String>,
-    /// If true, immediately execute the new session (only meaningful if `task_message` exists).
+    /// If true, execute the task message or the explicitly configured Workflow target.
     #[serde(default)]
     pub auto_execute: bool,
+}
+
+#[cfg(test)]
+mod workflow_target_tests {
+    use super::*;
+
+    #[test]
+    fn task_only_config_remains_compatible_and_workflow_target_round_trips() {
+        let legacy = serde_json::json!({"task_message":"existing task","auto_execute":true});
+        let config: ScheduleRunConfig = serde_json::from_value(legacy).unwrap();
+        assert!(config.workflow_target.is_none());
+        assert!(serde_json::to_value(&config)
+            .unwrap()
+            .get("workflow_target")
+            .is_none());
+        let target: ScheduleRunConfig = serde_json::from_value(serde_json::json!({
+            "auto_execute":true,
+            "workflow_target":{"workflow_id":"read-once","revision":7,"args":{"file":"notes.txt"}}
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::from_value::<ScheduleRunConfig>(serde_json::to_value(&target).unwrap())
+                .unwrap(),
+            target
+        );
+    }
 }

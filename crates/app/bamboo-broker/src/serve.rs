@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::BrokerClient;
 use crate::error::{BrokerError, BrokerResult};
+use crate::proto::FencedRunEnvelope;
 
 /// Connection loss is not a graceful shutdown: the owner can no longer receive
 /// results, so cancel admitted work and give cancellation-aware handlers a short
@@ -53,6 +54,9 @@ pub enum Handled {
     Ack,
     /// Leave the message unacked (it will be redelivered on the next subscribe).
     Leave,
+    /// Leave the message unacked and retire this subscription. A critical
+    /// actor uplink failed, so this worker cannot accept another Run safely.
+    LeaveAndDisconnect,
 }
 
 /// Why a mailbox worker stopped serving normally.
@@ -142,11 +146,55 @@ where
     H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Handled> + Send + 'static,
 {
+    serve_mailbox_full_with_lifecycle_and_owner_loss(
+        endpoint,
+        me,
+        token,
+        handler,
+        shutdown,
+        tls_config,
+        idle_timeout,
+        CancellationToken::new(),
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_mailbox_full_with_lifecycle_and_owner_loss<H, Fut>(
+    endpoint: &str,
+    me: AgentRef,
+    token: &str,
+    handler: H,
+    shutdown: CancellationToken,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+    idle_timeout: Option<Duration>,
+    owner_loss: CancellationToken,
+    environment_lease_v1: bool,
+) -> BrokerResult<ServeExitReason>
+where
+    H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Handled> + Send + 'static,
+{
     let mut client =
         BrokerClient::connect_with_tls(endpoint, me.clone(), token, clone_tls_config(&tls_config))
             .await?;
-    client.subscribe().await?;
-    serve_loop_with_idle_timeout(&mut client, &me, handler, shutdown, idle_timeout).await
+    if environment_lease_v1 {
+        client.subscribe_environment_lease_v1().await?;
+    } else {
+        client.subscribe().await?;
+    }
+    serve_loop_with_timeouts_and_owner_loss(
+        &mut client,
+        &me,
+        handler,
+        shutdown,
+        idle_timeout,
+        DEFAULT_CONNECTION_DRAIN_TIMEOUT,
+        DEFAULT_ABORT_JOIN_TIMEOUT,
+        owner_loss,
+    )
+    .await
 }
 
 /// [`BrokerClient::connect_with_tls`] takes an owned `ClientConfig`, while one
@@ -207,10 +255,18 @@ impl<T> Drop for AbortOnDropTask<T> {
     }
 }
 
-struct ActorControlCommand {
-    to: String,
-    message: InboxMessage,
-    result: tokio::sync::oneshot::Sender<BrokerResult<MsgId>>,
+enum ActorControlCommand {
+    Deliver {
+        to: String,
+        message: InboxMessage,
+        result: tokio::sync::oneshot::Sender<BrokerResult<MsgId>>,
+    },
+    ObserveSelf {
+        mailbox: String,
+        role: String,
+        result:
+            tokio::sync::oneshot::Sender<BrokerResult<Option<crate::proto::WorkerHostObservation>>>,
+    },
 }
 
 enum ActorEventCommand {
@@ -290,7 +346,7 @@ impl ActorBrokerUplink {
     async fn deliver_control(&self, to: &str, message: InboxMessage) -> BrokerResult<MsgId> {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         self.control
-            .send(ActorControlCommand {
+            .send(ActorControlCommand::Deliver {
                 to: to.to_string(),
                 message,
                 result: result_tx,
@@ -300,6 +356,34 @@ impl ActorBrokerUplink {
         result_rx
             .await
             .map_err(|_| BrokerError::Transport("actor control uplink closed".into()))?
+    }
+
+    /// Check a queued Run again after its execution slot opens. The inbound
+    /// connection may have lost ownership while the handler waited in memory.
+    async fn fenced_run_is_current(
+        &self,
+        me: &AgentRef,
+        envelope: &FencedRunEnvelope,
+    ) -> BrokerResult<bool> {
+        let role = me
+            .role
+            .as_deref()
+            .ok_or_else(|| BrokerError::Protocol("FencedRun worker role missing".into()))?;
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.control
+            .send(ActorControlCommand::ObserveSelf {
+                mailbox: me.session_id.clone(),
+                role: role.to_owned(),
+                result: result_tx,
+            })
+            .await
+            .map_err(|_| BrokerError::Transport("actor control uplink closed".into()))?;
+        let observation = result_rx
+            .await
+            .map_err(|_| BrokerError::Transport("actor control uplink closed".into()))??;
+        Ok(observation
+            .as_ref()
+            .is_some_and(|current| envelope.matches_observation(&me.session_id, current)))
     }
 
     /// Send an ordered durable boundary on the actor-event connection. Outcome
@@ -388,9 +472,28 @@ async fn actor_control_uplink_loop(
     mut commands: tokio::sync::mpsc::Receiver<ActorControlCommand>,
 ) {
     while let Some(command) = commands.recv().await {
-        let result = client.deliver(&command.to, command.message).await;
-        let transport_failed = result.is_err() && !client.reader_alive();
-        let _ = command.result.send(result);
+        let transport_failed = match command {
+            ActorControlCommand::Deliver {
+                to,
+                message,
+                result,
+            } => {
+                let delivery = client.deliver(&to, message).await;
+                let failed = delivery.is_err() && !client.reader_alive();
+                let _ = result.send(delivery);
+                failed
+            }
+            ActorControlCommand::ObserveSelf {
+                mailbox,
+                role,
+                result,
+            } => {
+                let observation = client.observe_host(&mailbox, &role).await;
+                let failed = observation.is_err() && !client.reader_alive();
+                let _ = result.send(observation);
+                failed
+            }
+        };
         if transport_failed {
             break;
         }
@@ -506,6 +609,34 @@ where
     H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Handled> + Send + 'static,
 {
+    serve_loop_with_timeouts_and_owner_loss(
+        client,
+        me,
+        handler,
+        shutdown,
+        idle_timeout,
+        connection_drain_timeout,
+        abort_join_timeout,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_loop_with_timeouts_and_owner_loss<H, Fut>(
+    client: &mut BrokerClient,
+    me: &AgentRef,
+    handler: H,
+    shutdown: CancellationToken,
+    idle_timeout: Option<Duration>,
+    connection_drain_timeout: Duration,
+    abort_join_timeout: Duration,
+    owner_loss: CancellationToken,
+) -> BrokerResult<ServeExitReason>
+where
+    H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Handled> + Send + 'static,
+{
     let handler = Arc::new(handler);
 
     // Live cancel tokens for runs still in flight, keyed by the run (message) id.
@@ -560,7 +691,8 @@ where
                     continue;
                 };
                 let delivery_count = completed.deliveries;
-                let remember_completion = !matches!(handled, Handled::Leave);
+                let retire = matches!(handled, Handled::LeaveAndDisconnect);
+                let remember_completion = matches!(handled, Handled::Reply(_) | Handled::Ack);
                 // The reader marks death before closing its event lanes. This
                 // closes the completion-vs-close select race: even if this
                 // biased arm wins first, it must not write to the dead socket
@@ -569,6 +701,7 @@ where
                     messages_open = false;
                     exit_reason = ServeExitReason::ConnectionClosed;
                     connection_lost = true;
+                    owner_loss.cancel();
                     for handler in inflight.values() {
                         handler.cancel.cancel();
                     }
@@ -602,7 +735,7 @@ where
                                 client.ack(id.clone()).await?;
                             }
                         }
-                        Handled::Leave => {}
+                        Handled::Leave | Handled::LeaveAndDisconnect => {}
                         }
                         Ok::<(), BrokerError>(())
                     }
@@ -615,7 +748,22 @@ where
                     tracing::warn!(%error, "broker worker completion delivery failed; cancelling remaining handlers");
                     messages_open = false;
                     connection_lost = true;
+                    owner_loss.cancel();
                     connection_failure = Some(error);
+                    for handler in inflight.values() {
+                        handler.cancel.cancel();
+                    }
+                    connection_drain_sleep.as_mut().reset(
+                        tokio::time::Instant::now() + connection_drain_timeout,
+                    );
+                } else if retire && !connection_lost {
+                    tracing::warn!(message_id = %id.as_str(), "worker lost Run ownership or critical uplink; retiring without ACK");
+                    messages_open = false;
+                    connection_lost = true;
+                    owner_loss.cancel();
+                    connection_failure = Some(BrokerError::Transport(
+                        "worker lost Run ownership or critical uplink; Run remains retryable".into(),
+                    ));
                     for handler in inflight.values() {
                         handler.cancel.cancel();
                     }
@@ -668,6 +816,7 @@ where
                     messages_open = false;
                     exit_reason = ServeExitReason::ConnectionClosed;
                     connection_lost = true;
+                    owner_loss.cancel();
                     for handler in inflight.values() {
                         handler.cancel.cancel();
                     }
@@ -681,6 +830,41 @@ where
                             .as_mut()
                             .reset(tokio::time::Instant::now() + timeout);
                     }
+                    // A Run may have reached this connection's reader queue
+                    // before another subscriber replaced it. The broker's
+                    // enqueue/replay fence alone cannot retract such a frame.
+                    // Ask the broker for the current authenticated generation
+                    // on this same connection immediately before admission.
+                    if msg.kind == InboxKind::FencedRun {
+                        let current = match (
+                            me.role.as_deref(),
+                            serde_json::from_value::<FencedRunEnvelope>(msg.body.clone()),
+                        ) {
+                            (Some(role), Ok(envelope)) => client
+                                .observe_host(&me.session_id, role)
+                                .await
+                                .ok()
+                                .flatten()
+                                .is_some_and(|observation| {
+                                    envelope.matches_observation(&me.session_id, &observation)
+                                }),
+                            _ => false,
+                        };
+                        if !current {
+                            tracing::warn!(run_id = %msg.id.as_str(), "queued FencedRun no longer owns this WorkerHost connection; retaining it for broker recovery");
+                            messages_open = false;
+                            exit_reason = ServeExitReason::ConnectionClosed;
+                            connection_lost = true;
+                            owner_loss.cancel();
+                            for handler in inflight.values() {
+                                handler.cancel.cancel();
+                            }
+                            connection_drain_sleep.as_mut().reset(
+                                tokio::time::Instant::now() + connection_drain_timeout,
+                            );
+                            continue;
+                        }
+                    }
                     let id = msg.id.clone();
                     if completed_admissions.contains(&id) {
                         // This id already completed successfully on this
@@ -690,6 +874,7 @@ where
                             tracing::warn!(%error, "broker worker duplicate ack failed; cancelling remaining handlers");
                             messages_open = false;
                             connection_lost = true;
+                            owner_loss.cancel();
                             connection_failure = Some(error);
                             for handler in inflight.values() {
                                 handler.cancel.cancel();
@@ -742,6 +927,7 @@ where
                     messages_open = false;
                     exit_reason = ServeExitReason::ConnectionClosed;
                     connection_lost = true;
+                    owner_loss.cancel();
                     for handler in inflight.values() {
                         handler.cancel.cancel();
                     }
@@ -957,9 +1143,15 @@ where
     // arrive as independent messages handled by independent tasks).
     let coords: RunCoords = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let waiters: ApprovalWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let tree_waiters: TreeWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let me_owned = me.clone();
     let approval_timeout = DEFAULT_APPROVAL_TIMEOUT;
-    serve_mailbox_full_with_lifecycle(
+    let readiness = shutdown.clone();
+    let fatal_uplink = CancellationToken::new();
+    let owner_loss = CancellationToken::new();
+    let handler_owner_loss = owner_loss.clone();
+    let environment_lease_v1 = executor.supports_environment_lease_v1();
+    serve_mailbox_full_with_lifecycle_and_owner_loss(
         endpoint,
         me,
         token,
@@ -968,25 +1160,38 @@ where
             let context = Arc::clone(&context);
             let coords = Arc::clone(&coords);
             let waiters = Arc::clone(&waiters);
+            let tree_waiters = Arc::clone(&tree_waiters);
             let execution_slots = Arc::clone(&execution_slots);
             let me = me_owned.clone();
             let uplink = uplink.clone();
+            let readiness = readiness.clone();
+            let fatal_uplink = fatal_uplink.clone();
+            let owner_loss = handler_owner_loss.clone();
             async move {
-                let _execution_slot =
-                    if matches!(msg.kind, InboxKind::Run | InboxKind::Ask | InboxKind::Task) {
-                        Some(
-                            execution_slots
-                                .acquire_owned()
-                                .await
-                                .expect("executor execution-slot semaphore is never closed"),
-                        )
-                    } else {
-                        None
-                    };
+                let _execution_slot = if matches!(
+                    msg.kind,
+                    InboxKind::Run
+                        | InboxKind::LeasedRun
+                        | InboxKind::FencedRun
+                        | InboxKind::Ask
+                        | InboxKind::Task
+                ) {
+                    Some(tokio::select! {
+                        biased;
+                        _ = fatal_uplink.cancelled() => return Handled::Leave,
+                        slot = execution_slots.acquire_owned() => slot
+                            .expect("executor execution-slot semaphore is never closed"),
+                    })
+                } else {
+                    None
+                };
+                if fatal_uplink.is_cancelled() {
+                    return Handled::Leave;
+                }
                 match msg.kind {
                     // A full child session over the bus (the actor-over-mailbox path):
                     // stream events back to the parent live, then the terminal outcome.
-                    InboxKind::Run => {
+                    InboxKind::Run | InboxKind::LeasedRun | InboxKind::FencedRun => {
                         handle_run(
                             executor.as_ref(),
                             &me,
@@ -994,8 +1199,13 @@ where
                             cancel,
                             &coords,
                             &waiters,
+                            &tree_waiters,
                             &uplink,
                             approval_timeout,
+                            readiness,
+                            fatal_uplink,
+                            owner_loss,
+                            environment_lease_v1,
                         )
                         .await
                     }
@@ -1032,6 +1242,56 @@ where
                         }
                         Handled::Ack
                     }
+                    InboxKind::OwnedTreeReply => {
+                        let id = msg
+                            .body
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default();
+                        let mut pending = tree_waiters_lock(&tree_waiters);
+                        if pending.get(id).is_some_and(|waiter| {
+                            waiter.parent == msg.from
+                                && msg.correlation_id.as_ref() == Some(&waiter.run_id)
+                        }) {
+                            if let Some(waiter) = pending.remove(id) {
+                                let page = msg
+                                    .body
+                                    .get("page")
+                                    .filter(|page| {
+                                        serde_json::to_vec(page)
+                                            .is_ok_and(|bytes| bytes.len() <= 8192)
+                                    })
+                                    .cloned();
+                                let _ = waiter.reply.send(page);
+                            }
+                        }
+                        Handled::Ack
+                    }
+                    InboxKind::SubAgentReply => {
+                        let id = msg
+                            .body
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        let mut pending = tree_waiters_lock(&tree_waiters);
+                        if pending.get(id).is_some_and(|waiter| {
+                            waiter.parent == msg.from
+                                && msg.correlation_id.as_ref() == Some(&waiter.run_id)
+                        }) {
+                            if let Some(waiter) = pending.remove(id) {
+                                let result = msg
+                                    .body
+                                    .get("result")
+                                    .filter(|value| {
+                                        serde_json::to_vec(value)
+                                            .is_ok_and(|bytes| bytes.len() <= 16 * 1024)
+                                    })
+                                    .cloned();
+                                let _ = waiter.reply.send(result);
+                            }
+                        }
+                        Handled::Ack
+                    }
                     // Ask/Task: the conversational query/steer path (unchanged).
                     _ => handle_with_executor(executor.as_ref(), &context, msg, cancel).await,
                 }
@@ -1040,6 +1300,8 @@ where
         shutdown,
         tls_config,
         idle_timeout,
+        owner_loss,
+        environment_lease_v1,
     )
     .await
 }
@@ -1067,6 +1329,32 @@ impl Drop for RunCoordRegistration {
 /// Pending gated-tool approvals a Run proxied up, keyed by approval-request id;
 /// an [`InboxKind::ApprovalReply`] fulfils the matching one.
 type ApprovalWaiters = Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>;
+
+struct TreeReplyWaiter {
+    parent: AgentRef,
+    run_id: MsgId,
+    reply: tokio::sync::oneshot::Sender<Option<serde_json::Value>>,
+}
+type TreeWaiters = Arc<std::sync::Mutex<HashMap<String, TreeReplyWaiter>>>;
+
+fn tree_waiters_lock(
+    waiters: &TreeWaiters,
+) -> std::sync::MutexGuard<'_, HashMap<String, TreeReplyWaiter>> {
+    waiters
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+struct TreeWaiterRegistration {
+    waiters: TreeWaiters,
+    id: String,
+}
+
+impl Drop for TreeWaiterRegistration {
+    fn drop(&mut self) {
+        tree_waiters_lock(&self.waiters).remove(&self.id);
+    }
+}
 
 fn approval_waiters_lock(
     waiters: &ApprovalWaiters,
@@ -1104,22 +1392,22 @@ async fn deliver_approval_request(
     waiters: &ApprovalWaiters,
     approval_id: &str,
     owner_cancel: &CancellationToken,
-) -> bool {
+) -> BrokerResult<bool> {
     let result = tokio::select! {
         biased;
         _ = owner_cancel.cancelled() => None,
         result = delivery => Some(result),
     };
     match result {
-        Some(Ok(_)) => true,
+        Some(Ok(_)) => Ok(true),
         Some(Err(error)) => {
             tracing::warn!(approval_id, %error, "approval request delivery failed; denying fail-closed");
             approval_waiters_lock(waiters).remove(approval_id);
-            false
+            Err(error)
         }
         None => {
             approval_waiters_lock(waiters).remove(approval_id);
-            false
+            Ok(false)
         }
     }
 }
@@ -1169,27 +1457,95 @@ async fn handle_run<E>(
     cancel: CancellationToken,
     coords: &RunCoords,
     waiters: &ApprovalWaiters,
+    tree_waiters: &TreeWaiters,
     uplink: &ActorBrokerUplink,
     approval_timeout: Duration,
+    readiness: CancellationToken,
+    fatal_uplink: CancellationToken,
+    owner_loss: CancellationToken,
+    environment_lease_v1: bool,
 ) -> Handled
 where
     E: bamboo_subagent::ChildExecutor + ?Sized,
 {
+    use bamboo_subagent::executor::HostRequestKind;
     use bamboo_subagent::{
         ActorEventBatcher, EventSink, ExecutorControl, HostBridge, RunSpec, SteerInbox,
     };
 
-    let spec: RunSpec = match serde_json::from_value(msg.body) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("run {:?}: malformed RunSpec, dropping: {e}", msg.id);
-            return Handled::Ack;
+    if fatal_uplink.is_cancelled() {
+        return Handled::Leave;
+    }
+    if msg.kind == InboxKind::LeasedRun {
+        return reject_leased_run(me, &msg, uplink, "remote_unfenced_run_rejected").await;
+    }
+    let spec: RunSpec = if msg.kind == InboxKind::FencedRun {
+        let envelope: FencedRunEnvelope = match serde_json::from_value(msg.body.clone()) {
+            Ok(envelope) => envelope,
+            Err(_) => {
+                return reject_leased_run(me, &msg, uplink, "remote_fenced_runspec_invalid").await;
+            }
+        };
+        if envelope.version != FencedRunEnvelope::VERSION
+            || envelope.recipient_host_ref.is_empty()
+            || envelope.recipient_mailbox != me.session_id
+            || envelope.recipient_connection_generation.is_empty()
+            || envelope.recipient_role != me.role.as_deref().unwrap_or_default()
+        {
+            return reject_leased_run(me, &msg, uplink, "remote_fenced_runspec_invalid").await;
+        }
+        // The message can wait for an executor slot after the inbound reader
+        // checked it. A replacement during that wait invalidates the old
+        // connection even though its reader already queued this Run.
+        if !uplink
+            .fenced_run_is_current(me, &envelope)
+            .await
+            .unwrap_or(false)
+        {
+            tracing::warn!(run_id = %msg.id.as_str(), "FencedRun lost WorkerHost ownership before executor admission");
+            return Handled::LeaveAndDisconnect;
+        }
+        envelope.run
+    } else {
+        match serde_json::from_value(msg.body.clone()) {
+            Ok(spec) => spec,
+            Err(error) => {
+                tracing::warn!("run {:?}: malformed RunSpec: {error}", msg.id);
+                return Handled::Ack;
+            }
         }
     };
+    if msg.kind == InboxKind::Run
+        && spec
+            .permission_policy
+            .as_ref()
+            .and_then(|policy| policy.environment_lease.as_ref())
+            .is_some()
+    {
+        return reject_leased_run(me, &msg, uplink, "remote_unfenced_run_rejected").await;
+    }
+    if msg.kind == InboxKind::FencedRun {
+        if !environment_lease_v1 {
+            tracing::warn!(run_id = %msg.id.as_str(), "leased Run reached an unsupported executor; retaining it for a capable worker");
+            return Handled::LeaveAndDisconnect;
+        }
+        let error = if !spec.permission_policy.as_ref().is_some_and(|policy| {
+            policy.workspace_path.is_none() && policy.environment_lease.is_some()
+        }) {
+            Some("remote_environment_lease_missing_or_host_path_present")
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return reject_leased_run(me, &msg, uplink, error).await;
+        }
+    }
     let run_id = msg.id.clone();
+    let parent_actor = msg.from.clone();
     let parent = msg.from.session_id.clone();
     let legacy_event_wire = spec.execution_epoch == 0;
-    let mut event_batcher = ActorEventBatcher::for_run(&spec, None, Some(me.session_id.clone()));
+    let mut event_batcher = ActorEventBatcher::for_run(&spec, None, Some(me.session_id.clone()))
+        .with_durable_events(executor.requires_contiguous_events());
 
     let (sink, mut events, mut controls) = EventSink::channel_with_control();
     // Steer: register this run's steer inbox so out-of-band Steer messages route in.
@@ -1205,11 +1561,12 @@ where
     // Approval: a host bridge on the sink; its requests are pumped to the parent.
     let (host_bridge, mut host_rx) = HostBridge::channel();
     let sink = sink.with_host_bridge(host_bridge);
-    let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+    let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel::<bamboo_subagent::ChildOutcome>();
 
     let me = me.clone();
     let forward_cancel = cancel.clone();
     let approval_cancel = cancel.clone();
+    let critical_uplink_failed = CancellationToken::new();
 
     // Forward task: enqueue Events onto the worker-owned ordered data uplink,
     // then append Outcome on that same lane once the run finishes.
@@ -1217,7 +1574,18 @@ where
     let me_fwd = me.clone();
     let parent_fwd = parent.clone();
     let uplink_fwd = uplink.clone();
+    let failure_fwd = critical_uplink_failed.clone();
+    let readiness_fwd = readiness.clone();
+    let fatal_fwd = fatal_uplink.clone();
+    let owner_loss_fwd = owner_loss.clone();
     let mut forward = AbortOnDropTask::new(tokio::spawn(async move {
+        let critical_failure = || {
+            failure_fwd.cancel();
+            fatal_fwd.cancel();
+            readiness_fwd.cancel();
+            forward_cancel.cancel();
+            false
+        };
         let emit = |kind, body| InboxMessage {
             id: MsgId::new(),
             from: me_fwd.clone(),
@@ -1231,11 +1599,33 @@ where
         flush.tick().await;
         let mut events_open = true;
         let mut controls_open = true;
+        let mut explicit_cancel_seen = false;
         while events_open || controls_open {
             tokio::select! {
                 biased;
-                _ = forward_cancel.cancelled() => return,
+                _ = owner_loss_fwd.cancelled() => return false,
+                _ = fatal_fwd.cancelled() => return false,
+                // An explicit parent Cancel still needs a durable Cancelled
+                // Outcome before the Run may be acknowledged.
+                _ = forward_cancel.cancelled(), if !explicit_cancel_seen => {
+                    explicit_cancel_seen = true;
+                },
                 control = controls.recv(), if controls_open => match control {
+                    Some(ExecutorControl::InitialInputReleaseRequest(request)) => {
+                        // The worker enqueued its actual permission audit before
+                        // this control. Drain/flush it on the ordered event lane
+                        // before asking the Host for provider permission.
+                        while let Ok(event) = events.try_recv() {
+                            for batch in event_batcher.push(event) {
+                                if !forward_actor_event_batch(&uplink_fwd, &parent_fwd, &run_id_fwd, batch).await { return critical_failure(); }
+                            }
+                        }
+                        if let Some(batch) = event_batcher.flush() {
+                            if !forward_actor_event_batch(&uplink_fwd, &parent_fwd, &run_id_fwd, batch).await { return critical_failure(); }
+                        }
+                        let Ok(body) = serde_json::to_value(bamboo_subagent::proto::InitialInputControl::Request { request }) else { return critical_failure(); };
+                        if uplink_fwd.deliver_ordered(&parent_fwd, emit(InboxKind::SessionMessageAdmitted, body)).await.is_err() { return critical_failure(); }
+                    }
                     Some(ExecutorControl::SessionMessageAdmitted(confirmation)) => {
                         let body = serde_json::to_value(confirmation)
                             .unwrap_or_else(|_| serde_json::json!({}));
@@ -1247,7 +1637,7 @@ where
                             .await
                             .is_err()
                         {
-                            return;
+                            return critical_failure();
                         }
                     }
                     None => controls_open = false,
@@ -1262,7 +1652,7 @@ where
                         )
                         .await
                         {
-                            return;
+                            return critical_failure();
                         }
                     }
                 },
@@ -1277,7 +1667,7 @@ where
                                 .await
                                 .is_err()
                             {
-                                return;
+                                return critical_failure();
                             }
                             continue;
                         }
@@ -1290,7 +1680,7 @@ where
                             )
                             .await
                             {
-                                return;
+                                return critical_failure();
                             }
                         }
                     }
@@ -1301,16 +1691,36 @@ where
         if !legacy_event_wire {
             if let Some(batch) = event_batcher.flush() {
                 if !forward_actor_event_batch(&uplink_fwd, &parent_fwd, &run_id_fwd, batch).await {
-                    return;
+                    return critical_failure();
                 }
             }
         }
-        if let Ok(outcome) = outcome_rx.await {
-            let body = serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}));
-            let _ = uplink_fwd
-                .deliver_ordered(&parent_fwd, emit(InboxKind::Outcome, body))
-                .await;
+        let outcome = tokio::select! {
+            biased;
+            _ = owner_loss_fwd.cancelled() => return false,
+            _ = fatal_fwd.cancelled() => return false,
+            _ = failure_fwd.cancelled() => return false,
+            outcome = outcome_rx => outcome,
+        };
+        let Ok(mut outcome) = outcome else {
+            return critical_failure();
+        };
+        // Never trust an executor-supplied watermark. This ordered forwarder
+        // has now received every strict batch receipt, including the final flush.
+        outcome.final_event_watermark = event_batcher.final_watermark();
+        let body = serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}));
+        if failure_fwd.is_cancelled() || fatal_fwd.is_cancelled() || owner_loss_fwd.is_cancelled() {
+            return false;
         }
+        // Once submitted, the receipt is authoritative: a concurrent control
+        // failure must not discard a known-successful Outcome and replay it.
+        let delivered = uplink_fwd
+            .deliver_ordered(&parent_fwd, emit(InboxKind::Outcome, body))
+            .await;
+        if delivered.is_err() {
+            return critical_failure();
+        }
+        true
     }));
 
     // Approval drain: each gated-tool approval the executor raises is delivered to
@@ -1318,8 +1728,13 @@ where
     // ApprovalReply wakes the registered waiter, whose decision answers the tool.
     // Ends when the run drops the sink ⇒ the host bridge ⇒ `host_rx` closes.
     let waiters_drain = Arc::clone(waiters);
+    let tree_waiters_drain = Arc::clone(tree_waiters);
     let run_id_appr = run_id.clone();
+    let parent_actor_appr = parent_actor.clone();
     let uplink_appr = uplink.clone();
+    let failure_appr = critical_uplink_failed.clone();
+    let readiness_appr = readiness.clone();
+    let fatal_appr = fatal_uplink.clone();
     let mut approval = AbortOnDropTask::new(tokio::spawn(async move {
         loop {
             let req = tokio::select! {
@@ -1330,6 +1745,78 @@ where
                     None => break,
                 },
             };
+            if matches!(
+                req.kind,
+                HostRequestKind::OwnedTree | HostRequestKind::SubAgent
+            ) {
+                let request_id = MsgId::new();
+                let request_id_str = format!("{request_id:?}");
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                tree_waiters_lock(&tree_waiters_drain).insert(
+                    request_id_str.clone(),
+                    TreeReplyWaiter {
+                        parent: parent_actor_appr.clone(),
+                        run_id: run_id_appr.clone(),
+                        reply: tx,
+                    },
+                );
+                let _registration = TreeWaiterRegistration {
+                    waiters: tree_waiters_drain.clone(),
+                    id: request_id_str.clone(),
+                };
+                let (kind, body, timeout) = match req.kind {
+                    HostRequestKind::OwnedTree => (
+                        InboxKind::OwnedTreeRequest,
+                        serde_json::json!({
+                            "id": request_id_str,
+                            "cursor": req.body.get("cursor").cloned().unwrap_or_default(),
+                        }),
+                        Duration::from_secs(8),
+                    ),
+                    HostRequestKind::SubAgent => (
+                        InboxKind::SubAgentRequest,
+                        serde_json::json!({
+                            "id": request_id_str,
+                            "tool_call_id": req.body.get("tool_call_id"),
+                            "args": req.body.get("args"),
+                        }),
+                        Duration::from_secs(30),
+                    ),
+                    HostRequestKind::Approval => unreachable!(),
+                };
+                let message = InboxMessage {
+                    id: MsgId::new(),
+                    from: me.clone(),
+                    kind,
+                    body,
+                    created_at: Utc::now(),
+                    correlation_id: Some(run_id_appr.clone()),
+                };
+                let delivered = tokio::select! {
+                    _ = approval_cancel.cancelled() => false,
+                    result = tokio::time::timeout(timeout,
+                        uplink_appr.deliver_control(&parent, message)) => result.is_ok_and(|result| result.is_ok()),
+                };
+                let result = if delivered {
+                    tokio::select! {
+                        _ = approval_cancel.cancelled() => None,
+                        result = tokio::time::timeout(timeout, rx) => result.ok().and_then(Result::ok).flatten(),
+                    }
+                } else {
+                    None
+                };
+                let reply = if req.kind == HostRequestKind::OwnedTree {
+                    serde_json::json!({ "page": result })
+                } else {
+                    result.unwrap_or_else(|| {
+                        serde_json::json!({
+                            "error": "canonical SubAgent operation unavailable"
+                        })
+                    })
+                };
+                let _ = req.reply.send(reply);
+                continue;
+            }
             let approval_id = MsgId::new();
             let approval_id_str = format!("{approval_id:?}");
             let (atx, arx) = tokio::sync::oneshot::channel::<bool>();
@@ -1353,9 +1840,20 @@ where
                 &approval_cancel,
             )
             .await;
-            if !delivered {
-                let _ = req.reply.send(serde_json::json!({ "approved": false }));
-                continue;
+            match delivered {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = req.reply.send(serde_json::json!({ "approved": false }));
+                    continue;
+                }
+                Err(_) => {
+                    failure_appr.cancel();
+                    fatal_appr.cancel();
+                    readiness_appr.cancel();
+                    approval_cancel.cancel();
+                    let _ = req.reply.send(serde_json::json!({ "approved": false }));
+                    break;
+                }
             }
             let approved = await_approval_decision(
                 &waiters_drain,
@@ -1372,15 +1870,63 @@ where
     // Run to completion (events stream into `sink`); dropping `sink` closes the
     // forward loop's `events` (→ outcome) and the approval drain's `host_rx`.
     use futures_util::FutureExt;
-    let outcome = std::panic::AssertUnwindSafe(executor.run(spec, sink, steer_inbox, cancel))
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|_| bamboo_subagent::ChildOutcome::error("actor executor panicked"));
+    let outcome = tokio::select! {
+        biased;
+        _ = owner_loss.cancelled() => return Handled::Leave,
+        _ = fatal_uplink.cancelled() => return Handled::LeaveAndDisconnect,
+        _ = critical_uplink_failed.cancelled() => return Handled::LeaveAndDisconnect,
+        outcome = std::panic::AssertUnwindSafe(executor.run(spec, sink, steer_inbox, cancel)).catch_unwind() => {
+            outcome.unwrap_or_else(|_| bamboo_subagent::ChildOutcome::error("actor executor panicked"))
+        }
+    };
     drop(registration);
     let _ = outcome_tx.send(outcome);
-    let _ = forward.join().await;
+    let critical_uplink_ok = matches!(forward.join().await, Ok(true));
     let _ = approval.join().await;
-    Handled::Ack
+    // Once Outcome is durable, a subsequently observed control failure retires
+    // this worker but must not replay the same successful terminal result.
+    if critical_uplink_ok {
+        Handled::Ack
+    } else {
+        Handled::LeaveAndDisconnect
+    }
+}
+
+async fn reject_leased_run(
+    me: &AgentRef,
+    msg: &InboxMessage,
+    uplink: &ActorBrokerUplink,
+    reason: &'static str,
+) -> Handled {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let outcome = bamboo_subagent::ChildOutcome::error(reason);
+    let body = serde_json::to_value(outcome).expect("ChildOutcome is serializable");
+    // Maildir names include both created_at and MsgId. Keep both stable across
+    // a Run replay so a lost Run ACK cannot create a fresh terminal identity.
+    let mut stable_id = String::from("lease-reject-");
+    for byte in Sha256::digest(format!("{}:{}", me.session_id, msg.id.as_str()).as_bytes()) {
+        write!(&mut stable_id, "{byte:02x}").expect("write to String");
+    }
+    let outcome_id = MsgId(stable_id);
+    let terminal = InboxMessage {
+        id: outcome_id,
+        from: me.clone(),
+        kind: InboxKind::Outcome,
+        body,
+        created_at: msg.created_at,
+        correlation_id: Some(msg.id.clone()),
+    };
+    if uplink
+        .deliver_ordered(&msg.from.session_id, terminal)
+        .await
+        .is_ok()
+    {
+        Handled::Ack
+    } else {
+        Handled::LeaveAndDisconnect
+    }
 }
 
 async fn forward_actor_event_batch(
@@ -1471,6 +2017,17 @@ fn decode_steer_body(
     body: &serde_json::Value,
     durable_message_id: Option<&str>,
 ) -> Option<bamboo_subagent::SteerMessage> {
+    if ["initial_input_control", "request", "release"]
+        .iter()
+        .any(|key| body.get(key).is_some())
+    {
+        return match bamboo_subagent::proto::InitialInputControl::decode(body.clone()) {
+            Ok(bamboo_subagent::proto::InitialInputControl::Release { release }) => {
+                Some(bamboo_subagent::SteerMessage::InitialInputRelease(release))
+            }
+            _ => None, // Unknown tags/wrong direction never fall back to Text.
+        };
+    }
     // Any typed-protocol marker makes this a typed frame. A partial/malformed
     // typed frame must fail closed; it may never fall through to a coincidental
     // `text` field and become an uncorrelated legacy steer.
@@ -1517,6 +2074,9 @@ fn decode_steer_body(
         }
     }
 }
+
+#[cfg(test)]
+mod history_delivery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1847,6 +2407,565 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("mailbox reaches {expected} pending file(s)"));
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RunUplinkFault {
+        Event,
+        Control,
+        Approval,
+        Outcome,
+    }
+
+    struct RetryRunExecutor {
+        fault: RunUplinkFault,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    struct WaitForRunCancel {
+        started: Arc<tokio::sync::Notify>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl bamboo_subagent::ChildExecutor for WaitForRunCancel {
+        async fn run(
+            &self,
+            _spec: bamboo_subagent::RunSpec,
+            _events: bamboo_subagent::EventSink,
+            _steer: bamboo_subagent::SteerInbox,
+            cancel: CancellationToken,
+        ) -> bamboo_subagent::ChildOutcome {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started.notify_one();
+            cancel.cancelled().await;
+            bamboo_subagent::ChildOutcome::cancelled()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl bamboo_subagent::ChildExecutor for RetryRunExecutor {
+        async fn run(
+            &self,
+            _spec: bamboo_subagent::RunSpec,
+            events: bamboo_subagent::EventSink,
+            _steer: bamboo_subagent::SteerInbox,
+            _cancel: CancellationToken,
+        ) -> bamboo_subagent::ChildOutcome {
+            use std::sync::atomic::Ordering;
+            if self.calls.fetch_add(1, Ordering::SeqCst) != 0 {
+                return bamboo_subagent::ChildOutcome::completed("recovered");
+            }
+            match self.fault {
+                RunUplinkFault::Event => {
+                    events
+                        .emit(serde_json::json!({"type":"task_list_item_progress"}))
+                        .await;
+                }
+                RunUplinkFault::Control => {
+                    events
+                        .confirm_session_message(
+                            bamboo_subagent::SessionMessageAdmissionConfirmation {
+                                target_session_id: "retry-worker".into(),
+                                envelope_id: "owned-input".into(),
+                                canonical_claim_generation: 1,
+                                activation_run_id: "same-activation".into(),
+                            },
+                        )
+                        .await;
+                }
+                RunUplinkFault::Approval => {
+                    let _ = events
+                        .host()
+                        .expect("Run has a host bridge")
+                        .approval_call(serde_json::json!({"resource":"blocked"}))
+                        .await;
+                }
+                RunUplinkFault::Outcome => {
+                    return bamboo_subagent::ChildOutcome::completed("unconfirmed");
+                }
+            }
+            // The worker must retire even if an executor ignores cancellation.
+            std::future::pending().await
+        }
+    }
+
+    fn test_run_uplink(
+        source: &AgentRef,
+        core: &Arc<BrokerCore>,
+        fault: Option<RunUplinkFault>,
+        outcomes: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> ActorBrokerUplink {
+        let (control, mut control_rx) = tokio::sync::mpsc::channel::<ActorControlCommand>(4);
+        let (events, mut event_rx) = tokio::sync::mpsc::channel::<ActorEventCommand>(4);
+        if matches!(
+            fault,
+            Some(RunUplinkFault::Control | RunUplinkFault::Approval)
+        ) {
+            drop(control_rx);
+        } else {
+            let core = Arc::clone(core);
+            tokio::spawn(async move {
+                while let Some(command) = control_rx.recv().await {
+                    match command {
+                        ActorControlCommand::Deliver {
+                            to,
+                            message,
+                            result,
+                        } => {
+                            let _ = result.send(core.deliver(&to, &message).await);
+                        }
+                        ActorControlCommand::ObserveSelf {
+                            mailbox,
+                            role,
+                            result,
+                        } => {
+                            let _ = result
+                                .send(Ok(core.current_host_observation(&mailbox, &role).await));
+                        }
+                    }
+                }
+            });
+        }
+        if matches!(fault, Some(RunUplinkFault::Event | RunUplinkFault::Outcome)) {
+            drop(event_rx);
+        } else {
+            let core = Arc::clone(core);
+            let outcomes = Arc::clone(outcomes);
+            tokio::spawn(async move {
+                while let Some(command) = event_rx.recv().await {
+                    if let ActorEventCommand::Durable {
+                        to,
+                        message,
+                        result,
+                    } = command
+                    {
+                        let terminal = matches!(message.kind, InboxKind::Outcome);
+                        let delivered = core.deliver(&to, &message).await;
+                        if terminal && delivered.is_ok() {
+                            outcomes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        let _ = result.send(delivered);
+                    }
+                }
+            });
+        }
+        ActorBrokerUplink {
+            control,
+            events,
+            source: source.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_fenced_run_fails_worker_admission_after_slot_wait_and_replacement() {
+        use crate::core::AuthenticatedHost;
+        use chrono::Utc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(BrokerCore::new(dir.path()));
+        let me = AgentRef {
+            session_id: "worker".into(),
+            role: Some("worker".into()),
+        };
+        let host = || AuthenticatedHost {
+            host_ref: "worker-host".into(),
+            credential_expires_at: Utc::now() + chrono::Duration::minutes(5),
+            host_capabilities: None,
+            max_slots: None,
+        };
+        let (_first_streams, _first_lease) = core
+            .subscribe_scoped_environment_lease_v1("worker", Some("worker"), host())
+            .await
+            .unwrap();
+        let first = core
+            .current_host_observation("worker", "worker")
+            .await
+            .unwrap();
+        let run: bamboo_subagent::RunSpec = serde_json::from_value(serde_json::json!({
+            "assignment":"queued work",
+            "logical_session":{
+                "session_id":"logical-child","parent_session_id":"logical-parent",
+                "root_session_id":"logical-root",
+                "creation":{"created_at":Utc::now(),"spawn_depth":1}
+            },
+            "activation_run_id":"activation-1","execution_epoch":1,
+            "permission_policy":{
+                "revision":1,"bypass_permissions":false,
+                "session_id":"logical-child","policy":{},
+                "environment_lease":{
+                    "version":1,"actor_id":"logical-child",
+                    "activation_run_id":"activation-1","execution_epoch":1,
+                    "admit_before":Utc::now()+chrono::Duration::minutes(2),
+                    "git_commit":"a".repeat(40),"content_sha256":"b".repeat(64),
+                    "workspace_relpath":"."
+                }
+            }
+        }))
+        .unwrap();
+        let envelope = FencedRunEnvelope::for_observation(run, &first).unwrap();
+        let outcomes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let uplink = test_run_uplink(&me, &core, None, &outcomes);
+        assert!(uplink.fenced_run_is_current(&me, &envelope).await.unwrap());
+
+        // The worker's handler can sit behind its execution-slot semaphore.
+        // When it eventually admits the queued Run, the old generation fails.
+        let (_successor_streams, _successor_lease) = core
+            .subscribe_scoped_environment_lease_v1("worker", Some("worker"), host())
+            .await
+            .unwrap();
+        assert!(!uplink.fenced_run_is_current(&me, &envelope).await.unwrap());
+
+        struct Probe(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl bamboo_subagent::ChildExecutor for Probe {
+            async fn run(
+                &self,
+                _spec: bamboo_subagent::RunSpec,
+                _events: bamboo_subagent::EventSink,
+                _steer: bamboo_subagent::SteerInbox,
+                _cancel: CancellationToken,
+            ) -> bamboo_subagent::ChildOutcome {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                bamboo_subagent::ChildOutcome::completed("should not execute")
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let message = InboxMessage {
+            id: MsgId::new(),
+            from: AgentRef {
+                session_id: "parent".into(),
+                role: Some("host".into()),
+            },
+            kind: InboxKind::FencedRun,
+            body: serde_json::to_value(envelope).unwrap(),
+            created_at: Utc::now(),
+            correlation_id: None,
+        };
+        let handled = handle_run(
+            &Probe(Arc::clone(&calls)),
+            &me,
+            message,
+            CancellationToken::new(),
+            &Arc::new(std::sync::Mutex::new(HashMap::new())),
+            &Arc::new(std::sync::Mutex::new(HashMap::new())),
+            &Arc::new(std::sync::Mutex::new(HashMap::new())),
+            &uplink,
+            Duration::from_secs(1),
+            CancellationToken::new(),
+            CancellationToken::new(),
+            CancellationToken::new(),
+            true,
+        )
+        .await;
+        assert!(matches!(handled, Handled::LeaveAndDisconnect));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    async fn serve_retry_run<E>(
+        endpoint: &str,
+        worker: AgentRef,
+        executor: Arc<E>,
+        uplink: ActorBrokerUplink,
+    ) -> BrokerResult<ServeExitReason>
+    where
+        E: bamboo_subagent::ChildExecutor + ?Sized,
+    {
+        let mut client = BrokerClient::connect(endpoint, worker.clone(), TOKEN).await?;
+        client.subscribe().await?;
+        let coords: RunCoords = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let waiters: ApprovalWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let tree_waiters: TreeWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let readiness = CancellationToken::new();
+        let loop_readiness = readiness.clone();
+        let fatal = CancellationToken::new();
+        let owner_loss = CancellationToken::new();
+        let loop_owner_loss = owner_loss.clone();
+        let handler_worker = worker.clone();
+        serve_loop_with_timeouts_and_owner_loss(
+            &mut client,
+            &worker,
+            move |message, cancel| {
+                let executor = Arc::clone(&executor);
+                let coords = Arc::clone(&coords);
+                let waiters = Arc::clone(&waiters);
+                let tree_waiters = Arc::clone(&tree_waiters);
+                let uplink = uplink.clone();
+                let worker = handler_worker.clone();
+                let readiness = readiness.clone();
+                let fatal = fatal.clone();
+                let owner_loss = owner_loss.clone();
+                async move {
+                    handle_run(
+                        executor.as_ref(),
+                        &worker,
+                        message,
+                        cancel,
+                        &coords,
+                        &waiters,
+                        &tree_waiters,
+                        &uplink,
+                        Duration::from_secs(1),
+                        readiness,
+                        fatal,
+                        owner_loss,
+                        false,
+                    )
+                    .await
+                }
+            },
+            loop_readiness,
+            Some(Duration::from_millis(500)),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            loop_owner_loss,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn critical_run_uplink_failures_retry_same_run_without_duplicate_outcome() {
+        use std::sync::atomic::Ordering;
+        for fault in [
+            RunUplinkFault::Event,
+            RunUplinkFault::Control,
+            RunUplinkFault::Approval,
+            RunUplinkFault::Outcome,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let core = Arc::new(BrokerCore::new(dir.path()));
+            let server = Arc::new(BrokerServer::new(Arc::clone(&core), TOKEN));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let server_task = tokio::spawn(async move {
+                let _ = server.serve(listener).await;
+            });
+            let worker = AgentRef {
+                session_id: "retry-worker".into(),
+                role: None,
+            };
+            let run_id = MsgId::new();
+            let run = InboxMessage {
+                id: run_id.clone(),
+                from: AgentRef {
+                    session_id: "retry-parent".into(),
+                    role: None,
+                },
+                kind: InboxKind::Run,
+                body: serde_json::to_value(bamboo_subagent::RunSpec {
+                    assignment: "same-generation".into(),
+                    logical_session: None,
+                    project_id: None,
+                    reasoning_effort: None,
+                    permission_policy: None,
+                    messages: vec![],
+                    activation_run_id: Some("same-activation".into()),
+                    execution_epoch: 1,
+                    initial_session_messages: Vec::new(),
+                    secrets: Default::default(),
+                })
+                .unwrap(),
+                created_at: Utc::now(),
+                correlation_id: None,
+            };
+            core.deliver(&worker.session_id, &run).await.unwrap();
+            let outcomes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let executor = Arc::new(RetryRunExecutor {
+                fault,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let bad_uplink = test_run_uplink(&worker, &core, Some(fault), &outcomes);
+            let failed = tokio::time::timeout(
+                Duration::from_secs(5),
+                serve_retry_run(&endpoint, worker.clone(), Arc::clone(&executor), bad_uplink),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{fault:?}: failed worker must retire promptly"));
+            assert!(
+                failed.is_err(),
+                "{fault:?}: worker stays ready after uplink loss"
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while core.is_subscribed(&worker.session_id).await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{fault:?}: failed worker remains subscribed"));
+            wait_for_mailbox_count(&dir, &worker.session_id, 1).await;
+            assert_eq!(outcomes.load(Ordering::SeqCst), 0, "{fault:?}");
+
+            let healthy = test_run_uplink(&worker, &core, None, &outcomes);
+            let recovered = tokio::time::timeout(
+                Duration::from_secs(5),
+                serve_retry_run(&endpoint, worker.clone(), Arc::clone(&executor), healthy),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{fault:?}: replacement must finish"))
+            .unwrap();
+            assert_eq!(recovered, ServeExitReason::IdleTimeout, "{fault:?}");
+            wait_for_empty_mailbox(&dir, &worker.session_id).await;
+            assert_eq!(executor.calls.load(Ordering::SeqCst), 2, "{fault:?}");
+            assert_eq!(outcomes.load(Ordering::SeqCst), 1, "{fault:?}");
+            assert_eq!(mailbox_pending_files(&dir, "retry-parent").await, 1);
+            server_task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_connection_loss_does_not_publish_cancelled_outcome_for_unacked_run() {
+        let (endpoint, dir, core, connection) = start_single_connection().await;
+        let worker = AgentRef {
+            session_id: "inbound-loss-worker".into(),
+            role: None,
+        };
+        let run = InboxMessage {
+            id: MsgId::new(),
+            from: AgentRef {
+                session_id: "inbound-loss-parent".into(),
+                role: None,
+            },
+            kind: InboxKind::Run,
+            body: serde_json::to_value(bamboo_subagent::RunSpec {
+                assignment: "inbound-loss".into(),
+                logical_session: None,
+                project_id: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                messages: vec![],
+                activation_run_id: Some("inbound-loss-activation".into()),
+                execution_epoch: 1,
+                initial_session_messages: Vec::new(),
+                secrets: Default::default(),
+            })
+            .unwrap(),
+            created_at: Utc::now(),
+            correlation_id: None,
+        };
+        core.deliver(&worker.session_id, &run).await.unwrap();
+        let outcomes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let uplink = test_run_uplink(&worker, &core, None, &outcomes);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let executor = Arc::new(WaitForRunCancel {
+            started: Arc::clone(&started),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let worker_task =
+            tokio::spawn(async move { serve_retry_run(&endpoint, worker, executor, uplink).await });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("Run starts before inbound disconnect");
+        connection.abort();
+        let _ = connection.await;
+        tokio::time::timeout(Duration::from_secs(5), worker_task)
+            .await
+            .expect("worker stops after inbound loss")
+            .expect("worker task does not panic")
+            .expect("inbound loss uses the existing clean connection-close path");
+        wait_for_mailbox_count(&dir, "inbound-loss-worker", 1).await;
+        assert_eq!(outcomes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(mailbox_pending_files(&dir, "inbound-loss-parent").await, 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_parent_cancel_publishes_terminal_before_ack_without_replaying_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(BrokerCore::new(dir.path()));
+        let server = Arc::new(BrokerServer::new(Arc::clone(&core), TOKEN));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server_task = tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        let worker = AgentRef {
+            session_id: "cancel-worker".into(),
+            role: None,
+        };
+        let run = InboxMessage {
+            id: MsgId::new(),
+            from: AgentRef {
+                session_id: "cancel-parent".into(),
+                role: None,
+            },
+            kind: InboxKind::Run,
+            body: serde_json::to_value(bamboo_subagent::RunSpec {
+                assignment: "explicit-parent-cancel".into(),
+                logical_session: None,
+                project_id: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                messages: vec![],
+                activation_run_id: Some("cancel-activation".into()),
+                execution_epoch: 1,
+                initial_session_messages: Vec::new(),
+                secrets: Default::default(),
+            })
+            .unwrap(),
+            created_at: Utc::now(),
+            correlation_id: None,
+        };
+        core.deliver(&worker.session_id, &run).await.unwrap();
+        let outcomes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let executor = Arc::new(WaitForRunCancel {
+            started: Arc::clone(&started),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let worker_task = tokio::spawn({
+            let endpoint = endpoint.clone();
+            let worker = worker.clone();
+            let executor = Arc::clone(&executor);
+            let uplink = test_run_uplink(&worker, &core, None, &outcomes);
+            async move { serve_retry_run(&endpoint, worker, executor, uplink).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("Run starts before explicit parent cancel");
+        assert!(core.cancel(&worker.session_id, &run.id).await);
+        let exit = tokio::time::timeout(Duration::from_secs(5), worker_task)
+            .await
+            .expect("worker finishes cancelled Run")
+            .expect("worker task does not panic")
+            .expect("healthy uplink keeps worker serving until idle");
+        assert_eq!(exit, ServeExitReason::IdleTimeout);
+        wait_for_empty_mailbox(&dir, &worker.session_id).await;
+        assert_eq!(outcomes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(mailbox_pending_files(&dir, "cancel-parent").await, 1);
+        let mut parent = core.subscribe("cancel-parent", None).await.unwrap();
+        let PushItem::Message(terminal) = parent.recv().await.expect("durable parent Outcome")
+        else {
+            panic!("parent receives an Outcome message");
+        };
+        assert_eq!(terminal.kind, InboxKind::Outcome);
+        assert_eq!(terminal.correlation_id, Some(run.id));
+        let outcome: bamboo_subagent::ChildOutcome = serde_json::from_value(terminal.body).unwrap();
+        assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Cancelled);
+
+        let replacement = test_run_uplink(&worker, &core, None, &outcomes);
+        let replay = tokio::time::timeout(
+            Duration::from_secs(2),
+            serve_retry_run(&endpoint, worker, Arc::clone(&executor), replacement),
+        )
+        .await
+        .expect("replacement remains idle")
+        .expect("replacement can subscribe");
+        assert_eq!(replay, ServeExitReason::IdleTimeout);
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(outcomes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server_task.abort();
+    }
+
+    #[test]
+    fn malformed_initial_release_never_becomes_text_steering() {
+        for value in [
+            serde_json::json!({"release":{}, "text":"unsafe"}),
+            serde_json::json!({"request":{}, "text":"unsafe"}),
+            serde_json::json!({"initial_input_control":"unknown", "text":"unsafe"}),
+            serde_json::json!({"initial_input_control":"release", "release":{}, "text":"unsafe"}),
+            serde_json::json!({"initial_input_control":"request", "request":{}, "text":"unsafe"}),
+        ] {
+            assert!(decode_steer_body(&value, Some("transport-id")).is_none());
+        }
     }
 
     #[test]
@@ -2450,6 +3569,143 @@ mod tests {
         assert!(events >= 1, "expected streamed events, got {events}");
         let oc: bamboo_subagent::ChildOutcome = serde_json::from_value(outcome.body).unwrap();
         assert_eq!(oc.result.as_deref(), Some("echo: ping pong"));
+    }
+
+    #[tokio::test]
+    async fn canonical_subagent_rpc_rejects_wrong_run_reply_over_real_broker() {
+        struct NestedCall;
+
+        #[async_trait::async_trait]
+        impl bamboo_subagent::ChildExecutor for NestedCall {
+            async fn run(
+                &self,
+                _spec: bamboo_subagent::RunSpec,
+                events: bamboo_subagent::EventSink,
+                _steer: bamboo_subagent::SteerInbox,
+                _cancel: CancellationToken,
+            ) -> bamboo_subagent::ChildOutcome {
+                let result = events
+                    .host()
+                    .expect("active Run bridge")
+                    .subagent_call(
+                        serde_json::json!({"intent":"inspect","target":"owned-child"}),
+                        "nested-call",
+                    )
+                    .await
+                    .expect("canonical Host reply");
+                bamboo_subagent::ChildOutcome::completed(
+                    result["result"].as_str().expect("canonical result text"),
+                )
+            }
+        }
+
+        let (endpoint, _dir) = start().await;
+        let worker_endpoint = endpoint.clone();
+        tokio::spawn(async move {
+            let _ = serve_executor(
+                &worker_endpoint,
+                AgentRef {
+                    session_id: "nested-worker".into(),
+                    role: None,
+                },
+                TOKEN,
+                Arc::new(NestedCall),
+            )
+            .await;
+        });
+        let mut parent = BrokerClient::connect(
+            &endpoint,
+            AgentRef {
+                session_id: "nested-parent".into(),
+                role: None,
+            },
+            TOKEN,
+        )
+        .await
+        .unwrap();
+        parent.subscribe().await.unwrap();
+        let run = InboxMessage {
+            id: MsgId::new(),
+            from: AgentRef {
+                session_id: "nested-parent".into(),
+                role: None,
+            },
+            kind: InboxKind::Run,
+            body: serde_json::to_value(bamboo_subagent::RunSpec {
+                assignment: "inspect owned child".into(),
+                logical_session: None,
+                project_id: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                messages: vec![],
+                activation_run_id: Some("nested-activation".into()),
+                execution_epoch: 1,
+                initial_session_messages: Vec::new(),
+                secrets: Default::default(),
+            })
+            .unwrap(),
+            created_at: Utc::now(),
+            correlation_id: None,
+        };
+        let run_id = run.id.clone();
+        parent.deliver("nested-worker", run).await.unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = parent.next_message().await.unwrap();
+                if message.kind == InboxKind::SubAgentRequest {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("worker SubAgent RPC");
+        assert_eq!(request.correlation_id.as_ref(), Some(&run_id));
+        assert_eq!(request.body["tool_call_id"], "nested-call");
+        assert_eq!(request.body["args"]["target"], "owned-child");
+        parent.ack(request.id.clone()).await.ok();
+        let id = request.body["id"].as_str().unwrap();
+        let result = serde_json::json!({"result":{
+            "success":true,"result":"canonical-result","display_preference":null
+        }});
+        let reply = |correlation_id| InboxMessage {
+            id: MsgId::new(),
+            from: AgentRef {
+                session_id: "nested-parent".into(),
+                role: None,
+            },
+            kind: InboxKind::SubAgentReply,
+            body: serde_json::json!({"id":id,"result":result.clone()}),
+            created_at: Utc::now(),
+            correlation_id: Some(correlation_id),
+        };
+        parent
+            .deliver("nested-worker", reply(MsgId::new()))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), parent.next_message())
+                .await
+                .is_err(),
+            "wrong Run reply must not wake the caller"
+        );
+        parent
+            .deliver("nested-worker", reply(run_id.clone()))
+            .await
+            .unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = parent.next_message().await.unwrap();
+                if message.kind == InboxKind::Outcome {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("correlated canonical reply completes Run");
+        assert_eq!(terminal.correlation_id.as_ref(), Some(&run_id));
+        let outcome: bamboo_subagent::ChildOutcome = serde_json::from_value(terminal.body).unwrap();
+        assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
+        assert_eq!(outcome.result.as_deref(), Some("canonical-result"));
     }
 
     #[tokio::test]
@@ -3409,15 +4665,14 @@ mod tests {
             created_at: Utc::now(),
             correlation_id: None,
         };
-        assert!(
-            !deliver_approval_request(
-                deliver.deliver("full-parent", message),
-                &waiters,
-                "rejected",
-                &CancellationToken::new(),
-            )
-            .await
-        );
+        assert!(deliver_approval_request(
+            deliver.deliver("full-parent", message),
+            &waiters,
+            "rejected",
+            &CancellationToken::new(),
+        )
+        .await
+        .is_err());
         assert!(approval_waiters_lock(&waiters).is_empty());
         assert!(waiter_rx.await.is_err(), "removed sender must be dropped");
     }

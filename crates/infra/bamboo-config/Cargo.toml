@@ -10,7 +10,6 @@ license = "MIT"
 bamboo-domain = { path = "../../core/bamboo-domain" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = "0.9"
 chrono = { workspace = true }
 thiserror = { workspace = true }
 anyhow = "1"
@@ -25,7 +24,6 @@ hex = "0.4"
 base64 = "0.23"
 url = "2"
 uuid = { workspace = true }
-fs2 = "0.4"
 notify = "8"
 
 [target.'cfg(unix)'.dependencies]

@@ -1,6 +1,5 @@
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use super::*;
 
@@ -18,11 +17,6 @@ pub(super) enum EffectiveTransportConfig {
         cwd: Option<String>,
         env: BTreeMap<String, String>,
         startup_timeout_ms: u64,
-    },
-    Sse {
-        url: String,
-        headers: Vec<EffectiveHeaderConfig>,
-        connect_timeout_ms: u64,
     },
     StreamableHttp {
         url: String,
@@ -53,18 +47,6 @@ pub(super) fn effective_server_config(config: &McpServerConfig) -> EffectiveServ
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             startup_timeout_ms: stdio.startup_timeout_ms,
-        },
-        TransportConfig::Sse(sse) => EffectiveTransportConfig::Sse {
-            url: sse.url.clone(),
-            headers: sse
-                .headers
-                .iter()
-                .map(|h| EffectiveHeaderConfig {
-                    name: h.name.clone(),
-                    value: h.value.clone(),
-                })
-                .collect(),
-            connect_timeout_ms: sse.connect_timeout_ms,
         },
         TransportConfig::StreamableHttp(sh) => EffectiveTransportConfig::StreamableHttp {
             url: sh.url.clone(),
@@ -116,18 +98,4 @@ pub(super) fn proxy_fingerprint(config: &Config) -> Option<String> {
     hasher.update(b"\0");
     hasher.update(password.as_bytes());
     Some(hex::encode(hasher.finalize()))
-}
-
-pub(super) async fn manager_proxy_fingerprint(
-    cfg_handle: Option<&Arc<tokio::sync::RwLock<Config>>>,
-) -> Option<String> {
-    let handle = cfg_handle?;
-    let cfg = handle.read().await.clone();
-    proxy_fingerprint(&cfg)
-}
-
-pub(super) async fn desired_proxy_fingerprint(
-    cfg_handle: Option<&Arc<tokio::sync::RwLock<Config>>>,
-) -> Option<String> {
-    manager_proxy_fingerprint(cfg_handle).await
 }

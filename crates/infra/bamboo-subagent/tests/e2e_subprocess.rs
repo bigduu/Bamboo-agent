@@ -96,7 +96,9 @@ async fn spawn_discover_run_stream_terminal() {
         match frame {
             ChildFrame::Event { event } => events.push(event),
             ChildFrame::EventBatch { batch } => events.extend(batch.events),
-            ChildFrame::ApprovalRequest { .. } => {}
+            ChildFrame::ApprovalRequest { .. }
+            | ChildFrame::OwnedTreeRequest { .. }
+            | ChildFrame::SubAgentRequest { .. } => {}
             ChildFrame::SessionMessageAdmitted { confirmation } => {
                 panic!("echo run emitted unexpected SessionInbox confirmation: {confirmation:?}")
             }

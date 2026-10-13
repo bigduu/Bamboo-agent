@@ -1,8 +1,9 @@
 use super::*;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{
-    FunctionCall, Tool, ToolCall, ToolCtx, ToolError, ToolExecutionContext,
-    ToolExecutionSessionFlags, ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
+    observed_tool_output_cap, scope_tool_output_cap, FunctionCall, Tool, ToolCall, ToolCtx,
+    ToolError, ToolExecutionContext, ToolExecutionSessionFlags, ToolExecutor, ToolOutcome,
+    ToolResult, ToolSchema,
 };
 use bamboo_domain::{AgentRuntimeState, PendingQuestionSource, RuntimeSessionPersistence};
 use bamboo_engine::session_app::respond::{
@@ -39,6 +40,7 @@ struct Invocation {
 #[derive(Default)]
 struct Probe {
     calls: Mutex<Vec<Invocation>>,
+    output_caps: Mutex<Vec<(String, String, Option<u32>)>>,
     actions: AtomicUsize,
     provider_calls: AtomicUsize,
     fail_execution: AtomicBool,
@@ -191,14 +193,14 @@ impl Tool for RegisteredProbeTool {
         "record the selected exact tool"
     }
     fn parameters_schema(&self) -> Value {
-        json!({ "type": "object", "properties": { "command": { "type": "string" } }, "required": ["command"] })
+        json!({ "type": "object", "properties": { "cmd": { "type": "string" } }, "required": ["cmd"] })
     }
     async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
         let session_id = ctx.session_id.as_deref().unwrap();
-        // Bash is gated by the real BuiltinToolExecutor. The exact custom
+        // exec_command is gated by the real BuiltinToolExecutor. The exact custom
         // registration requests its own permission through the same public
         // evaluator, so the engine creates both pending structures itself.
-        if self.name == "execute_command" {
+        if self.name == "default::exec_command" {
             match self
                 .config
                 .evaluate(bamboo_tools::permission::PermissionEvaluation {
@@ -208,7 +210,7 @@ impl Tool for RegisteredProbeTool {
                     tool_name: self.name.clone(),
                     tool_args: args.clone(),
                     permission_type: PermissionType::ExecuteCommand,
-                    resource: args["command"].as_str().unwrap().into(),
+                    resource: args["cmd"].as_str().unwrap().into(),
                     operation_summary: "custom operation".into(),
                     risk_level: RiskLevel::High,
                     bypass_requested: ctx.bypass_permissions,
@@ -231,6 +233,11 @@ impl Tool for RegisteredProbeTool {
                 }
             }
         }
+        self.probe.output_caps.lock().unwrap().push((
+            session_id.into(),
+            ctx.tool_call_id.to_string(),
+            observed_tool_output_cap(&ctx),
+        ));
         self.probe.calls.lock().unwrap().push(Invocation {
             name: self.name.clone(),
             arguments: args.clone(),
@@ -582,8 +589,8 @@ fn alias_call() -> ToolCall {
         id: CALL.into(),
         tool_type: "function".into(),
         function: FunctionCall {
-            name: "execute_command".into(),
-            arguments: json!({"command": "current-command"}).to_string(),
+            name: "default::exec_command".into(),
+            arguments: json!({"cmd": "current-command"}).to_string(),
         },
     }
 }
@@ -601,13 +608,16 @@ fn current_request(session: &Session) -> PermissionRequest {
 
 fn alias_config() -> Arc<PermissionConfig> {
     let config = Arc::new(PermissionConfig::new());
-    config.set_ask_rules(["Bash(current-command)".into(), "execute_command".into()]);
+    config.set_ask_rules([
+        "Bash(current-command)".into(),
+        "default::exec_command".into(),
+    ]);
     config
 }
 
 async fn alias_pending_fixture() -> (Fixture, Session, PermissionRequest) {
     let fixture = Fixture::new().await;
-    let agent = fixture.registered_agent(alias_config(), &["Bash"]);
+    let agent = fixture.registered_agent(alias_config(), &["exec_command"]);
     *fixture.probe.next_call.lock().unwrap() = Some(alias_call());
     let initial_events =
         events(agent.run_stream(Session::new("alias-pending", "test-model"), "operate")).await;
@@ -617,14 +627,14 @@ async fn alias_pending_fixture() -> (Fixture, Session, PermissionRequest) {
     let pending = agent.load_session("alias-pending").await.unwrap().unwrap();
     assert_eq!(
         pending.pending_question.as_ref().unwrap().tool_name,
-        "execute_command"
+        "default::exec_command"
     );
     assert_eq!(
         pending.pending_question.as_ref().unwrap().source,
         PendingQuestionSource::PauseTool
     );
     let request = current_request(&pending);
-    assert_eq!(request.tool_name, "Bash");
+    assert_eq!(request.tool_name, "exec_command");
     assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
     (fixture, pending, request)
 }
@@ -632,12 +642,12 @@ async fn alias_pending_fixture() -> (Fixture, Session, PermissionRequest) {
 #[tokio::test]
 async fn typed_alias_pending_retains_the_real_original_question_identity() {
     let (fixture, pending, _) = Box::pin(alias_pending_fixture()).await;
-    let agent = fixture.registered_agent(alias_config(), &["Bash"]);
+    let agent = fixture.registered_agent(alias_config(), &["exec_command"]);
     let calls_before = fixture.probe.provider_calls.load(Ordering::SeqCst);
     let waiting = events(agent.resume_stream(pending)).await;
     assert_eq!(waiting.len(), 1);
     assert!(
-        matches!(&waiting[0], AgentEvent::NeedClarification { tool_name: Some(name), .. } if name == "execute_command")
+        matches!(&waiting[0], AgentEvent::NeedClarification { tool_name: Some(name), .. } if name == "default::exec_command")
     );
     assert_eq!(
         fixture.probe.provider_calls.load(Ordering::SeqCst),
@@ -647,11 +657,11 @@ async fn typed_alias_pending_retains_the_real_original_question_identity() {
 }
 
 #[tokio::test]
-async fn typed_alias_approved_replay_reaches_the_registered_bash_owner() {
+async fn typed_alias_approved_replay_reaches_the_registered_exec_owner() {
     let (mut fixture, _, request) = Box::pin(alias_pending_fixture()).await;
     fixture.approve(&request).await;
     fixture.reopen_store().await;
-    let agent = fixture.registered_agent(alias_config(), &["Bash"]);
+    let agent = fixture.registered_agent(alias_config(), &["exec_command"]);
     let session = agent
         .load_session(&request.session_id)
         .await
@@ -665,8 +675,8 @@ async fn typed_alias_approved_replay_reaches_the_registered_bash_owner() {
     )));
     let calls = fixture.probe.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "Bash");
-    assert_eq!(calls[0].arguments, json!({"command": "current-command"}));
+    assert_eq!(calls[0].name, "exec_command");
+    assert_eq!(calls[0].arguments, json!({"cmd": "current-command"}));
     assert_eq!(
         calls[0].generation.as_deref(),
         Some(request.request_generation.as_str())
@@ -677,12 +687,132 @@ async fn typed_alias_approved_replay_reaches_the_registered_bash_owner() {
 }
 
 #[tokio::test]
-async fn typed_alias_exact_custom_owner_cannot_borrow_bash_approval() {
+async fn sdk_approval_replay_does_not_retain_a_completed_original_output_cap_scope() {
+    // Keep the positive limit large enough for the real permission payload.
+    for cap in [0, 4096] {
+        let mut fixture = Fixture::new().await;
+        let agent = fixture.registered_agent(alias_config(), &["exec_command"]);
+        let id = format!("replay-cap-{cap}");
+        let mut session = Session::new(&id, "test-model");
+        session.token_budget = Some(bamboo_domain::TokenBudget {
+            max_tool_output_tokens: cap,
+            ..Default::default()
+        });
+        let mut original_ctx = ToolCtx::none(CALL);
+        original_ctx.session_id = Some(Arc::from(id.as_str()));
+        *fixture.probe.next_call.lock().unwrap() = Some(alias_call());
+
+        // A real original SDK dispatch parks for approval. Its host scope
+        // ends before approval/reload; replay must not resurrect that scalar.
+        scope_tool_output_cap(&id, CALL, Some(cap), async {
+            assert_eq!(observed_tool_output_cap(&original_ctx), Some(cap));
+            Box::pin(agent.run(&mut session, "operate")).await.unwrap();
+            assert_eq!(observed_tool_output_cap(&original_ctx), Some(cap));
+        })
+        .await;
+        assert_eq!(observed_tool_output_cap(&original_ctx), None);
+        assert!(session.pending_question.is_some());
+        assert!(fixture.probe.output_caps.lock().unwrap().is_empty());
+        assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+        let request = current_request(&session);
+        assert_eq!(request.request_id, CALL);
+        let waiting_result_id = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+            .unwrap()
+            .id
+            .clone();
+        fixture.approve(&request).await;
+        fixture.reopen_store().await;
+        let mut reloaded = fixture.reload(&id).await;
+        // Actual V2 loading clears stale Root overrides before SDK replay.
+        assert_eq!(
+            reloaded
+                .token_budget
+                .as_ref()
+                .map(|budget| budget.max_tool_output_tokens),
+            None
+        );
+        let replay_agent = fixture.registered_agent(alias_config(), &["exec_command"]);
+        let provider_calls = fixture.probe.provider_calls.load(Ordering::SeqCst);
+        Box::pin(replay_agent.resume(&mut reloaded)).await.unwrap();
+
+        assert_eq!(
+            *fixture.probe.output_caps.lock().unwrap(),
+            vec![(id.clone(), CALL.into(), None)]
+        );
+        assert_eq!(observed_tool_output_cap(&original_ctx), None);
+        assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 1);
+        assert!(fixture.probe.provider_calls.load(Ordering::SeqCst) > provider_calls);
+        assert!(reloaded.pending_question.is_none());
+        assert!(result_message(&reloaded, &waiting_result_id)["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("REAL OUTPUT"));
+        let calls = fixture.probe.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "exec_command");
+        assert_eq!(calls[0].arguments, json!({"cmd": "current-command"}));
+        assert_eq!(
+            calls[0].generation.as_deref(),
+            Some(request.request_generation.as_str())
+        );
+    }
+}
+
+#[tokio::test]
+async fn approved_alias_is_blocked_after_durable_root_tool_tightening() {
+    let (fixture, _, request) = Box::pin(alias_pending_fixture()).await;
+    let stale = fixture.approve(&request).await;
+    let mut latest = stale.clone();
+    latest.set_root_orchestration_only(true).unwrap();
+    fixture.store.save_session(&latest).await.unwrap();
+
+    let config = alias_config();
+    let agent = fixture.registered_agent(config.clone(), &["exec_command"]);
+    let completed = events(agent.resume_stream(stale)).await;
+    assert!(!completed.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolLifecycle { .. }
+            | AgentEvent::ToolComplete { .. }
+            | AgentEvent::Error { .. }
+    )));
+    assert!(fixture.probe.calls.lock().unwrap().is_empty());
+    assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+    assert!(!config.consume_once_for_generation(
+        &request.session_id,
+        CALL,
+        &request.request_generation,
+        PermissionType::ExecuteCommand,
+        "current-command",
+    ));
+    let saved = fixture.reload(&request.session_id).await;
+    assert!(!saved
+        .metadata
+        .contains_key(PERMISSION_REEXECUTE_METADATA_KEY));
+    assert!(!saved
+        .metadata
+        .contains_key(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY));
+    let result = saved
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+        .unwrap();
+    assert_eq!(result.tool_success, Some(false));
+    assert!(result.content.contains("Root orchestration policy blocked"));
+}
+
+#[tokio::test]
+async fn typed_alias_exact_custom_owner_cannot_borrow_exec_approval() {
     let (fixture, mut pending, request) = Box::pin(alias_pending_fixture()).await;
-    let shadow = fixture.registered_agent(alias_config(), &["Bash", "execute_command"]);
+    let shadow =
+        fixture.registered_agent(alias_config(), &["exec_command", "default::exec_command"]);
     let before = fixture.probe.provider_calls.load(Ordering::SeqCst);
     assert!(Box::pin(shadow.resume(&mut pending)).await.is_err());
-    let mut approved = fixture.approve(&request).await;
+    let mut approved = Box::pin(fixture.approve(&request)).await;
     assert!(Box::pin(shadow.resume(&mut approved)).await.is_err());
     assert!(fixture.probe.calls.lock().unwrap().is_empty());
     assert_eq!(fixture.probe.provider_calls.load(Ordering::SeqCst), before);
@@ -704,10 +834,10 @@ async fn typed_alias_exact_custom_owner_cannot_borrow_bash_approval() {
     );
     assert_eq!(
         pending.pending_question.as_ref().unwrap().tool_name,
-        "execute_command"
+        "default::exec_command"
     );
     let request = current_request(&pending);
-    assert_eq!(request.tool_name, "execute_command");
+    assert_eq!(request.tool_name, "default::exec_command");
     let approved = fixture.approve(&request).await;
     let completed = events(shadow.resume_stream(approved)).await;
     assert!(!completed.iter().any(|event| matches!(
@@ -716,7 +846,7 @@ async fn typed_alias_exact_custom_owner_cannot_borrow_bash_approval() {
     )));
     let calls = fixture.probe.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "execute_command");
+    assert_eq!(calls[0].name, "default::exec_command");
     assert_eq!(
         calls[0].generation.as_deref(),
         Some(request.request_generation.as_str())
@@ -1190,6 +1320,71 @@ struct FailReplaySave {
     attempts: AtomicUsize,
 }
 
+struct FailAfterBlockedCommit {
+    inner: Arc<LockedSessionStore>,
+    attempts: AtomicUsize,
+}
+
+#[async_trait]
+impl RuntimeSessionPersistence for FailAfterBlockedCommit {
+    async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.inner.save_runtime_session(session).await?;
+        if session.messages.iter().any(|message| {
+            message
+                .content
+                .starts_with("Root orchestration policy blocked")
+        }) && self.attempts.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            return Err(std::io::Error::other("injected post-commit replay error"));
+        }
+        Ok(())
+    }
+
+    async fn load_runtime_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+        self.inner.load_runtime_session(id).await
+    }
+}
+
+#[tokio::test]
+async fn sdk_post_commit_blocked_save_error_reloads_consumed_approval_in_caller_snapshot() {
+    let fixture = Fixture::new().await;
+    let (mut pending, request) = parked("post-commit-blocked", true);
+    fixture.repo.save(&mut pending).await.unwrap();
+    let mut approved = fixture.approve(&request).await;
+    let mut latest = approved.clone();
+    latest.set_root_orchestration_only(true).unwrap();
+    fixture.store.save_session(&latest).await.unwrap();
+
+    let persistence = Arc::new(FailAfterBlockedCommit {
+        inner: fixture.persistence.clone(),
+        attempts: AtomicUsize::new(0),
+    });
+    let agent = fixture.agent(
+        Some(Arc::new(PermissionConfig::new())),
+        true,
+        false,
+        Some(persistence.clone()),
+    );
+    let error = Box::pin(agent.resume(&mut approved)).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("injected post-commit replay error"));
+    assert_eq!(persistence.attempts.load(Ordering::SeqCst), 1);
+    assert!(fixture.probe.calls.lock().unwrap().is_empty());
+    assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+    assert!(!approved
+        .metadata
+        .contains_key(PERMISSION_REEXECUTE_METADATA_KEY));
+    let durable = fixture.reload(&request.session_id).await;
+    assert_eq!(replay_state(&approved), replay_state(&durable));
+    assert_eq!(
+        result_message(&approved, "result-current")["tool_success"],
+        false
+    );
+    assert!(Box::pin(agent.resume(&mut approved)).await.is_ok());
+    assert!(fixture.probe.calls.lock().unwrap().is_empty());
+}
+
 #[async_trait]
 impl RuntimeSessionPersistence for FailReplaySave {
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
@@ -1284,6 +1479,9 @@ async fn output_repark_and_plan_save_failures_stop_provider_and_success_events()
             assert!(error
                 .to_string()
                 .contains("injected replay persistence failure"));
+            if plan {
+                assert_eq!(replay_state(&session), before);
+            }
         }
         assert_eq!(persistence.attempts.load(Ordering::SeqCst), 1);
         assert_eq!(

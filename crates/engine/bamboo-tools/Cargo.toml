@@ -4,7 +4,7 @@ version.workspace = true
 edition = "2021"
 rust-version.workspace = true
 description = "Tool execution and integrations for the Bamboo agent framework"
-license = "MIT"
+license = "MIT AND Apache-2.0"
 
 [dependencies]
 bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
@@ -19,10 +19,12 @@ bamboo-plugin-protocol = { path = "../../infra/bamboo-plugin-protocol" }
 bamboo-domain = { path = "../../core/bamboo-domain" }
 serde = { workspace = true }
 serde_json = "1"
-serde_yaml = "0.9"
+schemars = "1.2.2"
+serde_yaml = { package = "serde_norway", version = "=0.9.42" }
 tokio = { version = "1", features = ["full", "test-util"] }
 futures = "0.3"
 async-trait = "0.1"
+bm25 = "=2.3.2"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 thiserror = "2"
@@ -32,6 +34,7 @@ dashmap = "6"
 sha2 = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
+ignore = "0.4"
 globset = "0.4"
 base64 = "0.23"
 url = "2"
@@ -46,3 +49,9 @@ bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure", features =
 bamboo-llm = { path = "../../infra/bamboo-llm" }
 bamboo-config = { path = "../../infra/bamboo-config" }
 bamboo-storage = { path = "../../infra/bamboo-storage" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }

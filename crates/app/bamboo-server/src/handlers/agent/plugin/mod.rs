@@ -25,8 +25,12 @@
 mod api_types;
 mod errors;
 mod handlers;
+mod official_jiandu;
 #[cfg(test)]
 mod tests;
 
 pub use api_types::{InstallPluginRequest, InstalledPluginView, PluginListResponse};
-pub use handlers::{install_plugin, list_plugins, remove_plugin, update_plugin};
+pub use handlers::{
+    install_plugin, list_plugins, plugin_hooks, remove_plugin, review_plugin_hooks, update_plugin,
+};
+pub use official_jiandu::{install_official_jiandu, jiandu_setup};

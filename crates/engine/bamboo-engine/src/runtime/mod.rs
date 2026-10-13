@@ -5,6 +5,7 @@ pub mod complexity_classifier;
 pub mod config;
 pub mod context;
 pub mod execution;
+pub(crate) mod final_evidence;
 pub mod goal_recovery;
 pub mod goal_state;
 pub mod gold_evaluation;

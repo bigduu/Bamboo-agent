@@ -18,7 +18,7 @@ pub use agent::ExecuteRequestBuilder;
 pub use agent::{
     Agent, AgentBuilder, AgentHook, AgentHookPoint, HookPayload, HookResult, HookRunner,
     HookToolOutcome, LifecycleHookEvent, LifecycleHookTestOutput, LifecycleScriptRunner,
-    PermissionMode, RuntimeAgent, RuntimeAgentBuilder, ScriptHook, SdkError,
+    PermissionMode, RuntimeAgent, RuntimeAgentBuilder, ScriptHook, SdkError, SdkSkillInput,
     SessionActivationDisposition, SessionActivationError, SessionActivationLaunch,
     SessionActivationPolicy, SessionActivationPort, SessionActivationReserveOutcome,
     SessionActivationRouter, SessionActivationSpawner, SessionChildOutcome, SessionInboxBacklog,

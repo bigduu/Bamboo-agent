@@ -1,3 +1,4 @@
+use crate::error::ResponseResult;
 use actix_web::{web, HttpResponse};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -8,26 +9,30 @@ use crate::handlers::agent::schedules::types::{CreateScheduleRequest, PatchSched
 use crate::schedule_app::{MisFirePolicy, OverlapPolicy, ScheduleRunConfig, ScheduleTrigger};
 use bamboo_engine::model_config_helper::get_schedule_model_from_config;
 
-pub(super) fn validate_schedule_name(name: &str) -> Result<String, HttpResponse> {
+pub(super) fn validate_schedule_name(name: &str) -> ResponseResult<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Err(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": crate::error::error_value("name is required")
-        })));
+        return Err(HttpResponse::BadRequest()
+            .json(serde_json::json!({
+                "error": crate::error::error_value("name is required")
+            }))
+            .into());
     }
     Ok(trimmed.to_string())
 }
 
-fn validate_interval_seconds(interval_seconds: u64) -> Result<(), HttpResponse> {
+fn validate_interval_seconds(interval_seconds: u64) -> ResponseResult<()> {
     if interval_seconds == 0 {
-        return Err(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": crate::error::error_value("trigger.every_seconds must be > 0")
-        })));
+        return Err(HttpResponse::BadRequest()
+            .json(serde_json::json!({
+                "error": crate::error::error_value("trigger.every_seconds must be > 0")
+            }))
+            .into());
     }
     Ok(())
 }
 
-pub(super) fn validate_schedule_trigger(trigger: &ScheduleTrigger) -> Result<(), HttpResponse> {
+pub(super) fn validate_schedule_trigger(trigger: &ScheduleTrigger) -> ResponseResult<()> {
     match trigger {
         ScheduleTrigger::Interval { every_seconds, .. } => {
             validate_interval_seconds(*every_seconds)
@@ -38,9 +43,11 @@ pub(super) fn validate_schedule_trigger(trigger: &ScheduleTrigger) -> Result<(),
             // (compute_initial_next_run_at) and surface a 500. Reject it here
             // with a 400 instead, mirroring the cron/timezone pre-checks.
             if *at <= Utc::now() {
-                return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": crate::error::error_value("trigger.at must be in the future")
-                })));
+                return Err(HttpResponse::BadRequest()
+                    .json(serde_json::json!({
+                        "error": crate::error::error_value("trigger.at must be in the future")
+                    }))
+                    .into());
             }
             Ok(())
         }
@@ -56,9 +63,11 @@ pub(super) fn validate_schedule_trigger(trigger: &ScheduleTrigger) -> Result<(),
             second,
         } => {
             if weekdays.is_empty() {
-                return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": crate::error::error_value("trigger.weekdays must not be empty")
-                })));
+                return Err(HttpResponse::BadRequest()
+                    .json(serde_json::json!({
+                        "error": crate::error::error_value("trigger.weekdays must not be empty")
+                    }))
+                    .into());
             }
             validate_hms(*hour, *minute, *second)
         }
@@ -69,23 +78,27 @@ pub(super) fn validate_schedule_trigger(trigger: &ScheduleTrigger) -> Result<(),
             second,
         } => {
             if days.is_empty() {
-                return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": crate::error::error_value("trigger.days must not be empty")
-                })));
+                return Err(HttpResponse::BadRequest()
+                    .json(serde_json::json!({
+                        "error": crate::error::error_value("trigger.days must not be empty")
+                    }))
+                    .into());
             }
             if days.iter().any(|day| *day == 0 || *day > 31) {
                 return Err(HttpResponse::BadRequest().json(serde_json::json!({
                     "error": crate::error::error_value("trigger.days values must be between 1 and 31")
-                })));
+                })).into());
             }
             validate_hms(*hour, *minute, *second)
         }
         ScheduleTrigger::Cron { expr } => {
             let expr = expr.trim();
             if expr.is_empty() {
-                return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": crate::error::error_value("trigger.expr is required")
-                })));
+                return Err(HttpResponse::BadRequest()
+                    .json(serde_json::json!({
+                        "error": crate::error::error_value("trigger.expr is required")
+                    }))
+                    .into());
             }
             // Parse with the same `cron::Schedule` the trigger engine uses, so an
             // invalid expression fails here with a 400 instead of deep in the
@@ -93,7 +106,7 @@ pub(super) fn validate_schedule_trigger(trigger: &ScheduleTrigger) -> Result<(),
             if expr.parse::<CronSchedule>().is_err() {
                 return Err(HttpResponse::BadRequest().json(serde_json::json!({
                     "error": crate::error::error_value(format!("trigger.expr is not a valid cron expression: {expr}"))
-                })));
+                })).into());
             }
             Ok(())
         }
@@ -103,12 +116,14 @@ pub(super) fn validate_schedule_trigger(trigger: &ScheduleTrigger) -> Result<(),
 pub(super) fn validate_schedule_window(
     start_at: Option<DateTime<Utc>>,
     end_at: Option<DateTime<Utc>>,
-) -> Result<(), HttpResponse> {
+) -> ResponseResult<()> {
     if let (Some(start_at), Some(end_at)) = (start_at, end_at) {
         if start_at >= end_at {
-            return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                "error": crate::error::error_value("start_at must be earlier than end_at")
-            })));
+            return Err(HttpResponse::BadRequest()
+                .json(serde_json::json!({
+                    "error": crate::error::error_value("start_at must be earlier than end_at")
+                }))
+                .into());
         }
     }
     Ok(())
@@ -121,23 +136,25 @@ pub(super) fn validate_trigger_api_fields(
     end_at: Option<DateTime<Utc>>,
     misfire_policy: Option<MisFirePolicy>,
     overlap_policy: Option<OverlapPolicy>,
-) -> Result<(), HttpResponse> {
+) -> ResponseResult<()> {
     if let Some(trigger) = trigger {
         validate_schedule_trigger(trigger)?;
     }
 
     if let Some(timezone) = timezone.map(str::trim) {
         if timezone.is_empty() {
-            return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                "error": crate::error::error_value("timezone must not be empty when provided")
-            })));
+            return Err(HttpResponse::BadRequest()
+                .json(serde_json::json!({
+                    "error": crate::error::error_value("timezone must not be empty when provided")
+                }))
+                .into());
         }
         // Same `chrono_tz::Tz` parse the trigger engine uses (parse_timezone);
         // reject a bogus zone with a 400 rather than a later 500.
         if timezone.parse::<Tz>().is_err() {
             return Err(HttpResponse::BadRequest().json(serde_json::json!({
                 "error": crate::error::error_value(format!("timezone is not a valid IANA timezone: {timezone}"))
-            })));
+            })).into());
         }
     }
 
@@ -161,7 +178,7 @@ pub(super) struct ResolvedPatchScheduleDefinition {
 
 pub(super) fn resolve_create_schedule_definition(
     req: &CreateScheduleRequest,
-) -> Result<ResolvedCreateScheduleDefinition, HttpResponse> {
+) -> ResponseResult<ResolvedCreateScheduleDefinition> {
     validate_trigger_api_fields(
         Some(&req.trigger),
         req.timezone.as_deref(),
@@ -185,7 +202,7 @@ pub(super) fn resolve_create_schedule_definition(
 
 pub(super) fn resolve_patch_schedule_definition(
     req: &PatchScheduleRequest,
-) -> Result<ResolvedPatchScheduleDefinition, HttpResponse> {
+) -> ResponseResult<ResolvedPatchScheduleDefinition> {
     validate_trigger_api_fields(
         req.trigger.as_ref(),
         req.timezone.as_deref(),
@@ -207,57 +224,84 @@ pub(super) fn resolve_patch_schedule_definition(
     })
 }
 
-fn validate_hms(hour: u8, minute: u8, second: u8) -> Result<(), HttpResponse> {
+fn validate_hms(hour: u8, minute: u8, second: u8) -> ResponseResult<()> {
     if hour > 23 {
-        return Err(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": crate::error::error_value("trigger.hour must be between 0 and 23")
-        })));
+        return Err(HttpResponse::BadRequest()
+            .json(serde_json::json!({
+                "error": crate::error::error_value("trigger.hour must be between 0 and 23")
+            }))
+            .into());
     }
     if minute > 59 {
-        return Err(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": crate::error::error_value("trigger.minute must be between 0 and 59")
-        })));
+        return Err(HttpResponse::BadRequest()
+            .json(serde_json::json!({
+                "error": crate::error::error_value("trigger.minute must be between 0 and 59")
+            }))
+            .into());
     }
     if second > 59 {
-        return Err(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": crate::error::error_value("trigger.second must be between 0 and 59")
-        })));
+        return Err(HttpResponse::BadRequest()
+            .json(serde_json::json!({
+                "error": crate::error::error_value("trigger.second must be between 0 and 59")
+            }))
+            .into());
     }
     Ok(())
+}
+
+pub(super) fn validate_workflow_target(
+    trigger: &ScheduleTrigger,
+    run_config: &ScheduleRunConfig,
+) -> ResponseResult<()> {
+    crate::schedule_app::manager::validate_workflow_schedule_target(trigger, run_config).map_err(
+        |message| {
+            HttpResponse::BadRequest()
+                .json(serde_json::json!({
+                    "error": crate::error::error_value(message)
+                }))
+                .into()
+        },
+    )
 }
 
 pub(super) async fn validate_auto_execute_run_config(
     state: &web::Data<AppState>,
     run_config: &ScheduleRunConfig,
-) -> Result<ScheduleRunConfig, HttpResponse> {
+) -> ResponseResult<ScheduleRunConfig> {
     let mut normalized = run_config.clone();
     if let Some(project_id) = run_config.project_id.as_ref() {
         match state.project_store.get(project_id) {
             Ok(project) if project.status == bamboo_domain::ProjectStatus::Active => {}
             Ok(_) => {
-                return Err(HttpResponse::Conflict().json(serde_json::json!({
-                    "error": {
-                        "type": "api_error",
-                        "code": "project_archived",
-                        "message": "run_config.project_id must reference an active Project"
-                    },
-                    "project_id": project_id,
-                })));
+                return Err(HttpResponse::Conflict()
+                    .json(serde_json::json!({
+                        "error": {
+                            "type": "api_error",
+                            "code": "project_archived",
+                            "message": "run_config.project_id must reference an active Project"
+                        },
+                        "project_id": project_id,
+                    }))
+                    .into());
             }
             Err(bamboo_projects::ProjectStoreError::NotFound(_)) => {
-                return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": crate::error::error_value(
-                        "run_config.project_id references a Project that does not exist"
-                    ),
-                    "project_id": project_id,
-                })));
+                return Err(HttpResponse::BadRequest()
+                    .json(serde_json::json!({
+                        "error": crate::error::error_value(
+                            "run_config.project_id references a Project that does not exist"
+                        ),
+                        "project_id": project_id,
+                    }))
+                    .into());
             }
             Err(error) => {
-                return Err(HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": crate::error::error_value(format!(
-                        "failed to validate run_config.project_id: {error}"
-                    ))
-                })));
+                return Err(HttpResponse::InternalServerError()
+                    .json(serde_json::json!({
+                        "error": crate::error::error_value(format!(
+                            "failed to validate run_config.project_id: {error}"
+                        ))
+                    }))
+                    .into());
             }
         }
     }
@@ -279,37 +323,43 @@ pub(super) async fn validate_auto_execute_run_config(
                 } else {
                     HttpResponse::BadRequest()
                 };
-                return Err(response.json(serde_json::json!({
-                    "error": {
-                        "type": "api_error",
-                        "code": code,
-                        "message": message
-                    },
-                    "workspace": workspace,
-                })));
+                return Err(response
+                    .json(serde_json::json!({
+                        "error": {
+                            "type": "api_error",
+                            "code": code,
+                            "message": message
+                        },
+                        "workspace": workspace,
+                    }))
+                    .into());
             }
             Err(crate::project_context::ProjectWorkspaceValidationError::Conflict {
                 workspace,
                 owner_project_id,
                 session_project_id,
             }) => {
-                return Err(HttpResponse::Conflict().json(serde_json::json!({
-                    "error": {
-                        "type": "api_error",
-                        "code": "project_workspace_conflict",
-                        "message": "Workspace belongs to another Project"
-                    },
-                    "workspace": workspace,
-                    "owner_project_id": owner_project_id,
-                    "session_project_id": session_project_id,
-                })));
+                return Err(HttpResponse::Conflict()
+                    .json(serde_json::json!({
+                        "error": {
+                            "type": "api_error",
+                            "code": "project_workspace_conflict",
+                            "message": "Workspace belongs to another Project"
+                        },
+                        "workspace": workspace,
+                        "owner_project_id": owner_project_id,
+                        "session_project_id": session_project_id,
+                    }))
+                    .into());
             }
             Err(crate::project_context::ProjectWorkspaceValidationError::Store(error)) => {
-                return Err(HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": crate::error::error_value(format!(
-                        "failed to validate run_config.workspace_path: {error}"
-                    ))
-                })));
+                return Err(HttpResponse::InternalServerError()
+                    .json(serde_json::json!({
+                        "error": crate::error::error_value(format!(
+                            "failed to validate run_config.workspace_path: {error}"
+                        ))
+                    }))
+                    .into());
             }
         };
     // Keep omission durable so execution resolves the current Project path.
@@ -325,7 +375,13 @@ pub(super) async fn validate_auto_execute_run_config(
                 .as_deref()
                 .map(bamboo_config::paths::path_to_display_string),
         );
-    if !run_config.auto_execute {
+    if run_config.workflow_target.is_some() {
+        if !run_config.auto_execute || run_config.task_message.is_some() {
+            return Err(HttpResponse::BadRequest().json(serde_json::json!({
+                "error": crate::error::error_value("workflow_target requires auto_execute: true and no task_message")
+            })).into());
+        }
+    } else if !run_config.auto_execute {
         return Ok(normalized);
     }
 
@@ -336,10 +392,10 @@ pub(super) async fn validate_auto_execute_run_config(
         .filter(|value| !value.is_empty())
         .is_some();
 
-    if !has_task {
+    if !has_task && run_config.workflow_target.is_none() {
         return Err(HttpResponse::BadRequest().json(serde_json::json!({
             "error": crate::error::error_value("run_config.task_message is required when auto_execute is true")
-        })));
+        })).into());
     }
 
     let has_explicit_model = run_config
@@ -359,7 +415,7 @@ pub(super) async fn validate_auto_execute_run_config(
                 "run_config.model not provided and no fast/default model configured for provider {}: {}",
                 snapshot.provider, error
             ))
-        })));
+        })).into());
     }
 
     Ok(normalized)

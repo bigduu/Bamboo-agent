@@ -2427,6 +2427,7 @@ mod tests {
             auto_approve_permissions: false,
             session_id: "explicit-default".to_string(),
             workspace_path: None,
+            environment_lease: None,
             inherit_session_grants: false,
             policy: json!({}),
         };
@@ -3452,6 +3453,7 @@ exit 0
                 auto_approve_permissions: true,
                 session_id: "codex-exec-explicit-deny".to_string(),
                 workspace_path: Some(workspace.path().to_string_lossy().into_owned()),
+                environment_lease: None,
                 inherit_session_grants: false,
                 policy: serde_json::to_value(policy).unwrap(),
             });

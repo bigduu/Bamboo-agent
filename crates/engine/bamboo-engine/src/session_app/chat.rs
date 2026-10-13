@@ -191,6 +191,13 @@ pub fn prepare_chat_turn_from_authoritative_session_with_workspace_policy(
     // ---- Resolve enhance prompt ----
     resolve_enhance_prompt(&mut session, input.enhance_prompt.as_deref());
     let enhance_prompt = session.enhance_prompt();
+    if let Some(enabled) = input.root_orchestration_prompt {
+        // Only a root can select this host-owned prompt. The runtime repeats
+        // the same root check before model assembly for persisted sessions.
+        if session.kind == bamboo_domain::SessionKind::Root && session.parent_session_id.is_none() {
+            session.set_root_orchestration_prompt_enabled(enabled);
+        }
+    }
 
     // ---- Resolve workspace path (metadata only, no filesystem) ----
     let allow_legacy_workspace_fallback = matches!(
@@ -213,6 +220,28 @@ pub fn prepare_chat_turn_from_authoritative_session_with_workspace_policy(
         input.selected_skill_ids.as_deref(),
         &input.message,
     )?;
+    if let Some(enabled) = input.root_orchestration_only {
+        session.set_root_orchestration_only(enabled)?;
+    }
+    if session.root_orchestration_only_enabled() {
+        session.validate_root_orchestration_compatibility()?;
+        // A typed Workflow can remain pending or active without a valid
+        // selected-skill mirror. Treat malformed authority as incompatible.
+        let pending = session
+            .metadata
+            .contains_key(WORKFLOW_SELECTION_METADATA_KEY);
+        let active = session
+            .metadata
+            .get(ACTIVE_WORKFLOW_METADATA_KEY)
+            .is_some_and(|raw| {
+                serde_json::from_str::<ActiveWorkflow>(raw)
+                    .map(|workflow| workflow.status != WorkflowActivationStatus::Deactivated)
+                    .unwrap_or(true)
+            });
+        if pending || active {
+            return Err(bamboo_domain::RootToolAuthorityError::WorkflowSelected.into());
+        }
+    }
     if let Some(opted_in) = input.orchestration_opt_in {
         session.metadata.insert(
             WORKFLOW_ORCHESTRATION_OPT_IN_METADATA_KEY.to_string(),
@@ -905,6 +934,8 @@ mod tests {
             message: "hello".to_string(),
             system_prompt: Some("Base prompt".to_string()),
             enhance_prompt: enhance_prompt.map(ToString::to_string),
+            root_orchestration_prompt: None,
+            root_orchestration_only: None,
             workspace_path: None,
             permission_mode: None,
             default_workspace_path: None,
@@ -1205,6 +1236,186 @@ mod tests {
             .metadata
             .get(PROMPT_COMPONENT_FLAGS_KEY)
             .is_some_and(|flags| flags.contains("enhance=0")));
+    }
+
+    #[test]
+    fn root_orchestration_selection_survives_omitted_resume_and_can_be_cleared() {
+        let mut start = chat_turn_input(None);
+        start.root_orchestration_prompt = Some(true);
+        let started =
+            prepare_chat_turn_from_authoritative_session(None, start, "", "Builtin fallback")
+                .expect("start opted-in root");
+        assert!(started.root_orchestration_prompt_enabled());
+
+        let reloaded = serde_json::from_str(&serde_json::to_string(&started).unwrap())
+            .expect("reload persisted session");
+        let resumed = prepare_chat_turn_from_authoritative_session(
+            Some(reloaded),
+            chat_turn_input(None),
+            "",
+            "Builtin fallback",
+        )
+        .expect("resume without changing selection");
+        assert!(resumed.root_orchestration_prompt_enabled());
+
+        let mut disable = chat_turn_input(None);
+        disable.root_orchestration_prompt = Some(false);
+        let disabled = prepare_chat_turn_from_authoritative_session(
+            Some(resumed),
+            disable,
+            "",
+            "Builtin fallback",
+        )
+        .expect("disable root guidance");
+        assert!(!disabled.root_orchestration_prompt_enabled());
+    }
+
+    #[test]
+    fn root_tool_selection_persists_on_resume_and_explicit_disable() {
+        let mut start = chat_turn_input(None);
+        start.root_orchestration_only = Some(true);
+        let selected =
+            prepare_chat_turn_from_authoritative_session(None, start, "", "Builtin fallback")
+                .expect("select Root tool authority");
+        assert!(selected.root_orchestration_only_enabled());
+        assert!(!selected.root_orchestration_prompt_enabled());
+        assert_eq!(selected.root_tool_authority_revision, 1);
+
+        let reloaded: Session = serde_json::from_str(&serde_json::to_string(&selected).unwrap())
+            .expect("reload durable selection");
+        let resumed = prepare_chat_turn_from_authoritative_session(
+            Some(reloaded),
+            chat_turn_input(None),
+            "",
+            "Builtin fallback",
+        )
+        .expect("omission preserves selection");
+        assert!(resumed.root_orchestration_only_enabled());
+        assert_eq!(resumed.root_tool_authority_revision, 1);
+
+        let mut disable = chat_turn_input(None);
+        disable.root_orchestration_only = Some(false);
+        let disabled = prepare_chat_turn_from_authoritative_session(
+            Some(resumed),
+            disable,
+            "",
+            "Builtin fallback",
+        )
+        .expect("explicit disable");
+        assert!(!disabled.root_orchestration_only_enabled());
+        assert_eq!(disabled.root_tool_authority_revision, 2);
+
+        let child = Session::new_child_of("root-child", &disabled, "model", "child");
+        for enabled in [false, true] {
+            let mut input = chat_turn_input(None);
+            input.session_id = child.id.clone();
+            input.root_orchestration_only = Some(enabled);
+            assert!(matches!(
+                prepare_chat_turn_from_authoritative_session(
+                    Some(child.clone()),
+                    input,
+                    "",
+                    "Builtin fallback"
+                ),
+                Err(ChatError::RootToolAuthority(
+                    bamboo_domain::RootToolAuthorityError::NotRoot
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn root_tool_selection_rejects_workflow_and_plan_before_persistence() {
+        let mut selected = Session::new("session-enhance", "model");
+        selected.set_root_orchestration_only(true).unwrap();
+        let mut skill_request = chat_turn_input(None);
+        skill_request.selected_skill_ids = Some(vec!["review".into()]);
+        assert!(matches!(
+            prepare_chat_turn_from_authoritative_session(
+                Some(selected.clone()),
+                skill_request,
+                "",
+                "Builtin fallback"
+            ),
+            Err(ChatError::RootToolAuthority(
+                bamboo_domain::RootToolAuthorityError::WorkflowSelected
+            ))
+        ));
+
+        let selection = WorkflowSelection {
+            id: "review".into(),
+            source: bamboo_skills::WorkflowSource::Builtin,
+            revision: 1,
+            args: serde_json::json!({}),
+        };
+        let mut workflow_request = chat_turn_input(None);
+        workflow_request.workflow_selection = Some(selection.clone());
+        assert!(matches!(
+            prepare_chat_turn_from_authoritative_session(
+                Some(selected.clone()),
+                workflow_request,
+                "",
+                "Builtin fallback"
+            ),
+            Err(ChatError::RootToolAuthority(
+                bamboo_domain::RootToolAuthorityError::WorkflowSelected
+            ))
+        ));
+
+        let mut disable_and_select = chat_turn_input(None);
+        disable_and_select.root_orchestration_only = Some(false);
+        disable_and_select.workflow_selection = Some(selection);
+        let switched = prepare_chat_turn_from_authoritative_session(
+            Some(selected),
+            disable_and_select,
+            "",
+            "Builtin fallback",
+        )
+        .expect("explicit disable permits a Workflow selection");
+        assert!(!switched.root_orchestration_only_enabled());
+        assert_eq!(switched.selected_skill_ids(), Some(vec!["review".into()]));
+
+        let mut malformed = Session::new("session-enhance", "model");
+        malformed
+            .metadata
+            .insert(WORKFLOW_SELECTION_METADATA_KEY.into(), "{".into());
+        let mut enable = chat_turn_input(None);
+        enable.root_orchestration_only = Some(true);
+        assert!(matches!(
+            prepare_chat_turn_from_authoritative_session(
+                Some(malformed),
+                enable,
+                "",
+                "Builtin fallback"
+            ),
+            Err(ChatError::RootToolAuthority(
+                bamboo_domain::RootToolAuthorityError::WorkflowSelected
+            ))
+        ));
+
+        let mut legacy_plan = Session::new("session-enhance", "model");
+        legacy_plan.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState {
+            plan_mode: Some(bamboo_domain::PlanModeState {
+                entered_at: chrono::Utc::now(),
+                pre_permission_mode: "default".into(),
+                plan_file_path: None,
+                status: bamboo_domain::PlanModeStatus::Exploring,
+            }),
+            ..bamboo_domain::AgentRuntimeState::default()
+        });
+        let mut enable = chat_turn_input(None);
+        enable.root_orchestration_only = Some(true);
+        assert!(matches!(
+            prepare_chat_turn_from_authoritative_session(
+                Some(legacy_plan),
+                enable,
+                "",
+                "Builtin fallback"
+            ),
+            Err(ChatError::RootToolAuthority(
+                bamboo_domain::RootToolAuthorityError::LegacyPlanActive
+            ))
+        ));
     }
 
     #[test]

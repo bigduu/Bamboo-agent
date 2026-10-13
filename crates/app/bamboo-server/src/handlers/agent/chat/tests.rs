@@ -59,11 +59,18 @@ fn chat_request_model_field_is_optional_string() {
 #[test]
 fn chat_request_blank_model_trims_to_empty() {
     let request = ChatRequest {
+        message_id: None,
+        thread_id: None,
+        in_reply_to: None,
+        correlation_id: None,
         message: "Hello".to_string(),
         session_id: None,
         project_id: None,
         system_prompt: None,
         enhance_prompt: None,
+        root_orchestration_prompt: None,
+        root_orchestration_only: None,
+        thinking_mode: None,
         workspace_path: None,
         selected_skill_ids: None,
         workflow_selection: None,

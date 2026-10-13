@@ -14,26 +14,37 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use bamboo_subagent::{AgentRef, InboxKind, InboxMessage, MsgId};
+use bamboo_subagent::{AgentRef, AskBody, InboxKind, InboxMessage, MsgId, ReplyBody};
 use chrono::Utc;
 use futures_util::SinkExt;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::client::{send_close, ReaderLifecycle, WsSink, CLIENT_SHUTDOWN_TIMEOUT};
 use crate::error::{BrokerError, BrokerResult};
 use crate::proto::ClientFrame;
 
-/// Bound on the delivery-receipt wait (mirrors `client::DELIVER_RECEIPT_TIMEOUT`).
-const DELIVER_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
+const CANCEL_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+const ORPHAN_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 
-type Pending = Arc<StdMutex<HashMap<MsgId, oneshot::Sender<InboxMessage>>>>;
+struct ReplyWaiter {
+    target: String,
+    kind: InboxKind,
+    sender: oneshot::Sender<InboxMessage>,
+}
+
+type Pending = Arc<StdMutex<HashMap<MsgId, ReplyWaiter>>>;
 
 struct PendingRequest {
     pending: Pending,
     id: MsgId,
+    sink: Arc<Mutex<WsSink>>,
+    target: String,
+    sent: bool,
+    replied: bool,
 }
 
 impl Drop for PendingRequest {
@@ -42,6 +53,23 @@ impl Drop for PendingRequest {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&self.id);
+        if self.sent && !self.replied {
+            let sink = Arc::clone(&self.sink);
+            let target = self.target.clone();
+            let id = self.id.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let frame = ClientFrame::Cancel {
+                        to: target,
+                        correlation_id: id,
+                    };
+                    let _ = tokio::time::timeout(CANCEL_SEND_TIMEOUT, async {
+                        sink.lock().await.send(Message::text(frame.to_text())).await
+                    })
+                    .await;
+                });
+            }
+        }
     }
 }
 
@@ -54,12 +82,16 @@ pub struct MultiplexedClient {
     /// detaching it behind its supervisor. #788.
     reader: ReaderLifecycle,
     /// Locked only for the duration of one frame write — never across a reply wait.
-    sink: Mutex<WsSink>,
+    sink: Arc<Mutex<WsSink>>,
     /// correlation_id (== the request msg.id) -> reply waiter.
     pending: Pending,
-    /// Delivery receipts. Consumed one-at-a-time (any receipt confirms enqueue —
-    /// receipts are FIFO over one socket), so concurrent sends don't race it.
+    /// Delivery sends and their exact receipt correlation are serialized. Reply
+    /// waits never hold this lock, so independent requests still overlap.
+    delivery_lock: Mutex<()>,
     delivered: Mutex<mpsc::UnboundedReceiver<MsgId>>,
+    errors: Mutex<mpsc::UnboundedReceiver<(MsgId, String)>>,
+    ack_lock: Mutex<()>,
+    ack_results: Mutex<mpsc::UnboundedReceiver<(MsgId, MsgId, bool, Option<String>)>>,
     /// Shared with the (still-running) background reader; flips false when it dies.
     reader_alive: Arc<AtomicBool>,
     /// The correlation router; ends when `messages` closes (reader death) or when
@@ -77,26 +109,51 @@ impl MultiplexedClient {
         sink: WsSink,
         mut messages: mpsc::UnboundedReceiver<InboxMessage>,
         delivered: mpsc::UnboundedReceiver<MsgId>,
+        errors: mpsc::UnboundedReceiver<(MsgId, String)>,
+        ack_results: mpsc::UnboundedReceiver<(MsgId, MsgId, bool, Option<String>)>,
         reader_alive: Arc<AtomicBool>,
         me: AgentRef,
     ) -> Self {
         let pending: Pending = Arc::new(StdMutex::new(HashMap::new()));
         let routed = pending.clone();
+        let sink = Arc::new(Mutex::new(sink));
+        let router_sink = Arc::clone(&sink);
         let router = tokio::spawn(async move {
             while let Some(msg) = messages.recv().await {
                 if let Some(cid) = msg.correlation_id.clone() {
-                    if let Some(tx) = routed
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .remove(&cid)
-                    {
-                        let _ = tx.send(msg);
+                    let (waiter, active_invalid) = {
+                        let mut pending = routed.lock().unwrap_or_else(|error| error.into_inner());
+                        match pending.get(&cid) {
+                            Some(waiter)
+                                if waiter.kind == msg.kind
+                                    && waiter.target == msg.from.session_id =>
+                            {
+                                (pending.remove(&cid), false)
+                            }
+                            Some(_) => (None, true),
+                            None => (None, false),
+                        }
+                    };
+                    if active_invalid {
+                        // A forged or malformed correlation cannot consume
+                        // the real request's waiter or its durable message.
                         continue;
                     }
+                    if let Some(waiter) = waiter {
+                        match waiter.sender.send(msg) {
+                            Ok(()) => continue,
+                            Err(returned) => {
+                                // The caller was cancelled after the router
+                                // removed its waiter. Treat the reply as late.
+                                retire_orphan_reply(&router_sink, &returned).await;
+                                continue;
+                            }
+                        }
+                    }
                 }
-                // No waiter: a late reply whose request already timed out and
-                // unregistered, or a stray. Drop it.
-                tracing::debug!("mcp mux: dropping uncorrelated/late reply");
+                // Only our namespaced, abandoned request ids are safe to
+                // retire. Other mailbox traffic belongs to its own consumer.
+                retire_orphan_reply(&router_sink, &msg).await;
             }
             // `messages` closed == the reader exited == the connection is dead.
             // Drop every pending sender so all in-flight waiters resolve to an
@@ -109,9 +166,13 @@ impl MultiplexedClient {
 
         Self {
             reader,
-            sink: Mutex::new(sink),
+            sink,
             pending,
+            delivery_lock: Mutex::new(()),
             delivered: Mutex::new(delivered),
+            errors: Mutex::new(errors),
+            ack_lock: Mutex::new(()),
+            ack_results: Mutex::new(ack_results),
             reader_alive,
             router,
             me,
@@ -123,7 +184,10 @@ impl MultiplexedClient {
     /// direct-abort fallback if this future is cancelled or cleanup stalls.
     pub async fn close(mut self) -> BrokerResult<()> {
         self.reader.mark_intentional_shutdown();
-        let close_result = send_close(self.sink.get_mut()).await;
+        let close_result = {
+            let mut sink = self.sink.lock().await;
+            send_close(&mut sink).await
+        };
         self.reader.shutdown().await;
 
         if tokio::time::timeout(CLIENT_SHUTDOWN_TIMEOUT, &mut self.router)
@@ -141,9 +205,7 @@ impl MultiplexedClient {
         self.reader_alive.load(Ordering::SeqCst)
     }
 
-    /// Send a `kind`/`body` request to `target` and await its correlated reply,
-    /// concurrently with any other in-flight requests. The reply wait holds NO
-    /// lock, so N concurrent calls overlap their round-trips.
+    /// Send an MCP request and return its durably acknowledged MCP reply.
     pub async fn request(
         &self,
         target: &str,
@@ -151,8 +213,81 @@ impl MultiplexedClient {
         body: Value,
         timeout: Duration,
     ) -> BrokerResult<Value> {
+        let reply_kind = match kind {
+            InboxKind::McpRequest => InboxKind::McpReply,
+            InboxKind::Ask => InboxKind::Reply,
+            _ => {
+                return Err(BrokerError::Protocol(
+                    "unsupported multiplexed request kind".into(),
+                ))
+            }
+        };
+        self.request_validated(target, kind, body, reply_kind, timeout, |body| {
+            match reply_kind {
+                InboxKind::McpReply => {
+                    serde_json::from_value::<crate::mcp::McpReply>(body.clone()).map_err(
+                        |error| BrokerError::Protocol(format!("bad MCP reply body: {error}")),
+                    )?;
+                }
+                InboxKind::Reply => {
+                    serde_json::from_value::<ReplyBody>(body.clone()).map_err(|error| {
+                        BrokerError::Protocol(format!("bad reply body: {error}"))
+                    })?;
+                }
+                _ => unreachable!("reply kind was checked above"),
+            }
+            Ok(body.clone())
+        })
+        .await
+    }
+
+    /// Ask on this caller's one subscribed connection. A typed Reply is parsed
+    /// before ACK so a malformed answer remains recoverable.
+    pub async fn ask(
+        &self,
+        target: &str,
+        question: &str,
+        mode: bamboo_subagent::AskMode,
+        timeout: Duration,
+    ) -> BrokerResult<String> {
+        let body = serde_json::to_value(AskBody {
+            question: question.to_owned(),
+            mode,
+        })
+        .expect("AskBody serializes");
+        self.request_validated(
+            target,
+            InboxKind::Ask,
+            body,
+            InboxKind::Reply,
+            timeout,
+            |body| {
+                let reply: ReplyBody = serde_json::from_value(body.clone())
+                    .map_err(|error| BrokerError::Protocol(format!("bad reply body: {error}")))?;
+                Ok(reply.answer)
+            },
+        )
+        .await
+    }
+
+    async fn request_validated<T>(
+        &self,
+        target: &str,
+        kind: InboxKind,
+        body: Value,
+        reply_kind: InboxKind,
+        timeout: Duration,
+        parse: impl FnOnce(&Value) -> BrokerResult<T>,
+    ) -> BrokerResult<T> {
+        let prefix = if kind == InboxKind::Ask {
+            "broker-ask-"
+        } else {
+            "broker-mcp-"
+        };
         let msg = InboxMessage {
-            id: MsgId::new(),
+            // The namespace lets a later connection retire only replies to
+            // requests owned by this driver, preserving other mailbox traffic.
+            id: MsgId(format!("{prefix}{}", MsgId::new().as_str())),
             from: self.me.clone(),
             kind,
             body,
@@ -167,42 +302,57 @@ impl MultiplexedClient {
         self.pending
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(qid.clone(), tx);
+            .insert(
+                qid.clone(),
+                ReplyWaiter {
+                    target: target.to_owned(),
+                    kind: reply_kind,
+                    sender: tx,
+                },
+            );
         // Register cleanup before the first await: caller cancellation can
         // happen while waiting for a receipt or a reply, not only at timeout.
-        let _pending_request = PendingRequest {
+        let mut pending_request = PendingRequest {
             pending: self.pending.clone(),
             id: qid.clone(),
+            sink: Arc::clone(&self.sink),
+            target: target.to_owned(),
+            sent: false,
+            replied: false,
         };
-
-        if let Err(e) = self.deliver(target, msg).await {
-            self.pending
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .remove(&qid);
-            return Err(e);
-        }
-
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(reply)) => Ok(reply.body),
-            Ok(Err(_)) => {
-                // Sender dropped == the router cleared pending == connection dead.
-                self.pending
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .remove(&qid);
-                Err(BrokerError::Transport(
-                    "connection closed before reply".into(),
-                ))
+        // One absolute deadline covers lock admission, exact delivery receipt,
+        // reply routing and exact durable ACK. The Drop guard handles caller
+        // cancellation at any await in the sequence.
+        let deadline = Instant::now() + timeout;
+        let result = tokio::time::timeout_at(deadline, async {
+            pending_request.sent = true; // a cancelled send is uncertain
+            self.deliver_exact(target, msg).await?;
+            let reply = rx
+                .await
+                .map_err(|_| BrokerError::Transport("connection closed before reply".into()))?;
+            pending_request.replied = true;
+            let parsed = parse(&reply.body)?;
+            self.ack_confirmed(reply.id).await?;
+            Ok(parsed)
+        })
+        .await;
+        match result {
+            Ok(Err(BrokerError::Rejected(reason))) => {
+                // The broker definitively did not enqueue this request.
+                // A scoped peer may not be allowed to send Cancel, and there
+                // is no worker run to cancel after an explicit rejection.
+                pending_request.sent = false;
+                Err(BrokerError::Rejected(reason))
             }
+            Ok(result) => result,
             Err(_) => {
-                // Timed out: drop our waiter so a late reply isn't mis-routed, and
-                // tell the worker to stop the abandoned run (out-of-band, #50 parity).
-                self.pending
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .remove(&qid);
-                let _ = self.cancel(target, &qid).await;
+                // Best effort cancellation is bounded separately. Disarm the
+                // Drop path to avoid sending the same signal twice.
+                if pending_request.sent && !pending_request.replied {
+                    let _ =
+                        tokio::time::timeout(CANCEL_SEND_TIMEOUT, self.cancel(target, &qid)).await;
+                    pending_request.sent = false;
+                }
                 Err(BrokerError::Transport(format!(
                     "request to '{target}' timed out after {timeout:?}"
                 )))
@@ -210,20 +360,8 @@ impl MultiplexedClient {
         }
     }
 
-    /// Send a `Deliver` frame (under the brief sink lock), then consume ONE
-    /// delivery receipt (serialized on `delivered`).
-    ///
-    /// Under concurrency the receipt consumed may be a DIFFERENT in-flight
-    /// deliver's (receipts are FIFO over one socket; we take the next one, not a
-    /// by-id match). So this confirms "the connection is live and *some*
-    /// concurrent deliver was enqueued", not necessarily THIS message's. That is
-    /// safe ONLY because the sole caller, `request()`, ignores this returned id
-    /// and gates real success on the correlated REPLY (with its own timeout): a
-    /// frame that was secretly dropped simply produces no reply → a timeout, never
-    /// a false success. INVARIANT: keep `deliver` private and `request` its only
-    /// consumer — a caller that trusted the receipt as a per-message ack would be
-    /// wrong under concurrency.
-    async fn deliver(&self, to: &str, message: InboxMessage) -> BrokerResult<MsgId> {
+    async fn deliver_exact(&self, to: &str, message: InboxMessage) -> BrokerResult<()> {
+        let _delivery = self.delivery_lock.lock().await;
         let id = message.id.clone();
         let frame = ClientFrame::Deliver {
             to: to.into(),
@@ -236,14 +374,58 @@ impl MultiplexedClient {
                 .map_err(|e| BrokerError::Transport(format!("ws send: {e}")))?;
         }
         let mut delivered = self.delivered.lock().await;
-        match tokio::time::timeout(DELIVER_RECEIPT_TIMEOUT, delivered.recv()).await {
-            Ok(Some(_)) => Ok(id),
-            Ok(None) => Err(BrokerError::Transport(
-                "connection closed before delivery receipt".into(),
-            )),
-            Err(_) => Err(BrokerError::Transport(
-                "timed out waiting for delivery receipt from broker".into(),
-            )),
+        let mut errors = self.errors.lock().await;
+        loop {
+            tokio::select! {
+                biased;
+                error = errors.recv() => match error {
+                    Some((received, reason)) if received == id => return Err(BrokerError::Rejected(reason)),
+                    Some(_) => continue,
+                    None => return Err(BrokerError::Transport("connection closed before delivery receipt".into())),
+                },
+                receipt = delivered.recv() => match receipt {
+                    Some(received) if received == id => return Ok(()),
+                    Some(_) => continue,
+                    None => return Err(BrokerError::Transport("connection closed before delivery receipt".into())),
+                },
+            }
+        }
+    }
+
+    async fn ack_confirmed(&self, id: MsgId) -> BrokerResult<()> {
+        let _ack = self.ack_lock.lock().await;
+        let request_id = MsgId::new();
+        let frame = ClientFrame::AckWithReceipt {
+            id: id.clone(),
+            request_id: request_id.clone(),
+        };
+        self.sink
+            .lock()
+            .await
+            .send(Message::text(frame.to_text()))
+            .await
+            .map_err(|error| BrokerError::Transport(format!("ws send: {error}")))?;
+        let mut results = self.ack_results.lock().await;
+        loop {
+            match results.recv().await {
+                Some((received, request, accepted, reason))
+                    if received == id && request == request_id =>
+                {
+                    return if accepted {
+                        Ok(())
+                    } else {
+                        Err(BrokerError::Rejected(
+                            reason.unwrap_or_else(|| "broker rejected durable ACK".into()),
+                        ))
+                    };
+                }
+                Some(_) => continue,
+                None => {
+                    return Err(BrokerError::Transport(
+                        "connection closed before ACK receipt".into(),
+                    ))
+                }
+            }
         }
     }
 
@@ -258,6 +440,41 @@ impl MultiplexedClient {
             .await
             .map_err(|e| BrokerError::Transport(format!("ws send: {e}")))
     }
+}
+
+fn owned_reply(message: &InboxMessage) -> bool {
+    let Some(correlation) = message.correlation_id.as_ref() else {
+        return false;
+    };
+    let prefix = match message.kind {
+        InboxKind::Reply if serde_json::from_value::<ReplyBody>(message.body.clone()).is_ok() => {
+            "broker-ask-"
+        }
+        InboxKind::McpReply
+            if serde_json::from_value::<crate::mcp::McpReply>(message.body.clone()).is_ok() =>
+        {
+            "broker-mcp-"
+        }
+        _ => return false,
+    };
+    correlation
+        .as_str()
+        .strip_prefix(prefix)
+        .is_some_and(|suffix| uuid::Uuid::parse_str(suffix).is_ok())
+}
+
+async fn retire_orphan_reply(sink: &Arc<Mutex<WsSink>>, message: &InboxMessage) {
+    if !owned_reply(message) {
+        tracing::debug!("broker mux: leaving unrelated durable message unacknowledged");
+        return;
+    }
+    let frame = ClientFrame::Ack {
+        id: message.id.clone(),
+    };
+    let _ = tokio::time::timeout(ORPHAN_ACK_TIMEOUT, async {
+        sink.lock().await.send(Message::text(frame.to_text())).await
+    })
+    .await;
 }
 
 impl Drop for MultiplexedClient {

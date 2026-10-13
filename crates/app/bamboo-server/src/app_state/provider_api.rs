@@ -72,7 +72,7 @@ impl AppState {
         }
     }
 
-    /// Shutdown all MCP servers gracefully
+    /// Shut down Child runtimes and MCP servers gracefully.
     ///
     /// Sends shutdown signals to all running MCP server processes
     /// and waits for them to terminate cleanly.
@@ -85,6 +85,9 @@ impl AppState {
         // Stop the supervised MCP proxy service (issue #47) so its reconnect
         // supervisor exits cleanly instead of looping after an intended stop.
         self.mcp_proxy_shutdown.cancel();
+        if let Err(error) = self.external_child_runner.shutdown().await {
+            tracing::warn!(%error, "Child runtime shutdown did not complete cleanly");
+        }
         self.mcp_manager.shutdown_all().await;
         tracing::info!("MCP servers shut down complete");
     }
@@ -196,7 +199,18 @@ mod tests {
 
     #[tokio::test]
     async fn model_ref_copilot_returns_provider() {
-        let (_temp, state) = make_state().await;
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = bamboo_config::Config::default();
+        config.default_provider_instance = Some("copilot".into());
+        config.provider_instances.insert(
+            "copilot".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"copilot", "model":"gpt-4o", "runtime_models":["gpt-4o"]
+            }))
+            .unwrap(),
+        );
+        config.save_to_dir(temp.path().to_path_buf()).unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         let target = bamboo_domain::ProviderModelRef::new("copilot", "gpt-4o");
         let result = state.get_provider_for_model_ref(&target);
         assert!(result.is_ok(), "copilot provider should be routable");
@@ -378,10 +392,7 @@ mod tests {
             state.browser.state(other).await.unwrap()["page_epoch"],
             other_state["page_epoch"]
         );
-        assert_eq!(
-            state.browser.state(other).await.unwrap()["url"],
-            "about:blank"
-        );
+        assert_eq!(state.browser.state(other).await.unwrap()["url"], "");
 
         let stale_url = dispatch("document.title", epoch, &format!("{url}other"));
         let mut context = ToolExecutionContext::none(&stale_url.id);

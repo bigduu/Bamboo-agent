@@ -1,3 +1,4 @@
+use crate::error::ResponseResult;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -227,14 +228,15 @@ async fn clone_target_scope(
     app_state: &AppState,
     target: CloneWorkflowTarget,
     session_id: Option<&str>,
-) -> Result<CloneTargetScope, HttpResponse> {
+) -> ResponseResult<CloneTargetScope> {
     match target {
         CloneWorkflowTarget::User => {
             if session_id.is_some_and(|value| !value.trim().is_empty()) {
                 return Err(fixed_clone_error(
                     StatusCode::BAD_REQUEST,
                     "session_id is only valid for a Project Workflow clone",
-                ));
+                )
+                .into());
             }
             let store = app_state
                 .skill_manager
@@ -286,13 +288,13 @@ async fn clone_target_scope(
                     return Err(fixed_clone_error(
                         StatusCode::BAD_REQUEST,
                         "Project Workflow clone requires an assigned Project",
-                    ));
+                    ).into());
                 }
                 bamboo_engine::project_context::SessionProjectIdentity::Invalid { .. } => {
                     return Err(fixed_clone_error(
                         StatusCode::CONFLICT,
                         "Session Project/workspace assignment is invalid",
-                    ));
+                    ).into());
                 }
             };
             let persisted_workspace = (session
@@ -403,7 +405,7 @@ pub async fn clone_workflow(
     .await
     {
         Ok(scope) => scope,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     if let Err(error) = scope.store.reload().await {
         tracing::error!(%error, "failed to reload Workflow clone source catalog");

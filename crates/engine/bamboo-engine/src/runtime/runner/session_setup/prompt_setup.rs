@@ -684,6 +684,34 @@ pub(crate) fn migrate_legacy_workspace_prompt(session: &mut Session) -> bool {
         .iter_mut()
         .filter(|message| matches!(message.role, bamboo_agent_core::Role::System))
     {
+        // A marker-free System message is already canonical. The stripping
+        // helpers trim their input even when they find no generated section;
+        // doing that after a Child's running checkpoint changes its transcript
+        // bytes and makes the Host's broker terminal receipt unprovable.
+        let has_legacy_section = [
+            (PROJECT_CONTEXT_START_MARKER, PROJECT_CONTEXT_END_MARKER),
+            (WORKSPACE_CONTEXT_START_MARKER, WORKSPACE_CONTEXT_END_MARKER),
+            (
+                INSTRUCTION_CONTEXT_START_MARKER,
+                INSTRUCTION_CONTEXT_END_MARKER,
+            ),
+            (ENV_CONTEXT_START_MARKER, ENV_CONTEXT_END_MARKER),
+            (
+                "<!-- BAMBOO_SKILL_CONTEXT_START -->",
+                "<!-- BAMBOO_SKILL_CONTEXT_END -->",
+            ),
+            (
+                "<!-- BAMBOO_TOOL_GUIDE_START -->",
+                "<!-- BAMBOO_TOOL_GUIDE_END -->",
+            ),
+        ]
+        .iter()
+        .any(|(start, end)| strip_wrapped_section(&message.content, start, end).is_some())
+            || crate::runtime::context::legacy_unwrapped_workspace_context_bounds(&message.content)
+                .is_some();
+        if !has_legacy_section {
+            continue;
+        }
         if authoritative_path.is_none() && recovered_path.is_none() {
             recovered_path = extract_workspace_context(&message.content)
                 .as_deref()
@@ -862,6 +890,9 @@ fn strip_exact_generated_section(prompt: &str, section: &str) -> String {
 }
 
 fn strip_project_context(prompt: &str) -> String {
+    if !prompt.contains(PROJECT_CONTEXT_START_MARKER) {
+        return prompt.to_string();
+    }
     let mut current = prompt.trim().to_string();
     loop {
         let Some(stripped) = strip_wrapped_section(

@@ -14,6 +14,7 @@
 
 pub mod codex_discovery;
 pub mod discovery;
+pub mod environment;
 pub mod error;
 pub mod executor;
 pub mod executor_util;
@@ -37,8 +38,8 @@ pub use mailbox::{
     ReplyBody, ADMITTED_SET_CAPACITY,
 };
 pub use proto::{
-    ActorEventBatch, ActorEventBatcher, ActorEventQos, AgentRecord, ChildFrame,
-    LogicalSessionIdentity, ParentFrame, RunSpec, SessionMessageAdmissionConfirmation,
+    ActorEventBatch, ActorEventBatcher, ActorEventQos, ActorEventWatermark, AgentRecord,
+    ChildFrame, LogicalSessionIdentity, ParentFrame, RunSpec, SessionMessageAdmissionConfirmation,
     SessionMessageDelivery, TerminalStatus, MAX_ACTOR_EVENT_BATCH_EVENTS,
 };
 pub use provision::{
@@ -50,4 +51,6 @@ pub use store::{
     ChildEntry, ChildFields, ChildStatus, ChildrenIndex, MetaExtractor, ProjectIndex, ProjectKey,
     RootEntry, RootFields, SessionLoc, SubagentStore,
 };
-pub use transport::{ChildClient, ChildLink, TransportError, TransportResult, WsServer};
+pub use transport::{
+    ChildClient, ChildLink, DurableChildDeliveryReceipt, TransportError, TransportResult, WsServer,
+};

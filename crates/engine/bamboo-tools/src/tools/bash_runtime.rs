@@ -1,3 +1,6 @@
+use crate::local_task_resources::{
+    InitialHandoff, InitialWait, LocalTaskResources, ManagedBashChild, ResourceTask,
+};
 use bamboo_agent_core::{AgentEvent, BashCompletionInfo, BashCompletionSink};
 use bamboo_infrastructure::process::{
     build_command_environment, decode_process_line_lossy, hide_window_for_tokio_command,
@@ -19,6 +22,8 @@ use tokio::sync::Notify;
 use tokio::time::{sleep, timeout, Duration};
 use tracing::warn;
 
+use super::exec_command::{pump_polled_stream, PolledShellState};
+
 /// Per-stream line cap for a background shell's captured output, AND for the
 /// foreground promotion-seed buffers (`bash.rs`). Shared so a chatty command
 /// can't balloon memory before it promotes (issue #84, phase 2d).
@@ -35,6 +40,7 @@ const COMPLETION_TAIL_MAX_BYTES: usize = 4096;
 /// buffer, child not draining) cannot pin the stdin mutex — and thus block any
 /// queued writer — indefinitely. A timeout surfaces a clear error instead.
 const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+type PolledCapture = (Arc<PolledShellState>, Arc<Mutex<Option<ChildStdin>>>);
 
 #[derive(Debug)]
 pub struct ShellSession {
@@ -45,6 +51,11 @@ pub struct ShellSession {
     /// per-session. `None` means the shell is untagged (e.g. spawned from tests).
     pub session_id: Option<String>,
     pub environment: CommandEnvironmentDiagnostics,
+    /// Pull-based exec sessions retain their owner but do not participate in
+    /// legacy Bash completion notifications or end-of-turn suspension.
+    pub(crate) polled: Option<Arc<PolledShellState>>,
+    pub(crate) initial_handoff: Option<Arc<InitialHandoff>>,
+    initial_cancelled: Arc<AtomicBool>,
     /// Kill request for the still-running child. The child handle itself is owned
     /// by the completion task, which awaits its exit via `child.wait()` (truly
     /// event-driven — no polling). Because that task holds the handle across the
@@ -64,6 +75,10 @@ pub struct ShellSession {
 }
 
 impl ShellSession {
+    pub fn is_model_polled(&self) -> bool {
+        self.polled.is_some()
+    }
+
     pub fn status(&self) -> &'static str {
         if self.running.load(Ordering::Relaxed) {
             "running"
@@ -111,8 +126,25 @@ impl ShellSession {
     #[allow(clippy::unused_async)] // async kept: callers `.await` it; symmetry with the other handle ops.
     pub async fn kill(&self) -> Result<(), String> {
         self.running.store(false, Ordering::Relaxed);
+        if let Some(owner) = &self.initial_handoff {
+            owner.start_kill().map_err(|error| error.to_string())?;
+        }
         self.kill_notify.notify_one();
         Ok(())
+    }
+
+    pub(crate) fn cancel_initial(&self) {
+        self.initial_cancelled.store(true, Ordering::Release);
+        if let Some(owner) = &self.initial_handoff {
+            owner.cancel();
+        }
+        self.kill_notify.notify_one();
+    }
+
+    pub(crate) fn deliver_initial(&self) -> Result<Option<std::process::ExitStatus>, String> {
+        self.initial_handoff.as_ref().map_or(Ok(None), |owner| {
+            owner.deliver().map_err(|error| error.to_string())
+        })
     }
 
     /// Write `data` to the shell's retained stdin pipe (issue #89). When
@@ -126,12 +158,14 @@ impl ShellSession {
     /// exited shell's pipe is gone.
     pub async fn write_stdin(&self, data: &str, append_newline: bool) -> Result<(), String> {
         let mut guard = self.stdin.lock().await;
-        let stdin = guard.as_mut().ok_or_else(|| {
-            format!(
-                "Shell '{}' has no interactive stdin pipe; spawn it via Bash with interactive=true",
-                self.id
+        let stdin =
+            guard.as_mut().ok_or_else(|| {
+                format!(
+                "Shell '{}' has no interactive stdin pipe; spawn it via {} with interactive=true",
+                self.id,
+                if self.is_model_polled() { "exec_command" } else { "Bash" }
             )
-        })?;
+            })?;
         let mut bytes = data.as_bytes().to_vec();
         if append_newline {
             bytes.push(b'\n');
@@ -228,6 +262,48 @@ pub async fn spawn_background(
     interactive: bool,
     bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
 ) -> Result<Arc<ShellSession>, String> {
+    spawn_background_with_capture(
+        command,
+        cwd,
+        event_tx,
+        session_id,
+        interactive,
+        bash_completion_sink,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn spawn_polled(
+    command: &str,
+    cwd: &Path,
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
+    session_id: String,
+    interactive: bool,
+    state: Arc<PolledShellState>,
+) -> Result<Arc<ShellSession>, String> {
+    spawn_background_with_capture(
+        command,
+        Some(cwd),
+        event_tx,
+        Some(session_id),
+        interactive,
+        None,
+        Some(state),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_background_with_capture(
+    command: &str,
+    cwd: Option<&Path>,
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
+    session_id: Option<String>,
+    interactive: bool,
+    bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
+    polled: Option<Arc<PolledShellState>>,
+) -> Result<Arc<ShellSession>, String> {
     let shell = preferred_bash_shell();
     trace_windows_command(
         "agent.bash.background",
@@ -256,22 +332,24 @@ pub async fn spawn_background(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn background shell: {}", e))?;
+    let mut child = if polled.is_some() {
+        ManagedBashChild::spawn_polled(&mut cmd)
+    } else {
+        ManagedBashChild::spawn(&mut cmd)
+    }
+    .map_err(|e| format!("Failed to spawn background shell: {}", e))?;
+    let initial_handoff = child.initial_handoff();
 
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| "Failed to capture shell stdout".to_string())?;
     let stderr = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| "Failed to capture shell stderr".to_string())?;
     // Only take (and store) the stdin handle when spawned interactive; a
     // non-interactive child never has a stdin pipe to take.
     let stdin_handle = if interactive {
-        child.stdin.take()
+        child.take_stdin()
     } else {
         None
     };
@@ -282,12 +360,16 @@ pub async fn spawn_background(
     let running = Arc::new(AtomicBool::new(true));
     let exit_code = Arc::new(Mutex::new(None));
     let kill_notify = Arc::new(Notify::new());
+    let initial_cancelled = Arc::new(AtomicBool::new(false));
 
     let session = Arc::new(ShellSession {
         id: shell_id.clone(),
         command: command.to_string(),
         session_id,
         environment: prepared_env.diagnostics.clone(),
+        polled: polled.clone(),
+        initial_handoff,
+        initial_cancelled: initial_cancelled.clone(),
         kill_notify: kill_notify.clone(),
         stdin: Arc::new(Mutex::new(stdin_handle)),
         output: output.clone(),
@@ -299,20 +381,34 @@ pub async fn spawn_background(
     let stdout_pump = {
         let output = output.clone();
         let base_index = base_index.clone();
-        tokio::spawn(async move {
-            pump_stream_lines("stdout", stdout, output, base_index).await;
+        let polled = polled.clone();
+        ResourceTask::spawn(async move {
+            if let Some(state) = polled {
+                pump_polled_stream(stdout, state).await;
+            } else {
+                pump_stream_lines("stdout", stdout, output, base_index).await;
+            }
         })
+        .map_err(|error| error.to_string())?
     };
 
     let stderr_pump = {
         let output = output.clone();
         let base_index = base_index.clone();
-        tokio::spawn(async move {
-            pump_stream_lines("stderr", stderr, output, base_index).await;
+        let polled = polled.clone();
+        ResourceTask::spawn(async move {
+            if let Some(state) = polled {
+                pump_polled_stream(stderr, state).await;
+            } else {
+                pump_stream_lines("stderr", stderr, output, base_index).await;
+            }
         })
+        .map_err(|error| error.to_string())?
     };
 
-    spawn_completion_poll(
+    // Publish the cache entry before a fast completion can remove it.
+    sessions().insert(shell_id.clone(), session.clone());
+    if let Err(error) = spawn_completion_poll(
         child,
         kill_notify,
         shell_id.clone(),
@@ -324,9 +420,12 @@ pub async fn spawn_background(
         event_tx,
         bash_completion_sink,
         vec![stdout_pump, stderr_pump],
-    );
-
-    sessions().insert(shell_id, session.clone());
+        polled.map(|state| (state, session.stdin.clone())),
+        initial_cancelled,
+    ) {
+        sessions().remove(&shell_id);
+        return Err(error);
+    }
     Ok(session)
 }
 
@@ -339,7 +438,7 @@ pub async fn spawn_background(
 /// (issue #84, phase 2d + Phase 2b follow-up).
 #[allow(clippy::too_many_arguments)]
 fn spawn_completion_poll(
-    mut child: Child,
+    mut child: ManagedBashChild,
     kill_notify: Arc<Notify>,
     shell_id: String,
     command: String,
@@ -352,26 +451,87 @@ fn spawn_completion_poll(
     // Stdout/stderr pump task handles. Awaited (bounded) before reading the
     // completion tail so it reflects the fully-drained output — observing exit
     // can race the pumps that are still flushing the final lines.
-    pump_handles: Vec<tokio::task::JoinHandle<()>>,
-) {
+    pump_handles: Vec<ResourceTask<()>>,
+    polled: Option<PolledCapture>,
+    initial_cancelled: Arc<AtomicBool>,
+) -> Result<(), String> {
     let session_id_for_gc = shell_id.clone();
     let bash_id_for_event = shell_id.clone();
     let bash_id_for_sink = shell_id;
     let command_for_event = command.clone();
     let command_for_sink = command;
-    tokio::spawn(async move {
+    let owned = LocalTaskResources::current().is_some();
+    ResourceTask::spawn(async move {
         // Event-driven exit detection: await the process directly (`child.wait()`
         // is OS-notified via tokio's process driver — no polling). A kill request
         // (`kill_notify`, fired by `ShellSession::kill`) races the natural exit via
         // `select!`; whichever wins, we then reap and read the exit status. This
         // task owns the child handle, so no lock is contended and no killer blocks.
-        let wait_result = tokio::select! {
-            result = child.wait() => result,
+        let prepared = tokio::select! {
+            result = child.prepare_initial_wait() => result,
             _ = kill_notify.notified() => {
+                let _ = child.start_kill();
+                Ok(InitialWait::NeedWait)
+            }
+        };
+        let mut pump_handles = Some(pump_handles);
+        let wait_result = match prepared {
+            Ok(InitialWait::Reaped(result)) => result,
+            Ok(InitialWait::NaturalPending) => {
+                // WNOWAIT pins the leader during the terminal capture proposal.
+                // Initial delivery itself must perform the actual leader reap.
+                if let Some((state, _)) = &polled {
+                    let owner = child.initial_handoff().expect("pending initial owner");
+                    let drain = drain_polled_capture(&mut pump_handles, state);
+                    tokio::pin!(drain);
+                    tokio::select! {
+                        _ = drain.as_mut() => {
+                            child.mark_initial_capture_ready();
+                            child.wait().await
+                        }
+                        _ = owner.resolved() => {
+                            // A running result can be delivered during the pipe
+                            // grace. Reap now, preserving the existing prompt
+                            // process-exited observation and the same 2s drain.
+                            let result = child.wait().await;
+                            if result.is_ok() {
+                                state.mark_process_exited();
+                            }
+                            drain.await;
+                            result
+                        }
+                    }
+                } else {
+                    unreachable!("initial ownership requires polled capture")
+                }
+            }
+            Ok(InitialWait::NeedWait) => child.wait().await,
+            Err(error) => {
+                if let Some((state, _)) = &polled {
+                    state
+                        .record_error(format!("Shell exit observation failed: {error}"))
+                        .await;
+                }
                 let _ = child.start_kill();
                 child.wait().await
             }
         };
+        if wait_result.is_ok() {
+            if let Some((state, _)) = &polled {
+                state.mark_process_exited();
+            }
+        }
+        // Test-only failure is injected after actual OS cleanup and reap.
+        // It exercises readout without replacing real process ownership.
+        #[cfg(test)]
+        let wait_result = wait_result.and_then(|status| {
+            if let Some((state, _)) = &polled {
+                state.test_cleanup_after_reap()?;
+            }
+            Ok(status)
+        });
+        let waited = wait_result.is_ok();
+        let wait_error = wait_result.as_ref().err().map(ToString::to_string);
         let (status_str, exit_code_value) = match wait_result {
             Ok(status) => {
                 let code = status.code();
@@ -388,6 +548,21 @@ fn spawn_completion_poll(
             }
             Err(_) => ("error", None),
         };
+        if let Some((state, stdin)) = &polled {
+            if let Some(error) = wait_error {
+                state
+                    .record_cleanup_error(format!("Shell wait failed: {error}"))
+                    .await;
+            }
+            // Publish terminal status only after both streams reach EOF. The
+            // model must not receive a final marker before the last output.
+            // A legacy shell may exit while a descendant still holds its pipes
+            // open. Stop capture cooperatively after a bounded grace period,
+            // then join the same futures so no pump is detached or abandoned.
+            drain_polled_capture(&mut pump_handles, state).await;
+            state.finish(status_str, exit_code_value).await;
+            stdin.lock().await.take();
+        }
         *exit_code.lock().await = exit_code_value;
         running.store(false, Ordering::Relaxed);
 
@@ -423,11 +598,20 @@ fn spawn_completion_poll(
         // no loop to notify). The sink hands off to a detached task, so this call
         // is cheap. It is best-effort and idempotent with the durable end-of-turn
         // suspend/poll backstop, which still runs.
+        if owned {
+            for handle in pump_handles.take().unwrap_or_default() {
+                if let Err(error) = handle.join().await {
+                    if let Some(scope) = LocalTaskResources::current() {
+                        scope.record_unconfirmed(error.to_string());
+                    }
+                }
+            }
+        }
         if let (Some(sink), Some(session_id)) = (bash_completion_sink, session_id) {
             // Wait (bounded) for the pumps to reach EOF so the tail is complete;
             // the child's pipes close on exit, so this is the fast common case.
-            for handle in pump_handles {
-                let _ = timeout(Duration::from_secs(1), handle).await;
+            for handle in pump_handles.take().unwrap_or_default() {
+                let _ = timeout(Duration::from_secs(1), handle.join()).await;
             }
             let output_tail = output_tail(&output).await;
             sink.on_bash_completed(BashCompletionInfo {
@@ -440,9 +624,58 @@ fn spawn_completion_poll(
             });
         }
 
-        sleep(Duration::from_secs(COMPLETED_SESSION_TTL_SECS)).await;
-        let _ = remove_shell(&session_id_for_gc);
-    });
+        if polled.is_some() {
+            let cancelled = initial_cancelled.load(Ordering::Acquire);
+            if cancelled && waited {
+                // Notification is not proof; discard only after real cleanup.
+                let _ = remove_shell(&session_id_for_gc);
+            } else {
+                if cancelled {
+                    // Never include command text or captured output here.
+                    warn!(bash_id = %session_id_for_gc, "Initial exec cleanup failed; terminal error retained for write_stdin until the existing cache TTL");
+                }
+                // Failed initial cleanup uses the same bounded terminal cache
+                // as a delivered result, retaining only its display/result key.
+                tokio::spawn(async move {
+                    sleep(Duration::from_secs(COMPLETED_SESSION_TTL_SECS)).await;
+                    let _ = remove_shell(&session_id_for_gc);
+                });
+            }
+        } else if owned {
+            // Resource finalization must not wait for a display-cache TTL.
+            let _ = remove_shell(&session_id_for_gc);
+        } else {
+            sleep(Duration::from_secs(COMPLETED_SESSION_TTL_SECS)).await;
+            let _ = remove_shell(&session_id_for_gc);
+        }
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn drain_polled_capture(
+    pump_handles: &mut Option<Vec<ResourceTask<()>>>,
+    state: &PolledShellState,
+) {
+    let drain = async {
+        for handle in pump_handles.take().unwrap_or_default() {
+            if let Err(error) = handle.join().await {
+                state.record_error(error.to_string()).await;
+                if let Some(scope) = LocalTaskResources::current() {
+                    scope.record_unconfirmed(error.to_string());
+                }
+            }
+        }
+    };
+    tokio::pin!(drain);
+    if timeout(Duration::from_secs(2), drain.as_mut())
+        .await
+        .is_err()
+    {
+        state.record_error("Shell exited but output pipes stayed open for 2s; captured output is incomplete (background descendants may still hold the pipes)".into()).await;
+        state.stop_capture();
+        drain.await;
+    }
 }
 
 /// Join the last [`COMPLETION_TAIL_LINES`] captured lines into a byte-bounded
@@ -485,6 +718,39 @@ pub async fn adopt_running_child(
     event_tx: Option<mpsc::Sender<AgentEvent>>,
     bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
 ) -> Result<Arc<ShellSession>, String> {
+    if LocalTaskResources::current().is_some() {
+        return Err(
+            "local task cannot adopt a process without its original ownership handle".into(),
+        );
+    }
+    adopt_managed_child(
+        child.into(),
+        stdout_reader,
+        stderr_reader,
+        seeded_stdout_lines,
+        seeded_stderr_lines,
+        command,
+        session_id,
+        environment,
+        event_tx,
+        bash_completion_sink,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn adopt_managed_child(
+    child: ManagedBashChild,
+    stdout_reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    stderr_reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    seeded_stdout_lines: Vec<String>,
+    seeded_stderr_lines: Vec<String>,
+    command: &str,
+    session_id: Option<String>,
+    environment: CommandEnvironmentDiagnostics,
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
+    bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
+) -> Result<Arc<ShellSession>, String> {
     let shell_id = uuid::Uuid::new_v4().to_string();
     let output = Arc::new(Mutex::new(Vec::new()));
     let base_index = Arc::new(Mutex::new(0usize));
@@ -505,6 +771,9 @@ pub async fn adopt_running_child(
         command: command.to_string(),
         session_id,
         environment,
+        polled: None,
+        initial_handoff: None,
+        initial_cancelled: Arc::new(AtomicBool::new(false)),
         kill_notify: kill_notify.clone(),
         // The foreground streamer always spawns with Stdio::null() (bash.rs), so
         // a promoted shell has no stdin pipe — None preserves EOF-on-read.
@@ -522,19 +791,23 @@ pub async fn adopt_running_child(
     let stdout_pump = {
         let output = output.clone();
         let base_index = base_index.clone();
-        tokio::spawn(async move {
+        ResourceTask::spawn(async move {
             pump_stream_lines("stdout", stdout_reader, output, base_index).await;
         })
+        .map_err(|error| error.to_string())?
     };
     let stderr_pump = {
         let output = output.clone();
         let base_index = base_index.clone();
-        tokio::spawn(async move {
+        ResourceTask::spawn(async move {
             pump_stream_lines("stderr", stderr_reader, output, base_index).await;
         })
+        .map_err(|error| error.to_string())?
     };
 
-    spawn_completion_poll(
+    // Publish the cache entry before a fast completion can remove it.
+    sessions().insert(shell_id.clone(), session.clone());
+    if let Err(error) = spawn_completion_poll(
         child,
         kill_notify,
         shell_id.clone(),
@@ -546,9 +819,12 @@ pub async fn adopt_running_child(
         event_tx,
         bash_completion_sink,
         vec![stdout_pump, stderr_pump],
-    );
-
-    sessions().insert(shell_id, session.clone());
+        None,
+        session.initial_cancelled.clone(),
+    ) {
+        sessions().remove(&shell_id);
+        return Err(error);
+    }
     Ok(session)
 }
 
@@ -558,6 +834,23 @@ pub fn get_shell(id: &str) -> Option<Arc<ShellSession>> {
 
 pub fn remove_shell(id: &str) -> Option<Arc<ShellSession>> {
     sessions().remove(id).map(|(_, value)| value)
+}
+
+/// Current pull-session handles whose terminal result has not been consumed.
+///
+/// Include exited sessions: only a terminal `poll_result` removes their handle
+/// (apart from the existing cache TTL). The exec-session capacity bounds this
+/// snapshot; do not truncate it or infer process state from registry presence.
+/// This observes the existing registry without reading output or advancing a
+/// cursor, and intentionally excludes legacy Bash sessions.
+pub fn uncollected_polled_shells_for_session(session_id: &str) -> Vec<String> {
+    let mut ids = sessions()
+        .iter()
+        .filter(|entry| entry.polled.is_some() && entry.session_id.as_deref() == Some(session_id))
+        .map(|entry| entry.id.clone())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
 }
 
 /// Returns the ids of background shells owned by `session_id` that are still
@@ -579,6 +872,7 @@ pub fn running_shells_for_session(session_id: &str) -> Vec<String> {
                 .session_id
                 .as_deref()
                 .is_some_and(|sid| sid == session_id)
+                && entry.polled.is_none()
                 && entry.status() == "running"
         })
         .map(|entry| entry.id.clone())

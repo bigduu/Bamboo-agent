@@ -45,6 +45,22 @@ fn request_tool_schemas_for_loading_mode<'a>(
     mode: bamboo_domain::CapabilityLoadingMode,
     required_tool: Option<&str>,
 ) -> Cow<'a, [ToolSchema]> {
+    if session.root_orchestration_only_enabled() {
+        // The full bounded catalog is already selected for this Root. A
+        // provider-specific discovery gateway must not reintroduce an
+        // unapproved tenth tool after that selection.
+        return Cow::Owned(
+            tool_schemas
+                .iter()
+                .filter(|schema| {
+                    bamboo_domain::ClassifiedToolSchema::new((**schema).clone()).is_some_and(
+                        |entry| session.allows_model_tool_execution(entry.execution_name()),
+                    )
+                })
+                .cloned()
+                .collect(),
+        );
+    }
     if mode == bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog {
         // Legacy providers keep every other Deferred function unchanged. Only
         // the shared browser is replaced with a small discovery gateway until
@@ -148,15 +164,29 @@ pub(crate) fn canonical_attempt_usage(
     estimated_prompt_tokens: u64,
     estimated_completion_tokens: u64,
 ) -> MetricsTokenUsage {
-    let prompt_tokens = stream_output
-        .provider_usage
+    canonical_token_usage(
+        stream_output.provider_usage,
+        stream_output.input_tokens,
+        stream_output.output_tokens,
+        estimated_prompt_tokens,
+        estimated_completion_tokens,
+    )
+}
+
+pub(crate) fn canonical_token_usage(
+    provider_usage: Option<crate::runtime::stream::handler::ProviderUsageSnapshot>,
+    legacy_prompt_tokens: u64,
+    legacy_completion_tokens: u64,
+    estimated_prompt_tokens: u64,
+    estimated_completion_tokens: u64,
+) -> MetricsTokenUsage {
+    let prompt_tokens = provider_usage
         .and_then(|usage| usage.input_tokens)
-        .or_else(|| (stream_output.input_tokens > 0).then_some(stream_output.input_tokens))
+        .or_else(|| (legacy_prompt_tokens > 0).then_some(legacy_prompt_tokens))
         .unwrap_or(estimated_prompt_tokens);
-    let completion_tokens = stream_output
-        .provider_usage
+    let completion_tokens = provider_usage
         .and_then(|usage| usage.output_tokens)
-        .or_else(|| (stream_output.output_tokens > 0).then_some(stream_output.output_tokens))
+        .or_else(|| (legacy_completion_tokens > 0).then_some(legacy_completion_tokens))
         .unwrap_or(estimated_completion_tokens);
 
     MetricsTokenUsage {
@@ -177,6 +207,7 @@ pub(crate) async fn execute_llm_round(
     session_id: &str,
     model_name: &str,
     tool_schemas: &[ToolSchema],
+    observation_progress_hint: Option<&str>,
     prompt_memory_exposure: Option<PromptMemoryExposureFrame<'_>>,
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
     let request_tool_schemas =
@@ -209,6 +240,7 @@ pub(crate) async fn execute_llm_round(
         reasoning_effort: config.reasoning_effort,
         max_context_tokens: prepared.budget.max_context_tokens,
         max_output_tokens: prepared.budget.max_output_tokens,
+        observation_progress_hint,
         prompt_memory_exposure,
     };
 
@@ -475,7 +507,7 @@ mod tests {
             schema("Read"),
             schema("ReadArchive"),
             schema("Workspace"),
-            schema("Bash"),
+            schema("exec_command"),
         ];
 
         let request_tools =
@@ -486,11 +518,56 @@ mod tests {
                 .iter()
                 .map(|tool| tool.function.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Read", "Bash", "discover_capabilities"]
+            vec!["Read", "exec_command", "discover_capabilities"]
         );
         assert!(request_tools.iter().all(|tool| {
             tool.function.name != "ReadArchive" && tool.function.name != "Workspace"
         }));
+    }
+
+    #[tokio::test]
+    async fn selected_root_provider_never_receives_discovery_or_denied_tools() {
+        let provider = Arc::new(StickyCapturingProvider {
+            requests: Mutex::new(Vec::new()),
+        });
+        let llm: Arc<dyn LLMProvider> = provider.clone();
+        let mut session = Session::new("selected-root-tools", "chat-model");
+        session.set_root_orchestration_only(true).unwrap();
+        session.add_message(Message::user("coordinate this task"));
+        let config = AgentLoopConfig {
+            model_name: Some("chat-model".to_string()),
+            ..Default::default()
+        };
+        let tools = vec![
+            schema("Read"),
+            schema("SubAgent"),
+            schema("Plan"),
+            schema("Task"),
+            schema("exec_command"),
+            schema("discover_capabilities"),
+        ];
+        let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+        execute_llm_round(
+            &mut session,
+            &config,
+            &llm,
+            &event_tx,
+            &CancellationToken::new(),
+            "selected-root-tools",
+            "chat-model",
+            &tools,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            provider.requests.lock().unwrap()[0]
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Read", "SubAgent", "Plan", "Task"]
+        );
     }
 
     #[tokio::test]
@@ -509,7 +586,7 @@ mod tests {
             schema("Read"),
             schema("ReadArchive"),
             schema("Workspace"),
-            schema("Bash"),
+            schema("exec_command"),
         ];
         let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
         let cancel = CancellationToken::new();
@@ -523,6 +600,7 @@ mod tests {
             "sticky-round-tools",
             "chat-model",
             &tools,
+            None,
             None,
         )
         .await
@@ -570,6 +648,7 @@ mod tests {
             "chat-model",
             &tools,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -586,7 +665,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.function.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Read", "Bash", "discover_capabilities"]
+            vec!["Read", "exec_command", "discover_capabilities"]
         );
         assert_eq!(
             requests[0][2].function.parameters["properties"]["query"]["maxLength"],

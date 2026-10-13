@@ -17,6 +17,10 @@ pub struct SkillDefinition {
     /// Human-readable description
     pub description: String,
 
+    /// Normalized optional catalog summary from frontmatter or agents/openai.yaml.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_description: Option<String>,
+
     /// Optional license information from SKILL.md frontmatter
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub license: Option<String>,
@@ -49,6 +53,7 @@ impl SkillDefinition {
             id: id.into(),
             name: name.into(),
             description: description.into(),
+            short_description: None,
             license: None,
             compatibility: None,
             metadata: None,
@@ -223,6 +228,7 @@ mod tests {
             id: "test-id".to_string(),
             name: "Test".to_string(),
             description: "Desc".to_string(),
+            short_description: Some("Short description".to_string()),
             license: Some("MIT".to_string()),
             compatibility: None,
             metadata: Some(serde_json::json!({"key": "value"})),
@@ -233,6 +239,8 @@ mod tests {
         let json = serde_json::to_string(&skill).unwrap();
         assert!(json.contains("\"id\":\"test-id\""));
         assert!(json.contains("\"license\":\"MIT\""));
+        let decoded: SkillDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, skill);
         assert!(json.contains("\"tool_refs\":[\"tool-1\"]"));
     }
 
@@ -247,6 +255,7 @@ mod tests {
         }"#;
 
         let skill: SkillDefinition = serde_json::from_str(json).unwrap();
+        assert!(skill.short_description.is_none());
         assert_eq!(skill.id, "skill-1");
         assert_eq!(skill.tool_refs.len(), 1);
     }

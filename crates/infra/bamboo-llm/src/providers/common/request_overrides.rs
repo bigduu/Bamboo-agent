@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use super::log_identity;
 use chrono::Utc;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value};
@@ -56,8 +57,8 @@ pub fn apply_overrides_to_header_map_with_env(
         }
         if is_forbidden_header_name(header_name) {
             tracing::warn!(
-                "Skipping forbidden request override header '{}' for endpoint '{}'",
-                header_name,
+                "Skipping forbidden request override header_hash={} for endpoint '{}'",
+                log_identity(header_name),
                 endpoint
             );
             continue;
@@ -65,30 +66,28 @@ pub fn apply_overrides_to_header_map_with_env(
 
         let Some(value) = resolve_template_expr(&expr, env_vars) else {
             tracing::warn!(
-                "Skipping request override header '{}' because its value did not resolve",
-                header_name
+                "Skipping request override header_hash={} because its value did not resolve",
+                log_identity(header_name)
             );
             continue;
         };
 
         let parsed_name = match HeaderName::from_bytes(header_name.as_bytes()) {
             Ok(name) => name,
-            Err(error) => {
+            Err(_) => {
                 tracing::warn!(
-                    "Skipping invalid request override header name '{}': {}",
-                    header_name,
-                    error
+                    "Skipping invalid request override header_name_hash={}",
+                    log_identity(header_name)
                 );
                 continue;
             }
         };
         let parsed_value = match HeaderValue::from_str(&value) {
             Ok(value) => value,
-            Err(error) => {
+            Err(_) => {
                 tracing::warn!(
-                    "Skipping request override header '{}' due to invalid value: {}",
-                    header_name,
-                    error
+                    "Skipping request override header_hash={} due to invalid value",
+                    log_identity(header_name)
                 );
                 continue;
             }
@@ -126,15 +125,15 @@ pub fn apply_overrides_to_body_with_env(
             BodyPatchOp::Set => {
                 let Some(raw) = patch.value.as_ref() else {
                     tracing::warn!(
-                        "Skipping body_patch set op without value for path '{}'",
-                        patch.path
+                        "Skipping body_patch set op without value for path_hash={}",
+                        log_identity(&patch.path)
                     );
                     continue;
                 };
                 let Some(value) = resolve_patch_value(raw, env_vars) else {
                     tracing::warn!(
-                        "Skipping body_patch set op for path '{}' because value did not resolve",
-                        patch.path
+                        "Skipping body_patch set op for path_hash={} because value did not resolve",
+                        log_identity(&patch.path)
                     );
                     continue;
                 };

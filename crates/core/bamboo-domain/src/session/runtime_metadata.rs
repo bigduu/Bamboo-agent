@@ -37,6 +37,7 @@ pub mod keys {
     pub const SKILL_MODE_LEGACY: &str = "mode";
     pub const REASONING_EFFORT: &str = "reasoning_effort";
     pub const ENHANCE_PROMPT: &str = "enhance_prompt";
+    pub const ROOT_ORCHESTRATION_PROMPT: &str = "root_orchestration_prompt";
     pub const TASK_LIST_VERSION: &str = "task_list_version";
     pub const TODO_LIST_VERSION: &str = "todo_list_version";
     pub const WORKSPACE_PATH: &str = "workspace_path";
@@ -63,6 +64,17 @@ pub struct SessionRuntimeMetadata {
     /// Last run error text, if the previous run failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_error: Option<String>,
+    /// Monotonic generation of a queued child launch. A later explicit retry
+    /// advances this value so old scheduler deliveries cannot run it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_launch_generation: Option<u64>,
+    /// Highest child launch generation cancelled by its parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_cancelled_generation: Option<u64>,
+    /// Explicit auto-run intent committed before queue admission. Only this
+    /// exact pending launch generation is eligible for startup recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_auto_run_launch_intent_generation: Option<u64>,
     /// Provider name pinned to this session (legacy `metadata["provider_name"]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_name: Option<String>,
@@ -87,6 +99,9 @@ pub struct SessionRuntimeMetadata {
     /// System-prompt enhancement text (legacy `metadata["enhance_prompt"]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enhance_prompt: Option<String>,
+    /// Explicit opt-in to root-only delegation guidance. Never inherited by children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_orchestration_prompt: Option<bool>,
     /// Monotonic task-list version, stored as its decimal string form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_list_version: Option<String>,

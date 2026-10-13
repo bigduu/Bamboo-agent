@@ -96,6 +96,7 @@ pub mod bash_completion;
 pub mod context;
 pub mod executor;
 pub mod input_guard;
+mod output_cap_observation;
 pub mod registry;
 pub mod result_handler;
 pub mod smart_code_review;
@@ -115,6 +116,7 @@ pub use context::{
     ExecutingSupervisorObservation, ToolExecutionContext, ToolExecutionSessionFlags,
 };
 pub use executor::{execute_tool_call, execute_tool_call_with_context, ToolError, ToolExecutor};
+pub use output_cap_observation::{observed_tool_output_cap, scope_tool_output_cap};
 pub use registry::{
     global_registry, normalize_tool_name, RegistryError, SharedTool, Tool, ToolRegistry,
 };
@@ -197,6 +199,9 @@ pub fn plan_mode_allows_tool(tool_name: &str) -> bool {
             "request_permissions",
             "archive_context",
             "compact_context",
+            // This mixed-action tool checks Plan posture itself: target
+            // discovery is read-only, while send/reply remain forbidden.
+            "session_message",
         ]
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(tool_name))
@@ -226,6 +231,13 @@ mod tests {
     #[test]
     fn classify_write_as_mutating() {
         assert_eq!(classify_tool("Write"), ToolMutability::Mutating);
+    }
+
+    #[test]
+    fn session_message_plan_entry_keeps_mutating_name_classification() {
+        assert!(plan_mode_allows_tool("session_message"));
+        assert_eq!(classify_tool("session_message"), ToolMutability::Mutating);
+        assert!(!plan_mode_allows_tool("session_control"));
     }
 
     #[test]

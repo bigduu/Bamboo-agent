@@ -28,6 +28,44 @@ async fn bootstrap(store: &SessionStoreV2) -> SupervisorBootstrapReceipt {
         .unwrap()
 }
 
+#[tokio::test]
+async fn supervisor_identity_precedes_model_setup_and_reopens_without_rebinding() {
+    let (store, home) = fixture().await;
+    let first = store.get_or_create_default_supervisor("  ").await.unwrap();
+    assert!(first.created);
+    let initial = authority(&store).await;
+    assert!(initial.model.is_empty());
+    assert!(initial.messages.is_empty());
+    assert_eq!(incarnation(&initial), first.incarnation_id);
+    let birth = initial.created_at;
+    drop(store);
+
+    let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let second = reopened
+        .get_or_create_default_supervisor("configured-later")
+        .await
+        .unwrap();
+    assert!(!second.created);
+    assert_eq!(second.incarnation_id, first.incarnation_id);
+    let mut session = reopened
+        .load_session(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.created_at, birth);
+    assert!(session.model.is_empty());
+    // Normal Session configuration can bind the idle identity without a message.
+    session.model = "selected-model".into();
+    reopened.save_session(&session).await.unwrap();
+    let third = reopened
+        .get_or_create_default_supervisor("another-default")
+        .await
+        .unwrap();
+    assert!(!third.created);
+    assert_eq!(authority(&reopened).await.model, "selected-model");
+    assert_eq!(third.incarnation_id, first.incarnation_id);
+}
+
 async fn authority(store: &SessionStoreV2) -> Session {
     store
         .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
@@ -337,7 +375,7 @@ async fn strict_authority_rejects_missing_corrupt_and_mismatched_sidecars() {
 }
 
 #[tokio::test]
-async fn strict_reads_distinguish_absence_from_legacy_compatibility_fallback() {
+async fn strict_reads_distinguish_absence_from_missing_legacy_root_authority() {
     let (store, _home) = fixture().await;
     assert!(store
         .load_root_authority("absent-root")
@@ -353,29 +391,39 @@ async fn strict_reads_distinguish_absence_from_legacy_compatibility_fallback() {
         .join(RUNTIME_SIDECAR_FILE);
     fs::remove_file(&path).await.unwrap();
     assert!(store.load_root_authority(&legacy.id).await.is_err());
-    let compatible = store
-        .load_runtime_control_plane(&legacy.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        compatible.authority_identity,
-        SessionAuthorityIdentity::Ordinary
-    );
-    assert_eq!(compatible.model, "legacy-model");
-    assert_eq!(
+    for error in [
         store
-            .load_session(&legacy.id)
+            .load_runtime_control_plane(&legacy.id)
             .await
-            .unwrap()
-            .unwrap()
-            .messages
-            .len(),
-        1
-    );
+            .unwrap_err(),
+        store.load_session(&legacy.id).await.unwrap_err(),
+    ] {
+        assert!(error.to_string().contains("canonical runtime file"));
+    }
     assert!(store.migrate_runtime_sidecars().await.is_err());
     assert!(!path.exists());
     assert!(store.load_root_authority(&legacy.id).await.is_err());
+}
+
+#[tokio::test]
+async fn supervisor_control_plane_rejects_stale_valid_tool_authority_sidecar() {
+    let (store, _home) = fixture().await;
+    bootstrap(&store).await;
+    let mut root = authority(&store).await;
+    let runtime = directory(&store).join(RUNTIME_SIDECAR_FILE);
+    let old_runtime = fs::read(&runtime).await.unwrap();
+    root.set_root_orchestration_only(true).unwrap();
+    store.save_session(&root).await.unwrap();
+    fs::write(&runtime, old_runtime).await.unwrap();
+
+    assert!(store
+        .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .is_err());
+    assert!(store
+        .load_runtime_control_plane(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .is_err());
 }
 
 #[tokio::test]

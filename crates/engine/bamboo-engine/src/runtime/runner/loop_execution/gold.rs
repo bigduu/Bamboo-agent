@@ -428,7 +428,7 @@ fn spawn_gold_evaluation_request(
     // running the evaluation to completion (issue #347). `biased` checks
     // cancellation first so an already-cancelled run never even starts consuming
     // the eval stream.
-    let join_handle = tokio::spawn(async move {
+    let join_handle = bamboo_tools::local_task_resources::spawn_cancellable(async move {
         tokio::select! {
             biased;
             _ = cancel_token.cancelled() => None,
@@ -1150,6 +1150,7 @@ mod tests {
         let mut state = crate::runtime::runner::loop_execution::startup::LoopRunState {
             session_id: "session-gold-eval".to_string(),
             execution_id: "gold-eval-execution".to_string(),
+            current_inputs: None,
             model_name: "model".to_string(),
             metrics_collector: None,
             debug_logger: crate::runtime::runner::logging::DebugLogger::new(false),
