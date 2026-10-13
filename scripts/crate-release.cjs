@@ -494,6 +494,16 @@ function makeContext(env = process.env) {
   const sourceRevision = command(['git', 'rev-parse', 'HEAD']).trim()
   const event = JSON.parse(fs.readFileSync(env.GITHUB_EVENT_PATH, 'utf8'))
   const automatic = validateSource({ eventName: env.GITHUB_EVENT_NAME, event, repository, sourceRevision })
+  return makeVerifiedContext(env, repository, sourceRevision, event.workflow_run, automatic)
+}
+
+function makeRecoveryContext(env = process.env) {
+  const source = command(['git', 'rev-parse', 'HEAD']).trim()
+  const run = require('./crate-release-recover.cjs').authorize(env, undefined, source)
+  return makeVerifiedContext(env, env.GITHUB_REPOSITORY, source, run, true)
+}
+
+function makeVerifiedContext(env, repository, sourceRevision, run, automatic) {
   assert.ok(env.CARGO_REGISTRY_TOKEN, 'Missing CARGO_REGISTRY_TOKEN')
   assertSigningConfiguration(env.BAMBOO_RELEASE_SIGNING_KEY, env.BAMBOO_RELEASE_SIGNING_KEY_SHA256)
   const frontendDirectory = 'crates/app/bamboo-server/frontend_package'
@@ -531,7 +541,7 @@ function makeContext(env = process.env) {
     return { bytes, entry: (file) => command(['tar', '-xOf', archive, `${name}-${version}/${file}`], { encoding: null }) }
   }
   const context = { automatic, identity, frontendBytes, crates, receiptFile,
-    ciRun: event.workflow_run.html_url,
+    ciRun: run.html_url,
     releases: async () => paginated('releases?per_page=100'),
     tags: async () => paginated('tags?per_page=100').map((tag) => tag.name.replace(/^v/, '')),
     versions: async (names) => {
@@ -653,7 +663,7 @@ async function main() {
 }
 
 module.exports = { assertVersion, assertManualVersion, validateSource, validateReceipt, nextVersion, selectVersion,
-  plan, publish, makeContext, sha256, githubArgs, receiptBody, readBodyReceipt,
+  plan, publish, makeContext, makeRecoveryContext, sha256, githubArgs, receiptBody, readBodyReceipt,
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
   canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
   verifyRegistrySource, highestStableVersion, spawnCommand, command }
