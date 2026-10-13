@@ -4935,8 +4935,12 @@ mod tests {
         session
             .compression_events
             .push(retrieval_event("event", session.created_at));
+        session.add_message(Message::user(
+            "Retained pending source must still be extracted.",
+        ));
+        let retained_id = session.messages[0].id.clone();
         session.add_message(Message::user("A user turn later removed by retry."));
-        let removed_id = session.messages[0].id.clone();
+        let removed_id = session.messages[1].id.clone();
         storage.save_session(&session).await.expect("save source");
         let first_response = serde_json::json!({
             "candidates": [{"title":"Partially written old fact","type":"reference","scope":"global","content":"Old extracted fact","tags":[],"session_id":"source-session-0001","confidence":"high"}],
@@ -4961,7 +4965,10 @@ mod tests {
         )
         .await;
         assert_eq!(contexts.len(), 1);
-        assert_eq!(contexts[0].source_message_ids, vec![removed_id.clone()]);
+        assert_eq!(
+            contexts[0].source_message_ids,
+            vec![retained_id.clone(), removed_id.clone()]
+        );
         let invalid_root = temp_dir.path().join("invalid-ledger-root");
         std::fs::write(&invalid_root, "not a directory").expect("invalid ledger root");
         let failing_ledger = LedgerStore::new(&invalid_root);
@@ -4979,7 +4986,10 @@ mod tests {
             .await
             .expect("stored checkpoint");
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].batches[0].source_message_ids, vec![removed_id]);
+        assert_eq!(
+            stored[0].batches[0].source_message_ids,
+            vec![retained_id.clone(), removed_id]
+        );
         assert!(memory
             .read_session_state(&session.id)
             .await
@@ -4987,10 +4997,10 @@ mod tests {
             .last_extracted_at
             .is_none());
 
-        session.messages.clear();
+        session.messages.truncate(1);
         session.add_message(Message::user("The replacement canonical user turn."));
         session.updated_at = contexts[0].entry.updated_at + chrono::Duration::seconds(1);
-        let replacement_id = session.messages[0].id.clone();
+        let replacement_id = session.messages[1].id.clone();
         storage
             .save_session(&session)
             .await
@@ -5001,7 +5011,10 @@ mod tests {
             Utc::now() - chrono::Duration::hours(24),
         )
         .await;
-        assert_eq!(current[0].source_message_ids, vec![replacement_id.clone()]);
+        assert_eq!(
+            current[0].source_message_ids,
+            vec![retained_id.clone(), replacement_id.clone()]
+        );
         let fresh_sequence = Arc::new(SequenceProvider::new(vec![extraction_response(
             "Fresh canonical fact",
             "Fresh fact from the replacement turn",
@@ -5021,6 +5034,10 @@ mod tests {
         assert_eq!(writes.memory, 1);
         assert_eq!(writes.ledger, 0);
         assert_eq!(fresh_sequence.recorded_prompts().len(), 1);
+        let fresh_prompt = &fresh_sequence.recorded_prompts()[0];
+        assert!(fresh_prompt.contains("Retained pending source must still be extracted."));
+        assert!(fresh_prompt.contains("The replacement canonical user turn."));
+        assert!(!fresh_prompt.contains("A user turn later removed by retry."));
         let documents = memory
             .list_memory_documents(MemoryScope::Global, None)
             .await
@@ -5031,7 +5048,7 @@ mod tests {
             .expect("fresh extraction persisted");
         assert_eq!(
             fresh.frontmatter.sources[0].message_range,
-            vec![replacement_id]
+            vec![retained_id, replacement_id]
         );
         assert!(
             ledger
@@ -5047,6 +5064,16 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let next_poll = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        assert!(
+            next_poll.is_empty(),
+            "the recovered source watermark is acknowledged"
+        );
         let no_call = Arc::new(SequenceProvider::new(Vec::new()));
         let no_call_provider: Arc<dyn LLMProvider> = no_call.clone();
         let retry = extract_and_persist_durable_candidates(
@@ -5055,7 +5082,7 @@ mod tests {
             &memory,
             &ledger,
             "fast-model",
-            &current,
+            &next_poll,
         )
         .await
         .expect("later poll must remain healthy");
