@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,7 +60,7 @@ const RETRIEVAL_EXTRACTION_MAX_CHARS: usize = 12_000;
 const RETRIEVAL_EXTRACTION_CONTENT_SEGMENT_CHARS: usize = 1_500;
 const RETRIEVAL_EXTRACTION_CONTINUATION_OVERLAP_CHARS: usize = 128;
 const RETRIEVAL_EXTRACTION_HEADER_RESERVE_CHARS: usize = 1_536;
-const EXTRACTION_CHECKPOINT_VERSION: u32 = 3;
+const EXTRACTION_CHECKPOINT_VERSION: u32 = 4;
 const EXTRACTION_CHECKPOINT_DIR: &str = "auto_dream/extraction-checkpoints/v3";
 const RETRIEVAL_SOURCE_STATE_VERSION: u32 = 1;
 
@@ -182,6 +182,7 @@ struct CandidateSessionContext {
     topics: Vec<(String, String)>,
     retrieval_event_key: Option<String>,
     source_message_ids: Vec<String>,
+    source_message_fingerprints: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -937,6 +938,10 @@ async fn collect_candidate_session_contexts_from_sessions(
                     project_key: project_key.clone(),
                     entry: entry.clone(),
                     summary,
+                    source_message_fingerprints: capture_source_fingerprints(
+                        &session,
+                        &source_message_ids,
+                    ),
                     source_message_ids,
                     topics: Vec::new(),
                     retrieval_event_key: retrieval_event_key.clone(),
@@ -949,6 +954,7 @@ async fn collect_candidate_session_contexts_from_sessions(
                     entry,
                     summary: None,
                     source_message_ids: Vec::new(),
+                    source_message_fingerprints: BTreeMap::new(),
                     topics,
                     retrieval_event_key,
                 });
@@ -963,6 +969,7 @@ async fn collect_candidate_session_contexts_from_sessions(
                     .next()
                     .and_then(|(summary, _)| summary),
                 source_message_ids: Vec::new(),
+                source_message_fingerprints: BTreeMap::new(),
                 topics,
                 retrieval_event_key: None,
             });
@@ -1029,6 +1036,8 @@ struct ExtractionCheckpoint {
     topics_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     source_message_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    source_message_fingerprints: BTreeMap<String, String>,
     extracted: ExtractedCandidateBatch,
 }
 
@@ -1044,6 +1053,7 @@ struct RetrievalSourceState {
 struct PreparedExtractionBatch {
     context_index: usize,
     source_message_ids: Vec<String>,
+    source_message_fingerprints: BTreeMap<String, String>,
     extracted: ExtractedCandidateBatch,
 }
 
@@ -1051,6 +1061,7 @@ struct PreparedExtractionBatch {
 struct PendingExtractionBatch {
     context_index: usize,
     source_message_ids: Vec<String>,
+    source_message_fingerprints: BTreeMap<String, String>,
     prompt: String,
     checkpoint_id: String,
     transaction_id: String,
@@ -1212,11 +1223,24 @@ fn build_pending_extraction_batches(
             // Bind retry identity to the host coverage without exposing IDs in
             // the provider prompt. Replaced messages with identical prose must
             // not reuse a checkpoint's provenance.
-            let checkpoint_input = format!("{prompt}\0{:?}", source_message_ids);
+            let source_message_fingerprints = source_message_ids
+                .iter()
+                .filter_map(|id| {
+                    session
+                        .source_message_fingerprints
+                        .get(id)
+                        .map(|hash| (id.clone(), hash.clone()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let checkpoint_input = format!(
+                "{prompt}\0{:?}\0{:?}",
+                source_message_ids, source_message_fingerprints
+            );
             let source_updated_at = session.entry.updated_at.to_rfc3339();
             PendingExtractionBatch {
                 context_index,
                 source_message_ids,
+                source_message_fingerprints,
                 checkpoint_id: extraction_checkpoint_id(
                     model,
                     &session.session_id,
@@ -1444,9 +1468,9 @@ async fn read_extraction_checkpoint(
             ));
         }
     };
-    let checkpoint: ExtractionCheckpoint = serde_json::from_slice(&raw)
+    let mut checkpoint: ExtractionCheckpoint = serde_json::from_slice(&raw)
         .map_err(|error| format!("failed to parse AutoDream extraction checkpoint: {error}"))?;
-    if checkpoint.version != EXTRACTION_CHECKPOINT_VERSION
+    if !matches!(checkpoint.version, 3 | EXTRACTION_CHECKPOINT_VERSION)
         || checkpoint.batch_id != checkpoint_id
         || checkpoint.session_key.len() != 64
         || !checkpoint
@@ -1463,6 +1487,16 @@ async fn read_extraction_checkpoint(
         || DateTime::parse_from_rfc3339(&checkpoint.source_updated_at).is_err()
     {
         return Err("AutoDream extraction checkpoint identity mismatch".to_string());
+    }
+    if checkpoint.version < EXTRACTION_CHECKPOINT_VERSION {
+        // Old IDs alone cannot prove the content supplied to the model.
+        checkpoint.source_message_ids.clear();
+        checkpoint.source_message_fingerprints.clear();
+    } else if !source_fingerprint_shape_is_valid(
+        &checkpoint.source_message_ids,
+        &checkpoint.source_message_fingerprints,
+    ) {
+        return Err("AutoDream checkpoint content proof is incomplete".to_string());
     }
     validate_extracted_candidate_batch(&checkpoint.extracted)?;
     Ok(Some(checkpoint))
@@ -1731,6 +1765,7 @@ async fn rebuild_retrieval_contexts_after_checkpoint_replay(
     .map(|(summary, source_message_ids)| CandidateSessionContext {
         entry: entry.clone(),
         summary: Some(summary),
+        source_message_fingerprints: capture_source_fingerprints(&session, &source_message_ids),
         source_message_ids,
         session_id: template.session_id.clone(),
         project_key: project_key.clone(),
@@ -1743,6 +1778,7 @@ async fn rebuild_retrieval_contexts_after_checkpoint_replay(
             entry,
             summary: None,
             source_message_ids: Vec::new(),
+            source_message_fingerprints: BTreeMap::new(),
             session_id: template.session_id.clone(),
             project_key,
             topics,
@@ -1854,12 +1890,11 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                     })?;
                 let source_is_current = source.as_ref().is_some_and(|source| {
                     transaction.batches.iter().all(|batch| {
-                        batch.source_message_ids.iter().all(|id| {
-                            source
-                                .messages
-                                .iter()
-                                .any(|message| message.id == *id && message.role != Role::System)
-                        })
+                        captured_source_is_current(
+                            source,
+                            &batch.source_message_ids,
+                            &batch.source_message_fingerprints,
+                        )
                     })
                 });
                 if !source_is_current {
@@ -1890,6 +1925,8 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                 for checkpoint in transaction.batches {
                     let mut replay_context = context.clone();
                     replay_context.source_message_ids = checkpoint.source_message_ids;
+                    replay_context.source_message_fingerprints =
+                        checkpoint.source_message_fingerprints;
                     let writes = persist_durable_candidate_batch_with_project_resolver(
                         ctx,
                         memory,
@@ -2042,7 +2079,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             .expect("every pending Session has a source watermark");
         let checkpoint_path =
             extraction_checkpoint_path(ctx, &session.session_id, &pending.checkpoint_id);
-        let (extracted, source_message_ids) =
+        let (extracted, source_message_ids, source_message_fingerprints) =
             match read_extraction_checkpoint(&checkpoint_path, &pending.checkpoint_id).await? {
                 Some(checkpoint) => {
                     if !checkpoint_matches_pending_batch(
@@ -2053,7 +2090,11 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                     ) {
                         return Err("AutoDream pending checkpoint metadata mismatch".to_string());
                     }
-                    (checkpoint.extracted, checkpoint.source_message_ids)
+                    (
+                        checkpoint.extracted,
+                        checkpoint.source_message_ids,
+                        checkpoint.source_message_fingerprints,
+                    )
                 }
                 None => {
                     let extracted = extract_durable_candidate_batch(
@@ -2073,10 +2114,15 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                         batch_count: pending.batch_count,
                         topics_fingerprint: Some(pending.topics_fingerprint.clone()),
                         source_message_ids: pending.source_message_ids.clone(),
+                        source_message_fingerprints: pending.source_message_fingerprints.clone(),
                         extracted: extracted.clone(),
                     };
                     if write_extraction_checkpoint(&checkpoint_path, &checkpoint).await? {
-                        (extracted, pending.source_message_ids.clone())
+                        (
+                            extracted,
+                            pending.source_message_ids.clone(),
+                            pending.source_message_fingerprints.clone(),
+                        )
                     } else {
                         let checkpoint =
                             read_extraction_checkpoint(&checkpoint_path, &pending.checkpoint_id)
@@ -2095,13 +2141,18 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                                 "concurrent AutoDream checkpoint metadata mismatch".to_string()
                             );
                         }
-                        (checkpoint.extracted, checkpoint.source_message_ids)
+                        (
+                            checkpoint.extracted,
+                            checkpoint.source_message_ids,
+                            checkpoint.source_message_fingerprints,
+                        )
                     }
                 }
             };
         prepared_batches.push(PreparedExtractionBatch {
             context_index: pending.context_index,
             source_message_ids,
+            source_message_fingerprints,
             extracted,
         });
     }
@@ -2109,6 +2160,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     for batch in prepared_batches {
         let mut source_context = extraction_sessions[batch.context_index].clone();
         source_context.source_message_ids = batch.source_message_ids;
+        source_context.source_message_fingerprints = batch.source_message_fingerprints;
         let writes = persist_durable_candidate_batch_with_project_resolver(
             ctx,
             memory,
@@ -2288,6 +2340,75 @@ fn durable_scope_for_source(
         Some("global" | "project") | None => Some(parse_candidate_scope(candidate, project_key)),
         _ => None,
     }
+}
+
+fn message_content_fingerprint(message: &Message) -> String {
+    let mut digest = Sha256::new();
+    digest.update(format!("{:?}\0", message.role).as_bytes());
+    digest.update(message.content.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn capture_source_fingerprints(session: &Session, ids: &[String]) -> BTreeMap<String, String> {
+    ids.iter()
+        .filter_map(|id| {
+            session
+                .messages
+                .iter()
+                .find(|message| message.id == *id && message.role != Role::System)
+                .map(|message| (id.clone(), message_content_fingerprint(message)))
+        })
+        .collect()
+}
+
+fn source_fingerprint_shape_is_valid(
+    ids: &[String],
+    fingerprints: &BTreeMap<String, String>,
+) -> bool {
+    ids.iter().collect::<HashSet<_>>().len() == ids.len()
+        && ids.len() == fingerprints.len()
+        && ids.iter().all(|id| {
+            fingerprints.get(id).is_some_and(|hash| {
+                hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        })
+}
+
+fn captured_source_is_current(
+    session: &Session,
+    ids: &[String],
+    fingerprints: &BTreeMap<String, String>,
+) -> bool {
+    source_fingerprint_shape_is_valid(ids, fingerprints)
+        && ids.iter().all(|id| {
+            session.messages.iter().any(|message| {
+                message.id == *id
+                    && message.role != Role::System
+                    && fingerprints.get(id) == Some(&message_content_fingerprint(message))
+            })
+        })
+}
+
+async fn validate_captured_source(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    ids: &[String],
+    fingerprints: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    validate_source_message_ids(ctx, session_id, ids).await?;
+    if ids.is_empty() && fingerprints.is_empty() {
+        return Ok(());
+    }
+    let source = ctx
+        .storage
+        .load_session(session_id)
+        .await
+        .map_err(|error| format!("failed to verify extraction content: {error}"))?
+        .ok_or_else(|| "extraction source session no longer exists".to_string())?;
+    if !captured_source_is_current(&source, ids, fingerprints) {
+        return Err("extraction source content changed or has incomplete proof".to_string());
+    }
+    Ok(())
 }
 
 async fn validate_source_message_ids(
@@ -2478,7 +2599,23 @@ async fn persist_durable_candidate_batch_with_project_resolver(
             .filter(|source| source.session_id == session_id)
             .flat_map(|source| source.source_message_ids.iter().cloned())
             .collect::<Vec<_>>();
-        validate_source_message_ids(ctx, session_id, &source_message_ids).await?;
+        let source_message_fingerprints = sessions
+            .iter()
+            .filter(|source| source.session_id == session_id)
+            .flat_map(|source| {
+                source
+                    .source_message_fingerprints
+                    .iter()
+                    .map(|(id, hash)| (id.clone(), hash.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        validate_captured_source(
+            ctx,
+            session_id,
+            &source_message_ids,
+            &source_message_fingerprints,
+        )
+        .await?;
         let scope_key = (scope, write_project_key.clone());
         if !existing_by_scope.contains_key(&scope_key) {
             let existing = write_memory
@@ -2520,6 +2657,13 @@ async fn persist_durable_candidate_batch_with_project_resolver(
         {
             continue;
         }
+        validate_captured_source(
+            ctx,
+            session_id,
+            &source_message_ids,
+            &source_message_fingerprints,
+        )
+        .await?;
         write_memory
             .write_memory_with_retrieval_and_source_range(
                 scope,
@@ -4006,6 +4150,9 @@ mod tests {
                 build_retrieval_window_extraction_batches_with_ranges(&session, None, false);
             assert_eq!(batches.len(), 2, "{tail_kind}");
             assert_eq!(batches[0].1, safe_ids, "{tail_kind}");
+            let captured = capture_source_fingerprints(&session, &batches[0].1);
+            assert_eq!(captured.len(), batches[0].1.len());
+            assert!(!captured.contains_key("withheld-tail"));
             assert_eq!(batches[1].1, vec!["safe-after".to_string()], "{tail_kind}");
             assert!(batches[1].0.contains("Continuation overlap"));
             assert!(!batches
@@ -4751,6 +4898,137 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn captured_source_fingerprint_covers_identity_role_and_content() {
+        let mut session = Session::new("content-proof", "model");
+        session.add_message(Message::assistant("Original canonical content", None));
+        let ids = vec![session.messages[0].id.clone()];
+        let fingerprints = capture_source_fingerprints(&session, &ids);
+        assert!(captured_source_is_current(&session, &ids, &fingerprints));
+        session.messages[0].content = "Edited content under the same ID".to_string();
+        assert!(!captured_source_is_current(&session, &ids, &fingerprints));
+        session.messages[0].content = "Original canonical content".to_string();
+        session.messages[0].role = Role::System;
+        assert!(!captured_source_is_current(&session, &ids, &fingerprints));
+        session.messages.clear();
+        assert!(!captured_source_is_current(&session, &ids, &fingerprints));
+        assert!(!source_fingerprint_shape_is_valid(
+            &[ids[0].clone(), ids[0].clone()],
+            &fingerprints
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_checkpoint_ids_without_content_proof_keep_unknown_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        let id = "a".repeat(64);
+        let path = temp.path().join(format!("{id}.json"));
+        let mut checkpoint = ExtractionCheckpoint {
+            version: 3,
+            batch_id: id.clone(),
+            session_key: "b".repeat(64),
+            source_updated_at: Utc::now().to_rfc3339(),
+            transaction_id: "c".repeat(64),
+            batch_index: 0,
+            batch_count: 1,
+            topics_fingerprint: None,
+            source_message_ids: vec!["unverifiable-old-id".to_string()],
+            source_message_fingerprints: BTreeMap::new(),
+            extracted: ExtractedCandidateBatch {
+                memory: Vec::new(),
+                ledger: Vec::new(),
+            },
+        };
+        tokio::fs::write(&path, serde_json::to_vec(&checkpoint).unwrap())
+            .await
+            .unwrap();
+        let legacy = read_extraction_checkpoint(&path, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(legacy.source_message_ids.is_empty());
+        assert!(legacy.source_message_fingerprints.is_empty());
+        checkpoint.version = EXTRACTION_CHECKPOINT_VERSION;
+        tokio::fs::write(&path, serde_json::to_vec(&checkpoint).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            read_extraction_checkpoint(&path, &id).await.is_err(),
+            "new snapshots may not omit content proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn edited_in_flight_source_cannot_persist_an_old_content_range() {
+        let temp = tempfile::tempdir().unwrap();
+        bamboo_config::paths::init_bamboo_dir(temp.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let mut session = Session::new("in-flight-edit", "model");
+        session
+            .compression_events
+            .push(retrieval_event("event", session.created_at));
+        session.add_message(Message::assistant("Original extraction content", None));
+        storage.save_session(&session).await.unwrap();
+        let sequence = Arc::new(SequenceProvider::new(vec![extraction_response(
+            "Old fact",
+            "Fact extracted before PATCH",
+        )]));
+        let provider: Arc<dyn LLMProvider> = sequence;
+        let memory = MemoryStore::new(temp.path());
+        let context = AutoDreamContext {
+            session_store,
+            storage: storage.clone(),
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let captured = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        let captured_id = session.messages[0].id.clone();
+        session.messages[0].content = "Unrelated edited canonical text".to_string();
+        assert_eq!(session.messages[0].id, captured_id);
+        storage.save_session(&session).await.unwrap();
+        let ledger = LedgerStore::new(temp.path());
+        let error = extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &captured,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("content changed"));
+        assert!(memory
+            .list_memory_documents(MemoryScope::Global, None)
+            .await
+            .unwrap()
+            .is_empty());
+        let checkpoints = load_extraction_checkpoint_transactions(&context, &session.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            checkpoints.len(),
+            1,
+            "completed output remains recoverable until the next canonical snapshot"
+        );
+        assert_eq!(
+            checkpoints[0].batches[0].source_message_fingerprints,
+            captured[0].source_message_fingerprints
+        );
+    }
+
     #[tokio::test]
     async fn extraction_checkpoint_io_revalidates_the_privacy_boundary() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -4766,6 +5044,7 @@ mod tests {
             batch_count: 1,
             topics_fingerprint: None,
             source_message_ids: Vec::new(),
+            source_message_fingerprints: BTreeMap::new(),
             extracted: ExtractedCandidateBatch {
                 memory: vec![DurableExtractionCandidate {
                     title: "Credential".to_string(),
@@ -4922,6 +5201,15 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_checkpoint_source_is_discarded_and_current_input_is_reextracted() {
+        assert_changed_checkpoint_recovery(false).await;
+    }
+
+    #[tokio::test]
+    async fn edited_checkpoint_source_is_discarded_and_current_input_is_reextracted() {
+        assert_changed_checkpoint_recovery(true).await;
+    }
+
+    async fn assert_changed_checkpoint_recovery(edit_content: bool) {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
         let session_store = Arc::new(
@@ -4930,8 +5218,8 @@ mod tests {
                 .expect("session store"),
         );
         let storage: Arc<dyn Storage> = session_store.clone();
-        let mut session = Session::new("truncated-checkpoint", "model");
-        session.title = "Truncated checkpoint".to_string();
+        let mut session = Session::new("changed-checkpoint", "model");
+        session.title = "Changed checkpoint".to_string();
         session
             .compression_events
             .push(retrieval_event("event", session.created_at));
@@ -4939,7 +5227,10 @@ mod tests {
             "Retained pending source must still be extracted.",
         ));
         let retained_id = session.messages[0].id.clone();
-        session.add_message(Message::user("A user turn later removed by retry."));
+        session.add_message(Message::assistant(
+            "A user turn later removed by retry.",
+            None,
+        ));
         let removed_id = session.messages[1].id.clone();
         storage.save_session(&session).await.expect("save source");
         let first_response = serde_json::json!({
@@ -4997,8 +5288,17 @@ mod tests {
             .last_extracted_at
             .is_none());
 
-        session.messages.truncate(1);
-        session.add_message(Message::user("The replacement canonical user turn."));
+        if edit_content {
+            let original_id = session.messages[1].id.clone();
+            session.messages[1].content = "The replacement canonical user turn.".to_string();
+            assert_eq!(session.messages[1].id, original_id, "PATCH preserves ID");
+        } else {
+            session.messages.truncate(1);
+            session.add_message(Message::assistant(
+                "The replacement canonical user turn.",
+                None,
+            ));
+        }
         session.updated_at = contexts[0].entry.updated_at + chrono::Duration::seconds(1);
         let replacement_id = session.messages[1].id.clone();
         storage
