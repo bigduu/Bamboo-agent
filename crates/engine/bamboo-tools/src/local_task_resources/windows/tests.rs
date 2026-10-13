@@ -241,3 +241,93 @@ async fn local_task_resources_windows_assignment_failure_reaps_suspended_child()
         );
     }
 }
+
+#[tokio::test]
+async fn initial_exec_windows_cancel_before_supervisor_poll_stops_descendant() {
+    assert!(LocalTaskResources::current().is_none());
+    let directory = tempfile::tempdir().unwrap();
+    let mut child =
+        ManagedBashChild::spawn_initial(&mut powershell(&tree_script(directory.path(), false)))
+            .unwrap();
+    let initial = child.initial_delivery().unwrap();
+    // Permit only the native processes to run before requesting cancellation.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let pid = loop {
+        if let Some(pid) = std::fs::read_to_string(directory.path().join("ready"))
+            .ok()
+            .and_then(|text| text.parse::<u32>().ok())
+            .filter(|pid| *pid > 0)
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "native descendant did not start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let descendant = observe_process(pid);
+    initial.cancel();
+    let (status, ()) = tokio::join!(child.wait(), actually_stopped(descendant));
+    assert!(!status.unwrap().success());
+    assert!(!directory.path().join("late").exists());
+}
+
+#[tokio::test]
+async fn initial_exec_windows_cancel_after_natural_leader_exit_stops_descendant() {
+    assert!(LocalTaskResources::current().is_none());
+    let directory = tempfile::tempdir().unwrap();
+    let mut child =
+        ManagedBashChild::spawn_initial(&mut powershell(&tree_script(directory.path(), true)))
+            .unwrap();
+    let initial = child.initial_delivery().unwrap();
+    let descendant = process_from_ready(directory.path()).await;
+    std::fs::write(directory.path().join("release"), "exit now").unwrap();
+    let observed = child.wait_for_output().await.unwrap();
+    initial.cancel();
+    let (status, ()) = tokio::join!(child.wait(), actually_stopped(descendant));
+    assert!(observed.success());
+    assert!(status.unwrap().success());
+    assert!(!directory.path().join("late").exists());
+}
+
+#[tokio::test]
+async fn initial_exec_windows_delivery_keeps_natural_exit_descendant_alive() {
+    assert!(LocalTaskResources::current().is_none());
+    let directory = tempfile::tempdir().unwrap();
+    let done = directory.path().join("done");
+    struct Release(std::path::PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, "done");
+        }
+    }
+    let _release = Release(done.clone());
+    let descendant_script = encoded(&format!(
+        "[IO.File]::WriteAllText({}, [string]$PID); $deadline=[DateTime]::UtcNow.AddSeconds(20); while ((Test-Path -LiteralPath {}) -and !(Test-Path -LiteralPath {}) -and [DateTime]::UtcNow -lt $deadline) {{ Start-Sleep -Milliseconds 10 }}",
+        quoted(&directory.path().join("ready")), quoted(directory.path()), quoted(&done)
+    ));
+    let script = format!(
+        "$ErrorActionPreference='Stop'; Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','{descendant_script}') -NoNewWindow; while (!(Test-Path -LiteralPath {})) {{ Start-Sleep -Milliseconds 10 }}; exit 7",
+        quoted(&directory.path().join("release"))
+    );
+    let mut child = ManagedBashChild::spawn_initial(&mut powershell(&script)).unwrap();
+    let initial = child.initial_delivery().unwrap();
+    let descendant = process_from_ready(directory.path()).await;
+    std::fs::write(directory.path().join("release"), "exit now").unwrap();
+    let observed = child.wait_for_output().await.unwrap();
+    initial.deliver().unwrap();
+    let reaped = child.wait().await.unwrap();
+    drop(child);
+    drop(initial);
+    let survived = is_running(&descendant);
+    // Cooperative fixture cleanup precedes the captured survival assertions.
+    std::fs::write(done, "done").unwrap();
+    actually_stopped(descendant).await;
+    assert_eq!(observed.code(), Some(7));
+    assert_eq!(reaped.code(), Some(7));
+    assert!(
+        survived,
+        "delivery or closing the job killed a background descendant"
+    );
+}

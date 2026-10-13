@@ -317,8 +317,15 @@ async fn spawn_background_with_capture(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child = ManagedBashChild::spawn(&mut cmd)
-        .map_err(|e| format!("Failed to spawn background shell: {}", e))?;
+    let mut child = if polled.is_some() {
+        ManagedBashChild::spawn_initial(&mut cmd)
+    } else {
+        ManagedBashChild::spawn(&mut cmd)
+    }
+    .map_err(|e| format!("Failed to spawn background shell: {}", e))?;
+    if let (Some(state), Some(initial)) = (&polled, child.initial_delivery()) {
+        let _ = state.initial_delivery.set(initial);
+    }
 
     let stdout = child
         .take_stdout()
@@ -405,6 +412,22 @@ async fn spawn_background_with_capture(
     Ok(session)
 }
 
+fn shell_wait_outcome(
+    result: &std::io::Result<std::process::ExitStatus>,
+) -> (&'static str, Option<i32>) {
+    match result {
+        Ok(status) => (
+            if status.code().is_none() {
+                "killed"
+            } else {
+                "completed"
+            },
+            status.code(),
+        ),
+        Err(_) => ("error", None),
+    }
+}
+
 /// Shared completion-poll task. Polls the child until it exits, then sets the
 /// exit code/running flags, emits a `BashCompleted` event (when a sender is
 /// wired), pushes a loop-facing completion into the owning session via
@@ -437,67 +460,64 @@ fn spawn_completion_poll(
     let command_for_sink = command;
     let owned = LocalTaskResources::current().is_some();
     ResourceTask::spawn(async move {
-        // Event-driven exit detection: await the process directly (`child.wait()`
-        // is OS-notified via tokio's process driver — no polling). A kill request
-        // (`kill_notify`, fired by `ShellSession::kill`) races the natural exit via
-        // `select!`; whichever wins, we then reap and read the exit status. This
-        // task owns the child handle, so no lock is contended and no killer blocks.
-        let wait_result = tokio::select! {
-            result = child.wait() => result,
+        // Scoped and delivered processes use the real wait result. A pending
+        // initial exec may first observe exit without reaping its group leader.
+        // A retained kill request races either path; the real wait below always
+        // joins the process-owning supervisor before publishing final cleanup.
+        let prepared_wait = tokio::select! {
+            result = child.wait_for_output() => result,
             _ = kill_notify.notified() => {
                 let _ = child.start_kill();
                 child.wait().await
             }
         };
-        if wait_result.is_ok() {
-            if let Some((state, _)) = &polled {
-                state.mark_process_exited();
-            }
-        }
-        let wait_error = wait_result.as_ref().err().map(ToString::to_string);
-        let (status_str, exit_code_value) = match wait_result {
-            Ok(status) => {
-                let code = status.code();
-                // `code.is_none()` ⇒ terminated by signal (our SIGKILL, or an
-                // external one) ⇒ "killed"; otherwise a normal exit ⇒ "completed".
-                (
-                    if code.is_none() {
-                        "killed"
-                    } else {
-                        "completed"
-                    },
-                    code,
-                )
-            }
-            Err(_) => ("error", None),
-        };
         let mut pump_handles = Some(pump_handles);
-        if let Some((state, stdin)) = &polled {
-            if let Some(error) = wait_error {
-                state
-                    .record_error(format!("Shell wait failed: {error}"))
-                    .await;
-            }
-            // Publish terminal status only after both streams reach EOF. The
-            // model must not receive a final marker before the last output.
-            // A legacy shell may exit while a descendant still holds its pipes
-            // open. Stop capture cooperatively after a bounded grace period,
-            // then join the same futures so no pump is detached or abandoned.
-            let drain = async {
-                for handle in pump_handles.take().unwrap_or_default() {
-                    if let Err(error) = handle.join().await {
-                        state.record_error(error.to_string()).await;
-                        if let Some(scope) = LocalTaskResources::current() {
-                            scope.record_unconfirmed(error.to_string());
+        let wait_result = if let Some((state, _)) = &polled {
+            // Preparing output and actual reaping are separate. An undelivered
+            // natural exit keeps its containment anchor until the initial
+            // caller commits delivery or cancels. Start the same two-second
+            // pipe deadline at observation, not after that delivery decision.
+            let prepare = async {
+                if let Err(error) = &prepared_wait {
+                    state.record_error(format!("Shell wait failed: {error}")).await;
+                }
+                let drain = async {
+                    for handle in pump_handles.take().unwrap_or_default() {
+                        if let Err(error) = handle.join().await {
+                            state.record_error(error.to_string()).await;
+                            if let Some(scope) = LocalTaskResources::current() {
+                                scope.record_unconfirmed(error.to_string());
+                            }
                         }
                     }
+                };
+                tokio::pin!(drain);
+                if timeout(Duration::from_secs(2), drain.as_mut()).await.is_err() {
+                    state.record_error("Shell exited but output pipes stayed open for 2s; captured output is incomplete (background descendants may still hold the pipes)".into()).await;
+                    state.stop_capture();
+                    drain.await;
                 }
+                let (status, code) = shell_wait_outcome(&prepared_wait);
+                state.prepare(status, code).await;
             };
-            tokio::pin!(drain);
-            if timeout(Duration::from_secs(2), drain.as_mut()).await.is_err() {
-                state.record_error("Shell exited but output pipes stayed open for 2s; captured output is incomplete (background descendants may still hold the pipes)".into()).await;
-                state.stop_capture();
-                drain.await;
+            let reap = async {
+                let result = child.wait().await;
+                if result.is_ok() {
+                    // This flag still means the real child was reaped. A
+                    // WNOWAIT observation or prepared result is not a receipt.
+                    state.mark_process_exited();
+                }
+                result
+            };
+            let (result, ()) = tokio::join!(reap, prepare);
+            result
+        } else {
+            prepared_wait
+        };
+        let (status_str, exit_code_value) = shell_wait_outcome(&wait_result);
+        if let Some((state, stdin)) = &polled {
+            if let Err(error) = wait_result {
+                state.record_error(format!("Shell wait failed: {error}")).await;
             }
             state.finish(status_str, exit_code_value).await;
             stdin.lock().await.take();

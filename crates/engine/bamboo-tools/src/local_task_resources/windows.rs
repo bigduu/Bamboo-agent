@@ -68,7 +68,7 @@ fn spawn_with_setup(
             cancellation_safe: false,
             relay_abort: None,
             task: tokio::spawn(async move {
-                let cleanup = stop_and_reap(child, job).await;
+                let cleanup = stop_and_reap(child, &job).await;
                 Err(match cleanup {
                     Ok(_) => failure,
                     Err(error) => format!("{failure}; cleanup failed: {error}"),
@@ -94,7 +94,7 @@ fn spawn_with_setup(
             };
             // A leader exiting does not imply its descendants exited. Keep
             // the exact job handle and terminate/drain it on every path.
-            let cleanup = stop_and_reap(child, job).await;
+            let cleanup = stop_and_reap(child, &job).await;
             let outcome = match first_wait {
                 Some(Err(error)) => Err(error),
                 _ => cleanup,
@@ -111,15 +111,16 @@ fn spawn_with_setup(
         stdin,
         kill,
         result,
+        initial: None,
     })
 }
 
-struct WindowsJob {
+pub(super) struct WindowsJob {
     handle: OwnedHandle,
 }
 
 impl WindowsJob {
-    fn new_kill_on_close() -> io::Result<Self> {
+    pub(super) fn new_kill_on_close() -> io::Result<Self> {
         // SAFETY: unnamed, non-inheritable job; OwnedHandle closes it exactly
         // once. No breakaway flags are set, so descendants stay in this job.
         let raw = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
@@ -147,6 +148,24 @@ impl WindowsJob {
         Ok(job)
     }
 
+    pub(super) fn disarm_kill_on_close(&self) -> io::Result<()> {
+        let limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        // This unnamed per-spawn job has no limits other than kill-on-close.
+        // Keep the retained job identity; only successful delivery disarms it.
+        if unsafe {
+            SetInformationJobObject(
+                self.raw(),
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn raw(&self) -> HANDLE {
         self.handle.as_raw_handle().cast()
     }
@@ -163,7 +182,7 @@ impl WindowsJob {
         Ok(())
     }
 
-    fn assign_and_resume(&self, child: &Child) -> io::Result<()> {
+    pub(super) fn assign_and_resume(&self, child: &Child) -> io::Result<()> {
         self.assign(child)?;
         let pid = child
             .id()
@@ -171,7 +190,7 @@ impl WindowsJob {
         resume_unique_initial_thread(pid)
     }
 
-    fn terminate(&self) -> io::Result<()> {
+    pub(super) fn terminate(&self) -> io::Result<()> {
         // SAFETY: this is the retained per-spawn job, not a name/PID lookup.
         if unsafe { TerminateJobObject(self.raw(), 1) } == 0 {
             return Err(io::Error::last_os_error());
@@ -214,7 +233,7 @@ impl WindowsJob {
     }
 }
 
-async fn stop_and_reap(mut child: Child, job: WindowsJob) -> io::Result<ExitStatus> {
+pub(super) async fn stop_and_reap(mut child: Child, job: &WindowsJob) -> io::Result<ExitStatus> {
     let terminated = job.terminate();
     // This also covers a child whose job assignment failed. It targets the
     // actual Child handle. A failed request is not substituted for a wait.

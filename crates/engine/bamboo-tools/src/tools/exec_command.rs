@@ -23,6 +23,7 @@ struct CapturedOutput {
     bytes: Vec<u8>,
     omitted_bytes: usize,
     completion: Option<(&'static str, Option<i32>)>,
+    prepared: Option<(&'static str, Option<i32>)>,
     error: Option<String>,
 }
 
@@ -38,6 +39,7 @@ pub(crate) struct PolledShellState {
     capture_stop: watch::Sender<bool>,
     pub(crate) interaction: Mutex<()>,
     _permit: OwnedSemaphorePermit,
+    pub(crate) initial_delivery: OnceLock<crate::local_task_resources::InitialExecHandle>,
 }
 
 impl PolledShellState {
@@ -55,6 +57,7 @@ impl PolledShellState {
             capture_stop: watch::channel(false).0,
             interaction: Mutex::new(()),
             _permit: permit,
+            initial_delivery: OnceLock::new(),
         }))
     }
 
@@ -79,6 +82,11 @@ impl PolledShellState {
         self.capture_stop.send_replace(true);
     }
 
+    pub(crate) async fn prepare(&self, status: &'static str, exit_code: Option<i32>) {
+        self.output.lock().await.prepared = Some((status, exit_code));
+        self.completed.notify_waiters();
+    }
+
     pub(crate) async fn finish(&self, status: &'static str, exit_code: Option<i32>) {
         let mut output = self.output.lock().await;
         let status = if output.error.is_some() {
@@ -100,14 +108,21 @@ impl PolledShellState {
     }
 
     pub(super) async fn wait(&self, yield_time_ms: u64) {
-        let notified = self.completed.notified();
-        tokio::pin!(notified);
-        // Register before observing completion: even an immediate child exit
-        // cannot slip between the state check and the notification wait.
-        notified.as_mut().enable();
-        let running = self.output.lock().await.completion.is_none();
-        if running {
-            let _ = timeout(Duration::from_millis(yield_time_ms), notified).await;
+        self.wait_result(yield_time_ms, false).await;
+    }
+
+    async fn wait_result(&self, yield_time_ms: u64, initial: bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(yield_time_ms);
+        loop {
+            let notified = self.completed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let output = self.output.lock().await;
+            let ready = output.completion.is_some() || (initial && output.prepared.is_some());
+            drop(output);
+            if ready || tokio::time::timeout_at(deadline, notified).await.is_err() {
+                break;
+            }
         }
     }
 
@@ -115,7 +130,17 @@ impl PolledShellState {
         self.output.lock().await.completion.is_some()
     }
 
+    #[cfg(test)]
     async fn take(&self, shell_id: &str, max_output_tokens: Option<usize>) -> ExecSessionResult {
+        self.take_result(shell_id, max_output_tokens, false).await
+    }
+
+    async fn take_result(
+        &self,
+        shell_id: &str,
+        max_output_tokens: Option<usize>,
+        initial: bool,
+    ) -> ExecSessionResult {
         let mut output = self.output.lock().await;
         let bytes = std::mem::take(&mut output.bytes);
         let decoded = String::from_utf8_lossy(&bytes);
@@ -126,9 +151,15 @@ impl PolledShellState {
         let end = json_output_prefix_end(&decoded, budget);
         let omitted = std::mem::take(&mut output.omitted_bytes)
             .saturating_add(decoded.len().saturating_sub(end));
-        let (status, exit_code) = output.completion.unwrap_or(("running", None));
+        let completion = output
+            .completion
+            .or(if initial { output.prepared } else { None });
+        let (mut status, exit_code) = completion.unwrap_or(("running", None));
+        if completion.is_some() && output.error.is_some() {
+            status = "error";
+        }
         ExecSessionResult {
-            session_id: output.completion.is_none().then(|| shell_id.to_owned()),
+            session_id: completion.is_none().then(|| shell_id.to_owned()),
             status,
             output: decoded[..end].to_owned(),
             exit_code,
@@ -263,9 +294,20 @@ pub(crate) async fn poll_result(
     yield_time_ms: u64,
     max_output_tokens: Option<usize>,
 ) -> ToolOutcome {
+    poll_result_inner(shell, yield_time_ms, max_output_tokens, false).await
+}
+
+async fn poll_result_inner(
+    shell: &bash_runtime::ShellSession,
+    yield_time_ms: u64,
+    max_output_tokens: Option<usize>,
+    initial: bool,
+) -> ToolOutcome {
     let state = shell.polled.as_ref().expect("validated exec session");
-    state.wait(yield_time_ms).await;
-    let result = state.take(&shell.id, max_output_tokens).await;
+    state.wait_result(yield_time_ms, initial).await;
+    let result = state
+        .take_result(&shell.id, max_output_tokens, initial)
+        .await;
     if result.session_id.is_none() {
         bash_runtime::remove_shell(&shell.id);
     }
@@ -292,6 +334,14 @@ impl Drop for InitialExecGuard<'_> {
         if !self.delivered {
             // The completion task retains the real child handle and performs
             // the kill/reap and existing output drain. Never signal by PID.
+            if let Some(initial) = self
+                .shell
+                .polled
+                .as_ref()
+                .and_then(|state| state.initial_delivery.get())
+            {
+                initial.cancel();
+            }
             self.shell.request_kill();
             bash_runtime::remove_shell(&self.shell.id);
         }
@@ -406,12 +456,22 @@ impl Tool for ExecCommandTool {
             shell: &shell,
             delivered: false,
         };
-        let result = poll_result(
+        let result = poll_result_inner(
             &shell,
             yield_duration(parsed.yield_time_ms),
             parsed.max_output_tokens,
+            true,
         )
         .await;
+        if let Some(delivery) = shell
+            .polled
+            .as_ref()
+            .and_then(|state| state.initial_delivery.get())
+        {
+            delivery.deliver().map_err(|error| {
+                ToolError::Execution(format!("Failed to deliver initial exec: {error}"))
+            })?;
+        }
         initial.delivered = true;
         Ok(result)
     }

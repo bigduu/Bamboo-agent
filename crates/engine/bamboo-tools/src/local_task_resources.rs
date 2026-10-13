@@ -26,6 +26,9 @@ mod darwin;
 #[cfg(windows)]
 mod windows;
 
+mod initial_exec;
+pub(crate) use initial_exec::InitialExecHandle;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalTaskResourceIdentity {
     pub session_id: String,
@@ -369,7 +372,8 @@ impl LocalTaskChild {
     }
 }
 
-/// Legacy Child behavior is untouched when no local execution scope is bound.
+/// Legacy Bash is unchanged outside a local scope. Initial exec delivery may
+/// also retain a per-spawn supervisor without creating a local resource scope.
 pub(crate) enum ManagedBashChild {
     Legacy(Child),
     Owned {
@@ -378,6 +382,7 @@ pub(crate) enum ManagedBashChild {
         stdin: Option<ChildStdin>,
         kill: watch::Sender<bool>,
         result: watch::Receiver<Option<Result<ExitStatus, String>>>,
+        initial: Option<InitialExecHandle>,
     },
 }
 impl From<Child> for ManagedBashChild {
@@ -413,7 +418,11 @@ impl ManagedBashChild {
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
             let stdin = child.stdin.take();
-            let mut child = GroupLeader { child, pid };
+            let mut child = GroupLeader {
+                child,
+                pid,
+                kill_group_on_drop: true,
+            };
             let (kill, mut requested) = watch::channel(false);
             let (result_tx, result) = watch::channel(None);
             let mut stop = scope.0.stop.subscribe();
@@ -458,9 +467,61 @@ impl ManagedBashChild {
                 stdin,
                 kill,
                 result,
+                initial: None,
             })
         }
     }
+    pub(crate) fn spawn_initial(command: &mut Command) -> io::Result<Self> {
+        if LocalTaskResources::current().is_some() {
+            return Self::spawn(command);
+        }
+        initial_exec::spawn(command)
+    }
+
+    pub(crate) fn initial_delivery(&self) -> Option<InitialExecHandle> {
+        match self {
+            Self::Owned { initial, .. } => initial.clone(),
+            Self::Legacy(_) => None,
+        }
+    }
+
+    /// Initial output can be prepared from a non-reaping exit observation.
+    /// `wait` remains the actual reap/cleanup result and must still be joined.
+    pub(crate) async fn wait_for_output(&mut self) -> io::Result<ExitStatus> {
+        if let Self::Owned {
+            initial: Some(initial),
+            result,
+            ..
+        } = self
+        {
+            let mut observed = initial.observed();
+            loop {
+                if let Some(outcome) = result.borrow().clone() {
+                    return outcome.map_err(io::Error::other);
+                }
+                if let Some(status) = *observed.borrow() {
+                    return Ok(status);
+                }
+                tokio::select! {
+                    changed = result.changed() => {
+                        if changed.is_err() && result.borrow().is_none() {
+                            return Err(io::Error::other("initial exec finalizer disappeared"));
+                        }
+                    }
+                    changed = observed.changed() => {
+                        // Natural delivery can finish without publishing an
+                        // observation. Recheck the real result before treating
+                        // its sibling sender closing as a failed supervisor.
+                        if changed.is_err() && result.borrow().is_none() {
+                            return Err(io::Error::other("initial exec observer disappeared"));
+                        }
+                    }
+                }
+            }
+        }
+        self.wait().await
+    }
+
     pub(crate) fn take_stdout(&mut self) -> Option<ChildStdout> {
         match self {
             Self::Legacy(c) => c.stdout.take(),
@@ -521,11 +582,12 @@ impl Drop for ManagedBashChild {
 struct GroupLeader {
     child: Child,
     pid: u32,
+    kill_group_on_drop: bool,
 }
 #[cfg(unix)]
 impl Drop for GroupLeader {
     fn drop(&mut self) {
-        if self.child.id().is_some() {
+        if self.kill_group_on_drop && self.child.id().is_some() {
             let _ = signal_group(self.pid);
             let _ = self.child.start_kill();
         }
@@ -534,6 +596,12 @@ impl Drop for GroupLeader {
 
 #[cfg(unix)]
 async fn wait_without_reaping(pid: u32) -> io::Result<()> {
+    observe_without_reaping(pid).await.map(|_| ())
+}
+
+#[cfg(unix)]
+async fn observe_without_reaping(pid: u32) -> io::Result<ExitStatus> {
+    use std::os::unix::process::ExitStatusExt;
     loop {
         // Keep siginfo's platform-specific raw pointers out of the async state.
         // Only the plain observation crosses the following await.
@@ -558,10 +626,21 @@ async fn wait_without_reaping(pid: u32) -> io::Result<()> {
             }
             // SAFETY: a successful waitid initialized the SIGCHLD fields. Zero
             // PID means no state change with WNOHANG.
-            unsafe { info.si_pid() != 0 }
+            if unsafe { info.si_pid() } == 0 {
+                None
+            } else {
+                let status = unsafe { info.si_status() };
+                let raw = match info.si_code {
+                    libc::CLD_EXITED => status << 8,
+                    libc::CLD_KILLED => status,
+                    libc::CLD_DUMPED => status | 0x80,
+                    _ => return Err(io::Error::other("unexpected terminal child observation")),
+                };
+                Some(ExitStatus::from_raw(raw))
+            }
         };
-        if exited {
-            return Ok(());
+        if let Some(status) = exited {
+            return Ok(status);
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
@@ -954,7 +1033,11 @@ mod tests {
             .kill_on_drop(true);
         let child = command.spawn().unwrap();
         let pid = child.id().unwrap();
-        let mut leader = GroupLeader { child, pid };
+        let mut leader = GroupLeader {
+            child,
+            pid,
+            kill_group_on_drop: true,
+        };
         tokio::time::timeout(Duration::from_secs(5), wait_without_reaping(pid))
             .await
             .unwrap()

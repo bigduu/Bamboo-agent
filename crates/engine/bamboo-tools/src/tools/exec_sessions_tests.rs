@@ -820,4 +820,374 @@ mod process_tests {
             "before"
         );
     }
+    // Re-execute this synchronous test in a real OS child. Its retained
+    // std::process::Child is the sleeper's sole reap/kill authority; unlike a
+    // shell job table, it cannot asynchronously reap and recycle that PID.
+    const FORK_HELPER_TEST: &str =
+        "tools::exec_command::tests::process_tests::initial_exec_fork_fixture_process";
+
+    #[test]
+    fn initial_exec_fork_fixture_process() {
+        let Ok(directory) = std::env::var("BAMBOO_INITIAL_EXEC_FIXTURE_DIR") else {
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        let name = std::env::var("BAMBOO_INITIAL_EXEC_FIXTURE_NAME").unwrap();
+        assert!(["target", "survivor", "unrelated"].contains(&name.as_str()));
+        if !directory.exists() {
+            return;
+        }
+        struct Sleeper(Option<std::process::Child>);
+        impl Sleeper {
+            fn stop(&mut self) -> std::io::Result<()> {
+                let Some(mut child) = self.0.take() else {
+                    return Ok(());
+                };
+                // Child retains the unreaped identity even if sleep exited.
+                // Consume it once: an uncertain wait never permits a PID retry.
+                let killed = child.kill();
+                let waited = child.wait();
+                killed?;
+                waited.map(|_| ())
+            }
+        }
+        impl Drop for Sleeper {
+            fn drop(&mut self) {
+                if let Err(error) = self.stop() {
+                    eprintln!("fork helper cleanup unconfirmed: {error}");
+                }
+            }
+        }
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut sleeper = Sleeper(Some(child));
+        std::fs::write(
+            directory.join(format!("{name}.sleep")),
+            sleeper.0.as_ref().unwrap().id().to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join(format!("{name}.helper")),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while directory.exists()
+            && !directory.join(format!("{name}.release")).exists()
+            && std::time::Instant::now() < deadline
+        {
+            if directory.join(format!("{name}.probe")).exists() {
+                let _ = std::fs::write(directory.join(format!("{name}.alive")), b"alive");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        sleeper
+            .stop()
+            .expect("fork helper must kill and reap its owned sleeper");
+        let _ = std::fs::write(directory.join(format!("{name}.cleaned")), b"cleaned");
+    }
+
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+
+    struct ForkFixture {
+        directory: tempfile::TempDir,
+    }
+
+    impl ForkFixture {
+        fn new() -> Self {
+            Self {
+                directory: tempfile::tempdir().unwrap(),
+            }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.directory.path().join(name)
+        }
+
+        fn helper_command(&self, name: &str) -> String {
+            format!("BAMBOO_INITIAL_EXEC_FIXTURE_DIR={} BAMBOO_INITIAL_EXEC_FIXTURE_NAME={} {} --exact {} --test-threads=1 --nocapture",
+                shell_quote(self.directory.path().to_str().unwrap()), shell_quote(name),
+                shell_quote(std::env::current_exe().unwrap().to_str().unwrap()), shell_quote(FORK_HELPER_TEST))
+        }
+
+        fn command(&self, early_exit: bool) -> String {
+            format!(
+                "printf '%s' \"$$\" > target.leader; {} & {}",
+                self.helper_command("target"),
+                if early_exit { "exit 7" } else { "wait" }
+            )
+        }
+
+        fn release(&self) {
+            for name in ["target", "survivor", "unrelated"] {
+                let _ = std::fs::write(self.path(&format!("{name}.release")), b"release");
+            }
+        }
+
+        fn ready(&self, name: &str) -> bool {
+            ["sleep", "helper"].into_iter().all(|suffix| {
+                std::fs::read_to_string(self.path(&format!("{name}.{suffix}")))
+                    .ok()
+                    .and_then(|text| text.parse::<u32>().ok())
+                    .is_some_and(|pid| pid > 0)
+            })
+        }
+
+        fn pid(&self, name: &str) -> u32 {
+            std::fs::read_to_string(self.path(name))
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
+    }
+
+    impl Drop for ForkFixture {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    struct UnrelatedFork {
+        child: std::process::Child,
+        release: PathBuf,
+    }
+
+    impl Drop for UnrelatedFork {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.release, b"release");
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "unrelated fixture cleanup could not confirm child ownership: {error}"
+                        );
+                        return;
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // The actual Child remains unreaped and was created in this
+            // fixture's private group. Never signal any marker-file PID.
+            if unsafe { libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL) } != 0 {
+                eprintln!(
+                    "unrelated fixture group cleanup request failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            if let Err(error) = self.child.wait() {
+                eprintln!("unrelated fixture reap unconfirmed: {error}");
+            }
+        }
+    }
+
+    fn fork_process_running(pid: u32) -> bool {
+        // Read-only observation works on Darwin and Linux and rejects zombies.
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&output.stdout);
+        !state.trim().is_empty() && !state.trim_start().starts_with(['Z', 'X'])
+    }
+
+    async fn fork_ready(fixture: &ForkFixture, name: &str) {
+        timeout(Duration::from_secs(2), async {
+            while !fixture.ready(name) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("real forked descendant did not start");
+    }
+
+    async fn cancelled_initial_fork(
+        early_exit: bool,
+        before_first_poll: bool,
+        after_prepared: bool,
+    ) {
+        let _environment = environment();
+        assert!(crate::LocalTaskResources::current().is_none());
+        let fixture = ForkFixture::new();
+        let owner = format!("initial-fork-{}", uuid::Uuid::new_v4());
+        let _cleanup = ExecTestCleanup(&owner);
+        workspace_state::publish_resolved_workspace(&owner, fixture.directory.path().to_path_buf());
+        let survivor = start(
+            format!("{} & wait", fixture.helper_command("survivor")),
+            &owner,
+            false,
+        )
+        .await;
+        let survivor_id = survivor["session_id"].as_str().unwrap();
+        fork_ready(&fixture, "survivor").await;
+        use std::os::unix::process::CommandExt;
+        let mut unrelated = UnrelatedFork {
+            child: std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    FORK_HELPER_TEST,
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env("BAMBOO_INITIAL_EXEC_FIXTURE_DIR", fixture.directory.path())
+                .env("BAMBOO_INITIAL_EXEC_FIXTURE_NAME", "unrelated")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+            release: fixture.path("unrelated.release"),
+        };
+        fork_ready(&fixture, "unrelated").await;
+
+        let tool = ExecCommandTool::new();
+        let mut invocation =
+            tool.invoke(json!({"cmd":fixture.command(early_exit)}), context(&owner));
+        assert!(futures::poll!(invocation.as_mut()).is_pending());
+        if before_first_poll {
+            // Do not yield this current-thread runtime. OS children can fork,
+            // but neither product supervisor nor completion task can poll yet.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !fixture.ready("target") && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(fixture.ready("target"));
+        } else {
+            fork_ready(&fixture, "target").await;
+        }
+        let ids = bash_runtime::uncollected_polled_shells_for_session(&owner);
+        let id = ids.iter().find(|id| id.as_str() != survivor_id).unwrap();
+        let shell = bash_runtime::get_shell(id).unwrap();
+        let state = shell.polled.as_ref().unwrap();
+        let target_sleep = fixture.pid("target.sleep");
+        let target_helper = fixture.pid("target.helper");
+        let survivor_sleep = fixture.pid("survivor.sleep");
+        let unrelated_sleep = fixture.pid("unrelated.sleep");
+        if early_exit {
+            timeout(Duration::from_secs(2), async {
+                while fork_process_running(fixture.pid("target.leader")) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("leader did not exit naturally");
+        }
+        if after_prepared {
+            // Leave invoke unpolled after its first suspension. Its real
+            // completion task reaches the existing two-second pipe timeout,
+            // but this caller still has not committed initial delivery.
+            timeout(Duration::from_secs(3), async {
+                while state.output.lock().await.error.is_none() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("bounded incomplete result was not prepared");
+        }
+        let descendant_started = fork_process_running(target_sleep);
+        drop(invocation);
+        state.wait(2000).await;
+        let cancelled_sleep_stopped = !fork_process_running(target_sleep);
+        let cancelled_helper_stopped = !fork_process_running(target_helper);
+        let registry_removed = bash_runtime::get_shell(id).is_none();
+        let actually_reaped = state.process_exited();
+
+        // Cancelling a later poll must not acquire initial cancellation power.
+        let poll_tool = WriteStdinTool::new();
+        let mut later = poll_tool.invoke(json!({"session_id":survivor_id}), context(&owner));
+        assert!(futures::poll!(later.as_mut()).is_pending());
+        drop(later);
+        std::fs::write(fixture.path("survivor.probe"), b"probe").unwrap();
+        std::fs::write(fixture.path("unrelated.probe"), b"probe").unwrap();
+        let controls_answered = timeout(Duration::from_secs(2), async {
+            while !fixture.path("survivor.alive").exists()
+                || !fixture.path("unrelated.alive").exists()
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let controls_running =
+            fork_process_running(survivor_sleep) && fork_process_running(unrelated_sleep);
+
+        // Always complete RED/control cleanup before asserting the captured
+        // product failure. Each Rust helper owns and waits its own sleeper.
+        fixture.release();
+        let cleanup_stopped = timeout(Duration::from_secs(3), async {
+            while [target_sleep, target_helper, survivor_sleep, unrelated_sleep]
+                .into_iter()
+                .any(fork_process_running)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        state.wait(2000).await;
+        let cleanup_capture_complete = state.is_complete().await;
+        let survivor_result = poll(survivor_id, &owner).await;
+        let unrelated_status = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(status) = unrelated.child.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("unrelated control was not reaped");
+        bash_runtime::remove_shell(id);
+        assert!(
+            cleanup_stopped && cleanup_capture_complete,
+            "fork fixture cleanup did not finish"
+        );
+        assert_eq!(survivor_result["status"], "completed");
+        assert!(survivor_result.get("session_id").is_none());
+        assert!(unrelated_status.success());
+        eprintln!("INITIAL_EXEC_FORK_CLEANUP_CONFIRMED early_exit={early_exit} before_first_poll={before_first_poll} after_prepared={after_prepared} all_sleepers_stopped=true survivor_reaped=true unrelated_reaped=true capture_complete=true");
+        assert!(
+            descendant_started,
+            "fixture did not exercise a live long-lived descendant"
+        );
+        assert!(
+            controls_answered && controls_running,
+            "initial cancellation stopped a delivered or unrelated sibling"
+        );
+        assert!(
+            registry_removed && actually_reaped,
+            "initial cancellation did not remove/reap its leader"
+        );
+        assert!(
+            cancelled_sleep_stopped && cancelled_helper_stopped,
+            "cancelled initial exec left a forked descendant alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_initial_exec_stops_long_lived_fork_without_stopping_siblings() {
+        cancelled_initial_fork(false, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_initial_exec_fork_before_supervisor_first_poll() {
+        cancelled_initial_fork(false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_initial_exec_fork_after_natural_leader_exit() {
+        cancelled_initial_fork(true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_initial_exec_fork_after_incomplete_result_preparation() {
+        cancelled_initial_fork(true, false, true).await;
+    }
 }
