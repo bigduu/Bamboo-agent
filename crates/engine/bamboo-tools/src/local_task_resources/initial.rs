@@ -284,7 +284,8 @@ impl InitialHandoff {
                             .process
                             .as_mut()
                             .expect("delivered child remains owned");
-                        pin!(process.child_mut().wait()).poll(cx)
+                        let outcome = pin!(process.child_mut().wait()).poll(cx);
+                        outcome
                     })
                     .await
                 }
