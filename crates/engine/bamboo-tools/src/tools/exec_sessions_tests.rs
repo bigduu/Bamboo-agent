@@ -438,6 +438,224 @@ mod process_tests {
         assert!(result["output"].as_str().unwrap().contains("err"));
     }
 
+    async fn initial_snapshot_fixture(
+        owner: &str,
+        directory: &Path,
+    ) -> Arc<bash_runtime::ShellSession> {
+        let state = PolledShellState::new().unwrap();
+        state.push(b"early/").await;
+        state.output.lock().await.omitted_bytes = 5;
+        bash_runtime::spawn_polled(
+            "while [ ! -f release ]; do sleep 0.01; done; exit 7",
+            directory,
+            None,
+            owner.to_owned(),
+            false,
+            state,
+        )
+        .await
+        .unwrap()
+    }
+
+    // This unit writer controls the capture-state boundary, not an OS pipe
+    // fault. The real child and unchanged completion task supply readiness:
+    // nobody in this fixture calls mark_capture_ready or supplies a status.
+    fn observe_initial_capture_writer(
+        shell: &Arc<bash_runtime::ShellSession>,
+        release: PathBuf,
+        worker: &mut Option<tokio::task::JoinHandle<()>>,
+    ) -> Option<(bool, bool)> {
+        let state = shell.polled.as_ref().unwrap().clone();
+        let handoff = shell.initial_handoff.as_ref().unwrap().clone();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        *worker = Some(tokio::spawn(async move {
+            let written = {
+                if let Ok(mut output) = state.output.try_lock() {
+                    output.bytes.extend_from_slice(b"tail");
+                    output.omitted_bytes += 3;
+                    output.error = Some("late capture error".to_owned());
+                    true
+                } else {
+                    false
+                }
+            };
+            let ready = if written {
+                std::fs::write(release, b"release").unwrap();
+                timeout(Duration::from_secs(5), handoff.capture_ready())
+                    .await
+                    .is_ok()
+            } else {
+                false
+            };
+            let _ = send.send((written, ready));
+        }));
+        // The second runtime worker executes the try_lock attempt while the
+        // invoking worker stays at this exact commit boundary; no sleeps race.
+        receive.recv_timeout(Duration::from_secs(6)).ok()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initial_snapshot_commit_preserves_running_tail_error_and_omissions() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("initial-snapshot-running-{}", uuid::Uuid::new_v4());
+        let release = directory.path().join("release");
+        let _cleanup = InitialProcessCleanup {
+            owner: &owner,
+            release: release.clone(),
+        };
+        let shell = initial_snapshot_fixture(&owner, directory.path()).await;
+        let state = shell.polled.as_ref().unwrap();
+        let mut delivery = InitialDelivery {
+            shell: &shell,
+            delivered: false,
+        };
+        let mut worker = None;
+        let mut observation = None;
+        let first = take_initial_result(&shell, None, &mut delivery, || {
+            observation = observe_initial_capture_writer(&shell, release.clone(), &mut worker);
+        })
+        .await
+        .unwrap();
+        let worker_result = worker.unwrap().await;
+        // A writer held off by the committed snapshot remains retrievable via
+        // the running handle. Use the ordinary capture APIs for its next turn.
+        state.push(b"tail").await;
+        state.record_error("late capture error".to_owned()).await;
+        state.output.lock().await.omitted_bytes += 3;
+        std::fs::write(&release, b"release").unwrap();
+        let last = payload(poll_result(&shell, 5_000, None).await);
+        let (reaped, removed) = await_initial_cleanup(&shell).await;
+        assert!(worker_result.is_ok());
+        assert_eq!(observation, Some((false, false)));
+        assert!(delivery.delivered);
+        assert_eq!(first.session_id.as_deref(), Some(shell.id.as_str()));
+        assert_eq!(first.status, "running");
+        assert_eq!(first.output, "early/");
+        assert_eq!(first.output_omitted_bytes, 5);
+        assert!(first.error.is_none());
+        assert!(last.get("session_id").is_none());
+        assert_eq!(last["status"], "error");
+        assert_eq!(last["exit_code"], 7);
+        assert_eq!(last["output"], "tail");
+        assert_eq!(last["output_omitted_bytes"], 3);
+        assert_eq!(last["error"], "late capture error");
+        assert!(reaped && removed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn split_initial_snapshot_control_exposes_unretrievable_terminal_tail() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("initial-snapshot-old-split-{}", uuid::Uuid::new_v4());
+        let release = directory.path().join("release");
+        let _cleanup = InitialProcessCleanup {
+            owner: &owner,
+            release: release.clone(),
+        };
+        let shell = initial_snapshot_fixture(&owner, directory.path()).await;
+        let state = shell.polled.as_ref().unwrap();
+        let mut delivery = InitialDelivery {
+            shell: &shell,
+            delivered: false,
+        };
+        // Source-bound negative control: the AE9 split (take, then deliver)
+        // releases capture before the real second worker completes its write.
+        let mut stale = state.take(&shell.id, None).await;
+        let mut worker = None;
+        let observation = observe_initial_capture_writer(&shell, release, &mut worker);
+        let terminal = shell.deliver_initial().unwrap().unwrap();
+        stale.session_id = None;
+        stale.exit_code = terminal.code();
+        stale.status = if stale.error.is_some() {
+            "error"
+        } else if terminal.code().is_none() {
+            "killed"
+        } else {
+            "completed"
+        };
+        delivery.delivered = true;
+        bash_runtime::remove_shell(&shell.id);
+        let worker_result = worker.unwrap().await;
+        let (reaped, removed) = await_initial_cleanup(&shell).await;
+        let unreachable_tail = state.take(&shell.id, None).await;
+        assert!(worker_result.is_ok());
+        assert_eq!(observation, Some((true, true)));
+        assert!(stale.session_id.is_none());
+        assert_eq!(stale.output, "early/");
+        assert_eq!(stale.output_omitted_bytes, 5);
+        assert!(stale.error.is_none());
+        assert_eq!(unreachable_tail.output, "tail");
+        assert_eq!(unreachable_tail.output_omitted_bytes, 3);
+        assert_eq!(
+            unreachable_tail.error.as_deref(),
+            Some("late capture error")
+        );
+        assert!(bash_runtime::get_shell(&shell.id).is_none());
+        assert!(reaped && removed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_initial_snapshot_returns_complete_terminal_capture() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("initial-snapshot-ready-{}", uuid::Uuid::new_v4());
+        let release = directory.path().join("release");
+        let _cleanup = InitialProcessCleanup {
+            owner: &owner,
+            release: release.clone(),
+        };
+        let shell = initial_snapshot_fixture(&owner, directory.path()).await;
+        let state = shell.polled.as_ref().unwrap();
+        state.push(b"tail").await;
+        state.record_error("late capture error".to_owned()).await;
+        state.output.lock().await.omitted_bytes += 3;
+        std::fs::write(release, b"release").unwrap();
+        timeout(
+            Duration::from_secs(5),
+            shell.initial_handoff.as_ref().unwrap().capture_ready(),
+        )
+        .await
+        .unwrap();
+        let reaped_before_delivery = state.process_exited();
+        let last = payload(poll_initial_result(&shell, 250, None).await.unwrap());
+        let (reaped, removed) = await_initial_cleanup(&shell).await;
+        assert!(!reaped_before_delivery);
+        assert!(last.get("session_id").is_none());
+        assert_eq!(last["status"], "error");
+        assert_eq!(last["exit_code"], 7);
+        assert_eq!(last["output"], "early/tail");
+        assert_eq!(last["output_omitted_bytes"], 8);
+        assert_eq!(last["error"], "late capture error");
+        assert!(reaped && removed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_initial_snapshot_keeps_output_cursor_until_cleanup() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("initial-snapshot-cancelled-{}", uuid::Uuid::new_v4());
+        let _cleanup = InitialProcessCleanup {
+            owner: &owner,
+            release: directory.path().join("release"),
+        };
+        let shell = initial_snapshot_fixture(&owner, directory.path()).await;
+        let state = shell.polled.as_ref().unwrap();
+        shell.cancel_initial();
+        let mut delivery = InitialDelivery {
+            shell: &shell,
+            delivered: false,
+        };
+        let result = take_initial_result(&shell, None, &mut delivery, || {}).await;
+        drop(delivery);
+        let (reaped, removed) = await_initial_cleanup(&shell).await;
+        let retained = state.take(&shell.id, None).await;
+        assert!(matches!(result, Err(ToolError::Execution(_))));
+        assert_eq!(retained.output, "early/");
+        assert_eq!(retained.output_omitted_bytes, 5);
+        assert!(reaped && removed);
+    }
+
     #[tokio::test]
     async fn fast_completion_drains_stdout_and_stderr_before_returning_final_result() {
         let _environment = environment();
