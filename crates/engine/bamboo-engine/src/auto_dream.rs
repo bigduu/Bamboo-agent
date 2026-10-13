@@ -2664,8 +2664,11 @@ async fn persist_durable_candidate_batch_with_project_resolver(
             &source_message_fingerprints,
         )
         .await?;
+        // Content proofs protect this extraction and checkpoint replay. Jiandu's
+        // durable format stores IDs alone, so persisted Session coverage stays
+        // unknown even while the captured input is still current.
         write_memory
-            .write_memory_with_retrieval_and_source_range(
+            .write_memory_with_retrieval(
                 scope,
                 write_project_key.as_deref(),
                 memory_type,
@@ -2677,7 +2680,6 @@ async fn persist_durable_candidate_batch_with_project_resolver(
                 "background-fast-model",
                 false,
                 None,
-                &source_message_ids,
             )
             .await
             .map_err(|error| {
@@ -5030,6 +5032,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_memory_keeps_unknown_ranges_after_same_id_edit_and_dedup() {
+        assert_persisted_unknown_range_after_source_change(true).await;
+    }
+
+    #[tokio::test]
+    async fn persisted_memory_keeps_unknown_ranges_after_truncation_and_dedup() {
+        assert_persisted_unknown_range_after_source_change(false).await;
+    }
+
+    async fn assert_persisted_unknown_range_after_source_change(edit_content: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        bamboo_config::paths::init_bamboo_dir(temp.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let mut session = Session::new("persisted-source-change", "model");
+        session
+            .compression_events
+            .push(retrieval_event("event", session.created_at));
+        session.add_message(Message::user("Retained canonical input."));
+        session.add_message(Message::assistant("Original assistant source.", None));
+        storage.save_session(&session).await.unwrap();
+        let source_id = session.messages[1].id.clone();
+        let response = extraction_response("Stable fact", "The stable fact survives source edits.");
+        let sequence = Arc::new(SequenceProvider::new(vec![response.clone(), response]));
+        let provider: Arc<dyn LLMProvider> = sequence.clone();
+        let memory = MemoryStore::new(temp.path());
+        let context = AutoDreamContext {
+            session_store,
+            storage: storage.clone(),
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let captured = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].source_message_ids.contains(&source_id));
+        let ledger = LedgerStore::new(temp.path());
+        let writes = extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &captured,
+        )
+        .await
+        .unwrap();
+        assert_eq!(writes.memory, 1);
+        let document = memory
+            .list_memory_documents(MemoryScope::Global, None)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(document.frontmatter.sources[0].message_range.is_empty());
+        assert_eq!(document.frontmatter.sources[0].id, session.id);
+        let raw_new = tokio::fs::read_to_string(&document.path).await.unwrap();
+        assert!(
+            !raw_new.contains("message_range:"),
+            "new durable bytes claim no exact range"
+        );
+
+        // Simulate a record saved by the earlier ID-only implementation. Reads
+        // and dedup must handle it without deleting or rewriting user memory.
+        let mut legacy_frontmatter = document.frontmatter.clone();
+        legacy_frontmatter.sources[0].message_range = captured[0].source_message_ids.clone();
+        let legacy_bytes = format!(
+            "---\n{}---\n\n{}",
+            serde_yaml::to_string(&legacy_frontmatter).unwrap(),
+            document.body
+        );
+        tokio::fs::write(&document.path, &legacy_bytes)
+            .await
+            .unwrap();
+        if edit_content {
+            session.messages[1].content = "Unrelated replacement content.".to_string();
+            assert_eq!(session.messages[1].id, source_id);
+        } else {
+            session.messages.truncate(1);
+            assert!(!session
+                .messages
+                .iter()
+                .any(|message| message.id == source_id));
+        }
+        let updated_at = captured[0].entry.updated_at + chrono::Duration::seconds(2);
+        session.add_message(message_at(
+            Message::user("The stable fact still applies."),
+            "fresh-source",
+            updated_at,
+        ));
+        session.updated_at = updated_at;
+        storage.save_session(&session).await.unwrap();
+        let read = memory
+            .get_memory(&document.frontmatter.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read, document,
+            "unknown coverage preserves memory identity and content"
+        );
+        let current = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        assert_eq!(current.len(), 1);
+        assert!(current[0]
+            .source_message_ids
+            .contains(&"fresh-source".to_string()));
+        let retry = extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &current,
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry.memory, 0, "identical extraction remains idempotent");
+        assert_eq!(sequence.recorded_prompts().len(), 2);
+        assert_eq!(
+            memory
+                .list_memory_documents(MemoryScope::Global, None)
+                .await
+                .unwrap(),
+            vec![document.clone()]
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&document.path).await.unwrap(),
+            legacy_bytes
+        );
+        assert!(
+            load_extraction_checkpoint_transactions(&context, &session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn extraction_checkpoint_io_revalidates_the_privacy_boundary() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let checkpoint_id = "a".repeat(64);
@@ -5346,10 +5501,8 @@ mod tests {
             .iter()
             .find(|doc| doc.frontmatter.title == "Fresh canonical fact")
             .expect("fresh extraction persisted");
-        assert_eq!(
-            fresh.frontmatter.sources[0].message_range,
-            vec![retained_id, replacement_id]
-        );
+        assert!(fresh.frontmatter.sources[0].message_range.is_empty());
+        assert_eq!(fresh.frontmatter.sources[0].id, session.id);
         assert!(
             ledger
                 .list_records(LedgerScope::Global, None, &RecordFilter::default())
@@ -5598,13 +5751,7 @@ mod tests {
             .expect("list aliased memory candidate");
         assert_eq!(documents.len(), 1);
         assert_eq!(documents[0].frontmatter.confidence, None);
-        assert_eq!(
-            documents[0].frontmatter.sources[0].message_range,
-            captured_ids
-        );
-        assert!(!documents[0].frontmatter.sources[0]
-            .message_range
-            .contains(&session.messages[1].id));
+        assert!(documents[0].frontmatter.sources[0].message_range.is_empty());
         validate_source_message_ids(&context, "session-auto", &["foreign-message".to_string()])
             .await
             .expect_err("foreign source must be rejected");
