@@ -16,7 +16,7 @@ use tokio::{
     sync::watch,
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE},
+    Foundation::{ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
@@ -28,8 +28,8 @@ use windows_sys::Win32::{
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         },
         Threading::{
-            GetProcessIdOfThread, OpenThread, ResumeThread, CREATE_NO_WINDOW, CREATE_SUSPENDED,
-            THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+            GetProcessIdOfThread, OpenThread, ResumeThread, WaitForSingleObject, CREATE_NO_WINDOW,
+            CREATE_SUSPENDED, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
         },
     },
 };
@@ -114,6 +114,85 @@ fn spawn_with_setup(
     })
 }
 
+/// One ordinary command's initial ownership, independent of scoped Owned jobs.
+/// Field destruction retains kill_on_drop and kill-on-job-close as fallbacks;
+/// only stop_and_reap produces a cleanup result.
+pub(super) struct InitialWindowsProcess {
+    pub(super) child: Child,
+    job: Option<WindowsJob>,
+}
+
+pub(super) fn spawn_initial(
+    command: &mut Command,
+) -> io::Result<(InitialWindowsProcess, io::Result<()>)> {
+    spawn_initial_with_setup(command, WindowsJob::assign_and_resume)
+}
+
+fn spawn_initial_with_setup(
+    command: &mut Command,
+    setup: impl FnOnce(&WindowsJob, &Child) -> io::Result<()>,
+) -> io::Result<(InitialWindowsProcess, io::Result<()>)> {
+    let job = WindowsJob::new_kill_on_close()?;
+    command
+        .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW)
+        .kill_on_drop(true);
+    let child = command.spawn()?;
+    let result = setup(&job, &child);
+    // A setup error after spawn still returns the real child and job to the
+    // same owner. It must clean these up, never spawn an uncontained fallback.
+    Ok((
+        InitialWindowsProcess {
+            child,
+            job: Some(job),
+        },
+        result,
+    ))
+}
+
+impl InitialWindowsProcess {
+    pub(super) fn leader_has_exited(&self) -> io::Result<bool> {
+        let handle = self
+            .child
+            .raw_handle()
+            .ok_or_else(|| io::Error::other("initial Windows process has no retained handle"))?;
+        // SAFETY: the actual Child retains this process handle. A zero-time
+        // observation does not reap the child or look up any process by PID.
+        match unsafe { WaitForSingleObject(handle.cast(), 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            u32::MAX => Err(io::Error::last_os_error()),
+            value => Err(io::Error::other(format!(
+                "unexpected initial Windows process wait result: {value}"
+            ))),
+        }
+    }
+
+    pub(super) fn disarm(&mut self) -> io::Result<()> {
+        self.disarm_with(WindowsJob::clear_kill_on_close)
+    }
+
+    fn disarm_with(
+        &mut self,
+        release: impl FnOnce(&WindowsJob) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let Some(job) = &self.job else {
+            return Ok(());
+        };
+        release(job)?;
+        // Delivery closes our only job handle only after the close-kill flag
+        // was successfully cleared. On error the original job remains owned.
+        drop(self.job.take());
+        Ok(())
+    }
+
+    pub(super) async fn stop_and_reap(self) -> io::Result<ExitStatus> {
+        let job = self
+            .job
+            .ok_or_else(|| io::Error::other("initial Windows job was already released"))?;
+        stop_and_reap(self.child, job).await
+    }
+}
+
 struct WindowsJob {
     handle: OwnedHandle,
 }
@@ -169,6 +248,39 @@ impl WindowsJob {
             .id()
             .ok_or_else(|| io::Error::other("owned suspended process has no PID"))?;
         resume_unique_initial_thread(pid)
+    }
+
+    fn clear_kill_on_close(&self) -> io::Result<()> {
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        // SAFETY: writable initialized buffer matches this information class.
+        // Query first so delivery changes no other configured job limits.
+        if unsafe {
+            QueryInformationJobObject(
+                self.raw(),
+                JobObjectExtendedLimitInformation,
+                (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        limits.BasicLimitInformation.LimitFlags &= !JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: the retained exact job handle and initialized limits remain
+        // valid for this synchronous call. Failure does not release the handle.
+        if unsafe {
+            SetInformationJobObject(
+                self.raw(),
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     fn terminate(&self) -> io::Result<()> {

@@ -35,6 +35,8 @@ pub(crate) struct PolledShellState {
     // A reaped parent may still have descendants holding its output pipes.
     // This observation does not publish a terminal capture result.
     process_exited: AtomicBool,
+    #[cfg(test)]
+    fail_cleanup_after_reap: AtomicBool,
     capture_stop: watch::Sender<bool>,
     pub(crate) interaction: Mutex<()>,
     _permit: OwnedSemaphorePermit,
@@ -52,6 +54,8 @@ impl PolledShellState {
             output: Mutex::new(CapturedOutput::default()),
             completed: Notify::new(),
             process_exited: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_cleanup_after_reap: AtomicBool::new(false),
             capture_stop: watch::channel(false).0,
             interaction: Mutex::new(()),
             _permit: permit,
@@ -73,6 +77,21 @@ impl PolledShellState {
 
     pub(crate) async fn record_error(&self, error: String) {
         self.output.lock().await.error.get_or_insert(error);
+    }
+
+    pub(crate) async fn record_cleanup_error(&self, error: String) {
+        // A real wait/group-drain failure takes priority over an earlier
+        // capture timeout so the retained continuation explains failed cleanup.
+        self.output.lock().await.error = Some(error);
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_cleanup_after_reap(&self) -> std::io::Result<()> {
+        if self.fail_cleanup_after_reap.swap(false, Ordering::AcqRel) {
+            Err(std::io::Error::other("controlled post-reap cleanup error"))
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn stop_capture(&self) {
@@ -117,6 +136,14 @@ impl PolledShellState {
 
     async fn take(&self, shell_id: &str, max_output_tokens: Option<usize>) -> ExecSessionResult {
         let mut output = self.output.lock().await;
+        Self::take_locked(&mut output, shell_id, max_output_tokens)
+    }
+
+    fn take_locked(
+        output: &mut CapturedOutput,
+        shell_id: &str,
+        max_output_tokens: Option<usize>,
+    ) -> ExecSessionResult {
         let bytes = std::mem::take(&mut output.bytes);
         let decoded = String::from_utf8_lossy(&bytes);
         let budget = max_output_tokens
@@ -269,33 +296,95 @@ pub(crate) async fn poll_result(
     if result.session_id.is_none() {
         bash_runtime::remove_shell(&shell.id);
     }
+    result_outcome(&result)
+}
+
+fn result_outcome(result: &ExecSessionResult) -> ToolOutcome {
     ToolOutcome::Completed(ToolResult {
         // A command's nonzero exit is an observed outcome, not tool transport
         // failure. Models inspect exit_code/status to decide their next step.
         success: true,
-        result: serde_json::to_string(&result).expect("exec result is serializable"),
+        result: serde_json::to_string(result).expect("exec result is serializable"),
         display_preference: Some("Collapsible".into()),
         images: Vec::new(),
     })
 }
 
-/// A newly spawned command still belongs to its invoking future until the
-/// initial result hands its handle to the caller. Later polls must not acquire
-/// this guard: delivered handles intentionally survive across agent rounds.
-struct InitialExecGuard<'a> {
+/// Exists only during the first invocation. The completion owner, not Drop,
+/// performs and certifies cleanup before discarding an unpublished entry.
+struct InitialDelivery<'a> {
     shell: &'a bash_runtime::ShellSession,
     delivered: bool,
 }
 
-impl Drop for InitialExecGuard<'_> {
+impl Drop for InitialDelivery<'_> {
     fn drop(&mut self) {
         if !self.delivered {
-            // The completion task retains the real child handle and performs
-            // the kill/reap and existing output drain. Never signal by PID.
-            self.shell.request_kill();
-            bash_runtime::remove_shell(&self.shell.id);
+            self.shell.cancel_initial();
         }
     }
+}
+
+async fn poll_initial_result(
+    shell: &bash_runtime::ShellSession,
+    yield_time_ms: u64,
+    max_output_tokens: Option<usize>,
+) -> Result<ToolOutcome, ToolError> {
+    let mut delivery = InitialDelivery {
+        shell,
+        delivered: false,
+    };
+    let state = shell.polled.as_ref().expect("validated initial exec");
+    if let Some(owner) = &shell.initial_handoff {
+        tokio::select! {
+            _ = state.wait(yield_time_ms) => {},
+            _ = owner.capture_ready() => {},
+        }
+    } else {
+        state.wait(yield_time_ms).await;
+    }
+    let result = take_initial_result(shell, max_output_tokens, &mut delivery, || {}).await?;
+    if result.session_id.is_none() {
+        bash_runtime::remove_shell(&shell.id);
+    }
+    Ok(result_outcome(&result))
+}
+
+/// The last await acquires capture, then ownership and its one output snapshot
+/// commit synchronously under that same lock. A writer cannot finish draining
+/// between a stale snapshot and terminal delivery. The observer is a private
+/// scheduling seam; it does not supply ownership readiness or an exit status.
+async fn take_initial_result(
+    shell: &bash_runtime::ShellSession,
+    max_output_tokens: Option<usize>,
+    delivery: &mut InitialDelivery<'_>,
+    before_commit: impl FnOnce(),
+) -> Result<ExecSessionResult, ToolError> {
+    let state = shell.polled.as_ref().expect("validated initial exec");
+    let mut output = state.output.lock().await;
+    before_commit();
+    // Delivery errors must leave the output cursor untouched for cleanup.
+    let terminal = shell.deliver_initial().map_err(ToolError::Execution)?;
+    let mut result = PolledShellState::take_locked(&mut output, &shell.id, max_output_tokens);
+    if let Some(status) = terminal {
+        result.session_id = None;
+        result.exit_code = status.code();
+        result.status = if result.error.is_some() {
+            "error"
+        } else if status.code().is_none() {
+            "killed"
+        } else {
+            "completed"
+        };
+    } else if shell.initial_handoff.is_some() {
+        // A not-yet-drained initial owner still has a retrievable result handle.
+        result.session_id = Some(shell.id.clone());
+        result.status = "running";
+        result.exit_code = None;
+    }
+    delivery.delivered = true;
+    drop(output);
+    Ok(result)
 }
 
 #[derive(Deserialize)]
@@ -402,21 +491,19 @@ impl Tool for ExecCommandTool {
         )
         .await
         .map_err(ToolError::Execution)?;
-        let mut initial = InitialExecGuard {
-            shell: &shell,
-            delivered: false,
-        };
-        let result = poll_result(
+        poll_initial_result(
             &shell,
             yield_duration(parsed.yield_time_ms),
             parsed.max_output_tokens,
         )
-        .await;
-        initial.delivered = true;
-        Ok(result)
+        .await
     }
 }
 
 #[cfg(test)]
 #[path = "exec_sessions_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "initial_exec_cleanup_tests.rs"]
+mod initial_cleanup_tests;
