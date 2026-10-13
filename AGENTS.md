@@ -10,6 +10,23 @@ Read [README.md](./README.md) for the product boundary. Use this canonical Jiand
 
 Jiandu owns canonical persistence, derived indexes, lexical recall, and Dream snapshot bytes. Bamboo owns prompt selection and budget, optional reranking, and the model and cadence used to refresh Dream.
 
+## Parallel Development
+
+Follow [Parallel Development](./gitflow.md). Give each bounded Issue one owner,
+branch and isolated worktree; only the named integrator writes a shared batch
+branch. Dev CI admission requires the `Test` check to pass its compile-only mode.
+Before admission, run the affected tests locally, add or update coverage for changed
+behavior, and record exact source, commands and results in the PR. Auxiliary
+`Quick Checks` do not replace compilation or local test evidence. Dev CI does
+not run the full test suite on every PR. Freeze a recorded batch for complete
+release acceptance; `release → main` must pass the full required suite and
+platform matrix. Keep one release owner and one writer per build output; never
+cancel or clean another worker's resources. Verify the separately approved
+protection configuration and never bypass current gates. Normal direct pushes
+must be fast-forward and satisfy the same evidence and checks; never force push.
+Use the authoritative
+[Release Process](./CONTRIBUTING.md#release-process) for cuts, repairs and publication.
+
 ## Pull Request Review
 
 ### Bamboo #791 integration exception
@@ -18,10 +35,10 @@ For the #791 multi-agent epic, the user's 2026-09-28 delivery instruction takes
 precedence over the per-Issue PR and review steps below. Inventory all related
 PR heads and existing work first, then merge implemented work into one local
 integration baseline. Review integration changes locally and use focused checks
-while assembling it. Run the complete affected regression once after the
-baseline is ready, then submit one PR to `dev` and satisfy its required GitHub
-checks. Do not request or wait for GitHub Codex PR review for this epic. Close
-superseded component PRs and clean only safely merged worktrees after the final
+while assembling it. Submit one PR to `dev` with the required compilation gate
+and local test/coverage evidence under the current gate policy. Run the complete affected regression once
+on the frozen release snapshot before promotion to `main`. Do not request or
+wait for GitHub Codex PR review for this epic. Close superseded component PRs and clean only safely merged worktrees after the final
 integration is accepted. Preserve dirty or uncertain worktrees.
 
 - Every non-draft pull request that enters review must have a Codex review for

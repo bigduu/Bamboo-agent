@@ -86,25 +86,26 @@ test("macOS link guard preserves Cargo failures and rejects lost or oversized di
   }
 })
 
-test("routine dev pull requests run locked Rust, formatting, and policy checks", () => {
+test("full snapshot and main gates preserve locked Rust, formatting, and policy checks", () => {
   assert.match(workflow, /push:\n\s+branches: \[ main \]/u)
   assert.match(workflow, /pull_request:\n\s+branches: \[ dev, main \]/u)
 
   const testJob = job("test")
   assert.match(testJob, /name: Test\n/u)
-  assert.match(testJob, /name: Test\n    runs-on: ubuntu-latest\n    timeout-minutes: 75\n/u)
+  assert.match(testJob, /runs-on: ubuntu-latest\n/u)
+  assert.ok(testJob.includes("    timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"))
   assert.match(testJob, /run: cargo build --locked\n/u)
   assert.match(
     testJob,
-    /- name: Test locked Rust workspace\n        timeout-minutes: 45\n        run: cargo test --locked\n/u,
+    /- name: Test locked Rust workspace\n        if: needs\.validation-source\.outputs\.full == 'true'\n        timeout-minutes: 45\n        run: cargo test --locked\n/u,
   )
   assert.match(
     testJob,
-    /- name: Test CI workflow policy\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs\n/u,
+    /- name: Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs\n/u,
   )
   assert.match(
     testJob,
-    /- name: Check formatting\n        run: cargo fmt --all -- --check\n/u,
+    /- name: Check formatting\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: cargo fmt --all -- --check\n/u,
   )
   assert.match(
     testJob,
@@ -130,14 +131,18 @@ test("routine dev pull requests run locked Rust, formatting, and policy checks",
 
   assert.match(
     contributing,
-    /Pull requests into `dev` run locked Rust build\/test, formatting, and CI workflow policy checks in the required `Test` gate\./u,
+    /Pull requests into `dev` run the required\s+`Test` check in compile-only mode \(`cargo build --locked`\) and auxiliary\s+`Quick Checks`/u,
   )
+  assert.match(contributing, /Before merge, owners must run affected tests locally and add or update coverage/u)
+  assert.match(contributing, /for changed behavior, recording exact source, commands and results/u)
 })
 
-function assertLockedWorkspaceBudget(testJob) {
+test("locked Rust test compilation has a separate budget before the complete suite", () => {
+  const testJob = job("test")
   const [settings, ...steps] = testJob.split(/(?=^      - )/mu)
-  assert.doesNotMatch(settings, /^    (?:if|continue-on-error):/mu)
-  assert.match(settings, /^    timeout-minutes: 75$/mu)
+  assert.doesNotMatch(settings, /^    continue-on-error:/mu)
+  assert.match(settings, /^    if: always\(\) && !cancelled\(\)$/mu)
+  assert.ok(settings.includes("    timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"))
 
   const requiredSteps = [
     ["Build locked Rust workspace", "cargo build --locked", undefined],
@@ -153,7 +158,9 @@ function assertLockedWorkspaceBudget(testJob) {
     assert.ok(index > previousIndex, `${name} must follow the preceding Rust step`)
     previousIndex = index
 
-    assert.doesNotMatch(step, /^        (?:if|continue-on-error):/mu)
+    assert.doesNotMatch(step, /^        continue-on-error:/mu)
+    if (name === "Build locked Rust workspace") assert.doesNotMatch(step, /^        if:/mu)
+    else assert.match(step, /^        if: needs\.validation-source\.outputs\.full == 'true'$/mu)
     assert.deepEqual(
       [...step.matchAll(/^        run: (.*)$/gmu)].map((match) => match[1]),
       [command],
@@ -173,20 +180,6 @@ function assertLockedWorkspaceBudget(testJob) {
       1,
       `${command} must not run again under another step name`,
     )
-  }
-}
-
-test("locked Rust compilation and the complete suite retain explicit aggregate budgets", () => {
-  const testJob = job("test")
-  assertLockedWorkspaceBudget(testJob)
-  for (const [from, to] of [
-    ["    timeout-minutes: 75", "    timeout-minutes: 45"],
-    ["        timeout-minutes: 15", "        timeout-minutes: 30"],
-    ["        timeout-minutes: 45", "        timeout-minutes: 30"],
-    ["        timeout-minutes: 45", "        timeout-minutes: 60"],
-  ]) {
-    assert.ok(testJob.includes(from))
-    assert.throws(() => assertLockedWorkspaceBudget(testJob.replace(from, to)), `reject unapproved aggregate budget: ${to}`)
   }
 })
 
@@ -297,7 +290,7 @@ test("expensive validation jobs stay off dev pull requests", () => {
     "security",
     "deny",
   ]) {
-    assert.ok(job(id).includes(comprehensiveOnly), `${id} must be comprehensive-only`)
+    assert.ok(job(id).includes("if: needs.validation-source.outputs.full == 'true'"), `${id} must be comprehensive-only`)
   }
 })
 
@@ -366,7 +359,7 @@ test("frozen promotion bootstrap is read-only and leaves merge-tree validation i
   assert.match(contributing, /Bind both receipts to their respective\n   SHA\/tree/u)
   assert.match(contributing, /branch to the recorded original fix head `F`; never substitute `U`/u)
   assert.match(contributing, /dev merge result for recorded `F`\. Review must reject any other repair target/u)
-  assert.match(contributing, /Pending or failing checks block this route/u)
+  assert.match(contributing, /Pending or failing release-source or required integration checks block this/u)
   assert.match(contributing, /Only if existing branch rules cannot preserve exact\n   `F` ancestry, or the necessary repair cannot stay within the recorded scope/u)
   assert.match(contributing, /this gate alone cannot\n   authorize `U` as the release target/u)
   assert.match(contributing, /Release source and version tags are immutable/u)
@@ -637,17 +630,18 @@ function assertFrontendPolicy(source) {
     "name: Frontend consumer acceptance",
     "on:",
     "  workflow_dispatch:",
+    "    inputs:",
+    "      snapshot_sha:",
+    "        description: Exact 40-character SHA of the selected ref for source acceptance",
+    "        required: true",
+    "        type: string",
     "  pull_request:",
-    "    branches: [dev]",
-    "    paths:",
-    "      - \".github/workflows/frontend-acceptance.yml\"",
-    "      - \"scripts/frontend-package-lock.json\"",
-    "      - \"scripts/release-frontend-policy.test.cjs\"",
-    "      - \"crates/app/bamboo-server/frontend_package/**\"",
-    "      - \"crates/app/bamboo-server/src/services/frontend_package.rs\"",
+    "    branches: [main]",
     "permissions:",
     "  contents: read",
-  ], "the original triggers have no arbitrary source inputs or environment overrides")
+    "env:",
+    "  PYTHONDONTWRITEBYTECODE: \"1\"",
+  ], "main and manual snapshot routing binds the actual source without Cargo environment overrides")
   const lint = source.split("\n  lint:\n")[1].split("\n  build:\n")[0].replace(/^  #.*(?:\n|$)/gmu, "").trimEnd()
   assert.equal(lint, [
     "    name: Original release Clippy and frontend policy",
@@ -659,10 +653,17 @@ function assertFrontendPolicy(source) {
     "",
     "      - name: Require the exact clean candidate source",
     "        env:",
+    "          EXPECTED_SNAPSHOT_SHA: ${{ inputs.snapshot_sha }}",
     "          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}",
     "        run: |",
+    "          set -euo pipefail",
+    "          if [[ \"$GITHUB_EVENT_NAME\" == workflow_dispatch ]]; then",
+    "            [[ \"$EXPECTED_SNAPSHOT_SHA\" =~ ^[0-9a-f]{40}$ ]]",
+    "            test \"$EXPECTED_SNAPSHOT_SHA\" = \"$GITHUB_SHA\"",
+    "          fi",
     "          test \"$(git rev-parse HEAD)\" = \"$EXPECTED_SHA\"",
-    "          test -z \"$(git status --porcelain --untracked-files=all)\"",
+    "          source_status=\"$(git status --porcelain --untracked-files=all)\"",
+    "          test -z \"$source_status\"",
     "",
     "      - name: Setup Node.js",
     "        uses: actions/setup-node@v7",
@@ -703,7 +704,7 @@ function assertFrontendPolicy(source) {
     "",
     "      - name: Require source files to remain unchanged",
     "        run: git diff --exit-code",
-  ].join("\n"), "the original lint job, Clippy arguments and cache policy remain unchanged")
+  ].join("\n"), "the current lint job, snapshot guard, Clippy arguments and cache policy remain unchanged")
   const jobs = frontendJobs(source)
   source = "  build:\n" + source.split("  build:\n")[1]
   const withoutFinalConditions = source.replaceAll(
@@ -765,9 +766,10 @@ function assertFrontendPolicy(source) {
     ].join("\n"))
     const guard = frontendStep(frontendJob, "Require the exact clean candidate source")
     assert.equal(guard.split("        run: |\n")[0], "      - name: Require the exact clean candidate source\n        id: source\n        env:\n" +
+      "          EXPECTED_SNAPSHOT_SHA: ${{ inputs.snapshot_sha }}\n" +
       `          EXPECTED_SHA: ${frontendHead}\n` + (index === 0 ? "" :
         "          BUILD_SOURCE_SHA: ${{ needs.build.outputs.source_sha }}\n          BUILD_SOURCE_TREE: ${{ needs.build.outputs.source_tree }}\n") + "        shell: bash\n")
-    for (const line of ['test "$source_sha" = "$EXPECTED_SHA"', 'source_status="$(git status --porcelain --untracked-files=all)"', 'test -z "$source_status"']) {
+    for (const line of ['if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then', '  [[ "$EXPECTED_SNAPSHOT_SHA" =~ ^[0-9a-f]{40}$ ]]', '  test "$EXPECTED_SNAPSHOT_SHA" = "$GITHUB_SHA"', 'fi', 'test "$source_sha" = "$EXPECTED_SHA"', 'source_status="$(git status --porcelain --untracked-files=all)"', 'test -z "$source_status"']) {
       assert.ok(frontendScript(guard).split("\n").includes(line), `missing source guard: ${line}`)
     }
     const toolchain = frontendStep(frontendJob, "Record and bind the actual Rust toolchain")
@@ -792,6 +794,8 @@ test("frontend acceptance preserves both original command gates and actual-head 
   assertFrontendPolicy(frontendWorkflow)
   for (const [from, to] of [
     ["  workflow_dispatch:", "  workflow_dispatch:\n    inputs:\n      source:\n        type: string"],
+    ["    branches: [main]", "    branches: [dev]"],
+    ['PYTHONDONTWRITEBYTECODE: "1"', 'PYTHONDONTWRITEBYTECODE: "0"'],
     ["contents: read", "contents: write"],
     ["permissions:\n", 'env:\n  RUST_TEST_THREADS: "1"\npermissions:\n'],
     ["permissions:\n", 'env:\n  CARGO_PROFILE_TEST_OPT_LEVEL: "3"\npermissions:\n'],
@@ -852,6 +856,7 @@ test("frontend acceptance source guards reject drift and dirty entries on both j
         const run = (env = {}) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", script], {
           cwd: checkout, encoding: "utf8", env: { ...process.env,
             EXPECTED_SHA: sha,
+            GITHUB_SHA: sha, GITHUB_EVENT_NAME: "pull_request", EXPECTED_SNAPSHOT_SHA: "",
             BUILD_SOURCE_SHA: sha, BUILD_SOURCE_TREE: tree,
             GITHUB_OUTPUT: path.join(directory, "outputs"),
             ...env,
@@ -860,6 +865,16 @@ test("frontend acceptance source guards reject drift and dirty entries on both j
         writeFileSync(path.join(directory, "outputs"), "")
         const accepted = run()
         assert.equal(accepted.status, 0, accepted.stderr)
+        assert.equal(readFileSync(path.join(directory, "outputs"), "utf8"), `sha=${sha}\ntree=${tree}\n`)
+        writeFileSync(path.join(directory, "outputs"), "")
+        assert.equal(run({ GITHUB_EVENT_NAME: "workflow_dispatch", EXPECTED_SNAPSHOT_SHA: sha }).status, 0,
+          "an exact manual snapshot is accepted")
+        for (const snapshot of ["", "a".repeat(39), "A".repeat(40), "0".repeat(40)]) {
+          assert.notEqual(run({ GITHUB_EVENT_NAME: "workflow_dispatch", EXPECTED_SNAPSHOT_SHA: snapshot }).status, 0,
+            "missing, malformed or mismatched manual snapshots fail closed")
+        }
+        assert.notEqual(run({ GITHUB_EVENT_NAME: "workflow_dispatch", EXPECTED_SNAPSHOT_SHA: sha, GITHUB_SHA: "0".repeat(40) }).status, 0,
+          "manual snapshot must bind the actual dispatch source")
         assert.equal(readFileSync(path.join(directory, "outputs"), "utf8"), `sha=${sha}\ntree=${tree}\n`)
         for (const env of [{ EXPECTED_SHA: "0".repeat(40) },
           ...(index === 1 ? [{ BUILD_SOURCE_SHA: "" }, { BUILD_SOURCE_TREE: "2".repeat(40) }] : [])]) {
