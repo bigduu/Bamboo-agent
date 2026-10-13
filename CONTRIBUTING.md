@@ -170,7 +170,12 @@ bamboo/
 ### Testing Guidelines
 
 - Write tests for all new functionality
-- Ensure all tests pass before submitting PRs
+- Before merging to dev, run affected tests locally in the assigned executor
+- Add or update regression coverage for changed behavior, including relevant
+  normal and failure cases; record source SHA/tree, commands, selection and results
+- Missing or failing relevant local tests block merge; compilation is not test evidence
+- Dev CI requires successful compilation and normal review; complete build/test
+  acceptance is mandatory through the frozen candidate's main promotion checks
 - Use descriptive test names
 - Include edge cases in tests
 - Use `#[tokio::test]` for async tests
@@ -193,12 +198,129 @@ bamboo/
 
 ## Release Process
 
-Feature pull requests target `dev`. After a normal protected `dev → main`
-promotion, successful same-repository main push CI queues publication of its
-exact tested commit to crates.io and a GitHub Release. The workflow must first
-reach main through that normal promotion; do not promote unrelated development
-solely to activate it. Source manifests keep `0.0.0`; temporary publication
-stamps an unused `YYYY.M.N` UTC version and embeds the committed frontend lock.
+Follow [Parallel Development](./gitflow.md) for branch ownership, bounded batches
+and evidence. Batch integration and standalone PRs target `dev`. Its required
+`Test` gate runs `cargo build --locked` in compile-only mode; `Quick Checks`
+remains auxiliary.
+Before merge, owners must run affected tests locally and add or update coverage
+for changed behavior, recording exact source, commands and results. Dev CI does
+not execute the full test suite for every PR. Complete validation runs on a
+fixed batch for release; its failures remain visible and owned. Existing review
+and security requirements still apply.
+
+Keep the existing required `Test` check name. Its dev mode must actually compile
+and propagate source-verification or Cargo failures; it must not be skipped.
+A green dev `Test` means compilation passed, not that the full suite ran. The
+same check retains full validation for release/main and explicit snapshots.
+Main's required checks are unchanged.
+
+A normal fast-forward direct push may be used once dev's actual branch rule
+permits it, with the same compilation, local test/coverage and applicable review
+requirements. The current compile job is PR-triggered; obtain valid candidate
+checks through that existing path before direct admission, or keep the normal
+PR route when exact-source equivalence is unproven. Do not force push or treat
+removal of the PR requirement as permission to bypass required checks. See
+[direct-push evidence](./gitflow.md#normal-direct-pushes-to-dev).
+
+Each release follows
+`dev → release/<40-character-cut-SHA> → main` in this repository. Never promote
+the moving `dev` branch directly to `main`.
+
+### Validate a fixed snapshot
+
+For manual `CI` or `Frontend consumer acceptance` runs, select the intended
+branch/tag and supply `snapshot_sha` as the full lowercase 40-character SHA.
+It must equal that dispatch event's actual source SHA; mismatches fail closed.
+Record the ref, exact SHA/tree, workflow run and result. Do not silently replace
+it with a later moving `dev` head. Manual validation does not grant publication
+authority.
+
+CI on a main PR tests its actual synthetic merge result. The frontend workflow
+also runs on main PRs and validates the exact PR head with its original
+source-cleanliness, artifact and strict Clippy contracts. Preserve the two source
+identities; evidence is reusable only if all relevant source and build/test
+inputs match. An initial cut does not require an additional manual full suite
+merely to repeat equivalent promotion validation. Repair `F` still requires the
+separate exact-source acceptance below.
+Ordinary dev PRs compile in CI but do not automatically run these full test suites.
+Existing path-scoped Windows/adapter checks retain their own triggers.
+
+### Freeze the release scope
+
+1. After all changes and controls required for this release have normally merged
+   into protected `dev`, freshly read its actual current HEAD immediately before
+   creating the release branch. This is the cut; do not select an arbitrary
+   historical ancestor. Record the cut's UTC timestamp, full lowercase
+   40-character SHA, tree SHA, fresh branch-read receipt, and bounded release
+   scope in the release PR. Create `release/<cut-SHA>` at that exact recorded SHA.
+   Keep `dev` open for ongoing development after the cut.
+2. Open the release branch's PR into `main`. Freeze its scope: do not repeatedly
+   merge the latest `dev` tip or unrelated features into the release to chase
+   ongoing development. If a broader release is needed, explicitly choose and
+   record a new cut and scope on a new release branch.
+3. For a necessary release fix, branch from the frozen release head and keep
+   the original fix head `F` within the recorded release scope. Record `F`'s
+   exact SHA/tree and bounded diff as the intended release target; independently
+   review and run the complete release-source gates on that exact `F`, including
+   full Linux/macOS/Windows coverage. Preserve `F` unchanged while admitting it
+   to protected `dev` (do not squash or rebase it into a different commit).
+   If `dev` has advanced, use a separate integration head `U` containing both
+   `F` and the current protected `dev` head. Keep `U` up to date as strict branch
+   protection requires, and submit it through normal current-head/base review
+   and required checks. Record `U`'s exact SHA/tree, review/check receipts, and
+   normal admission into `dev`, with exact `F` → `U` → accepted-`dev` ancestry.
+   Keep release-source and integration validation separate: `U`'s checks cannot
+   replace `F`'s complete release-source checks, and `F`'s checks cannot replace
+   `U`'s normal integration checks. Bind both receipts to their respective
+   SHA/tree, even if the two heads coincide when no dev update is needed.
+   Only after both pass and `F` is admitted through `U`, fast-forward the release
+   branch to the recorded original fix head `F`; never substitute `U` or its
+   dev merge result for recorded `F`. Review must reject any other repair target,
+   even if its ancestry gate passes. Do not merge unrelated `dev` work into the
+   release. A changed `F` requires fresh source evidence and normal admission.
+   Pending or failing release-source or required integration checks block this
+   route; fix and rerun them, never change
+   the cut to evade a gate. Only if existing branch rules cannot preserve exact
+   `F` ancestry, or the necessary repair cannot stay within the recorded scope,
+   stop and explicitly agree a new cut/scope through the normal process.
+   Never bypass protection.
+4. The required `Promotion Source` gate verifies the actual same-repository
+   release branch against the PR's exact head, proves cut → release-head
+   ancestry, and proves release-head → protected-`dev` ancestry. Missing proof,
+   source drift, or an unbackmerged fix fails closed. Later `dev` commits do not
+   invalidate a frozen release. Static CI cannot prove the historical timing of
+   branch creation or judge release scope. In particular, an admitted `U` can
+   pass ancestry while containing unrelated `dev` work; this gate alone cannot
+   authorize `U` as the release target. Review must verify the fresh cut receipt
+   and actual normal branch creation, the recorded scope, and the separate `F`
+   release-source and `U` integration receipts before accepting a repair.
+5. Merge the release PR into `main` only after its current-head review, all
+   required checks, the full Linux/macOS/Windows matrix, and normal branch
+   protection pass. Main PR checks continue to test the synthetic merge result;
+   manual CI can additionally validate the exact release source. A new head or
+   changed base requires fresh review and checks, never relabeled old results.
+
+Release source and version tags are immutable: never move or replace a frozen
+tag. This process adds no publication or deployment authorization, credentials,
+permissions, or protection exceptions. Existing publication prerequisites still
+apply.
+
+After the normal protected release-branch promotion, successful same-repository
+main push CI queues publication of its exact tested commit to crates.io and a
+GitHub Release. The workflow must first reach main through that normal promotion;
+do not promote unrelated development solely to activate it. Source manifests
+keep `0.0.0`; temporary publication stamps an unused `YYYY.M.N` UTC version and
+embeds the committed frontend lock. Keep this successful-main-CI path as the
+single automatic Bamboo publisher. Once Bamboo is published, downstream Zenith
+runs should use `targets=bodhi`, verify the already-published Bamboo version and
+source, and consume that release instead of dispatching a duplicate Bamboo
+publication.
+
+Main pushes also trigger documentation publication to public GitHub Pages.
+GHCR image publication is triggered separately by `v*`/`bamboo-v*` tag pushes or
+an explicit Docker workflow dispatch, not by a main push. Account for these
+side effects under the existing authorization and release prerequisites; the
+branch policy does not change their workflows.
 
 Automatic runs and manual/Zenith dispatches using this workflow share one
 `bamboo-crate-publication` queue without canceling queued uploads. Previously
@@ -314,7 +436,20 @@ must finish before independent main publication is activated.
 
 Bamboo uses GitHub Actions for continuous integration and publishing:
 
-- **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run locked Rust build/test, formatting, and CI workflow policy checks in the required `Test` gate. Pull requests into `main`, pushes to `main`, and manual dispatches retain comprehensive validation, with the all-feature library and integration suite in the required `E2E Tests` job. Only promotion pull requests from this repository's `dev` branch into `main` add release builds on Linux, macOS, and Windows; manual dispatches also run that platform matrix. Linux TLS and frontend contract tests run in `Test`, while macOS and Windows run their platform-specific checks. Successful dev PR builds can reuse their own Rust cache until closure; `.github/workflows/pr-cache-cleanup.yml` then removes only that same-repository PR's merge-ref caches.
+- **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run the required
+  `Test` check in compile-only mode (`cargo build --locked`) and auxiliary
+  `Quick Checks` (Node policy tests and Rust formatting). A compile pass does not
+  replace the owner's
+  pre-merge local affected-test and regression-coverage evidence. The same `Test`
+  check runs the complete build/test job for fixed-snapshot manual validation,
+  frozen release PRs into `main`, and main pushes; dev mode does not execute
+  the full suite. Release/main and manual full-validation routes
+  retain the comprehensive checks and all-feature `E2E Tests`. Same-repository
+  frozen release PRs and manual full validation run the Linux/macOS/Windows
+  release-build matrix. Main pushes retain their complete CI/publication queue.
+  Required-check configuration is separate from these workflow triggers; verify
+  the intended dev compilation gate and preserve all main requirements before declaring
+  the policy active. PR cache cleanup remains scoped to that same-repository PR.
 - **CodeQL** (`.github/workflows/codeql.yml`) -- Runs the Actions, JavaScript/TypeScript, Python, and Rust analyses for pull requests into `main`, pushes to `main`, and explicit manual dispatches. Routine `dev` activity does not run CodeQL.
 - **Publish Crate** (`.github/workflows/publish-crate.yml`) -- Publishes successful main CI source commits to crates.io and GitHub Releases with verified same-source recovery. Manual/Zenith dispatches retain explicit versions, the exact locked frontend and `dry_run`.
   Its Cargo PATH entrypoint, including metadata invoked from Python, runs the

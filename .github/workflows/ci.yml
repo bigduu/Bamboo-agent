@@ -2,8 +2,13 @@ name: CI
 
 on:
   workflow_dispatch:
-  # Pull requests are the required dev gate; do not repeat the same suite after
-  # that tested head merges. Main promotions still validate their merge result.
+    inputs:
+      snapshot_sha:
+        description: Exact 40-character SHA of the selected ref to validate as one frozen batch
+        required: true
+        type: string
+  # Dev admission requires a real compile; related tests run in the executor
+  # before merge. Full CI tests belong to snapshots, promotions and main pushes.
   push:
     branches: [ main ]
   pull_request:
@@ -12,7 +17,7 @@ on:
 # Queue every main push for its own release gate; supersede iterative PR/manual
 # validation independently. Promotion builds still fan out to three platforms.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event_name }}-${{ (github.event_name == 'workflow_dispatch' && inputs.snapshot_sha) || github.event.pull_request.number || github.ref }}
   # Every main merge needs a completed CI gate before its own publication.
   # PRs/manual validation keep their existing superseding-run behavior.
   queue: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'max' || 'single' }}
@@ -20,27 +25,51 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
-  promotion-source:
-    name: Promotion Source
-    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+  validation-source:
+    name: Validation Source
     runs-on: ubuntu-latest
+    outputs:
+      full: ${{ steps.scope.outputs.full }}
     steps:
-      - name: Require the repository dev branch
+      - name: Bind full validation to the actual event snapshot
+        id: scope
         env:
-          HEAD_REF: ${{ github.head_ref }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          EXPECTED_SNAPSHOT_SHA: ${{ inputs.snapshot_sha }}
+        shell: bash
         run: |
-          if [[ "$HEAD_REF" != "dev" || "$HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
-            echo "::error::Pull requests into main must promote bigduu/Bamboo-agent:dev."
-            exit 1
-          fi
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          full=false
+          case "$GITHUB_EVENT_NAME" in
+            workflow_dispatch)
+              [[ "$EXPECTED_SNAPSHOT_SHA" =~ ^[0-9a-f]{40}$ ]]
+              test "$EXPECTED_SNAPSHOT_SHA" = "$GITHUB_SHA"
+              full=true
+              ;;
+            pull_request)
+              case "$GITHUB_BASE_REF" in
+                main) full=true ;;
+                dev) ;;
+                *) exit 1 ;;
+              esac
+              ;;
+            push)
+              test "$GITHUB_REF" = refs/heads/main
+              full=true
+              ;;
+            *) exit 1 ;;
+          esac
+          printf 'Event source: %s; full validation: %s\n' "$GITHUB_SHA" "$full"
+          printf 'full=%s\n' "$full" >> "$GITHUB_OUTPUT"
 
-  test:
-    name: Test
+  quick-checks:
+    name: Quick Checks
+    if: github.event_name == 'pull_request' && github.base_ref == 'dev'
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -48,9 +77,145 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
+          package-manager-cache: false
+
+      - name: Install Rust formatting tools
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test fast workflow and release policies
+        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs
+
+  promotion-source:
+    name: Promotion Source
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require a frozen release from protected dev history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import re
+          import urllib.parse
+          import urllib.request
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          require(repository == "bigduu/Bamboo-agent", "Unexpected promotion repository")
+          require(os.environ["HEAD_REPOSITORY"] == repository, "Promotion must use a same-repository branch")
+          release = os.environ["HEAD_REF"]
+          match = re.fullmatch(r"release/([0-9a-f]{40})", release)
+          require(match is not None, "Main accepts only release/<40-character-cut-SHA> branches")
+          cut = match.group(1)
+          head = os.environ["HEAD_SHA"]
+          require(re.fullmatch(r"[0-9a-f]{40}", head) is not None, "Missing exact pull-request head")
+          token = os.environ["GH_TOKEN"]
+          require(bool(token), "Missing read-only source proof authority")
+
+          # Fixed API origin; never follow a redirect with the job credential.
+          # No checkout or execution of scripts from the proposed release.
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, message, headers, newurl):
+                  return None
+
+          opener = urllib.request.build_opener(NoRedirect())
+          def api(route):
+              request = urllib.request.Request(
+                  f"https://api.github.com/repos/{repository}/{route}",
+                  headers={"Authorization": f"Bearer {token}",
+                           "Accept": "application/vnd.github+json",
+                           "X-GitHub-Api-Version": "2022-11-28",
+                           "User-Agent": "bamboo-promotion-source"},
+              )
+              with opener.open(request, timeout=30) as response:
+                  return json.load(response)
+
+          def branch(name, protected=False):
+              data = api(f"branches/{urllib.parse.quote(name, safe='')}")
+              require(data["name"] == name, "Branch identity changed")
+              if protected:
+                  require(data["protected"] is True, "dev must remain protected")
+              sha = data["commit"]["sha"]
+              require(re.fullmatch(r"[0-9a-f]{40}", sha) is not None, "Missing branch commit identity")
+              return sha
+
+          def ancestor(source, target):
+              proof = api(f"compare/{source}...{target}")
+              require(proof["status"] in {"ahead", "identical"}
+                      and proof["base_commit"]["sha"] == source
+                      and proof["merge_base_commit"]["sha"] == source,
+                      "Release ancestry proof is missing or does not match")
+
+          require(branch(release) == head, "Release branch no longer matches the exact PR head")
+          dev = branch("dev", protected=True)
+          ancestor(cut, head)
+          ancestor(head, dev)
+          # Normal dev advancement is allowed; rewritten history is not.
+          # Comparisons are always between immutable SHAs, never moving refs.
+          current_dev = branch("dev", protected=True)
+          if current_dev != dev:
+              ancestor(dev, current_dev)
+          require(branch(release) == head, "Release branch changed during source proof")
+          print(f"Accepted frozen release cut={cut} head={head} protected_dev={current_dev}")
+          PYTHON
+
+  test:
+    name: Test
+    needs: validation-source
+    # A source-gate failure must fail required Test, never turn it into a skip.
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}
+    steps:
+      - name: Require validation admission
+        env:
+          SOURCE_RESULT: ${{ needs.validation-source.result }}
+          FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$SOURCE_RESULT" = success
+          case "$GITHUB_EVENT_NAME:${GITHUB_BASE_REF:-}:$FULL_VALIDATION" in
+            pull_request:dev:false|pull_request:main:true|workflow_dispatch::true) ;;
+            push::true) test "$GITHUB_REF" = refs/heads/main ;;
+            *) exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v7
+
+      - name: Require the exact clean event source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+          git show -s --format='Source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
 
       - name: Test CI workflow policy
-        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs
+        if: needs.validation-source.outputs.full == 'true'
+        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs
 
       - name: Test frontend artifact and release policies
         if: github.event_name != 'pull_request' || github.base_ref == 'main'
@@ -69,7 +234,13 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Record the full validation toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+
       - name: Check formatting
+        if: needs.validation-source.outputs.full == 'true'
         run: cargo fmt --all -- --check
 
       - name: Rust cache
@@ -100,12 +271,14 @@ jobs:
         run: cargo build --locked
 
       - name: Compile locked Rust test targets
+        if: needs.validation-source.outputs.full == 'true'
         timeout-minutes: 15
         run: cargo test --locked --no-run
         env:
           RUST_MIN_STACK: "8388608"
 
       - name: Test locked Rust workspace
+        if: needs.validation-source.outputs.full == 'true'
         timeout-minutes: 30
         run: cargo test --locked
         # Deep actor-runtime tests need the same thread stack on CI as the
@@ -139,9 +312,19 @@ jobs:
         timeout-minutes: 10
         run: scripts/run-russh-live.sh
 
+      - name: Require the exact clean source after full validation
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+
   msrv:
     name: MSRV (Rust 1.95)
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
+    needs: validation-source
+    if: needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -168,7 +351,8 @@ jobs:
 
   tls-fixture-test:
     name: TLS Fixture (${{ matrix.os }})
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
+    needs: validation-source
+    if: needs.validation-source.outputs.full == 'true'
     # Keep the test-only certificate generator portable across the OpenSSL and
     # LibreSSL variants on every supported host. The release build matrix below
     # does not compile or execute #[cfg(test)] code.
@@ -202,7 +386,8 @@ jobs:
 
   tool-event-recorder-e2e:
     name: ToolEvent Recorder E2E (${{ matrix.os }})
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
+    needs: validation-source
+    if: needs.validation-source.outputs.full == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -225,7 +410,8 @@ jobs:
 
   e2e-test:
     name: E2E Tests
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
+    needs: validation-source
+    if: needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -246,7 +432,8 @@ jobs:
 
   lint:
     name: Lint
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
+    needs: validation-source
+    if: needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -281,14 +468,16 @@ jobs:
   build:
     name: Build (${{ matrix.os }})
     # Integration work is validated on Linux. The release-grade platform
-    # matrix is reserved for promoting this repository's dev branch to main;
+    # matrix is reserved for this repository's frozen release branches to main;
     # workflow_dispatch remains an explicit escape hatch for manual validation.
+    needs: validation-source
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      needs.validation-source.outputs.full == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
        github.base_ref == 'main' &&
-       github.head_ref == 'dev' &&
-       github.event.pull_request.head.repo.full_name == github.repository)
+       startsWith(github.head_ref, 'release/') &&
+       github.event.pull_request.head.repo.full_name == github.repository))
     strategy:
       fail-fast: false
       matrix:
@@ -342,7 +531,8 @@ jobs:
 
   docs:
     name: Documentation
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
+    needs: validation-source
+    if: needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -361,7 +551,8 @@ jobs:
 
   security:
     name: Security Audit
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
+    needs: validation-source
+    if: needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -396,7 +587,8 @@ jobs:
 
   deny:
     name: cargo-deny (licenses/bans/advisories/sources)
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
+    needs: validation-source
+    if: needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
