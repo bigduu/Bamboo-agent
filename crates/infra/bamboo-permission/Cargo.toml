@@ -29,7 +29,7 @@ libc = "0.2"
 regex = "1"
 anyhow = "1"
 thiserror = "2"
-tree-sitter = "0.26"
+tree-sitter = "0.27"
 tree-sitter-bash = "0.25"
 
 [dev-dependencies]
