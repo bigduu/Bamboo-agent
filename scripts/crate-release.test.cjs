@@ -1202,7 +1202,7 @@ else:
     payload.workflow_run.head_sha = source
     const result = run({}, payload)
     assert.equal(result.status, 0, result.stderr)
-    assert.equal(result.output, `revision=${source}\n`)
+    assert.equal(result.output, `revision=${source}\ncontroller_revision=${dev}\n`)
   }
   for (const invalid of [feature, 'f'.repeat(40), 'invalid']) {
     const payload = clone(event)
@@ -1220,7 +1220,7 @@ else:
   }
   const automatic = run({ GITHUB_SHA: dev })
   assert.equal(automatic.status, 0, automatic.stderr)
-  assert.equal(automatic.output, `revision=${historical}\n`, 'workflow SHA cannot replace the tested CI source')
+  assert.equal(automatic.output, `revision=${historical}\ncontroller_revision=${dev}\n`, 'workflow SHA cannot replace the tested CI source')
   for (const [key, value] of [['name', 'Other'], ['head_repository', { full_name: 'foreign/repository' }],
     ['event', 'pull_request'], ['conclusion', 'failure'], ['head_branch', 'dev']]) {
     const changed = clone(event)
@@ -1327,3 +1327,6 @@ test('temporary lock refresh preserves the exact tested external dependency mult
   assert.notEqual(check({ package: [stamped.package[1]] }).status, 0)
   assert.notEqual(check({ package: [...stamped.package, clone(external)] }).status, 0)
 })
+
+// Exercise the real REST adapter and the separate trusted controller loader.
+require('./crate-release-draft-tag.test.cjs')

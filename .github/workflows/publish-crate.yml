@@ -431,6 +431,7 @@ jobs:
               assert accepted, "Publication source and workflow must belong to protected dev/main history"
           with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
               stream.write(f"revision={source}\n")
+              stream.write(f"controller_revision={workflow_source}\n")
           PY
 
       - uses: actions/checkout@v7
@@ -449,6 +450,49 @@ jobs:
       - name: Require the release policy in this source commit
         # Pre-policy main CI cannot acquire the automatic publication authority.
         run: test -f scripts/crate-release.cjs
+
+      - name: Load the accepted publication controller outside the product checkout
+        id: controller
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROLLER_REVISION: ${{ steps.source.outputs.controller_revision }}
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+        run: |
+          python3 - <<'PYCONTROLLER'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          revision = os.environ["CONTROLLER_REVISION"]
+          assert repository == "bigduu/Bamboo-agent"
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          assert revision == os.environ["GITHUB_WORKFLOW_SHA"]
+          # The preceding bootstrap admitted this exact workflow SHA to protected history.
+          # Keep both controller files outside the exact CI-tested product checkout.
+          directory = Path(os.environ["RUNNER_TEMP"]) / "bamboo-release-controller"
+          directory.mkdir(parents=True, exist_ok=True)
+          for name in ("crate-release.cjs", "crate-release-frontend.py"):
+              route = f"repos/{repository}/contents/scripts/{name}?ref={revision}"
+              entry = json.loads(subprocess.check_output(["gh", "api", route], text=True))
+              assert entry["type"] == "file" and entry["path"] == f"scripts/{name}"
+              assert entry["encoding"] == "base64"
+              content = base64.b64decode("".join(entry["content"].split()), validate=True)
+              blob = hashlib.sha1(f"blob {len(content)}\0".encode() + content).hexdigest()
+              assert blob == entry["sha"], "Controller blob bytes do not match the accepted Git object"
+              (directory / name).write_bytes(content)
+              print(f"Publication controller {name}: source={revision} blob={blob}")
+          source = os.environ["SOURCE_REVISION"]
+          assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == source
+          assert subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=all"], text=True) == ""
+          with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+              stream.write(f"path={directory / 'crate-release.cjs'}\n")
+              stream.write(f"revision={revision}\n")
+          PYCONTROLLER
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -505,7 +549,7 @@ jobs:
           BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
           FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
           FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
-        run: node scripts/crate-release.cjs plan
+        run: node "${{ steps.controller.outputs.path }}" plan
 
       - name: Prepare workspace manifests for publish
         env:
@@ -525,4 +569,4 @@ jobs:
           BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
           FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
           FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
-        run: node scripts/crate-release.cjs publish
+        run: node "${{ steps.controller.outputs.path }}" publish
