@@ -3136,19 +3136,18 @@ impl SkillStore {
     }
 
     /// Release a session pin without depending on its workspace still existing.
-    /// Session IDs are unique across scopes, so clearing the root and every cached
-    /// workspace store is both safe and robust to deleted/unmounted projects.
+    /// Session IDs are unique across scopes. Visit cached Project/workspace and
+    /// mode descendants too, without reopening deleted or unmounted resources.
     pub async fn release_activation_across_cached_scopes(&self, activation_id: &str) {
         self.release_activation(activation_id).await;
-        let workspace_stores = self
-            .workspace_stores
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for store in workspace_stores {
+        let mut pending = self.cached_dependent_stores().await;
+        let mut visited = HashSet::from([self.store_token]);
+        while let Some(store) = pending.pop() {
+            if !visited.insert(store.store_token) {
+                continue;
+            }
             store.release_activation(activation_id).await;
+            pending.extend(store.cached_dependent_stores().await);
         }
     }
 
@@ -6887,6 +6886,61 @@ Use this skill for testing.
             .activation_descriptor("deleted-workspace-session")
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn release_reaches_project_and_nested_mode_pins_without_touching_other_sessions() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("skills");
+        let project_home = directory.path().join("project");
+        let workspace = directory.path().join("workspace");
+        fs::create_dir_all(&project_home).await.unwrap();
+        fs::create_dir_all(&workspace).await.unwrap();
+        write_skill(&skills_dir, "release-scope", "scope", "private scope")
+            .await
+            .unwrap();
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+        store.initialize().await.unwrap();
+        let project_id = bamboo_domain::ProjectId::new();
+        let project = store
+            .skill_store_for_project_workspace(&project_id, &project_home, Some(&workspace))
+            .await
+            .unwrap();
+        let mode = project
+            .skill_store_for_mode(Some("code"))
+            .await
+            .unwrap()
+            .unwrap();
+        let ids = ["release-scope".to_string()];
+        project
+            .pin_current_activation("retiring-session", &ids, None)
+            .await
+            .unwrap();
+        mode.pin_current_activation("retiring-session", &ids, None)
+            .await
+            .unwrap();
+        mode.pin_current_activation("other-session", &ids, None)
+            .await
+            .unwrap();
+        fs::remove_dir_all(project_home).await.unwrap();
+        fs::remove_dir_all(workspace).await.unwrap();
+
+        store
+            .release_activation_across_cached_scopes("retiring-session")
+            .await;
+
+        assert!(project
+            .activation_descriptor("retiring-session")
+            .await
+            .is_none());
+        assert!(mode
+            .activation_descriptor("retiring-session")
+            .await
+            .is_none());
+        assert!(mode.activation_descriptor("other-session").await.is_some());
     }
 
     #[tokio::test]

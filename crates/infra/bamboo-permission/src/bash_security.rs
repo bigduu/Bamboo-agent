@@ -677,7 +677,7 @@ fn count_commands(node: &tree_sitter::Node) -> usize {
         | "function_definition" => {
             let mut total = 0;
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
+                if let Some(child) = node.child(i) {
                     total += count_commands(&child);
                 }
             }
@@ -758,7 +758,7 @@ fn walk_node_with_budget(
         // live false positive (every `unset` Denied). #557.
         | "unset_command" => {
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
+                if let Some(child) = node.child(i) {
                     walk_node_with_budget(&child, source, warnings, node_count);
                 }
             }
@@ -795,7 +795,7 @@ fn walk_node_with_budget(
                 detail: "subshell ( ... )".to_string(),
             });
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
+                if let Some(child) = node.child(i) {
                     walk_node_with_budget(&child, source, warnings, node_count);
                 }
             }
@@ -807,7 +807,7 @@ fn walk_node_with_budget(
                 detail: "compound statement { ... }".to_string(),
             });
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
+                if let Some(child) = node.child(i) {
                     walk_node_with_budget(&child, source, warnings, node_count);
                 }
             }
@@ -819,7 +819,7 @@ fn walk_node_with_budget(
                 detail: "function definition".to_string(),
             });
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
+                if let Some(child) = node.child(i) {
                     walk_node_with_budget(&child, source, warnings, node_count);
                 }
             }
@@ -833,7 +833,7 @@ fn walk_node_with_budget(
                 detail: format!("control flow: {}", kind),
             });
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
+                if let Some(child) = node.child(i) {
                     walk_node_with_budget(&child, source, warnings, node_count);
                 }
             }
@@ -976,7 +976,7 @@ fn collect_commands_recursive(
         | "else_clause"
         | "negated_command" => {
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
+                if let Some(child) = node.child(i) {
                     collect_commands_recursive(&child, source, commands);
                 }
             }
@@ -993,7 +993,7 @@ fn extract_command_from_node(
     let mut args: Vec<String> = Vec::new();
 
     for i in 0..node.child_count() {
-        let child = node.child(i as u32)?;
+        let child = node.child(i)?;
         match child.kind() {
             "command_name" => {
                 name = Some(node_text(&child, source));
@@ -2047,7 +2047,7 @@ fn check_redirects_node(node: &tree_sitter::Node, source: &str, warnings: &mut V
         let mut target_path: Option<String> = None;
 
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
+            if let Some(child) = node.child(i) {
                 let kind = child.kind();
                 let text = node_text(&child, source);
                 if kind == "file_descriptor" || kind == "redirect_operator" {
@@ -2085,7 +2085,7 @@ fn check_redirects_node(node: &tree_sitter::Node, source: &str, warnings: &mut V
     }
 
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
+        if let Some(child) = node.child(i) {
             check_redirects_node(&child, source, warnings);
         }
     }
@@ -2101,10 +2101,10 @@ fn check_variable_command(tree: &tree_sitter::Tree) -> Vec<BashWarning> {
 fn check_variable_command_node(node: &tree_sitter::Node, warnings: &mut Vec<BashWarning>) {
     if node.kind() == "command" {
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
+            if let Some(child) = node.child(i) {
                 if child.kind() == "command_name" {
                     for j in 0..child.child_count() {
-                        if let Some(name_child) = child.child(j as u32) {
+                        if let Some(name_child) = child.child(j) {
                             let kind = name_child.kind();
                             // `$var`/`${var}` AND `$(cmd)`/`` `cmd` `` as the
                             // command name are equally dynamic/statically-
@@ -2138,7 +2138,7 @@ fn check_variable_command_node(node: &tree_sitter::Node, warnings: &mut Vec<Bash
     }
 
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
+        if let Some(child) = node.child(i) {
             check_variable_command_node(&child, warnings);
         }
     }
@@ -2161,7 +2161,7 @@ fn check_suspicious_arguments_node(
         let mut args: Vec<String> = Vec::new();
 
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
+            if let Some(child) = node.child(i) {
                 match child.kind() {
                     "command_name" => {
                         cmd_name = Some(node_text(&child, source).to_ascii_lowercase());
@@ -2224,7 +2224,7 @@ fn check_suspicious_arguments_node(
     }
 
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
+        if let Some(child) = node.child(i) {
             check_suspicious_arguments_node(&child, source, warnings);
         }
     }
@@ -2300,7 +2300,7 @@ fn check_heredoc_expansions_node(
     }
 
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
+        if let Some(child) = node.child(i) {
             check_heredoc_expansions_node(&child, source, warnings);
         }
     }
