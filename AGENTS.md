@@ -56,3 +56,15 @@ integration is accepted. Preserve dirty or uncertain worktrees.
 - Green CI does not mean review passed. Add `review:agent` and remove
   `review:needed` only after the current-head Codex review has finished with no
   unresolved findings and the remaining acceptance and merge gates pass.
+
+## Release Branches
+
+Follow the authoritative [Release Process](./CONTRIBUTING.md#release-process):
+cut a same-repository `release/<40-character-cut-SHA>` from the freshly read
+actual protected-`dev` HEAD after required changes and controls have merged.
+Record the cut timestamp, SHA, tree, fresh-read receipt, and bounded scope;
+review must verify the receipt and normal branch creation. Promote that frozen
+branch to `main`. Keep `dev` open; never chase its moving tip in a release. Necessary
+release-based fixes must pass normal review/checks into protected `dev` with
+exact ancestry preserved before fast-forwarding the release. Keep frozen tags
+immutable and retain all required checks, platform coverage, and protection.

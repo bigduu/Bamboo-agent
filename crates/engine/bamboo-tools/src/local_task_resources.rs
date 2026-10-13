@@ -26,6 +26,15 @@ mod darwin;
 #[cfg(windows)]
 mod windows;
 
+mod initial;
+pub(crate) use initial::InitialHandoff;
+
+pub(crate) enum InitialWait {
+    NaturalPending,
+    NeedWait,
+    Reaped(io::Result<ExitStatus>),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalTaskResourceIdentity {
     pub session_id: String,
@@ -372,6 +381,7 @@ impl LocalTaskChild {
 /// Legacy Child behavior is untouched when no local execution scope is bound.
 pub(crate) enum ManagedBashChild {
     Legacy(Child),
+    Initial(Arc<InitialHandoff>),
     Owned {
         stdout: Option<ChildStdout>,
         stderr: Option<ChildStderr>,
@@ -386,6 +396,49 @@ impl From<Child> for ManagedBashChild {
     }
 }
 impl ManagedBashChild {
+    pub(crate) fn spawn_polled(command: &mut Command) -> io::Result<Self> {
+        if LocalTaskResources::current().is_some() {
+            return Self::spawn(command);
+        }
+        let (owner, setup) = InitialHandoff::spawn(command)?;
+        if let Err(error) = setup {
+            owner.cancel();
+            // Setup already created a real child. Keep that exact owner until
+            // its cleanup completes, even though no tool handle is returned.
+            tokio::spawn(async move {
+                if let Err(cleanup) = owner.wait().await {
+                    tracing::warn!(%cleanup, "initial exec setup cleanup failed");
+                }
+            });
+            return Err(error);
+        }
+        Ok(Self::Initial(owner))
+    }
+
+    pub(crate) fn initial_handoff(&self) -> Option<Arc<InitialHandoff>> {
+        match self {
+            Self::Initial(owner) => Some(owner.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) async fn prepare_initial_wait(&mut self) -> io::Result<InitialWait> {
+        match self {
+            Self::Initial(owner) => Ok(if owner.prepare_wait().await? {
+                InitialWait::NaturalPending
+            } else {
+                InitialWait::NeedWait
+            }),
+            _ => Ok(InitialWait::Reaped(self.wait().await)),
+        }
+    }
+
+    pub(crate) fn mark_initial_capture_ready(&self) {
+        if let Self::Initial(owner) = self {
+            owner.mark_capture_ready();
+        }
+    }
+
     pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
         let Some(scope) = LocalTaskResources::current() else {
             return command.spawn().map(Self::Legacy);
@@ -464,24 +517,28 @@ impl ManagedBashChild {
     pub(crate) fn take_stdout(&mut self) -> Option<ChildStdout> {
         match self {
             Self::Legacy(c) => c.stdout.take(),
+            Self::Initial(owner) => owner.take_stdout(),
             Self::Owned { stdout, .. } => stdout.take(),
         }
     }
     pub(crate) fn take_stderr(&mut self) -> Option<ChildStderr> {
         match self {
             Self::Legacy(c) => c.stderr.take(),
+            Self::Initial(owner) => owner.take_stderr(),
             Self::Owned { stderr, .. } => stderr.take(),
         }
     }
     pub(crate) fn take_stdin(&mut self) -> Option<ChildStdin> {
         match self {
             Self::Legacy(c) => c.stdin.take(),
+            Self::Initial(owner) => owner.take_stdin(),
             Self::Owned { stdin, .. } => stdin.take(),
         }
     }
     pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
         match self {
             Self::Legacy(child) => child.wait().await,
+            Self::Initial(owner) => owner.wait().await,
             Self::Owned { result, .. } => loop {
                 if let Some(outcome) = result.borrow().clone() {
                     return outcome.map_err(io::Error::other);
@@ -496,6 +553,7 @@ impl ManagedBashChild {
     pub(crate) fn start_kill(&mut self) -> io::Result<()> {
         match self {
             Self::Legacy(child) => child.start_kill(),
+            Self::Initial(owner) => owner.start_kill(),
             Self::Owned { kill, .. } => {
                 kill.send_replace(true);
                 Ok(())
@@ -509,6 +567,10 @@ impl ManagedBashChild {
 }
 impl Drop for ManagedBashChild {
     fn drop(&mut self) {
+        if let Self::Initial(owner) = self {
+            owner.cancel();
+            owner.retain_cancelled_cleanup();
+        }
         if let Self::Owned { kill, .. } = self {
             kill.send_replace(true);
         }
@@ -535,35 +597,37 @@ impl Drop for GroupLeader {
 #[cfg(unix)]
 async fn wait_without_reaping(pid: u32) -> io::Result<()> {
     loop {
-        // Keep siginfo's platform-specific raw pointers out of the async state.
-        // Only the plain observation crosses the following await.
-        let exited = {
-            // SAFETY: waitid initializes siginfo; WNOWAIT retains the owned leader
-            // as a zombie, preventing PID/PGID reuse before the group signal.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            let result = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    pid as libc::id_t,
-                    &mut info,
-                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                )
-            };
-            if result != 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            // SAFETY: a successful waitid initialized the SIGCHLD fields. Zero
-            // PID means no state change with WNOHANG.
-            unsafe { info.si_pid() != 0 }
-        };
-        if exited {
+        if leader_has_exited(pid)? {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+fn leader_has_exited(pid: u32) -> io::Result<bool> {
+    loop {
+        // SAFETY: waitid initializes siginfo; WNOWAIT retains the owned leader
+        // as a zombie, preventing PID/PGID reuse before the group signal.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        // SAFETY: a successful waitid initialized the SIGCHLD fields. Zero
+        // PID means no state change with WNOHANG.
+        return Ok(unsafe { info.si_pid() != 0 });
     }
 }
 
