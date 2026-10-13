@@ -340,6 +340,60 @@ async fn missing_success_is_capability_and_install_eligibility_not_desktop_readi
     );
 }
 
+#[actix_web::test]
+async fn cancelled_queued_operation_drops_work_without_acquiring_the_plugin_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path()).await;
+    let installer = ServerPluginInstaller::new(state.clone());
+    let held = installer.begin_operation().await;
+    let (started, mut start) = tokio::sync::oneshot::channel();
+    let (finish, completion) = tokio::sync::oneshot::channel::<()>();
+    let mut request = Box::pin(run_owned_operation(state, async move {
+        started.send(()).unwrap();
+        completion.await.unwrap();
+    }));
+    assert!(futures::poll!(request.as_mut()).is_pending());
+    drop(request);
+    assert!(finish.is_closed(), "cancelled queued work must be dropped");
+    assert!(matches!(
+        start.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+    ));
+    drop(held);
+    let _following = tokio::time::timeout(Duration::from_secs(2), installer.begin_operation())
+        .await
+        .expect("cancelled queued work must not retain a plugin-lock waiter");
+}
+
+#[actix_web::test]
+async fn started_operation_keeps_plugin_lock_after_request_cancellation() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path()).await;
+    let installer = ServerPluginInstaller::new(state.clone());
+    let (started, start) = tokio::sync::oneshot::channel();
+    let (finish, completion) = tokio::sync::oneshot::channel::<()>();
+    let mut request = Box::pin(run_owned_operation(state, async move {
+        started.send(()).unwrap();
+        completion.await.unwrap();
+    }));
+    assert!(futures::poll!(request.as_mut()).is_pending());
+    tokio::time::timeout(Duration::from_secs(2), start)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(request);
+    assert!(
+        !finish.is_closed(),
+        "started work must retain owned cleanup"
+    );
+    let mut following = Box::pin(installer.begin_operation());
+    assert!(futures::poll!(following.as_mut()).is_pending());
+    finish.send(()).unwrap();
+    let _following = tokio::time::timeout(Duration::from_secs(2), following)
+        .await
+        .expect("completed owned work must release the plugin lock");
+}
+
 #[cfg(unix)]
 #[actix_web::test]
 async fn existing_app_or_absent_accepted_artifact_never_enables_installation() {

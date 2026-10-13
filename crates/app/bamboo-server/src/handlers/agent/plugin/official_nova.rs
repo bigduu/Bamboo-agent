@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -852,12 +853,25 @@ async fn save_archive(
     Ok((temporary, archive))
 }
 
+async fn run_owned_operation<T: 'static>(
+    state: web::Data<AppState>,
+    operation: impl Future<Output = T> + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    // Cancelled waiters must disappear before any work is detached. Once started,
+    // retain the snapshot/lock until the operation's bounded cleanup completes.
+    let installer = ServerPluginInstaller::new(state);
+    let guard = installer.begin_operation().await;
+    actix_web::rt::spawn(async move {
+        let _guard = guard;
+        operation.await
+    })
+    .await
+}
+
 pub async fn nova_app(state: web::Data<AppState>) -> HttpResponse {
-    // HTTP cancellation must not release the snapshot/lock before bounded child cleanup.
-    match actix_web::rt::spawn(async move {
-        let installer = ServerPluginInstaller::new(state.clone());
-        let _guard = installer.begin_operation().await;
-        inspect_locked(&state, Host::detect(), &accepted_catalog())
+    let operation_state = state.clone();
+    match run_owned_operation(state, async move {
+        inspect_locked(&operation_state, Host::detect(), &accepted_catalog())
             .await
             .map(|inspection| inspection.report)
     })
@@ -877,12 +891,10 @@ pub struct AppInstallRequest {
     artifact_id: Option<String>,
 }
 
-async fn install_owned(
+async fn install_locked(
     state: web::Data<AppState>,
     request: AppInstallRequest,
 ) -> Result<Setup, &'static str> {
-    let installer = ServerPluginInstaller::new(state.clone());
-    let _guard = installer.begin_operation().await;
     let catalog = accepted_catalog();
     let inspection = inspect_locked(&state, Host::detect(), &catalog)
         .await
@@ -965,13 +977,13 @@ async fn install_downloaded(
     Ok(fresh)
 }
 
-/// Explicit user action; the owned bounded operation survives a lost HTTP response.
+/// Explicit user action; cancellation removes queued work, while started work owns cleanup.
 pub async fn install_nova_app(
     state: web::Data<AppState>,
     body: web::Json<AppInstallRequest>,
 ) -> HttpResponse {
     let request = body.into_inner();
-    match actix_web::rt::spawn(install_owned(state, request)).await {
+    match run_owned_operation(state.clone(), install_locked(state, request)).await {
         Ok(Ok(report)) => HttpResponse::Created().json(report),
         result => {
             let reason = match result {
