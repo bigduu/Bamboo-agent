@@ -170,8 +170,11 @@ bamboo/
 ### Testing Guidelines
 
 - Write tests for all new functionality
-- Run relevant focused tests and report their actual results with the PR
-- Dev admission follows the required fast gate and review; complete build/test
+- Before merging to dev, run affected tests locally in the assigned executor
+- Add or update regression coverage for changed behavior, including relevant
+  normal and failure cases; record source SHA/tree, commands, selection and results
+- Missing or failing relevant local tests block merge; compilation is not test evidence
+- Dev CI requires successful compilation and normal review; complete build/test
   acceptance is mandatory through the frozen candidate's main promotion checks
 - Use descriptive test names
 - Include edge cases in tests
@@ -196,16 +199,26 @@ bamboo/
 ## Release Process
 
 Follow [Parallel Development](./gitflow.md) for branch ownership, bounded batches
-and evidence. Batch integration and standalone PRs target `dev`. The required
-`Quick Checks` gate runs policy checks and formatting without compiling Rust.
-Full build/test is advisory for dev and runs on a fixed snapshot when requested,
-rather than blocking every PR. Its failures remain visible and owned. Existing
-review and security requirements still apply.
+and evidence. Batch integration and standalone PRs target `dev`. Its required
+`Dev Build` gate runs `cargo build --locked`; `Quick Checks` remains auxiliary.
+Before merge, owners must run affected tests locally and add or update coverage
+for changed behavior, recording exact source, commands and results. Dev CI does
+not execute the full test suite for every PR. Complete validation runs on a
+fixed batch for release; its failures remain visible and owned. Existing review
+and security requirements still apply.
 
 This gate transition requires the separately approved dev protection update from
-`Test` to `Quick Checks`; until its actual configuration is verified, the existing
-required gate remains in force. Never count a skipped heavy job as completed
-full validation. Main's required checks are unchanged.
+`Test` to `Dev Build`; until its actual configuration is verified, the existing
+required gate remains in force. Never count a skipped full-test job as completed
+validation. Main's required checks are unchanged.
+
+A normal fast-forward direct push may be used once dev's actual branch rule
+permits it, with the same compilation, local test/coverage and applicable review
+requirements. The current compile job is PR-triggered; obtain valid candidate
+checks through that existing path before direct admission, or keep the normal
+PR route when exact-source equivalence is unproven. Do not force push or treat
+removal of the PR requirement as permission to bypass required checks. See
+[direct-push evidence](./gitflow.md#normal-direct-pushes-to-dev).
 
 Each release follows
 `dev → release/<40-character-cut-SHA> → main` in this repository. Never promote
@@ -227,7 +240,7 @@ identities; evidence is reusable only if all relevant source and build/test
 inputs match. An initial cut does not require an additional manual full suite
 merely to repeat equivalent promotion validation. Repair `F` still requires the
 separate exact-source acceptance below.
-Ordinary dev PRs no longer automatically run these complete heavy suites.
+Ordinary dev PRs compile in CI but do not automatically run these full test suites.
 Existing path-scoped Windows/adapter checks retain their own triggers.
 
 ### Freeze the release scope
@@ -421,16 +434,18 @@ must finish before independent main publication is activated.
 
 Bamboo uses GitHub Actions for continuous integration and publishing:
 
-- **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run `Quick Checks`
-  (Node workflow/release policy tests and Rust formatting, without a Rust build).
-  Heavy `Test` remains a real complete build/test job for fixed-snapshot manual
-  validation, frozen release PRs into `main`, and main pushes; it is not an
-  automatic dev-PR requirement. Release/main and manual full-validation routes
+- **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run the required
+  `Dev Build` (`cargo build --locked`) and auxiliary `Quick Checks` (Node policy
+  tests and Rust formatting). A compile pass does not replace the owner's
+  pre-merge local affected-test and regression-coverage evidence. Full `Test`
+  remains a real complete build/test job for fixed-snapshot manual validation,
+  frozen release PRs into `main`, and main pushes; it is not an automatic dev-PR
+  requirement. Release/main and manual full-validation routes
   retain the comprehensive checks and all-feature `E2E Tests`. Same-repository
   frozen release PRs and manual full validation run the Linux/macOS/Windows
   release-build matrix. Main pushes retain their complete CI/publication queue.
   Required-check configuration is separate from these workflow triggers; verify
-  the intended dev fast gate and preserve all main requirements before declaring
+  the intended dev compilation gate and preserve all main requirements before declaring
   the policy active. PR cache cleanup remains scoped to that same-repository PR.
 - **CodeQL** (`.github/workflows/codeql.yml`) -- Runs the Actions, JavaScript/TypeScript, Python, and Rust analyses for pull requests into `main`, pushes to `main`, and explicit manual dispatches. Routine `dev` activity does not run CodeQL.
 - **Publish Crate** (`.github/workflows/publish-crate.yml`) -- Publishes successful main CI source commits to crates.io and GitHub Releases with verified same-source recovery. Manual/Zenith dispatches retain explicit versions, the exact locked frontend and `dry_run`.

@@ -130,8 +130,10 @@ test("full snapshot and main gates preserve locked Rust, formatting, and policy 
 
   assert.match(
     contributing,
-    /Pull requests into `dev` run `Quick Checks`/u,
+    /Pull requests into `dev` run the required\s+`Dev Build` \(`cargo build --locked`\) and auxiliary `Quick Checks`/u,
   )
+  assert.match(contributing, /Before merge, owners must run affected tests locally and add or update coverage/u)
+  assert.match(contributing, /for changed behavior, recording exact source, commands and results/u)
 })
 
 test("locked Rust test compilation has a separate budget before the complete suite", () => {

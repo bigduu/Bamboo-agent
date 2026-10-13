@@ -131,12 +131,12 @@ test("source guards propagate Git inspection errors and reject dirty or mismatch
   const sha = git("rev-parse", "HEAD");
   fs.writeFileSync(path.join(bin, "git"), '#!/bin/bash\nif [[ "$1" == status && "$FAIL_STATUS" == 1 ]]; then echo "fatal: inspection failed" >&2; exit 23; fi\nexec "$REAL_GIT" "$@"\n', { mode: 0o755 });
   const guards = [];
-  for (const source of [job(ci, "test"), job(frontend, "lint"), job(frontend, "test")]) {
+  for (const source of [job(ci, "dev-build"), job(ci, "test"), job(frontend, "lint"), job(frontend, "test")]) {
     for (const step of source.split(/(?=^      - )/m)) {
       if (step.includes("source_status=")) guards.push(script(step));
     }
   }
-  assert.equal(guards.length, 4);
+  assert.equal(guards.length, 6);
   for (const shell of guards) {
     const run = (overrides = {}) => spawnSync("bash", ["-c", shell], { cwd: repo, encoding: "utf8", env: { ...process.env,
       PATH: `${bin}${path.delimiter}${process.env.PATH}`, REAL_GIT: realGit, FAIL_STATUS: "0",
@@ -148,4 +148,45 @@ test("source guards propagate Git inspection errors and reject dirty or mismatch
     fs.writeFileSync(path.join(repo, "Cargo.lock"), "# changed\n"); assert.notEqual(run().status, 0);
     git("add", "Cargo.lock"); assert.notEqual(run().status, 0); git("reset", "--hard", sha);
   }
+});
+
+
+function assertDevBuild(source) {
+  const build = job(source, "dev-build");
+  const [settings, ...steps] = build.split(/(?=^      - )/m);
+  assert.match(settings, /^    name: Dev Build$/m);
+  assert.match(settings, /^    if: github.event_name == 'pull_request' && github.base_ref == 'dev'$/m);
+  assert.match(settings, /^    runs-on: ubuntu-latest$/m);
+  assert.match(settings, /^    timeout-minutes: 45$/m);
+  assert.doesNotMatch(settings, /^    (?:needs|continue-on-error):/m);
+  const cargo = steps.filter((step) => step.startsWith("      - name: Build locked Rust workspace\n"));
+  assert.equal(cargo.length, 1);
+  assert.equal(cargo[0].trimEnd(), "      - name: Build locked Rust workspace\n        run: cargo build --locked");
+  assert.doesNotMatch(build, /cargo (?:test|check|clippy)|continue-on-error:|\|\| true|\|\| exit 0/);
+  assert.doesNotMatch(build, /^          ref:/m, "Dev Build must use the actual event merge source");
+  assert.match(build, /uses: actions\/checkout@v7/);
+  assert.match(build, /uses: actions\/setup-node@v7/);
+  assert.match(build, /uses: dtolnay\/rust-toolchain@stable/);
+  assert.equal((build.match(/test "\$\(git rev-parse HEAD\)" = "\$GITHUB_SHA"/g) || []).length, 2);
+  assert.equal((build.match(/source_status="\$\(git status --porcelain --untracked-files=all\)"/g) || []).length, 2);
+  assert.match(build, /name: Require the exact clean source after dev build\n        if: always\(\)/);
+  assert.match(build, /sha256sum Cargo.lock/);
+}
+
+test("Dev Build honestly compiles the dev merge without running the full CI test suite", () => {
+  assertDevBuild(ci);
+  for (const [from, to] of [
+    ["name: Dev Build", "name: Quick Checks"],
+    ["run: cargo build --locked", "run: cargo check --locked"],
+    ["run: cargo build --locked", "run: cargo test --locked"],
+    ["run: cargo build --locked", "run: cargo build --locked || true"],
+    ["run: cargo build --locked", "continue-on-error: true\n        run: cargo build --locked"],
+    ["run: cargo build --locked", "if: false\n        run: cargo build --locked"],
+    ["    name: Dev Build", "    needs: quick-checks\n    name: Dev Build"],
+  ]) assert.throws(() => assertDevBuild(ci.replace(from, to)), `reject ${to}`);
+  // Existing executable controller tests prove dev emits full=false; these
+  // contracts ensure that no default-workspace full test is added to dev jobs.
+  assert.doesNotMatch(job(ci, "quick-checks"), /cargo (?:build|test)/);
+  assert.match(job(ci, "test"), /github.event_name != 'pull_request' \|\| github.base_ref == 'main'/);
+  assert.match(job(ci, "e2e-test"), /if: needs.validation-source.outputs.full == 'true'/);
 });

@@ -14,15 +14,18 @@ Jiandu owns canonical persistence, derived indexes, lexical recall, and Dream sn
 
 Follow [Parallel Development](./gitflow.md). Give each bounded Issue one owner,
 branch and isolated worktree; only the named integrator writes a shared batch
-branch. Dev admission uses required fast checks and current review; heavy
-compilation and full tests are advisory for dev, with failures owned and tracked.
-Freeze a recorded batch for complete release acceptance; `release → main` must
-pass the full required suite and platform matrix. Keep one release owner and one
-writer per build output. Preserve exact-source evidence and never cancel or
-clean another worker's resources. The new gate roles require verified workflow
-and separately approved protection configuration; never bypass current gates.
-Use the authoritative [Release Process](./CONTRIBUTING.md#release-process) for
-frozen cuts, repairs and publication.
+branch. Dev CI admission requires a successful `Dev Build`. Before admission,
+run the affected tests locally, add or update regression coverage for changed
+behavior, and record exact source, commands and results in the PR. Auxiliary
+`Quick Checks` do not replace compilation or local test evidence. Dev CI does
+not run the full test suite on every PR. Freeze a recorded batch for complete
+release acceptance; `release → main` must pass the full required suite and
+platform matrix. Keep one release owner and one writer per build output; never
+cancel or clean another worker's resources. Verify the separately approved
+protection configuration and never bypass current gates. Normal direct pushes
+must be fast-forward and satisfy the same evidence and checks; never force push.
+Use the authoritative
+[Release Process](./CONTRIBUTING.md#release-process) for cuts, repairs and publication.
 
 ## Pull Request Review
 
@@ -32,8 +35,8 @@ For the #791 multi-agent epic, the user's 2026-09-28 delivery instruction takes
 precedence over the per-Issue PR and review steps below. Inventory all related
 PR heads and existing work first, then merge implemented work into one local
 integration baseline. Review integration changes locally and use focused checks
-while assembling it. Submit one PR to `dev` through its required fast GitHub
-checks under the current gate policy. Run the complete affected regression once
+while assembling it. Submit one PR to `dev` with the required compilation gate
+and local test/coverage evidence under the current gate policy. Run the complete affected regression once
 on the frozen release snapshot before promotion to `main`. Do not request or
 wait for GitHub Codex PR review for this epic. Close superseded component PRs and clean only safely merged worktrees after the final
 integration is accepted. Preserve dirty or uncertain worktrees.
