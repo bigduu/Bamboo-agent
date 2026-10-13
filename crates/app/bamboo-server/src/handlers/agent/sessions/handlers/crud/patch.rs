@@ -1904,14 +1904,24 @@ mod tests {
                     .uri(&format!("/api/v1/sessions/{id}"))
                     .insert_header((header::IF_MATCH, "\"0\""))
                     .set_json(if project_change {
-                        serde_json::json!({"project_id": target.id})
+                        serde_json::json!({
+                            "project_id": target.id,
+                            "workspace_path": target_workspace.path(),
+                        })
                     } else {
                         serde_json::json!({"workspace_path": target_workspace.path()})
                     })
                     .to_request(),
             )
             .await;
-            assert_eq!(response.status(), StatusCode::OK);
+            let status = response.status();
+            let response_body: Value = test::read_body_json(response).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "PATCH error: {}",
+                response_body["error"]
+            );
             let session = state.storage.load_session(id).await.unwrap().unwrap();
             assert_scope_workflow_retired(&session);
             assert_eq!(
@@ -2080,13 +2090,17 @@ mod tests {
         )
         .await;
         let target_id = target.id.clone();
+        let target_path = display(target_workspace.path());
         let caller = actix_web::rt::spawn(async move {
             test::call_service(
                 &app,
                 test::TestRequest::patch()
                     .uri(&format!("/api/v1/sessions/{id}"))
                     .insert_header((header::IF_MATCH, "\"0\""))
-                    .set_json(serde_json::json!({"project_id": target_id}))
+                    .set_json(serde_json::json!({
+                        "project_id": target_id,
+                        "workspace_path": target_path,
+                    }))
                     .to_request(),
             )
             .await
