@@ -1464,6 +1464,10 @@ impl Drop for RootActorExecution {
 }
 
 #[cfg(test)]
+#[path = "agent_spawn_peer_privacy_tests.rs"]
+mod peer_privacy_tests;
+
+#[cfg(test)]
 mod reservation_tests {
     use super::*;
     use crate::runtime::execution::runner_state::AgentStatus;

@@ -125,7 +125,7 @@ jobs:
           shared-key: bamboo-actor-snapshot-windows-2025-msvc-1.99
           save-if: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' }}
 
-      - name: Compile and verify all 36 selected native tests
+      - name: Compile and verify all 41 selected native tests
         timeout-minutes: 20
         run: |
           $evidence = Join-Path $env:RUNNER_TEMP 'actor-snapshot-evidence'
@@ -194,8 +194,15 @@ jobs:
             'execution_isolation'
             'assignment_failure_reaps_suspended_child'
           ) 'local-task-process-list.log'
+          Assert-TestList 'bamboo-tools' 'local_task_resources::windows::tests::initial_exec_windows_' @(
+            'live_cancel_drains_retained_job'
+            'cancel_after_leader_reap_drains_retained_job'
+            'delivery_closes_last_job_handle_without_killing_descendant'
+            'disarm_failure_retains_job_until_cleanup'
+            'setup_failure_retains_suspended_child_for_cleanup'
+          ) 'initial-exec-process-list.log'
 
-      - name: Execute 9 snapshot, 3 gateway, 19 directory and 5 task-process tests
+      - name: Execute 9 snapshot, 3 gateway, 19 directory, 5 scoped and 5 initial process tests
         timeout-minutes: 5
         run: |
           $evidence = Join-Path $env:RUNNER_TEMP 'actor-snapshot-evidence'
@@ -219,6 +226,7 @@ jobs:
           Assert-TestRun 'bamboo-server' 'handlers::agent::actor_snapshot::tests::' 3 'gateway-run.log'
           Assert-TestRun 'bamboo-storage' 'v2::actor_directory::tests::' 19 'directory-run.log'
           Assert-TestRun 'bamboo-tools' 'local_task_resources::windows::tests::local_task_resources_windows_' 5 'local-task-process-run.log'
+          Assert-TestRun 'bamboo-tools' 'local_task_resources::windows::tests::initial_exec_windows_' 5 'initial-exec-process-run.log'
           # This receipts the selected native reader/process tests, not all of #1338 or #791.
           Get-Content "$evidence/verified-counts.txt" | Add-Content $env:GITHUB_STEP_SUMMARY
 
