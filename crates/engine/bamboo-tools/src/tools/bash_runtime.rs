@@ -121,15 +121,9 @@ impl ShellSession {
     /// [`ShellSession::kill_notify`].
     #[allow(clippy::unused_async)] // async kept: callers `.await` it; symmetry with the other handle ops.
     pub async fn kill(&self) -> Result<(), String> {
-        self.request_kill();
-        Ok(())
-    }
-
-    /// Request through the child-owning task. `notify_one` retains an early
-    /// request even if that task has not reached its first poll yet.
-    pub(crate) fn request_kill(&self) {
         self.running.store(false, Ordering::Relaxed);
         self.kill_notify.notify_one();
+        Ok(())
     }
 
     /// Write `data` to the shell's retained stdin pipe (issue #89). When
