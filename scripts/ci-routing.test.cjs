@@ -103,14 +103,16 @@ test("frontend source acceptance leaves ordinary dev admission but retains exact
   assert.match(frontend, /pull_request:\n    branches: \[main\]/);
   assert.doesNotMatch(frontend, /branches: \[dev\]|paths:/);
   assert.match(frontend, /snapshot_sha:\n.*\n        required: true\n        type: string/);
-  for (const id of ["lint", "test"]) {
+  for (const id of ["lint", "build", "test"]) {
     const block = job(frontend, id);
     assert.match(block, /ref: \$\{\{ github.event_name == 'pull_request' && github.event.pull_request.head.sha \|\| github.sha \}\}/);
     assert.match(block, /test "\$EXPECTED_SNAPSHOT_SHA" = "\$GITHUB_SHA"/);
-    assert.match(block, /source_status="\$\(git status --porcelain --untracked-files=all\)"\n          test -z "\$source_status"/);
+    assert.match(block, /source_status="\$\(git status --porcelain --untracked-files=all\)"/);
+    assert.match(block, /test -z "\$source_status"/);
     assert.doesNotMatch(block, /continue-on-error:/);
   }
-  for (const command of ["cargo build --locked", "cargo test --locked --no-run", "cargo test --locked"]) assert.ok(job(frontend, "test").includes(`        run: ${command}\n`));
+  assert.ok(job(frontend, "build").includes("        run: cargo build --locked\n"));
+  for (const command of ["cargo test --locked --no-run", "cargo test --locked"]) assert.ok(job(frontend, "test").includes(`        run: ${command}\n`));
   assert.match(job(frontend, "lint"), /cargo clippy --all-features --/);
 });
 
@@ -132,21 +134,24 @@ test("source guards propagate Git inspection errors and reject dirty or mismatch
   git("init", "-q"); git("add", ".");
   git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture");
   const sha = git("rev-parse", "HEAD");
+  const tree = git("rev-parse", "HEAD^{tree}");
   fs.writeFileSync(path.join(bin, "git"), '#!/bin/bash\nif [[ "$1" == status && "$FAIL_STATUS" == 1 ]]; then echo "fatal: inspection failed" >&2; exit 23; fi\nexec "$REAL_GIT" "$@"\n', { mode: 0o755 });
   const guards = [];
-  for (const source of [job(ci, "test"), job(frontend, "lint"), job(frontend, "test")]) {
+  for (const source of [job(ci, "test"), job(frontend, "lint"), job(frontend, "build"), job(frontend, "test")]) {
     for (const step of source.split(/(?=^      - )/m)) {
       if (step.includes("source_status=")) guards.push(script(step));
     }
   }
-  assert.equal(guards.length, 4);
+  assert.equal(guards.length, 7);
   for (const shell of guards) {
     const run = (overrides = {}) => spawnSync("bash", ["-c", shell], { cwd: repo, encoding: "utf8", env: { ...process.env,
       PATH: `${bin}${path.delimiter}${process.env.PATH}`, REAL_GIT: realGit, FAIL_STATUS: "0",
-      GITHUB_SHA: sha, EXPECTED_SHA: sha, GITHUB_EVENT_NAME: "workflow_dispatch", EXPECTED_SNAPSHOT_SHA: sha, ...overrides } });
+      GITHUB_SHA: sha, EXPECTED_SHA: sha, EXPECTED_TREE: tree,
+      BUILD_SOURCE_SHA: sha, BUILD_SOURCE_TREE: tree, GITHUB_OUTPUT: path.join(directory, "outputs"),
+      GITHUB_EVENT_NAME: "workflow_dispatch", EXPECTED_SNAPSHOT_SHA: sha, ...overrides } });
     assert.equal(run().status, 0);
     assert.notEqual(run({ FAIL_STATUS: "1" }).status, 0, "Git status failure must not be clean success");
-    assert.notEqual(run({ GITHUB_SHA: "b".repeat(40) }).status, 0);
+    assert.notEqual(run({ GITHUB_SHA: "b".repeat(40), EXPECTED_SHA: "b".repeat(40) }).status, 0);
     fs.writeFileSync(path.join(repo, "untracked"), "dirty\n"); assert.notEqual(run().status, 0); fs.unlinkSync(path.join(repo, "untracked"));
     fs.writeFileSync(path.join(repo, "Cargo.lock"), "# changed\n"); assert.notEqual(run().status, 0);
     git("add", "Cargo.lock"); assert.notEqual(run().status, 0); git("reset", "--hard", sha);

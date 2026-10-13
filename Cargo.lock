@@ -3028,9 +3028,9 @@ dependencies = [
 
 [[package]]
 name = "eventsource-client"
-version = "0.18.1"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4a8e552605d54307fc2c066c65f604bef5eab45435d3578f5e5179b674f2e18"
+checksum = "d779d24f01e43764af8a0244078c3a98e27a578243609d831cdf0e0ea0d88ce6"
 dependencies = [
  "base64 0.22.1",
  "bytes",

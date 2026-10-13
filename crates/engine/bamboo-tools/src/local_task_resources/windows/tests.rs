@@ -241,3 +241,191 @@ async fn local_task_resources_windows_assignment_failure_reaps_suspended_child()
         );
     }
 }
+
+async fn spawn_initial_tree(directory: &Path, fast: bool) -> InitialWindowsProcess {
+    let (process, setup) = spawn_initial(&mut powershell(&tree_script(directory, fast))).unwrap();
+    if let Err(error) = setup {
+        let cleanup = process.stop_and_reap().await;
+        panic!("initial Windows setup failed: {error}; cleanup: {cleanup:?}");
+    }
+    process
+}
+
+async fn initial_leader_exit(process: &InitialWindowsProcess) -> io::Result<()> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if process.leader_has_exited()? {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "initial leader did not exit"))?
+}
+
+#[tokio::test]
+async fn initial_exec_windows_live_cancel_drains_retained_job() {
+    let directory = tempfile::tempdir().unwrap();
+    let process = spawn_initial_tree(directory.path(), false).await;
+    let descendant = process_from_ready(directory.path()).await;
+    let descendant_was_live = is_running(&descendant);
+    let leader_was_live = process.leader_has_exited().map(|exited| !exited);
+    let (cleanup, ()) = tokio::join!(process.stop_and_reap(), actually_stopped(descendant));
+    assert!(descendant_was_live);
+    assert!(leader_was_live.unwrap());
+    assert!(!cleanup.unwrap().success());
+    assert!(!directory.path().join("late").exists());
+}
+
+#[tokio::test]
+async fn initial_exec_windows_cancel_after_leader_reap_drains_retained_job() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut process = spawn_initial_tree(directory.path(), true).await;
+    let descendant = process_from_ready(directory.path()).await;
+    std::fs::write(directory.path().join("release"), "exit now").unwrap();
+    let observed_exit = initial_leader_exit(&process).await;
+    // Reap the leader before cancellation: only the retained job can still
+    // contain and drain its surviving descendant. No PID is stop authority.
+    let first_wait = tokio::time::timeout(Duration::from_secs(15), process.child.wait()).await;
+    let descendant_survived_reap = is_running(&descendant);
+    let (cleanup, ()) = tokio::join!(process.stop_and_reap(), actually_stopped(descendant));
+    observed_exit.unwrap();
+    assert!(first_wait.unwrap().unwrap().success());
+    assert!(descendant_survived_reap);
+    assert!(cleanup.unwrap().success());
+    assert!(!directory.path().join("late").exists());
+}
+
+fn initial_delivery_tree_script(directory: &Path) -> String {
+    let descendant = encoded(&format!(
+        "$ErrorActionPreference='Stop'; [IO.File]::WriteAllText({}, [string]$PID); Write-Output 'descendant-ready'; $deadline=[DateTime]::UtcNow.AddSeconds(30); while (!(Test-Path -LiteralPath {})) {{ if ([DateTime]::UtcNow -ge $deadline) {{ exit 7 }}; Start-Sleep -Milliseconds 10 }}; [IO.File]::WriteAllText({}, 'delivered-survivor')",
+        quoted(&directory.join("ready")),
+        quoted(&directory.join("survivor-release")),
+        quoted(&directory.join("late"))
+    ));
+    format!(
+        "$ErrorActionPreference='Stop'; $p=Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','{descendant}') -PassThru -NoNewWindow; while (!(Test-Path -LiteralPath {})) {{ Start-Sleep -Milliseconds 10 }}; Write-Output 'leader-ready'; while (!(Test-Path -LiteralPath {})) {{ Start-Sleep -Milliseconds 10 }}; exit 0",
+        quoted(&directory.join("ready")),
+        quoted(&directory.join("release"))
+    )
+}
+
+// A failing assertion must not leave the deliberately delivered descendant
+// waiting for the test. This is only a fixture gate, never process authority.
+struct InitialDeliveryGate(std::path::PathBuf);
+
+impl Drop for InitialDeliveryGate {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, "finish delivered fixture");
+    }
+}
+
+#[tokio::test]
+async fn initial_exec_windows_delivery_closes_last_job_handle_without_killing_descendant() {
+    let directory = tempfile::tempdir().unwrap();
+    let survivor_release = directory.path().join("survivor-release");
+    let gate = InitialDeliveryGate(survivor_release.clone());
+    let (mut process, setup) = spawn_initial(&mut powershell(&initial_delivery_tree_script(
+        directory.path(),
+    )))
+    .unwrap();
+    if let Err(error) = setup {
+        let cleanup = process.stop_and_reap().await;
+        panic!("initial Windows setup failed: {error}; cleanup: {cleanup:?}");
+    }
+    let descendant = process_from_ready(directory.path()).await;
+    let mut stdout = process.child.stdout.take().unwrap();
+    std::fs::write(directory.path().join("release"), "exit leader").unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(15), process.child.wait()).await;
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            let (cleanup, ()) = tokio::join!(process.stop_and_reap(), actually_stopped(descendant));
+            panic!("initial Windows leader wait timed out: {error}; cleanup: {cleanup:?}");
+        }
+    };
+    let survived_reap = is_running(&descendant);
+    let mut output = Vec::new();
+    // The pending descendant still owns its inherited pipe. A natural leader
+    // exit must retain the existing two-second capture bound before delivery.
+    let capture =
+        tokio::time::timeout(Duration::from_secs(2), stdout.read_to_end(&mut output)).await;
+    let survived_capture_bound = is_running(&descendant);
+    if let Err(error) = process.disarm() {
+        let (cleanup, ()) = tokio::join!(process.stop_and_reap(), actually_stopped(descendant));
+        panic!("initial Windows disarm failed: {error}; cleanup: {cleanup:?}");
+    }
+    // There is no duplicate job handle in this test. disarm has closed the
+    // last handle, so retaining a hidden kill-on-close job cannot mask a bug.
+    let last_job_handle_closed = process.job.is_none();
+    let survived_disarm = is_running(&descendant);
+    drop(process);
+    let survived_owner_drop = is_running(&descendant);
+    drop(stdout);
+    std::fs::write(&survivor_release, "finish normally").unwrap();
+    actually_stopped(descendant).await;
+    drop(gate);
+    assert!(last_job_handle_closed);
+    assert!(survived_disarm);
+    assert!(status.unwrap().success());
+    assert!(survived_reap);
+    assert!(capture.is_err(), "delivered descendant pipe closed early");
+    assert!(survived_capture_bound);
+    assert!(survived_owner_drop);
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("late")).unwrap(),
+        "delivered-survivor"
+    );
+}
+
+#[tokio::test]
+async fn initial_exec_windows_disarm_failure_retains_job_until_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut process = spawn_initial_tree(directory.path(), false).await;
+    let descendant = process_from_ready(directory.path()).await;
+    let disarm = process.disarm_with(|_| Err(io::Error::other("injected disarm failure")));
+    let remained_armed = process.job.is_some();
+    let descendant_was_live = is_running(&descendant);
+    let (cleanup, ()) = tokio::join!(process.stop_and_reap(), actually_stopped(descendant));
+    assert!(disarm.unwrap_err().to_string().contains("disarm failure"));
+    assert!(remained_armed);
+    assert!(descendant_was_live);
+    assert!(!cleanup.unwrap().success());
+    assert!(!directory.path().join("late").exists());
+}
+
+#[tokio::test]
+async fn initial_exec_windows_setup_failure_retains_suspended_child_for_cleanup() {
+    for assigned in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("must-not-execute");
+        let mut observed = None;
+        let (process, setup) = spawn_initial_with_setup(
+            &mut powershell(&format!(
+                "[IO.File]::WriteAllText({}, 'ran')",
+                quoted(&marker)
+            )),
+            |job, child| {
+                observed = Some(observe_process(child.id().unwrap()));
+                if assigned {
+                    job.assign(child)?;
+                }
+                Err(io::Error::other(
+                    "injected initial assignment/resume failure",
+                ))
+            },
+        )
+        .expect("setup failure must return the real suspended child");
+        let remained_armed = process.job.is_some();
+        let (cleanup, ()) =
+            tokio::join!(process.stop_and_reap(), actually_stopped(observed.unwrap()));
+        assert!(setup.unwrap_err().to_string().contains("assignment/resume"));
+        assert!(remained_armed);
+        assert!(!cleanup.unwrap().success());
+        assert!(
+            !marker.exists(),
+            "initial child executed before successful containment/resume"
+        );
+    }
+}
