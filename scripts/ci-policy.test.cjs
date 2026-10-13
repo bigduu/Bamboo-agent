@@ -92,19 +92,20 @@ test("full snapshot and main gates preserve locked Rust, formatting, and policy 
 
   const testJob = job("test")
   assert.match(testJob, /name: Test\n/u)
-  assert.match(testJob, /runs-on: ubuntu-latest\n    timeout-minutes: 75\n/u)
+  assert.match(testJob, /runs-on: ubuntu-latest\n/u)
+  assert.ok(testJob.includes("    timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"))
   assert.match(testJob, /run: cargo build --locked\n/u)
   assert.match(
     testJob,
-    /- name: Test locked Rust workspace\n        timeout-minutes: 30\n        run: cargo test --locked\n/u,
+    /- name: Test locked Rust workspace\n        if: needs\.validation-source\.outputs\.full == 'true'\n        timeout-minutes: 30\n        run: cargo test --locked\n/u,
   )
   assert.match(
     testJob,
-    /- name: Test CI workflow policy\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs\n/u,
+    /- name: Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs\n/u,
   )
   assert.match(
     testJob,
-    /- name: Check formatting\n        run: cargo fmt --all -- --check\n/u,
+    /- name: Check formatting\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: cargo fmt --all -- --check\n/u,
   )
   assert.match(
     testJob,
@@ -130,7 +131,7 @@ test("full snapshot and main gates preserve locked Rust, formatting, and policy 
 
   assert.match(
     contributing,
-    /Pull requests into `dev` run the required\s+`Dev Build` \(`cargo build --locked`\) and auxiliary `Quick Checks`/u,
+    /Pull requests into `dev` run the required\s+`Test` check in compile-only mode \(`cargo build --locked`\) and auxiliary\s+`Quick Checks`/u,
   )
   assert.match(contributing, /Before merge, owners must run affected tests locally and add or update coverage/u)
   assert.match(contributing, /for changed behavior, recording exact source, commands and results/u)
@@ -140,8 +141,8 @@ test("locked Rust test compilation has a separate budget before the complete sui
   const testJob = job("test")
   const [settings, ...steps] = testJob.split(/(?=^      - )/mu)
   assert.doesNotMatch(settings, /^    continue-on-error:/mu)
-  assert.match(settings, /if: always\(\) && !cancelled\(\) && \(github\.event_name != 'pull_request' \|\| github\.base_ref == 'main'\)/u)
-  assert.match(settings, /^    timeout-minutes: 75$/mu)
+  assert.match(settings, /^    if: always\(\) && !cancelled\(\)$/mu)
+  assert.ok(settings.includes("    timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"))
 
   const requiredSteps = [
     ["Build locked Rust workspace", "cargo build --locked", undefined],
@@ -157,7 +158,9 @@ test("locked Rust test compilation has a separate budget before the complete sui
     assert.ok(index > previousIndex, `${name} must follow the preceding Rust step`)
     previousIndex = index
 
-    assert.doesNotMatch(step, /^        (?:if|continue-on-error):/mu)
+    assert.doesNotMatch(step, /^        continue-on-error:/mu)
+    if (name === "Build locked Rust workspace") assert.doesNotMatch(step, /^        if:/mu)
+    else assert.match(step, /^        if: needs\.validation-source\.outputs\.full == 'true'$/mu)
     assert.deepEqual(
       [...step.matchAll(/^        run: (.*)$/gmu)].map((match) => match[1]),
       [command],

@@ -29,7 +29,7 @@ can be temporarily unstable; it does not relax release or security requirements.
   exact commands, test selection, results and coverage in the PR. Missing or
   failing relevant local tests block merge; a successful compile is not a
   substitute. Disclose unrun checks and the reason rather than claiming a pass.
-- PRs targeting dev must pass the real `Dev Build` compilation gate and applicable
+- PRs targeting dev must pass the real compile-only `Test` gate and applicable
   review. `Quick Checks` remains auxiliary. Dev CI does not execute the full test
   suite for each PR; complete validation belongs to the frozen batch. Workers
   may run additional scoped checks in parallel. Do not assume automatic GitHub
@@ -50,8 +50,8 @@ allowed. It still requires successful compilation, local affected tests with
 coverage evidence, applicable review, and every actual required check. Force
 pushes and protection overrides remain forbidden; main's rules are unchanged.
 
-The current `Dev Build` workflow runs for PRs targeting dev, not arbitrary branch
-pushes. A feature branch can obtain checks through the existing PR path before
+The current dev compile-only `Test` workflow runs for PRs targeting dev, not
+arbitrary branch pushes. A feature branch can obtain checks through the PR path before
 a permitted fast-forward admission. Verify that the intended target commit has
 the applicable successful checks and that tested source/tree and build inputs
 match. A synthetic-merge result is not automatically proof for another checkout.
@@ -112,10 +112,11 @@ validation receipts; cleanup is a separate owned action.
 
 ## Gate roles and activation
 
-The required dev `Dev Build` gate runs `cargo build --locked` on the actual PR
-merge source and propagates compilation or source-verification failures.
+The required `Test` gate runs `cargo build --locked` in dev compile-only mode
+on the actual PR merge source and propagates compilation or source-verification
+failures. A green dev `Test` reports compilation, not a full test-suite pass.
 `Quick Checks` runs policy checks and formatting as an auxiliary check; it is
-not a replacement for `Dev Build`. Local affected tests and regression coverage
+not a replacement for compilation. Local affected tests and regression coverage
 remain a separate pre-merge obligation, documented with source-bound evidence.
 
 Ordinary dev PRs do not run the complete CI test suite. Request full validation
@@ -129,11 +130,11 @@ Clippy contract. Keep exact-source/tree, toolchain and before/after source
 cleanliness evidence. Consolidating equivalent heavy jobs must preserve these
 contracts and must not run the same reusable full suite twice.
 
-Workflow changes and branch protection are separate. The transition is active
-only after the actual dev required-check configuration names `Dev Build`
-and no longer requires the full-suite `Test`. Until that separately approved
-configuration is verified, existing required checks still apply. Do not weaken
-main protection, fabricate statuses, or use merge overrides to bridge the change.
+Keep one required check named `Test`: dev uses its compile-only mode and
+release/main/manual snapshots use its full mode. Do not skip the dev check or
+add another same-named skipped job. This preserves the existing required-check
+configuration without a protection change. Verify the actual source and mode;
+never fabricate statuses, weaken main protection, or use merge overrides.
 
 Cover positive and negative compile-only dev/full-release routing and failure behavior
 in CI policy tests. Preserve all required main-push CI/publication queue entries

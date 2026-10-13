@@ -14,8 +14,8 @@ Jiandu owns canonical persistence, derived indexes, lexical recall, and Dream sn
 
 Follow [Parallel Development](./gitflow.md). Give each bounded Issue one owner,
 branch and isolated worktree; only the named integrator writes a shared batch
-branch. Dev CI admission requires a successful `Dev Build`. Before admission,
-run the affected tests locally, add or update regression coverage for changed
+branch. Dev CI admission requires the `Test` check to pass its compile-only mode.
+Before admission, run the affected tests locally, add or update coverage for changed
 behavior, and record exact source, commands and results in the PR. Auxiliary
 `Quick Checks` do not replace compilation or local test evidence. Dev CI does
 not run the full test suite on every PR. Freeze a recorded batch for complete

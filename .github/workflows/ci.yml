@@ -90,57 +90,6 @@ jobs:
       - name: Test fast workflow and release policies
         run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs
 
-  dev-build:
-    name: Dev Build
-    if: github.event_name == 'pull_request' && github.base_ref == 'dev'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Require the exact clean dev merge source
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          source_status="$(git status --porcelain --untracked-files=all)"
-          test -z "$source_status"
-          git show -s --format='Source: %H tree: %T' HEAD
-          sha256sum Cargo.lock
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: lts/*
-          package-manager-cache: false
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Record the dev build toolchain
-        run: |
-          rustc --version --verbose
-          cargo --version --verbose
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          # Preserve compatible PR-scoped caches from the former full dev gate.
-          shared-key: bamboo-ci-test-${{ runner.os }}
-          save-if: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' }}
-
-      - name: Build locked Rust workspace
-        run: cargo build --locked
-
-      - name: Require the exact clean source after dev build
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          source_status="$(git status --porcelain --untracked-files=all)"
-          test -z "$source_status"
-
   promotion-source:
     name: Promotion Source
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
@@ -229,13 +178,23 @@ jobs:
     name: Test
     needs: validation-source
     # A source-gate failure must fail required Test, never turn it into a skip.
-    if: always() && !cancelled() && (github.event_name != 'pull_request' || github.base_ref == 'main')
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}
     steps:
-      - name: Require full-validation admission
-        if: needs.validation-source.result != 'success' || needs.validation-source.outputs.full != 'true'
-        run: exit 1
+      - name: Require validation admission
+        env:
+          SOURCE_RESULT: ${{ needs.validation-source.result }}
+          FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$SOURCE_RESULT" = success
+          case "$GITHUB_EVENT_NAME:${GITHUB_BASE_REF:-}:$FULL_VALIDATION" in
+            pull_request:dev:false|pull_request:main:true|workflow_dispatch::true) ;;
+            push::true) test "$GITHUB_REF" = refs/heads/main ;;
+            *) exit 1 ;;
+          esac
 
       - uses: actions/checkout@v7
 
@@ -255,6 +214,7 @@ jobs:
           node-version: lts/*
 
       - name: Test CI workflow policy
+        if: needs.validation-source.outputs.full == 'true'
         run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs
 
       - name: Test frontend artifact and release policies
@@ -280,6 +240,7 @@ jobs:
           cargo --version --verbose
 
       - name: Check formatting
+        if: needs.validation-source.outputs.full == 'true'
         run: cargo fmt --all -- --check
 
       - name: Rust cache
@@ -310,12 +271,14 @@ jobs:
         run: cargo build --locked
 
       - name: Compile locked Rust test targets
+        if: needs.validation-source.outputs.full == 'true'
         timeout-minutes: 15
         run: cargo test --locked --no-run
         env:
           RUST_MIN_STACK: "8388608"
 
       - name: Test locked Rust workspace
+        if: needs.validation-source.outputs.full == 'true'
         timeout-minutes: 30
         run: cargo test --locked
         # Deep actor-runtime tests need the same thread stack on CI as the

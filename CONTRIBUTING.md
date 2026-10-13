@@ -200,17 +200,19 @@ bamboo/
 
 Follow [Parallel Development](./gitflow.md) for branch ownership, bounded batches
 and evidence. Batch integration and standalone PRs target `dev`. Its required
-`Dev Build` gate runs `cargo build --locked`; `Quick Checks` remains auxiliary.
+`Test` gate runs `cargo build --locked` in compile-only mode; `Quick Checks`
+remains auxiliary.
 Before merge, owners must run affected tests locally and add or update coverage
 for changed behavior, recording exact source, commands and results. Dev CI does
 not execute the full test suite for every PR. Complete validation runs on a
 fixed batch for release; its failures remain visible and owned. Existing review
 and security requirements still apply.
 
-This gate transition requires the separately approved dev protection update from
-`Test` to `Dev Build`; until its actual configuration is verified, the existing
-required gate remains in force. Never count a skipped full-test job as completed
-validation. Main's required checks are unchanged.
+Keep the existing required `Test` check name. Its dev mode must actually compile
+and propagate source-verification or Cargo failures; it must not be skipped.
+A green dev `Test` means compilation passed, not that the full suite ran. The
+same check retains full validation for release/main and explicit snapshots.
+Main's required checks are unchanged.
 
 A normal fast-forward direct push may be used once dev's actual branch rule
 permits it, with the same compilation, local test/coverage and applicable review
@@ -435,12 +437,13 @@ must finish before independent main publication is activated.
 Bamboo uses GitHub Actions for continuous integration and publishing:
 
 - **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run the required
-  `Dev Build` (`cargo build --locked`) and auxiliary `Quick Checks` (Node policy
-  tests and Rust formatting). A compile pass does not replace the owner's
-  pre-merge local affected-test and regression-coverage evidence. Full `Test`
-  remains a real complete build/test job for fixed-snapshot manual validation,
-  frozen release PRs into `main`, and main pushes; it is not an automatic dev-PR
-  requirement. Release/main and manual full-validation routes
+  `Test` check in compile-only mode (`cargo build --locked`) and auxiliary
+  `Quick Checks` (Node policy tests and Rust formatting). A compile pass does not
+  replace the owner's
+  pre-merge local affected-test and regression-coverage evidence. The same `Test`
+  check runs the complete build/test job for fixed-snapshot manual validation,
+  frozen release PRs into `main`, and main pushes; dev mode does not execute
+  the full suite. Release/main and manual full-validation routes
   retain the comprehensive checks and all-feature `E2E Tests`. Same-repository
   frozen release PRs and manual full validation run the Linux/macOS/Windows
   release-build matrix. Main pushes retain their complete CI/publication queue.
