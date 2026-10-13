@@ -1,6 +1,7 @@
 //! Passive, verified package-owned Nova.app setup. No PATH lookup or desktop launch.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -556,7 +557,7 @@ fn confirm_zombie_group(group: u32) -> std::io::Result<()> {
 
 async fn run_cli(
     command: &VerifiedCli,
-    args: &[String],
+    args: &[OsString],
     timeout: Duration,
     legacy: bool,
 ) -> Result<AppReport, &'static str> {
@@ -906,6 +907,18 @@ async fn install_owned(
     install_downloaded(&state, Host::detect(), &catalog, artifact, &archive).await
 }
 
+fn install_arguments(artifact: &AppArtifact, archive: &Path) -> [OsString; 7] {
+    [
+        "app".into(),
+        "install".into(),
+        "--archive".into(),
+        archive.as_os_str().to_owned(),
+        "--sha256".into(),
+        artifact.sha256.clone().into(),
+        "--local-sign".into(),
+    ]
+}
+
 async fn install_downloaded(
     state: &web::Data<AppState>,
     host: Host,
@@ -923,15 +936,7 @@ async fn install_downloaded(
     let command = fresh.command.ok_or("unverified_install")?;
     let report = run_cli(
         &command,
-        &[
-            "app".into(),
-            "install".into(),
-            "--archive".into(),
-            archive.to_str().ok_or("invalid_archive_path")?.into(),
-            "--sha256".into(),
-            artifact.sha256.clone(),
-            "--local-sign".into(),
-        ],
+        &install_arguments(artifact, archive),
         INSTALL_TIMEOUT,
         false,
     )

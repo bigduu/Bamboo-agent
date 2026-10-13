@@ -85,7 +85,8 @@ async fn run_fixture(
         }
     };
     let private = command._temporary.path().to_path_buf();
-    let result = run_cli(&command, args, timeout, legacy).await;
+    let arguments: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let result = run_cli(&command, &arguments, timeout, legacy).await;
     drop(command);
     assert!(!private.exists());
     result
@@ -563,6 +564,19 @@ async fn snapshot_creation_failure_removes_its_owned_private_files() {
         .await
         .is_err());
     assert!(!private.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn install_arguments_preserve_non_utf8_temporary_archive_paths() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let bytes = b"/private/tmp/tmp-\xff/Nova.zip";
+    let archive = PathBuf::from(OsString::from_vec(bytes.to_vec()));
+    assert!(archive.to_str().is_none());
+
+    let arguments = install_arguments(&artifact(), &archive);
+    assert_eq!(arguments[3].as_os_str().as_bytes(), bytes);
 }
 
 #[cfg(unix)]
