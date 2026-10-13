@@ -10,6 +10,19 @@ Read [README.md](./README.md) for the product boundary. Use this canonical Jiand
 
 Jiandu owns canonical persistence, derived indexes, lexical recall, and Dream snapshot bytes. Bamboo owns prompt selection and budget, optional reranking, and the model and cadence used to refresh Dream.
 
+## Parallel Development
+
+Follow [Parallel Development](./gitflow.md). Give each
+bounded Issue one owner, branch and isolated worktree. Related feature PRs feed
+one finite `integration/<batch>`; only its named integrator writes that branch
+and submits the combined candidate to `dev`. Freeze before full validation;
+queue admissions and do not separately merge already-included slices into
+`dev`. Keep scoped evidence separate from exact-head/base acceptance. Assign
+one release owner and one writer for each build output; do not cancel or clean
+another worker's resources. Existing review and protection gates still apply.
+CI deduplication requires the control-PR rollout in that document; these rules do
+not remove existing checks or excuse real failures.
+
 ## Pull Request Review
 
 ### Bamboo #791 integration exception

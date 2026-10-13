@@ -193,7 +193,11 @@ bamboo/
 
 ## Release Process
 
-Feature pull requests target `dev`. After a normal protected `dev → main`
+Follow [Parallel Development](./gitflow.md) for feature branches, bounded
+integration batches and validation ownership. Batch integration and standalone
+pull requests target `dev`. The frozen-release path described there requires a
+separate workflow rollout; the current workflow still requires the repository
+`dev` branch for promotion into `main`. After a normal protected `dev → main`
 promotion, successful same-repository main push CI queues publication of its
 exact tested commit to crates.io and a GitHub Release. The workflow must first
 reach main through that normal promotion; do not promote unrelated development
