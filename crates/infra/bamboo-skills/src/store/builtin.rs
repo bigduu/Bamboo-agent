@@ -39,7 +39,8 @@ pub fn builtin_clone_files(
                 path.clone(),
                 BuiltinSkillFile {
                     bytes: bytes.clone(),
-                    executable: path.starts_with("scripts/"),
+                    executable: BUILTIN_SKILL_EXECUTABLE_FILES
+                        .contains(&format!("{}/{path}", bundle.skill.id).as_str()),
                 },
             )
         })
@@ -275,6 +276,40 @@ mod tests {
         kind: String,
         prompt: String,
         expectations: Vec<String>,
+    }
+
+    #[test]
+    fn builtin_clone_modes_preserve_python_modules_and_executable_entrypoints() {
+        let bundles = load_builtin_skill_bundles().unwrap();
+        let bundle = bundles
+            .iter()
+            .find(|bundle| bundle.skill.id == "skill-creator")
+            .unwrap();
+        let files = super::builtin_clone_files(bundle).unwrap();
+        assert!(!files["scripts/__init__.py"].executable);
+        assert!(!files["scripts/utils.py"].executable);
+        assert!(!files["SKILL.md"].executable);
+        assert!(files["scripts/run_eval.py"].executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embedded_clone_executable_manifest_matches_source_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../builtin_skills");
+        for (relative, _) in super::BUILTIN_SKILL_FILES {
+            let source_executable = std::fs::metadata(root.join(relative))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111
+                != 0;
+            assert_eq!(
+                super::BUILTIN_SKILL_EXECUTABLE_FILES.contains(relative),
+                source_executable,
+                "source mode drift: {relative}",
+            );
+        }
     }
 
     #[test]
