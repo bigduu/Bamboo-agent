@@ -79,33 +79,50 @@ jobs:
       - name: Require source files to remain unchanged
         run: git diff --exit-code
 
-  test:
-    name: Original release Test on frozen consumer source
+  # Keep the full dev-profile build gate separate from test-profile compilation.
+  # Both jobs use the same actual event head and bind their source/toolchain.
+  # CARGO_BIN_EXE consumers are built by Cargo's test profile in the test job;
+  # no binaries, artifacts or caches are transferred between these jobs.
+  build:
+    name: Original release Build on frozen consumer source
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      source_tree: ${{ steps.source.outputs.tree }}
+      rustc_version: ${{ steps.toolchain.outputs.rustc_version }}
+      cargo_version: ${{ steps.toolchain.outputs.cargo_version }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Require the exact clean candidate source
+        id: source
         env:
           EXPECTED_SNAPSHOT_SHA: ${{ inputs.snapshot_sha }}
           EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        shell: bash
         run: |
           set -euo pipefail
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             [[ "$EXPECTED_SNAPSHOT_SHA" =~ ^[0-9a-f]{40}$ ]]
             test "$EXPECTED_SNAPSHOT_SHA" = "$GITHUB_SHA"
           fi
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          source_sha="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
           source_status="$(git status --porcelain --untracked-files=all)"
+          test "$source_sha" = "$EXPECTED_SHA"
           test -z "$source_status"
+          printf 'Source: %s, tree: %s\n' "$source_sha" "$source_tree"
+          printf 'sha=%s\ntree=%s\n' "$source_sha" "$source_tree" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
+          package-manager-cache: false
 
       - name: Test original CI policy
         run: node --test scripts/ci-policy.test.cjs
@@ -115,17 +132,114 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Record and bind the actual Rust toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version --verbose
+          cargo --version --verbose
+          rustc_version="$(rustc --version)"
+          cargo_version="$(cargo --version)"
+          test -n "$rustc_version"
+          test -n "$cargo_version"
+          printf 'rustc_version=%s\ncargo_version=%s\n' "$rustc_version" "$cargo_version" >> "$GITHUB_OUTPUT"
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          shared-key: bamboo-ci-test-${{ runner.os }}
-          save-if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'dev') }}
-
       - name: Build locked Rust workspace
         run: cargo build --locked
+
+      - name: Require source files to remain unchanged
+        run: git diff --exit-code
+
+      - name: Require the exact clean source after execution
+        if: always()
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_TREE: ${{ steps.source.outputs.tree }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          printf 'Final source: %s, tree: %s\n' "$source_sha" "$source_tree"
+          printf '%s\n' "$source_status"
+          test "$source_sha" = "$EXPECTED_SHA"
+          test "$source_tree" = "$EXPECTED_TREE"
+          test -z "$source_status"
+
+  test:
+    name: Original release Test on frozen consumer source
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Require the exact clean candidate source
+        id: source
+        env:
+          EXPECTED_SNAPSHOT_SHA: ${{ inputs.snapshot_sha }}
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          BUILD_SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+          BUILD_SOURCE_TREE: ${{ needs.build.outputs.source_tree }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$EXPECTED_SNAPSHOT_SHA" =~ ^[0-9a-f]{40}$ ]]
+            test "$EXPECTED_SNAPSHOT_SHA" = "$GITHUB_SHA"
+          fi
+          source_sha="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test "$source_sha" = "$EXPECTED_SHA"
+          test "$source_sha" = "$BUILD_SOURCE_SHA"
+          test "$source_tree" = "$BUILD_SOURCE_TREE"
+          test -z "$source_status"
+          printf 'Source: %s, tree: %s\n' "$source_sha" "$source_tree"
+          printf 'sha=%s\ntree=%s\n' "$source_sha" "$source_tree" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          package-manager-cache: false
+
+      - name: Test original CI policy
+        run: node --test scripts/ci-policy.test.cjs
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Record and bind the actual Rust toolchain
+        id: toolchain
+        env:
+          BUILD_RUSTC_VERSION: ${{ needs.build.outputs.rustc_version }}
+          BUILD_CARGO_VERSION: ${{ needs.build.outputs.cargo_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version --verbose
+          cargo --version --verbose
+          rustc_version="$(rustc --version)"
+          cargo_version="$(cargo --version)"
+          test -n "$rustc_version"
+          test -n "$cargo_version"
+          test "$rustc_version" = "$BUILD_RUSTC_VERSION"
+          test "$cargo_version" = "$BUILD_CARGO_VERSION"
+          printf 'rustc_version=%s\ncargo_version=%s\n' "$rustc_version" "$cargo_version" >> "$GITHUB_OUTPUT"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       - name: Compile locked Rust test targets
         timeout-minutes: 15
@@ -134,10 +248,27 @@ jobs:
           RUST_MIN_STACK: "8388608"
 
       - name: Test locked Rust workspace
-        timeout-minutes: 30
+        timeout-minutes: 45
         run: cargo test --locked
         env:
           RUST_MIN_STACK: "8388608"
 
       - name: Require source files to remain unchanged
         run: git diff --exit-code
+
+      - name: Require the exact clean source after execution
+        if: always()
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_TREE: ${{ steps.source.outputs.tree }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          printf 'Final source: %s, tree: %s\n' "$source_sha" "$source_tree"
+          printf '%s\n' "$source_status"
+          test "$source_sha" = "$EXPECTED_SHA"
+          test "$source_tree" = "$EXPECTED_TREE"
+          test -z "$source_status"

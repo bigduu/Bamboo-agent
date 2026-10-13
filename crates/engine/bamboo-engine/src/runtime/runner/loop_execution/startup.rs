@@ -145,16 +145,18 @@ pub(super) async fn initialize_loop_state(
         session.messages.len() as u32,
     );
 
+    // A resumed User can be an admitted peer envelope. Keep diagnostics free
+    // of prompt/body/routing text without changing the provider-facing input.
     tracing::debug!(
-        "[{}] Starting agent loop with message: {}",
-        session_id,
-        initial_message
+        session_id = %session_id,
+        initial_message_bytes = initial_message.len(),
+        "Starting agent loop"
     );
     debug_logger.log_event(
         &session_id,
         "agent_loop_start",
         serde_json::json!({
-            "message": initial_message,
+            "message_bytes": initial_message.len(),
             "round_cap": config.run_budget.max_rounds,
             "initial_message_count": session.messages.len(),
         }),
