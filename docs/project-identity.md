@@ -117,8 +117,10 @@ including after an older binary rewrites only that cache.
 
 Section IDs are unique `section:<canonical lowercase hyphenated UUID>` values.
 Names are trimmed, contain 1–80 Unicode scalar values without controls, and are
-unique case-insensitively among custom sections. The independent legacy
-`Project.section` may share a display name. `legacy` is a valid assignment target
+unique after Unicode lowercase conversion among custom sections. For example,
+`Ärger`/`ärger` collide, while
+`Straße`/`STRASSE` remain distinct buckets. The independent legacy `Project.section`
+may share a display name. `legacy` is a valid assignment target
 only when that legacy section exists and is visible. A null assignment records
 an explicit move to "No section". Creating a section never assigns sessions.
 

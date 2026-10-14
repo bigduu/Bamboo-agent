@@ -1589,6 +1589,8 @@ pub fn validate_project_sidebar(
     legacy_section: Option<&str>,
 ) -> ProjectStoreResult<()> {
     let mut ids = HashSet::new();
+    // Preserve the existing sidebar naming rule: distinct Unicode lowercase
+    // forms keep distinct buckets, including legacy Straße/STRASSE imports.
     let mut names = HashSet::new();
     for section in &sidebar.sections {
         let valid_id = section
@@ -1608,7 +1610,8 @@ pub fn validate_project_sidebar(
             || !names.insert(section.name.to_lowercase())
         {
             return Err(ProjectStoreError::Validation(
-                "sidebar section names must be unique (case insensitive), trimmed 1..=80 characters without controls".into(),
+                "sidebar section names must be unique, trimmed 1..=80 characters without controls"
+                    .into(),
             ));
         }
     }
@@ -2151,12 +2154,19 @@ mod tests {
         let mut duplicate = sidebar();
         duplicate.sections.push(duplicate.sections[0].clone());
         invalid.push(duplicate);
-        let mut duplicate_name = sidebar();
-        duplicate_name.sections.push(ProjectSidebarSection {
-            id: "section:28f595c0-21dc-4a86-8b83-5f8b258386fa".into(),
-            name: "support".into(),
-        });
-        invalid.push(duplicate_name);
+        for (first, second) in [
+            ("Support", "support"),
+            ("Ärger", "ärger"),
+            ("Straße", "STRAẞE"),
+        ] {
+            let mut duplicate_name = sidebar();
+            duplicate_name.sections[0].name = first.into();
+            duplicate_name.sections.push(ProjectSidebarSection {
+                id: "section:28f595c0-21dc-4a86-8b83-5f8b258386fa".into(),
+                name: second.into(),
+            });
+            invalid.push(duplicate_name);
+        }
         for (session_id, target) in [
             ("root", "missing"),
             ("root", "legacy"),

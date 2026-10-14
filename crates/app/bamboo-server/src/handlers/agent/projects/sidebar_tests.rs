@@ -314,6 +314,67 @@ async fn sidebar_import_filters_confirmed_stale_assignments_and_cannot_overwrite
 }
 
 #[actix_web::test]
+async fn sidebar_unicode_lowercase_collisions_reject_without_writes_or_events() {
+    let (_dir, state, project) = fixture().await;
+    let cursor = state.account_sink.latest_seq();
+    for (first, second) in [("Ärger", "ärger"), ("Straße", "STRAẞE")] {
+        let mut requested = snapshot(json!({}));
+        requested["sections"][0]["name"] = json!(first);
+        requested["sections"][1]["name"] = json!(second);
+        for field in ["sidebar", "import_sidebar"] {
+            let response = patch(&state, &project.id, Some(1), json!({field: requested})).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_unchanged(&state, &project, cursor);
+        }
+    }
+}
+
+#[actix_web::test]
+async fn sidebar_import_preserves_distinct_lowercase_names_ids_and_assignments_on_reopen() {
+    let (dir, state, project) = fixture().await;
+    save_root(&state, "sharp-s-root", Some(&project.id)).await;
+    save_root(&state, "ascii-root", Some(&project.id)).await;
+    let mut requested = snapshot(json!({"sharp-s-root": SECTION, "ascii-root": EMPTY_SECTION}));
+    requested["sections"][0]["name"] = json!("Straße");
+    requested["sections"][1]["name"] = json!("STRASSE");
+    let response = patch(
+        &state,
+        &project.id,
+        Some(1),
+        json!({"import_sidebar": requested}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body(response).await["sidebar"], requested);
+
+    // An ordinary metadata write must retain both accepted buckets and their
+    // independent root assignments before a subsequent store reopen.
+    let response = patch(
+        &state,
+        &project.id,
+        Some(2),
+        json!({"name": "Renamed Project"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved: ProjectManifest = serde_json::from_value(body(response).await).unwrap();
+    assert_eq!(serde_json::to_value(&saved.sidebar).unwrap(), requested);
+    let manifest: Value = serde_json::from_slice(
+        &std::fs::read(state.project_store.paths().manifest_path(&project.id)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["sidebar"], requested);
+
+    let reopened = bamboo_projects::ProjectStore::open(dir.path()).unwrap();
+    assert_eq!(reopened.get(&project.id).unwrap(), saved);
+    assert_eq!(reopened.list().unwrap(), vec![saved.clone()]);
+    assert_eq!(
+        serde_json::to_value(&reopened.index().unwrap().projects[&project.id].sidebar).unwrap(),
+        requested
+    );
+}
+
+#[actix_web::test]
 async fn empty_sidebar_import_is_durable_and_blocks_other_browser_replay() {
     let (dir, state, project) = fixture().await;
     let empty = json!({"sections":[],"session_sections":{},"hidden_legacy":false});
