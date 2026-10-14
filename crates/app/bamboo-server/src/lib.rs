@@ -114,6 +114,7 @@ pub mod error;
 pub mod events;
 pub mod handlers;
 mod lifecycle_hooks;
+mod local_child_skills;
 pub mod logging;
 pub mod notify_sinks;
 mod permission_audit;

@@ -131,6 +131,14 @@ pub struct SessionInboxRuntimeBinding {
 /// and respecting the `cancel_token`.
 #[async_trait::async_trait]
 pub trait ExternalChildRunner: Send + Sync {
+    /// App catalog/read services for the owned local backend only.
+    /// Process and remote adapters deliberately retain the default no-op.
+    fn set_local_child_skill_factory(
+        &self,
+        _factory: Option<Arc<dyn crate::external_agents::local_task::LocalChildSkillFactory>>,
+    ) {
+    }
+
     /// Bind the Host's in-process execution resources. Process/remote adapters
     /// deliberately ignore this capability and retain their existing mode.
     fn set_local_task_runtime(
