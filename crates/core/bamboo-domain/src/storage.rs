@@ -416,6 +416,24 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Trusted Host file publication while the current canonical Supervisor's
+    /// incarnation, Ultra mode and authority revision remain physically locked.
+    /// This is a transient critical section, never a durable permission grant.
+    /// A backend must retain the complete lock set after caller cancellation
+    /// until its synchronous job returns; unsupported backends never run it.
+    async fn with_supervisor_orchestration_authority(
+        &self,
+        supervisor: &SupervisorReference,
+        expected_revision: u64,
+        operation: Box<dyn FnOnce() -> std::io::Result<()> + Send>,
+    ) -> std::io::Result<()> {
+        let _ = (supervisor, expected_revision, operation);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support locked Supervisor publication",
+        ))
+    }
+
     /// Strict canonical Root control-plane read for authority decisions.
     /// `None` means absent; partial/corrupt/mismatched published authority is an
     /// error, never a fallback to stale session.json. Returned messages are empty;

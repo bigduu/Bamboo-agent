@@ -2,7 +2,7 @@
 //! Authority always comes from Host storage; client JSON never selects a role.
 use std::{
     collections::BTreeSet,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
 
@@ -18,13 +18,17 @@ use crate::tools::{ticket_dispatch_adapter::TicketDispatchPolicy, ChildSessionAd
 pub struct TicketApplication {
     storage: Arc<dyn Storage>,
     config: Arc<RwLock<Config>>,
-    service: Option<Arc<TicketService>>,
+    service: Arc<OnceLock<Arc<TicketService>>>,
+    initializing: tokio::sync::Mutex<()>,
+    root: PathBuf,
     unavailable: Option<String>,
     adapter: OnceLock<Arc<ChildSessionAdapter>>,
     messenger: OnceLock<Arc<bamboo_engine::SessionMessenger>>,
     workspace: String,
 }
 
+mod initialization;
+pub use initialization::{ScopeInitialization, ScopeInitializationError};
 mod resolution;
 #[cfg(test)]
 mod tests;
@@ -39,7 +43,9 @@ impl TicketApplication {
         Self {
             storage,
             config,
-            service,
+            service: Arc::new(service.map(OnceLock::from).unwrap_or_default()),
+            initializing: tokio::sync::Mutex::new(()),
+            root: root.to_path_buf(),
             unavailable,
             adapter: OnceLock::new(),
             messenger: OnceLock::new(),
@@ -180,7 +186,7 @@ impl TicketApplication {
     }
 
     pub fn service(&self) -> Result<Arc<TicketService>> {
-        self.service.clone().ok_or_else(|| {
+        self.service.get().cloned().ok_or_else(|| {
             Error::AuthorityUnavailable(
                 self.unavailable
                     .clone()
@@ -201,7 +207,7 @@ impl TicketApplication {
     /// snapshot, session index, cached Child or abandoned activation. This runs
     /// before startup can admit work and has no runner/adapter dependency.
     pub(super) async fn reconcile_completed_native_results(&self) -> Result<()> {
-        if self.service.is_none() {
+        if self.service.get().is_none() {
             return Ok(());
         }
         let (service, _) = self.authority(Principal::Runtime).await?;
@@ -323,29 +329,6 @@ impl TicketApplication {
             ));
         }
         Ok((service, Authority::from_verified_host(binding, principal)))
-    }
-
-    pub async fn status(&self) -> Value {
-        let flags = self.config.read().await.features.clone();
-        match self
-            .authority(Principal::User {
-                user_id: "host-owner".into(),
-            })
-            .await
-        {
-            Ok((service, authority)) => match service.work_overview(&authority) {
-                Ok(overview) => {
-                    json!({"available": true, "binding": service.published().map(|(_,s)| s.binding).ok(),
-                    "health": match service.health() { Health::Writable => "writable", _ => "read_only" },
-                    "mutation_enabled": flags.ticket_mutation, "dispatch_enabled": flags.ticket_dispatch,
-                    "capabilities":{"ticket_scope_v1":true,"multi_pending_v1":true,"precise_request_response_v1":true,"message_references_v1":true,"semantic_messages_v1":true},
-                    "overview": overview})
-                }
-                Err(error) => json!({"available":false,"reason":error.to_string()}),
-            },
-            Err(error) => json!({"available": false, "reason": error.to_string(),
-                "mutation_enabled": flags.ticket_mutation, "dispatch_enabled": flags.ticket_dispatch}),
-        }
     }
 
     pub async fn update(

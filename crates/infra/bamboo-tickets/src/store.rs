@@ -72,6 +72,7 @@ pub struct FileStore {
     _writer_lock: File,
     pub health: Health,
     pub published: Option<(String, Snapshot)>,
+    pub(crate) binding_mismatch: bool,
     fault: Option<PublicationFault>,
     pub(crate) offline_original_writable: bool,
     #[cfg(feature = "test-utils")]
@@ -134,10 +135,36 @@ impl FileStore {
         &self.root
     }
     pub fn open(root: &Path, binding: ScopeBinding) -> Result<Self> {
+        Self::open_with_policy(root, binding, false)
+    }
+
+    pub(crate) fn initialize_empty(root: &Path, binding: ScopeBinding) -> Result<Self> {
+        Self::open_with_policy(root, binding, true)
+    }
+
+    fn open_with_policy(root: &Path, binding: ScopeBinding, empty_only: bool) -> Result<Self> {
         if !cfg!(any(target_os = "macos", target_os = "linux")) {
             return Err(Error::AuthorityUnavailable(
                 "filesystem platform not validated".into(),
             ));
+        }
+        if empty_only {
+            match fs::symlink_metadata(root) {
+                Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                    return Err(Error::Io(std::io::Error::other(
+                        "scope is not a plain directory",
+                    )));
+                }
+                Ok(_) if fs::read_dir(root)?.next().transpose()?.is_some() => {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "existing scope requires explicit recovery",
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         fs::create_dir_all(root)?;
         if fs::symlink_metadata(root)?.file_type().is_symlink() {
@@ -159,13 +186,31 @@ impl FileStore {
             .truncate(false)
             .open(lock_path)?;
         writer_lock.try_lock_exclusive().map_err(|_| {
-            Error::AuthorityUnavailable("another local writer holds the process lock".into())
+            if empty_only {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "another local writer holds the process lock",
+                ))
+            } else {
+                Error::AuthorityUnavailable("another local writer holds the process lock".into())
+            }
         })?;
+        if empty_only {
+            for entry in fs::read_dir(&root)? {
+                if entry?.file_name() != "writer.lock" {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "scope changed before initialization",
+                    )));
+                }
+            }
+        }
         let mut store = Self {
             root,
             _writer_lock: writer_lock,
             health: Health::Writable,
             published: None,
+            binding_mismatch: false,
             fault: None,
             offline_original_writable: false,
             #[cfg(feature = "test-utils")]
@@ -178,6 +223,7 @@ impl FileStore {
                     store.published = Some((hash, snapshot));
                 }
                 Ok(_) => {
+                    store.binding_mismatch = true;
                     store.health = Health::ReadOnly {
                         reason: "scope binding mismatch".into(),
                     }

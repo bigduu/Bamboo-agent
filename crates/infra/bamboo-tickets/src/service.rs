@@ -115,7 +115,15 @@ pub struct TicketService {
 
 impl TicketService {
     pub fn open(root: impl AsRef<Path>, binding: ScopeBinding) -> Result<Self> {
-        let mut store = FileStore::open(root.as_ref(), binding)?;
+        Self::from_store(FileStore::open(root.as_ref(), binding)?)
+    }
+
+    /// Create only an empty scope; never attach, import or recover existing bytes.
+    pub fn initialize_empty(root: impl AsRef<Path>, binding: ScopeBinding) -> Result<Self> {
+        Self::from_store(FileStore::initialize_empty(root.as_ref(), binding)?)
+    }
+
+    fn from_store(mut store: FileStore) -> Result<Self> {
         if store.health == Health::Writable {
             if let Err(error) =
                 validate_snapshot(&store.published.as_ref().expect("healthy store snapshot").1)
@@ -188,6 +196,11 @@ impl TicketService {
 
     pub fn health(&self) -> Health {
         self.inner.lock().expect("store mutex").health.clone()
+    }
+
+    /// Diagnostic only: never grants access to a mismatched published scope.
+    pub fn binding_mismatch(&self) -> bool {
+        self.inner.lock().expect("store mutex").binding_mismatch
     }
 
     /// Trusted host view only; Worker-facing reads use the bounded scoped API.
