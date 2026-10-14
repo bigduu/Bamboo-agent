@@ -95,6 +95,14 @@ is running.
 
 Project list/detail responses include `sidebar: null` until a snapshot is saved
 or imported. This explicit field distinguishes support from older servers.
+Project manifests and their derived index use schema 3. Loading schema 1 or 2
+migrates the manifest with the existing revision floor and atomic writer;
+schema 2 paths, bindings and sidebar data are preserved. Both the primary and
+normal recovery backup use schema 3 so older binaries cannot recover a schema 2
+backup and silently discard sidebar data. Exact legacy primary bytes remain in
+`project.json.migrated-v1` or `project.json.migrated-v2` for inspection, outside
+the recovery path. The derived index is rebuilt from manifests on startup,
+including after an older binary rewrites only that cache.
 `PATCH /api/v1/projects/{id}` accepts a complete non-null `sidebar` snapshot:
 
 ```json

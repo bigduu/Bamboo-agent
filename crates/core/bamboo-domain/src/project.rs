@@ -13,8 +13,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PROJECT_MANIFEST_SCHEMA_VERSION: u32 = 2;
-pub const PROJECT_INDEX_SCHEMA_VERSION: u32 = 2;
+// Sidebar snapshots must not be rewritten by v2 binaries that discard the
+// unknown field when serializing an ordinary Project metadata update.
+pub const PROJECT_MANIFEST_SCHEMA_VERSION: u32 = 3;
+pub const PROJECT_INDEX_SCHEMA_VERSION: u32 = 3;
 
 fn initial_project_revision() -> u64 {
     1
