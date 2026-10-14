@@ -894,13 +894,21 @@ impl AppState {
             // A bounded startup pass keeps an unavailable remote broker from
             // delaying the HTTP server indefinitely. The periodic pass retries
             // receipts left after that bound or a transient broker failure.
-            let broker_receipt_reconciler = Arc::new(
-                bamboo_engine::external_agents::actor_adapter::BrokerTerminalReceiptReconciler::new(
-                    session_store.clone(),
-                    &config_snapshot,
-                )
-                .with_ticket_service(tickets.service().ok()),
-            );
+            // Route configuration stays frozen at boot. Resolve only the
+            // current in-process Work service at each existing repair pass.
+            let build_broker_receipt_reconciler = {
+                let store = session_store.clone();
+                let boot_config = config_snapshot.clone();
+                let app = tickets.clone();
+                move || {
+                    bamboo_engine::external_agents::actor_adapter::BrokerTerminalReceiptReconciler::new(
+                        store.clone(),
+                        &boot_config,
+                    )
+                    .with_ticket_service(app.service().ok())
+                }
+            };
+            let broker_receipt_reconciler = build_broker_receipt_reconciler();
             match tokio::time::timeout(
                 std::time::Duration::from_secs(15),
                 broker_receipt_reconciler.reconcile_once(),
@@ -921,7 +929,7 @@ impl AppState {
                 _ => {}
             }
             {
-                let reconciler = broker_receipt_reconciler.clone();
+                let build_reconciler = build_broker_receipt_reconciler;
                 let shutdown = mcp_proxy_shutdown.clone();
                 tokio::spawn(async move {
                     loop {
@@ -929,7 +937,7 @@ impl AppState {
                             _ = shutdown.cancelled() => break,
                             _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
                         }
-                        let report = reconciler.reconcile_once().await;
+                        let report = build_reconciler().reconcile_once().await;
                         if report.candidates > 0 || report.blocked > 0 {
                             tracing::info!(
                                 candidates = report.candidates,
