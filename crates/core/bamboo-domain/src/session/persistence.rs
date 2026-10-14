@@ -210,6 +210,23 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         None
     }
 
+    /// Execution-private input restriction. A selector carries no authority;
+    /// only a persister already bound to a real Root writer may install it.
+    /// Unsupported hosts fail closed. This introduces no durable state.
+    fn bind_root_inbox_receipt(
+        &self,
+        _receipt: crate::SessionInboxReceipt,
+    ) -> io::Result<Arc<dyn RuntimeSessionPersistence>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Root receipt binding unsupported",
+        ))
+    }
+
+    fn root_inbox_receipt(&self) -> Option<&crate::SessionInboxReceipt> {
+        None
+    }
+
     /// Whether this Host requires an explicit execution capability for the
     /// proposed Root. A route without a bound event/persistence handoff must
     /// reject before claiming or making a provider call.
@@ -618,6 +635,17 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
 
     fn root_actor_writer(&self) -> Option<crate::RootActorRuntimeWrite> {
         (**self).root_actor_writer()
+    }
+
+    fn bind_root_inbox_receipt(
+        &self,
+        receipt: crate::SessionInboxReceipt,
+    ) -> io::Result<Arc<dyn RuntimeSessionPersistence>> {
+        (**self).bind_root_inbox_receipt(receipt)
+    }
+
+    fn root_inbox_receipt(&self) -> Option<&crate::SessionInboxReceipt> {
+        (**self).root_inbox_receipt()
     }
 
     fn root_actor_execution_required(&self, session: &Session) -> bool {

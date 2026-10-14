@@ -43,6 +43,7 @@ pub struct SessionRepository {
         Arc<dyn bamboo_domain::ActorDirectoryPort>,
         Arc<bamboo_domain::RootActorRuntimeWrite>,
     )>,
+    root_inbox_receipt: Option<bamboo_domain::SessionInboxReceipt>,
     root_actor_writers:
         Arc<dashmap::DashMap<String, std::sync::Weak<bamboo_domain::RootActorRuntimeWrite>>>,
     #[cfg(test)]
@@ -61,6 +62,7 @@ impl SessionRepository {
             persistence,
             root_actor_directory: None,
             root_actor_owner: None,
+            root_inbox_receipt: None,
             root_actor_writers: Arc::new(Default::default()),
             #[cfg(test)]
             post_durable_hook: None,
@@ -569,6 +571,30 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         self.root_actor_owner
             .as_ref()
             .map(|(_, owner)| (**owner).clone())
+    }
+
+    fn bind_root_inbox_receipt(
+        &self,
+        receipt: bamboo_domain::SessionInboxReceipt,
+    ) -> std::io::Result<Arc<dyn bamboo_domain::RuntimeSessionPersistence>> {
+        if self.root_actor_owner.is_none()
+            || receipt.generation == 0
+            || self
+                .root_inbox_receipt
+                .as_ref()
+                .is_some_and(|current| current != &receipt)
+        {
+            return Err(root_actor_binding_error(
+                "Root receipt requires its unchanged execution writer",
+            ));
+        }
+        let mut bound = self.clone();
+        bound.root_inbox_receipt = Some(receipt);
+        Ok(Arc::new(bound))
+    }
+
+    fn root_inbox_receipt(&self) -> Option<&bamboo_domain::SessionInboxReceipt> {
+        self.root_inbox_receipt.as_ref()
     }
 
     fn root_actor_execution_required(&self, session: &Session) -> bool {

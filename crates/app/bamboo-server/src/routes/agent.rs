@@ -401,7 +401,7 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         )
         .route(
             "/sessions/{session_id}/stop",
-            web::post().to(agent::stop::handler),
+            web::post().to(agent::stop::handler_with_run),
         )
         .route(
             "/sessions/{session_id}/history",
@@ -447,7 +447,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         // Account-scoped change feed: one resumable SSE stream across all
         // sessions (multi-client sync, replaces session-index polling).
         .route("/stream", web::get().to(agent::stream::handler))
-        .route("/stop/{session_id}", web::post().to(agent::stop::handler))
+        .route(
+            "/stop/{session_id}",
+            web::post().to(agent::stop::handler_with_run),
+        )
         .route(
             "/child-approval/{child_session_id}",
             web::post().to(agent::child_approval::handler),

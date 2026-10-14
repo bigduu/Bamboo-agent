@@ -16,6 +16,7 @@ use self::response::{
 };
 
 mod ready;
+mod receipt;
 mod response;
 #[cfg(test)]
 mod tests;
@@ -38,12 +39,21 @@ pub async fn handler(
     {
         return crate::handlers::agent::tickets::TicketHttpError::from(error).error_response();
     }
-    let prepared = match crate::app_state::mutation_idempotency::prepare(
-        &http_request,
-        "execute",
-        &format!("POST /api/v1/execute/{session_id}"),
-        &*req,
-    ) {
+    let selected = match receipt::selection(&http_request) {
+        Ok(selected) => selected,
+        Err(response) => return *response,
+    };
+    let target = format!("POST /api/v1/execute/{session_id}");
+    let prepared = match if let Some(receipt) = selected.as_ref() {
+        crate::app_state::mutation_idempotency::prepare(
+            &http_request,
+            "execute",
+            &target,
+            &serde_json::json!({"request": &*req, "input": {"message_id": receipt.receipt.id.as_str(), "ingress_seq": receipt.receipt.generation, "session_created_at": receipt.created_at}}),
+        )
+    } else {
+        crate::app_state::mutation_idempotency::prepare(&http_request, "execute", &target, &*req)
+    } {
         Ok(prepared) => prepared,
         Err(response) => return *response,
     };
@@ -52,7 +62,9 @@ pub async fn handler(
     };
     let store = state.mutation_idempotency.clone();
     store
-        .execute(prepared, || handle_execute(state, session_id, req))
+        .execute(prepared, || {
+            handle_execute_inner(state, session_id, req, selected)
+        })
         .await
 }
 
@@ -63,6 +75,15 @@ pub async fn handle_execute(
     state: web::Data<AppState>,
     session_id: String,
     req: web::Json<ExecuteRequest>,
+) -> HttpResponse {
+    handle_execute_inner(state, session_id, req, None).await
+}
+
+async fn handle_execute_inner(
+    state: web::Data<AppState>,
+    session_id: String,
+    req: web::Json<ExecuteRequest>,
+    selected: Option<receipt::Selection>,
 ) -> HttpResponse {
     // Linearize startup ownership against an abandoned-turn reconciliation.
     // Reconciliation holds the same persistence lock through its durable CAS
@@ -76,7 +97,13 @@ pub async fn handle_execute(
     // Bind rejection rollback to the exact turn observed by this request. A
     // delayed failure from turn A must never poison a newer turn B.
     drop(startup_lock);
-    let mut admission_reservation = match state.reserve_root_chat_for_execute(&session_id).await {
+    let selected_reservation = match selected.as_ref() {
+        Some(receipt) => receipt::reserve(&state, &session_id, receipt)
+            .await
+            .map(Some),
+        None => state.reserve_root_chat_for_execute(&session_id).await,
+    };
+    let mut admission_reservation = match selected_reservation {
         Ok(reservation) => reservation,
         Err(response) => return *response,
     };
@@ -94,7 +121,7 @@ pub async fn handle_execute(
     // Await exact cleanup on every non-spawn return. The reservation's own
     // cancellation-safe Drop remains the fallback if this HTTP future is lost.
     abandon_admission_reservation(&mut admission_reservation).await;
-    response
+    receipt::annotate(response, selected)
 }
 
 async fn handle_reserved_execute(

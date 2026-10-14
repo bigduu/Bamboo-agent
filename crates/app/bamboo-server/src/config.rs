@@ -762,7 +762,8 @@ pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
 
     // Session metadata mutations use ETag as their If-Match CAS token. The
     // browser workbench also needs active tab, frame sequence, epoch, and geometry headers
-    // when its frontend and Bamboo use different local origins.
+    // when its frontend and Bamboo use different local origins. Native activation
+    // receipts must also be readable by the supported cross-origin clients.
     cors.expose_headers([
         header::ETAG,
         header::HeaderName::from_static("x-frame-seq"),
@@ -770,6 +771,10 @@ pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
         header::HeaderName::from_static("x-page-epoch"),
         header::HeaderName::from_static("x-viewport-width"),
         header::HeaderName::from_static("x-viewport-height"),
+        header::HeaderName::from_static("bamboo-input-id"),
+        header::HeaderName::from_static("bamboo-ingress-seq"),
+        header::HeaderName::from_static("bamboo-session-created-at"),
+        header::HeaderName::from_static("bamboo-output-scope"),
     ])
 }
 
@@ -1223,6 +1228,10 @@ mod tests {
                 "x-page-epoch",
                 "x-viewport-width",
                 "x-viewport-height",
+                "bamboo-input-id",
+                "bamboo-ingress-seq",
+                "bamboo-session-created-at",
+                "bamboo-output-scope",
             ] {
                 assert!(
                     exposed.iter().any(|value| value.eq_ignore_ascii_case(name)),
@@ -1231,8 +1240,8 @@ mod tests {
             }
             assert_eq!(
                 exposed.len(),
-                6,
-                "only the CAS and browser frame headers are exposed for bind {bind_addr}"
+                10,
+                "only CAS, browser frame and activation receipt headers are exposed for bind {bind_addr}"
             );
 
             let preflight = test::call_service(
@@ -1265,6 +1274,30 @@ mod tests {
                     .any(|value| value.trim().eq_ignore_ascii_case("if-match")),
                 "If-Match must remain allowed for bind {bind_addr}; allowed={allowed_headers}"
             );
+
+            for (path, requested_headers) in [
+                (format!("/api/v1/sessions/{session_id}/execute"),
+                 "content-type, idempotency-key, bamboo-input-id, bamboo-ingress-seq, bamboo-session-created-at"),
+                (format!("/api/v1/sessions/{session_id}/stop"), "bamboo-run-id"),
+            ] {
+                let preflight = test::call_service(
+                    &app,
+                    test::TestRequest::default()
+                        .method(Method::OPTIONS)
+                        .uri(&path)
+                        .insert_header((header::ORIGIN, origin))
+                        .insert_header((header::ACCESS_CONTROL_REQUEST_METHOD, "POST"))
+                        .insert_header((header::ACCESS_CONTROL_REQUEST_HEADERS, requested_headers))
+                        .to_request(),
+                ).await;
+                assert_eq!(preflight.status(), StatusCode::OK, "receipt preflight for bind {bind_addr}");
+                let allowed = preflight.headers().get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+                    .unwrap().to_str().unwrap();
+                for name in requested_headers.split(',').map(str::trim) {
+                    assert!(allowed.split(',').any(|value| value.trim().eq_ignore_ascii_case(name)),
+                        "{name} must be allowed for bind {bind_addr}: {allowed}");
+                }
+            }
         }
 
         state.shutdown().await;
