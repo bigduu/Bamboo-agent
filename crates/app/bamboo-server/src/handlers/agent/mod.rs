@@ -26,6 +26,7 @@ pub mod plugin;
 pub mod projects;
 pub mod prompt_presets;
 pub mod respond;
+pub mod run_output;
 pub mod schedules;
 pub mod sessions;
 pub mod stop;

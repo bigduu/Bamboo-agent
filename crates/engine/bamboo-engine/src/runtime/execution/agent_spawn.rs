@@ -164,6 +164,40 @@ impl SessionExecutionReservation {
         Ok(())
     }
 
+    /// Opt only a selected, actual Root execution into finite visible output
+    /// replay. No public request data can supply its writer or runner identity.
+    pub async fn retain_selected_run_output(&self) -> std::io::Result<bool> {
+        if !self.selected_input {
+            return Ok(false);
+        }
+        let owner = self
+            .root_actor_writer()
+            .ok_or_else(|| std::io::Error::other("Selected output requires its Root writer"))?;
+        let receipt = self
+            .execution_persistence
+            .as_ref()
+            .and_then(|p| p.root_inbox_receipt())
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("Selected output requires its bound receipt"))?;
+        if owner.fence.actor_id != self.session_id
+            || owner.fence.run_id != self.run_id
+            || self.cancel_token.is_cancelled()
+        {
+            return Err(std::io::Error::other(
+                "Selected output reservation is not live",
+            ));
+        }
+        let runners = self.runners.read().await;
+        let runner = runners
+            .get(&self.session_id)
+            .filter(|r| r.run_id == self.run_id && !r.cancel_token.is_cancelled())
+            .ok_or_else(|| std::io::Error::other("Selected output runner is unavailable"))?;
+        runner
+            .visible_messages
+            .retain_selected_output(&owner, receipt)?;
+        Ok(true)
+    }
+
     pub fn root_actor_writer(&self) -> Option<bamboo_domain::RootActorRuntimeWrite> {
         self.root_actor
             .as_ref()

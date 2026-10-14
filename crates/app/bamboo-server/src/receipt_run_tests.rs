@@ -761,3 +761,6 @@ async fn receipt_run_old_lifetime_cannot_select_recreated_roots_reused_id_and_ge
         .await
         .unwrap());
 }
+
+#[path = "run_output_tests.rs"]
+mod run_output_tests;

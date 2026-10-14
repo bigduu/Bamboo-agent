@@ -400,6 +400,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::events::handler),
         )
         .route(
+            "/sessions/{session_id}/runs/{run_id}/output",
+            web::get().to(agent::run_output::handler),
+        )
+        .route(
             "/sessions/{session_id}/stop",
             web::post().to(agent::stop::handler_with_run),
         )

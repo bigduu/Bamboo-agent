@@ -264,6 +264,23 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         );
     }
 
+    // Finish cancellable output binding before any auxiliary title task.
+    // Title generation and forwarder/spawn then share one uninterrupted Ready
+    // handoff. Ordinary reservations remain a synchronous no-op here.
+    if let Err(error) = execution_reservation.retain_selected_run_output().await {
+        execution_reservation.abandon().await;
+        rollback_startup(
+            state,
+            session_id,
+            &run_id,
+            ready.startup_turn_id.as_deref(),
+            &error.to_string(),
+            ready.startup_guard,
+        )
+        .await;
+        return internal_server_error_response("Selected run output binding rejected");
+    }
+
     if ready.generate_title && !session.title_generated {
         crate::title_gen::spawn_title_generation(state.clone().into_inner(), session_id.to_owned());
     }
