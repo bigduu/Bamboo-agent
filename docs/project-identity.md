@@ -145,6 +145,14 @@ writes update the manifest and derived index before publishing durable
 `ProjectUpdated`; rejected requests publish nothing. Clients receiving a CAS or
 already-imported conflict must reload the authoritative Project before retrying.
 
+Incoming sidebar/import snapshots allow at most 256 custom sections, 10,000
+explicit session mappings, and 1 MiB of compact serialized snapshot JSON.
+Larger snapshots are rejected in full with `413` before Project storage or
+session membership reads. These limits bound submitted organization state,
+not the Project's total session history. Existing stored snapshots remain
+readable, and ordinary Project metadata edits preserve them without applying
+the incoming-snapshot limits.
+
 ### Session workspace changes
 
 `PATCH /api/v1/sessions/{id}` accepts `workspace_path` as an immediate durable

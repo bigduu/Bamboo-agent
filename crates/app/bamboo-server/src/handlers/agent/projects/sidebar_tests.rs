@@ -1,9 +1,12 @@
 use super::*;
 
 use actix_web::{body::to_bytes, http::header, test, App};
-use bamboo_domain::{Session, Storage};
+use bamboo_domain::{ProjectSidebarSection, Session, Storage};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 const SECTION: &str = "section:2d567c47-a081-4a8d-9c9e-246bce470c9f";
 const EMPTY_SECTION: &str = "section:28f595c0-21dc-4a86-8b83-5f8b258386fa";
@@ -75,6 +78,170 @@ async fn body(response: HttpResponse) -> Value {
 fn assert_unchanged(state: &AppState, project: &ProjectManifest, cursor: u64) {
     assert_eq!(state.project_store.get(&project.id).unwrap(), *project);
     assert_eq!(state.account_sink.latest_seq(), cursor);
+}
+
+fn large_snapshot(sections: usize, assignments: usize) -> ProjectSidebar {
+    let sections = (0..sections)
+        .map(|index| ProjectSidebarSection {
+            id: format!("section:{}", uuid::Uuid::from_u128(index as u128 + 1)),
+            name: format!("Section {index}"),
+        })
+        .collect::<Vec<_>>();
+    let target = sections.first().map(|section| section.id.clone());
+    ProjectSidebar {
+        sections,
+        session_sections: (0..assignments)
+            .map(|index| (format!("root-{index}"), target.clone()))
+            .collect(),
+        hidden_legacy: false,
+    }
+}
+
+fn snapshot_with_json_bytes(bytes: usize) -> ProjectSidebar {
+    let mut sidebar = large_snapshot(1, 0);
+    let target = sidebar.sections[0].id.clone();
+    sidebar
+        .session_sections
+        .insert(String::new(), Some(target.clone()));
+    let overhead = serde_json::to_vec(&sidebar).unwrap().len();
+    sidebar.session_sections.clear();
+    sidebar
+        .session_sections
+        .insert("r".repeat(bytes - overhead), Some(target));
+    assert_eq!(serde_json::to_vec(&sidebar).unwrap().len(), bytes);
+    sidebar
+}
+
+fn project_disk_snapshot(state: &AppState, id: &ProjectId) -> Vec<Option<Vec<u8>>> {
+    let paths = state.project_store.paths();
+    let home = paths.project_home(id);
+    [
+        paths.manifest_path(id),
+        home.join("project.json.bak"),
+        paths.manifest_revision_path(id),
+        paths.index_path(),
+        home.join("project.json.migrated-v2"),
+    ]
+    .into_iter()
+    .map(|path| match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("fixture read failed: {error}"),
+    })
+    .collect()
+}
+
+async fn failing_control_plane_fixture() -> (
+    tempfile::TempDir,
+    web::Data<AppState>,
+    ProjectManifest,
+    Arc<AtomicUsize>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = Box::pin(AppState::new(dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    // Keep deliberately rewritten legacy fixtures outside the store captured
+    // by AppState's background watchers.
+    state.project_store = Arc::new(
+        bamboo_projects::ProjectStore::open(dir.path().join("isolated-registry")).unwrap(),
+    );
+    let project = state.project_store.create("Zenith", None).unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    state.storage = Arc::new(FailingControlPlane {
+        reads: reads.clone(),
+    });
+    (dir, web::Data::new(state), project, reads)
+}
+
+#[actix_web::test]
+async fn oversized_sidebar_requests_reject_before_storage_migration_or_events() {
+    let (_dir, state, project, reads) = failing_control_plane_fixture().await;
+    let manifest_path = state.project_store.paths().manifest_path(&project.id);
+    let mut legacy: Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    legacy["schema_version"] = json!(2);
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+    let before = project_disk_snapshot(&state, &project.id);
+    let cursor = state.account_sink.latest_seq();
+    let mut escaped = large_snapshot(1, 1);
+    escaped.sections[0].name = "\0".repeat(MAX_SIDEBAR_JSON_BYTES / 6 + 1);
+    assert!(serde_json::to_vec(&escaped).unwrap().len() > MAX_SIDEBAR_JSON_BYTES);
+    let oversized = [
+        large_snapshot(MAX_SIDEBAR_SECTIONS + 1, 1),
+        large_snapshot(1, MAX_SIDEBAR_ASSIGNMENTS + 1),
+        snapshot_with_json_bytes(MAX_SIDEBAR_JSON_BYTES + 1),
+        escaped,
+    ];
+    for field in ["sidebar", "import_sidebar"] {
+        for sidebar in &oversized {
+            let response = patch(&state, &project.id, Some(1), json!({field: sidebar})).await;
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(reads.load(Ordering::SeqCst), 0);
+            // Do not call get here: the assertion itself would migrate v2.
+            assert_eq!(project_disk_snapshot(&state, &project.id), before);
+            assert_eq!(state.account_sink.latest_seq(), cursor);
+        }
+    }
+}
+
+#[actix_web::test]
+async fn sidebar_size_boundaries_reach_normal_membership_validation() {
+    let (_dir, state, project, reads) = failing_control_plane_fixture().await;
+    let before = project_disk_snapshot(&state, &project.id);
+    let cursor = state.account_sink.latest_seq();
+    let allowed = [
+        large_snapshot(MAX_SIDEBAR_SECTIONS, 1),
+        large_snapshot(1, MAX_SIDEBAR_ASSIGNMENTS),
+        snapshot_with_json_bytes(MAX_SIDEBAR_JSON_BYTES),
+    ];
+    for field in ["sidebar", "import_sidebar"] {
+        for sidebar in &allowed {
+            reads.store(0, Ordering::SeqCst);
+            let response = patch(&state, &project.id, Some(1), json!({field: sidebar})).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            assert_eq!(project_disk_snapshot(&state, &project.id), before);
+            assert_eq!(state.account_sink.latest_seq(), cursor);
+        }
+    }
+}
+
+#[actix_web::test]
+async fn stored_over_limit_sidebar_remains_readable_and_metadata_edits_preserve_it() {
+    let (dir, state, project) = fixture().await;
+    let mut sidebar = large_snapshot(MAX_SIDEBAR_SECTIONS + 1, MAX_SIDEBAR_ASSIGNMENTS + 1);
+    sidebar.session_sections.insert(
+        "r".repeat(MAX_SIDEBAR_JSON_BYTES),
+        Some(sidebar.sections[0].id.clone()),
+    );
+    let stored = state
+        .project_store
+        .update(&project.id, 1, |project| {
+            project.sidebar = Some(sidebar.clone());
+            Ok(())
+        })
+        .unwrap();
+    let reopened = bamboo_projects::ProjectStore::open(dir.path()).unwrap();
+    assert_eq!(reopened.get(&project.id).unwrap(), stored);
+    assert_eq!(reopened.list().unwrap(), vec![stored]);
+
+    let response = patch(
+        &state,
+        &project.id,
+        Some(2),
+        json!({"name": "Renamed Project"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved: ProjectManifest = serde_json::from_value(body(response).await).unwrap();
+    assert_eq!(saved.sidebar, Some(sidebar));
+    let reopened = bamboo_projects::ProjectStore::open(dir.path()).unwrap();
+    assert_eq!(reopened.get(&project.id).unwrap(), saved);
+    assert_eq!(
+        reopened.index().unwrap().projects[&project.id].sidebar,
+        saved.sidebar
+    );
 }
 
 #[actix_web::test]
@@ -409,7 +576,9 @@ async fn empty_sidebar_import_is_durable_and_blocks_other_browser_replay() {
     assert_unchanged(&state, &reopened, cursor);
 }
 
-struct FailingControlPlane;
+struct FailingControlPlane {
+    reads: Arc<AtomicUsize>,
+}
 
 #[actix_web::test]
 async fn sidebar_import_preserves_ids_when_legacy_and_custom_display_names_collide() {
@@ -456,19 +625,14 @@ impl Storage for FailingControlPlane {
         unreachable!()
     }
     async fn load_runtime_control_plane(&self, _: &str) -> std::io::Result<Option<Session>> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         Err(std::io::Error::other("injected control-plane read failure"))
     }
 }
 
 #[actix_web::test]
 async fn sidebar_import_read_error_never_commits_an_empty_snapshot() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = Box::pin(AppState::new(dir.path().to_path_buf()))
-        .await
-        .unwrap();
-    let project = state.project_store.create("Zenith", None).unwrap();
-    state.storage = Arc::new(FailingControlPlane);
-    let state = web::Data::new(state);
+    let (_dir, state, project, reads) = failing_control_plane_fixture().await;
     let cursor = state.account_sink.latest_seq();
     for field in ["sidebar", "import_sidebar"] {
         let response = patch(
@@ -481,4 +645,5 @@ async fn sidebar_import_read_error_never_commits_an_empty_snapshot() {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_unchanged(&state, &project, cursor);
     }
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
 }

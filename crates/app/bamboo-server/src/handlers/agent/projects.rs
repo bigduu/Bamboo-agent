@@ -7,7 +7,8 @@
 
 use crate::error::ResponseResult;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::io::{self, Write};
 use std::path::Path;
 
 use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse, Result};
@@ -77,29 +78,58 @@ pub struct PatchProjectRequest {
     pub import_sidebar: Option<ProjectSidebar>,
 }
 
-fn sidebar_target_exists(sidebar: &ProjectSidebar, legacy: Option<&str>, target: &str) -> bool {
-    (target == "legacy" && legacy.is_some() && !sidebar.hidden_legacy)
-        || sidebar.sections.iter().any(|section| section.id == target)
+// Bound incoming organization snapshots without imposing new read-time rules
+// on already-persisted manifests or on the Project's total session history.
+const MAX_SIDEBAR_SECTIONS: usize = 256;
+const MAX_SIDEBAR_ASSIGNMENTS: usize = 10_000;
+const MAX_SIDEBAR_JSON_BYTES: usize = 1024 * 1024;
+
+struct SidebarByteBudget {
+    remaining: usize,
+}
+
+impl Write for SidebarByteBudget {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes.len())
+            .ok_or_else(|| io::Error::other("sidebar snapshot byte limit exceeded"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn sidebar_request_within_limits(sidebar: &ProjectSidebar) -> bool {
+    if sidebar.sections.len() > MAX_SIDEBAR_SECTIONS
+        || sidebar.session_sections.len() > MAX_SIDEBAR_ASSIGNMENTS
+    {
+        return false;
+    }
+    serde_json::to_writer(
+        SidebarByteBudget {
+            remaining: MAX_SIDEBAR_JSON_BYTES,
+        },
+        sidebar,
+    )
+    .is_ok()
 }
 
 fn clear_removed_sidebar_assignments(
     previous: Option<&ProjectSidebar>,
-    sidebar: &mut ProjectSidebar,
-    legacy: Option<&str>,
+    assignments: &mut BTreeMap<String, Option<String>>,
+    available: &HashSet<&str>,
 ) {
-    let removed = sidebar
-        .session_sections
-        .iter()
-        .filter(|(id, target)| {
-            target.as_deref().is_some_and(|value| {
-                !sidebar_target_exists(sidebar, legacy, value)
-                    && previous.is_some_and(|old| old.session_sections.get(*id) == Some(*target))
-            })
-        })
-        .map(|(id, _)| id.clone())
-        .collect::<Vec<_>>();
-    for id in removed {
-        sidebar.session_sections.insert(id, None);
+    for (id, target) in assignments {
+        if target
+            .as_deref()
+            .is_some_and(|value| !available.contains(value))
+            && previous.is_some_and(|old| old.session_sections.get(id) == Some(&*target))
+        {
+            *target = None;
+        }
     }
 }
 
@@ -121,18 +151,21 @@ fn apply_sidebar_snapshot(
     for section in &mut sidebar.sections {
         section.name = section.name.trim().to_string();
     }
-    clear_removed_sidebar_assignments(previous, &mut sidebar, project.section.as_deref());
+    let mut available = sidebar
+        .sections
+        .iter()
+        .map(|section| section.id.as_str())
+        .collect::<HashSet<_>>();
+    if project.section.is_some() && !sidebar.hidden_legacy {
+        available.insert("legacy");
+    }
+    clear_removed_sidebar_assignments(previous, &mut sidebar.session_sections, &available);
     if importing {
-        let available = sidebar
-            .sections
-            .iter()
-            .map(|section| section.id.as_str())
-            .collect::<HashSet<_>>();
-        let legacy_visible = project.section.is_some() && !sidebar.hidden_legacy;
         for target in sidebar.session_sections.values_mut() {
-            if target.as_ref().is_some_and(|target| {
-                !available.contains(target.as_str()) && !(target == "legacy" && legacy_visible)
-            }) {
+            if target
+                .as_ref()
+                .is_some_and(|target| !available.contains(target.as_str()))
+            {
                 *target = None;
             }
         }
@@ -454,6 +487,19 @@ pub async fn patch_project(
         Ok(revision) => revision,
         Err(response) => return Ok(*response),
     };
+    for sidebar in request
+        .sidebar
+        .as_ref()
+        .into_iter()
+        .chain(request.import_sidebar.as_ref())
+    {
+        if !sidebar_request_within_limits(sidebar) {
+            return Ok(crate::error::json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Sidebar snapshots allow at most 256 sections, 10000 session mappings and 1 MiB of compact JSON",
+            ));
+        }
+    }
     if request.sidebar.is_some() && request.import_sidebar.is_some() {
         return Ok(project_error(ProjectStoreError::Validation(
             "sidebar and import_sidebar are mutually exclusive".into(),
