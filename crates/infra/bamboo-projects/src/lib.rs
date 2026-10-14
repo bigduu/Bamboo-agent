@@ -13,7 +13,7 @@ use bamboo_domain::{
     LegacyProjectAssignment, LegacyProjectDryRunReport, LegacyProjectMatchBasis,
     LegacyProjectSuggestion, LegacyProjectUnassigned, LegacySessionProjectInput, ProjectId,
     ProjectIndex, ProjectIndexEntry, ProjectManifest, ProjectPathStatus, ProjectResourceEntry,
-    ProjectResourceKind, ProjectResourceSummary, ProjectStatus, WorkspaceBinding,
+    ProjectResourceKind, ProjectResourceSummary, ProjectSidebar, ProjectStatus, WorkspaceBinding,
     PROJECT_INDEX_SCHEMA_VERSION, PROJECT_MANIFEST_SCHEMA_VERSION,
 };
 use chrono::Utc;
@@ -1505,6 +1505,9 @@ fn validate_manifest(manifest: &ProjectManifest) -> ProjectStoreResult<()> {
                 .to_string(),
         ));
     }
+    if let Some(sidebar) = manifest.sidebar.as_ref() {
+        validate_project_sidebar(sidebar, manifest.section.as_deref())?;
+    }
     if manifest.revision == 0 || manifest.resource_revision == 0 {
         return Err(ProjectStoreError::Validation(
             "project revisions must be positive".to_string(),
@@ -1557,6 +1560,61 @@ fn validate_manifest(manifest: &ProjectManifest) -> ProjectStoreResult<()> {
         }
         if let Some(git_common_dir) = &binding.git_common_dir {
             validate_absolute_path(git_common_dir, "git common dir")?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate the self-contained sidebar shape. Session ownership is checked by
+/// the server against durable session control planes before accepting new or
+/// changed assignments; it must never be inferred from these presentation IDs.
+pub fn validate_project_sidebar(
+    sidebar: &ProjectSidebar,
+    legacy_section: Option<&str>,
+) -> ProjectStoreResult<()> {
+    let mut ids = HashSet::new();
+    let mut names = HashSet::new();
+    for section in &sidebar.sections {
+        let valid_id = section
+            .id
+            .strip_prefix("section:")
+            .and_then(|value| Uuid::parse_str(value).ok().map(|id| (value, id)))
+            .is_some_and(|(value, id)| value == id.to_string());
+        if !valid_id || !ids.insert(section.id.as_str()) {
+            return Err(ProjectStoreError::Validation(
+                "sidebar section ids must be unique section:<canonical UUID> values".into(),
+            ));
+        }
+        if section.name.trim() != section.name
+            || section.name.is_empty()
+            || section.name.chars().count() > 80
+            || section.name.chars().any(char::is_control)
+            || !names.insert(section.name.to_lowercase())
+        {
+            return Err(ProjectStoreError::Validation(
+                "sidebar section names must be unique (case insensitive), trimmed 1..=80 characters without controls".into(),
+            ));
+        }
+    }
+    for (session_id, target) in &sidebar.session_sections {
+        if session_id.is_empty()
+            || session_id.contains('/')
+            || session_id.contains('\\')
+            || session_id.contains("..")
+            || session_id.chars().any(char::is_control)
+        {
+            return Err(ProjectStoreError::Validation(
+                "invalid sidebar session id".into(),
+            ));
+        }
+        if let Some(target) = target {
+            if !ids.contains(target.as_str())
+                && !(target == "legacy" && legacy_section.is_some() && !sidebar.hidden_legacy)
+            {
+                return Err(ProjectStoreError::Validation(
+                    "sidebar assignment references an unavailable section".into(),
+                ));
+            }
         }
     }
     Ok(())
@@ -1996,13 +2054,126 @@ fn suggest_groups<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_domain::WorkspaceBinding;
+    use bamboo_domain::{ProjectSidebarSection, WorkspaceBinding};
     use tempfile::TempDir;
 
     fn store() -> (TempDir, ProjectStore) {
         let temp = tempfile::tempdir().unwrap();
         let store = ProjectStore::open(temp.path()).unwrap();
         (temp, store)
+    }
+
+    fn sidebar() -> ProjectSidebar {
+        ProjectSidebar {
+            sections: vec![ProjectSidebarSection {
+                id: "section:2d567c47-a081-4a8d-9c9e-246bce470c9f".into(),
+                name: "Support".into(),
+            }],
+            session_sections: BTreeMap::from([("root".into(), None)]),
+            hidden_legacy: false,
+        }
+    }
+
+    #[test]
+    fn project_sidebar_survives_restart_and_derived_index_rebuild() {
+        let (temp, store) = store();
+        let project = store.create("Zenith", None).unwrap();
+        let updated = store
+            .update(&project.id, 1, |project| {
+                project.sidebar = Some(sidebar());
+                Ok(())
+            })
+            .unwrap();
+        let home = store.paths().project_home(&project.id);
+        drop(store);
+        let reopened = ProjectStore::open(temp.path()).unwrap();
+        assert_eq!(reopened.get(&project.id).unwrap(), updated);
+        assert_eq!(reopened.list().unwrap(), vec![updated.clone()]);
+        assert_eq!(
+            reopened.index().unwrap().projects[&project.id].sidebar,
+            updated.sidebar
+        );
+        assert_eq!(reopened.paths().project_home(&project.id), home);
+        let empty = reopened
+            .update(&project.id, 2, |project| {
+                project.sidebar = Some(ProjectSidebar::default());
+                Ok(())
+            })
+            .unwrap();
+        drop(reopened);
+        let reopened = ProjectStore::open(temp.path()).unwrap();
+        assert_eq!(reopened.get(&project.id).unwrap().sidebar, empty.sidebar);
+        assert_eq!(empty.sidebar, Some(ProjectSidebar::default()));
+    }
+
+    #[test]
+    fn sidebar_validation_rejects_bad_ids_names_and_targets_without_writes() {
+        let (_temp, store) = store();
+        let project = store.create("Zenith", None).unwrap();
+        let manifest_path = store.paths().manifest_path(&project.id);
+        let original = std::fs::read(&manifest_path).unwrap();
+        let mut invalid = Vec::new();
+        for name in [
+            "".into(),
+            " leading".into(),
+            "line\nbreak".into(),
+            "界".repeat(81),
+        ] {
+            let mut candidate = sidebar();
+            candidate.sections[0].name = name;
+            invalid.push(candidate);
+        }
+        for id in [
+            "legacy",
+            "section:invalid",
+            "section:2D567C47-A081-4A8D-9C9E-246BCE470C9F",
+        ] {
+            let mut candidate = sidebar();
+            candidate.sections[0].id = id.into();
+            invalid.push(candidate);
+        }
+        let mut duplicate = sidebar();
+        duplicate.sections.push(duplicate.sections[0].clone());
+        invalid.push(duplicate);
+        let mut duplicate_name = sidebar();
+        duplicate_name.sections.push(ProjectSidebarSection {
+            id: "section:28f595c0-21dc-4a86-8b83-5f8b258386fa".into(),
+            name: "support".into(),
+        });
+        invalid.push(duplicate_name);
+        for (session_id, target) in [
+            ("root", "missing"),
+            ("root", "legacy"),
+            ("../root", "legacy"),
+        ] {
+            let mut candidate = sidebar();
+            candidate.session_sections = BTreeMap::from([(session_id.into(), Some(target.into()))]);
+            invalid.push(candidate);
+        }
+        for candidate in invalid {
+            assert!(matches!(
+                store.update(&project.id, 1, |project| {
+                    project.sidebar = Some(candidate);
+                    Ok(())
+                }),
+                Err(ProjectStoreError::Validation(_))
+            ));
+            assert_eq!(std::fs::read(&manifest_path).unwrap(), original);
+            assert_eq!(store.index().unwrap().projects[&project.id].revision, 1);
+        }
+        let mut unicode = sidebar();
+        unicode.sections[0].name = "界".repeat(80);
+        validate_project_sidebar(&unicode, None).unwrap();
+        let mut legacy = sidebar();
+        legacy
+            .session_sections
+            .insert("root".into(), Some("legacy".into()));
+        validate_project_sidebar(&legacy, Some("Development")).unwrap();
+        // Legacy Project.section has an independent rename lifecycle. Its
+        // display name may collide without invalidating stored bucket IDs.
+        validate_project_sidebar(&legacy, Some("support")).unwrap();
+        legacy.hidden_legacy = true;
+        assert!(validate_project_sidebar(&legacy, Some("Development")).is_err());
     }
 
     fn binding(path: &Path) -> WorkspaceBinding {

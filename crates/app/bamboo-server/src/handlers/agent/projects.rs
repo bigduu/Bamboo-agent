@@ -7,12 +7,14 @@
 
 use crate::error::ResponseResult;
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse, Result};
 use bamboo_agent_core::AgentEvent;
 use bamboo_domain::{
-    LegacySessionProjectInput, ProjectId, ProjectManifest, ProjectStatus, WorkspaceBinding,
+    LegacySessionProjectInput, ProjectId, ProjectManifest, ProjectSidebar, ProjectStatus,
+    SessionKind, WorkspaceBinding,
 };
 use bamboo_projects::{
     canonicalize_workspace_path, plan_legacy_migration, resolve_git_common_dir, ProjectStoreError,
@@ -43,6 +45,15 @@ where
     Option::<String>::deserialize(deserializer).map(Some)
 }
 
+fn deserialize_sidebar_snapshot<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<ProjectSidebar>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    ProjectSidebar::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PatchProjectRequest {
     #[serde(default)]
@@ -57,6 +68,95 @@ pub struct PatchProjectRequest {
     /// revision as name/description updates.
     #[serde(default)]
     pub project_path: Option<String>,
+    /// Complete Project-owned sidebar snapshot. Explicit null is invalid;
+    /// clearing the sidebar uses an empty snapshot, which remains durable.
+    #[serde(default, deserialize_with = "deserialize_sidebar_snapshot")]
+    pub sidebar: Option<ProjectSidebar>,
+    /// One-time browser migration. It cannot overwrite an existing snapshot.
+    #[serde(default, deserialize_with = "deserialize_sidebar_snapshot")]
+    pub import_sidebar: Option<ProjectSidebar>,
+}
+
+fn sidebar_target_exists(sidebar: &ProjectSidebar, legacy: Option<&str>, target: &str) -> bool {
+    (target == "legacy" && legacy.is_some() && !sidebar.hidden_legacy)
+        || sidebar.sections.iter().any(|section| section.id == target)
+}
+
+fn clear_removed_sidebar_assignments(
+    previous: Option<&ProjectSidebar>,
+    sidebar: &mut ProjectSidebar,
+    legacy: Option<&str>,
+) {
+    let removed = sidebar
+        .session_sections
+        .iter()
+        .filter(|(id, target)| {
+            target.as_deref().is_some_and(|value| {
+                !sidebar_target_exists(sidebar, legacy, value)
+                    && previous.is_some_and(|old| old.session_sections.get(*id) == Some(*target))
+            })
+        })
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    for id in removed {
+        sidebar.session_sections.insert(id, None);
+    }
+}
+
+fn apply_sidebar_snapshot(
+    project: &mut ProjectManifest,
+    requested: Option<&ProjectSidebar>,
+    importing: bool,
+    valid_roots: &HashSet<String>,
+) -> bamboo_projects::ProjectStoreResult<()> {
+    if importing && project.sidebar.is_some() {
+        return Err(ProjectStoreError::Validation(
+            "Project sidebar has already been saved or imported".into(),
+        ));
+    }
+    let previous = project.sidebar.as_ref();
+    let Some(mut sidebar) = requested.cloned().or_else(|| previous.cloned()) else {
+        return Ok(());
+    };
+    for section in &mut sidebar.sections {
+        section.name = section.name.trim().to_string();
+    }
+    clear_removed_sidebar_assignments(previous, &mut sidebar, project.section.as_deref());
+    if importing {
+        let available = sidebar
+            .sections
+            .iter()
+            .map(|section| section.id.as_str())
+            .collect::<HashSet<_>>();
+        let legacy_visible = project.section.is_some() && !sidebar.hidden_legacy;
+        for target in sidebar.session_sections.values_mut() {
+            if target.as_ref().is_some_and(|target| {
+                !available.contains(target.as_str()) && !(target == "legacy" && legacy_visible)
+            }) {
+                *target = None;
+            }
+        }
+        sidebar
+            .session_sections
+            .retain(|id, _| valid_roots.contains(id));
+    } else if requested.is_some() {
+        for (id, target) in &sidebar.session_sections {
+            let old = previous.and_then(|previous| previous.session_sections.get(id));
+            // Existing entries may outlive a deleted/reassigned root. Preserve
+            // unchanged mappings and always permit an existing entry to clear.
+            if old == Some(target) || (target.is_none() && old.is_some()) {
+                continue;
+            }
+            if !valid_roots.contains(id) {
+                return Err(ProjectStoreError::Validation(
+                    "sidebar assignment requires an existing root session in this Project".into(),
+                ));
+            }
+        }
+    }
+    bamboo_projects::validate_project_sidebar(&sidebar, project.section.as_deref())?;
+    project.sidebar = Some(sidebar);
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -354,6 +454,82 @@ pub async fn patch_project(
         Ok(revision) => revision,
         Err(response) => return Ok(*response),
     };
+    if request.sidebar.is_some() && request.import_sidebar.is_some() {
+        return Ok(project_error(ProjectStoreError::Validation(
+            "sidebar and import_sidebar are mutually exclusive".into(),
+        )));
+    }
+    let requested_sidebar = request.sidebar.as_ref().or(request.import_sidebar.as_ref());
+    let importing = request.import_sidebar.is_some();
+    if requested_sidebar.is_some()
+        && (request.name.is_some()
+            || request.description.is_some()
+            || request.section.is_some()
+            || request.project_path.is_some())
+    {
+        return Ok(project_error(ProjectStoreError::Validation(
+            "sidebar snapshots cannot be mixed with other Project metadata mutations".into(),
+        )));
+    }
+    let mut valid_roots = HashSet::new();
+    if let Some(sidebar) = requested_sidebar {
+        let current = match state.project_store.get(&id) {
+            Ok(current) => current,
+            Err(error) => return Ok(project_error(error)),
+        };
+        if current.revision != expected {
+            return Ok(project_error(ProjectStoreError::Conflict {
+                expected,
+                actual: current.revision,
+            }));
+        }
+        if importing && current.sidebar.is_some() {
+            return Ok(project_error(ProjectStoreError::Validation(
+                "Project sidebar has already been saved or imported".into(),
+            )));
+        }
+        for (session_id, target) in &sidebar.session_sections {
+            if session_id.is_empty()
+                || session_id.contains('/')
+                || session_id.contains('\\')
+                || session_id.contains("..")
+                || session_id.chars().any(char::is_control)
+            {
+                return Ok(project_error(ProjectStoreError::Validation(
+                    "invalid sidebar session id".into(),
+                )));
+            }
+            let old = current
+                .sidebar
+                .as_ref()
+                .and_then(|old| old.session_sections.get(session_id));
+            if !importing && (old == Some(target) || (target.is_none() && old.is_some())) {
+                continue;
+            }
+            // Read the durable control plane, never the paginated list or UI
+            // cache. Normal reads use the lightweight sidecar; the storage
+            // port retains its existing legacy main-history fallback.
+            match state.storage.load_runtime_control_plane(session_id).await {
+                Ok(Some(session))
+                    if session.id == *session_id
+                        && session.kind == SessionKind::Root
+                        && session.parent_session_id.is_none()
+                        && session.spawn_depth == 0
+                        && (session.root_session_id.is_empty()
+                            || session.root_session_id == session.id)
+                        && session.project_id_meta().as_deref() == Some(id.as_str()) =>
+                {
+                    valid_roots.insert(session_id.clone());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // An uncertain read must never turn a browser import into
+                    // a durable empty snapshot and discard its only source.
+                    return Ok(project_error(ProjectStoreError::Io(error)));
+                }
+            }
+        }
+    }
     let mutate = |project: &mut ProjectManifest| {
         if let Some(name) = request.name.as_ref() {
             project.name = name.clone();
@@ -364,6 +540,7 @@ pub async fn patch_project(
         if let Some(section) = request.section.as_ref() {
             project.section = section.as_ref().map(|value| value.trim().to_string());
         }
+        apply_sidebar_snapshot(project, requested_sidebar, importing, &valid_roots)?;
         Ok(())
     };
     let result = if let Some(project_path) = request.project_path.as_deref() {
@@ -549,6 +726,10 @@ pub async fn legacy_dry_run(
 pub fn is_active(project: &ProjectManifest) -> bool {
     project.status == ProjectStatus::Active
 }
+
+#[cfg(test)]
+#[path = "projects/sidebar_tests.rs"]
+mod sidebar_tests;
 
 #[cfg(test)]
 mod tests {

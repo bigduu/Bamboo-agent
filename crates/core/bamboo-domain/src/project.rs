@@ -143,6 +143,23 @@ pub struct WorkspaceBinding {
     pub git_common_dir: Option<String>,
 }
 
+/// Ordered, user-created sidebar bucket. The ID is stable across renames.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSidebarSection {
+    pub id: String,
+    pub name: String,
+}
+
+/// Project-owned presentation state, independent from session execution metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSidebar {
+    pub sections: Vec<ProjectSidebarSection>,
+    /// Only explicit mappings assign a root to a bucket. Null records an
+    /// explicit move to "No section"; creating a bucket never assigns roots.
+    pub session_sections: BTreeMap<String, Option<String>>,
+    pub hidden_legacy: bool,
+}
+
 /// Authoritative `${BAMBOO_DATA_DIR}/projects/<id>/project.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectManifest {
@@ -156,6 +173,10 @@ pub struct ProjectManifest {
     /// its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section: Option<String>,
+    /// `None` means no sidebar has been saved/imported yet. Serialize explicit
+    /// null so clients can distinguish support from an older backend.
+    #[serde(default)]
+    pub sidebar: Option<ProjectSidebar>,
     #[serde(default)]
     pub status: ProjectStatus,
     /// Canonical user source/work folder used when an assigned session has no
@@ -197,6 +218,7 @@ impl ProjectManifest {
             name: name.into(),
             description,
             section: None,
+            sidebar: None,
             status: ProjectStatus::Active,
             project_path: None,
             project_path_status: ProjectPathStatus::NeedsConfiguration,
@@ -231,6 +253,8 @@ pub struct ProjectIndexEntry {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section: Option<String>,
+    #[serde(default)]
+    pub sidebar: Option<ProjectSidebar>,
     pub status: ProjectStatus,
     #[serde(default)]
     pub project_path: Option<String>,
@@ -250,6 +274,7 @@ impl From<&ProjectManifest> for ProjectIndexEntry {
             name: manifest.name.clone(),
             description: manifest.description.clone(),
             section: manifest.section.clone(),
+            sidebar: manifest.sidebar.clone(),
             status: manifest.status,
             project_path: manifest.project_path.clone(),
             project_path_status: manifest.project_path_status,
@@ -391,6 +416,7 @@ mod tests {
         let manifest: ProjectManifest = serde_json::from_value(value).unwrap();
         assert_eq!(manifest.status, ProjectStatus::Active);
         assert!(manifest.section.is_none());
+        assert!(manifest.sidebar.is_none());
         assert!(manifest.project_path.is_none());
         assert_eq!(
             manifest.project_path_status,
@@ -399,5 +425,33 @@ mod tests {
         assert!(manifest.workspace_bindings.is_empty());
         assert_eq!(manifest.revision, 1);
         assert_eq!(manifest.resource_revision, 1);
+        assert_eq!(
+            serde_json::to_value(&manifest).unwrap().get("sidebar"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            serde_json::to_value(ProjectIndexEntry::from(&manifest))
+                .unwrap()
+                .get("sidebar"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn sidebar_public_serde_roundtrip_preserves_empty_buckets_and_explicit_clearing() {
+        let sidebar = ProjectSidebar {
+            sections: vec![ProjectSidebarSection {
+                id: "section:2d567c47-a081-4a8d-9c9e-246bce470c9f".into(),
+                name: "Support".into(),
+            }],
+            session_sections: BTreeMap::from([("root".into(), None)]),
+            hidden_legacy: true,
+        };
+        let encoded = serde_json::to_value(&sidebar).unwrap();
+        assert!(encoded["session_sections"]["root"].is_null());
+        assert_eq!(
+            serde_json::from_value::<ProjectSidebar>(encoded).unwrap(),
+            sidebar
+        );
     }
 }

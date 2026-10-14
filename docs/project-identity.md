@@ -91,6 +91,52 @@ Session create/list/detail and chat contracts expose `project_id`; explicit
 session reassignment also requires `If-Match` and is rejected while the session
 is running.
 
+### Project sidebar sections
+
+Project list/detail responses include `sidebar: null` until a snapshot is saved
+or imported. This explicit field distinguishes support from older servers.
+`PATCH /api/v1/projects/{id}` accepts a complete non-null `sidebar` snapshot:
+
+```json
+{
+  "sidebar": {
+    "sections": [{"id": "section:2d567c47-a081-4a8d-9c9e-246bce470c9f", "name": "Support"}],
+    "session_sections": {"root-session-id": "section:2d567c47-a081-4a8d-9c9e-246bce470c9f"},
+    "hidden_legacy": false
+  }
+}
+```
+
+Section IDs are unique `section:<canonical lowercase hyphenated UUID>` values.
+Names are trimmed, contain 1–80 Unicode scalar values without controls, and are
+unique case-insensitively among custom sections. The independent legacy
+`Project.section` may share a display name. `legacy` is a valid assignment target
+only when that legacy section exists and is visible. A null assignment records
+an explicit move to "No section". Creating a section never assigns sessions.
+
+New/changed assignments require an existing durable root session currently
+assigned to the Project; child, missing and foreign-Project assignments return
+`409`. Existing unchanged stale assignments do not block rename/delete, and
+existing entries may always be removed or cleared. Removing a section clears
+unchanged assignments that targeted it. The sidebar is presentation state and
+never changes a session's Project, workspace, permissions or execution state.
+
+For one-time browser migration, send `import_sidebar` with the same snapshot
+shape. It succeeds only while `sidebar` is null (`409` if already saved).
+Confirmed missing, child and foreign-Project assignments are skipped;
+unavailable legacy/stale section targets become null. A storage read error
+fails the request without saving a partial or empty snapshot. Explicit empty
+snapshots remain durable, preventing another browser from replaying old data.
+
+Both mutations use the Project ETag/`If-Match` CAS (`428` missing, `412` stale),
+are mutually exclusive, and cannot be mixed with name, description, section or
+Project path changes (`409`). Null snapshots are invalid (`400`). Successful
+writes update the manifest and derived index before publishing durable
+`ProjectUpdated`; rejected requests publish nothing. Clients receiving a CAS or
+already-imported conflict must reload the authoritative Project before retrying.
+
+### Session workspace changes
+
 `PATCH /api/v1/sessions/{id}` accepts `workspace_path` as an immediate durable
 Workspace switch. It requires `If-Match` (`428` when absent, `412` when stale),
 never changes `project_id`, updates the session metadata/index before returning,
