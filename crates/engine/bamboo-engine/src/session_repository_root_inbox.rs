@@ -79,7 +79,12 @@ impl SessionRepository {
         let inbox = self.storage.bind_root_actor_inbox(owner, inbox)?;
         let consumer = SessionInboxConsumerId::new();
         let mut admission = RootInboxAdmission::default();
-        for _ in 0..128 {
+        let limit = if self.root_inbox_receipt.is_some() {
+            1
+        } else {
+            128
+        };
+        for _ in 0..limit {
             match self
                 .admit_one_root_input(
                     session,
@@ -115,13 +120,19 @@ impl SessionRepository {
         consumer: &SessionInboxConsumerId,
     ) -> io::Result<InputAdmission> {
         let request = lease_request(directory, owner, consumer).await?;
-        let Some(claim) = inbox
-            .claim_owned(&session.id, 1, active_run_id, &request)
-            .await
-            .map_err(io::Error::other)?
-            .into_iter()
-            .next()
-        else {
+        let claim = match self.root_inbox_receipt.as_ref() {
+            Some(receipt) => inbox
+                .claim_owned_receipt(&session.id, receipt, Some(&owner.fence.run_id), &request)
+                .await
+                .map_err(io::Error::other)?,
+            None => inbox
+                .claim_owned(&session.id, 1, active_run_id, &request)
+                .await
+                .map_err(io::Error::other)?
+                .into_iter()
+                .next(),
+        };
+        let Some(claim) = claim else {
             return Ok(InputAdmission::Empty);
         };
         let mut pending = PendingClaim {
@@ -140,6 +151,14 @@ impl SessionRepository {
             .map_err(io::Error::other)?;
         pending.claim = Some(claim.clone());
         let envelope = &claim.claim.envelope;
+        if self.root_inbox_receipt.is_some()
+            && (envelope.source != bamboo_domain::SessionMessageSource::User
+                || envelope.kind != bamboo_domain::SessionMessageKind::UserInput)
+        {
+            return Err(io::Error::other(
+                "Selected Root receipt is not an ordinary User input",
+            ));
+        }
         let matching = session
             .messages
             .iter()

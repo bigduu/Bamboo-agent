@@ -950,3 +950,6 @@ async fn native_registered_producer_rejects_excluded_hosts_before_source_access(
 
 #[path = "skill_runtime_ultra_tests.rs"]
 mod ultra;
+
+#[path = "receipt_run_tests.rs"]
+mod receipt_run_tests;

@@ -437,10 +437,21 @@ pub struct SessionRunRegistration {
     notifications: Option<watch::Receiver<u64>>,
     abort_cleanup: Option<AbortCleanup>,
     quarantine_on_drop: bool,
+    selected_input_wakes: Option<watch::Receiver<u64>>,
     armed: bool,
 }
 
 impl SessionRunRegistration {
+    /// Observe independent producer wakeups without consuming the runtime's
+    /// normal receiver. A selected input must not promote unrelated durable
+    /// backlog merely by releasing its own registration. This is an existing
+    /// watch subscription, not a second routing state or durable grant.
+    pub(crate) fn restrict_to_selected_input(&mut self) {
+        if self.selected_input_wakes.is_none() {
+            self.selected_input_wakes = self.notifications.clone();
+        }
+    }
+
     pub fn notifications_mut(&mut self) -> &mut watch::Receiver<u64> {
         self.notifications
             .as_mut()
@@ -496,18 +507,26 @@ impl SessionRunRegistration {
     /// cleanup closure or this router owner.
     pub async fn abandon(mut self) {
         self.armed = false;
+        if self.selected_input_wakes.is_some() {
+            drop(self.notifications.take());
+        }
         let abort_cleanup = self.abort_cleanup.take();
         let router = self.router.clone();
         let target_session_id = self.target_session_id.clone();
         let run_id = self.run_id.clone();
         let cleanup_target_session_id = target_session_id.clone();
         let cleanup_run_id = run_id.clone();
+        let selected_input_wakes = self.selected_input_wakes.take();
         let cleanup = tokio::spawn(async move {
             if let Some(cleanup) = abort_cleanup {
                 cleanup().await;
             }
             router
-                .cleanup_abandoned_registration(&cleanup_target_session_id, &cleanup_run_id)
+                .cleanup_abandoned_registration(
+                    &cleanup_target_session_id,
+                    &cleanup_run_id,
+                    selected_input_wakes,
+                )
                 .await;
         });
         if let Err(error) = cleanup.await {
@@ -529,10 +548,21 @@ impl SessionRunRegistration {
         // The router compacts caught-up routing state only after the last
         // safe-point receiver is gone.
         drop(self.notifications.take());
-        let result = self
-            .router
-            .finish_finalization(&self.target_session_id, &self.run_id, admitted_generation)
-            .await;
+        let released = match self.selected_input_wakes.as_ref() {
+            Some(wakes) => {
+                self.router
+                    .release_selected_if_unnotified(&self.target_session_id, &self.run_id, wakes)
+                    .await
+            }
+            None => false,
+        };
+        let result = if released {
+            Ok(None)
+        } else {
+            self.router
+                .finish_finalization(&self.target_session_id, &self.run_id, admitted_generation)
+                .await
+        };
         if result.is_ok() {
             self.armed = false;
             self.abort_cleanup = None;
@@ -551,6 +581,10 @@ impl Drop for SessionRunRegistration {
         let run_id = self.run_id.clone();
         let abort_cleanup = self.abort_cleanup.take();
         let quarantine = self.quarantine_on_drop;
+        if self.selected_input_wakes.is_some() {
+            drop(self.notifications.take());
+        }
+        let selected_input_wakes = self.selected_input_wakes.take();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 if quarantine {
@@ -561,7 +595,11 @@ impl Drop for SessionRunRegistration {
                     cleanup().await;
                 }
                 router
-                    .cleanup_abandoned_registration(&target_session_id, &run_id)
+                    .cleanup_abandoned_registration(
+                        &target_session_id,
+                        &run_id,
+                        selected_input_wakes,
+                    )
                     .await;
             });
         }
@@ -900,6 +938,7 @@ impl SessionActivationRouter {
                 notifications,
                 abort_cleanup: None,
                 quarantine_on_drop: false,
+                selected_input_wakes: None,
                 armed: true,
             });
         }
@@ -975,11 +1014,56 @@ impl SessionActivationRouter {
         }
     }
 
+    /// Close selection and notification atomically under the original router
+    /// owner lock. A producer arriving afterwards sees no owner and reserves
+    /// its own activation; a coalesced earlier notification retains the normal
+    /// finalization/recovery path, including Child/Bash coordinator wakeups.
+    async fn release_selected_if_unnotified(
+        &self,
+        target_session_id: &str,
+        run_id: &str,
+        wakes: &watch::Receiver<u64>,
+    ) -> bool {
+        let mut states = self.states.lock().await;
+        let Some(state) = states.get_mut(target_session_id) else {
+            return true;
+        };
+        if !state
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.run_id == run_id)
+        {
+            return true;
+        }
+        if wakes.has_changed().unwrap_or(false) {
+            return false;
+        }
+        state.owner = None;
+        state.owner_completion_epoch = state.owner_completion_epoch.wrapping_add(1);
+        if state.latest_generation == 0
+            && !state.activation_reserved
+            && state.notify.receiver_count() <= 1
+            && state.activation_epoch.receiver_count() == 0
+        {
+            states.remove(target_session_id);
+        }
+        true
+    }
+
     async fn cleanup_abandoned_registration(
         self: &Arc<Self>,
         target_session_id: &str,
         run_id: &str,
+        selected_input_wakes: Option<watch::Receiver<u64>>,
     ) {
+        if let Some(wakes) = selected_input_wakes {
+            if self
+                .release_selected_if_unnotified(target_session_id, run_id, &wakes)
+                .await
+            {
+                return;
+            }
+        }
         {
             let mut states = self.states.lock().await;
             let Some(state) = states.get_mut(target_session_id) else {
@@ -3224,5 +3308,150 @@ mod tests {
             router.current_run_id("session").await.as_deref(),
             Some("quarantined-run")
         );
+    }
+    async fn selected_fixture() -> (
+        tempfile::TempDir,
+        Arc<SessionActivationRouter>,
+        Arc<RecordingSpawner>,
+        Arc<bamboo_storage::FileSessionInbox>,
+    ) {
+        use bamboo_domain::{
+            Session, SessionActivationPolicy, SessionInboxLimits, SessionMessageEnvelope, Storage,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().into())
+                .await
+                .unwrap(),
+        );
+        store
+            .save_session(&Session::new("selected", "model"))
+            .await
+            .unwrap();
+        let inbox = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store,
+            SessionInboxLimits::default(),
+        ));
+        inbox
+            .deliver_with_activation_intent(
+                &SessionMessageEnvelope::user_input("selected", "other eligible input"),
+                SessionActivationPolicy::RespectSpecificWait,
+                None,
+            )
+            .await
+            .unwrap();
+        let router = SessionActivationRouter::new();
+        router.set_inbox(inbox.clone());
+        let spawner = spawner();
+        router.set_spawner(spawner.clone()).await;
+        (temp, router, spawner, inbox)
+    }
+
+    #[tokio::test]
+    async fn receipt_run_selected_release_never_inherits_unrequested_durable_backlog() {
+        for mode in ["finish", "abandon", "drop"] {
+            let (_temp, router, spawner, inbox) = selected_fixture().await;
+            let mut selected = router
+                .register_run("selected", "manual-selected")
+                .await
+                .unwrap();
+            selected.restrict_to_selected_input();
+            match mode {
+                "finish" => {
+                    selected.begin_finalization().await;
+                    assert_eq!(selected.finish(0).await.unwrap(), None);
+                }
+                "abandon" => selected.abandon().await,
+                _ => drop(selected),
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while router.current_run_id("selected").await.is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(spawner.reservations.load(Ordering::SeqCst), 0, "{mode}");
+            assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
+            assert_eq!(inbox.inspect("selected").await.unwrap().pending, 1);
+            // A subsequent real producer request still owns normal scheduling.
+            assert_eq!(
+                router.request_activation("selected", 1).await.unwrap(),
+                SessionActivationDisposition::ActivationReserved
+            );
+            assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn receipt_run_selected_release_preserves_explicit_coalesced_coordinator_wake() {
+        for mode in ["finish", "abandon", "drop"] {
+            for notify_before_scope in [false, true] {
+                let (_temp, router, spawner, _inbox) = selected_fixture().await;
+                let mut selected = router
+                    .register_run("selected", "manual-selected")
+                    .await
+                    .unwrap();
+                if !notify_before_scope {
+                    selected.restrict_to_selected_input();
+                }
+                assert_eq!(
+                    router.request_activation("selected", 1).await.unwrap(),
+                    SessionActivationDisposition::ActiveNotified
+                );
+                if notify_before_scope {
+                    selected.restrict_to_selected_input();
+                }
+                match mode {
+                    "finish" => {
+                        selected.begin_finalization().await;
+                        assert_eq!(
+                            selected.finish(0).await.unwrap(),
+                            Some(SessionActivationDisposition::ActivationReserved)
+                        );
+                    }
+                    "abandon" => selected.abandon().await,
+                    _ => drop(selected),
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while spawner.reservations.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    spawner.reservations.load(Ordering::SeqCst),
+                    1,
+                    "{mode}/{notify_before_scope}"
+                );
+                assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
+                assert!(router.owns_run("selected", "run-1").await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn receipt_run_cancelled_selected_finish_retains_restricted_drop_cleanup() {
+        let (_temp, router, spawner, inbox) = selected_fixture().await;
+        let mut selected = router
+            .register_run("selected", "manual-selected")
+            .await
+            .unwrap();
+        selected.restrict_to_selected_input();
+        let lock = router.states.lock().await;
+        let mut finish = Box::pin(selected.finish(0));
+        assert!(futures::poll!(finish.as_mut()).is_pending());
+        drop(finish);
+        drop(lock);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while router.current_run_id("selected").await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 0);
+        assert_eq!(inbox.inspect("selected").await.unwrap().pending, 1);
     }
 }
