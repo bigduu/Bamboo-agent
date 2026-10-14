@@ -591,10 +591,11 @@ async fn compat_activation_other_protocol_entries_explicitly_unsupported_without
     let id = "compat-other-protocols";
     seed(&state, id).await;
     let input = chat(&state, id, "DO_NOT_CONSUME_FROM_OTHER_PROTOCOLS").await;
-    for (path, body) in other_protocol_requests()
-        .into_iter()
-        .filter(|(path, _)| *path != "/anthropic/v1/messages" && *path != "/openai/v1/responses")
-    {
+    for (path, body) in other_protocol_requests().into_iter().filter(|(path, _)| {
+        *path != "/anthropic/v1/messages"
+            && *path != "/openai/v1/responses"
+            && !path.ends_with(":generateContent")
+    }) {
         let (status, rejected, headers) = request_headers(
             &state,
             path,
@@ -826,3 +827,6 @@ mod anthropic_activation_tests;
 
 #[path = "responses_activation_tests.rs"]
 mod responses_activation_tests;
+
+#[path = "gemini_activation_tests.rs"]
+mod gemini_activation_tests;
