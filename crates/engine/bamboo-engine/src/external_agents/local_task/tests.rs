@@ -1873,3 +1873,5 @@ async fn local_confirmed_stop_without_publication_keeps_admission_after_coordina
     registration.quarantine().await;
     harness.runner.shutdown().await.unwrap();
 }
+
+pub(super) mod skills;
