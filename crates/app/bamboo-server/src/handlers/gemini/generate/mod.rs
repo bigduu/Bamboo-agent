@@ -1,4 +1,4 @@
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpRequest, HttpResponse};
 use anyhow::anyhow;
 
 use crate::services::gemini_model_mapping_service::resolve_model;
@@ -24,7 +24,11 @@ pub async fn generate_content(
     path: web::Path<String>,
     request: web::Json<bamboo_llm::protocol::gemini::GeminiRequest>,
     state: web::Data<AppState>,
+    http: HttpRequest,
 ) -> Result<HttpResponse, AppError> {
+    if crate::handlers::llm_compat::activation::requested(&http) {
+        return Ok(crate::handlers::llm_compat::activation::unsupported());
+    }
     let forward_id = uuid::Uuid::new_v4().to_string();
     let gemini_model = path.into_inner();
 
