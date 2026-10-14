@@ -47,7 +47,7 @@ pub async fn handler(
     let prepared = match if let Some(receipt) = selected.as_ref() {
         crate::app_state::mutation_idempotency::prepare(
             &http_request,
-            "execute_receipt",
+            "execute",
             &target,
             &serde_json::json!({"request": &*req, "input": {"message_id": receipt.receipt.id.as_str(), "ingress_seq": receipt.receipt.generation, "session_created_at": receipt.created_at}}),
         )

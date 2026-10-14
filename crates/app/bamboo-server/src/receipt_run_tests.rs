@@ -14,12 +14,14 @@ async fn request_headers(
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
+            .wrap(crate::config::build_cors("127.0.0.1", 9562))
             .configure(crate::configure_routes),
     )
     .await;
     let mut request = test::TestRequest::post()
         .uri(path)
         .peer_addr("127.0.0.1:5700".parse().unwrap())
+        .insert_header(("Origin", "http://127.0.0.1:1420"))
         .set_json(body);
     for (name, value) in headers {
         request = request.insert_header((*name, value.as_str()));
@@ -173,6 +175,25 @@ async fn receipt_run_actual_selected_user_skills_multiple_rounds_and_ack_leave_s
         response_headers.get("Bamboo-Output-Scope").unwrap(),
         "activation-receipt"
     );
+    let exposed = response_headers
+        .get("access-control-expose-headers")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    for name in [
+        "bamboo-input-id",
+        "bamboo-ingress-seq",
+        "bamboo-session-created-at",
+        "bamboo-output-scope",
+    ] {
+        assert!(response_headers.contains_key(name));
+        assert!(
+            exposed
+                .split(',')
+                .any(|value| value.trim().eq_ignore_ascii_case(name)),
+            "actual 202 receipt header {name} must be browser-readable: {exposed}"
+        );
+    }
     let run = started["run_id"].as_str().unwrap();
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -281,6 +302,20 @@ async fn receipt_run_actual_selected_user_skills_multiple_rounds_and_ack_leave_s
         assert_eq!(replay_headers.get(name), response_headers.get(name));
     }
     let calls = provider.inner.trace.lock().unwrap().requests.len();
+    let (status, missing_selector, _) = request_headers(
+        &state,
+        &format!("/api/v1/execute/{id}"),
+        body.clone(),
+        &[("Idempotency-Key", "real-selected".into())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{missing_selector}");
+    assert_eq!(
+        missing_selector["error"]["code"],
+        "idempotency_key_conflict"
+    );
+    assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 3);
+    assert_eq!(state.agent_runners.read().await[id].run_id, run);
     let (status, conflict, _) = request_headers(
         &state,
         &format!("/api/v1/execute/{id}"),
@@ -299,6 +334,43 @@ async fn receipt_run_actual_selected_user_skills_multiple_rounds_and_ack_leave_s
     assert_eq!(status, StatusCode::CONFLICT, "{consumed}");
     no_running(&state, id).await;
     assert_eq!(provider.inner.trace.lock().unwrap().requests.len(), calls);
+}
+
+#[actix_web::test]
+async fn receipt_run_adding_selector_to_an_ordinary_execute_key_conflicts_before_claim() {
+    let _proof = HTTP_PROOF.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let provider = provider(home.path(), 4096, false);
+    let state = state(home.path(), provider.clone()).await;
+    let id = "receipt-run-ordinary-key";
+    seed(&state, id).await;
+    let body = json!({"provider":"missing-provider"});
+    let (status, original, _) = request_headers(
+        &state,
+        &format!("/api/v1/execute/{id}"),
+        body.clone(),
+        &[("Idempotency-Key", "ordinary-before-selected".into())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{original}");
+    let receipt = chat(&state, id, "must remain pending").await;
+    let (status, conflict, _) = request_headers(
+        &state,
+        &format!("/api/v1/sessions/{id}/execute"),
+        body,
+        &receipt_headers(&receipt, "ordinary-before-selected"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["error"]["code"], "idempotency_key_conflict");
+    no_running(&state, id).await;
+    assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+    assert!(!state
+        .session_inbox
+        .was_admitted(id, &durable_receipt(&receipt).id)
+        .await
+        .unwrap());
+    assert!(provider.trace.lock().unwrap().requests.is_empty());
 }
 
 #[actix_web::test]

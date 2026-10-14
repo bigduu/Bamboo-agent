@@ -59,7 +59,9 @@ checkpoint/ACK, permission ceilings, cancellation and finalization remain.
 The existing 202 response is an **activation receipt**, with the exact newly
 reserved `run_id`. It echoes `Bamboo-Input-Id` and `Bamboo-Ingress-Seq`, plus
 `Bamboo-Output-Scope: activation-receipt`. It is not an LLM completion payload.
-The existing `events_url` still names the Native shared Session stream; this
+The four receipt headers are exposed through the existing CORS middleware for
+supported cross-origin browser clients. The existing `events_url` still names
+the Native shared Session stream; this
 slice does not claim an isolated run stream, output replay or protocol response
 conversion. Those are subsequent adapter work, never inferred by joining the
 current runner or returning another execution's result.
@@ -87,7 +89,9 @@ may therefore leave an uncertain client outcome; never assume it did not execute
 ## Idempotency and restart
 
 The existing process-local idempotency store fingerprints the execute request
-and canonical selector together. Concurrent/same-key retries replay the original
+and canonical selector together in the same execute key namespace. Adding or
+removing the selector with that key conflicts, including a retry that lost its
+headers; it cannot become an unrelated ordinary execution. Concurrent/same-key retries replay the original
 small response within its configured window; changing the payload or selector
 with that key conflicts. An error response is also replayed in that window.
 
