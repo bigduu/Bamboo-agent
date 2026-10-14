@@ -930,7 +930,21 @@ impl FileSessionInbox {
         limit: usize,
         run: Option<&str>,
         request: &SessionInboxLeaseRequest,
+        receipt: Option<&SessionInboxReceipt>,
     ) -> Result<Vec<SessionInboxOwnedClaim>, SessionInboxError> {
+        if receipt.is_some_and(|receipt| receipt.generation == 0) {
+            return Err(invalid("Inbox receipt generation must be nonzero"));
+        }
+        if receipt.is_some()
+            && self
+                .root_owner
+                .as_ref()
+                .is_some_and(|owner| run != Some(owner.fence.run_id.as_str()))
+        {
+            return Err(invalid(
+                "Root Inbox run differs from its execution capability",
+            ));
+        }
         if self
             .child_owner
             .as_ref()
@@ -977,6 +991,12 @@ impl FileSessionInbox {
             if result.len() >= limit.min(self.limits.max_claim_batch) {
                 break;
             }
+            // Select while retaining the exact same lifecycle/Actor, process
+            // and filesystem guards as the lease CAS. No inspection result
+            // authorizes a later generic claim or cleanup of a sibling.
+            if receipt.is_some_and(|receipt| receipt.generation != generation) {
+                continue;
+            }
             let (wrapper, stored) = self.read_owned_transport(&path).await?;
             let intent = Self::activation_intent(&wrapper.body)?;
             let activation = Self::message_activation_intent(&wrapper.body)?;
@@ -990,6 +1010,9 @@ impl FileSessionInbox {
                 .map_err(|_| invalid("invalid Inbox envelope"))?;
             if envelope.target_session_id != target {
                 return Err(invalid("Inbox target mismatch"));
+            }
+            if receipt.is_some_and(|receipt| receipt.id != envelope.id) {
+                continue;
             }
             // Receipt publication is terminal even if a process stopped before
             // removing cur. Never mint a successor over this admitted input.
