@@ -379,3 +379,90 @@ fn all_model_contract_schema_branches_require_user_acceptance() {
         "must cover both semantic Create/Steer and raw Create/UpdateContract"
     );
 }
+
+struct EmptyExecutor;
+#[async_trait::async_trait]
+impl ToolExecutor for EmptyExecutor {
+    async fn execute(
+        &self,
+        _call: &bamboo_agent_core::tools::ToolCall,
+    ) -> std::result::Result<
+        bamboo_agent_core::tools::ToolResult,
+        bamboo_agent_core::tools::ToolError,
+    > {
+        Err(bamboo_agent_core::tools::ToolError::Execution(
+            "unknown tool".into(),
+        ))
+    }
+    fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+        vec![]
+    }
+}
+
+#[tokio::test]
+async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_denial() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
+    storage
+        .get_or_create_default_supervisor("model")
+        .await
+        .unwrap();
+    let mut session = storage
+        .load_session(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    session.set_root_orchestration_only(true).unwrap();
+    storage.save_session(&session).await.unwrap();
+    let config: Config =
+        serde_json::from_value(json!({"features":{"ticket_mutation":true}})).unwrap();
+    let app = Arc::new(
+        TicketApplication::open(root.path(), storage, Arc::new(RwLock::new(config))).await,
+    );
+    let tools = overlay(Arc::new(EmptyExecutor), app.clone());
+    let payload = crate::app_state::ticket_application::ScopeInitialization {
+        supervisor_session_id: session.id.clone(),
+        incarnation_id: session.supervisor_incarnation_id().unwrap(),
+        binding_revision: session.root_tool_authority_revision,
+    };
+    assert!(app
+        .initialize_scope(
+            Principal::User {
+                user_id: "host-owner".into()
+            },
+            payload
+        )
+        .await
+        .unwrap());
+    let names = tools
+        .list_tools()
+        .into_iter()
+        .map(|s| s.function.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        NAMES.into_iter().all(|name| names.contains(name)),
+        "initialized Work remained absent from the startup tool executor"
+    );
+    let fixture = Fixture {
+        _root: root,
+        app,
+        session,
+    };
+    let (ok, result) = invoke(&fixture.tool("work_overview"), json!({}), fixture.ctx()).await;
+    assert!(ok);
+    assert_eq!(result["data"]["work_count"], 0);
+    let before = fixture.app.service().unwrap().published().unwrap().0;
+    let mut ordinary = Session::new("ordinary-ultra", "model");
+    ordinary.set_root_orchestration_only(true).unwrap();
+    let mut ctx = ToolCtx::none("ordinary");
+    ctx.session_id = Some(Arc::from(ordinary.id.as_str()));
+    ctx.executing_supervisor =
+        ExecutingSupervisorObservation::capture_from_executing_session(&ordinary);
+    let (ok, denied) = invoke(&fixture.tool("work_overview"), json!({}), ctx).await;
+    assert!(!ok);
+    assert_eq!(denied["status_code"], 403);
+    assert_eq!(
+        fixture.app.service().unwrap().published().unwrap().0,
+        before
+    );
+}

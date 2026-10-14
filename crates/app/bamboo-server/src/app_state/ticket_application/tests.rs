@@ -1373,7 +1373,9 @@ impl NativeResultFixture {
     }
 
     async fn restart(&mut self) {
-        self.app.service.take();
+        Arc::get_mut(&mut self.app.service)
+            .expect("no active initializer in restart fixture")
+            .take();
         self.app =
             TicketApplication::open(self.root.path(), self.storage.clone(), config(false)).await;
     }
@@ -1693,7 +1695,9 @@ async fn native_result_startup_recovers_before_any_provider_or_child_activation(
         }
     }
     let mut f = NativeResultFixture::new().await;
-    f.app.service.take();
+    Arc::get_mut(&mut f.app.service)
+        .expect("no active initializer in startup fixture")
+        .take();
     let provider = Arc::new(NoExecution::default());
     let mut startup_config = config(false).read().await.clone();
     // The new Supervisor is also an AutoDream candidate. Isolate that unrelated
@@ -1754,4 +1758,409 @@ async fn native_result_recovery_never_submits_missing_or_nonfinal_output() {
             "{case} stop replay must be idempotent"
         );
     }
+}
+
+#[tokio::test]
+async fn ticket_scope_status_distinguishes_empty_uninitialized_and_disabled() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
+    storage
+        .get_or_create_default_supervisor("model")
+        .await
+        .unwrap();
+    let mut supervisor = storage
+        .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    supervisor.set_root_orchestration_only(true).unwrap();
+    storage.save_session(&supervisor).await.unwrap();
+    let scope_root = root
+        .path()
+        .join("tickets")
+        .join(supervisor.supervisor_incarnation_id().unwrap().to_string());
+    for enabled in [true, false] {
+        let app = TicketApplication::open(root.path(), storage.clone(), config(enabled)).await;
+        let status = app.status().await;
+        assert_eq!(status["available"], false);
+        assert_eq!(status["readable"], false);
+        assert_eq!(
+            status["availability"]["kind"],
+            if enabled { "uninitialized" } else { "disabled" }
+        );
+        assert_eq!(status["can_initialize"], enabled);
+        assert!(
+            !scope_root.exists(),
+            "status initialized a scope without a User action"
+        );
+    }
+}
+
+fn scope_payload(supervisor: &bamboo_domain::Session) -> ScopeInitialization {
+    ScopeInitialization {
+        supervisor_session_id: supervisor.id.clone(),
+        incarnation_id: supervisor.supervisor_incarnation_id().unwrap(),
+        binding_revision: supervisor.root_tool_authority_revision,
+    }
+}
+
+async fn uninitialized_work_fixture() -> (
+    tempfile::TempDir,
+    Arc<SessionStoreV2>,
+    TicketApplication,
+    bamboo_domain::Session,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
+    storage
+        .get_or_create_default_supervisor("model")
+        .await
+        .unwrap();
+    let mut supervisor = storage
+        .load_session(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    supervisor.add_message(bamboo_domain::Message::user("existing Supervisor history"));
+    supervisor.set_root_orchestration_only(true).unwrap();
+    storage.save_session(&supervisor).await.unwrap();
+    let app = TicketApplication::open(root.path(), storage.clone(), config(true)).await;
+    (root, storage, app, supervisor)
+}
+
+fn scope_owner() -> Principal {
+    Principal::User {
+        user_id: "host-owner".into(),
+    }
+}
+
+#[tokio::test]
+async fn ticket_scope_initialization_is_explicit_empty_idempotent_and_survives_restart() {
+    let (root, storage, app, supervisor) = uninitialized_work_fixture().await;
+    let payload = scope_payload(&supervisor);
+    let before = serde_json::to_value(storage.load_session(&supervisor.id).await.unwrap()).unwrap();
+    let config_before = serde_json::to_value(app.config.read().await.clone()).unwrap();
+    let observed: ScopeInitialization =
+        serde_json::from_value(app.status().await["initialization"].clone()).unwrap();
+    assert_eq!(observed, payload);
+    let (first, second) = tokio::join!(
+        app.initialize_scope(scope_owner(), payload.clone()),
+        app.initialize_scope(scope_owner(), payload.clone())
+    );
+    let mut created = [first.unwrap(), second.unwrap()];
+    created.sort();
+    assert_eq!(created, [false, true]);
+    let service = app.service().unwrap();
+    let before_retry = service.published().unwrap();
+    assert!(before_retry.1.tickets.is_empty());
+    assert!(before_retry.1.assignments.is_empty());
+    assert!(!app
+        .initialize_scope(scope_owner(), payload.clone())
+        .await
+        .unwrap());
+    assert_eq!(service.published().unwrap().0, before_retry.0);
+    let status = app.status().await;
+    assert_eq!(status["availability"]["kind"], "ready");
+    assert_eq!(status["readable"], true);
+    assert_eq!(status["can_initialize"], false);
+    assert_eq!(status["initialization"], Value::Null);
+    assert_eq!(
+        serde_json::to_value(storage.load_session(&supervisor.id).await.unwrap()).unwrap(),
+        before
+    );
+    assert_eq!(
+        serde_json::to_value(app.config.read().await.clone()).unwrap(),
+        config_before
+    );
+    let scope = storage
+        .inspect_supervisor_scope(&bamboo_domain::SupervisorReference {
+            session_id: supervisor.id.clone(),
+            incarnation_id: payload.incarnation_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(scope.state_revision, 0);
+    assert!(scope.allowed_projects.is_empty());
+    drop(service);
+    drop(app);
+    let app = TicketApplication::open(root.path(), storage.clone(), config(false)).await;
+    let status = app.status().await;
+    assert_eq!(status["availability"]["kind"], "ready");
+    assert_eq!(status["readable"], true);
+    assert_eq!(status["mutation_enabled"], false);
+    assert_eq!(status["dispatch_enabled"], false);
+    assert!(!app.initialize_scope(scope_owner(), payload).await.unwrap());
+}
+
+#[tokio::test]
+async fn ticket_scope_initialization_refuses_gates_stale_identity_and_non_owner_without_effects() {
+    for scenario in [
+        "disabled",
+        "standard",
+        "revision",
+        "incarnation",
+        "non-owner",
+        "recreated",
+    ] {
+        let (_root, storage, app, mut supervisor) = uninitialized_work_fixture().await;
+        let mut payload = scope_payload(&supervisor);
+        let mut principal = scope_owner();
+        let (status, code) = match scenario {
+            "disabled" => {
+                app.config.write().await.features.ticket_mutation = false;
+                (503, "ticket_mutation_disabled")
+            }
+            "standard" => {
+                supervisor.set_root_orchestration_only(false).unwrap();
+                storage.save_session(&supervisor).await.unwrap();
+                payload = scope_payload(&supervisor);
+                (403, "supervisor_mode_required")
+            }
+            "revision" => {
+                payload.binding_revision += 1;
+                (409, "scope_binding_mismatch")
+            }
+            "incarnation" => {
+                payload.incarnation_id = uuid::Uuid::new_v4();
+                (409, "scope_binding_mismatch")
+            }
+            "non-owner" => {
+                principal = Principal::Runtime;
+                (403, "supervisor_identity_mismatch")
+            }
+            "recreated" => {
+                storage.delete_session(&supervisor.id).await.unwrap();
+                storage
+                    .get_or_create_default_supervisor("new-model")
+                    .await
+                    .unwrap();
+                supervisor = storage.load_session(&supervisor.id).await.unwrap().unwrap();
+                supervisor.set_root_orchestration_only(true).unwrap();
+                storage.save_session(&supervisor).await.unwrap();
+                (409, "scope_binding_mismatch")
+            }
+            _ => unreachable!(),
+        };
+        let before =
+            serde_json::to_value(storage.load_session(&supervisor.id).await.unwrap()).unwrap();
+        let error = app
+            .initialize_scope(principal, payload.clone())
+            .await
+            .unwrap_err();
+        assert_eq!((error.status, error.code), (status, code), "{scenario}");
+        assert!(
+            !app.scope_root(payload.incarnation_id).exists(),
+            "{scenario}"
+        );
+        assert_eq!(
+            serde_json::to_value(storage.load_session(&supervisor.id).await.unwrap()).unwrap(),
+            before,
+            "{scenario}"
+        );
+        assert!(app.service().is_err());
+    }
+}
+
+#[tokio::test]
+async fn ticket_scope_initialization_never_recovers_unknown_partial_or_symlinked_stores() {
+    for scenario in ["unknown", "partial", "symlink"] {
+        let (root, storage, app, supervisor) = uninitialized_work_fixture().await;
+        let payload = scope_payload(&supervisor);
+        let scope = app.scope_root(payload.incarnation_id);
+        std::fs::create_dir_all(scope.parent().unwrap()).unwrap();
+        let outside = root.path().join("outside");
+        if scenario == "symlink" {
+            std::fs::create_dir(&outside).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&outside, &scope).unwrap();
+        } else {
+            std::fs::create_dir(&scope).unwrap();
+            if scenario == "partial" {
+                std::fs::create_dir(scope.join("objects")).unwrap();
+            }
+            std::fs::write(scope.join("preserve.txt"), b"historical bytes").unwrap();
+        }
+        let before =
+            serde_json::to_value(storage.load_session(&supervisor.id).await.unwrap()).unwrap();
+        let status = app.status().await;
+        assert_eq!(status["availability"]["kind"], "error");
+        assert_eq!(status["can_initialize"], false);
+        let error = app
+            .initialize_scope(scope_owner(), payload)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            if scenario == "symlink" {
+                "scope_io_error"
+            } else {
+                "scope_requires_recovery"
+            }
+        );
+        assert!(!scope.join("HEAD").exists());
+        assert!(!scope.join("writer.lock").exists());
+        assert_eq!(
+            serde_json::to_value(storage.load_session(&supervisor.id).await.unwrap()).unwrap(),
+            before
+        );
+        if scenario != "symlink" {
+            assert_eq!(
+                std::fs::read(scope.join("preserve.txt")).unwrap(),
+                b"historical bytes"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn ticket_scope_status_reports_binding_mismatch_without_rebinding_old_head() {
+    let (root, storage, app, mut supervisor) = uninitialized_work_fixture().await;
+    let payload = scope_payload(&supervisor);
+    app.initialize_scope(scope_owner(), payload.clone())
+        .await
+        .unwrap();
+    let head = std::fs::read(app.scope_root(payload.incarnation_id).join("HEAD")).unwrap();
+    drop(app);
+    supervisor.set_root_orchestration_only(false).unwrap();
+    storage.save_session(&supervisor).await.unwrap();
+    supervisor.set_root_orchestration_only(true).unwrap();
+    storage.save_session(&supervisor).await.unwrap();
+    let app = TicketApplication::open(root.path(), storage, config(true)).await;
+    let status = app.status().await;
+    assert_eq!(status["availability"]["kind"], "forbidden");
+    assert_eq!(
+        status["availability"]["reason_code"],
+        "scope_binding_mismatch"
+    );
+    assert_eq!(status["readable"], false);
+    assert_eq!(status["can_initialize"], false);
+    assert_eq!(
+        app.initialize_scope(scope_owner(), scope_payload(&supervisor))
+            .await
+            .unwrap_err()
+            .code,
+        "scope_binding_mismatch"
+    );
+    assert_eq!(
+        std::fs::read(app.scope_root(payload.incarnation_id).join("HEAD")).unwrap(),
+        head
+    );
+}
+
+#[tokio::test]
+async fn ticket_scope_status_distinguishes_forged_identity_and_io_authority_failure() {
+    for corrupted in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
+        let payload = if corrupted {
+            let receipt = storage
+                .get_or_create_default_supervisor("model")
+                .await
+                .unwrap();
+            let mut session = storage
+                .load_session(&receipt.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            session.set_root_orchestration_only(true).unwrap();
+            storage.save_session(&session).await.unwrap();
+            let payload = scope_payload(&session);
+            std::fs::write(
+                storage
+                    .sessions_root_dir()
+                    .join(&session.id)
+                    .join("runtime.json"),
+                b"corrupt authority",
+            )
+            .unwrap();
+            payload
+        } else {
+            let mut ordinary = bamboo_domain::Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+            ordinary.metadata.insert("role".into(), "supervisor".into());
+            ordinary.set_root_orchestration_only(true).unwrap();
+            storage.save_session(&ordinary).await.unwrap();
+            ScopeInitialization {
+                supervisor_session_id: ordinary.id,
+                incarnation_id: uuid::Uuid::new_v4(),
+                binding_revision: ordinary.root_tool_authority_revision,
+            }
+        };
+        let app = TicketApplication::open(root.path(), storage, config(true)).await;
+        let status = app.status().await;
+        assert_eq!(
+            status["availability"]["kind"],
+            if corrupted { "error" } else { "forbidden" }
+        );
+        assert_eq!(
+            status["availability"]["reason_code"],
+            if corrupted {
+                "scope_io_error"
+            } else {
+                "supervisor_identity_mismatch"
+            }
+        );
+        assert_eq!(status["can_initialize"], false);
+        let error = app
+            .initialize_scope(scope_owner(), payload)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, if corrupted { 503 } else { 403 });
+        assert!(!root.path().join("tickets").exists());
+    }
+}
+
+#[tokio::test]
+async fn ticket_scope_platform_contract_denies_get_eligibility_and_post_without_effects() {
+    let (_root, storage, app, supervisor) = uninitialized_work_fixture().await;
+    let payload = scope_payload(&supervisor);
+    let before = serde_json::to_value(storage.load_session(&supervisor.id).await.unwrap()).unwrap();
+    let status = app.status_for_platform(false).await;
+    assert_eq!(status["availability"]["kind"], "error");
+    assert_eq!(status["availability"]["reason_code"], "scope_io_error");
+    assert_eq!(status["readable"], false);
+    assert_eq!(status["can_initialize"], false);
+    assert_eq!(status["initialization"], Value::Null);
+    let error = app
+        .initialize_for_platform(scope_owner(), payload.clone(), false)
+        .await
+        .unwrap_err();
+    assert_eq!((error.status, error.code), (503, "scope_io_error"));
+    assert!(!app.scope_root(payload.incarnation_id).exists());
+    assert_eq!(
+        serde_json::to_value(storage.load_session(&supervisor.id).await.unwrap()).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn ticket_scope_initialization_publishes_runtime_service_once_after_authorized_creation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (_root, _storage, app, supervisor) = uninitialized_work_fixture().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let called = calls.clone();
+    let expected = scope_payload(&supervisor);
+    let expected_binding = expected.clone();
+    app.bind_service_publisher(Arc::new(move |service| {
+        let snapshot = service.published().unwrap().1;
+        assert_eq!(
+            snapshot.binding.supervisor_session_id,
+            expected_binding.supervisor_session_id
+        );
+        assert_eq!(
+            snapshot.binding.binding_revision,
+            expected_binding.binding_revision
+        );
+        called.fetch_add(1, Ordering::SeqCst);
+    }));
+    let mut stale = expected.clone();
+    stale.binding_revision += 1;
+    assert!(app.initialize_scope(scope_owner(), stale).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(app
+        .initialize_scope(scope_owner(), expected.clone())
+        .await
+        .unwrap());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!app.initialize_scope(scope_owner(), expected).await.unwrap());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

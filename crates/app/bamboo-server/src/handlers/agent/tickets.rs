@@ -69,6 +69,19 @@ pub async fn scope(
     Ok(HttpResponse::Ok().json(state.tickets.status().await))
 }
 
+pub async fn initialize(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    body: web::Json<crate::app_state::ticket_application::ScopeInitialization>,
+) -> std::result::Result<HttpResponse, TicketHttpError> {
+    let principal = user(&state, &req).await?;
+    match state.tickets.initialize_scope(principal, body.into_inner()).await {
+        Ok(created) => Ok(HttpResponse::Ok().json(serde_json::json!({"created":created,"scope":state.tickets.status().await}))),
+        Err(error) => Ok(HttpResponse::build(StatusCode::from_u16(error.status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE))
+            .json(serde_json::json!({"error":error.error,"code":error.code,"scope":state.tickets.status().await}))),
+    }
+}
+
 pub async fn overview(
     state: web::Data<AppState>,
     req: HttpRequest,
@@ -619,5 +632,132 @@ mod tests {
             assert!(serde_json::from_value::<UpdateRequest>(request.clone()).is_err());
             request.as_object_mut().unwrap().remove(field);
         }
+    }
+    #[actix_web::test]
+    async fn scope_initialize_http_requires_owner_and_returns_fresh_scope_on_conflict() {
+        use actix_web::{test, App};
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(root.path().to_path_buf()).await.unwrap();
+        *state.config.write().await = serde_json::from_value(serde_json::json!({
+            "provider":"openai","features":{"ticket_mutation":true},
+            "providers":{"openai":{"api_key":"fixture","model":"fixture-model"}}
+        }))
+        .unwrap();
+        state
+            .config
+            .write()
+            .await
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .auto_dream_enabled = false;
+        state
+            .storage
+            .get_or_create_default_supervisor("model")
+            .await
+            .unwrap();
+        let mut supervisor = state
+            .storage
+            .load_session(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        supervisor.set_root_orchestration_only(true).unwrap();
+        state.storage.save_session(&supervisor).await.unwrap();
+        state.tickets = Arc::new(
+            crate::app_state::ticket_application::TicketApplication::open(
+                root.path(),
+                state.storage.clone(),
+                state.config.clone(),
+            )
+            .await,
+        );
+        let scope_root = root
+            .path()
+            .join("tickets")
+            .join(supervisor.supervisor_incarnation_id().unwrap().to_string());
+        let before =
+            serde_json::to_value(state.storage.load_session(&supervisor.id).await.unwrap())
+                .unwrap();
+        let body = serde_json::json!({"supervisor_session_id":supervisor.id,"incarnation_id":supervisor.supervisor_incarnation_id().unwrap(),"binding_revision":supervisor.root_tool_authority_revision});
+        let state = web::Data::new(state);
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/tickets/initialize")
+                .peer_addr("203.0.113.17:5700".parse().unwrap())
+                .set_json(&body)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let request = test::TestRequest::post()
+            .uri("/api/v1/tickets/initialize")
+            .peer_addr("127.0.0.1:5700".parse().unwrap())
+            .set_json(&body)
+            .to_request();
+        request
+            .extensions_mut()
+            .insert(crate::codex_run_tokens::CodexRunAuthContext {
+                session_id: "worker".into(),
+            });
+        let response = test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let mut unknown = body.clone();
+        unknown["enable_feature"] = serde_json::json!(true);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/tickets/initialize")
+                .peer_addr("127.0.0.1:5700".parse().unwrap())
+                .set_json(unknown)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!scope_root.exists());
+        assert_eq!(
+            serde_json::to_value(state.storage.load_session(&supervisor.id).await.unwrap())
+                .unwrap(),
+            before
+        );
+        for created in [true, false] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/tickets/initialize")
+                    .peer_addr("127.0.0.1:5700".parse().unwrap())
+                    .set_json(&body)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let result: serde_json::Value = test::read_body_json(response).await;
+            assert_eq!(result["created"], created);
+            assert_eq!(result["scope"]["availability"]["kind"], "ready");
+            assert_eq!(result["scope"]["readable"], true);
+        }
+        let mut stale = body;
+        stale["binding_revision"] = serde_json::json!(supervisor.root_tool_authority_revision + 1);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/tickets/initialize")
+                .peer_addr("127.0.0.1:5700".parse().unwrap())
+                .set_json(stale)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let result: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(result["code"], "scope_binding_mismatch");
+        assert_eq!(result["scope"]["readable"], true);
+        assert_eq!(result["scope"]["availability"]["kind"], "ready");
     }
 }

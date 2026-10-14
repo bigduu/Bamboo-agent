@@ -6750,6 +6750,16 @@ impl Storage for SessionStoreV2 {
         self.bootstrap_default_supervisor(initial_model).await
     }
 
+    async fn with_supervisor_orchestration_authority(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        expected_revision: u64,
+        operation: Box<dyn FnOnce() -> io::Result<()> + Send>,
+    ) -> io::Result<()> {
+        self.supervisor_orchestration_job(supervisor, expected_revision, operation)
+            .await
+    }
+
     async fn load_root_authority(&self, session_id: &str) -> io::Result<Option<Session>> {
         let _lifecycle = self.lock_session_lifecycle_shared().await?;
         let _task = self.lock_runtime_task_sidecar_shared().await?;
