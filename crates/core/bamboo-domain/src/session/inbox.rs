@@ -1384,8 +1384,10 @@ pub trait SessionInboxPort: Send + Sync {
     /// mismatched, staged, leased elsewhere or already acknowledged). A retry
     /// with the same live consumer returns the same lease without renewing it.
     /// ACK remains terminal; release/expiry use the existing epoch protocol.
-    /// Root-bound callers must supply their bound Actor's actual run id.
-    /// Unsupported backends must fail closed, never emulate read-then-claim.
+    /// Like `claim_owned`, this opts the queue into the owned lease format,
+    /// even if no matching item is available. Root-bound callers must supply
+    /// their bound Actor's actual run id. Unsupported backends must fail
+    /// closed, never emulate read-then-claim.
     async fn claim_owned_receipt(
         &self,
         _target_session_id: &str,

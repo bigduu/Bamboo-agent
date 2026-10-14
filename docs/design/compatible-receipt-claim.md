@@ -12,7 +12,9 @@ item returns `None`; it never substitutes an earlier or later pending input.
 Unsupported backends fail closed. The existing batch method keeps its behavior.
 
 The selector creates no activation permission, run, current-input observation,
-Skill grant, output subscription or persistent state. The receipt is not a Session
+Skill grant or output subscription. This reuses the existing persistent lease model,
+including irreversible owned-format opt-in even when the selected item is unavailable;
+call only after taking genuine ownership of the queue. The receipt is not a Session
 incarnation proof. A Host must retain its actual lifetime and execution capability.
 The same lifecycle/Actor/process/physical Inbox locks protect selection and lease
 CAS. Existing eligibility, successor waits, retry deadlines, dead letters and
