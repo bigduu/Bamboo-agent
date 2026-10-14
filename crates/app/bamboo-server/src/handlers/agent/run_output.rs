@@ -18,10 +18,14 @@ pub async fn handler(
     path: web::Path<(String, String)>,
 ) -> HttpResponse {
     let (id, run_id) = path.into_inner();
+    // Match delete/create lock ordering so authority, birth and retained-run
+    // bytes form one read boundary across concurrent Root replacement.
+    let _session_guard = state.persistence.acquire_lock(&id).await;
     if let Err(reason) =
         crate::handlers::agent::tickets::require_supervisor_owner(&state, &http, &id).await
     {
-        return crate::handlers::agent::tickets::TicketHttpError::from(reason).error_response();
+        let reason = crate::handlers::agent::tickets::TicketHttpError::from(reason);
+        return error(reason.status_code(), &reason.to_string());
     }
     let expected = if http.headers().get_all("Bamboo-Session-Created-At").count() == 1 {
         http.headers()

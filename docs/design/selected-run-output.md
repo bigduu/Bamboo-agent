@@ -19,6 +19,11 @@ Bamboo-Session-Created-At: {existing Root birth used for execute}
 The GET uses the existing route authentication and supervisor-owner gate, checks
 the canonical ordinary Root lifetime, matches the exact retained runner and its
 Host-captured output identity, and returns `Cache-Control: no-store`.
+The existing per-session persistence lock covers owner validation, Root birth
+and the retained-run snapshot together, in the same lock order as delete/create.
+A waiting read validates the replacement Root after its mutation completes;
+retained old bytes cannot authorize a read across Root recreation or a new
+Supervisor identity.
 The expected birth header must occur once and parse as RFC3339. Missing/invalid
 birth is 400; wrong Root lifetime/kind is 409. Missing/replaced/unretained run,
 evicted buffer, absent Root or process restart is 410. Storage verification
@@ -96,6 +101,8 @@ Real HTTP/fake-provider tests cover current input/run identity, live and late
 post-history reads, exact retries, an actual successor, sibling and reasoning
 isolation, cancellation/error prefixes, missing/nonselected runs, trusted Root
 recreation with deliberately retained old runner bytes, eviction and restart.
+A concurrent recreation fixture verifies the read waits for the existing Host
+lock, then rejects a new ordinary birth or unauthenticated Supervisor access.
 A real reserved-token cancellation fixture also verifies that aborting output
 binding starts neither title nor primary provider work. Shared-core tests
 preserve default WS clear-on-history and cover binding,

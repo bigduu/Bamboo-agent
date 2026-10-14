@@ -65,6 +65,15 @@ async fn output(
     run: &str,
     birth: Option<&str>,
 ) -> (StatusCode, Value) {
+    output_from_peer(state, id, run, birth, "127.0.0.1:5700").await
+}
+async fn output_from_peer(
+    state: &web::Data<AppState>,
+    id: &str,
+    run: &str,
+    birth: Option<&str>,
+    peer: &str,
+) -> (StatusCode, Value) {
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
@@ -74,7 +83,7 @@ async fn output(
     .await;
     let mut req = test::TestRequest::get()
         .uri(&format!("/api/v1/sessions/{id}/runs/{run}/output"))
-        .peer_addr("127.0.0.1:5700".parse().unwrap())
+        .peer_addr(peer.parse().unwrap())
         .insert_header(("Origin", "http://127.0.0.1:1420"));
     if let Some(birth) = birth {
         req = req.insert_header(("Bamboo-Session-Created-At", birth));
@@ -455,4 +464,83 @@ async fn run_output_cancelled_before_binding_never_starts_title_or_primary() {
         .await
         .get(id)
         .is_none_or(|runner| runner.visible_messages.selected_output_snapshot().is_none()));
+}
+
+#[actix_web::test]
+async fn run_output_waits_for_root_recreation_and_rechecks_supervisor_owner() {
+    let _proof = HTTP_PROOF.lock().await;
+    for supervisor in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let provider = OutputProvider::new(false);
+        let state = state(home.path(), provider.clone()).await;
+        let id = if supervisor {
+            bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
+        } else {
+            "run-output-concurrent-recreate"
+        };
+        seed(&state, id).await;
+        let (input, run) = start_output(&state, id, "CONCURRENT_ROOT_OUTPUT", &provider).await;
+        let birth = input["session_created_at"].as_str().unwrap();
+        provider.release.notify_one();
+        assert!(matches!(done(&state, id).await, AgentStatus::Completed));
+        committed_output(&state, id, &run, birth).await;
+
+        // Hold the same Host lock as delete/create while deliberately leaving
+        // the old exact-run buffer alive: the read must serialize, then
+        // validate the replacement's actual birth and owner authority.
+        let guard = state.persistence.acquire_lock(id).await;
+        let peer = if supervisor {
+            "203.0.113.17:5700"
+        } else {
+            "127.0.0.1:5700"
+        };
+        let mut read = Box::pin(output_from_peer(&state, id, &run, Some(birth), peer));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut read)
+                .await
+                .is_err(),
+            "output read escaped the canonical Root persistence lock"
+        );
+        state
+            .session_store
+            .delete_session_recursive(id, true)
+            .await
+            .unwrap();
+        if supervisor {
+            state
+                .storage
+                .get_or_create_default_supervisor("test-model")
+                .await
+                .unwrap();
+        } else {
+            state
+                .storage
+                .recreate_root_session(id, "test-model")
+                .await
+                .unwrap();
+        }
+        let replacement = state
+            .storage
+            .load_root_authority(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(replacement.created_at.to_rfc3339(), birth);
+        assert_eq!(replacement.authority_identity.is_ordinary(), !supervisor);
+        drop(guard);
+        let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(15), read)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            if supervisor {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::CONFLICT
+            },
+            "{body}"
+        );
+        assert!(!body.to_string().contains("CONCURRENT_ROOT_OUTPUT"));
+        eprintln!("serialized Root replacement supervisor={supervisor}: {status}");
+    }
 }
