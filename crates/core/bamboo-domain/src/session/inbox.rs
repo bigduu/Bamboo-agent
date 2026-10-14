@@ -1374,6 +1374,30 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    /// Claim at most one exact delivery under the same transaction and lease
+    /// rules as `claim_owned`. Match both receipt fields; never fall back to
+    /// another pending item. The receipt is a selector, not execution or
+    /// activation authority. Existing eligibility, successor waits, retry
+    /// deadlines, Actor fences and lease ownership still apply.
+    ///
+    /// `None` means this receipt is not currently claimable (including missing,
+    /// mismatched, staged, leased elsewhere or already acknowledged). A retry
+    /// with the same live consumer returns the same lease without renewing it.
+    /// ACK remains terminal; release/expiry use the existing epoch protocol.
+    /// Root-bound callers must supply their bound Actor's actual run id.
+    /// Unsupported backends must fail closed, never emulate read-then-claim.
+    async fn claim_owned_receipt(
+        &self,
+        _target_session_id: &str,
+        _receipt: &SessionInboxReceipt,
+        _active_run_id: Option<&str>,
+        _request: &SessionInboxLeaseRequest,
+    ) -> Result<Option<SessionInboxOwnedClaim>, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "exact-receipt owned Inbox leases unsupported".into(),
+        ))
+    }
+
     async fn renew_owned(
         &self,
         _target_session_id: &str,
