@@ -677,10 +677,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         if let (Some(policy), Some(workspace)) = (&self.permission, &session.workspace) {
             policy.register_session_workspace(session.id.clone(), workspace);
         }
-        let required =
-            bamboo_domain::ChildContextBinding::from_session(session).map_err(failure)?;
-        let strict = required.is_some() || crate::session_app::child_session::named_profile::has_named_profile(session)
-            || session.metadata.contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY);
+        let strict = skill_host::strict_child(session)?;
         let names = if strict { match &self.ceiling {
             Some(source) => Some(source.observe(session).await.map_err(failure)?),
             None => return Err(failure("strict native tool ceiling unavailable")),
@@ -698,7 +695,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         let mut tools: Arc<dyn ToolExecutor> = runtime.tools.clone();
         let names = names.unwrap_or_else(||tools.list_tools().into_iter().map(|s|s.function.name).collect());
         let store = lock(&self.bindings).store.clone().ok_or_else(||failure("local store unavailable"))?;
-        tools = Arc::new(tool_policy::LocalChildTools::new(tools, names.clone(), session, store, execution.owner.clone(), job.disabled_tools.as_deref())?.with_canonical_subagent(lock(&self.bindings).subagent.clone()));
+        tools = Arc::new(tool_policy::LocalChildTools::new(tools, names.clone(), session, store.clone(), execution.owner.clone(), job.disabled_tools.as_deref())?.with_canonical_subagent(lock(&self.bindings).subagent.clone()));
         if session.metadata.contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY) {
             tools = Arc::new(crate::ticket_worker_plan::files::LocalFileExecutor::new(
                 tools, tickets.clone().ok_or_else(||failure("Ticket authority unavailable"))?, session.clone(), run_id.clone(), &names
@@ -747,9 +744,12 @@ impl ExternalChildRunner for LocalTaskChildRunner {
             .checkpoint_runtime_session(&mut owned_session)
             .await
             .map_err(failure)?;
-        let agent = runtime
+        let mut agent = runtime
             .agent
             .with_execution_persistence(execution.persistence.clone());
+        if strict {
+            agent = agent.with_skill_execution_host(skill_host::StrictChildSkills::bind(store, &execution));
+        }
         let resources = execution.resources.clone();
         let task_cancel = cancel_token.clone();
         let mut handle = execution.task.lock().await;
@@ -1192,6 +1192,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
 
 mod approval;
 mod events;
+mod skill_host;
 mod tool_policy;
 
 #[cfg(test)]
