@@ -46,13 +46,22 @@ fn engine_error(error: ToolError) -> AgentError {
     AgentError::Tool(error.to_string())
 }
 
-pub(crate) fn ordinary_main(session: &Session) -> bool {
+// A host-selected Ultra Root uses the finite runtime with an empty Skills
+// surface. This predicate is eligibility only; the real reservation and
+// registered Root executor remain mandatory at bind_registered_execution.
+pub(crate) fn registered_main(session: &Session) -> bool {
     session.kind == bamboo_domain::SessionKind::Root
         && session.parent_session_id.is_none()
         && session.root_session_id == session.id
         && session.spawn_depth == 0
         && session.authority_identity.is_ordinary()
-        && !session.root_orchestration_only_enabled()
+        && (!session.root_orchestration_only_enabled()
+            || (session.root_tool_authority_revision > 0
+                && session.validate_root_orchestration_compatibility().is_ok()))
+}
+
+pub(crate) fn ordinary_main(session: &Session) -> bool {
+    registered_main(session) && !session.root_orchestration_only_enabled()
 }
 
 // Capture the resolved directory once. Re-resolving the original alias on
@@ -194,6 +203,7 @@ struct Policy {
     configured_mode: bamboo_domain::PermissionMode,
     session_id: String,
     root_revision: u64,
+    orchestration_only: bool,
     permission_mode: SessionPermissionMode,
     plan: bool,
     workspace: Option<std::path::PathBuf>,
@@ -203,8 +213,8 @@ struct Policy {
 }
 impl Policy {
     fn new(state: Arc<ServerMainSkillProducer>, session: &Session) -> Result<Self, ToolError> {
-        if !ordinary_main(session) {
-            return Err(denied("Native Skills require ordinary Main"));
+        if !registered_main(session) {
+            return Err(denied("Native Skills require a registered Main"));
         }
         let base = state.tools_for(ToolSurface::Root);
         if !base.owns_exact_tool("load_skill") || !base.owns_exact_tool("read_skill_resource") {
@@ -224,6 +234,7 @@ impl Policy {
             base,
             session_id: session.id.clone(),
             root_revision: session.root_tool_authority_revision,
+            orchestration_only: session.root_orchestration_only_enabled(),
             permission_mode: permission_mode(session),
             plan: session
                 .agent_runtime_state
@@ -254,10 +265,12 @@ impl Policy {
     }
     fn check_execution_session(&self, session: &Session) -> Result<(), ToolError> {
         self.check()?;
-        if session.id != self.session_id || !ordinary_main(session) {
+        if session.id != self.session_id || !registered_main(session) {
             return Err(denied("Native Main identity changed"));
         }
-        if session.root_tool_authority_revision != self.root_revision {
+        if session.root_tool_authority_revision != self.root_revision
+            || session.root_orchestration_only_enabled() != self.orchestration_only
+        {
             return Err(denied("Native Root tool authority revision changed"));
         }
         if permission_mode(session) != self.permission_mode
@@ -338,6 +351,9 @@ pub(crate) async fn prepare_envelope(
     let Some(selection) = selection else {
         return Ok(());
     };
+    if !ordinary_main(candidate) {
+        return Err(denied("Native Skill selection requires ordinary Main"));
+    }
     let policy = Policy::new(
         Arc::new(ServerMainSkillProducer::from_state(&state)),
         candidate,
@@ -455,6 +471,17 @@ impl NativeRun {
             return Err(denied("Native owner changed during validation"));
         }
         Ok(epoch)
+    }
+    async fn check_durable_session(&self) -> Result<(), ToolError> {
+        let session = self
+            .policy
+            .state
+            .storage
+            .load_session(&self.policy.session_id)
+            .await
+            .map_err(|e| denied(&e.to_string()))?
+            .ok_or_else(|| denied("Native Session disappeared"))?;
+        self.policy.check_session(&session)
     }
     fn caller(&self, ctx: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
         let epoch = self.check_live()?;
@@ -574,16 +601,7 @@ impl SkillCatalogCallerResolver for NativeResolver {
         let caller = self.run.caller(ctx)?;
         // Direct durable read, never cache/owner reentry. The Reader also
         // validates current canonical Source scope and Config for each page.
-        let session = self
-            .run
-            .policy
-            .state
-            .storage
-            .load_session(&caller.session_id)
-            .await
-            .map_err(|e| denied(&e.to_string()))?
-            .ok_or_else(|| denied("Native Session disappeared"))?;
-        self.run.policy.check_session(&session)?;
+        self.run.check_durable_session().await?;
         self.run.check_owner().await?;
         let current = self.run.caller(ctx)?;
         if current.caller_id != caller.caller_id || current.input_id != caller.input_id {
@@ -659,6 +677,18 @@ impl SkillExecutionHost for NativeHost {
         let mut ctx = ToolCtx::none(format!("native-metadata:{execution_id}"));
         ctx.session_id = Some(session.id.clone().into());
         let epoch = self.run.check_owner().await.map_err(engine_error)?;
+        if self.run.policy.orchestration_only {
+            // Ultra has no Skill authority. Validate its actual durable owner
+            // without resolving a Source publication or rendering Skill bytes.
+            self.run
+                .check_durable_session()
+                .await
+                .map_err(engine_error)?;
+            if self.run.check_owner().await.map_err(engine_error)? != epoch {
+                return Err(engine_error(denied("Native metadata owner changed")));
+            }
+            return Ok(String::new());
+        }
         let rendered = NATIVE_PHASE
             .scope(
                 Phase {
@@ -765,6 +795,11 @@ impl NativeExecutor {
         name: &str,
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolOutcome, ToolError> {
+        if self.run.policy.orchestration_only
+            && !bamboo_domain::orchestration_only_allows_execution_name(name)
+        {
+            return Err(denied("Native Ultra tool is outside its Root authority"));
+        }
         if matches!(name, "load_skill" | "read_skill_resource") {
             return Err(denied("Native finite Skills use the scoped Reader"));
         }
@@ -862,20 +897,24 @@ impl ToolExecutor for NativeExecutor {
                 !matches!(
                     tool.function.name.as_str(),
                     "load_skill" | "read_skill_resource"
-                )
+                ) && (!self.run.policy.orchestration_only
+                    || bamboo_domain::orchestration_only_allows_execution_name(&tool.function.name))
             })
             .collect()
     }
     fn owns_exact_tool(&self, name: &str) -> bool {
-        !matches!(name, "load_skill" | "read_skill_resource") && self.tools.owns_exact_tool(name)
+        !matches!(name, "load_skill" | "read_skill_resource")
+            && (!self.run.policy.orchestration_only
+                || bamboo_domain::orchestration_only_allows_execution_name(name))
+            && self.tools.owns_exact_tool(name)
     }
     fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
-        if matches!(name, "skills_list" | "skills_read") {
-            Some(self)
-        } else if self.owns_exact_tool(name) {
-            self.tools.exact_tool_owner(name)
-        } else {
+        if !self.owns_exact_tool(name) {
             None
+        } else if matches!(name, "skills_list" | "skills_read") {
+            Some(self)
+        } else {
+            self.tools.exact_tool_owner(name)
         }
     }
     fn tool_guidance(&self) -> Option<String> {

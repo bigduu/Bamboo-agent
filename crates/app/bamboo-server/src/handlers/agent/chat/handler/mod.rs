@@ -959,7 +959,7 @@ async fn handle_chat(
         None
     };
 
-    let native_skills = crate::skill_runtime::ordinary_main(&session)
+    let native_skills = crate::skill_runtime::registered_main(&session)
         && [
             &req.message_id,
             &req.thread_id,

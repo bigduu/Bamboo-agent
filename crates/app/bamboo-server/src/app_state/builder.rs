@@ -1181,7 +1181,7 @@ impl AppState {
         .with_root_observer(child_completion_coordinator.root_tool_surface_observer());
         child_completion_coordinator.set_reserved_root_execution_adapter(Arc::new(
             move |agent, session, reservation, tools| {
-                if !crate::skill_runtime::ordinary_main(session) {
+                if !crate::skill_runtime::registered_main(session) {
                     return Ok((agent, tools));
                 }
                 skill_producer
