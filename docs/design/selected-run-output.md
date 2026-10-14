@@ -116,7 +116,13 @@ activation adapters, vendor completion/usage/stream mapping, isolated full event
 streams, durable restart replay and configured-provider/full-platform acceptance
 remain open. No vendor endpoint is activated here. No paid model or deployment.
 
-An existing Actor-mode Root Chat path queues through `commit_selected_input`
-without returning its receipt in ChatResponse. The successor proof uses the
-existing canonical Inbox acceptance port and actual selected HTTP execute; this
-upstream receipt propagation gap remains separate #1595 work.
+Actor-mode Root Chat returns the exact durable Inbox receipt from its existing
+`commit_selected_input` transaction in the existing `message_id`/`ingress_seq`
+response fields. The successor proof uses the actual Root Chat POST response,
+then selected HTTP execute and exact-run output; direct Inbox acceptance cannot
+substitute for that entry boundary. This receipt remains input identity, not a
+writer, a reservation or an execution promise. A legitimate consumer can already
+have admitted it before execute. Original activation policy, detached commit,
+owner/lifetime/lock, cancellation, bounded process-local idempotency and output
+retention contracts remain unchanged; disconnects do not create durable response
+replay or exactly-once HTTP submission guarantees.

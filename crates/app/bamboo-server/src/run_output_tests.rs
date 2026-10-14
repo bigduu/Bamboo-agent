@@ -59,6 +59,42 @@ impl LLMProvider for OutputProvider {
     }
 }
 
+// Explicit execute can select only an input that a background consumer has
+// not already admitted. Exercise that legitimate availability condition by
+// injecting failure at the existing optional activation port; all HTTP input,
+// real Root reservation, Inbox claim/ACK and output publication stay intact.
+#[derive(Default)]
+struct DeferredRootActivation {
+    requests: std::sync::Mutex<Vec<(String, u64)>>,
+}
+#[async_trait]
+impl bamboo_engine::session_activation::SessionActivationSpawner for DeferredRootActivation {
+    async fn reserve_activation(
+        &self,
+        target: &str,
+        generation: u64,
+    ) -> Result<
+        bamboo_engine::session_activation::SessionActivationReserveOutcome,
+        bamboo_domain::SessionActivationError,
+    > {
+        self.requests
+            .lock()
+            .unwrap()
+            .push((target.to_owned(), generation));
+        Err(bamboo_domain::SessionActivationError::Internal(
+            "synthetic optional activation unavailable; explicit execute remains available".into(),
+        ))
+    }
+}
+async fn defer_root_activation(state: &web::Data<AppState>) -> Arc<DeferredRootActivation> {
+    let deferred = Arc::new(DeferredRootActivation::default());
+    state
+        .session_activation_router
+        .set_spawner(deferred.clone())
+        .await;
+    deferred
+}
+
 async fn output(
     state: &web::Data<AppState>,
     id: &str,
@@ -203,19 +239,23 @@ async fn run_output_real_selected_execution_replays_after_history_and_never_foll
         .was_admitted(id, &durable_receipt(&sibling).id)
         .await
         .unwrap());
-    // Existing Actor-mode Root Chat does not return its queued receipt. Use
-    // the existing canonical accepted-Inbox port for this independent producer,
-    // then exercise the same real selected HTTP activation and actual successor.
-    let next = state
-        .session_inbox
-        .deliver_with_activation_intent(
-            &SessionMessageEnvelope::user_input(id, "OUTPUT_TWO"),
-            SessionActivationPolicy::RespectSpecificWait,
-            None,
-        )
+    let root = state.storage.load_session(id).await.unwrap().unwrap();
+    assert!(state
+        .session_store
+        .root_actor_input_required(&root)
         .await
-        .unwrap();
-    let next_input = json!({"message_id": next.id.as_str(), "ingress_seq": next.generation, "session_created_at": birth});
+        .unwrap());
+    let deferred = defer_root_activation(&state).await;
+    // The successor must use the actual Actor-mode Root Chat response;
+    // direct Inbox acceptance cannot prove receipt propagation at this entry.
+    let next_input = chat(&state, id, "OUTPUT_TWO").await;
+    assert!(deferred
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(target, generation)| target == id
+            && Some(*generation) == next_input["ingress_seq"].as_u64()));
     let (next_input, next_run) =
         start_output_receipt(&state, id, "OUTPUT_TWO", &provider, next_input).await;
     assert_ne!(run, next_run);
@@ -543,4 +583,194 @@ async fn run_output_waits_for_root_recreation_and_rechecks_supervisor_owner() {
         assert!(!body.to_string().contains("CONCURRENT_ROOT_OUTPUT"));
         eprintln!("serialized Root replacement supervisor={supervisor}: {status}");
     }
+}
+
+#[actix_web::test]
+async fn root_chat_receipt_actual_http_retry_conflict_selected_cancel_and_sibling_isolation() {
+    let _proof = HTTP_PROOF.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let provider = OutputProvider::new(false);
+    let state = state(home.path(), provider.clone()).await;
+    let id = "root-chat-receipt-real";
+    seed(&state, id).await;
+    let (bootstrap, _) = start_output(&state, id, "ROOT_BOOTSTRAP", &provider).await;
+    provider.release.notify_one();
+    assert!(matches!(done(&state, id).await, AgentStatus::Completed));
+    let root = state.storage.load_session(id).await.unwrap().unwrap();
+    assert!(state
+        .session_store
+        .root_actor_input_required(&root)
+        .await
+        .unwrap());
+    let birth = bootstrap["session_created_at"].as_str().unwrap();
+    let deferred = defer_root_activation(&state).await;
+    let sibling = chat(&state, id, "ROOT_CHAT_SIBLING").await;
+    assert!(sibling["message_id"].is_string(), "{sibling}");
+    assert!(sibling["ingress_seq"].as_u64().unwrap() > 0);
+
+    let chat_body = json!({"session_id":id,"message":"ROOT_CHAT_SELECTED"});
+    let chat_headers = [("Idempotency-Key", "root-chat-returned-receipt".to_owned())];
+    let (status, raw, _) =
+        request_headers(&state, "/api/v1/chat", chat_body.clone(), &chat_headers).await;
+    assert_eq!(status, StatusCode::CREATED, "{raw}");
+    assert!(
+        raw["message_id"].is_string(),
+        "real Root Chat must return its receipt: {raw}"
+    );
+    assert!(raw["ingress_seq"].as_u64().unwrap() > sibling["ingress_seq"].as_u64().unwrap());
+    assert_ne!(raw["message_id"], sibling["message_id"]);
+    assert!(deferred.requests.lock().unwrap().iter().any(
+        |(target, generation)| target == id && Some(*generation) == raw["ingress_seq"].as_u64()
+    ));
+    let (status, retry, _) =
+        request_headers(&state, "/api/v1/chat", chat_body.clone(), &chat_headers).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(retry, raw);
+    let (status, _, _) = request_headers(
+        &state,
+        "/api/v1/chat",
+        json!({"session_id":id,"message":"CONFLICT_MUST_NOT_QUEUE"}),
+        &chat_headers,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 2);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+    let mut selected = raw.clone();
+    selected["session_created_at"] = json!(birth);
+    let (selected, run) =
+        start_output_receipt(&state, id, "ROOT_CHAT_SELECTED", &provider, selected).await;
+    let (status, visible) = output(&state, id, &run, Some(birth)).await;
+    assert_eq!(status, StatusCode::OK, "{visible}");
+    assert_eq!(visible["input"]["message_id"], raw["message_id"]);
+    assert_eq!(visible["input"]["ingress_seq"], raw["ingress_seq"]);
+    assert!(visible.to_string().contains("ROOT_CHAT_SELECTED"));
+    assert!(!visible.to_string().contains("ROOT_CHAT_SIBLING"));
+    assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+    assert!(!state
+        .session_inbox
+        .was_admitted(id, &durable_receipt(&sibling).id)
+        .await
+        .unwrap());
+    let (status, stopped, _) = request_headers(
+        &state,
+        &format!("/api/v1/sessions/{id}/stop"),
+        json!({}),
+        &[("Bamboo-Run-Id", run.clone())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{stopped}");
+    provider.release.notify_one();
+    assert!(matches!(done(&state, id).await, AgentStatus::Cancelled));
+    let (status, cancelled) = output(&state, id, &run, Some(birth)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cancelled["runner_status"], "cancelled");
+    assert_eq!(cancelled["input"], visible["input"]);
+    assert_eq!(
+        cancelled["output"]["messages"],
+        visible["output"]["messages"]
+    );
+    let (status, replay, _) = request_headers(
+        &state,
+        &format!("/api/v1/execute/{id}"),
+        json!({}),
+        &receipt_headers(&selected, "ROOT_CHAT_SELECTED"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(replay["run_id"], run);
+    let (status, retry, _) =
+        request_headers(&state, "/api/v1/chat", chat_body, &chat_headers).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(retry, raw);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+    assert!(!state
+        .session_inbox
+        .was_admitted(id, &durable_receipt(&sibling).id)
+        .await
+        .unwrap());
+}
+
+#[actix_web::test]
+async fn root_chat_receipt_real_coordinator_can_consume_before_execute_without_owner_adoption() {
+    let _proof = HTTP_PROOF.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let provider = OutputProvider::new(false);
+    let state = state(home.path(), provider.clone()).await;
+    let id = "root-chat-real-activation-race";
+    seed(&state, id).await;
+    let (bootstrap, bootstrap_run) = start_output(&state, id, "AUTO_BOOTSTRAP", &provider).await;
+    provider.release.notify_one();
+    assert!(matches!(done(&state, id).await, AgentStatus::Completed));
+    let birth = bootstrap["session_created_at"].as_str().unwrap();
+    committed_output(&state, id, &bootstrap_run, birth).await;
+    let root = state.storage.load_session(id).await.unwrap().unwrap();
+    assert!(state
+        .session_store
+        .root_actor_input_required(&root)
+        .await
+        .unwrap());
+    // Keep the actual AppState coordinator here; no scheduling port is replaced.
+    let body = json!({"session_id":id,"message":"ROOT_CHAT_AUTO_CONSUMED"});
+    let headers = [("Idempotency-Key", "root-chat-real-coordinator".to_owned())];
+    let (status, raw, _) = request_headers(&state, "/api/v1/chat", body.clone(), &headers).await;
+    assert_eq!(status, StatusCode::CREATED, "{raw}");
+    assert!(raw["message_id"].is_string(), "{raw}");
+    assert!(raw["ingress_seq"].as_u64().unwrap() > 0);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        provider.entered.notified(),
+    )
+    .await
+    .unwrap();
+    let mut input = raw.clone();
+    input["session_created_at"] = json!(birth);
+    assert!(state
+        .session_inbox
+        .was_admitted(id, &durable_receipt(&input).id)
+        .await
+        .unwrap());
+    let actual_run = state.agent_runners.read().await[id].run_id.clone();
+    assert_ne!(actual_run, bootstrap_run);
+    let (status, retry, _) = request_headers(&state, "/api/v1/chat", body, &headers).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(retry, raw);
+    let (status, rejected, _) = request_headers(
+        &state,
+        &format!("/api/v1/execute/{id}"),
+        json!({}),
+        &receipt_headers(&input, "never-adopt-auto-owner"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(state.agent_runners.read().await[id].run_id, actual_run);
+    assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 0);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    // A returned input receipt cannot opt the background run into selected output.
+    assert_eq!(
+        output(&state, id, &actual_run, Some(birth)).await.0,
+        StatusCode::GONE
+    );
+    let (status, stopped, _) = request_headers(
+        &state,
+        &format!("/api/v1/sessions/{id}/stop"),
+        json!({}),
+        &[("Bamboo-Run-Id", actual_run.clone())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{stopped}");
+    assert!(state.agent_runners.read().await[id]
+        .cancel_token
+        .is_cancelled());
+    provider.release.notify_one();
+    let terminal = done(&state, id).await;
+    assert!(!matches!(
+        terminal,
+        AgentStatus::Pending | AgentStatus::Running
+    ));
+    assert_eq!(state.agent_runners.read().await[id].run_id, actual_run);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    eprintln!("actual coordinator accepted receipt{}, explicit execute409, background selected-output410, terminal={terminal:?}",raw["message_id"]);
 }
