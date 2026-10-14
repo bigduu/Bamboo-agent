@@ -457,6 +457,15 @@ async fn anthropic_activation_native_request_body_headers_and_owner_ceiling_fail
         json!({"tool_choice":{"type":"tool","name":"FakeTool"}}),
         json!({"thinking":{"type":"enabled","budget_tokens":1}}),
         json!({"stream_options":{"include_usage":true}}),
+        json!({"system":null}),
+        json!({"max_tokens":null}),
+        json!({"temperature":null}),
+        json!({"top_p":null}),
+        json!({"top_k":null}),
+        json!({"stop_sequences":null}),
+        json!({"stream":null}),
+        json!({"tools":null}),
+        json!({"tool_choice":null}),
         json!({"no_human_approver":true}),
         json!({"run_budget":{"max_rounds":999999}}),
     ];
@@ -617,6 +626,30 @@ async fn anthropic_activation_plain_messages_sse_remains_stateless_and_activatio
     );
     assert!(!text.contains("bamboo.activation") && !text.contains("SSE_MUST_NOT_CONSUME_PENDING"));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    // Strict extension parsing must not change ordinary DTO null/default or
+    // duplicate-known-field behavior; this still uses the original extractor.
+    provider.release.notify_one();
+    let (status, ordinary, _) = request_headers(&state, MESSAGES,
+        json!({"model":"claude-sonnet","messages":[{"role":"user","content":"ordinary Anthropic null defaults"}],
+            "system":null,"max_tokens":null,"temperature":null,"top_p":null,"top_k":null,
+            "stop_sequences":null,"stream":null,"tools":null,"tool_choice":null}), &[]).await;
+    assert_eq!(status, StatusCode::OK, "{ordinary}");
+    assert_eq!(ordinary["type"], "message");
+    assert!(ordinary
+        .to_string()
+        .contains("visible answer for ordinary Anthropic null defaults"));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    let duplicate = test::TestRequest::post().uri(MESSAGES)
+        .peer_addr("127.0.0.1:5700".parse().unwrap())
+        .insert_header(("Content-Type", "application/json"))
+        .set_payload(r#"{"model":"claude-sonnet","model":"claude-sonnet","messages":[{"role":"user","content":"duplicate must not forward"}]}"#)
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, duplicate).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
     assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
     no_running(&state, id).await;
 }

@@ -3,7 +3,7 @@
 This is Bamboo's asynchronous receipt-activation extension, not a vendor
 completion response. The shared contract is independent of OpenAI, Anthropic,
 Gemini, the selected provider, and the model. Non-streaming Chat Completions and
-Anthropic Messages have explicit adapters. Each validates its own DTO before the
+Anthropic Messages have explicit adapters. Each validates its own HTTP schema before the
 unchanged neutral Native activation port; Messages does not construct an OpenAI
 request or pass through its ordinary conversion layer. Responses, Anthropic legacy
 Complete and Gemini activation remain open. Ordinary forwarding remains supported
@@ -106,11 +106,17 @@ Bamboo receipt/output/cancel contract.
 
 `POST /anthropic/v1/messages` uses the same six single headers, neutral202
 envelope, actual selected run, Native execute idempotency namespace, exact finite
-output and exact cancellation. Its own `AnthropicMessagesRequest` validates
+output and exact cancellation. Its strict Messages receipt schema validates
 `{"model":"bamboo-agent","messages":[]}`, optionally `stream:false` and empty
 `tools:[]`. `system` (text or blocks), `max_tokens`, sampling/stop parameters,
 nonempty transcript/tools, tool choice, streaming and every flattened extra option
 return400 before ordinary conversion, provider forwarding or Root admission.
+Only the four allowed keys may be present, with their exact allowed values;
+explicit null is rejected too (including `stream:null` and `tools:null`). The HTTP
+extractor selects either this strict schema or the original ordinary
+`Json<AnthropicMessagesRequest>` extractor. Both retain the existing JSON
+content-type, compression and payload-limit handling. Ordinary null/default and
+duplicate-field semantics remain the original DTO's behavior.
 These fields cannot replace accepted input, add authority, select a backend or
 override the server's budget. The shared activation module and all Native owners
 remain unchanged.

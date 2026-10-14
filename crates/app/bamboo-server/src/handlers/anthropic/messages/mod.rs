@@ -2,7 +2,7 @@ mod non_stream;
 mod shared;
 mod stream;
 
-use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse};
+use actix_web::{http::StatusCode, web, FromRequest, HttpRequest, HttpResponse};
 
 use crate::{app_state::AppState, error::AppError};
 use bamboo_llm::api::models::StreamOptions;
@@ -12,35 +12,71 @@ use super::conversion::convert_messages_request;
 use super::errors::{anthropic_error_response, AnthropicError};
 use super::resolution::resolve_model;
 
+/// Select the original ordinary JSON extractor or the explicit extension's
+/// strict four-field schema. Shared activation never receives a vendor DTO.
+pub enum MessagesHttpRequest {
+    Activation(ReceiptActivationBody),
+    Forward(AnthropicMessagesRequest),
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptActivationBody {
+    model: String,
+    messages: Vec<bamboo_llm::providers::anthropic::api_types::AnthropicMessage>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    tools: Vec<bamboo_llm::providers::anthropic::api_types::AnthropicTool>,
+}
+
+impl FromRequest for MessagesHttpRequest {
+    type Error = actix_web::Error;
+    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, Self::Error>>>>;
+    fn from_request(http: &HttpRequest, payload: &mut actix_web::dev::Payload) -> Self::Future {
+        if crate::handlers::llm_compat::activation::requested(http) {
+            let parsed = web::Json::<ReceiptActivationBody>::from_request(http, payload);
+            Box::pin(async move {
+                let body = parsed.await.map_err(|error| {
+                    if error.as_response_error().status_code() != StatusCode::BAD_REQUEST {
+                        return error;
+                    }
+                    actix_web::error::InternalError::from_response(error,
+                        crate::handlers::llm_compat::activation::error(StatusCode::BAD_REQUEST,
+                            "unsupported_bamboo_activation_body",
+                            "Receipt activation allows only model=bamboo-agent, empty messages/tools and optional stream:false; null and other fields are rejected"))
+                        .into()
+                })?;
+                Ok(Self::Activation(body.into_inner()))
+            })
+        } else {
+            let parsed = web::Json::<AnthropicMessagesRequest>::from_request(http, payload);
+            Box::pin(async move { Ok(Self::Forward(parsed.await?.into_inner())) })
+        }
+    }
+}
+
 pub async fn messages(
     app_state: web::Data<AppState>,
-    req: web::Json<AnthropicMessagesRequest>,
+    req: MessagesHttpRequest,
     http: HttpRequest,
 ) -> Result<HttpResponse, AppError> {
-    if crate::handlers::llm_compat::activation::requested(&http) {
-        // Validate this protocol's own DTO before ordinary conversion. The
-        // neutral Native port never receives a vendor transcript or options.
-        if req.model != "bamboo-agent"
-            || !req.messages.is_empty()
-            || req.system.is_some()
-            || req.max_tokens.is_some()
-            || req.temperature.is_some()
-            || req.top_p.is_some()
-            || req.top_k.is_some()
-            || req.stop_sequences.is_some()
-            || req.stream.unwrap_or(false)
-            || req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
-            || req.tool_choice.is_some()
-            || !req.extra.is_empty()
-        {
-            return Ok(crate::handlers::llm_compat::activation::error(
-                StatusCode::BAD_REQUEST, "unsupported_bamboo_activation_body",
-                "Receipt activation requires model=bamboo-agent, empty messages/tools and no system, max_tokens, generation or streaming options"));
+    let request = match req {
+        MessagesHttpRequest::Activation(body) => {
+            if body.model != "bamboo-agent"
+                || !body.messages.is_empty()
+                || body.stream
+                || !body.tools.is_empty()
+            {
+                return Ok(crate::handlers::llm_compat::activation::error(StatusCode::BAD_REQUEST,
+                    "unsupported_bamboo_activation_body",
+                    "Receipt activation requires model=bamboo-agent, empty messages/tools and optional stream:false"));
+            }
+            return Ok(crate::handlers::llm_compat::activation::activate(app_state, http).await);
         }
-        return Ok(crate::handlers::llm_compat::activation::activate(app_state, http).await);
-    }
-    let stream = req.stream.unwrap_or(false);
-    let request = req.into_inner();
+        MessagesHttpRequest::Forward(request) => request,
+    };
+    let stream = request.stream.unwrap_or(false);
     let response_model = request.model.clone();
     let forward_id = uuid::Uuid::new_v4().to_string();
 
