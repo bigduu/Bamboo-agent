@@ -1168,6 +1168,17 @@ impl AppState {
         )
         .with_root_actor_directory(session_store.clone());
 
+        external_runner.set_local_child_skill_factory(Some(Arc::new(
+            crate::local_child_skills::ServerChildSkillFactory::new(
+                skill_manager.clone(),
+                config.clone(),
+                session_repo.clone(),
+                project_store.clone(),
+                permission_checker.clone(),
+                tool_factory.clone(),
+            ),
+        )));
+
         let skill_producer = crate::skill_runtime::ServerMainSkillProducer::new(
             skill_manager.clone(),
             config.clone(),

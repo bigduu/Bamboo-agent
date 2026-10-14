@@ -66,7 +66,9 @@ pub(crate) fn ordinary_main(session: &Session) -> bool {
 
 // Capture the resolved directory once. Re-resolving the original alias on
 // every page would let a redirected symlink silently retarget an active run.
-fn workspace_identity(session: &Session) -> Result<Option<std::path::PathBuf>, ToolError> {
+pub(super) fn workspace_identity(
+    session: &Session,
+) -> Result<Option<std::path::PathBuf>, ToolError> {
     session
         .workspace_path_meta()
         .map(|path| {
@@ -80,7 +82,7 @@ fn workspace_identity(session: &Session) -> Result<Option<std::path::PathBuf>, T
         .transpose()
 }
 
-fn ceiling(session: &Session) -> Result<Option<BTreeSet<String>>, ToolError> {
+pub(super) fn ceiling(session: &Session) -> Result<Option<BTreeSet<String>>, ToolError> {
     session
         .metadata
         .get("selected_skill_ids")
@@ -91,7 +93,7 @@ fn ceiling(session: &Session) -> Result<Option<BTreeSet<String>>, ToolError> {
         })
         .transpose()
 }
-fn mode(session: &Session) -> Option<String> {
+pub(super) fn mode(session: &Session) -> Option<String> {
     session
         .metadata
         .get("skill_mode")
@@ -100,7 +102,7 @@ fn mode(session: &Session) -> Option<String> {
         .filter(|mode| !mode.is_empty())
         .map(str::to_owned)
 }
-fn permission_mode(session: &Session) -> SessionPermissionMode {
+pub(super) fn permission_mode(session: &Session) -> SessionPermissionMode {
     session
         .agent_runtime_state
         .as_ref()
@@ -939,4 +941,4 @@ impl ToolExecutor for NativeExecutor {
 
 #[cfg(test)]
 #[path = "skill_runtime_tests.rs"]
-mod tests;
+pub(crate) mod tests;

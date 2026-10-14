@@ -121,6 +121,15 @@ impl CompositeExternalChildRunner {
 
 #[async_trait]
 impl ExternalChildRunner for CompositeExternalChildRunner {
+    fn set_local_child_skill_factory(
+        &self,
+        factory: Option<Arc<dyn super::local_task::LocalChildSkillFactory>>,
+    ) {
+        for runner in &self.runners {
+            runner.set_local_child_skill_factory(factory.clone());
+        }
+    }
+
     fn set_local_task_runtime(&self, runtime: Option<super::local_task::LocalTaskRuntime>) {
         for runner in &self.runners {
             runner.set_local_task_runtime(runtime.clone());
