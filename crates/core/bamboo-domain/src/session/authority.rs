@@ -31,6 +31,24 @@ impl SessionAuthorityIdentity {
     }
 }
 
+impl super::Session {
+    /// Identity shape observed from an executing snapshot, never a live grant.
+    /// Every management operation must still revalidate canonical storage.
+    pub fn supervisor_incarnation_id(&self) -> Option<Uuid> {
+        let SessionAuthorityIdentity::Supervisor { incarnation_id } = self.authority_identity
+        else {
+            return None;
+        };
+        (self.id == DEFAULT_SUPERVISOR_SESSION_ID
+            && self.kind == super::SessionKind::Root
+            && self.root_session_id == self.id
+            && self.parent_session_id.is_none()
+            && self.spawn_depth == 0
+            && !incarnation_id.is_nil())
+        .then_some(incarnation_id)
+    }
+}
+
 /// Small bootstrap result, deliberately excluding Session history/control-plane
 /// snapshots so callers cannot install a history-free snapshot in a session cache.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

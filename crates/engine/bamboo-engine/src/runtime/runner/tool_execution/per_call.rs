@@ -327,7 +327,12 @@ async fn execute_tool_call_only_with_execution_name(
     // stale schema or the round's EffectiveCallableSet predates live tightening.
     // Reject before ToolStart, hooks, replay handling, and executor entry.
     if ctx.root_orchestration_only
-        && !bamboo_domain::orchestration_only_allows_execution_name(execution_name)
+        && !bamboo_domain::orchestration_only_allows_execution_name_for_supervisor(
+            execution_name,
+            ctx.executing_supervisor.is_some()
+                && ctx.session_id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
+                && ctx.root_session_id == ctx.session_id,
+        )
     {
         tracing::warn!(
             "[{}][round:{}] Tool call rejected by Root authority before ToolStart: tool_call_id={}, tool_name={}, execution_name={}",
@@ -2665,6 +2670,78 @@ mod hook_tests {
             concrete.entered(),
             ["vendor::exec_command", "vendor::write_stdin"]
         );
+    }
+
+    #[tokio::test]
+    async fn supervisor_ultra_final_gate_uses_original_observation_and_exact_management_tool() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let names = [
+            "session_control",
+            "session_history",
+            "exec_command",
+            "vendor::session_control",
+            "default::session_control",
+        ];
+        let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        supervisor.set_root_orchestration_only(true).unwrap();
+        let observed = ExecutingSupervisorObservation::capture_from_executing_session(&supervisor);
+        let callable =
+            effective_callable_set(&names, CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        for (observation, caller) in [
+            (observed, DEFAULT_SUPERVISOR_SESSION_ID),
+            (None, DEFAULT_SUPERVISOR_SESSION_ID),
+            (observed, "ordinary-root"),
+        ] {
+            let concrete = Arc::new(NameRecordingExecutor::new(&names));
+            let tools: Arc<dyn ToolExecutor> = concrete.clone();
+            let (tx, mut rx) = mpsc::channel(64);
+            for name in names {
+                let call = probe_call(name);
+                let outcome = execute_model_requested_tool_call_only(
+                    &callable,
+                    ToolExecutionOnlyContext {
+                        vision_support: true,
+                        output_cap: None,
+                        executing_supervisor: observation,
+                        tool_call: &call,
+                        event_tx: &tx,
+                        metrics_collector: None,
+                        session_id: caller,
+                        root_session_id: caller,
+                        root_orchestration_only: true,
+                        round_id: "round-1",
+                        round: 0,
+                        tools: &tools,
+                        config: &AgentLoopConfig::default(),
+                        hook_session: None,
+                        hook_runtime_state: None,
+                        session_flags: ToolExecutionSessionFlags::from_session(&supervisor),
+                        available_tool_schemas: &[],
+                    },
+                )
+                .await
+                .unwrap();
+                let allowed = observation.is_some()
+                    && caller == DEFAULT_SUPERVISOR_SESSION_ID
+                    && name == "session_control";
+                assert_eq!(outcome.result.is_ok(), allowed, "{caller}: {name}");
+            }
+            let expected = if observation.is_some() && caller == DEFAULT_SUPERVISOR_SESSION_ID {
+                vec!["session_control"]
+            } else {
+                vec![]
+            };
+            assert_eq!(concrete.entered(), expected);
+            assert_eq!(
+                std::iter::from_fn(|| rx.try_recv().ok())
+                    .filter(|event| matches!(event, AgentEvent::ToolStart { .. }))
+                    .count(),
+                expected.len()
+            );
+        }
     }
 
     #[tokio::test]
