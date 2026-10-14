@@ -67,7 +67,9 @@ A future vendor adapter must define its own completion/usage/error conversion.
 ## Same buffer, existing lifetime
 
 Only a selected execution carrying the actual Root writer and bound receipt may
-opt in at the last await before the existing forwarder/spawn. Identity is copied
+opt in before auxiliary title work and the existing forwarder/spawn.
+All fallible/cancellable output binding finishes before the title task is
+launched, so aborted Ready startup cannot trigger auxiliary model work. Identity is copied
 from that capability and exact runner, never supplied as authority by HTTP.
 Ordinary reservations are a no-op. Existing event producers, physical/Actor
 fences, history publication/ACK, cancellation, permissions and Ready handoff
@@ -94,7 +96,9 @@ Real HTTP/fake-provider tests cover current input/run identity, live and late
 post-history reads, exact retries, an actual successor, sibling and reasoning
 isolation, cancellation/error prefixes, missing/nonselected runs, trusted Root
 recreation with deliberately retained old runner bytes, eviction and restart.
-Shared-core tests preserve default WS clear-on-history and cover binding,
+A real reserved-token cancellation fixture also verifies that aborting output
+binding starts neither title nor primary provider work. Shared-core tests
+preserve default WS clear-on-history and cover binding,
 post-barrier segments, reused IDs, explicit discard and commit invalidation.
 Keep the prior Native/Skills/current-input/cancel/idempotency/CORS regressions,
 Root publication fences, message WS, and actual OpenAI Chat/Responses, Anthropic

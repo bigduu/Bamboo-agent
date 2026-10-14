@@ -354,3 +354,85 @@ async fn run_output_headers_nonselected_run_and_recreated_root_fail_closed() {
     assert_eq!(status, StatusCode::GONE);
     assert!(!new.to_string().contains("OLD_ROOT_OUTPUT"));
 }
+
+#[actix_web::test]
+async fn run_output_cancelled_before_binding_never_starts_title_or_primary() {
+    let _proof = HTTP_PROOF.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RestartProbe::default());
+    let state = state(home.path(), provider.clone()).await;
+    {
+        let mut config = state.config.write().await;
+        config.features.provider_model_ref = false;
+        config.providers_mut().openai.as_mut().unwrap().fast_model = Some("test-model".into());
+        assert!(bamboo_engine::model_config_helper::resolve_fast_model(
+            &config,
+            "openai",
+            &state.provider_registry
+        )
+        .is_some());
+    }
+    let id = "run-output-aborted-before-title";
+    // Unlike other fixtures this deliberately leaves title generation pending.
+    state
+        .storage
+        .save_session(&Session::new(id, "test-model"))
+        .await
+        .unwrap();
+    bindings()
+        .lock()
+        .unwrap()
+        .insert(id.into(), std::sync::Weak::new());
+    let input = chat(&state, id, "cancel this startup before output binding").await;
+    let cancel_at_real_binding = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let executor = {
+                    bindings()
+                        .lock()
+                        .unwrap()
+                        .get(id)
+                        .and_then(std::sync::Weak::upgrade)
+                };
+                if let Some(executor) = executor {
+                    executor.run.cancel.cancel();
+                    return executor;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    });
+    let (status, body, _) = request_headers(
+        &state,
+        &format!("/api/v1/execute/{id}"),
+        json!({}),
+        &receipt_headers(&input, "cancel-before-output"),
+    )
+    .await;
+    let executor = cancel_at_real_binding.await.unwrap();
+    assert!(executor.run.cancel.is_cancelled());
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if !provider.purposes.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let purposes = provider.purposes.lock().unwrap().clone();
+    eprintln!("aborted Ready provider purposes: {purposes:?}");
+    assert!(
+        purposes.is_empty(),
+        "aborted Ready started provider work: {purposes:?}"
+    );
+    assert!(state
+        .agent_runners
+        .read()
+        .await
+        .get(id)
+        .is_none_or(|runner| runner.visible_messages.selected_output_snapshot().is_none()));
+}
