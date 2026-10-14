@@ -134,6 +134,10 @@ impl FileStore {
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
+    pub fn is_platform_supported() -> bool {
+        cfg!(any(target_os = "macos", target_os = "linux"))
+    }
+
     pub fn open(root: &Path, binding: ScopeBinding) -> Result<Self> {
         Self::open_with_policy(root, binding, false)
     }
@@ -143,7 +147,7 @@ impl FileStore {
     }
 
     fn open_with_policy(root: &Path, binding: ScopeBinding, empty_only: bool) -> Result<Self> {
-        if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        if !Self::is_platform_supported() {
             return Err(Error::AuthorityUnavailable(
                 "filesystem platform not validated".into(),
             ));

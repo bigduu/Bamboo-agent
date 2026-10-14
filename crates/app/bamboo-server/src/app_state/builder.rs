@@ -873,6 +873,12 @@ impl AppState {
         ));
         external_runner.set_actor_directory_store(Some(session_store.clone()));
         external_runner.set_ticket_service(tickets.service().ok());
+        let ticket_runner = Arc::downgrade(&external_runner);
+        tickets.bind_service_publisher(Arc::new(move |service| {
+            if let Some(runner) = ticket_runner.upgrade() {
+                runner.set_ticket_service(Some(service));
+            }
+        }));
         external_runner.set_actor_event_observer(Some(actor_event_hub.clone()));
         // Broker receipts belong only to explicitly configured legacy routes.
         // The default local runtime must not scan/reconnect old broker receipts.

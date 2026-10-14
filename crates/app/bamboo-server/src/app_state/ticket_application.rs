@@ -20,6 +20,7 @@ pub struct TicketApplication {
     config: Arc<RwLock<Config>>,
     service: Arc<OnceLock<Arc<TicketService>>>,
     initializing: tokio::sync::Mutex<()>,
+    service_publisher: Arc<OnceLock<Arc<dyn Fn(Arc<TicketService>) + Send + Sync>>>,
     root: PathBuf,
     unavailable: Option<String>,
     adapter: OnceLock<Arc<ChildSessionAdapter>>,
@@ -45,6 +46,7 @@ impl TicketApplication {
             config,
             service: Arc::new(service.map(OnceLock::from).unwrap_or_default()),
             initializing: tokio::sync::Mutex::new(()),
+            service_publisher: Arc::new(OnceLock::new()),
             root: root.to_path_buf(),
             unavailable,
             adapter: OnceLock::new(),
@@ -193,6 +195,15 @@ impl TicketApplication {
                     .unwrap_or_else(|| "Ticket scope unavailable".into()),
             )
         })
+    }
+
+    /// Startup already seeds the runner; publish a future explicit empty scope
+    /// to that same process-local runner without changing any authority grant.
+    pub(super) fn bind_service_publisher(
+        &self,
+        publisher: Arc<dyn Fn(Arc<TicketService>) + Send + Sync>,
+    ) {
+        let _ = self.service_publisher.set(publisher);
     }
 
     pub fn bind_adapter(&self, adapter: Arc<ChildSessionAdapter>) {

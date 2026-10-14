@@ -2108,3 +2108,59 @@ async fn ticket_scope_status_distinguishes_forged_identity_and_io_authority_fail
         assert!(!root.path().join("tickets").exists());
     }
 }
+
+#[tokio::test]
+async fn ticket_scope_platform_contract_denies_get_eligibility_and_post_without_effects() {
+    let (_root, storage, app, supervisor) = uninitialized_work_fixture().await;
+    let payload = scope_payload(&supervisor);
+    let before = serde_json::to_value(storage.load_session(&supervisor.id).await.unwrap()).unwrap();
+    let status = app.status_for_platform(false).await;
+    assert_eq!(status["availability"]["kind"], "error");
+    assert_eq!(status["availability"]["reason_code"], "scope_io_error");
+    assert_eq!(status["readable"], false);
+    assert_eq!(status["can_initialize"], false);
+    assert_eq!(status["initialization"], Value::Null);
+    let error = app
+        .initialize_for_platform(scope_owner(), payload.clone(), false)
+        .await
+        .unwrap_err();
+    assert_eq!((error.status, error.code), (503, "scope_io_error"));
+    assert!(!app.scope_root(payload.incarnation_id).exists());
+    assert_eq!(
+        serde_json::to_value(storage.load_session(&supervisor.id).await.unwrap()).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn ticket_scope_initialization_publishes_runtime_service_once_after_authorized_creation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (_root, _storage, app, supervisor) = uninitialized_work_fixture().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let called = calls.clone();
+    let expected = scope_payload(&supervisor);
+    let expected_binding = expected.clone();
+    app.bind_service_publisher(Arc::new(move |service| {
+        let snapshot = service.published().unwrap().1;
+        assert_eq!(
+            snapshot.binding.supervisor_session_id,
+            expected_binding.supervisor_session_id
+        );
+        assert_eq!(
+            snapshot.binding.binding_revision,
+            expected_binding.binding_revision
+        );
+        called.fetch_add(1, Ordering::SeqCst);
+    }));
+    let mut stale = expected.clone();
+    stale.binding_revision += 1;
+    assert!(app.initialize_scope(scope_owner(), stale).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(app
+        .initialize_scope(scope_owner(), expected.clone())
+        .await
+        .unwrap());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!app.initialize_scope(scope_owner(), expected).await.unwrap());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

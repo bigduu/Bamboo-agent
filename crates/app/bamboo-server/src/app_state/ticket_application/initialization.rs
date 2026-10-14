@@ -59,6 +59,11 @@ impl TicketApplication {
     }
 
     pub async fn status(&self) -> Value {
+        self.status_for_platform(store::FileStore::is_platform_supported())
+            .await
+    }
+
+    pub(super) async fn status_for_platform(&self, platform_supported: bool) -> Value {
         let flags = self.config.read().await.features.clone();
         let mut status = json!({
             "available":false,"readable":false,"can_initialize":false,"initialization":null,
@@ -181,6 +186,14 @@ impl TicketApplication {
                 "Ticket mutation feature is disabled".into(),
             );
         }
+        if !platform_supported {
+            return unavailable(
+                status,
+                "error",
+                "scope_io_error",
+                "filesystem platform not validated".into(),
+            );
+        }
         let root = self.scope_root(incarnation_id);
         match tokio::task::spawn_blocking(move || scope_is_empty(&root)).await {
             Ok(Ok(true)) => {
@@ -214,6 +227,20 @@ impl TicketApplication {
         &self,
         principal: Principal,
         expected: ScopeInitialization,
+    ) -> std::result::Result<bool, ScopeInitializationError> {
+        self.initialize_for_platform(
+            principal,
+            expected,
+            store::FileStore::is_platform_supported(),
+        )
+        .await
+    }
+
+    pub(super) async fn initialize_for_platform(
+        &self,
+        principal: Principal,
+        expected: ScopeInitialization,
+        platform_supported: bool,
     ) -> std::result::Result<bool, ScopeInitializationError> {
         if !matches!(principal, Principal::User { ref user_id } if user_id == "host-owner") {
             return Err(ScopeInitializationError::new(
@@ -287,8 +314,16 @@ impl TicketApplication {
                 "Ticket mutation feature is disabled",
             ));
         }
+        if !platform_supported {
+            return Err(ScopeInitializationError::new(
+                503,
+                "scope_io_error",
+                "filesystem platform not validated",
+            ));
+        }
         let root = self.scope_root(incarnation_id);
         let service_slot = self.service.clone();
+        let service_publisher = self.service_publisher.clone();
         let created = Arc::new(AtomicBool::new(false));
         let created_job = created.clone();
         let operation = Box::new(move || {
@@ -323,9 +358,13 @@ impl TicketApplication {
                     "New scope requires recovery",
                 ));
             }
-            service_slot.set(Arc::new(service)).map_err(|_| {
+            let service = Arc::new(service);
+            service_slot.set(service.clone()).map_err(|_| {
                 io::Error::new(io::ErrorKind::WouldBlock, "concurrent initialization")
             })?;
+            if let Some(publish) = service_publisher.get() {
+                publish(service);
+            }
             created_job.store(true, Ordering::Release);
             Ok(())
         });
