@@ -198,6 +198,17 @@ fn resolve_catalog_with_activation(
         }
     }
 
+    if session.supervisor_incarnation_id().is_some() {
+        for schema in tool_schemas
+            .iter_mut()
+            .filter(|schema| schema.function.name == "session_history")
+        {
+            schema.function.description = "Bounded history/metadata readback for this Supervisor or an explicitly attached independent Root in its current valid Project/lifetime scope. Use read_messages/get_meta. Global list/search is not available; use session_history_current for current-turn paging.".into();
+            schema.function.parameters["properties"]["action"]["enum"] =
+                serde_json::json!(["read_messages", "get_meta"]);
+        }
+    }
+
     let mut by_execution_name = std::collections::BTreeMap::<String, ClassifiedToolSchema>::new();
     for entry in tool_schemas
         .into_iter()

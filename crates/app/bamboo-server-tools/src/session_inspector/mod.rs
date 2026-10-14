@@ -265,6 +265,48 @@ impl Tool for SessionInspectorTool {
             ToolError::InvalidArguments(format!("Invalid {} args: {e}", self.name()))
         })?;
 
+        if self.access == SessionHistoryAccess::Full
+            && (ctx.executing_supervisor.is_some()
+                || caller_session_id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID)
+        {
+            let original = ctx
+                .executing_supervisor_for(caller_session_id)
+                .ok_or_else(|| {
+                    ToolError::Execution(
+                        "Supervisor history requires the original executing identity".into(),
+                    )
+                })?
+                .supervisor_reference();
+            let target = match &parsed {
+                SessionInspectorArgs::ReadMessages { session_id, .. }
+                | SessionInspectorArgs::GetMeta { session_id } => session_id,
+                _ => return Err(ToolError::InvalidArguments(
+                    "Supervisor history supports only bounded read_messages/get_meta for its own Session or an explicitly attached Root; use session_history_current for current-turn paging".into(),
+                )),
+            };
+            let session = self
+                .storage
+                .load_supervisor_managed_session(&original, target)
+                .await
+                .map_err(|error| {
+                    ToolError::Execution(format!("Supervisor history denied: {error}"))
+                })?
+                .ok_or_else(|| ToolError::Execution("managed history target is missing".into()))?;
+            let result = match parsed {
+                SessionInspectorArgs::ReadMessages { session_id, from_end, offset, limit, truncate_chars, include_system, include_tool, include_tool_calls, include_image_urls } => {
+                    handlers::handle_read_messages(self, Some(session), session_id, from_end, offset, limit, truncate_chars, include_system, include_tool, include_tool_calls, include_image_urls).await?
+                }
+                SessionInspectorArgs::GetMeta { .. } => bamboo_agent_core::tools::ToolResult::text(true, json!({"session":{
+                    "id":session.id,"kind":session.kind,"root_session_id":session.root_session_id,
+                    "parent_session_id":session.parent_session_id,"project_id":session.project_id_meta(),
+                    "model":session.model,"message_count":session.messages.len(),"created_at":session.created_at,
+                    "metadata_version":session.metadata_version
+                }}).to_string()),
+                _ => unreachable!("scoped action checked before the physical read"),
+            };
+            return Ok(ToolOutcome::Completed(result));
+        }
+
         match parsed {
             SessionInspectorArgs::SearchCurrent { query, limit } => {
                 handlers::handle_search_current(
@@ -356,6 +398,7 @@ impl Tool for SessionInspectorTool {
             } => {
                 handlers::handle_read_messages(
                     self,
+                    None,
                     session_id,
                     from_end,
                     offset,

@@ -2726,11 +2726,11 @@ mod hook_tests {
                 .unwrap();
                 let allowed = observation.is_some()
                     && caller == DEFAULT_SUPERVISOR_SESSION_ID
-                    && name == "session_control";
+                    && matches!(name, "session_control" | "session_history");
                 assert_eq!(outcome.result.is_ok(), allowed, "{caller}: {name}");
             }
             let expected = if observation.is_some() && caller == DEFAULT_SUPERVISOR_SESSION_ID {
-                vec!["session_control"]
+                vec!["session_control", "session_history"]
             } else {
                 vec![]
             };

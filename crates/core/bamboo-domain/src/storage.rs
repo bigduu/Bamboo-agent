@@ -416,6 +416,21 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Immutable history snapshot read while canonical Supervisor and target
+    /// authority are locked. A public inspect_link followed by load_session is
+    /// not equivalent: its observation expires before the read starts.
+    async fn load_supervisor_managed_session(
+        &self,
+        supervisor: &SupervisorReference,
+        target_session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (supervisor, target_session_id);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support scoped Supervisor history",
+        ))
+    }
+
     /// Strict canonical Root control-plane read for authority decisions.
     /// `None` means absent; partial/corrupt/mismatched published authority is an
     /// error, never a fallback to stale session.json. Returned messages are empty;
