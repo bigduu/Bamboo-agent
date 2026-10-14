@@ -929,7 +929,8 @@ async fn native_registered_producer_rejects_excluded_hosts_before_source_access(
         match shape {
             0 => excluded.kind = bamboo_domain::SessionKind::Child,
             1 => {
-                excluded.set_root_orchestration_only(true).unwrap();
+                // Raw mode metadata lacks the host-selected authority revision.
+                excluded.root_orchestration_only = true;
             }
             2 => excluded.root_session_id = "forged-root-owner".into(),
             _ => excluded.spawn_depth = 1,
@@ -946,3 +947,6 @@ async fn native_registered_producer_rejects_excluded_hosts_before_source_access(
     reservation.abandon().await;
     assert!(provider.trace.lock().unwrap().requests.is_empty());
 }
+
+#[path = "skill_runtime_ultra_tests.rs"]
+mod ultra;

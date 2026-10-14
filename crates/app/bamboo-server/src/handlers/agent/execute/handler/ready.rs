@@ -198,7 +198,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             "error": crate::error::error_value(error.to_string())
         }));
     }
-    let native_binding = if ready.native_main && crate::skill_runtime::ordinary_main(&session) {
+    let native_binding = if ready.native_main && crate::skill_runtime::registered_main(&session) {
         match crate::skill_runtime::bind_execution(
             state.clone(),
             &session,

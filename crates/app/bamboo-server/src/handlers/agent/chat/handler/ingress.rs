@@ -316,7 +316,7 @@ impl AppState {
         else {
             return Ok(None);
         };
-        if !crate::skill_runtime::ordinary_main(&session)
+        if !crate::skill_runtime::registered_main(&session)
             || session.metadata.contains_key("chat.queued_ingress.v1")
             || !self
                 .session_inbox
@@ -476,7 +476,7 @@ impl AppState {
         if require_native_owner
             && reservation.is_none()
             && queued_id.is_none()
-            && crate::skill_runtime::ordinary_main(&session)
+            && crate::skill_runtime::registered_main(&session)
         {
             // Eligibility was observed under this actual admission check, not
             // the earlier HTTP selection. Never claim native owned-format work
