@@ -591,7 +591,10 @@ async fn compat_activation_other_protocol_entries_explicitly_unsupported_without
     let id = "compat-other-protocols";
     seed(&state, id).await;
     let input = chat(&state, id, "DO_NOT_CONSUME_FROM_OTHER_PROTOCOLS").await;
-    for (path, body) in other_protocol_requests() {
+    for (path, body) in other_protocol_requests()
+        .into_iter()
+        .filter(|(path, _)| *path != "/anthropic/v1/messages")
+    {
         let (status, rejected, headers) = request_headers(
             &state,
             path,
@@ -817,3 +820,6 @@ async fn compat_activation_browser_preflight_keeps_origin_policy_and_receipt_hea
         }
     }
 }
+
+#[path = "anthropic_activation_tests.rs"]
+mod anthropic_activation_tests;

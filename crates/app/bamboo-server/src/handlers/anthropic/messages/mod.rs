@@ -18,7 +18,26 @@ pub async fn messages(
     http: HttpRequest,
 ) -> Result<HttpResponse, AppError> {
     if crate::handlers::llm_compat::activation::requested(&http) {
-        return Ok(crate::handlers::llm_compat::activation::unsupported());
+        // Validate this protocol's own DTO before ordinary conversion. The
+        // neutral Native port never receives a vendor transcript or options.
+        if req.model != "bamboo-agent"
+            || !req.messages.is_empty()
+            || req.system.is_some()
+            || req.max_tokens.is_some()
+            || req.temperature.is_some()
+            || req.top_p.is_some()
+            || req.top_k.is_some()
+            || req.stop_sequences.is_some()
+            || req.stream.unwrap_or(false)
+            || req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+            || req.tool_choice.is_some()
+            || !req.extra.is_empty()
+        {
+            return Ok(crate::handlers::llm_compat::activation::error(
+                StatusCode::BAD_REQUEST, "unsupported_bamboo_activation_body",
+                "Receipt activation requires model=bamboo-agent, empty messages/tools and no system, max_tokens, generation or streaming options"));
+        }
+        return Ok(crate::handlers::llm_compat::activation::activate(app_state, http).await);
     }
     let stream = req.stream.unwrap_or(false);
     let request = req.into_inner();
