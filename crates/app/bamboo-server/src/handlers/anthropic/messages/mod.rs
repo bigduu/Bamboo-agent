@@ -2,7 +2,7 @@ mod non_stream;
 mod shared;
 mod stream;
 
-use actix_web::{http::StatusCode, web, HttpResponse};
+use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse};
 
 use crate::{app_state::AppState, error::AppError};
 use bamboo_llm::api::models::StreamOptions;
@@ -15,7 +15,11 @@ use super::resolution::resolve_model;
 pub async fn messages(
     app_state: web::Data<AppState>,
     req: web::Json<AnthropicMessagesRequest>,
+    http: HttpRequest,
 ) -> Result<HttpResponse, AppError> {
+    if crate::handlers::llm_compat::activation::requested(&http) {
+        return Ok(crate::handlers::llm_compat::activation::unsupported());
+    }
     let stream = req.stream.unwrap_or(false);
     let request = req.into_inner();
     let response_model = request.model.clone();

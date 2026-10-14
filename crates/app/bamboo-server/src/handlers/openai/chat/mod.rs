@@ -2,7 +2,7 @@ mod non_stream;
 mod prepare;
 mod stream;
 
-use actix_web::{web, HttpResponse};
+use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse};
 
 use crate::{app_state::AppState, error::AppError};
 use bamboo_agent_core::{tools::ToolSchema, Message};
@@ -10,8 +10,23 @@ use bamboo_llm::api::models::ChatCompletionRequest;
 
 pub async fn chat_completions(
     app_state: web::Data<AppState>,
+    http: HttpRequest,
     req: web::Json<ChatCompletionRequest>,
 ) -> Result<HttpResponse, AppError> {
+    if crate::handlers::llm_compat::activation::requested(&http) {
+        if req.model != "bamboo-agent"
+            || !req.messages.is_empty()
+            || req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+            || req.tool_choice.is_some()
+            || req.stream.unwrap_or(false)
+            || req.stream_options.is_some()
+            || !req.parameters.is_empty()
+        {
+            return Ok(crate::handlers::llm_compat::activation::error(StatusCode::BAD_REQUEST,"unsupported_bamboo_activation_body",
+                "Receipt activation requires model=bamboo-agent, empty messages/tools and no generation or streaming options"));
+        }
+        return Ok(crate::handlers::llm_compat::activation::activate(app_state, http).await);
+    }
     let forward_id = uuid::Uuid::new_v4().to_string();
     let prepared = prepare::prepare_chat_request(&app_state, req.into_inner()).await?;
 

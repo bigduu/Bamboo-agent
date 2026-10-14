@@ -28,6 +28,9 @@ pub async fn responses_create(
     http_request: HttpRequest,
     req: web::Json<ResponsesCreateRequest>,
 ) -> Result<HttpResponse, AppError> {
+    if crate::handlers::llm_compat::activation::requested(&http_request) {
+        return Ok(crate::handlers::llm_compat::activation::unsupported());
+    }
     let request = req.into_inner();
     let stream = request.stream.unwrap_or(false);
     let forward_id = uuid::Uuid::new_v4().to_string();

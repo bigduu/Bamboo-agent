@@ -774,3 +774,6 @@ async fn root_chat_receipt_real_coordinator_can_consume_before_execute_without_o
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     eprintln!("actual coordinator accepted receipt{}, explicit execute409, background selected-output410, terminal={terminal:?}",raw["message_id"]);
 }
+
+#[path = "compat_activation_tests.rs"]
+mod compat_activation_tests;
