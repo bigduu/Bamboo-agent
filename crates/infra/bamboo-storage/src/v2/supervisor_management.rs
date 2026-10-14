@@ -172,6 +172,25 @@ impl SessionStoreV2 {
         })
     }
 
+    pub(super) async fn management_history(
+        &self,
+        reference: &SupervisorReference,
+        target_id: &str,
+    ) -> io::Result<Option<Session>> {
+        if target_id == reference.session_id {
+            reference_is_valid(reference)?;
+            let _lifecycle = self.lock_session_lifecycle_shared().await?;
+            let _task = self.lock_runtime_task_sidecar_shared().await?;
+            let _sessions = self.management_session_locks(None).await?;
+            self.management_supervisor_locked(reference).await?;
+            return self.load_session_unlocked(target_id).await;
+        }
+        // This guard retains caller, link, Project and exact target lifetime
+        // validation through the complete physical read and overlay checks.
+        let _guard = self.lock_supervisor_followup(reference, target_id).await?;
+        self.load_session_unlocked(target_id).await
+    }
+
     /// Private loader only: every caller below owns lifecycle, Task and Session
     /// locks. Calling the public authority reader here would re-enter locks.
     async fn management_supervisor_locked(

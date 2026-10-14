@@ -78,8 +78,8 @@ pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {
 }
 
 /// Exact management tools with their own live Supervisor/target authority gate.
-/// Full session_history remains excluded until its global viewer is scoped.
-pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 1] = ["session_control"];
+/// The history executor restricts Supervisor reads to this scope too.
+pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 2] = ["session_control", "session_history"];
 
 pub fn orchestration_only_allows_execution_name_for_supervisor(
     execution_name: &str,
@@ -234,7 +234,7 @@ mod tests {
             supervisor.set_root_orchestration_only(ultra).unwrap();
             let restored: Session =
                 serde_json::from_value(serde_json::to_value(&supervisor).unwrap()).unwrap();
-            for name in ["session_control"] {
+            for name in ["session_control", "session_history"] {
                 assert!(
                     restored.allows_model_tool_execution(name),
                     "trusted Supervisor lost {name} in {:?}",
@@ -266,10 +266,11 @@ mod tests {
             let mut invalid = supervisor.clone();
             mutation(&mut invalid);
             invalid.metadata.insert("role".into(), "supervisor".into());
-            assert!(!invalid.allows_model_tool_execution("session_control"));
+            for name in ["session_control", "session_history"] {
+                assert!(!invalid.allows_model_tool_execution(name));
+            }
         }
         for name in [
-            "session_history",
             "default::session_control",
             "vendor::session_control",
             "exec_command",
@@ -282,7 +283,9 @@ mod tests {
         let mut ordinary = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
         ordinary.set_root_orchestration_only(true).unwrap();
         ordinary.metadata.insert("role".into(), "supervisor".into());
-        assert!(!ordinary.allows_model_tool_execution("session_control"));
+        for name in ["session_control", "session_history"] {
+            assert!(!ordinary.allows_model_tool_execution(name));
+        }
     }
 
     #[test]

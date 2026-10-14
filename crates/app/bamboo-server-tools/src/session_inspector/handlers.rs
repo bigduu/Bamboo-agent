@@ -358,6 +358,7 @@ pub(super) async fn handle_get_meta(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_read_messages(
     tool: &SessionInspectorTool,
+    loaded_session: Option<bamboo_agent_core::Session>,
     session_id: String,
     from_end: Option<bool>,
     offset: Option<usize>,
@@ -384,7 +385,10 @@ pub(super) async fn handle_read_messages(
     let include_tool_calls = include_tool_calls.unwrap_or(false);
     let include_image_urls = include_image_urls.unwrap_or(true);
 
-    let session = tool.load_session(&session_id).await?;
+    let session = match loaded_session {
+        Some(session) => session,
+        None => tool.load_session(&session_id).await?,
+    };
     let total = session.messages.len();
 
     let mut messages: Vec<(usize, &Message)> = session
