@@ -1,5 +1,6 @@
-use actix_web::{web, HttpRequest, HttpResponse};
+use actix_web::{http::StatusCode, web, FromRequest, HttpRequest, HttpResponse};
 use anyhow::anyhow;
+use bamboo_llm::protocol::gemini::{GeminiContent, GeminiRequest, GeminiTool};
 
 use crate::services::gemini_model_mapping_service::resolve_model;
 use crate::{app_state::AppState, error::AppError};
@@ -19,18 +20,70 @@ mod tests;
 use collect::collect_response_chunks;
 use response::build_gemini_response;
 
+/// Explicit receipt selectors choose the strict Gemini extension schema.
+/// Ordinary requests retain the original native DTO and framework JSON policy.
+pub enum GeminiHttpRequest {
+    Activation(GeminiReceiptActivationBody),
+    Forward(GeminiRequest),
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeminiReceiptActivationBody {
+    contents: Vec<GeminiContent>,
+    #[serde(default)]
+    tools: Vec<GeminiTool>,
+}
+
+impl FromRequest for GeminiHttpRequest {
+    type Error = actix_web::Error;
+    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, Self::Error>>>>;
+    fn from_request(http: &HttpRequest, payload: &mut actix_web::dev::Payload) -> Self::Future {
+        if crate::handlers::llm_compat::activation::requested(http) {
+            let parsed = web::Json::<GeminiReceiptActivationBody>::from_request(http, payload);
+            Box::pin(async move {
+                let body = parsed.await.map_err(|error| {
+                    if error.as_response_error().status_code() != StatusCode::BAD_REQUEST {
+                        return error;
+                    }
+                    actix_web::error::InternalError::from_response(error,
+                        crate::handlers::llm_compat::activation::error(StatusCode::BAD_REQUEST,
+                            "unsupported_bamboo_activation_body",
+                            "Receipt activation allows only present empty contents and optional empty tools; null and other fields are rejected"))
+                        .into()
+                })?;
+                Ok(Self::Activation(body.into_inner()))
+            })
+        } else {
+            let parsed = web::Json::<GeminiRequest>::from_request(http, payload);
+            Box::pin(async move { Ok(Self::Forward(parsed.await?.into_inner())) })
+        }
+    }
+}
+
 /// Generate content (non-streaming).
 pub async fn generate_content(
     path: web::Path<String>,
-    request: web::Json<bamboo_llm::protocol::gemini::GeminiRequest>,
+    request: GeminiHttpRequest,
     state: web::Data<AppState>,
     http: HttpRequest,
 ) -> Result<HttpResponse, AppError> {
-    if crate::handlers::llm_compat::activation::requested(&http) {
-        return Ok(crate::handlers::llm_compat::activation::unsupported());
-    }
-    let forward_id = uuid::Uuid::new_v4().to_string();
     let gemini_model = path.into_inner();
+    let request = match request {
+        GeminiHttpRequest::Activation(body) => {
+            if gemini_model != "bamboo-agent" || !body.contents.is_empty() || !body.tools.is_empty()
+            {
+                return Ok(crate::handlers::llm_compat::activation::error(StatusCode::BAD_REQUEST,
+                    "unsupported_bamboo_activation_body",
+                    "Receipt activation requires URL model=bamboo-agent, empty contents and optional empty tools"));
+            }
+            // Preserve the original HTTP identity and use the existing Native
+            // User gate, selected-input claim and actual Root lifecycle.
+            return Ok(crate::handlers::llm_compat::activation::activate(state, http).await);
+        }
+        GeminiHttpRequest::Forward(request) => request,
+    };
+    let forward_id = uuid::Uuid::new_v4().to_string();
 
     let resolution = {
         let config = state.config.read().await;

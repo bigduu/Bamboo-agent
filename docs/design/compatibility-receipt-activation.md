@@ -2,11 +2,11 @@
 
 This is Bamboo's asynchronous receipt-activation extension, not a vendor
 completion response. The shared contract is independent of OpenAI, Anthropic,
-Gemini, the selected provider, and the model. Non-streaming Chat Completions, Responses and
-Anthropic Messages have explicit adapters. Each validates its own HTTP schema before the
+Gemini, the selected provider, and the model. Non-streaming Chat Completions, Responses,
+Anthropic Messages and Gemini generateContent have explicit adapters. Each validates its own HTTP schema before the
 unchanged neutral Native activation port; Messages does not construct an OpenAI
 request or pass through its ordinary conversion layer. Anthropic legacy Complete
-and Gemini activation remain open. Ordinary forwarding remains supported
+and Gemini streaming activation remain open. Ordinary forwarding remains supported
 at all four protocol surfaces.
 
 ## Shared receipt, run and output contract
@@ -168,6 +168,44 @@ HTTP/Root/Skills EOF/Read/output with synthetic providers, four-entry same-key
 Native/Chat/Messages/Responses, proxy-context and cached-replay denial, strict
 null/owner/input validation, default coordinator409 and finite output410.
 
+## Gemini generateContent entry
+
+`POST /gemini/v1beta/models/bamboo-agent:generateContent` uses the same six single
+receipt headers and the unchanged neutral Native202/run/input/output/cancel
+contract. The virtual URL model must be exactly `bamboo-agent`; it does not pick
+the Gemini backend or change the server-owned Root session model. The strict
+native schema requires `{"contents":[]}`, optionally empty `tools:[]` using Gemini
+content/tool types. Only these two keys may be present. Missing/null/nonempty
+contents, null/nonempty tools and every unknown key reject400 before conversion,
+model mapping, provider forwarding or Root admission. This includes explicit
+null systemInstruction/system_instruction, generationConfig/generation_config,
+model, stream, safetySettings, toolConfig, cachedContent, transcripts, sampling,
+usage or authority/budget options. Other URL models also reject400 in receipt
+mode. No vendor DTO can replace accepted input or grant Root authority.
+
+Without receipt selectors the exact original `Json<GeminiRequest>` extractor,
+native aliases/defaults/unknown-field/duplicate/content-type/size handling, URL
+model mapping and ordinary conversion/output/SSE remain. `Idempotency-Key` alone
+is ordinary forwarding. Existing nonstream endpoint routing follows the original
+provider_model_ref flag; streaming continues to use the original default provider.
+No routing repair is included. Valid or revoked Responses run-tokens retain401
+for Gemini paths, even on loopback. Original HTTP extensions still reach the
+neutral verified User gate; a verified Worker context cannot replay cached202.
+
+This is an explicit **Bamboo202 extension**, not a standard Gemini
+generateContent response: it fabricates no candidates, finishReason or usage.
+An unaware Gemini SDK cannot consume it as a normal completion. Standard vendor
+completion/error/stream/tool-event/usage mapping and durable replay remain open.
+`streamGenerateContent` receipt activation stays501; legacy Complete stays501.
+
+Actual configured HTTP/Root SDK/Skills main+reference EOF then Read proofs run
+against only an Anthropic synthetic provider, with no OpenAI prerequisite. Native
+execute, Chat, Messages, Responses and Gemini share one operation key/run; exact
+cancel/prefix, cached202/finite410, actual coordinator-first409/background410 and
+stale cancel remain unchanged. Strict body/path/header/owner refusal and ordinary
+Gemini model/provider routing, JSON/SSE/native aliases/duplicates/null semantics
+and authentic token path denial are covered separately.
+
 ## Protocol status and bounded remaining work
 
 | Entry | Receipt activation in this slice | Existing path without activation selectors |
@@ -179,14 +217,15 @@ null/owner/input validation, default coordinator409 and finite output410.
 | Anthropic Messages, non-streaming | Actual selected Root run, explicit202 | Existing Messages forwarding |
 | Anthropic Messages, streaming | 400 | Existing Messages SSE forwarding |
 | Anthropic legacy Complete | 501 | Existing legacy forwarding |
-| Gemini Generate / StreamGenerate | 501 | Existing Gemini forwarding |
+| Gemini generateContent, non-streaming | Actual selected Root run, explicit202 | Existing Gemini DTO/model/endpoint-provider forwarding |
+| Gemini streamGenerateContent | 501 | Existing Gemini SSE/default-provider forwarding |
 
 Any mode/session/receipt selector activates fail-closed detection, so incomplete
 activation cannot quietly turn into stateless forwarding. `Idempotency-Key`
 alone remains an ordinary vendor header. Unsupported entries reject the explicit
 extension before conversion/provider/admission; this is a declared gap, not
-multi-protocol activation delivery. The Chat, Responses and Messages adapters share this neutral
-contract without changing the Root core; further vendor adapters remain open. Full vendor completion/stream/tool-event
+multi-protocol activation delivery. The Chat, Responses, Messages and Gemini generateContent adapters
+share this neutral contract without changing the Root core; remaining adapters stay open. Full vendor completion/stream/tool-event
 mapping, token usage accounting, durable event replay, reconnect cursors and
 distributed execution are outside this slice.
 
@@ -204,5 +243,7 @@ protocol forwarding, ordinary Anthropic Messages SSE and original CORS origin/he
 policy. Messages additionally proves execution and Skills with an Anthropic-only
 provider registry plus Native/Chat/Messages idempotency. Responses adds strict input/null
 validation, four-entry replay, and authentic scoped-proxy session preservation
-with activation/cache-replay denial. Existing Native
+with activation/cache-replay denial. Gemini adds strict contents/tools and URL
+selector validation, five-entry replay, preserved ordinary native DTO/model/provider
+routing/SSE, and authentic credential path denial. Existing Native
 ABA/owner/claim/cancellation/Skills and protocol regressions remain required.
