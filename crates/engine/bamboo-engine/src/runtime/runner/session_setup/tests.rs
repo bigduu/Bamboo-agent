@@ -1368,8 +1368,29 @@ fn supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials() {
             .map(|entry| entry.execution_name().to_string())
             .collect::<std::collections::BTreeSet<_>>();
         assert!(names.contains("session_control"));
+        let history = catalog
+            .iter()
+            .find(|entry| entry.execution_name() == "session_history")
+            .unwrap();
+        assert_eq!(
+            history.schema().function.parameters["properties"]["action"]["enum"],
+            serde_json::json!(["read_messages", "get_meta"])
+        );
+        assert!(history
+            .schema()
+            .function
+            .description
+            .contains("explicitly attached"));
         if ultra {
-            assert_eq!(names, ["Read".into(), "session_control".into()].into());
+            assert_eq!(
+                names,
+                [
+                    "Read".into(),
+                    "session_control".into(),
+                    "session_history".into()
+                ]
+                .into()
+            );
         }
         let provider = resolve_available_tool_schemas_for_session(&config, &tools, &supervisor)
             .into_iter()

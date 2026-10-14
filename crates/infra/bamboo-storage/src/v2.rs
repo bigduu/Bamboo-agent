@@ -6789,6 +6789,14 @@ impl Storage for SessionStoreV2 {
         self.management_link(supervisor, target_session_id).await
     }
 
+    async fn load_supervisor_managed_session(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target_session_id: &str,
+    ) -> io::Result<Option<Session>> {
+        self.management_history(supervisor, target_session_id).await
+    }
+
     async fn save_session(&self, session: &Session) -> io::Result<()> {
         let total_started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
