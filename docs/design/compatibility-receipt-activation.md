@@ -2,11 +2,11 @@
 
 This is Bamboo's asynchronous receipt-activation extension, not a vendor
 completion response. The shared contract is independent of OpenAI, Anthropic,
-Gemini, the selected provider, and the model. Non-streaming Chat Completions and
+Gemini, the selected provider, and the model. Non-streaming Chat Completions, Responses and
 Anthropic Messages have explicit adapters. Each validates its own HTTP schema before the
 unchanged neutral Native activation port; Messages does not construct an OpenAI
-request or pass through its ordinary conversion layer. Responses, Anthropic legacy
-Complete and Gemini activation remain open. Ordinary forwarding remains supported
+request or pass through its ordinary conversion layer. Anthropic legacy Complete
+and Gemini activation remain open. Ordinary forwarding remains supported
 at all four protocol surfaces.
 
 ## Shared receipt, run and output contract
@@ -138,13 +138,44 @@ output. Native execute, Chat and Messages replay the same key to the same actual
 run. Default coordinator competition,409/410, stale cancellation, source/input
 isolation and the verified User ceiling remain unchanged and tested.
 
+## Responses entry
+
+`POST /openai/v1/responses` uses the same six single receipt headers, unchanged
+neutral Native idempotency/lease/owned claim/ACK/Ready/spawn, actual-run202 envelope,
+finite exact output and exact cancellation. Its strict four-field receipt body is
+`{"model":"bamboo-agent","input":[]}`, optionally `stream:false` and empty
+`tools:[]` using the own Responses tool schema. Input must be a present empty
+array; text/nonempty transcript, missing/null input, null model/stream/tools and
+every unknown field reject400 before admission/provider. This includes null or
+present instructions, max_output_tokens, previous_response_id, conversation,
+store, tool_choice, reasoning, messages or authority/budget options. The extension
+does not construct a ChatCompletion request or let caller input become authority.
+
+Without receipt selectors, the original `Json<ResponsesCreateRequest>` extractor,
+preparation, conversion, output/stream and scoped request_session_id propagation
+remain unchanged. JSON content-type/compression/size/default/duplicate semantics
+stay on the framework's original extractor; `Idempotency-Key` alone is ordinary
+forwarding. Existing scoped model-proxy credentials are allowed to forward
+ordinary Responses with their actual session context. They **cannot activate a
+Root**, including replay of a cached202: the original HTTP extensions reach the
+unchanged neutral verified User gate, returning403 before Native execution/cache
+lookup. Revocation keeps401 even on loopback.
+
+This is explicit **Bamboo202**, not a standard Responses object, ChatCompletion,
+SDK out-of-box response, stream/usage mapping or durable replay. Standard
+Responses activation completion/error/stream/usage remains open. Tests use actual
+HTTP/Root/Skills EOF/Read/output with synthetic providers, four-entry same-key
+Native/Chat/Messages/Responses, proxy-context and cached-replay denial, strict
+null/owner/input validation, default coordinator409 and finite output410.
+
 ## Protocol status and bounded remaining work
 
 | Entry | Receipt activation in this slice | Existing path without activation selectors |
 | --- | --- | --- |
 | OpenAI Chat, non-streaming | Actual selected Root run, explicit202 | Existing stateless completion forwarding |
 | OpenAI Chat, streaming | 400 | Existing SSE forwarding |
-| OpenAI Responses | 501 | Existing Responses forwarding, scoped Codex model-proxy behavior |
+| OpenAI Responses, non-streaming | Actual selected Root run, explicit202 | Existing Responses forwarding and scoped model-proxy context |
+| OpenAI Responses, streaming | 400 | Existing Responses SSE forwarding |
 | Anthropic Messages, non-streaming | Actual selected Root run, explicit202 | Existing Messages forwarding |
 | Anthropic Messages, streaming | 400 | Existing Messages SSE forwarding |
 | Anthropic legacy Complete | 501 | Existing legacy forwarding |
@@ -154,7 +185,7 @@ Any mode/session/receipt selector activates fail-closed detection, so incomplete
 activation cannot quietly turn into stateless forwarding. `Idempotency-Key`
 alone remains an ordinary vendor header. Unsupported entries reject the explicit
 extension before conversion/provider/admission; this is a declared gap, not
-multi-protocol activation delivery. The Chat and Messages adapters share this neutral
+multi-protocol activation delivery. The Chat, Responses and Messages adapters share this neutral
 contract without changing the Root core; further vendor adapters remain open. Full vendor completion/stream/tool-event
 mapping, token usage accounting, durable event replay, reconnect cursors and
 distributed execution are outside this slice.
@@ -171,5 +202,7 @@ invalid/duplicate/partial/foreign selectors and rejected authority options;
 verified owner ceiling; declared unsupported protocol entries; original four
 protocol forwarding, ordinary Anthropic Messages SSE and original CORS origin/header
 policy. Messages additionally proves execution and Skills with an Anthropic-only
-provider registry plus three-entry Native/Chat/Messages idempotency. Existing Native
+provider registry plus Native/Chat/Messages idempotency. Responses adds strict input/null
+validation, four-entry replay, and authentic scoped-proxy session preservation
+with activation/cache-replay denial. Existing Native
 ABA/owner/claim/cancellation/Skills and protocol regressions remain required.
