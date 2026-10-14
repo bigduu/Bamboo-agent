@@ -118,7 +118,27 @@ async fn start_output_receipt(
     )
     .await
     .unwrap();
-    (input, body["run_id"].as_str().unwrap().to_owned())
+    let run = body["run_id"].as_str().unwrap().to_owned();
+    // Provider production precedes the asynchronous fenced forwarder. Wait
+    // for real HTTP publication, rather than treating provider entry as ACK.
+    let birth = input["session_created_at"].as_str().unwrap();
+    let expected = format!("visible answer for {key}");
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let (status, published) = output(state, id, &run, Some(birth)).await;
+            assert_eq!(status, StatusCode::OK, "{published}");
+            if published["output"]["messages"]
+                .as_array()
+                .is_some_and(|messages| messages.iter().any(|m| m["content"] == expected))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("selected visible text was not published through the real HTTP output boundary");
+    (input, run)
 }
 async fn committed_output(state: &web::Data<AppState>, id: &str, run: &str, birth: &str) -> Value {
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
