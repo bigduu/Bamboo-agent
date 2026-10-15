@@ -175,7 +175,7 @@ impl AgentStepPort for StructuredAttemptGate {
             self.0.first_agent_returned.store(true, Ordering::SeqCst);
             // A real measured result, rejected by the definition's output
             // schema. The existing structured-output loop would try again.
-            json!({"accepted":false})
+            json!("invalid structured output")
         } else {
             assert!(self.0.a_collapsed.lock().unwrap().is_some());
             self.0.a_return_allowed.notify_one();
@@ -226,7 +226,7 @@ async fn run_await_window(branch: WaitingBranch, restricted: bool) {
             failure: FailurePolicy::FailFast,
             output_schema: Some(json!({
                 "type":"object",
-                "properties":{"accepted":{"const":true}},
+                "properties":{"accepted":{"type":"boolean"}},
                 "required":["accepted"],
                 "additionalProperties":false
             })),
