@@ -35,6 +35,11 @@ pub enum ProjectStoreError {
     Json(#[from] serde_json::Error),
     #[error("unsupported project manifest schema {found}; this reader supports up to {supported}")]
     UnsupportedManifestSchema { found: u64, supported: u32 },
+    #[error("project {project_id} schema-{schema_version} manifest differs from its saved migration snapshot; preserve both copies and resolve the conflict before retrying")]
+    LegacyMigrationConflict {
+        project_id: ProjectId,
+        schema_version: u32,
+    },
     #[error("project {0} was not found")]
     NotFound(ProjectId),
     #[error("project {0} already exists")]
@@ -1081,10 +1086,20 @@ impl ProjectStore {
         // Old binaries try their recovery backup after rejecting a newer
         // primary schema. Keep the exact legacy bytes for inspection outside
         // that recovery path, and fence both writable copies with v3.
-        write_bytes_atomic(
-            &home.join(format!("project.json.migrated-v{legacy_schema_version}")),
-            legacy_bytes,
-        )?;
+        // An old reader may have rewritten the still-legacy primary after
+        // interruption. Never replace the only raw snapshot with those bytes;
+        // divergent copies require explicit reconciliation.
+        let snapshot = home.join(format!("project.json.migrated-v{legacy_schema_version}"));
+        if validate_regular_file_if_exists(&snapshot, "project migration snapshot")? {
+            if read_regular_file(&snapshot, "project migration snapshot")? != legacy_bytes {
+                return Err(ProjectStoreError::LegacyMigrationConflict {
+                    project_id: project_id.clone(),
+                    schema_version: legacy_schema_version,
+                });
+            }
+        } else {
+            write_bytes_atomic(&snapshot, legacy_bytes)?;
+        }
         write_json_atomic(&home.join(PROJECT_MANIFEST_BACKUP_FILE), &candidate)?;
         self.write_manifest_revision_floor(project_id, candidate.revision)?;
         write_json_atomic(&self.paths.manifest_path(project_id), &candidate)?;
@@ -3467,6 +3482,152 @@ mod tests {
         assert!(store.index().unwrap().projects[&project.id]
             .section
             .is_none());
+    }
+
+    #[test]
+    fn changed_legacy_manifest_cannot_overwrite_saved_migration_snapshot() {
+        for version in [1, 2] {
+            let (temp, store) = store();
+            let project = store.create("original metadata", None).unwrap();
+            let healthy = store.create("healthy", None).unwrap();
+            let home = store.paths().project_home(&project.id);
+            let primary = store.paths().manifest_path(&project.id);
+            let backup = home.join(PROJECT_MANIFEST_BACKUP_FILE);
+            let floor = store.paths().manifest_revision_path(&project.id);
+            let snapshot = home.join(format!("project.json.migrated-v{version}"));
+            let mut original = serde_json::to_value(&project).unwrap();
+            original["schema_version"] = serde_json::json!(version);
+            original["sidebar"] = serde_json::to_value(sidebar()).unwrap();
+            original["unknown_legacy_field"] = serde_json::json!({"retained": [1, 2, 3]});
+            let original_bytes = serde_json::to_vec_pretty(&original).unwrap();
+            std::fs::write(&snapshot, &original_bytes).unwrap();
+
+            // A cooperating old writer can change a still-readable primary
+            // after an interrupted migration. Its fields must not replace the
+            // first snapshot, nor may recovery silently discard its edits.
+            let mut changed = original;
+            changed.as_object_mut().unwrap().remove("sidebar");
+            changed
+                .as_object_mut()
+                .unwrap()
+                .remove("unknown_legacy_field");
+            changed["name"] = serde_json::json!("metadata edited by old writer");
+            changed["revision"] = serde_json::json!(3);
+            let changed_bytes = serde_json::to_vec_pretty(&changed).unwrap();
+            std::fs::write(&primary, &changed_bytes).unwrap();
+            std::fs::write(&backup, &changed_bytes).unwrap();
+            store.write_manifest_revision_floor(&project.id, 3).unwrap();
+            let files = [primary, backup, floor, snapshot];
+            let before = files.each_ref().map(|path| std::fs::read(path).unwrap());
+            assert!(matches!(
+                store.get(&project.id),
+                Err(ProjectStoreError::LegacyMigrationConflict { project_id, schema_version })
+                    if project_id == project.id && schema_version == version
+            ));
+            let mut mutated = false;
+            assert!(matches!(
+                store.update(&project.id, 3, |_| {
+                    mutated = true;
+                    Ok(())
+                }),
+                Err(ProjectStoreError::LegacyMigrationConflict { .. })
+            ));
+            assert!(!mutated);
+            assert_eq!(
+                files.each_ref().map(|path| std::fs::read(path).unwrap()),
+                before
+            );
+
+            drop(store);
+            let reopened = ProjectStore::open(temp.path()).unwrap();
+            assert!(!reopened.index().unwrap().projects.contains_key(&project.id));
+            assert!(reopened.index().unwrap().projects.contains_key(&healthy.id));
+            assert_eq!(
+                files.each_ref().map(|path| std::fs::read(path).unwrap()),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn identical_legacy_snapshot_resumes_each_interrupted_migration_prefix() {
+        for version in [1, 2] {
+            for stage in ["snapshot", "backup", "floor"] {
+                let (_temp, store) = store();
+                let project = store.create("resume original", None).unwrap();
+                let home = store.paths().project_home(&project.id);
+                let mut legacy = project.clone();
+                legacy.schema_version = version;
+                legacy.sidebar = Some(sidebar());
+                let original = serde_json::to_vec_pretty(&legacy).unwrap();
+                std::fs::write(store.paths().manifest_path(&project.id), &original).unwrap();
+                let snapshot = home.join(format!("project.json.migrated-v{version}"));
+                std::fs::write(&snapshot, &original).unwrap();
+                let mut candidate = legacy.clone();
+                candidate.schema_version = PROJECT_MANIFEST_SCHEMA_VERSION;
+                candidate.revision = 2;
+                let backup = home.join(PROJECT_MANIFEST_BACKUP_FILE);
+                if stage == "snapshot" {
+                    std::fs::write(&backup, &original).unwrap();
+                } else {
+                    write_json_atomic(&backup, &candidate).unwrap();
+                }
+                if stage == "floor" {
+                    store.write_manifest_revision_floor(&project.id, 2).unwrap();
+                }
+                let migrated = store.get(&project.id).unwrap();
+                assert_eq!(migrated.sidebar, legacy.sidebar);
+                assert_eq!(migrated.schema_version, PROJECT_MANIFEST_SCHEMA_VERSION);
+                assert_eq!(migrated.revision, if stage == "floor" { 3 } else { 2 });
+                assert_eq!(std::fs::read(&snapshot).unwrap(), original);
+                let saved_backup: ProjectManifest =
+                    serde_json::from_slice(&std::fs::read(&backup).unwrap()).unwrap();
+                assert_eq!(saved_backup, migrated);
+                assert_eq!(store.get(&project.id).unwrap(), migrated);
+                let updated = store
+                    .update(&project.id, migrated.revision, |manifest| {
+                        manifest.description =
+                            Some("current-schema update remains available".into());
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(updated.sidebar, migrated.sidebar);
+                assert_eq!(std::fs::read(&snapshot).unwrap(), original);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_snapshot_symlink_is_rejected_without_canonical_writes() {
+        use std::os::unix::fs::symlink;
+
+        let (_temp, store) = store();
+        let project = store.create("snapshot confinement", None).unwrap();
+        let home = store.paths().project_home(&project.id);
+        let primary = store.paths().manifest_path(&project.id);
+        let mut legacy = project.clone();
+        legacy.schema_version = 2;
+        let original = serde_json::to_vec_pretty(&legacy).unwrap();
+        std::fs::write(&primary, &original).unwrap();
+        let backup = home.join(PROJECT_MANIFEST_BACKUP_FILE);
+        std::fs::write(&backup, &original).unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), &original).unwrap();
+        let snapshot = home.join("project.json.migrated-v2");
+        symlink(outside.path(), &snapshot).unwrap();
+        assert!(matches!(
+            store.get(&project.id),
+            Err(ProjectStoreError::Validation(_))
+        ));
+        assert!(std::fs::symlink_metadata(&snapshot)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(outside.path()).unwrap(), original);
+        assert_eq!(std::fs::read(primary).unwrap(), original);
+        assert_eq!(std::fs::read(backup).unwrap(), original);
+        assert_eq!(store.read_manifest_revision_floor(&project.id).unwrap(), 1);
     }
 
     #[test]
