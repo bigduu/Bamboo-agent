@@ -310,6 +310,62 @@ mod background_outcomes {
     }
 
     #[tokio::test]
+    async fn released_wait_keeps_late_siblings_on_the_same_owners_successor() {
+        for (policy, first_status) in [
+            (ChildWaitPolicy::Any, "completed"),
+            (ChildWaitPolicy::FirstError, "error"),
+        ] {
+            let (_home, store, inbox, coordinator, reservations, launches) =
+                completion_inbox_fixture().await;
+            let parent_id = "released-wait-parent";
+            save_waiting_test_parent(
+                &store,
+                parent_id,
+                vec!["first-child".into(), "late-sibling".into()],
+                policy,
+            )
+            .await;
+            save_completion_test_child(&store, parent_id, "late-sibling", "running").await;
+            let first =
+                save_completion_test_child(&store, parent_id, "first-child", first_status).await;
+            let router = coordinator.agent.activation_router().unwrap();
+            router.set_inbox(inbox.clone());
+            let mut owner = router.register_run(parent_id, "parent-turn").await.unwrap();
+
+            coordinator.on_child_completed(first).await;
+            assert!(
+                read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
+                    .waiting_for_children
+                    .is_none()
+            );
+            // The durable wait is gone, but the current reasoning owner still
+            // predates its release. A later sibling must not overtake the first
+            // outcome merely because a fresh control-plane read now says None.
+            let late =
+                save_completion_test_child(&store, parent_id, "late-sibling", "completed").await;
+            coordinator.on_child_completed(late).await;
+            assert!(inbox
+                .claim_for_turn(parent_id, 8, Some("parent-turn"))
+                .await
+                .unwrap()
+                .is_empty());
+            owner.begin_finalization().await;
+            owner.finish(0).await.unwrap();
+            assert_eq!(reservations.load(Ordering::SeqCst), 1);
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+            let successor = router.current_run_id(parent_id).await.unwrap();
+            let claims = inbox
+                .claim_for_turn(parent_id, 8, Some(&successor))
+                .await
+                .unwrap();
+            assert_eq!(claims.len(), 2);
+            assert!(claims
+                .iter()
+                .all(|claim| claim.envelope.child_outcome_waits_for_run("parent-turn")));
+        }
+    }
+
+    #[tokio::test]
     async fn guardian_control_without_a_child_wait_still_waits_for_successor() {
         let (_home, store, inbox, coordinator, reservations, launches) =
             completion_inbox_fixture().await;
@@ -351,6 +407,15 @@ mod background_outcomes {
             .await
             .unwrap()
             .is_empty());
+        let background =
+            save_completion_test_child(&store, &parent.id, "after-guardian-child", "completed")
+                .await;
+        coordinator.on_child_completed(background).await;
+        assert!(inbox
+            .claim_for_turn(&parent.id, 8, Some("parent-turn"))
+            .await
+            .unwrap()
+            .is_empty());
         owner.begin_finalization().await;
         owner.finish(0).await.unwrap();
         assert_eq!(reservations.load(Ordering::SeqCst), 1);
@@ -360,10 +425,10 @@ mod background_outcomes {
             .claim_for_turn(&parent.id, 8, Some(&successor))
             .await
             .unwrap();
-        assert_eq!(claims.len(), 1);
-        assert!(claims[0]
-            .envelope
-            .child_outcome_waits_for_run("parent-turn"));
+        assert_eq!(claims.len(), 2);
+        assert!(claims
+            .iter()
+            .all(|claim| claim.envelope.child_outcome_waits_for_run("parent-turn")));
     }
 
     #[tokio::test]
