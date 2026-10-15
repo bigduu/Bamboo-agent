@@ -18,7 +18,7 @@ use bamboo_domain::{
 };
 use chrono::Utc;
 use fs2::FileExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -33,6 +33,8 @@ pub enum ProjectStoreError {
     Io(#[from] std::io::Error),
     #[error("project document is invalid")]
     Json(#[from] serde_json::Error),
+    #[error("unsupported project manifest schema {found}; this reader supports up to {supported}")]
+    UnsupportedManifestSchema { found: u64, supported: u32 },
     #[error("project {0} was not found")]
     NotFound(ProjectId),
     #[error("project {0} already exists")]
@@ -332,6 +334,8 @@ impl ProjectStore {
     /// Open the registry and rebuild its derived index. Corrupt individual
     /// manifests are recovered from their last-known-good backup when possible;
     /// otherwise they are quarantined and skipped rather than blocking startup.
+    /// Readable future-schema manifests are skipped without recovery or changes
+    /// to their canonical primary, backup or revision floor.
     pub fn open(data_dir: impl Into<PathBuf>) -> ProjectStoreResult<Self> {
         let data_dir = prepare_data_dir(data_dir.into())?;
         let paths = ProjectPaths::new(data_dir);
@@ -1014,6 +1018,7 @@ impl ProjectStore {
                 ),
                 None => self.normalize_manifest_revision_locked(decoded.manifest),
             },
+            Err(error @ ProjectStoreError::UnsupportedManifestSchema { .. }) => Err(error),
             Err(primary_error) => {
                 let quarantine =
                     path.with_file_name(format!("project.json.corrupt.{}", Uuid::new_v4()));
@@ -1233,6 +1238,21 @@ struct DecodedManifest {
 }
 
 fn decode_manifest(bytes: &[u8], expected_id: &ProjectId) -> ProjectStoreResult<DecodedManifest> {
+    // A future format may also change fields this reader knows. Check only
+    // its version before decoding the current DTO, so an incompatible field
+    // cannot send a readable newer manifest through corruption recovery.
+    #[derive(Deserialize)]
+    struct ManifestSchema {
+        schema_version: u64,
+    }
+    let schema: ManifestSchema = serde_json::from_slice(bytes)?;
+    if schema.schema_version > u64::from(PROJECT_MANIFEST_SCHEMA_VERSION) {
+        return Err(ProjectStoreError::UnsupportedManifestSchema {
+            found: schema.schema_version,
+            supported: PROJECT_MANIFEST_SCHEMA_VERSION,
+        });
+    }
+
     let mut manifest: ProjectManifest = serde_json::from_slice(bytes)?;
     let migrated_from = match manifest.schema_version {
         1 => {
@@ -3447,6 +3467,169 @@ mod tests {
         assert!(store.index().unwrap().projects[&project.id]
             .section
             .is_none());
+    }
+
+    #[test]
+    fn future_manifest_rejects_get_and_update_without_recovery() {
+        for version in [
+            u64::from(PROJECT_MANIFEST_SCHEMA_VERSION) + 1,
+            u64::from(u32::MAX) + 1,
+            u64::MAX,
+        ] {
+            for changed_shape in [false, true] {
+                let (_temp, store) = store();
+                let created = store.create("Future Project", None).unwrap();
+                let current = store
+                    .update(&created.id, created.revision, |manifest| {
+                        manifest.sidebar = Some(sidebar());
+                        Ok(())
+                    })
+                    .unwrap();
+                let mut future = serde_json::to_value(&current).unwrap();
+                future["schema_version"] = serde_json::json!(version);
+                future["revision"] = serde_json::json!(9);
+                future["future_fields"] = serde_json::json!({"preserve": ["unknown", 42]});
+                if changed_shape {
+                    future["status"] = serde_json::json!({"new_state": true});
+                    future.as_object_mut().unwrap().remove("name");
+                }
+                let home = store.paths().project_home(&current.id);
+                let primary = store.paths().manifest_path(&current.id);
+                std::fs::write(&primary, serde_json::to_vec_pretty(&future).unwrap()).unwrap();
+                store
+                    .write_manifest_revision_floor(&current.id, 17)
+                    .unwrap();
+                let snapshot = || {
+                    std::fs::read_dir(&home)
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .filter(|entry| entry.file_type().unwrap().is_file())
+                        .map(|entry| (entry.file_name(), std::fs::read(entry.path()).unwrap()))
+                        .collect::<BTreeMap<_, _>>()
+                };
+                let before = snapshot();
+
+                assert!(matches!(
+                    store.get(&current.id),
+                    Err(ProjectStoreError::UnsupportedManifestSchema { found, supported })
+                        if found == version && supported == PROJECT_MANIFEST_SCHEMA_VERSION
+                ));
+                assert_eq!(snapshot(), before);
+
+                let mut mutated = false;
+                assert!(matches!(
+                    store.update(&current.id, current.revision, |_| {
+                        mutated = true;
+                        Ok(())
+                    }),
+                    Err(ProjectStoreError::UnsupportedManifestSchema { found, .. })
+                        if found == version
+                ));
+                assert!(
+                    !mutated,
+                    "unsupported data must never reach the mutation callback"
+                );
+                assert_eq!(
+                    snapshot(),
+                    before,
+                    "no recovery, migration or floor write is allowed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn startup_skips_future_manifest_without_rewriting_canonical_files() {
+        let (temp, store) = store();
+        let future = store.create("Future Project", None).unwrap();
+        let current = store
+            .update(&future.id, future.revision, |manifest| {
+                manifest.sidebar = Some(sidebar());
+                Ok(())
+            })
+            .unwrap();
+        let healthy = store.create("Supported Project", None).unwrap();
+        let mut value = serde_json::to_value(&current).unwrap();
+        value["schema_version"] = serde_json::json!(PROJECT_MANIFEST_SCHEMA_VERSION + 1);
+        value["future_fields"] = serde_json::json!({"retained": true});
+        let primary = store.paths().manifest_path(&current.id);
+        let backup = store
+            .paths()
+            .project_home(&current.id)
+            .join(PROJECT_MANIFEST_BACKUP_FILE);
+        let floor = store.paths().manifest_revision_path(&current.id);
+        std::fs::write(&primary, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        store
+            .write_manifest_revision_floor(&current.id, 17)
+            .unwrap();
+        let canonical = [primary, backup, floor];
+        let before = canonical
+            .each_ref()
+            .map(|path| std::fs::read(path).unwrap());
+        drop(store);
+
+        let reopened = ProjectStore::open(temp.path()).unwrap();
+        let index = reopened.index().unwrap();
+        assert!(!index.projects.contains_key(&current.id));
+        assert!(index.projects.contains_key(&healthy.id));
+        assert_eq!(reopened.list().unwrap(), vec![healthy]);
+        assert!(matches!(
+            reopened.get(&current.id),
+            Err(ProjectStoreError::UnsupportedManifestSchema { .. })
+        ));
+        assert_eq!(
+            canonical
+                .each_ref()
+                .map(|path| std::fs::read(path).unwrap()),
+            before
+        );
+        assert!(
+            std::fs::read_dir(reopened.paths().project_home(&current.id))
+                .unwrap()
+                .map(Result::unwrap)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("project.json.corrupt."))
+        );
+    }
+
+    #[test]
+    fn supported_manifest_decode_and_validation_errors_still_recover() {
+        for invalid_type in [false, true] {
+            let (_temp, store) = store();
+            let created = store.create("Supported recovery", None).unwrap();
+            let updated = store
+                .update(&created.id, created.revision, |manifest| {
+                    manifest.description = Some("latest".into());
+                    Ok(())
+                })
+                .unwrap();
+            let mut corrupt = serde_json::to_value(&updated).unwrap();
+            corrupt["name"] = if invalid_type {
+                serde_json::json!({"invalid": "name"})
+            } else {
+                serde_json::json!("")
+            };
+            let primary = store.paths().manifest_path(&created.id);
+            std::fs::write(&primary, serde_json::to_vec_pretty(&corrupt).unwrap()).unwrap();
+            store
+                .write_manifest_revision_floor(&created.id, 17)
+                .unwrap();
+
+            let recovered = store.get(&created.id).unwrap();
+            assert_eq!(recovered.name, created.name);
+            assert_eq!(recovered.description, created.description);
+            assert_eq!(recovered.schema_version, PROJECT_MANIFEST_SCHEMA_VERSION);
+            assert_eq!(recovered.revision, 18);
+            assert!(matches!(
+                store.update(&created.id, 17, |_| Ok(())),
+                Err(ProjectStoreError::Conflict {
+                    expected: 17,
+                    actual: 18
+                })
+            ));
+        }
     }
 
     #[test]
