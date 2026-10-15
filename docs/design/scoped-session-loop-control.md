@@ -92,6 +92,17 @@ unapplied command. Never call generic `request_activation` as a substitute: it
 can reserve a successor when no owner exists. A human wait is preserved; this
 first slice may reject/defer mutations there, and never answers it.
 
+An applied remote objective and its pending/active objective revision must also
+retain the original initiator, link, host-grant and target-lifetime binding.
+Before every later provider-round or iteration admission for that remote-directed
+work, recheck the same canonical authority through the admission linearization
+point. Do not retain storage locks across a model call. Revocation or failed
+revalidation forbids further admission for that remote objective and records an
+explicit reason. The target's existing self opt-in cannot silently convert it
+to self-authorized work. Preserve already-admitted work boundaries and do not
+roll back external effects. Exact terminal status, explicit authority transfer
+and recovery semantics remain later design decisions, not defaults added here.
+
 ## Target owner and persistence ordering
 
 The target retains its context, provider/model, workspace, permissions,
