@@ -20,6 +20,11 @@ use std::{
     time::Duration,
 };
 
+// A Host's chosen port is briefly unbound between reservation and exec.
+// Keep this binary's other listeners out of that handoff; only startup is
+// serialized, while the actual Actor/provider scenarios still run together.
+static FIXTURE_LISTENER_ADMISSION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Probe {
     root_calls: AtomicUsize,
     followup_turn: AtomicUsize,
@@ -945,6 +950,8 @@ async fn fixture_sessions_poll_survives_idle_peer_close() {
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::sync::mpsc;
 
+    let _listener_admission = FIXTURE_LISTENER_ADMISSION.lock().await;
+
     fn accept_bounded(listener: &TcpListener) -> std::io::Result<TcpStream> {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
@@ -974,7 +981,16 @@ async fn fixture_sessions_poll_survives_idle_peer_close() {
             request.push(byte[0]);
             assert!(request.len() < 8192, "bounded request head");
         }
-        assert!(request.starts_with(b"GET /api/v1/sessions HTTP/1.1"));
+        assert!(
+            request.starts_with(b"GET /api/v1/sessions HTTP/1.1"),
+            "unexpected fixture request line: {:?}",
+            String::from_utf8_lossy(
+                request
+                    .split(|byte| *byte == b'\r')
+                    .next()
+                    .unwrap_or_default()
+            )
+        );
         let body = r#"{"sessions":[{"id":"plain-root","is_running":false}]}"#;
         write!(
             peer,
@@ -1116,6 +1132,7 @@ async fn fixture_with_followups(
     recovery: bool,
     two: Option<TwoFollowups>,
 ) {
+    let listener_admission = FIXTURE_LISTENER_ADMISSION.lock().await;
     let temp = tempfile::tempdir().unwrap();
     let temp_root = temp.path().canonicalize().unwrap();
     let data = temp_root.join("host");
@@ -1209,6 +1226,7 @@ async fn fixture_with_followups(
     })
     .await
     .unwrap();
+    drop(listener_admission);
     let response = client.post(format!("{base}/chat")).json(&json!({"session_id":"plain-root","message":"Delegate one plain answer","model":"plain-root","provider":"openai","model_ref":{"provider":"openai","model":"plain-root"},"thinking_mode":if ultra {"ultra"} else {"standard"},"permission_mode":"bypass","workspace_path":workspace,"project_id":project.id})).send().await.unwrap();
     assert!(
         response.status().is_success(),
@@ -1378,6 +1396,7 @@ async fn fixture_with_followups(
             bounded_diagnostic(&provider_host_phase(&probe).await.to_string(), 2048)
         );
         assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
+        let restart_admission = FIXTURE_LISTENER_ADMISSION.lock().await;
         drop(host); // Actual kill/wait; absence of Host is not our pre-release proof.
         drop(fault);
         probe.release.store(false, Ordering::SeqCst);
@@ -1397,6 +1416,7 @@ async fn fixture_with_followups(
         })
         .await
         .unwrap();
+        drop(restart_admission);
         let cold_cut = SessionStoreV2::new(data.clone())
             .await
             .unwrap()
@@ -2486,6 +2506,7 @@ async fn root_catalog_turn(
 }
 
 async fn root_catalog_fixture() {
+    let listener_admission = FIXTURE_LISTENER_ADMISSION.lock().await;
     let temp = tempfile::tempdir().unwrap();
     let root_dir = temp.path().canonicalize().unwrap();
     let data = root_dir.join("host");
@@ -2576,6 +2597,7 @@ async fn root_catalog_fixture() {
     })
     .await
     .expect("actual Root catalog Host health");
+    drop(listener_admission);
 
     let standard = root_catalog_turn(
         &client,
@@ -3190,6 +3212,7 @@ async fn message_only_fixture(
     browser: Option<ActorBrowserFixture>,
     execution: MessageOnlyExecution,
 ) {
+    let listener_admission = FIXTURE_LISTENER_ADMISSION.lock().await;
     let temp = tempfile::tempdir().unwrap();
     // Drop the log receipt guard before the temporary fixture data disappears.
     let mut browser = browser;
@@ -3295,6 +3318,7 @@ async fn message_only_fixture(
     })
     .await
     .unwrap();
+    drop(listener_admission);
     let chat = client.post(format!("{base}/chat")).json(&json!({"session_id":"plain-root","message":"Delegate one bounded assignment and report that it was delegated. The Child performs it.","model":"plain-root","provider":"openai","model_ref":{"provider":"openai","model":"plain-root"},"thinking_mode":"ultra","permission_mode":"bypass","workspace_path":workspace,"project_id":project.id})).send().await.unwrap();
     assert!(
         chat.status().is_success(),
@@ -3613,6 +3637,11 @@ async fn message_only_fixture(
         );
         assert_eq!(browser.wait("restart", &mut host).await["restart"], true);
     }
+    let restart_admission = if browser.is_some() {
+        Some(FIXTURE_LISTENER_ADMISSION.lock().await)
+    } else {
+        None
+    };
     let (killed, waited) = host.kill_and_wait("completed_before_cold_reopen");
     killed.unwrap();
     waited.unwrap();
@@ -3704,6 +3733,7 @@ async fn message_only_fixture(
         })
         .await
         .unwrap();
+        drop(restart_admission);
         browser.phase(
             "restarted",
             json!({"restarted":true,"host_pid":restarted_host_pid,
