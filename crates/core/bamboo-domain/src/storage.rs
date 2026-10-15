@@ -469,6 +469,18 @@ pub trait Storage: Send + Sync {
     /// Loads a session by ID, returns None if not found.
     async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>>;
 
+    /// Read a full durable Session for execution admission without repairing an
+    /// index or granting execution/write authority. Canonical backends retain
+    /// their strict identity and lifetime checks, including the complete main
+    /// history needed to detect pending input. Uncached legacy backends keep
+    /// their existing full loader; a control-only snapshot is not sufficient.
+    async fn load_execution_admission_snapshot(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        self.load_session(session_id).await
+    }
+
     /// Deletes a session, returns true if anything was deleted.
     async fn delete_session(&self, session_id: &str) -> std::io::Result<bool>;
 
