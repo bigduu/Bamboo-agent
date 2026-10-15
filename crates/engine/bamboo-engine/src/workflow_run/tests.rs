@@ -3228,6 +3228,45 @@ async fn unowned_running_tool_is_killed_before_workflow_suspends() {
     ));
 }
 
+#[tokio::test]
+async fn restricted_inline_workflow_running_fails_instead_of_creating_a_wait() {
+    let directory = tempfile::tempdir().unwrap();
+    let killed = Arc::new(AtomicBool::new(false));
+    let repository =
+        Arc::new(FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap());
+    let engine = WorkflowRunEngine::new(
+        repository.clone(),
+        Arc::new(RunningTools(killed.clone())),
+        Arc::new(MockAgents),
+        Arc::new(MockDefinitions::default()),
+        Arc::new(MockPolicy),
+        Arc::new(MockSecrets),
+        budgets(),
+    );
+    let workflow = definition(
+        vec![tool_step("detached", "detached", json!({}))],
+        WorkflowPlan::Step {
+            step: "detached".to_string(),
+        },
+    );
+    // This is the explicit inline run entry, not the independent background
+    // Start/Restart runtime. Only the caller's existing host scope applies.
+    let failed = bamboo_agent_core::tools::with_suspension_disabled(
+        engine.run(request(workflow, json!({}))),
+    )
+    .await
+    .unwrap();
+    assert!(killed.load(Ordering::SeqCst));
+    assert_eq!(failed.status, WorkflowRunStatus::Failed);
+    assert!(failed.suspension.is_none());
+    let error = failed.failure.as_ref().unwrap();
+    assert_eq!(error.code, WorkflowFailureCode::ExecutionFailed);
+    assert_eq!(error.message, "workflow tool reported failure");
+    let stored = repository.load(&failed.run_id).await.unwrap().unwrap();
+    assert_eq!(stored.status, WorkflowRunStatus::Failed);
+    assert!(stored.suspension.is_none());
+}
+
 struct UnpricedWorkflowAgents {
     calls: AtomicUsize,
     fail: bool,

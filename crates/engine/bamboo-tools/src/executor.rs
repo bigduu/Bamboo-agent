@@ -5722,4 +5722,56 @@ mod tests {
             assert!(!path.exists());
         }
     }
+
+    mod owned_suspension_rebind_tests {
+        use super::*;
+        use bamboo_agent_core::tools::with_suspension_disabled;
+        #[tokio::test]
+        async fn managed_owned_builtin_keeps_suspension_denial_before_background_bash_spawn() {
+            let directory = tempfile::tempdir().unwrap();
+            let session_id = "owned-rebind-background-probe";
+            let resources =
+                crate::LocalTaskResources::new(session_id, "probe-run", chrono::Utc::now());
+            let executor = BuiltinToolExecutor::new();
+            let call = make_tool_call(
+                "Bash",
+                json!({"command":"exit 0","run_in_background":true,"workdir":directory.path()}),
+            );
+            let (tx, mut rx) = mpsc::channel(32);
+            let ctx = ToolExecutionContext {
+                session_id: Some(session_id),
+                event_tx: Some(&tx),
+                can_async_resume: true,
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let result = with_suspension_disabled(
+                resources.scope(executor.execute_with_context_outcome(&call, ctx)),
+            )
+            .await;
+            // A RED may have spawned this fixture's exact short shell. Clean
+            // only its returned handle and drain this fixture before asserting.
+            if let Ok(ToolOutcome::Completed(output)) = &result {
+                if let Some(id) = serde_json::from_str::<serde_json::Value>(&output.result)
+                    .ok()
+                    .and_then(|v| v["bash_id"].as_str().map(str::to_owned))
+                {
+                    if let Some(shell) = crate::tools::bash_runtime::get_shell(&id) {
+                        let _ = shell.kill().await;
+                    }
+                }
+            }
+            let drained = resources.close_and_drain().await;
+            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(
+                matches!(result,Err(ToolError::Execution(ref text)) if text.contains("suspension_disabled")),
+                "{result:?}"
+            );
+            drained.unwrap();
+            assert!(
+                events.is_empty(),
+                "no detached shell event should be published: {events:?}"
+            );
+            assert!(crate::tools::bash_runtime::running_shells_for_session(session_id).is_empty());
+        }
+    }
 }

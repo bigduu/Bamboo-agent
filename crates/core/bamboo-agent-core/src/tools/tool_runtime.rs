@@ -340,3 +340,6 @@ mod tests {
         assert!(ctx.cloned_async_completion_sink().is_none());
     }
 }
+
+#[cfg(test)]
+mod restricted_running_tests;

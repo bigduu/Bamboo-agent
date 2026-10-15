@@ -1756,4 +1756,89 @@ mod tests {
             assert!(!events.iter().any(|event|matches!(event,AgentEvent::ToolComplete{tool_call_id,result} if ["nested-question","nested-wait"].contains(&tool_call_id.as_str()) && result.success)));
         }
     }
+
+    mod running_scope_queue_tests {
+        use super::*;
+        use crate::tools::{
+            with_suspension_disabled, AsyncWaitKind, RunningCompletion, RunningHandle, ToolOutcome,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Executor {
+            calls: std::sync::Mutex<Vec<String>>,
+            kills: Arc<AtomicUsize>,
+        }
+        impl Executor {
+            fn dispatch(&self, call: &ToolCall) -> ToolOutcome {
+                self.calls.lock().unwrap().push(call.function.name.clone());
+                if call.function.name == "running" {
+                    let kills = self.kills.clone();
+                    ToolOutcome::Running(RunningHandle {
+                        tool_call_id: call.id.clone(),
+                        ack: ToolResult::text(true, "running ack"),
+                        completion: RunningCompletion::Detached,
+                        wait_kind: AsyncWaitKind::AsyncTools,
+                        kill: Box::new(move || {
+                            kills.fetch_add(1, Ordering::SeqCst);
+                        }),
+                    })
+                } else {
+                    ToolOutcome::Completed(ToolResult::text(true, "later action"))
+                }
+            }
+        }
+        #[async_trait]
+        impl ToolExecutor for Executor {
+            async fn execute(&self, call: &ToolCall) -> crate::tools::executor::Result<ToolResult> {
+                Ok(self.dispatch(call).into_tool_result())
+            }
+            async fn execute_with_context_outcome(
+                &self,
+                call: &ToolCall,
+                _: ToolExecutionContext<'_>,
+            ) -> crate::tools::executor::Result<ToolOutcome> {
+                Ok(self.dispatch(call))
+            }
+            fn list_tools(&self) -> Vec<ToolSchema> {
+                vec![]
+            }
+        }
+        #[tokio::test]
+        async fn restricted_recursive_queue_refuses_running_and_stops_before_later_dispatch() {
+            let kills = Arc::new(AtomicUsize::new(0));
+            let tools = Executor {
+                calls: std::sync::Mutex::new(vec![]),
+                kills: kills.clone(),
+            };
+            let mut session = Session::new("restricted-running-queue", "synthetic-only");
+            let (tx, mut rx) = mpsc::channel(32);
+            let outcome = with_suspension_disabled(execute_sub_actions(
+                &[
+                    make_tool_call("nested-running", "running", "{}"),
+                    make_tool_call("not-dispatched", "later", "{}"),
+                ],
+                &tx,
+                &mut session,
+                &tools,
+                ToolExecutionSessionFlags::default(),
+                None,
+            ))
+            .await;
+            assert_eq!(outcome, ToolHandlingOutcome::Continue);
+            assert_eq!(*tools.calls.lock().unwrap(), ["running"]);
+            assert_eq!(kills.load(Ordering::SeqCst), 1);
+            let pairs = session
+                .messages
+                .iter()
+                .filter(|m| m.tool_call_id.as_deref() == Some("nested-running"))
+                .collect::<Vec<_>>();
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(pairs[0].tool_success, Some(false));
+            assert!(!session
+                .messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("not-dispatched")));
+            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(!events.iter().any(|e|matches!(e,AgentEvent::ToolComplete{tool_call_id,result} if tool_call_id=="nested-running" && result.success)));
+        }
+    }
 }

@@ -1475,3 +1475,6 @@ mod managed_interaction_runner_tests;
 mod start_hook_scope_tests;
 
 mod pending_rounds_runner_tests;
+
+mod managed_running_terminal_tests;
+mod running_timeout_observation_tests;
