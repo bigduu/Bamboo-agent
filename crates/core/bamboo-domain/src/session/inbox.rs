@@ -1046,6 +1046,15 @@ pub struct SessionInboxReceipt {
     pub generation: u64,
 }
 
+/// Exact delivery state observed under the same admission authority and Inbox
+/// locks as its receipt. A permanent ACK or terminal queue retry has no pending
+/// delivery; this says nothing about a model run's terminal state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInboxDeliveryReceipt {
+    pub delivery: SessionInboxReceipt,
+    pub pending: bool,
+}
+
 /// How an authorized inbox prefix interacts with a durable orchestration wait.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1061,22 +1070,60 @@ pub enum SessionActivationPolicy {
     InterruptSpecificWait,
 }
 
-/// Permission to activate this specific message, published with its delivery.
+/// Scheduling intent for an explicit peer delivery. Neither choice releases
+/// a human, child or Bash wait or grants the receiver additional permissions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMessageDeliveryIntent {
+    /// Available at the current owner's next safe point; never starts a run.
+    QueueOnly,
+    /// May start a turn through the existing activation router.
+    TriggerTurn,
+}
+
+/// Permission to consume/activate this specific message, published with its delivery.
 /// This never releases a coordinator's staged queue prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionInboxActivationIntent {
     version: u32,
     policy: SessionActivationPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery: Option<SessionMessageDeliveryIntent>,
 }
 
 impl SessionInboxActivationIntent {
     pub fn new(policy: SessionActivationPolicy) -> Self {
-        Self { version: 1, policy }
+        Self {
+            version: 1,
+            policy,
+            delivery: None,
+        }
+    }
+
+    /// Explicit delivery is versioned separately from legacy steering. Old
+    /// readers reject v2 rather than treating QueueOnly as activation authority.
+    pub fn with_delivery(delivery: SessionMessageDeliveryIntent) -> Self {
+        Self {
+            version: 2,
+            policy: SessionActivationPolicy::RespectSpecificWait,
+            delivery: Some(delivery),
+        }
+    }
+
+    pub fn delivery(&self) -> Option<SessionMessageDeliveryIntent> {
+        self.delivery
+    }
+
+    pub fn is_queue_only(&self) -> bool {
+        self.delivery == Some(SessionMessageDeliveryIntent::QueueOnly)
     }
 
     pub fn policy(&self) -> Result<SessionActivationPolicy, SessionInboxError> {
-        if self.version != 1 {
+        if !matches!(
+            (self.version, self.delivery, self.policy),
+            (1, None, _) | (2, Some(_), SessionActivationPolicy::RespectSpecificWait)
+        ) {
             return Err(SessionInboxError::InvalidClaim(
                 "unsupported SessionInbox activation intent version".into(),
             ));
@@ -1568,6 +1615,25 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    /// Opt-in explicit peer scheduling with the same retained lifetime/tree/
+    /// Project/reply authority as deliver_peer_message. QueueOnly is claimable
+    /// at a running consumer's safe point, but is excluded from wake scans.
+    /// Both intents respect specific waits. Pending state must be observed under
+    /// the same retained admission locks; a later independent read is not proof.
+    /// Unsupported backends fail closed.
+    async fn deliver_peer_message_with_intent(
+        &self,
+        _envelope: &SessionMessageEnvelope,
+        _source: &super::ActorSession,
+        _target: &super::ActorSession,
+        _reply_to: Option<&SessionMessageEnvelope>,
+        _intent: SessionMessageDeliveryIntent,
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "explicit peer delivery intent is unsupported".into(),
+        ))
+    }
+
     /// Admit one typed Supervisor peer message while retaining canonical
     /// incarnation, relationship, Project and target lifetime authority locks
     /// through the inbox receipt. An earlier link observation is not a grant.
@@ -1597,7 +1663,8 @@ pub trait SessionInboxPort: Send + Sync {
     /// Grant execution permission to one exact admitted delivery without
     /// authorizing any other queue item or changing its original delivery
     /// intent. Grants are monotonic, durable and idempotent, including after
-    /// ACK; an acknowledged item must never become pending again.
+    /// ACK; an acknowledged item must never become pending again. Explicit
+    /// peer scheduling/wait intent is immutable: conflicting promotion fails.
     async fn mark_message_activation_eligible(
         &self,
         _target_session_id: &str,
@@ -1707,6 +1774,17 @@ pub enum SessionActivationError {
 /// loop directly; it notifies the owner or reserves one successor activation.
 #[async_trait]
 pub trait SessionActivationPort: Send + Sync {
+    /// Signal only a currently running, non-finalizing owner. Never reserve a
+    /// runner or retain successor activation intent. False is not a failure of
+    /// durable admission: an idle target keeps the message until a later turn.
+    async fn notify_active_delivery(
+        &self,
+        _target_session_id: &str,
+        _inbox_generation: u64,
+    ) -> bool {
+        false
+    }
+
     async fn request_activation(
         &self,
         target_session_id: &str,
@@ -2691,5 +2769,49 @@ mod tests {
             SessionMessageId::stable("runtime", &serde_json::json!({"a": 1, "b": [2, 4]}))
         );
         assert_ne!(stable, SessionMessageId::stable("other", &left));
+    }
+
+    #[test]
+    fn explicit_delivery_intent_versions_reject_wait_escalation_and_keep_legacy_bytes() {
+        let legacy =
+            SessionInboxActivationIntent::new(SessionActivationPolicy::InterruptSpecificWait);
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap(),
+            serde_json::json!({"version":1,"policy":"interrupt_specific_wait"})
+        );
+        for delivery in [
+            SessionMessageDeliveryIntent::QueueOnly,
+            SessionMessageDeliveryIntent::TriggerTurn,
+        ] {
+            let intent = SessionInboxActivationIntent::with_delivery(delivery);
+            assert_eq!(
+                intent.policy().unwrap(),
+                SessionActivationPolicy::RespectSpecificWait
+            );
+            let raw = serde_json::to_value(intent).unwrap();
+            assert_eq!(raw["version"], 2);
+            assert_eq!(
+                serde_json::from_value::<SessionInboxActivationIntent>(raw.clone()).unwrap(),
+                intent
+            );
+            let mut escalated = raw;
+            escalated["policy"] = serde_json::json!("interrupt_specific_wait");
+            assert!(
+                serde_json::from_value::<SessionInboxActivationIntent>(escalated)
+                    .unwrap()
+                    .policy()
+                    .is_err()
+            );
+        }
+        for raw in [
+            serde_json::json!({"version":2,"policy":"respect_specific_wait"}),
+            serde_json::json!({"version":1,"policy":"respect_specific_wait","delivery":"queue_only"}),
+            serde_json::json!({"version":3,"policy":"respect_specific_wait","delivery":"queue_only"}),
+        ] {
+            assert!(serde_json::from_value::<SessionInboxActivationIntent>(raw)
+                .unwrap()
+                .policy()
+                .is_err());
+        }
     }
 }
