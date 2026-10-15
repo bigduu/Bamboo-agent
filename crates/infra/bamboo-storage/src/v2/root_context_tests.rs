@@ -2082,7 +2082,7 @@ async fn admission_reads_full_canonical_root_history_without_repairing_stale_ind
     let mut current = initial.clone();
     current.metadata.insert(
         "runtime.counted_loop".into(),
-        serde_json::json!({"generation":"current-durable-generation","revision":2}),
+        serde_json::json!({"generation":"current-durable-generation","revision":2}).to_string(),
     );
     writer.save_runtime_state(&current).await.unwrap();
     assert_eq!(
