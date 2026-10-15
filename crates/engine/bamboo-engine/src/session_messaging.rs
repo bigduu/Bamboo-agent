@@ -660,6 +660,11 @@ impl SessionMessenger {
                 self.inbox
                     .deliver_peer_message(&envelope, &source, &target, reply_to)
                     .await
+                    .map(|delivery| bamboo_domain::SessionInboxDeliveryReceipt {
+                        delivery,
+                        // Preserve the historical peer activation contract.
+                        pending: true,
+                    })
             }
         };
         let delivery = match result {
@@ -670,7 +675,18 @@ impl SessionMessenger {
                 return Err(error);
             }
         };
-        let admission = self.record_admission(envelope, delivery, started);
+        let pending = delivery.pending;
+        let admission = self.record_admission(envelope, delivery.delivery, started);
+        // Exact explicit retries of ACKed/cancelled/dead deliveries cannot
+        // revive input or request work from a fresh router. The Inbox observed
+        // this state while retaining the original admission authority/locks.
+        if !pending {
+            return Ok(SessionPeerDeliveryReceipt {
+                delivery: admission.delivery,
+                activation: None,
+                active_delivery_notified: false,
+            });
+        }
         if intent == Some(SessionMessageDeliveryIntent::QueueOnly) {
             let active_delivery_notified = self
                 .activation

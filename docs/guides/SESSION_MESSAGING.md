@@ -42,8 +42,9 @@ The tool retains `admitted`, `message_id`, `inbox_generation`, `activation` and
 
 - `accepted: true`: the exact message is durably in the Inbox (or was already
   acknowledged on an exact retry). It does not prove model context consumption.
-- `activation: "not_requested"`: QueueOnly requested no turn. Other existing
-  activation values report routing disposition, not a terminal result.
+- `activation: "not_requested"`: QueueOnly requested no turn, or an exact explicit
+  retry no longer has pending delivery. Other activation values report routing
+  disposition, not a terminal result.
 - `active_delivery_notified`: QueueOnly signalled a currently active owner. This
   in-memory observation is not durable processing or completion evidence.
 - `terminal: "not_observed"`: this delivery receipt does not observe run terminal
@@ -55,6 +56,10 @@ invent a second logical message. Changing intent under an existing key fails
 before activation. Intent is persisted with the delivery and bound into its
 semantic digest after ACK. Existing birth/operation identity checks still apply.
 Explicit intent uses versioned records that older readers reject safely.
+The Inbox observes pending state under its admission locks. An acknowledged
+explicit retry cannot activate or notify a new owner; ACK is a transport fact,
+not proof of model/run completion. Explicit per-message promotion applies the
+same policy before and after ACK.
 
 ## Receiver capability boundary
 

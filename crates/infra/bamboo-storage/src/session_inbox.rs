@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex, Weak};
 use async_trait::async_trait;
 use bamboo_domain::{
     SessionActivationPolicy, SessionInboxActivationIntent, SessionInboxBacklog, SessionInboxClaim,
-    SessionInboxError, SessionInboxLimits, SessionInboxPort, SessionInboxReceipt,
-    SessionMessageDeliveryIntent, SessionMessageEnvelope, SessionMessageId, SessionMessageSource,
+    SessionInboxDeliveryReceipt, SessionInboxError, SessionInboxLimits, SessionInboxPort,
+    SessionInboxReceipt, SessionMessageDeliveryIntent, SessionMessageEnvelope, SessionMessageId,
+    SessionMessageSource,
 };
 use bamboo_subagent::{AgentRef, InboxKind, InboxMessage, Mailbox, MsgId};
 use base64::Engine;
@@ -801,7 +802,7 @@ impl FileSessionInbox {
         target: &bamboo_domain::ActorSession,
         reply_to: Option<&SessionMessageEnvelope>,
         intent: Option<SessionMessageDeliveryIntent>,
-    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
         let reply_route_matches = match (&envelope.in_reply_to, reply_to) {
             (None, None) => true,
             (Some(id), Some(proof)) => {
@@ -834,7 +835,7 @@ impl FileSessionInbox {
             .lock_peer_delivery(source, target, reply_to)
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
-        self.deliver_with_lifecycle_held(
+        self.deliver_with_lifecycle_held_state(
             envelope,
             InboxAuthority::Peer { _guard: authority },
             None,
@@ -1067,14 +1068,17 @@ impl FileSessionInbox {
         requested: &SessionMessageEnvelope,
         requested_intent: Option<SessionInboxActivationIntent>,
         filesystem: &OwnedFilesystem,
-    ) -> Result<Option<SessionInboxReceipt>, SessionInboxError> {
+    ) -> Result<Option<SessionInboxDeliveryReceipt>, SessionInboxError> {
         if let Some(receipt) = Self::admitted_receipt(dir, requested).await? {
             if receipt.intent != requested_intent {
                 return Err(SessionInboxError::InvalidClaim(
                     "message id was reused with different activation intent".into(),
                 ));
             }
-            return Ok(Some(receipt.delivery));
+            return Ok(Some(SessionInboxDeliveryReceipt {
+                delivery: receipt.delivery,
+                pending: false,
+            }));
         }
         let id = &requested.id;
         let requested_digest = Self::delivery_digest(requested, requested_intent)?;
@@ -1110,9 +1114,12 @@ impl FileSessionInbox {
                             id
                         )));
                     }
-                    return Ok(Some(SessionInboxReceipt {
-                        id: id.clone(),
-                        generation,
+                    return Ok(Some(SessionInboxDeliveryReceipt {
+                        delivery: SessionInboxReceipt {
+                            id: id.clone(),
+                            generation,
+                        },
+                        pending: matches!(queue, "new" | "cur"),
                     }));
                 }
             }
@@ -1127,6 +1134,18 @@ impl FileSessionInbox {
         gate: Option<&bamboo_domain::AdmissionGate>,
         intent: Option<SessionInboxActivationIntent>,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        self.deliver_with_lifecycle_held_state(envelope, authority, gate, intent)
+            .await
+            .map(|receipt| receipt.delivery)
+    }
+
+    async fn deliver_with_lifecycle_held_state(
+        &self,
+        envelope: &SessionMessageEnvelope,
+        authority: InboxAuthority,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+        intent: Option<SessionInboxActivationIntent>,
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
         #[cfg(test)]
         let _scope_drop = owned::ScopeDrop(self.owned_scope_drop.clone());
         envelope
@@ -1221,9 +1240,12 @@ impl FileSessionInbox {
                 ))
             }
         }
-        Ok(SessionInboxReceipt {
-            id: envelope.id.clone(),
-            generation,
+        Ok(SessionInboxDeliveryReceipt {
+            delivery: SessionInboxReceipt {
+                id: envelope.id.clone(),
+                generation,
+            },
+            pending: true,
         })
     }
 
@@ -1557,7 +1579,9 @@ impl SessionInboxPort for FileSessionInbox {
             .validate()
             .map_err(|error| SessionInboxError::InvalidClaim(error.to_string()))?;
         let (dir, filesystem) = self.owned_filesystem(&envelope.target_session_id).await?;
-        Self::existing_receipt(&dir, envelope, None, &filesystem).await
+        Self::existing_receipt(&dir, envelope, None, &filesystem)
+            .await
+            .map(|receipt| receipt.map(|receipt| receipt.delivery))
     }
 
     async fn pending_child_outcomes(
@@ -1648,6 +1672,7 @@ impl SessionInboxPort for FileSessionInbox {
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         self.deliver_peer_impl(envelope, source, target, reply_to, None)
             .await
+            .map(|receipt| receipt.delivery)
     }
 
     async fn deliver_peer_message_with_intent(
@@ -1657,7 +1682,7 @@ impl SessionInboxPort for FileSessionInbox {
         target: &bamboo_domain::ActorSession,
         reply_to: Option<&SessionMessageEnvelope>,
         intent: SessionMessageDeliveryIntent,
-    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
         self.deliver_peer_impl(envelope, source, target, reply_to, Some(intent))
             .await
     }

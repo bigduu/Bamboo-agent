@@ -3745,10 +3745,9 @@ mod tests {
                     .remove(0);
                 let mut saved = fixture.store.load_session("target").await.unwrap().unwrap();
                 saved.add_message(claim.envelope.to_provider_message().unwrap());
-                saved.session_inbox_admission_mut().record(
-                    claim.envelope.id.clone(),
-                    claim.generation,
-                );
+                saved
+                    .session_inbox_admission_mut()
+                    .record(claim.envelope.id.clone(), claim.generation);
                 fixture.store.save_session(&saved).await.unwrap();
                 fixture.inbox.ack("target", &claim).await.unwrap();
 

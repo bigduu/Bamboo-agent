@@ -1046,6 +1046,15 @@ pub struct SessionInboxReceipt {
     pub generation: u64,
 }
 
+/// Exact delivery state observed under the same admission authority and Inbox
+/// locks as its receipt. A permanent ACK or terminal queue retry has no pending
+/// delivery; this says nothing about a model run's terminal state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInboxDeliveryReceipt {
+    pub delivery: SessionInboxReceipt,
+    pub pending: bool,
+}
+
 /// How an authorized inbox prefix interacts with a durable orchestration wait.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1609,7 +1618,9 @@ pub trait SessionInboxPort: Send + Sync {
     /// Opt-in explicit peer scheduling with the same retained lifetime/tree/
     /// Project/reply authority as deliver_peer_message. QueueOnly is claimable
     /// at a running consumer's safe point, but is excluded from wake scans.
-    /// Both intents respect specific waits. Unsupported backends fail closed.
+    /// Both intents respect specific waits. Pending state must be observed under
+    /// the same retained admission locks; a later independent read is not proof.
+    /// Unsupported backends fail closed.
     async fn deliver_peer_message_with_intent(
         &self,
         _envelope: &SessionMessageEnvelope,
@@ -1617,7 +1628,7 @@ pub trait SessionInboxPort: Send + Sync {
         _target: &super::ActorSession,
         _reply_to: Option<&SessionMessageEnvelope>,
         _intent: SessionMessageDeliveryIntent,
-    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
         Err(SessionInboxError::Storage(
             "explicit peer delivery intent is unsupported".into(),
         ))

@@ -762,6 +762,20 @@ impl FileSessionInbox {
         Ok(result)
     }
 
+    fn validate_explicit_message_promotion(
+        intent: Option<SessionInboxActivationIntent>,
+        policy: SessionActivationPolicy,
+    ) -> Result<(), SessionInboxError> {
+        if intent.is_some_and(|intent| {
+            intent.delivery().is_some()
+                && (intent.is_queue_only()
+                    || policy == SessionActivationPolicy::InterruptSpecificWait)
+        }) {
+            return Err(invalid("explicit peer delivery intent cannot be promoted"));
+        }
+        Ok(())
+    }
+
     pub(super) async fn mark_message_activation_eligible_impl(
         &self,
         target: &str,
@@ -782,13 +796,16 @@ impl FileSessionInbox {
             Ok(bytes) => {
                 let terminal: serde_json::Value = serde_json::from_slice(&bytes)
                     .map_err(|_| invalid("invalid Inbox admitted receipt"))?;
-                return if terminal["id"].as_str() == Some(receipt.id.as_str())
-                    && terminal["generation"].as_u64() == Some(receipt.generation)
+                if terminal["id"].as_str() != Some(receipt.id.as_str())
+                    || terminal["generation"].as_u64() != Some(receipt.generation)
                 {
-                    Ok(())
-                } else {
-                    Err(invalid("message activation receipt identity mismatch"))
-                };
+                    return Err(invalid("message activation receipt identity mismatch"));
+                }
+                Self::validate_explicit_message_promotion(
+                    Self::activation_intent(&terminal)?,
+                    policy,
+                )?;
+                return Ok(());
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(SessionInboxError::Storage(error.to_string())),
@@ -819,11 +836,7 @@ impl FileSessionInbox {
                     return Err(invalid("activation intent requires its v2 watermark"));
                 }
                 if let Some(intent) = current.filter(|intent| intent.delivery().is_some()) {
-                    if intent.is_queue_only()
-                        || policy == SessionActivationPolicy::InterruptSpecificWait
-                    {
-                        return Err(invalid("explicit peer delivery intent cannot be promoted"));
-                    }
+                    Self::validate_explicit_message_promotion(Some(intent), policy)?;
                     return Ok(());
                 }
                 if current.is_some_and(|intent| {

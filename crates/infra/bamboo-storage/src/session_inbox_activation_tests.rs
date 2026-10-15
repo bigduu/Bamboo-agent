@@ -1365,6 +1365,7 @@ async fn queue_only_survives_reopen_and_ack_without_wake_and_binds_intent_to_dig
         )
         .await
         .unwrap();
+    assert!(receipt.pending);
     let reopened = reopen(&temp).await;
     assert_eq!(
         reopened
@@ -1437,19 +1438,18 @@ async fn queue_only_survives_reopen_and_ack_without_wake_and_binds_intent_to_dig
         FileSessionInbox::semantic_digest(&envelope).unwrap()
     );
     let reopened = reopen(&temp).await;
-    assert_eq!(
-        reopened
-            .deliver_peer_message_with_intent(
-                &envelope,
-                &source,
-                &target,
-                None,
-                SessionMessageDeliveryIntent::QueueOnly
-            )
-            .await
-            .unwrap(),
-        receipt
-    );
+    let replay = reopened
+        .deliver_peer_message_with_intent(
+            &envelope,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::QueueOnly,
+        )
+        .await
+        .unwrap();
+    assert!(!replay.pending);
+    assert_eq!(replay.delivery, receipt.delivery);
     assert!(reopened
         .deliver_peer_message_with_intent(
             &envelope,
@@ -1530,7 +1530,7 @@ async fn explicit_intents_do_not_promote_staged_siblings_or_inherit_interrupt_gr
     inbox
         .mark_activation_eligible(
             "parent",
-            trigger_receipt.generation,
+            trigger_receipt.delivery.generation,
             SessionActivationPolicy::InterruptSpecificWait,
         )
         .await
@@ -1538,7 +1538,7 @@ async fn explicit_intents_do_not_promote_staged_siblings_or_inherit_interrupt_gr
     assert!(inbox
         .mark_message_activation_eligible(
             "parent",
-            &queue_receipt,
+            &queue_receipt.delivery,
             SessionActivationPolicy::InterruptSpecificWait,
         )
         .await
@@ -1715,7 +1715,8 @@ async fn explicit_peer_promotion_preserves_policy_after_ack_and_reopen() {
         let receipt = inbox
             .deliver_peer_message_with_intent(&envelope, &source, &target, None, intent)
             .await
-            .unwrap();
+            .unwrap()
+            .delivery;
         for after_ack in [false, true] {
             let reopened = reopen(&temp).await;
             for policy in [
