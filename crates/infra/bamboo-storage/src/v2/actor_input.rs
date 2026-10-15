@@ -684,7 +684,7 @@ impl SessionStoreV2 {
             return Err(ActorInputCheckpointError::Unsupported);
         }
         for claim in &request.claims {
-            claim_guard.verify(claim)?;
+            claim_guard.verify(claim, &request.fence.run_id)?;
         }
         let activation = actor_directory::current_live(&source.entry, &request.fence, Utc::now())?;
         if activation.status != ActorActivationStatus::Running {
@@ -708,7 +708,7 @@ impl SessionStoreV2 {
                         return Err(ActorInputCheckpointError::Unsupported);
                     }
                     for claim in &request.claims {
-                        claim_guard.verify(claim)?;
+                        claim_guard.verify(claim, &request.fence.run_id)?;
                     }
                     Ok(())
                 };

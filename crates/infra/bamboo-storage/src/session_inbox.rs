@@ -130,7 +130,11 @@ impl UnownedActorClaimGuard {
         &self.dir
     }
 
-    pub(crate) fn verify(&self, claim: &SessionInboxClaim) -> Result<(), SessionInboxError> {
+    pub(crate) fn verify(
+        &self,
+        claim: &SessionInboxClaim,
+        active_run_id: &str,
+    ) -> Result<(), SessionInboxError> {
         use std::io::Read;
 
         FileSessionInbox::validate_claim_name(&claim.claim_id)?;
@@ -167,6 +171,14 @@ impl UnownedActorClaimGuard {
         if wrapper.kind != InboxKind::SessionEnvelope {
             return Err(SessionInboxError::InvalidClaim(
                 "Actor claim kind changed".into(),
+            ));
+        }
+        if FileSessionInbox::activation_intent(&wrapper.body)?
+            .as_ref()
+            .is_some_and(|intent| !intent.admits_run(Some(active_run_id)))
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "Actor claim belongs to another run".into(),
             ));
         }
         let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body)
