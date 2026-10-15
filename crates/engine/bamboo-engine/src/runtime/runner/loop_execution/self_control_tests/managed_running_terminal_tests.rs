@@ -1061,3 +1061,5 @@ async fn self_control_observed_pre_start_running_refuses_start_without_changing_
         fixture.close().await;
     }
 }
+
+mod public_direct_running_tests;
