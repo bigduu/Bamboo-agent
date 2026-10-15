@@ -11,7 +11,7 @@ bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
 bamboo-compression = { path = "../../infra/bamboo-compression" }
 bamboo-config = { path = "../../infra/bamboo-config" }
 bamboo-domain = { path = "../../core/bamboo-domain" }
-jiandu-memory = "=0.2.1"
+jiandu-memory = "=0.3.3"
 serde = { workspace = true }
 serde_json = "1"
 serde_yaml = { package = "serde_norway", version = "=0.9.42" }
@@ -22,7 +22,7 @@ tracing = "0.1"
 thiserror = "2"
 dashmap = "6"
 seahash = "4"
-dirs = "6"
+dirs = "7"
 
 [dev-dependencies]
 tempfile = "3"

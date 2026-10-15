@@ -67,13 +67,12 @@ impl LocalChildTools {
                 )
             });
         }
-        let strict = bamboo_domain::ChildContextBinding::from_session(session)
-            .map_err(failure)?
-            .is_some()
-            || crate::session_app::child_session::named_profile::has_named_profile(session)
-            || session
-                .metadata
-                .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY);
+        let strict = skill_host::strict_child(session)?;
+        if strict {
+            // These routes already request an empty Skills set. Keep schema,
+            // exact ownership, dispatch and permission gates on that same set.
+            allowed.retain(|name| !skill_host::skill_interface(name));
+        }
         Ok(Self {
             store,
             owner,
@@ -467,6 +466,60 @@ mod tests {
                 name: name.into(),
                 arguments: "{}".into(),
             },
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_local_skill_interfaces_are_absent_from_all_callable_boundaries() {
+        const SKILLS: &[&str] = &[
+            "Read",
+            "load_skill",
+            "read_skill_resource",
+            "skills_list",
+            "skills_read",
+        ];
+        let mut f = Fixture::new().await;
+        Arc::get_mut(&mut f.base).unwrap().names = Some(SKILLS);
+        let mut strict = f.child.clone();
+        strict.metadata.insert(
+            crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
+            "bounded-policy-fixture".into(),
+        );
+        let tools = f.tools(&strict, SKILLS, &[]);
+        assert_eq!(
+            tools
+                .list_tools()
+                .iter()
+                .map(|t| t.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Read"]
+        );
+        for name in &SKILLS[1..] {
+            let call = call(name);
+            let mut ctx = ToolExecutionContext::none(&call.id);
+            ctx.session_id = Some(&strict.id);
+            assert!(!tools.owns_exact_tool(name));
+            assert!(tools.exact_tool_owner(name).is_none());
+            assert!(tools
+                .execute_with_context_outcome(&call, ctx)
+                .await
+                .is_err());
+            assert!(tools.check_permissions_for(&call, &ctx).await.is_err());
+            assert!(tools
+                .check_permissions_for_exact(&call, name, &ctx)
+                .await
+                .is_err());
+            assert!(tools
+                .check_permissions_for_resolved(&call, name, &json!({}), &ctx)
+                .await
+                .is_err());
+        }
+        assert_eq!(f.base.gates.load(Ordering::SeqCst), 0);
+        assert_eq!(f.base.executions.load(Ordering::SeqCst), 0);
+        let ordinary = f.tools(&f.child, SKILLS, &[]);
+        assert_eq!(ordinary.list_tools().len(), SKILLS.len());
+        for name in SKILLS {
+            assert!(ordinary.owns_exact_tool(name));
         }
     }
 

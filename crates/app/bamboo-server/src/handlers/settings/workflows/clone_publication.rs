@@ -1502,6 +1502,36 @@ fn publish_builtin_clone_with_fault(
             "Workflow clone marker is incomplete",
         ))?;
 
+    // Before source-mode embedding, the server marked every scripts/ file
+    // executable. Resume only that exact recorded variant, with identical
+    // source identity and bytes. Completed/deleted generations still retire
+    // through the existing protocol and use the new manifest when recloned.
+    let historical_files = if matches!(
+        current.phase,
+        ClonePublicationPhase::Prepared
+            | ClonePublicationPhase::StageBound
+            | ClonePublicationPhase::Staged
+            | ClonePublicationPhase::Aborted
+    ) && !marker_matches_request(&current, &requested)
+    {
+        let mut historical = files.clone();
+        for (relative, file) in &mut historical {
+            file.executable = relative.starts_with("scripts/");
+        }
+        let historical_request = ClonePublicationMarker {
+            bundle_digest: builtin_clone_bundle_digest(&historical),
+            ..requested.clone()
+        };
+        marker_matches_request(&current, &historical_request).then_some(historical)
+    } else {
+        None
+    };
+    let files = historical_files.as_ref().unwrap_or(files);
+    let requested = ClonePublicationMarker {
+        bundle_digest: builtin_clone_bundle_digest(files),
+        ..requested
+    };
+
     if current.phase == ClonePublicationPhase::Complete {
         match root.skills_dir.symlink_metadata(target_name) {
             Ok(metadata) => {
@@ -1982,6 +2012,161 @@ mod tests {
                 ClonePublicationPhase::Complete
             );
         }
+    }
+
+    fn mode_revision_files() -> BTreeMap<String, BuiltinSkillFile> {
+        let mut files = review_files();
+        files.insert(
+            "scripts/module.py".into(),
+            BuiltinSkillFile {
+                bytes: b"# non-executable module\n".to_vec(),
+                executable: false,
+            },
+        );
+        files
+    }
+
+    fn historical_mode_files() -> BTreeMap<String, BuiltinSkillFile> {
+        let mut files = mode_revision_files();
+        files.get_mut("scripts/module.py").unwrap().executable = true;
+        files
+    }
+
+    fn publish_modes(
+        root: &Path,
+        files: &BTreeMap<String, BuiltinSkillFile>,
+        fault: PublicationFault,
+    ) -> Result<ClonePublicationReceipt, ClonePublicationError> {
+        publish_builtin_clone_with_fault(root, "review", 7, &"a".repeat(64), files, fault)
+    }
+
+    #[test]
+    fn source_modes_resume_each_exact_historical_crash_point_and_reclone_uses_new_modes() {
+        let new_files = mode_revision_files();
+        let historical = historical_mode_files();
+        let old_digest = builtin_clone_bundle_digest(&historical);
+        let new_digest = builtin_clone_bundle_digest(&new_files);
+        assert_ne!(old_digest, new_digest);
+        for fault in [
+            PublicationFault::StopAfterPrepared,
+            PublicationFault::StopAfterStageDirectory,
+            PublicationFault::StopAfterStageBound,
+            PublicationFault::StopAfterStagePopulated,
+            PublicationFault::StopAfterStaged,
+            PublicationFault::StopAfterRename,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            assert!(publish_modes(root.path(), &historical, fault).is_err());
+            publish_modes(root.path(), &new_files, PublicationFault::None).unwrap();
+            let complete = current_marker(root.path());
+            assert_eq!(complete.phase, ClonePublicationPhase::Complete);
+            assert_eq!(complete.bundle_digest, old_digest);
+            assert_eq!(
+                std::fs::read(root.path().join("skills/review/scripts/module.py")).unwrap(),
+                historical["scripts/module.py"].bytes
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(root.path().join("skills/review/scripts/module.py"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o755
+                );
+            }
+            assert!(matches!(
+                publish_modes(root.path(), &new_files, PublicationFault::None),
+                Err(ClonePublicationError::Conflict(_))
+            ));
+            assert_eq!(current_marker(root.path()), complete);
+            std::fs::remove_dir_all(root.path().join("skills/review")).unwrap();
+            publish_modes(root.path(), &new_files, PublicationFault::None).unwrap();
+            assert_eq!(current_marker(root.path()).bundle_digest, new_digest);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(root.path().join("skills/review/scripts/module.py"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o644
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_mode_compatibility_does_not_accept_changed_source_or_mutate_divergent_stage() {
+        let root = tempfile::tempdir().unwrap();
+        let historical = historical_mode_files();
+        let new_files = mode_revision_files();
+        assert!(
+            publish_modes(root.path(), &historical, PublicationFault::StopAfterStaged).is_err()
+        );
+        let before = current_marker(root.path());
+        let journal_path = root.path().join("skills/.review.clone-v1.json");
+        let journal = std::fs::read(&journal_path).unwrap();
+        assert!(matches!(
+            publish_builtin_clone_with_fault(
+                root.path(),
+                "review",
+                7,
+                &"b".repeat(64),
+                &new_files,
+                PublicationFault::None,
+            ),
+            Err(ClonePublicationError::Conflict(_))
+        ));
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
+        let module = root
+            .path()
+            .join(CLONE_TRANSACTION_DIRECTORY)
+            .join(&before.staging_name)
+            .join("scripts/module.py");
+        std::fs::write(&module, b"foreign replacement bytes").unwrap();
+        assert!(matches!(
+            publish_modes(root.path(), &new_files, PublicationFault::None),
+            Err(ClonePublicationError::Conflict(_))
+        ));
+        assert_eq!(std::fs::read(module).unwrap(), b"foreign replacement bytes");
+        assert_eq!(std::fs::read(journal_path).unwrap(), journal);
+        assert!(!root.path().join("skills/review").exists());
+    }
+
+    #[test]
+    fn source_modes_resume_bound_historical_abort_without_overwriting_competitor() {
+        let root = tempfile::tempdir().unwrap();
+        let historical = historical_mode_files();
+        let new_files = mode_revision_files();
+        assert!(matches!(
+            publish_modes(
+                root.path(),
+                &historical,
+                PublicationFault::TargetDirectoryBeforeRename
+            ),
+            Err(ClonePublicationError::Conflict(_))
+        ));
+        let marker = current_marker(root.path());
+        assert!(matches!(
+            publish_modes(root.path(), &new_files, PublicationFault::None),
+            Err(ClonePublicationError::Conflict(_))
+        ));
+        assert_eq!(
+            std::fs::read(root.path().join("skills/review/sentinel.txt")).unwrap(),
+            b"competitor-owned"
+        );
+        assert_eq!(current_marker(root.path()), marker);
+        std::fs::remove_dir_all(root.path().join("skills/review")).unwrap();
+        publish_modes(root.path(), &new_files, PublicationFault::None).unwrap();
+        assert_eq!(
+            current_marker(root.path()).bundle_digest,
+            builtin_clone_bundle_digest(&historical)
+        );
     }
 
     #[test]

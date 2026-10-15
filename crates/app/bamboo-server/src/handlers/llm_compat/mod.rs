@@ -9,3 +9,5 @@ pub(crate) mod reasoning;
 pub(crate) mod usage;
 
 pub(crate) use reasoning::parse_reasoning_effort;
+
+pub(crate) mod activation;

@@ -284,7 +284,7 @@ pub(crate) fn new_execution_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
-pub(super) fn build_round_id(session_id: &str, execution_id: &str, round: usize) -> String {
+pub(crate) fn build_round_id(session_id: &str, execution_id: &str, round: usize) -> String {
     debug_assert!(
         !execution_id.is_empty(),
         "round metrics require an execution identity"

@@ -172,6 +172,57 @@ impl SessionStoreV2 {
         })
     }
 
+    pub(super) async fn management_history(
+        &self,
+        reference: &SupervisorReference,
+        target_id: &str,
+    ) -> io::Result<Option<Session>> {
+        if target_id == reference.session_id {
+            reference_is_valid(reference)?;
+            let _lifecycle = self.lock_session_lifecycle_shared().await?;
+            let _task = self.lock_runtime_task_sidecar_shared().await?;
+            let _sessions = self.management_session_locks(None).await?;
+            self.management_supervisor_locked(reference).await?;
+            return self.load_session_unlocked(target_id).await;
+        }
+        // This guard retains caller, link, Project and exact target lifetime
+        // validation through the complete physical read and overlay checks.
+        let _guard = self.lock_supervisor_followup(reference, target_id).await?;
+        self.load_session_unlocked(target_id).await
+    }
+
+    pub(super) async fn supervisor_orchestration_job(
+        &self,
+        reference: &SupervisorReference,
+        expected_revision: u64,
+        operation: Box<dyn FnOnce() -> io::Result<()> + Send>,
+    ) -> io::Result<()> {
+        reference_is_valid(reference)?;
+        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let sessions = self.management_session_locks(None).await?;
+        let current = self.management_supervisor_locked(reference).await?;
+        if !current.root_orchestration_only_enabled()
+            || expected_revision == 0
+            || current.root_tool_authority_revision != expected_revision
+        {
+            return Err(denied("Supervisor orchestration authority changed"));
+        }
+        let guards = Arc::new(SupervisorManagementGuards {
+            sessions,
+            _task: task,
+            _lifecycle: lifecycle,
+        });
+        // The physical job owns the guards through every file publication,
+        // including if the originating HTTP future or runtime disappears.
+        tokio::task::spawn_blocking(move || {
+            let _guards = guards;
+            operation()
+        })
+        .await
+        .map_err(|error| other_io_error(format!("join Supervisor publication: {error}")))?
+    }
+
     /// Private loader only: every caller below owns lifecycle, Task and Session
     /// locks. Calling the public authority reader here would re-enter locks.
     async fn management_supervisor_locked(

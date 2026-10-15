@@ -43,6 +43,15 @@ pub(crate) fn plugin_scope() -> impl HttpServiceFactory {
         .route("", web::get().to(agent::plugin::list_plugins))
         .route("/install", web::post().to(agent::plugin::install_plugin))
         .route("/jiandu/setup", web::get().to(agent::plugin::jiandu_setup))
+        .route("/nova/app", web::get().to(agent::plugin::nova_app))
+        .route(
+            "/nova/app/install",
+            web::post().to(agent::plugin::install_nova_app),
+        )
+        .route(
+            "/nova/app/start",
+            web::post().to(agent::plugin::start_nova_app),
+        )
         .route(
             "/official/jiandu/install",
             web::post().to(agent::plugin::install_official_jiandu),
@@ -102,6 +111,7 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .service(
             web::scope("/tickets")
                 .route("/scope", web::get().to(agent::tickets::scope))
+                .route("/initialize", web::post().to(agent::tickets::initialize))
                 .route("/overview", web::get().to(agent::tickets::overview))
                 .route("/search", web::post().to(agent::tickets::search))
                 .route("/inspect", web::post().to(agent::tickets::inspect))
@@ -395,8 +405,12 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::events::handler),
         )
         .route(
+            "/sessions/{session_id}/runs/{run_id}/output",
+            web::get().to(agent::run_output::handler),
+        )
+        .route(
             "/sessions/{session_id}/stop",
-            web::post().to(agent::stop::handler),
+            web::post().to(agent::stop::handler_with_run),
         )
         .route(
             "/sessions/{session_id}/history",
@@ -442,7 +456,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         // Account-scoped change feed: one resumable SSE stream across all
         // sessions (multi-client sync, replaces session-index polling).
         .route("/stream", web::get().to(agent::stream::handler))
-        .route("/stop/{session_id}", web::post().to(agent::stop::handler))
+        .route(
+            "/stop/{session_id}",
+            web::post().to(agent::stop::handler_with_run),
+        )
         .route(
             "/child-approval/{child_session_id}",
             web::post().to(agent::child_approval::handler),

@@ -1327,3 +1327,9 @@ test('temporary lock refresh preserves the exact tested external dependency mult
   assert.notEqual(check({ package: [stamped.package[1]] }).status, 0)
   assert.notEqual(check({ package: [...stamped.package, clone(external)] }).status, 0)
 })
+
+// Exercise the real REST adapter through draft resume and attachment upload.
+require('./crate-release-draft-tag.test.cjs')
+
+// Bound recovery replays the original successful main CI without a new reservation.
+require('./crate-release-recover.test.cjs')

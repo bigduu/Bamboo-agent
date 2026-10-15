@@ -495,7 +495,7 @@ pub(super) async fn commit_selected_input(
             std::collections::HashMap<String, crate::app_state::AgentRunner>,
         >,
     >,
-) -> ResponseResult<()> {
+) -> ResponseResult<Option<bamboo_domain::SessionInboxReceipt>> {
     let commit_state = state;
     let commit_session_id = session_id;
     let commit = tokio::spawn(async move {
@@ -531,6 +531,11 @@ pub(super) async fn commit_selected_input(
         } else {
             None
         };
+        // Return only the exact durable admission produced by this commit.
+        // It is response data, never a writer or a promise of execution.
+        let receipt = admission
+            .as_ref()
+            .map(|admission| admission.delivery.clone());
         #[cfg(test)]
         wait_at_workflow_post_save_test_barrier(&commit_session_id).await;
 
@@ -569,10 +574,10 @@ pub(super) async fn commit_selected_input(
         } else if !queued {
             publish_committed_chat(&commit_state, &session);
         }
-        Ok::<(), String>(())
+        Ok::<_, String>(receipt)
     });
-    match commit.await {
-        Ok(Ok(())) => {}
+    let receipt = match commit.await {
+        Ok(Ok(receipt)) => receipt,
         Ok(Err(error)) => {
             return Err(HttpResponse::InternalServerError()
                 .json(serde_json::json!({
@@ -590,6 +595,6 @@ pub(super) async fn commit_selected_input(
             )
             .into());
         }
-    }
-    Ok(())
+    };
+    Ok(receipt)
 }

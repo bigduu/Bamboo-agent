@@ -316,7 +316,7 @@ impl AppState {
         else {
             return Ok(None);
         };
-        if !crate::skill_runtime::ordinary_main(&session)
+        if !crate::skill_runtime::registered_main(&session)
             || session.metadata.contains_key("chat.queued_ingress.v1")
             || !self
                 .session_inbox
@@ -452,6 +452,9 @@ impl AppState {
         }) {
             return Ok(ExecuteAdmissionCheck::Checked(Box::default()));
         }
+        let selected = reservation
+            .and_then(|r| r.execution_persistence())
+            .and_then(|p| p.root_inbox_receipt().cloned());
         let Some(mut session) = self
             .storage
             .load_session(id)
@@ -461,6 +464,20 @@ impl AppState {
             return Ok(ExecuteAdmissionCheck::Checked(Box::default()));
         };
         let queued_id = session.metadata.get("chat.queued_ingress.v1").cloned();
+        if selected.is_some()
+            && (queued_id.is_some()
+                || !crate::skill_runtime::registered_main(&session)
+                || session.pending_injected_messages().is_some()
+                || session.agent_runtime_state.as_ref().is_some_and(|s| {
+                    s.waiting_for_children.is_some() || s.waiting_for_bash.is_some()
+                }))
+        {
+            return Err(error(
+                StatusCode::CONFLICT,
+                "Selected Root input context changed before admission",
+            )
+            .into());
+        }
         // Inspection selects an attempt; it neither grants a sibling nor proves Fresh.
         if queued_id.is_none()
             && !self
@@ -470,13 +487,20 @@ impl AppState {
                 .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?
                 .activation_pending()
         {
+            if selected.is_some() {
+                return Err(error(
+                    StatusCode::CONFLICT,
+                    "Selected input is not currently claimable",
+                )
+                .into());
+            }
             recover_user_handoff(self, &session).await?;
             return Ok(ExecuteAdmissionCheck::Checked(Box::default()));
         }
         if require_native_owner
             && reservation.is_none()
             && queued_id.is_none()
-            && crate::skill_runtime::ordinary_main(&session)
+            && crate::skill_runtime::registered_main(&session)
         {
             // Eligibility was observed under this actual admission check, not
             // the earlier HTTP selection. Never claim native owned-format work
@@ -511,6 +535,24 @@ impl AppState {
         }
         if let Some(reason) = refreshed.admission_error {
             return Err(error(StatusCode::SERVICE_UNAVAILABLE, reason).into());
+        }
+        if let Some(selected) = selected.as_ref() {
+            if refreshed.committed_messages.len() != 1
+                || !refreshed
+                    .committed_messages
+                    .iter()
+                    .all(|message| message.id == selected.id.as_str() && checked_user(id, message))
+                || !inputs.as_ref().is_some_and(|inputs| {
+                    inputs.observations().len() == 1
+                        && inputs.observations()[0].input_id() == selected.id.as_str()
+                })
+            {
+                return Err(error(
+                    StatusCode::CONFLICT,
+                    "Selected input was not newly checkpointed and acknowledged by this run",
+                )
+                .into());
+            }
         }
         let generate_title = queued_id.is_none()
             && refreshed

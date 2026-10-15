@@ -460,6 +460,7 @@ async fn activated_root_chat_preserves_handoff_and_commits_multimodal_input_once
         "images": [{"base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a8aUAAAAASUVORK5CYII=", "type":"image/png"}],
     })).unwrap()
     };
+    let mut returned_receipt = None;
     for _ in 0..2 {
         let response = super::handler(
             state.clone(),
@@ -479,6 +480,16 @@ async fn activated_root_chat_preserves_handoff_and_commits_multimodal_input_once
             "{}",
             String::from_utf8_lossy(&body)
         );
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let receipt = (
+            body["message_id"].as_str().unwrap().to_owned(),
+            body["ingress_seq"].as_u64().unwrap(),
+        );
+        assert!(receipt.1 > 0);
+        if let Some(previous) = returned_receipt.as_ref() {
+            assert_eq!(previous, &receipt);
+        }
+        returned_receipt = Some(receipt);
     }
     let queued = state
         .storage
@@ -541,6 +552,7 @@ async fn activated_root_chat_preserves_handoff_and_commits_multimodal_input_once
     assert!(system_prompts[0].content.contains("ROOT_PROMPT_REPLACED"));
     assert!(system_prompts[0].content.contains("ROOT_ENHANCE_ADDED"));
     let message = admission.committed_messages.first().unwrap();
+    assert_eq!(message.id, returned_receipt.as_ref().unwrap().0);
     assert_eq!(message.content, "second with image");
     let parts = message
         .content_parts
@@ -5573,4 +5585,114 @@ mod native_inbox_wait_boundaries {
         remove_shell(&second.id);
         cleanup.0.clear();
     }
+}
+
+#[actix_web::test]
+async fn root_chat_receipt_disconnected_commit_retains_real_owner_and_single_durable_input() {
+    use actix_web::{test, web, App};
+    use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
+    let home = tempfile::tempdir().unwrap();
+    let state = web::Data::new(crate::AppState::new(home.path().into()).await.unwrap());
+    let id = "root-chat-disconnected-receipt";
+    state
+        .storage
+        .save_session(&Session::new(id, "test-model"))
+        .await
+        .unwrap();
+    let root = state.storage.load_session(id).await.unwrap().unwrap();
+    let sender = state.get_session_event_sender(id).await;
+    let mut owner = match reserve_session_execution(
+        &state.agent,
+        &state.agent_runners,
+        &state.session_event_senders,
+        id,
+        &sender,
+    )
+    .await
+    {
+        SessionExecutionReserveOutcome::Reserved(owner) => owner,
+        _ => panic!("test Root must reserve its genuine execution"),
+    };
+    owner.bind_root_actor(&state.agent, &root).await.unwrap();
+    assert!(state
+        .session_store
+        .root_actor_input_required(&root)
+        .await
+        .unwrap());
+    let barrier = super::legacy_selection::install_workflow_post_save_test_barrier(id);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(crate::configure_routes),
+    )
+    .await;
+    {
+        let response = test::call_service(&app, test::TestRequest::post().uri("/api/v1/chat")
+            .peer_addr("127.0.0.1:5700".parse().unwrap())
+            .set_json(serde_json::json!({"session_id":id,"message":"ROOT_CHAT_SURVIVES_DISCONNECT","model":"test-model"})).to_request());
+        tokio::pin!(response);
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            tokio::select! {
+                permit = barrier.reached.acquire() => permit.unwrap().forget(),
+                early = &mut response => panic!("Root Chat returned before durable barrier: {}",early.status()),
+            }
+        }).await.unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(30),
+            state.persistence.acquire_lock(id)
+        )
+        .await
+        .is_err());
+        assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+        let saved = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(!saved
+            .messages
+            .iter()
+            .any(|m| m.content == "ROOT_CHAT_SURVIVES_DISCONNECT"));
+        // Drop the real Actix response; only the original detached commit owns
+        // the persistence lock and the already accepted message afterwards.
+    }
+    barrier.resume.add_permits(1);
+    let guard = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        state.persistence.acquire_lock(id),
+    )
+    .await
+    .unwrap();
+    drop(guard);
+    let mut saved = state.storage.load_session(id).await.unwrap().unwrap();
+    assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 1);
+    assert!(!saved
+        .messages
+        .iter()
+        .any(|m| m.content == "ROOT_CHAT_SURVIVES_DISCONNECT"));
+    let admitted = owner
+        .execution_persistence()
+        .unwrap()
+        .admit_root_inbox(
+            &mut saved,
+            state.session_inbox.clone(),
+            Some(owner.run_id()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(admitted.admission_error.is_none());
+    assert_eq!(admitted.merged, 1);
+    assert_eq!(admitted.committed_messages.len(), 1);
+    assert_eq!(
+        admitted.committed_messages[0].content,
+        "ROOT_CHAT_SURVIVES_DISCONNECT"
+    );
+    assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 0);
+    let durable = state.storage.load_session(id).await.unwrap().unwrap();
+    assert_eq!(
+        durable
+            .messages
+            .iter()
+            .filter(|m| m.content == "ROOT_CHAT_SURVIVES_DISCONNECT")
+            .count(),
+        1
+    );
+    owner.abandon().await;
 }

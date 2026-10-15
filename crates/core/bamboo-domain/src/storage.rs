@@ -416,6 +416,39 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Immutable history snapshot read while canonical Supervisor and target
+    /// authority are locked. A public inspect_link followed by load_session is
+    /// not equivalent: its observation expires before the read starts.
+    async fn load_supervisor_managed_session(
+        &self,
+        supervisor: &SupervisorReference,
+        target_session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (supervisor, target_session_id);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support scoped Supervisor history",
+        ))
+    }
+
+    /// Trusted Host file publication while the current canonical Supervisor's
+    /// incarnation, Ultra mode and authority revision remain physically locked.
+    /// This is a transient critical section, never a durable permission grant.
+    /// A backend must retain the complete lock set after caller cancellation
+    /// until its synchronous job returns; unsupported backends never run it.
+    async fn with_supervisor_orchestration_authority(
+        &self,
+        supervisor: &SupervisorReference,
+        expected_revision: u64,
+        operation: Box<dyn FnOnce() -> std::io::Result<()> + Send>,
+    ) -> std::io::Result<()> {
+        let _ = (supervisor, expected_revision, operation);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support locked Supervisor publication",
+        ))
+    }
+
     /// Strict canonical Root control-plane read for authority decisions.
     /// `None` means absent; partial/corrupt/mismatched published authority is an
     /// error, never a fallback to stale session.json. Returned messages are empty;
@@ -435,6 +468,18 @@ pub trait Storage: Send + Sync {
 
     /// Loads a session by ID, returns None if not found.
     async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>>;
+
+    /// Read a full durable Session for execution admission without repairing an
+    /// index or granting execution/write authority. Canonical backends retain
+    /// their strict identity and lifetime checks, including the complete main
+    /// history needed to detect pending input. Uncached legacy backends keep
+    /// their existing full loader; a control-only snapshot is not sufficient.
+    async fn load_execution_admission_snapshot(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        self.load_session(session_id).await
+    }
 
     /// Deletes a session, returns true if anything was deleted.
     async fn delete_session(&self, session_id: &str) -> std::io::Result<bool>;

@@ -15,6 +15,9 @@ mod gold;
 mod pipeline;
 mod startup;
 
+#[cfg(test)]
+mod counted_tests;
+
 use pipeline::run_pipeline;
 pub(in crate::runtime::runner) use pipeline::{
     legacy_browser_loaded_result_content, legacy_browser_needs_discovery,
@@ -50,7 +53,11 @@ pub(crate) async fn run_agent_loop_with_config(
     config: AgentLoopConfig,
 ) -> super::Result<()> {
     let session_span = tracing::info_span!("agent_loop", session_id = %session.id);
-    async {
+    let mut counted_generation = None;
+    let mut counted_usage = super::to_event_token_usage(0, 0);
+    let mut counted_runtime_identity = None;
+    let result = async {
+        crate::runtime::counted_loop::preflight(session, &config, &initial_message).await?;
         let session_start_source = session
             .metadata
             .remove(crate::session_app::chat::SESSION_START_SOURCE_METADATA_KEY)
@@ -120,6 +127,24 @@ pub(crate) async fn run_agent_loop_with_config(
         )
         .await?;
 
+        if config.counted_loop.is_some() {
+            // Capture the initialized run before begin can fail. Its first
+            // checkpoint error must also terminalize this runtime snapshot for
+            // the host's unconditional final error save.
+            counted_runtime_identity = Some((
+                state.runtime_state.run_id.clone(),
+                state.runtime_state.round.last_round_id.clone(),
+                state.runtime_state.execution_id.clone(),
+            ));
+        }
+        counted_generation = crate::runtime::counted_loop::begin(
+            session,
+            &config,
+            &state.execution_id,
+            &initial_message,
+        )
+        .await?;
+
         if config
             .hook_runner
             .has_hooks_for(AgentHookPoint::AfterSessionSetup)
@@ -154,7 +179,7 @@ pub(crate) async fn run_agent_loop_with_config(
                         &state.session_id,
                         &config,
                         state.metrics_collector.as_ref(),
-                        false,
+                        config.counted_loop.is_some(),
                         &mut state.runtime_state,
                     )
                     .await;
@@ -188,6 +213,20 @@ pub(crate) async fn run_agent_loop_with_config(
         )
         .await;
 
+        if config.counted_loop.is_some() {
+            // The last round and final-evidence spend have both been committed.
+            // Session history totals and the last response alone are not this run.
+            counted_usage = super::to_event_token_usage(
+                state.runtime_state.round.total_prompt_tokens,
+                state.runtime_state.round.total_completion_tokens,
+            );
+            counted_runtime_identity = Some((
+                state.runtime_state.run_id.clone(),
+                state.runtime_state.round.last_round_id.clone(),
+                state.runtime_state.execution_id.clone(),
+            ));
+        }
+
         let sent_complete = match pipeline_result {
             Ok(sent_complete) => sent_complete,
             Err(error) if error.is_hook_suspended() => {
@@ -202,7 +241,7 @@ pub(crate) async fn run_agent_loop_with_config(
                     &state.session_id,
                     &config,
                     state.metrics_collector.as_ref(),
-                    false,
+                    config.counted_loop.is_some(),
                     &mut state.runtime_state,
                 )
                 .await;
@@ -244,7 +283,7 @@ pub(crate) async fn run_agent_loop_with_config(
             &state.session_id,
             &config,
             state.metrics_collector.as_ref(),
-            sent_complete,
+            sent_complete || config.counted_loop.is_some(),
             &mut state.runtime_state,
         )
         .await;
@@ -252,7 +291,98 @@ pub(crate) async fn run_agent_loop_with_config(
         Ok(())
     }
     .instrument(session_span)
-    .await
+    .await;
+    let result = if counted_generation.is_some() && result.is_ok() && cancel_token.is_cancelled() {
+        Err(bamboo_agent_core::AgentError::Cancelled)
+    } else {
+        result
+    };
+    if let Err(error) = &result {
+        fail_counted_runtime(session, counted_runtime_identity.as_ref(), error);
+    }
+    let checkpoint = crate::runtime::counted_loop::finish(
+        session,
+        &config,
+        counted_generation.as_deref(),
+        &result,
+    )
+    .await;
+    match result {
+        Err(error) => {
+            if let Err(checkpoint_error) = checkpoint {
+                tracing::warn!(%checkpoint_error, "counted-loop terminal checkpoint failed");
+            }
+            Err(error)
+        }
+        Ok(()) => {
+            // Counted completion has one publication boundary, after every
+            // fallible hook/finalizer and the original generation's checkpoint.
+            let completion = match checkpoint {
+                Err(error) if cancel_token.is_cancelled() && counted_generation.is_some() => {
+                    tracing::warn!(%error, "counted-loop checkpoint failed during cancellation");
+                    Err(bamboo_agent_core::AgentError::Cancelled)
+                }
+                Err(error) => Err(error),
+                Ok(()) if counted_generation.is_some() => {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => Err(bamboo_agent_core::AgentError::Cancelled),
+                        _ = event_tx.send(AgentEvent::Complete { usage: counted_usage }) => Ok(()),
+                    }
+                }
+                Ok(()) => Ok(()),
+            };
+            if let Err(error) = &completion {
+                // LoopState may be missing, malformed or from another generation.
+                // Correct only this run's runtime snapshot before that fence can
+                // reject the LoopState write, preserving the host's error save.
+                fail_counted_runtime(session, counted_runtime_identity.as_ref(), error);
+                // A failed Completed checkpoint must not leave in-memory success
+                // for the host's final error save. Cancellation can also win
+                // during that checkpoint or while the event channel is full.
+                if let Err(checkpoint_error) = crate::runtime::counted_loop::finish(
+                    session,
+                    &config,
+                    counted_generation.as_deref(),
+                    &completion,
+                )
+                .await
+                {
+                    tracing::warn!(%checkpoint_error, "counted-loop failure checkpoint failed");
+                }
+            }
+            completion
+        }
+    }
+}
+
+fn fail_counted_runtime(
+    session: &mut Session,
+    expected: Option<&(String, Option<String>, Option<String>)>,
+    error: &bamboo_agent_core::AgentError,
+) {
+    let Some((run_id, last_round_id, execution_id)) = expected else {
+        return;
+    };
+    if let Some(runtime) = session.agent_runtime_state.as_mut() {
+        if runtime.run_id == *run_id
+            && runtime.round.last_round_id == *last_round_id
+            && runtime.execution_id == *execution_id
+            && matches!(
+                runtime.status,
+                bamboo_domain::AgentStatusState::Initializing
+                    | bamboo_domain::AgentStatusState::Running
+                    | bamboo_domain::AgentStatusState::Finalizing
+                    | bamboo_domain::AgentStatusState::Completed
+            )
+        {
+            runtime.status = if error.is_cancelled() {
+                bamboo_domain::AgentStatusState::Cancelled
+            } else {
+                bamboo_domain::AgentStatusState::Failed
+            };
+        }
+    }
 }
 
 #[cfg(test)]

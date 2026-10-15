@@ -699,3 +699,82 @@ async fn checkpoint_successor_once(
         1
     );
 }
+
+#[tokio::test]
+async fn root_receipt_claim_uses_current_writer_run_and_existing_checkpoint_ack() {
+    let f = Fixture::new(LeaseDuration::seconds(30)).await;
+    let selected = bamboo_domain::SessionInboxReceipt {
+        id: f.input.id.clone(),
+        generation: 1,
+    };
+    let now = Utc::now();
+    let request = SessionInboxLeaseRequest {
+        consumer: SessionInboxConsumerId::new(),
+        now,
+        duration: LeaseDuration::seconds(5),
+    };
+    for run in [None, Some("another-run")] {
+        assert!(f
+            .bound
+            .claim_owned_receipt(ROOT, &selected, run, &request)
+            .await
+            .is_err());
+    }
+    f.assert_unadmitted().await;
+    let claim = f
+        .bound
+        .claim_owned_receipt(ROOT, &selected, Some("run-a"), &request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.claim.envelope, f.input);
+    assert!(claim.lease.expires_at <= f.root_expires_at);
+    f.checkpoint(&claim).await.unwrap();
+    assert!(f.raw.was_admitted(ROOT, &selected.id).await.unwrap());
+    assert_eq!(f.publications.lock().unwrap().len(), 1);
+    assert!(f
+        .bound
+        .claim_owned_receipt(ROOT, &selected, Some("run-a"), &request)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn root_receipt_claim_rejects_stale_actor_and_lease_beyond_actor_deadline() {
+    let f = Fixture::new(LeaseDuration::seconds(30)).await;
+    let selected = bamboo_domain::SessionInboxReceipt {
+        id: f.input.id.clone(),
+        generation: 1,
+    };
+    let now = Utc::now();
+    let overlong = SessionInboxLeaseRequest {
+        consumer: SessionInboxConsumerId::new(),
+        now,
+        duration: LeaseDuration::minutes(1),
+    };
+    assert!(f
+        .bound
+        .claim_owned_receipt(ROOT, &selected, Some("run-a"), &overlong)
+        .await
+        .is_err());
+    f.a.finish_activation(
+        &f.owner.fence,
+        Utc::now(),
+        bamboo_domain::ActorActivationFinish::Cancelled,
+    )
+    .await
+    .unwrap();
+    let request = SessionInboxLeaseRequest {
+        duration: LeaseDuration::seconds(5),
+        ..overlong
+    };
+    assert!(f
+        .bound
+        .claim_owned_receipt(ROOT, &selected, Some("run-a"), &request)
+        .await
+        .is_err());
+    f.assert_unadmitted().await;
+    let backlog = f.raw.inspect(ROOT).await.unwrap();
+    assert_eq!((backlog.pending, backlog.claimed), (1, 0));
+}

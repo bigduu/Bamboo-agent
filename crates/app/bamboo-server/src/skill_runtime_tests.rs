@@ -16,27 +16,27 @@ use std::sync::Mutex;
 static HTTP_PROOF: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Default)]
-struct Trace {
-    requests: Vec<Vec<Message>>,
+pub(crate) struct Trace {
+    pub(crate) requests: Vec<Vec<Message>>,
     schemas: Vec<Vec<String>>,
     packages: BTreeMap<String, String>,
-    contents: BTreeMap<(String, String), String>,
-    eof: Vec<(String, String)>,
+    pub(crate) contents: BTreeMap<(String, String), String>,
+    pub(crate) eof: Vec<(String, String)>,
     pending: Option<(String, String)>,
     index: usize,
     reference: bool,
-    task_started: bool,
-    task_completed: bool,
-    failures: Vec<String>,
-    main_pages: usize,
+    pub(crate) task_started: bool,
+    pub(crate) task_completed: bool,
+    pub(crate) failures: Vec<String>,
+    pub(crate) main_pages: usize,
 }
 static NEXT_PROVIDER_CALL: AtomicU64 = AtomicU64::new(0);
-struct SkillsProvider {
+pub(crate) struct SkillsProvider {
     wanted: Vec<String>,
     task: PathBuf,
     read_references: bool,
     cap: u32,
-    trace: Mutex<Trace>,
+    pub(crate) trace: Mutex<Trace>,
 }
 impl SkillsProvider {
     fn call(trace: &mut Trace, name: &str, args: Value) -> LLMChunk {
@@ -54,7 +54,7 @@ impl SkillsProvider {
             },
         }])
     }
-    fn has_warm_page(&self, messages: &[Message]) -> bool {
+    pub(crate) fn has_warm_page(&self, messages: &[Message]) -> bool {
         let trace = self.trace.lock().unwrap();
         trace.pending.as_ref().is_some_and(|(id, name)| {
             name == "skills_read"
@@ -234,7 +234,7 @@ impl LLMProvider for SkillsProvider {
     }
 }
 
-fn write_skill(home: &Path, id: &str, automatic: bool) -> String {
+pub(crate) fn write_skill(home: &Path, id: &str, automatic: bool) -> String {
     let root = home.join("skills").join(id);
     std::fs::create_dir_all(root.join("references")).unwrap();
     std::fs::create_dir_all(root.join("agents")).unwrap();
@@ -332,7 +332,7 @@ async fn done(state: &web::Data<AppState>, id: &str) -> AgentStatus {
     .await
     .expect("real HTTP execution must terminate")
 }
-fn provider(home: &Path, cap: u32, references: bool) -> Arc<SkillsProvider> {
+pub(crate) fn provider(home: &Path, cap: u32, references: bool) -> Arc<SkillsProvider> {
     let task = home.join("task.txt");
     std::fs::write(&task, "NORMAL_TASK_ACTION").unwrap();
     Arc::new(SkillsProvider {
@@ -929,7 +929,8 @@ async fn native_registered_producer_rejects_excluded_hosts_before_source_access(
         match shape {
             0 => excluded.kind = bamboo_domain::SessionKind::Child,
             1 => {
-                excluded.set_root_orchestration_only(true).unwrap();
+                // Raw mode metadata lacks the host-selected authority revision.
+                excluded.root_orchestration_only = true;
             }
             2 => excluded.root_session_id = "forged-root-owner".into(),
             _ => excluded.spawn_depth = 1,
@@ -946,3 +947,9 @@ async fn native_registered_producer_rejects_excluded_hosts_before_source_access(
     reservation.abandon().await;
     assert!(provider.trace.lock().unwrap().requests.is_empty());
 }
+
+#[path = "skill_runtime_ultra_tests.rs"]
+mod ultra;
+
+#[path = "receipt_run_tests.rs"]
+mod receipt_run_tests;

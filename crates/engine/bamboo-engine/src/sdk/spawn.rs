@@ -291,6 +291,20 @@ async fn run_child_spawn_inner(
         }
     };
 
+    // Backend preparation has not supplied an Actor writer yet. Refuse old
+    // counted state read-only before skipped/running saves or tool preparation.
+    if let Err(error) = crate::runtime::counted_loop::reject_recovery(&session) {
+        if let Some(reservation) = reserved {
+            reservation.abandon().await;
+        }
+        return Err(publish_child_activation_blocked(
+            &parent_tx,
+            &child_tx,
+            &session.id,
+            &error.to_string(),
+        ));
+    }
+
     // A reserved activation was published by the logical-session router before
     // this task became runnable. Validate that exact ownership and the durable
     // authorized prefix before mutating workspace/control state or writing a

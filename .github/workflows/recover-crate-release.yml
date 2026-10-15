@@ -1,0 +1,136 @@
+name: Recover existing Bamboo release
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_controller_sha:
+        description: "Exact reviewed controller commit on protected dev/main; target source/version/reservation are fixed"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bamboo-crate-publication
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    environment: bamboo-release
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+      EXPECTED_CONTROLLER_SHA: ${{ inputs.expected_controller_sha }}
+    steps:
+      - name: Require the exact protected recovery controller before checkout
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          repository = os.environ["GITHUB_REPOSITORY"]
+          revision = os.environ["EXPECTED_CONTROLLER_SHA"]
+          assert repository == "bigduu/Bamboo-agent"
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          assert os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+          assert os.environ["GITHUB_SHA"] == os.environ["GITHUB_WORKFLOW_SHA"] == revision
+          assert os.environ["GITHUB_REF"] in {"refs/heads/dev", "refs/heads/main"}
+          assert os.environ["GITHUB_REF_TYPE"] == "branch"
+          assert os.environ["GITHUB_REF_PROTECTED"] == "true"
+          assert os.environ["GITHUB_WORKFLOW_REF"] == f"{repository}/.github/workflows/recover-crate-release.yml@{os.environ['GITHUB_REF']}"
+          PY
+
+      - name: Checkout the accepted controller separately
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.expected_controller_sha }}
+          path: controller
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout the original CI-tested product
+        uses: actions/checkout@v7
+        with:
+          ref: 430bf3b5a1e10305fd4226b81b13f6a2c28afa8e
+          path: product
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require clean, independent controller and product checkouts
+        run: |
+          test "$(git -C controller rev-parse HEAD)" = "${EXPECTED_CONTROLLER_SHA}"
+          test -z "$(git -C controller status --porcelain --untracked-files=all)"
+          test "$(git -C product rev-parse HEAD)" = "430bf3b5a1e10305fd4226b81b13f6a2c28afa8e"
+          test -z "$(git -C product status --porcelain --untracked-files=all)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+
+      - name: Verify the original successful main CI and protected controller history
+        working-directory: product
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node ../controller/scripts/crate-release-recover.cjs authorize
+
+      - name: Resolve the original locked frontend
+        working-directory: product
+        id: frontend
+        env:
+          FRONTEND_PACKAGE: "@bigduu/lotus-next"
+          FRONTEND_VERSION: "from_lock"
+        run: |
+          node scripts/release-frontend-policy.cjs
+          test "$(node -p "require('./scripts/frontend-package-lock.json').packageVersion")" = "2026.10.12"
+
+      - name: Stage the original immutable frontend package
+        working-directory: product
+        env:
+          LOTUS_PACKAGE_NAME: ${{ steps.frontend.outputs.package_name }}
+          LOTUS_VERSION: ${{ steps.frontend.outputs.package_version }}
+        run: |
+          test "${LOTUS_PACKAGE_NAME}" = "@bigduu/lotus-next"
+          test "${LOTUS_VERSION}" = "2026.10.12"
+          npm install --no-save --no-package-lock --ignore-scripts "${LOTUS_PACKAGE_NAME}@${LOTUS_VERSION}"
+          LOTUS_SOURCE=package node scripts/frontend-package.cjs stage
+
+      - name: Install the original isolated Cargo publication entrypoint
+        working-directory: product
+        run: node scripts/release-cargo-sandbox.cjs install
+
+      - name: Authenticate and resume only draft 411697635 version 2026.10.11
+        working-directory: product
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
+          BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
+          FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
+          FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
+        run: node ../controller/scripts/crate-release-recover.cjs plan
+
+      - name: Temporarily stamp the original source to its reserved version
+        working-directory: product
+        env:
+          TARGET_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          test "${TARGET_VERSION}" = "2026.10.11"
+          python3 scripts/crate-release-lock.py stamp "${TARGET_VERSION}"
+          cargo metadata --format-version 1 > /dev/null
+          python3 scripts/crate-release-lock.py
+
+      - name: Complete the same authenticated crate and GitHub Release closure
+        working-directory: product
+        env:
+          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
+          BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
+          FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
+          FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
+        run: node ../controller/scripts/crate-release-recover.cjs publish
