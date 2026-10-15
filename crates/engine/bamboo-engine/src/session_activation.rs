@@ -4021,6 +4021,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expected_run_publication_fence_does_not_block_other_sessions() {
+        let router = SessionActivationRouter::new();
+        let target = bamboo_domain::Session::new("target", "model");
+        let registration = router.register_session_run(&target, "run-a").await.unwrap();
+        let query = router.clone();
+        let guard = tokio::task::spawn_blocking(move || {
+            query.retain_expected_run_blocking(&target.id, target.created_at, "run-a")
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        // Keep the actual publication guard alive as if the final filesystem
+        // job is parked. Every unrelated owner transition must still complete.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let other = bamboo_domain::Session::new("independent", "model");
+            let mut other_run = router
+                .register_session_run(&other, "independent-run")
+                .await
+                .unwrap();
+            assert!(router.notify_active_delivery(&other.id, 11).await);
+            assert_eq!(*other_run.notifications_mut().borrow(), 11);
+            other_run.begin_finalization().await;
+            assert_eq!(other_run.finish(0).await.unwrap(), None);
+            assert_eq!(router.current_run_id(&other.id).await, None);
+        })
+        .await
+        .expect("a parked publication must not hold the global router lock");
+        drop(guard);
+        assert_eq!(registration.finish(0).await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn expected_run_requires_real_lifetime_binding_and_cannot_rebind() {
         use bamboo_domain::SessionRunConflictReason;
         let router = SessionActivationRouter::new();
