@@ -2593,9 +2593,9 @@ async fn handle_no_tool_calls_with_native(
         complete_usage.prompt_tokens,
         complete_usage.completion_tokens,
     );
-    if config.counted_loop.is_some() {
-        send_counted_complete(event_tx, cancel_token, usage).await?;
-    } else {
+    // Counted publication belongs to the outer runner, after AfterRound,
+    // normal finalization and the terminal LoopState checkpoint all succeed.
+    if config.counted_loop.is_none() {
         let _ = event_tx.send(AgentEvent::Complete { usage }).await;
     }
     record_no_tool_calls_round_completed(
@@ -2607,7 +2607,7 @@ async fn handle_no_tool_calls_with_native(
     );
     Ok(TurnOutcome {
         should_break: true,
-        sent_complete: true,
+        sent_complete: config.counted_loop.is_none(),
     })
 }
 
@@ -2841,19 +2841,21 @@ async fn handle_tool_calls_path(
                 "runtime.completion_reason".into(),
                 "ticket_question_yield".into(),
             );
-            let _ = frame
-                .event_tx
-                .send(AgentEvent::Complete {
-                    usage: to_event_token_usage(
-                        round_usage.prompt_tokens,
-                        round_usage.completion_tokens,
-                    ),
-                })
-                .await;
+            if frame.config.counted_loop.is_none() {
+                let _ = frame
+                    .event_tx
+                    .send(AgentEvent::Complete {
+                        usage: to_event_token_usage(
+                            round_usage.prompt_tokens,
+                            round_usage.completion_tokens,
+                        ),
+                    })
+                    .await;
+            }
         }
         return Ok(TurnOutcome {
             should_break: true,
-            sent_complete: ticket_question_yield,
+            sent_complete: ticket_question_yield && frame.config.counted_loop.is_none(),
         });
     }
 
@@ -2943,18 +2945,6 @@ use crate::runtime::runner::session_setup::legacy_instruction::{
     validate_first_step as validate_explicit_activation_first_step,
 };
 
-async fn send_counted_complete(
-    event_tx: &mpsc::Sender<AgentEvent>,
-    cancel_token: &CancellationToken,
-    usage: bamboo_agent_core::TokenUsage,
-) -> Result<(), AgentError> {
-    tokio::select! {
-        biased;
-        _ = cancel_token.cancelled() => Err(AgentError::Cancelled),
-        _ = event_tx.send(AgentEvent::Complete { usage }) => Ok(()),
-    }
-}
-
 pub(super) async fn run_pipeline(
     session: &mut Session,
     event_tx: &mpsc::Sender<AgentEvent>,
@@ -2992,12 +2982,6 @@ pub(super) async fn run_pipeline(
     };
     abort_in_flight_evaluations(state, event_tx, reason).await;
     state.current_inputs = None;
-    if config.counted_loop.is_some() && matches!(result, Ok(false)) {
-        // Own this publication so an early stop/budget return cannot escape
-        // through the ordinary finalizer's uncancellable fallback event.
-        send_counted_complete(event_tx, cancel_token, to_event_token_usage(0, 0)).await?;
-        return Ok(true);
-    }
     result
 }
 

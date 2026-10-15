@@ -448,7 +448,7 @@ pub(crate) async fn finish(
         return Err(invalid("generation changed during execution"));
     }
     let cancelled = result.as_ref().is_err_and(|error| error.is_cancelled());
-    if !state.live() && !cancelled {
+    if !state.live() && !cancelled && !(state.status == LoopStatus::Completed && result.is_err()) {
         return Ok(());
     }
     state.status = if cancelled {

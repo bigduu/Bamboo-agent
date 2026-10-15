@@ -25,6 +25,7 @@ struct FakeProvider {
     durable: Option<Arc<dyn Storage>>,
     barrier: Option<(Arc<Notify>, Arc<Notify>)>,
     tools_forever: bool,
+    reported_usage: Option<(u64, u64)>,
     fail_at: Option<usize>,
 }
 
@@ -77,10 +78,20 @@ impl LLMProvider for FakeProvider {
         } else {
             LLMChunk::Token(format!("iteration answer {n}"))
         };
-        Ok(Box::pin(futures::stream::iter(vec![
-            Ok(output),
-            Ok(LLMChunk::Done),
-        ])))
+        let mut chunks = vec![Ok(output)];
+        if let Some((prompt, completion)) = self.reported_usage {
+            chunks.push(Ok(LLMChunk::ProviderUsage {
+                input_tokens: Some(prompt),
+                output_tokens: Some(completion),
+                total_tokens: Some(prompt + completion),
+                reasoning_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
+            }));
+        }
+        chunks.push(Ok(LLMChunk::Done));
+        Ok(Box::pin(futures::stream::iter(chunks)))
     }
 }
 
@@ -879,7 +890,10 @@ impl RuntimeSessionPersistence for CancelAtTerminalCheckpoint {
         if read_loop_state(session).unwrap().is_some_and(|state| {
             matches!(
                 state.status,
-                LoopStatus::Stopped | LoopStatus::BudgetExhausted | LoopStatus::Finalizing
+                LoopStatus::Stopped
+                    | LoopStatus::BudgetExhausted
+                    | LoopStatus::Finalizing
+                    | LoopStatus::Completed
             )
         }) {
             self.cancel.cancel();
@@ -894,6 +908,7 @@ async fn counted_cancel_during_terminal_checkpoint_keeps_cancelled_error_and_no_
         LoopStatus::Stopped,
         LoopStatus::BudgetExhausted,
         LoopStatus::Finalizing,
+        LoopStatus::Completed,
     ] {
         let tools = boundary == LoopStatus::BudgetExhausted;
         let dir = tempfile::tempdir().unwrap();
@@ -929,4 +944,322 @@ async fn counted_cancel_during_terminal_checkpoint_keeps_cancelled_error_and_no_
             LoopStatus::Cancelled
         );
     }
+}
+
+struct HoldCompletedCheckpoint {
+    inner: Arc<dyn RuntimeSessionPersistence>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    fail: bool,
+}
+
+#[async_trait]
+impl RuntimeSessionPersistence for HoldCompletedCheckpoint {
+    async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.inner.save_runtime_session(session).await
+    }
+    async fn load_runtime_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+        self.inner.load_runtime_session(id).await
+    }
+    async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        if read_loop_state(session)
+            .unwrap()
+            .is_some_and(|state| state.status == LoopStatus::Completed)
+        {
+            self.entered.notify_one();
+            self.release.notified().await;
+            if self.fail {
+                return Err(std::io::Error::other(
+                    "synthetic Completed checkpoint failure",
+                ));
+            }
+        }
+        self.inner.checkpoint_runtime_session(session).await
+    }
+}
+
+#[tokio::test]
+async fn counted_complete_waits_for_terminal_checkpoint_and_never_publishes_failed_success() {
+    for fail in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(1, 1);
+        let mut session = Session::new("counted-fixture", "fake-only");
+        let storage = add_persistence(dir.path(), &mut cfg, &session).await;
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        cfg.persistence = Some(Arc::new(HoldCompletedCheckpoint {
+            inner: cfg.persistence.take().unwrap(),
+            entered: entered.clone(),
+            release: release.clone(),
+            fail,
+        }));
+        let provider = Arc::new(FakeProvider {
+            durable: Some(storage.clone()),
+            ..Default::default()
+        });
+        let (tx, mut rx) = mpsc::channel(512);
+        let mut events = Vec::new();
+        let (result, ()) = tokio::join!(
+            run_agent_loop_with_config(
+                &mut session,
+                PROMPT.into(),
+                tx,
+                provider.clone(),
+                Arc::new(FakeTools),
+                CancellationToken::new(),
+                cfg,
+            ),
+            async {
+                entered.notified().await;
+                while let Ok(event) = rx.try_recv() {
+                    events.push(event);
+                }
+                assert_eq!(complete_count(&events), 0, "checkpoint is still pending");
+                let stored = storage
+                    .load_session("counted-fixture")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    read_loop_state(&stored).unwrap().unwrap().status,
+                    LoopStatus::Finalizing
+                );
+                release.notify_one();
+            }
+        );
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let expected = if fail {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("checkpoint failed"));
+            assert_eq!(complete_count(&events), 0);
+            LoopStatus::Failed
+        } else {
+            result.unwrap();
+            assert_eq!(complete_count(&events), 1);
+            LoopStatus::Completed
+        };
+        assert_eq!(read_loop_state(&session).unwrap().unwrap().status, expected);
+        let stored = storage.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(read_loop_state(&stored).unwrap().unwrap().status, expected);
+        // The host's later normal/error save cannot accidentally restore the
+        // in-memory Completed value from the failed checkpoint attempt.
+        storage.save_session(&session).await.unwrap();
+        let saved_again = storage.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            read_loop_state(&saved_again).unwrap().unwrap().status,
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn counted_complete_reports_actual_run_usage_for_success_stop_and_budget() {
+    for terminal in [
+        LoopStatus::Completed,
+        LoopStatus::Stopped,
+        LoopStatus::BudgetExhausted,
+    ] {
+        let tools = terminal == LoopStatus::BudgetExhausted;
+        let mut cfg = if tools { config(1, 2) } else { config(2, 4) };
+        if terminal == LoopStatus::Stopped {
+            let mut hooks = crate::runtime::hooks::HookRunner::new();
+            hooks.register(Arc::new(StopAfterRound(cfg.counted_loop.clone().unwrap())));
+            cfg.hook_runner = Arc::new(hooks);
+        }
+        let mut session = Session::new("counted-fixture", "fake-only");
+        let provider = Arc::new(FakeProvider {
+            tools_forever: tools,
+            reported_usage: Some((7, 3)),
+            ..Default::default()
+        });
+        let (result, events) = run(
+            &mut session,
+            cfg,
+            provider.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        result.unwrap();
+        let calls = if terminal == LoopStatus::Stopped {
+            1
+        } else {
+            2
+        };
+        assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(read_loop_state(&session).unwrap().unwrap().status, terminal);
+        assert_eq!(complete_count(&events), 1);
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::Complete { usage } => Some(usage),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            ((calls * 7) as u64, (calls * 3) as u64, (calls * 10) as u64)
+        );
+    }
+}
+
+struct AbortCountedAfterRound;
+
+#[async_trait]
+impl AgentHook for AbortCountedAfterRound {
+    fn point(&self) -> AgentHookPoint {
+        AgentHookPoint::AfterRound
+    }
+    async fn run(&self, _: AgentHookPoint, _: &HookPayload, _: &Session) -> HookResult {
+        HookResult::Abort {
+            reason: "synthetic post-round failure".into(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn counted_after_round_failure_has_no_premature_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(1, 1);
+    let mut hooks = crate::runtime::hooks::HookRunner::new();
+    hooks.register(Arc::new(AbortCountedAfterRound));
+    cfg.hook_runner = Arc::new(hooks);
+    let mut session = Session::new("counted-fixture", "fake-only");
+    let storage = add_persistence(dir.path(), &mut cfg, &session).await;
+    let (result, events) = run(
+        &mut session,
+        cfg,
+        Arc::new(FakeProvider::default()),
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("synthetic post-round failure"));
+    assert_eq!(complete_count(&events), 0);
+    let stored = storage.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(
+        read_loop_state(&stored).unwrap().unwrap().status,
+        LoopStatus::Failed
+    );
+}
+
+struct ChangeFinalizingGeneration(Arc<dyn RuntimeSessionPersistence>);
+
+#[async_trait]
+impl RuntimeSessionPersistence for ChangeFinalizingGeneration {
+    async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.0.save_runtime_session(session).await
+    }
+    async fn load_runtime_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+        self.0.load_runtime_session(id).await
+    }
+    async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        if let Some(mut state) = read_loop_state(session).unwrap() {
+            if state.status == LoopStatus::Finalizing {
+                state.generation = uuid::Uuid::new_v4().to_string();
+                session.metadata.insert(
+                    LOOP_STATE_METADATA_KEY.into(),
+                    serde_json::to_string(&state).unwrap(),
+                );
+            }
+        }
+        self.0.checkpoint_runtime_session(session).await
+    }
+}
+
+#[tokio::test]
+async fn counted_generation_change_fails_before_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(1, 1);
+    let mut session = Session::new("counted-fixture", "fake-only");
+    add_persistence(dir.path(), &mut cfg, &session).await;
+    cfg.persistence = Some(Arc::new(ChangeFinalizingGeneration(
+        cfg.persistence.take().unwrap(),
+    )));
+    let (result, events) = run(
+        &mut session,
+        cfg,
+        Arc::new(FakeProvider::default()),
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("generation changed"));
+    assert_eq!(complete_count(&events), 0);
+}
+
+struct CountedStopHook(AtomicUsize);
+
+#[async_trait]
+impl AgentHook for CountedStopHook {
+    fn point(&self) -> AgentHookPoint {
+        AgentHookPoint::BeforeFinalize
+    }
+    async fn run(&self, _: AgentHookPoint, payload: &HookPayload, session: &Session) -> HookResult {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            read_loop_state(session)
+                .unwrap()
+                .unwrap()
+                .iterations_completed,
+            2
+        );
+        match payload {
+            HookPayload::Finalize {
+                stop_hook_active: false,
+            } => HookResult::Deny {
+                reason: "verify once".into(),
+            },
+            HookPayload::Finalize {
+                stop_hook_active: true,
+            } => HookResult::Continue,
+            payload => panic!("unexpected hook payload: {payload:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn counted_final_stop_hook_continues_within_cap_before_one_complete() {
+    let mut cfg = config(2, 3);
+    let hook = Arc::new(CountedStopHook(AtomicUsize::new(0)));
+    let mut hooks = crate::runtime::hooks::HookRunner::new();
+    hooks.register(hook.clone());
+    cfg.hook_runner = Arc::new(hooks);
+    let mut session = Session::new("counted-fixture", "fake-only");
+    let provider = Arc::new(FakeProvider {
+        reported_usage: Some((7, 3)),
+        ..Default::default()
+    });
+    let (result, events) = run(
+        &mut session,
+        cfg,
+        provider.clone(),
+        CancellationToken::new(),
+    )
+    .await;
+    result.unwrap();
+    let state = read_loop_state(&session).unwrap().unwrap();
+    assert_eq!(
+        (
+            state.iterations_completed,
+            state.rounds_started,
+            state.status
+        ),
+        (2, 3, LoopStatus::Completed)
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(hook.0.load(Ordering::SeqCst), 2);
+    assert_eq!(complete_count(&events), 1);
 }

@@ -26,7 +26,11 @@ accumulated transcript. The next ordinary runtime User is appended at the next
 round boundary, after checking stop and remaining budget. It carries generation,
 objective revision and iteration metadata and grants no new tool/skill authority.
 The counted gate emits no intermediate `Complete`; ordinary finalization emits
-one completion event for a successful live execution.
+one completion event for a successful live execution. Counted publication waits
+until all post-round hooks/finalizers and the original generation's terminal
+checkpoint succeed. A failed completion checkpoint records failure for the
+host's later error save; it cannot publish success first. The event carries this
+run's cumulative actual token usage, including retries and final-evidence work.
 
 Clones of `CountedLoopConfig` share an idempotent `stop()` signal. Stop drains
 the current admitted round/tool batch and prevents any later round or iteration;
