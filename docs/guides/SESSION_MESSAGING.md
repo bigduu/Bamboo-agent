@@ -82,3 +82,27 @@ Cancel accepted never means stopped: exact-run stop and Bamboo's durable termina
 validation keep their existing contracts. Supervisor SSE/output remains session
 scoped; no input-exclusive output attribution is inferred. These are the later
 P2 and P3 acceptance phases in #2000.
+
+## Run-fenced continuation foundations
+
+The host storage port `existing_peer_message_with_intent` observes an exact
+explicit peer receipt without delivering it again. It revalidates current
+source/target lifetimes, tree/Project membership and canonical reply proof,
+matches the immutable envelope and intent, and distinguishes pending from a
+permanent ACK or terminal queue item. Missing receipts return `None`;
+unsupported backends or invalid/corrupt evidence return an error. Observation
+does not allocate a delivery generation, claim, ACK, quarantine an entry or
+change activation permission. Queue and ACK reads retain the transport byte bound. The usual Inbox operation lock may be initialized.
+
+This observation is not an expected-run compare-and-steer grant. A later P2
+operation must retain the exact active non-finalizing owner through the actual
+durable transaction, including started filesystem work after caller cancellation.
+Checking a run snapshot before delivery is insufficient. An accepted old retry
+must be distinguishable from a new request naming a stale run.
+
+P3 must record actual admitted-input coverage before attributing output to an
+input. The existing selected-run visible-output buffer binds one selected
+receipt and a Root birth/run; that binding alone does not cover ordinary queued
+Supervisor followups or multiple inputs in a run. Session history and untagged
+SSE remain session-scoped. Unknown, partial or unavailable coverage must remain
+explicit, including after restart or eviction. No new output store is implied.

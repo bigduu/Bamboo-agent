@@ -1745,3 +1745,362 @@ async fn explicit_peer_promotion_preserves_policy_after_ack_and_reopen() {
         }
     }
 }
+
+fn peer_lookup_files(
+    dir: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(
+        base: &std::path::Path,
+        dir: &std::path::Path,
+        files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        if !dir.exists() {
+            return;
+        }
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                visit(base, &entry.path(), files);
+            } else {
+                files.insert(
+                    entry.path().strip_prefix(base).unwrap().to_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    visit(dir, dir, &mut files);
+    files
+}
+
+#[tokio::test]
+async fn peer_receipt_lookup_observes_exact_pending_claimed_and_ack_without_delivery() {
+    for intent in [
+        SessionMessageDeliveryIntent::QueueOnly,
+        SessionMessageDeliveryIntent::TriggerTurn,
+    ] {
+        let (temp, _store, inbox, source, target) = explicit_peer_fixture().await;
+        let envelope = peer_envelope("sender", "parent");
+        assert_eq!(
+            inbox
+                .existing_peer_message_with_intent(&envelope, &source, &target, None, intent)
+                .await
+                .unwrap(),
+            None
+        );
+        let dir = inbox.inbox_dir("parent").await.unwrap();
+        assert!(!dir.join(GENERATION_FILE).exists());
+        assert!(!dir.join(ACTIVATION_GENERATION_FILE).exists());
+        let empty = peer_lookup_files(&dir);
+        assert_eq!(
+            inbox
+                .existing_peer_message_with_intent(&envelope, &source, &target, None, intent)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(peer_lookup_files(&dir), empty);
+        let delivery = inbox
+            .deliver_peer_message_with_intent(&envelope, &source, &target, None, intent)
+            .await
+            .unwrap();
+        let mut claim = None;
+        for stage in 0..3 {
+            if stage == 1 {
+                claim = Some(
+                    inbox
+                        .claim_for_turn("parent", 1, Some("owned-run"))
+                        .await
+                        .unwrap()
+                        .remove(0),
+                );
+            } else if stage == 2 {
+                inbox.ack("parent", claim.as_ref().unwrap()).await.unwrap();
+            }
+            let reopened = reopen(&temp).await;
+            let before = peer_lookup_files(&dir);
+            let observed = reopened
+                .existing_peer_message_with_intent(&envelope, &source, &target, None, intent)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed.delivery, delivery.delivery);
+            assert_eq!(observed.pending, stage != 2);
+            for change in ["body", "thread", "correlation", "intent"] {
+                let mut changed = envelope.clone();
+                let mut requested_intent = intent;
+                match change {
+                    "body" => {
+                        changed.body = SessionMessageBody::Content(SessionMessageContent::text(
+                            "different semantic input",
+                        ));
+                    }
+                    "thread" => changed.thread_id = Some("different-thread".into()),
+                    "correlation" => changed.correlation_id = Some("different-operation".into()),
+                    "intent" => {
+                        requested_intent = match intent {
+                            SessionMessageDeliveryIntent::QueueOnly => {
+                                SessionMessageDeliveryIntent::TriggerTurn
+                            }
+                            SessionMessageDeliveryIntent::TriggerTurn => {
+                                SessionMessageDeliveryIntent::QueueOnly
+                            }
+                        };
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    reopened
+                        .existing_peer_message_with_intent(
+                            &changed,
+                            &source,
+                            &target,
+                            None,
+                            requested_intent,
+                        )
+                        .await
+                        .is_err(),
+                    "{change} must conflict at stage {stage}"
+                );
+            }
+            assert_eq!(peer_lookup_files(&dir), before);
+        }
+    }
+}
+
+#[tokio::test]
+async fn peer_receipt_lookup_revalidates_birth_and_canonical_reply_authority_after_ack() {
+    let (_temp, store, inbox) = fixture().await;
+    let (mut child, root, original, reply) = peer_reply_proof_fixture(&store, "parent").await;
+    let source = bamboo_domain::ActorSession::from_session(&child).unwrap();
+    let target = bamboo_domain::ActorSession::from_session(&root).unwrap();
+    let intent = SessionMessageDeliveryIntent::QueueOnly;
+    let receipt = inbox
+        .deliver_peer_message_with_intent(&reply, &source, &target, Some(&original), intent)
+        .await
+        .unwrap();
+    let claim = inbox.claim("parent", 1).await.unwrap().remove(0);
+    inbox.ack("parent", &claim).await.unwrap();
+    let dir = inbox.inbox_dir("parent").await.unwrap();
+    let before = peer_lookup_files(&dir);
+    let observed = inbox
+        .existing_peer_message_with_intent(&reply, &source, &target, Some(&original), intent)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.delivery, receipt.delivery);
+    assert!(!observed.pending);
+    for stale_source in [true, false] {
+        let mut requested_source = source.clone();
+        let mut requested_target = target.clone();
+        if stale_source {
+            requested_source.session_created_at += chrono::Duration::seconds(1);
+        } else {
+            requested_target.session_created_at += chrono::Duration::seconds(1);
+        }
+        assert!(inbox
+            .existing_peer_message_with_intent(
+                &reply,
+                &requested_source,
+                &requested_target,
+                Some(&original),
+                intent,
+            )
+            .await
+            .is_err());
+    }
+    assert!(inbox
+        .existing_peer_message_with_intent(&reply, &source, &target, None, intent)
+        .await
+        .is_err());
+    child.messages.clear();
+    store.save_session(&child).await.unwrap();
+    assert!(inbox
+        .existing_peer_message_with_intent(&reply, &source, &target, Some(&original), intent)
+        .await
+        .is_err());
+    assert_eq!(peer_lookup_files(&dir), before);
+}
+
+#[tokio::test]
+async fn peer_receipt_lookup_rejects_corruption_without_quarantine_or_watermark_repair() {
+    for defect in ["filename", "body", "intent", "watermark"] {
+        let (_temp, _store, inbox, source, target) = explicit_peer_fixture().await;
+        let envelope = peer_envelope("sender", "parent");
+        let intent = SessionMessageDeliveryIntent::QueueOnly;
+        inbox
+            .deliver_peer_message_with_intent(&envelope, &source, &target, None, intent)
+            .await
+            .unwrap();
+        let dir = inbox.inbox_dir("parent").await.unwrap();
+        let path = std::fs::read_dir(dir.join("new"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        match defect {
+            "filename" => std::fs::rename(&path, dir.join("new/bad.json")).unwrap(),
+            "body" => std::fs::write(&path, b"invalid-json").unwrap(),
+            "intent" => {
+                let mut raw: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                raw["body"][ACTIVATION_INTENT_KEY]["version"] = serde_json::json!(99);
+                std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+            }
+            "watermark" => std::fs::write(dir.join(ACTIVATION_GENERATION_FILE), b"0").unwrap(),
+            _ => unreachable!(),
+        }
+        let before = peer_lookup_files(&dir);
+        assert!(
+            inbox
+                .existing_peer_message_with_intent(&envelope, &source, &target, None, intent)
+                .await
+                .is_err(),
+            "{defect}"
+        );
+        assert_eq!(peer_lookup_files(&dir), before, "{defect}");
+    }
+}
+
+#[test]
+fn peer_receipt_lookup_started_lock_job_retains_authority_after_caller_shutdown() {
+    use super::owned_lifetime_tests::{Fixture, Parked};
+    let fixture = Fixture::new();
+    let child = Session::new_child("sender", "target", "model", "child");
+    let (source, target) = fixture.runtime.block_on(async {
+        fixture.store.save_session(&child).await.unwrap();
+        let parent = fixture.store.load_session("target").await.unwrap().unwrap();
+        (
+            bamboo_domain::ActorSession::from_session(&child).unwrap(),
+            bamboo_domain::ActorSession::from_session(&parent).unwrap(),
+        )
+    });
+    let envelope = peer_envelope("sender", "target");
+    let mut parked = Parked::start(
+        fixture.inbox.clone(),
+        "acquire",
+        fixture.dir.clone(),
+        move |inbox| async move {
+            inbox
+                .existing_peer_message_with_intent(
+                    &envelope,
+                    &source,
+                    &target,
+                    None,
+                    SessionMessageDeliveryIntent::QueueOnly,
+                )
+                .await
+                .map(|_| ())
+        },
+    );
+    parked.shutdown();
+    fixture.assert_physical_locks(false);
+    let writer_store = fixture.store.clone();
+    let mut writer = Box::pin(writer_store.delete_session_recursive("sender", true));
+    fixture.runtime.block_on(std::future::poll_fn(|cx| {
+        use std::future::Future;
+        assert!(writer.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    }));
+    parked.barrier.release();
+    assert!(fixture.runtime.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .unwrap()
+            .unwrap()
+    }));
+    assert!(!fixture.dir.join(GENERATION_FILE).exists());
+}
+
+#[tokio::test]
+async fn peer_receipt_lookup_bounds_pending_and_ack_reads_without_mutation() {
+    for acknowledged in [false, true] {
+        let (_temp, _store, mut inbox, source, target) = explicit_peer_fixture().await;
+        inbox.limits.max_payload_bytes = 1024;
+        let envelope = peer_envelope("sender", "parent");
+        let intent = SessionMessageDeliveryIntent::QueueOnly;
+        inbox
+            .deliver_peer_message_with_intent(&envelope, &source, &target, None, intent)
+            .await
+            .unwrap();
+        let dir = inbox.inbox_dir("parent").await.unwrap();
+        let path = if acknowledged {
+            let claim = inbox.claim("parent", 1).await.unwrap().remove(0);
+            inbox.ack("parent", &claim).await.unwrap();
+            FileSessionInbox::admitted_path(&dir, &envelope.id)
+        } else {
+            std::fs::read_dir(dir.join("new"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path()
+        };
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(inbox.max_transport_bytes() as u64 + 1)
+            .unwrap();
+        let before = peer_lookup_files(&dir);
+        let error = inbox
+            .existing_peer_message_with_intent(&envelope, &source, &target, None, intent)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("byte limit"));
+        assert_eq!(peer_lookup_files(&dir), before);
+    }
+}
+
+#[tokio::test]
+async fn peer_receipt_lookup_unsupported_backend_never_emulates_missing_or_delivery() {
+    struct Unsupported;
+    #[async_trait::async_trait]
+    impl SessionInboxPort for Unsupported {
+        async fn deliver(
+            &self,
+            _: &SessionMessageEnvelope,
+        ) -> Result<SessionInboxReceipt, SessionInboxError> {
+            panic!("receipt lookup must not deliver")
+        }
+        async fn claim(
+            &self,
+            _: &str,
+            _: usize,
+        ) -> Result<Vec<SessionInboxClaim>, SessionInboxError> {
+            panic!("receipt lookup must not claim")
+        }
+        async fn was_admitted(
+            &self,
+            _: &str,
+            _: &SessionMessageId,
+        ) -> Result<bool, SessionInboxError> {
+            panic!("receipt lookup must not replace exact evidence with a boolean")
+        }
+        async fn ack(&self, _: &str, _: &SessionInboxClaim) -> Result<(), SessionInboxError> {
+            panic!("receipt lookup must not ACK")
+        }
+        async fn inspect(&self, _: &str) -> Result<SessionInboxBacklog, SessionInboxError> {
+            panic!("receipt lookup must not replace exact evidence with aggregate state")
+        }
+    }
+    let parent = Session::new("parent", "model");
+    let child = Session::new_child_of("sender", &parent, "model", "task");
+    let source = bamboo_domain::ActorSession::from_session(&child).unwrap();
+    let target = bamboo_domain::ActorSession::from_session(&parent).unwrap();
+    let error = Unsupported
+        .existing_peer_message_with_intent(
+            &peer_envelope("sender", "parent"),
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::QueueOnly,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, SessionInboxError::Storage(message) if message.contains("unsupported"))
+    );
+}

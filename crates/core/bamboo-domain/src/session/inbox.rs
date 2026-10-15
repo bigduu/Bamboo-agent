@@ -1615,6 +1615,26 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    /// Observe an exact explicit peer delivery under the same retained
+    /// lifetime/tree/Project/reply authority and Inbox locks as admission.
+    /// Match the immutable envelope and intent, including permanent ACK state.
+    /// This must not enqueue, claim, ACK, quarantine, allocate a generation or
+    /// change activation permission. None means no exact delivery is known;
+    /// unsupported backends must return an error, never pretend it is absent.
+    /// A receipt is not current-run authority or proof of model completion.
+    async fn existing_peer_message_with_intent(
+        &self,
+        _envelope: &SessionMessageEnvelope,
+        _source: &super::ActorSession,
+        _target: &super::ActorSession,
+        _reply_to: Option<&SessionMessageEnvelope>,
+        _intent: SessionMessageDeliveryIntent,
+    ) -> Result<Option<SessionInboxDeliveryReceipt>, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "explicit peer receipt lookup is unsupported".into(),
+        ))
+    }
+
     /// Opt-in explicit peer scheduling with the same retained lifetime/tree/
     /// Project/reply authority as deliver_peer_message. QueueOnly is claimable
     /// at a running consumer's safe point, but is excluded from wake scans.
