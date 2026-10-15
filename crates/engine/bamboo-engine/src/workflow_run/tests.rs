@@ -115,7 +115,19 @@ async fn repository_promotes_journal_committed_staged_snapshot() {
         .await
         .unwrap();
 
-    let second = snapshot("run-1", WorkflowRunStatus::Running, 2);
+    let mut second = snapshot("run-1", WorkflowRunStatus::Running, 2);
+    second.steps.insert(
+        "echo".into(),
+        WorkflowStepSnapshot {
+            id: "echo".into(),
+            topology: second.definition.plan.step_topology("echo", Vec::new()),
+            status: WorkflowStepStatus::Running,
+            input_hash: "opaque".into(),
+            output: None,
+            failure: None,
+            attempts: 1,
+        },
+    );
     let event = run_event("run-1", 2, WorkflowRunEventKind::RunStarted);
     let run_dir = directory.path().join("run-1");
     tokio::fs::write(
@@ -139,6 +151,7 @@ async fn repository_promotes_journal_committed_staged_snapshot() {
     let recovered = repository.load("run-1").await.unwrap().unwrap();
     assert_eq!(recovered.status, WorkflowRunStatus::Running);
     assert_eq!(recovered.last_sequence, 2);
+    assert_eq!(recovered, second);
     assert!(!run_dir.join(".snapshot-2.tmp").exists());
 }
 

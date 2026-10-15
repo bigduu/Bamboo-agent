@@ -211,9 +211,11 @@ async fn topology_preserves_unexpanded_map_prefix_without_fabricating_item_zero(
 #[tokio::test]
 async fn topology_keeps_opaque_planned_ids_distinct_from_map_runtime_ids() {
     let directory = tempfile::tempdir().unwrap();
+    let mut producer = tool_step("a", "echo", json!({"from":"item","name":"item"}));
+    producer.output_schema = Some(json!({"type":"integer"}));
     let flow = definition(
         vec![
-            tool_step("a", "echo", json!({"from":"item","name":"item"})),
+            producer,
             tool_step("b", "echo", json!({"from":"step","step":"a"})),
             tool_step("a@root[0]", "echo", json!({"static":1})),
             tool_step("a@root[0]@", "echo", json!({"static":2})),
@@ -265,4 +267,62 @@ async fn topology_keeps_opaque_planned_ids_distinct_from_map_runtime_ids() {
         vec![2]
     );
     assert_eq!(result.steps["b@root[0]"].output, Some(json!(42)));
+}
+
+#[tokio::test]
+async fn topology_skip_does_not_overwrite_a_completed_colliding_planned_step() {
+    let directory = tempfile::tempdir().unwrap();
+    let flow = definition(
+        vec![
+            tool_step("a", "echo", json!({})),
+            tool_step("b", "echo", json!({})),
+            tool_step("a@root[0]", "echo", json!({"static":1})),
+            tool_step("a@root[0]@", "echo", json!({"static":2})),
+        ],
+        WorkflowPlan::Sequence {
+            nodes: vec![
+                choice_leaf("a@root[0]"),
+                choice_leaf("a@root[0]@"),
+                WorkflowPlan::Map {
+                    source: ValueRef::Args {
+                        pointer: "/items".into(),
+                    },
+                    item: "item".into(),
+                    body: Box::new(choice_plan(
+                        ValueRef::Literal {
+                            value: json!(false),
+                        },
+                        choice_leaf("a"),
+                        choice_leaf("b"),
+                    )),
+                },
+            ],
+        },
+    );
+    let result = engine(directory.path(), MockDefinitions::default())
+        .run(request(flow, json!({"items":[42]})))
+        .await
+        .unwrap();
+    assert_eq!(result.status, WorkflowRunStatus::Succeeded);
+    assert_eq!(result.steps.len(), 4);
+    let skipped = &result.steps["a@root[0]@@"];
+    assert_eq!(skipped.status, WorkflowStepStatus::Skipped);
+    assert_eq!(
+        skipped.topology.as_ref().unwrap().plan_node_path,
+        vec![2, 0, 0]
+    );
+    assert_eq!(skipped.topology.as_ref().unwrap().map_index_path, vec![0]);
+    for (id, output) in [
+        ("a@root[0]", json!({"static":1})),
+        ("a@root[0]@", json!({"static":2})),
+    ] {
+        assert_eq!(result.steps[id].status, WorkflowStepStatus::Succeeded);
+        assert_eq!(result.steps[id].output, Some(output));
+        assert!(result.steps[id]
+            .topology
+            .as_ref()
+            .unwrap()
+            .map_index_path
+            .is_empty());
+    }
 }
