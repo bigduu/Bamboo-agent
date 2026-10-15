@@ -46,20 +46,31 @@ fn request_tool_schemas_for_loading_mode<'a>(
     required_tool: Option<&str>,
 ) -> Cow<'a, [ToolSchema]> {
     if session.model_orchestration_only_enabled() {
-        // The full bounded catalog is already selected for this Root. A
-        // provider-specific discovery gateway must not reintroduce an
-        // unapproved tenth tool after that selection.
-        return Cow::Owned(
-            tool_schemas
-                .iter()
-                .filter(|schema| {
-                    bamboo_domain::ClassifiedToolSchema::new((**schema).clone()).is_some_and(
-                        |entry| session.allows_model_tool_execution(entry.execution_name()),
-                    )
+        // Preserve exact model authority in every provider projection. The
+        // trusted Supervisor may use the existing read-only loading gateway
+        // to discover only its bounded orchestration catalog.
+        let mut bounded = tool_schemas
+            .iter()
+            .filter(|schema| {
+                bamboo_domain::ClassifiedToolSchema::new((**schema).clone()).is_some_and(|entry| {
+                    session.allows_model_tool_execution(entry.execution_name())
                 })
-                .cloned()
-                .collect(),
-        );
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if session.supervisor_incarnation_id().is_some()
+            && mode == bamboo_domain::CapabilityLoadingMode::StickyFallback
+        {
+            // The existing read-only control gateway loads only this bounded
+            // catalog. Never force a named delegation tool or expose a shell.
+            bounded.retain(|schema| {
+                bamboo_domain::ClassifiedToolSchema::new(schema.clone()).is_some_and(|entry| {
+                    entry.loading_class() == bamboo_domain::CapabilityLoadingClass::Core
+                })
+            });
+            bounded.push(bamboo_domain::discovery_control_fallback_schema());
+        }
+        return Cow::Owned(bounded);
     }
     if mode == bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog {
         // Legacy providers keep every other Deferred function unchanged. Only
@@ -411,7 +422,8 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_delegation_first_provider_projection_never_reintroduces_discovery_or_execution() {
+    fn supervisor_delegation_first_provider_projection_keeps_only_bounded_tools_and_readonly_loading(
+    ) {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
         let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
         supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
@@ -438,12 +450,17 @@ mod tests {
             ] {
                 let offered =
                     request_tool_schemas_for_loading_mode(&supervisor, &schemas, mode, None);
+                let expected = if mode == CapabilityLoadingMode::StickyFallback {
+                    vec!["Read", "discover_capabilities"]
+                } else {
+                    vec!["Read", "SubAgent", "session_control", "session_history"]
+                };
                 assert_eq!(
                     offered
                         .iter()
                         .map(|s| s.function.name.as_str())
                         .collect::<Vec<_>>(),
-                    ["Read", "SubAgent", "session_control", "session_history"]
+                    expected
                 );
             }
         }

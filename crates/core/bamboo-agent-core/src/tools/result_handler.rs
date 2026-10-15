@@ -877,10 +877,10 @@ mod tests {
                         })
                         .unwrap(),
                     )),
-                    "SubAgent" if self.failure.is_some() => {
-                        Err(ToolError::Execution(self.failure.unwrap().into()))
-                    }
-                    "SubAgent" => Ok(ToolResult::text(true, "child assignment admitted")),
+                    "SubAgent" => match self.failure {
+                        Some(reason) => Err(ToolError::Execution(reason.into())),
+                        None => Ok(ToolResult::text(true, "child assignment admitted")),
+                    },
                     _ => Ok(ToolResult::text(
                         true,
                         "direct execution must never be reached",

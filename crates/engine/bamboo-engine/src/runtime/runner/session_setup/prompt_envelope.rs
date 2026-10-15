@@ -121,7 +121,13 @@ pub(crate) fn build_root_orchestration_context_block_for_tools(
                     .any(|schema| schema.function.name == *name)
             })
             .collect::<Vec<_>>();
-        let observation = if routes.is_empty() {
+        let observation = if routes.is_empty()
+            && tool_schemas.iter().any(|schema| {
+                schema.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
+            }) {
+            serde_json::json!({"status":"discovery_required",
+                "recovery":"Use the existing read-only discovery gateway to load an already-approved orchestration tool. If no match or worker is available, report the recoverable blocker; never self-execute."})
+        } else if routes.is_empty() {
             serde_json::json!({"status":"blocked","reason":"delegation_tools_unavailable",
                 "recovery":"Ask the owner to provide an authorized delegation route; do not perform the execution here."})
         } else {
@@ -249,6 +255,13 @@ fn supervisor_delegation_first_reports_unavailable_routes_without_claiming_worke
         assert!(blocked.content.contains("delegation_tools_unavailable"));
         assert!(blocked.content.contains("Ask the owner"));
         assert!(!supervisor.allows_model_tool_execution("exec_command"));
+        let loading = build_root_orchestration_context_block_for_tools(
+            &supervisor,
+            &[bamboo_domain::discovery_control_fallback_schema()],
+        )
+        .unwrap();
+        assert!(loading.content.contains("discovery_required"));
+        assert!(!loading.content.contains("delegation_tools_unavailable"));
         let exposed =
             build_root_orchestration_context_block_for_tools(&supervisor, &[schema("SubAgent")])
                 .unwrap();

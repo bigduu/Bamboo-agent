@@ -280,7 +280,7 @@ pub(super) fn reset_activation_state_for_new_selection(
 }
 
 pub(crate) fn explicit_activation_pending(session: &Session) -> bool {
-    if sdk_runtime_active() {
+    if sdk_runtime_active() || session.supervisor_incarnation_id().is_some() {
         return false;
     }
 
@@ -312,7 +312,7 @@ pub(crate) fn explicit_activation_pending(session: &Session) -> bool {
 /// This is a dedicated host context block, never a synthetic user message in
 /// session history and never a catalog/live-filesystem re-resolution.
 pub(crate) fn active_context_block(session: &Session) -> Option<ContextBlock> {
-    if sdk_runtime_active() {
+    if sdk_runtime_active() || session.supervisor_incarnation_id().is_some() {
         return None;
     }
 
@@ -582,6 +582,19 @@ mod tests {
                 incarnation_id: uuid::Uuid::new_v4(),
             };
             supervisor.set_root_orchestration_only(ultra).unwrap();
+            supervisor
+                .metadata
+                .insert(SKILL_RUNTIME_SELECTION_SOURCE_KEY.into(), "explicit".into());
+            supervisor.metadata.insert(
+                SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.into(),
+                "[\"legacy-ghost\"]".into(),
+            );
+            assert!(!explicit_activation_pending(&supervisor));
+            assert!(validate_first_step(&supervisor, &[]).unwrap().is_none());
+            assert!(
+                crate::runtime::runner::round_lifecycle::required_tool_for_session(&supervisor)
+                    .is_none()
+            );
             let config = AgentLoopConfig::default();
             let logger = DebugLogger::new(false);
             let before = serde_json::to_value(&supervisor).unwrap();
