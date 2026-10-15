@@ -155,6 +155,17 @@ impl ObserveScheduleGuard for Option<Arc<ScheduleGuardProgress>> {
     }
 }
 
+#[cfg(test)]
+fn guard_progress_for_job(
+    observers: &ScheduleGuardObservers,
+    job: &ScheduleRunJob,
+) -> Option<Arc<ScheduleGuardProgress>> {
+    if job.run_config.workflow_target.is_none() {
+        return None;
+    }
+    observers.lock().unwrap().get(&job.run_id).cloned()
+}
+
 impl ScheduleManager {
     pub fn new(ctx: ScheduleContext) -> Self {
         let (tx, mut rx) = mpsc::channel::<ScheduleRunJob>(128);
@@ -170,7 +181,7 @@ impl ScheduleManager {
                 while let Some(job) = rx.recv().await {
                     #[cfg(test)]
                     let progress = {
-                        let progress = guard_progress.lock().unwrap().get(&job.run_id).cloned();
+                        let progress = guard_progress_for_job(&guard_progress, &job);
                         if let Some(progress) = progress.as_ref() {
                             progress
                                 .received
@@ -335,12 +346,7 @@ impl ScheduleManager {
 
     pub async fn enqueue_run_now(&self, job: ScheduleRunJob) -> Result<(), String> {
         #[cfg(test)]
-        let progress = self
-            .guard_progress
-            .lock()
-            .unwrap()
-            .get(&job.run_id)
-            .cloned();
+        let progress = guard_progress_for_job(&self.guard_progress, &job);
         let result = self
             .tx
             .send(job)
@@ -1911,9 +1917,53 @@ budgets:
     }
 
     mod guard_metadata_tests {
-        use super::{guard_metadata, ScheduleGuardProgress};
+        use super::{
+            guard_metadata, guard_progress_for_job, ScheduleGuardObservers, ScheduleGuardProgress,
+            ScheduleRunJob,
+        };
         use chrono::Utc;
         use serde_json::json;
+        use std::sync::Arc;
+
+        #[test]
+        fn non_workflow_jobs_do_not_read_the_observer_map() {
+            let observers = ScheduleGuardObservers::default();
+            let progress = Arc::new(ScheduleGuardProgress::default());
+            let at = Utc::now();
+            let mut job = ScheduleRunJob {
+                run_id: "observed-run".into(),
+                schedule_id: "fixture-schedule".into(),
+                schedule_name: "fixture".into(),
+                run_config: serde_json::from_value(json!({"auto_execute": true})).unwrap(),
+                scheduled_for: at,
+                claimed_at: at,
+                was_catch_up: false,
+            };
+            observers
+                .lock()
+                .unwrap()
+                .insert(job.run_id.clone(), progress.clone());
+            assert!(guard_progress_for_job(&observers, &job).is_none());
+            job.run_config = serde_json::from_value(json!({
+                "auto_execute": true,
+                "workflow_target": {"workflow_id": "fixture", "revision": 1, "args": {}}
+            }))
+            .unwrap();
+            assert!(Arc::ptr_eq(
+                &guard_progress_for_job(&observers, &job).unwrap(),
+                &progress
+            ));
+
+            // A poisoned map would panic if this Agent job inspected it. This
+            // proves the fast path without a wait or a competing test thread.
+            let poison = std::panic::catch_unwind(|| {
+                let _mapping = observers.lock().unwrap();
+                panic!("poison fixture observer map");
+            });
+            assert!(poison.is_err());
+            job.run_config.workflow_target = None;
+            assert!(guard_progress_for_job(&observers, &job).is_none());
+        }
 
         #[test]
         fn guard_metadata_preserves_unobserved_boundaries_and_excludes_record_content() {
