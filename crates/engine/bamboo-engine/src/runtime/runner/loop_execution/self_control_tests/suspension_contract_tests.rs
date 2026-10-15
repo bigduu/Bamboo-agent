@@ -329,6 +329,14 @@ async fn reject_start_before_unknown_hook_reserves_generation(call_id: &'static 
         result.is_ok(),
         "ordinary suspension retains the existing runner result: {result:?}"
     );
+    // This fixture invokes the runner below Agent's final host save. Persist
+    // its real suspended snapshot at that same existing boundary; do not
+    // expect an earlier tool checkpoint to include a later native decision.
+    public
+        .persistence
+        .checkpoint_runtime_session(&mut fixture.session)
+        .await
+        .unwrap();
     assert_eq!(
         provider.calls.load(Ordering::SeqCst),
         if call_id == "start" { 1 } else { 2 }
@@ -429,10 +437,22 @@ async fn host_opt_in_without_start_preserves_ordinary_native_suspension() {
         SuspensionScript::InspectWithoutStart,
         fixture.storage.clone(),
     ));
+    let persistence = fixture
+        .config
+        .as_ref()
+        .unwrap()
+        .persistence
+        .clone()
+        .unwrap();
     let (result, events) = fixture
         .run(provider.clone(), CancellationToken::new())
         .await;
     assert!(result.is_ok(), "{result:?}");
+    // Mirror the existing host final save after this lower-level runner.
+    persistence
+        .checkpoint_runtime_session(&mut fixture.session)
+        .await
+        .unwrap();
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(provider.peak.load(Ordering::SeqCst), 1);
     assert_eq!(provider.active.load(Ordering::SeqCst), 0);

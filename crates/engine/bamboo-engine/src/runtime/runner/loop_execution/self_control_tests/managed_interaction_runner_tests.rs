@@ -569,7 +569,9 @@ async fn self_control_host_opt_in_without_start_preserves_ordinary_foreign_quest
             .iter()
             .filter(|event| matches!(event, AgentEvent::Complete { .. }))
             .count(),
-        0
+        // Ordinary finalization closes the stream even when its canonical
+        // status is Suspended; this is not a counted iteration completion.
+        1
     );
     let durable = fixture
         .storage
