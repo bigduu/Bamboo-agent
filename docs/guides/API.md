@@ -67,6 +67,57 @@ This bound limits tool conversion work and output reservation after parsing.
 Initial JSON deserialization still relies on the shared **25 MiB** request-body
 limit; the count guard does not bound total request memory.
 
+### User Worktree Management
+
+All routes below use the existing `/api/v1` access gate. Git is the only
+worktree registry; Core configuration stores directory preferences only.
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /worktrees/preferences` | Read `default_root` and `project_roots` |
+| `PUT /worktrees/preferences` | Set or clear one directory scope |
+| `GET /projects/{project_id}/worktrees` | Discover bound repositories and native Git worktrees |
+| `POST /projects/{project_id}/worktrees` | Create a new branch and user worktree |
+
+A preference write is `{"root":"/Volumes/External/worktrees"}` for the global
+scope, or includes `"project_id":"<id>"` for one Project override. `root` is
+required; explicit `null` clears only that scope. The directory must already
+exist, be readable and writable, and be outside an existing Git checkout.
+The existing configuration transaction persists the change before publication;
+other Project overrides and unrelated configuration remain intact.
+
+Creation accepts:
+
+```json
+{
+  "repository": "/existing/bound/repository",
+  "root": "/Volumes/External/worktrees",
+  "name": "task-42",
+  "branch": "feature/task-42"
+}
+```
+
+`root` may be omitted to use the Project override or global default, in that
+order. An absent default is an error. `repository` must exactly match a canonical
+Project source path. The new branch starts at that checkout's current `HEAD`.
+Folder names accept 1–80 ASCII letters, digits, hyphens or underscores.
+Success returns HTTP 201 with `{"path":"<canonical-root>/task-42"}`.
+
+Listing returns `project_id`, effective `default_root`, and `repositories`.
+Each repository includes `path`, `common_dir` when available, `error`, and
+`worktrees`. A worktree contains `path`, `branch` (null for detached HEAD),
+`head`, `dirty` (null when inspection fails), `locked`, `prunable`, `occupied`,
+`error`, and observed `sessions` (`id`, `title`, `active`). Occupancy is an
+observation of Bamboo Sessions/Git locks, not a cross-application lease.
+Unavailable paths are reported rather than dropped or pruned.
+
+Offline volumes, unwritable paths, existing destinations/branches, traversal,
+creation locks and boundary violations return explicit errors. There is no
+fallback directory or automatic retry. Preferences do not migrate checkouts.
+Opening an existing checkout uses the normal revisioned Project workspace binding
+API before Session selection; creation itself does not add another registry.
+No delete/prune/force operation or runtime-child GC is invoked by these endpoints.
+
 ### Chat Operations
 
 #### Create Chat Message

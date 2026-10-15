@@ -27,7 +27,7 @@ use crate::{
     KeywordMaskingConfig, LifecycleHooksConfig, LiveSection, MemoryConfig, NotificationsConfig,
     PluginTrustConfig, ProviderConfigs, ProviderInstanceConfig, RunBudgetConfig, SectionEnvelope,
     SectionSourceKind, SectionStatus, ServerConfig, SkillsConfig, StreamTimeoutConfig,
-    SubagentsConfig, ToolsConfig,
+    SubagentsConfig, ToolsConfig, WorktreeSettings,
 };
 
 pub(crate) const SECTION_SCHEMA_VERSION: u32 = 1;
@@ -287,7 +287,7 @@ impl SectionId {
 /// `proxy_auth` and `proxy_auth_encrypted` remain compatibility read fields,
 /// but their owner is still core; section serialization always drops them in
 /// favour of `proxy_auth_credential_ref`.
-pub const CONFIG_VALUE_FIELD_OWNERS: [(&str, SectionId); 31] = [
+pub const CONFIG_VALUE_FIELD_OWNERS: [(&str, SectionId); 32] = [
     ("http_proxy", SectionId::Core),
     ("https_proxy", SectionId::Core),
     ("proxy_auth", SectionId::Core),
@@ -308,6 +308,7 @@ pub const CONFIG_VALUE_FIELD_OWNERS: [(&str, SectionId); 31] = [
     ("skills", SectionId::ToolsSkills),
     ("env_vars", SectionId::Env),
     ("default_work_area", SectionId::Core),
+    ("worktrees", SectionId::Core),
     ("access_control", SectionId::AccessControl),
     ("features", SectionId::Providers),
     ("run_budget", SectionId::Core),
@@ -335,6 +336,8 @@ pub struct CoreSection {
     pub server: ServerConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_work_area: Option<DefaultWorkAreaConfig>,
+    #[serde(default, skip_serializing_if = "WorktreeSettings::is_empty")]
+    pub worktrees: WorktreeSettings,
     #[serde(default)]
     pub run_budget: RunBudgetConfig,
     #[serde(default)]
@@ -590,6 +593,7 @@ impl SectionProjection {
             skills,
             env_vars,
             default_work_area,
+            worktrees,
             access_control,
             features,
             run_budget,
@@ -613,6 +617,7 @@ impl SectionProjection {
                 headless_auth,
                 server,
                 default_work_area,
+                worktrees,
                 run_budget,
                 stream_timeout,
                 context_management,
@@ -679,6 +684,7 @@ impl SectionProjection {
             headless_auth,
             server,
             default_work_area,
+            worktrees,
             run_budget,
             stream_timeout,
             context_management,
@@ -731,6 +737,7 @@ impl SectionProjection {
                 skills,
                 env_vars: env.0,
                 default_work_area,
+                worktrees,
                 access_control: access_control.0,
                 features,
                 run_budget,
@@ -830,6 +837,7 @@ pub(crate) fn apply_runtime_section(id: SectionId, source: &Config, target: &mut
             target.headless_auth = source.headless_auth;
             target.server = source.server.clone();
             target.default_work_area = source.default_work_area.clone();
+            target.worktrees = source.worktrees.clone();
             target.run_budget = source.run_budget;
             target.stream_timeout = source.stream_timeout;
             target.context_management = source.context_management.clone();
@@ -3670,6 +3678,7 @@ fn project_legacy_raw_sections(
             | "headless_auth"
             | "server"
             | "default_work_area"
+            | "worktrees"
             | "run_budget"
             | "stream_timeout"
             | "context_management" => {
@@ -14873,6 +14882,7 @@ fn reconciliation_root_sections(root: &Value) -> ReconciliationRootSectionsResul
             | "headless_auth"
             | "server"
             | "default_work_area"
+            | "worktrees"
             | "run_budget"
             | "stream_timeout"
             | "context_management" => object(SectionId::Core, key, value, &mut object_sections),
@@ -16037,4 +16047,49 @@ fn reconcile_reappeared_legacy_root_locked(
         guard_advanced,
         partial: !record.complete,
     }))
+}
+
+#[cfg(test)]
+mod worktree_settings_tests {
+    use super::*;
+
+    #[test]
+    fn worktree_settings_persist_in_existing_core_authority_across_restart() {
+        let _key = crate::encryption::set_test_encryption_key([0x63; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let mut config = facade.effective_config();
+        config.worktrees.default_root = Some("/Volumes/External/worktrees".into());
+        config
+            .worktrees
+            .project_roots
+            .insert("project-a".into(), "/work/overrides".into());
+        persist_facade_effective_config(dir.path(), &config).unwrap();
+        drop(facade);
+        let restarted = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert_eq!(restarted.effective_config().worktrees, config.worktrees);
+        let core: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("core.json")).unwrap()).unwrap();
+        assert_eq!(
+            core["data"]["worktrees"]["default_root"],
+            "/Volumes/External/worktrees"
+        );
+    }
+
+    #[test]
+    fn worktree_preferences_survive_compatibility_and_core_projection() {
+        let mut config = Config::default();
+        config.worktrees.default_root = Some("/Volumes/External/worktrees".into());
+        config
+            .worktrees
+            .project_roots
+            .insert("project-a".into(), "/work/project-a".into());
+        let encoded = serde_json::to_value(&config).unwrap();
+        let decoded: Config = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.worktrees, config.worktrees);
+        let sections =
+            SectionProjection::from_config(&config, ModelLimitsSection::default()).unwrap();
+        assert_eq!(sections.core.worktrees, config.worktrees);
+        assert_eq!(sections.into_config().worktrees, config.worktrees);
+    }
 }
