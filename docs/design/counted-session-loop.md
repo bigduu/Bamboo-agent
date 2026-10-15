@@ -116,3 +116,45 @@ barriers and existing activation leases. They cover exact repetition/context,
 one terminal event, persisted admissions/terminal state, stop and cancel races,
 round limits, invalid bounds/state, recovery refusal, owner collision, and final
 Guardian suspension. No real model or broker is needed.
+
+## Final outcome and failure matrix
+
+One generation-fenced `finish` match resolves the execution Result. Stopped,
+BudgetExhausted and Completed may have been written at an earlier boundary;
+they cannot hide a later execution error. The existing cancellation-error
+precedence is retained. Every resolved outcome, including an unchanged status,
+checkpoints the final LoopState **and** Runtime mirror before Complete can be
+published. A checkpoint error prevents publication and preserves the original
+execution error when one already exists. Counters never roll back. This is a
+live-owner boundary, not a restart/reconciliation API.
+
+The table is the shared contract for outcome, persistence and admission tests.
+`derive` retains existing suspension, completion-reason and target checks;
+`preserve` retains the current status and still checkpoints the final mirror.
+Cancellation in the table means the returned `AgentError::Cancelled`, rather
+than replacing an unrelated original error merely because a signal also fired.
+
+| State / fault boundary | Successful Result | Error Result | Cancellation Result | Persistence / subsequent admission | Deterministic coverage |
+| --- | --- | --- | --- | --- | --- |
+| Running | derive | Failed | Cancelled | Same generation; conservative counters; final mirror checkpoint | `counted_finish_outcome_matrix_preserves_counters_and_generation_fence` and live-loop tests |
+| Finalizing | derive | Failed | Cancelled | No Complete before the final snapshot succeeds | Same outcome matrix; terminal publication barrier |
+| Stopped | preserve | Failed | Cancelled | An earlier stop checkpoint cannot hide a later hook/finalizer error | Outcome matrix; stopped hook barrier |
+| BudgetExhausted | preserve | Failed | Cancelled | The final Runtime mirror is saved even when the budget status is unchanged | Outcome matrix; bounded checkpoint matrix |
+| Completed | preserve | Failed | Cancelled | A failed write/publication never leaves live success for the host save | Outcome matrix; completion checkpoint tests |
+| Cancelled | preserve | preserve | Cancelled | Existing cancellation semantics and wait/identity fences remain | Outcome matrix; cancellation races |
+| Failed | preserve | preserve | Cancelled | No new admission is implied by terminal status | Outcome matrix; pending-repeat refusal |
+| RecoveryUnsupported | preserve | preserve | Cancelled | Ordinary entry still refuses this recovery fence; waits are not cleared | Outcome matrix; recovery and suspension matrices |
+| Foreign generation / malformed state | refuse | refuse | refuse | No LoopState write across the generation fence; no Complete | Outcome matrix; invalid-terminal-state tests |
+| Initial checkpoint fails, including failed failure-save | — | Failed | As above | Zero provider/Complete; later host save cannot persist phantom Running/Initializing | `counted_initial_checkpoint_failure_cannot_be_resaved_as_live` |
+| Third repeat checkpoint fails before write | — | Failed | As above | Provider=2, Complete=0, counters=3/2/3; no iteration-3 User; completed iteration-2 token is history | `counted_repeat_checkpoint_failure_stages_input_and_fences_ambiguous_writes` |
+| Repeat write commits then errors, including failed finish/host saves | — | Failed in live memory | As above | Durable state may remain at its last successful checkpoint; exact pending token / stale canonical snapshot refuses raw and registered re-entry without another provider call or error-save | Same repeat fault test; raw read matrix; SDK replay refusal |
+| Stopped / Budget / Completed checkpoint fails before or after write | — | Failed | As above | Both early exit and final Runtime-mirror boundaries; original error, one provider, zero Complete, later host save retains both failures | `counted_bounded_checkpoint_failure_matrix_never_publishes_success` (10 controlled faults) |
+| Stop wins during provider; AfterRound hook then aborts | — | Failed | As above | Hook first observes durable Stopped; returned/live/durable Runtime and Loop both Failed; no extra dispatch or Complete | `counted_stopped_after_round_failure_persists_both_failure_snapshots` |
+| Pending token followed by system wake / another counted User / unsaved external input | refuse reuse | — | — | Only a genuine already-canonical new User clears the exact unfinished token; typed preappend is not recovery authority | `counted_pending_repeat_requires_canonical_external_input`; SDK replay refusal |
+| Repository cache is stale or hides a newer token/generation | read durable | read durable | read durable | Admission read bypasses cache without publishing rejected data; canonical new User works | `counted_admission_bypasses_stale_repository_cache_without_publishing` |
+| Missing / failed / stale durable read; stale birth/revision | refuse | refuse | refuse | Read-only failure before hooks/final save; no cached clone substitutes for canonical state | `counted_raw_unfinished_terminal_read_fails_closed_without_writing`; stale registered-clone matrix |
+| Current / missing / expired / foreign lease, or missing Actor writer | existing proof only | refuse invalid proof | existing cancellation | Registration never mints writer authority; repair stages canonical data and fences only the matching runtime; foreign/Suspended waits remain | `counted_recovery_requires_real_current_owner_and_existing_actor_writer`; recovery identity matrix |
+
+These tests share synthetic providers, real temporary SessionStore/Repository
+adapters and controlled barriers. They do not claim crash-safe exactly-once
+external effects or implement objective edits, automatic recovery, or a new gate.

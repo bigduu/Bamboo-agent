@@ -678,36 +678,46 @@ pub(crate) async fn finish(
     if state.generation != generation {
         return Err(invalid("generation changed during execution"));
     }
-    let cancelled = result.as_ref().is_err_and(|error| error.is_cancelled());
-    if !state.live() && !cancelled && !(state.status == LoopStatus::Completed && result.is_err()) {
-        return Ok(());
-    }
-    state.status = if cancelled {
-        LoopStatus::Cancelled
-    } else if result.is_err() {
-        LoopStatus::Failed
-    } else if session.metadata.contains_key("runtime.suspend_reason")
-        || session.agent_runtime_state.as_ref().is_some_and(|runtime| {
-            matches!(runtime.status, bamboo_domain::AgentStatusState::Suspended)
-        })
-    {
-        LoopStatus::RecoveryUnsupported
-    } else if let Some(reason) = session.metadata.get("runtime.completion_reason") {
-        match reason.as_str() {
-            "counted_loop_round_limit"
-            | "counted_loop_budget_exhausted"
-            | "budget_exceeded"
-            | "max_rounds_reached"
-            | "stop_hook_continuation_cap" => LoopStatus::BudgetExhausted,
-            // Ticket questions and other non-budget early exits retain their
-            // diagnostic and require explicit host reconciliation, just like
-            // a suspended live generation. They never imply target completion.
-            _ => LoopStatus::RecoveryUnsupported,
+    // These are the original execution's final outcomes, not new admissions.
+    // A bounded exit can have been checkpointed before fallible AfterRound or
+    // finalization work; the Result still governs its unpublished outcome.
+    state.status = match result {
+        Err(error) if error.is_cancelled() => LoopStatus::Cancelled,
+        Err(_) => match state.status {
+            LoopStatus::Failed | LoopStatus::Cancelled | LoopStatus::RecoveryUnsupported => {
+                state.status
+            }
+            _ => LoopStatus::Failed,
+        },
+        Ok(()) if !state.live() => state.status,
+        Ok(())
+            if session.metadata.contains_key("runtime.suspend_reason")
+                || session.agent_runtime_state.as_ref().is_some_and(|runtime| {
+                    matches!(runtime.status, bamboo_domain::AgentStatusState::Suspended)
+                }) =>
+        {
+            LoopStatus::RecoveryUnsupported
         }
-    } else if state.iterations_completed == state.max_iterations {
-        LoopStatus::Completed
-    } else {
-        LoopStatus::Failed
+        Ok(()) => {
+            if let Some(reason) = session.metadata.get("runtime.completion_reason") {
+                match reason.as_str() {
+                    "counted_loop_round_limit"
+                    | "counted_loop_budget_exhausted"
+                    | "budget_exceeded"
+                    | "max_rounds_reached"
+                    | "stop_hook_continuation_cap" => LoopStatus::BudgetExhausted,
+                    // Question/wait diagnostics do not imply target completion.
+                    _ => LoopStatus::RecoveryUnsupported,
+                }
+            } else if state.iterations_completed == state.max_iterations {
+                LoopStatus::Completed
+            } else {
+                LoopStatus::Failed
+            }
+        }
     };
+    // Always persist the final Runtime mirror as well, even when a prior
+    // boundary already wrote the same Stopped/Budget/deny LoopStatus. Complete
+    // is published only after this full final snapshot succeeds.
     checkpoint(session, config, state).await
 }

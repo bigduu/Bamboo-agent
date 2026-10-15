@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use tokio::sync::Notify;
 
 mod recovery_tests;
+mod terminal_result_tests;
 
 const PROMPT: &str = "Inspect the next item using the accumulated context.";
 
