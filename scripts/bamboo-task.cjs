@@ -129,7 +129,7 @@ class Client {
         body: body === undefined ? undefined : JSON.stringify(body) });
     } catch { fail('transport_failed', 3); }
   }
-  async json(route, method = 'GET', body, headers, allowError = false) {
+  async json(route, method = 'GET', body, headers, allowError = false, maxBytes = MAX_JSON) {
     const r = await this.response(route, method, body, headers);
     if ((r.status === 401 || r.status === 403) || (!allowError && !r.ok)) {
       await r.body?.cancel();
@@ -138,7 +138,7 @@ class Client {
     const chunks = []; let size = 0;
     for await (const chunk of r.body || []) {
       size += chunk.length;
-      if (size > MAX_JSON) { await r.body?.cancel().catch(() => {}); fail('response_too_large'); }
+      if (size > maxBytes) { await r.body?.cancel().catch(() => {}); fail('response_too_large'); }
       chunks.push(chunk);
     }
     let data;
@@ -246,7 +246,10 @@ async function status(c, o, ctx) {
   const sid = o['session-id'];
   if (!o['run-id']) { ctx.phase = 'session_read'; return summary(await c.session(sid)); }
   ctx.phase = 'exact_output';
-  const { data } = await c.json(`/sessions/${encodeURIComponent(sid)}/runs/${encodeURIComponent(o['run-id'])}/output`, 'GET', undefined, { 'Bamboo-Session-Created-At': o['session-created-at'] });
+  // The native endpoint returns the complete retained snapshot and has no
+  // output byte cap. Keep the deadline, UTF-8/JSON and identity checks, without
+  // applying the small control-response limit to valid assistant output.
+  const { data } = await c.json(`/sessions/${encodeURIComponent(sid)}/runs/${encodeURIComponent(o['run-id'])}/output`, 'GET', undefined, { 'Bamboo-Session-Created-At': o['session-created-at'] }, false, Infinity);
   if (data.session_id !== sid || data.run_id !== o['run-id'] || data.output_scope !== 'visible_messages' || !['pending', 'running', 'completed', 'cancelled', 'error'].includes(data.runner_status) || !data.output || !Array.isArray(data.output.messages)) fail('invalid_exact_output');
   birth(data.session_created_at, 6);
   // Compare instants without dropping nanoseconds (offsets allowed by API).

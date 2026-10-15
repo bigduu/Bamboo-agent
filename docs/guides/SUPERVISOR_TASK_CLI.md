@@ -127,6 +127,13 @@ HTTP 409 (wrong birth/kind), 410 (unretained/unavailable) and 503 (verification
 failure) remain distinct, with no successor/history fallback. The current
 backend intentionally rejects this exact-output interface for Supervisor.
 
+The exact-output endpoint returns its complete retained snapshot even for
+metadata-only status. The client reads and validates that snapshot in memory;
+it imposes no additional output byte cap or truncation. Available memory must
+accommodate the retained output, and the command timeout still applies. Other
+JSON control responses retain a 1 MiB limit. Visible text is printed only with
+`--include-output`.
+
 Events are bounded NDJSON over **session** SSE. Each record says
 `event_scope=session`; run IDs appear only when the original event carries one.
 Untagged tokens and Complete replay must never be attributed to a selected run.

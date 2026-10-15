@@ -48,6 +48,8 @@ async function fixture(t, override = () => false) {
 async function cli(f, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [CLI, ...args, ...(f ? ['--server-url', f.base] : [])], { stdio: ['pipe', 'pipe', 'pipe'] });
+    // Pipe chunks can split a UTF-8 code point in large visible output.
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     let stdout = '', stderr = '';
     child.stdout.on('data', c => { stdout += c; options.onOutput?.(child, stdout); });
     child.stderr.on('data', c => { stderr += c; });
@@ -311,6 +313,31 @@ test('exact status uses original nanosecond birth; visible output requires expli
   const f = await fixture(t, (c, res) => { if (c.path.endsWith('/output')) { assert.equal(c.headers['bamboo-session-created-at'], BIRTH); json(res, output()); return true; } });
   const r = await cli(f, exact); assert.equal(r.code, 0); assert.equal(last(r).runner_status, 'completed'); assert.equal(last(r).output.message_count, 1); privateSafe(r);
   const raw = await cli(f, [...exact, '--include-output']); assert.equal(raw.code, 0); assert.equal(last(raw).output.messages[0].content, SECRET);
+});
+
+test('exact status accepts complete retained output larger than the control-response limit', async t => {
+  const content = `${SECRET}\n${'竹子\\\"\n'.repeat(200000)}`;
+  const value = output(); value.output.messages[0].content = content;
+  assert.ok(Buffer.byteLength(JSON.stringify(value)) > 1024 * 1024);
+  const f = await fixture(t, (c, res) => { if (c.path.endsWith('/output')) { json(res, value); return true; } });
+  const metadata = await cli(f, exact);
+  assert.equal(metadata.code, 0); assert.equal(last(metadata).output.message_count, 1);
+  assert.equal(last(metadata).output.messages, undefined); privateSafe(metadata);
+  const visible = await cli(f, [...exact, '--include-output']);
+  assert.equal(visible.code, 0); assert.equal(last(visible).output.messages[0].content, content);
+  assert.equal(posts(f).length, 0);
+});
+
+test('large exact output still validates the full JSON and original run without leaking text', async t => {
+  const value = output(); value.output.messages[0].content = `${SECRET}${'x'.repeat(1024 * 1024)}`;
+  for (const invalid of [`${JSON.stringify(value)}trailing`, JSON.stringify({ ...value, run_id: 'successor' })]) {
+    const f = await fixture(t, (c, res) => {
+      if (c.path.endsWith('/output')) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(invalid); return true; }
+    });
+    const result = await cli(f, exact);
+    assert.equal(result.code, 6); privateSafe(result);
+    assert.ok(['invalid_json_response', 'invalid_exact_output'].includes(last(result).error.code));
+  }
 });
 
 test('replaced/wrong-kind/unretained runs preserve HTTP distinctions without history/successor fallback', async t => {
