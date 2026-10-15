@@ -1018,10 +1018,17 @@ impl PausedChildReadStorage {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ReadSnapshot {
+    Full,
+    Control,
+    Admission,
+}
+
 async fn paused_bound_read(
     f: &Fixture,
     pause_after_read: bool,
-    control_plane: bool,
+    kind: ReadSnapshot,
 ) -> (
     Arc<PausedChildReadStorage>,
     tokio::task::JoinHandle<io::Result<Option<Session>>>,
@@ -1036,10 +1043,10 @@ async fn paused_bound_read(
         .bind_child_actor_writer(f.owner.clone(), f.a.clone(), f.publisher())
         .unwrap();
     let read = tokio::spawn(async move {
-        if control_plane {
-            bound.load_runtime_control_plane(CHILD).await
-        } else {
-            bound.load_runtime_session(CHILD).await
+        match kind {
+            ReadSnapshot::Full => bound.load_runtime_session(CHILD).await,
+            ReadSnapshot::Control => bound.load_runtime_control_plane(CHILD).await,
+            ReadSnapshot::Admission => bound.load_runtime_admission_snapshot(CHILD).await,
         }
     });
     tokio::time::timeout(WAIT, paused.reached.wait())
@@ -1050,11 +1057,16 @@ async fn paused_bound_read(
 
 #[tokio::test]
 async fn child_bound_read_rejects_takeover_during_snapshot_materialization() {
-    for (pause_after_read, control_plane) in
-        [(false, false), (true, false), (false, true), (true, true)]
-    {
+    for (pause_after_read, kind) in [
+        (false, ReadSnapshot::Full),
+        (true, ReadSnapshot::Full),
+        (false, ReadSnapshot::Control),
+        (true, ReadSnapshot::Control),
+        (false, ReadSnapshot::Admission),
+        (true, ReadSnapshot::Admission),
+    ] {
         let f = Fixture::new().await;
-        let (paused, read) = paused_bound_read(&f, pause_after_read, control_plane).await;
+        let (paused, read) = paused_bound_read(&f, pause_after_read, kind).await;
         f.b.finish_activation(&f.owner.fence, Utc::now(), ActorActivationFinish::Cancelled)
             .await
             .unwrap();
@@ -1098,11 +1110,16 @@ async fn child_bound_read_rejects_takeover_during_snapshot_materialization() {
 
 #[tokio::test]
 async fn child_bound_read_rejects_delete_rebirth_during_snapshot_materialization() {
-    for (pause_after_read, control_plane) in
-        [(false, false), (true, false), (false, true), (true, true)]
-    {
+    for (pause_after_read, kind) in [
+        (false, ReadSnapshot::Full),
+        (true, ReadSnapshot::Full),
+        (false, ReadSnapshot::Control),
+        (true, ReadSnapshot::Control),
+        (false, ReadSnapshot::Admission),
+        (true, ReadSnapshot::Admission),
+    ] {
         let f = Fixture::new().await;
-        let (paused, read) = paused_bound_read(&f, pause_after_read, control_plane).await;
+        let (paused, read) = paused_bound_read(&f, pause_after_read, kind).await;
         assert!(f.b.delete_session(CHILD).await.unwrap());
         let parent = f.b.load_session(ROOT).await.unwrap().unwrap();
         let mut reborn = Session::new_child_of(CHILD, &parent, "new-model", "new Child birth");
@@ -1160,9 +1177,21 @@ async fn child_bound_control_plane_read_allows_only_own_child_and_shared_task_ro
         .is_err());
     // Snapshot reads never inherit the Task-only Root exception.
     assert!(bound.load_runtime_session(ROOT).await.is_err());
+    assert!(bound.load_runtime_admission_snapshot(ROOT).await.is_err());
+    let admitted = bound
+        .load_runtime_admission_snapshot(CHILD)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(admitted.created_at, f.owner.created_at);
+    assert_eq!(
+        serde_json::to_value(&admitted.messages).unwrap(),
+        serde_json::to_value(&f.base.messages).unwrap()
+    );
     f.b.finish_activation(&f.owner.fence, Utc::now(), ActorActivationFinish::Cancelled)
         .await
         .unwrap();
     assert!(bound.load_runtime_control_plane(CHILD).await.is_err());
     assert!(bound.load_runtime_control_plane(ROOT).await.is_err());
+    assert!(bound.load_runtime_admission_snapshot(CHILD).await.is_err());
 }
