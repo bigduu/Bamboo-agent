@@ -193,6 +193,8 @@ pub(super) struct ToolExecutionOutcome {
     /// error). Pre-dispatch blocks, `Running`, and `NeedsHuman` do not represent
     /// a completed tool and must not fire `PostToolUse`.
     pub post_tool_hook_eligible: bool,
+    /// Host-only typed fault; never inferred from a model/tool result string.
+    pub managed_running_violation: bool,
     pub tool_duration: std::time::Duration,
 }
 
@@ -298,6 +300,7 @@ pub(super) async fn execute_model_requested_tool_call_only(
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: false,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::ZERO,
         });
     };
@@ -306,7 +309,7 @@ pub(super) async fn execute_model_requested_tool_call_only(
         return Ok(ToolExecutionOutcome {
             output_cap: None, permission_replay_origin: None,
             result: Err("ViewImage is unavailable: the current model does not support Vision. Select a Vision-capable model or enable supports_vision for this model in provider settings. No image was read or sent.".into()),
-            needs_human: None, portable_tool: None, post_tool_hook_eligible: false,
+            needs_human: None, portable_tool: None, post_tool_hook_eligible: false, managed_running_violation: false,
             tool_duration: std::time::Duration::ZERO,
         });
     }
@@ -326,9 +329,26 @@ async fn execute_tool_call_only_with_execution_name(
     ctx: ToolExecutionOnlyContext<'_>,
 ) -> Result<ToolExecutionOutcome, AgentError> {
     let noninteractive = crate::runtime::loop_control::suspension::active(ctx.config);
+    let control = ctx.config.loop_control.as_ref();
     let dispatch = execute_tool_call_only_with_execution_name_inner(execution_name, ctx);
-    if noninteractive {
-        bamboo_agent_core::tools::with_suspension_disabled(dispatch).await
+    if let Some(control) = control {
+        let (outcome, observation) =
+            bamboo_agent_core::tools::observe_tool_suspension(noninteractive, dispatch).await;
+        if observation.running_seen {
+            control.record_running_observed();
+        }
+        let mut outcome = outcome?;
+        if observation.forbidden_running_seen {
+            if let Some(resources) = bamboo_tools::LocalTaskResources::current() {
+                resources
+                    .record_unconfirmed(crate::runtime::loop_control::suspension::RUNNING_REFUSAL);
+            }
+            outcome.result = Err(crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into());
+            outcome.needs_human = None;
+            outcome.post_tool_hook_eligible = false;
+            outcome.managed_running_violation = true;
+        }
+        Ok(outcome)
     } else {
         dispatch.await
     }
@@ -369,6 +389,7 @@ async fn execute_tool_call_only_with_execution_name_inner(
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: false,
+            managed_running_violation: false,
             result: Err(if executing_supervisor {
                 format!("supervisor_delegation_required: Tool '{}' is outside Supervisor orchestration authority. Delegate execution to an authorized worker. If unavailable or denied, report the actual recoverable blocker; do not self-execute or retry unchanged delegation indefinitely.", ctx.tool_call.function.name)
             } else {
@@ -398,6 +419,7 @@ async fn execute_tool_call_only_with_execution_name_inner(
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: false,
+            managed_running_violation: false,
             result: Err(policy_error),
             tool_duration: std::time::Duration::ZERO,
         });
@@ -485,6 +507,7 @@ async fn execute_tool_call_only_with_execution_name_inner(
                 needs_human: None,
                 portable_tool: None,
                 post_tool_hook_eligible: false,
+                managed_running_violation: false,
                 tool_duration: tool_timer.elapsed(),
             });
         };
@@ -531,6 +554,7 @@ async fn execute_tool_call_only_with_execution_name_inner(
                     needs_human: None,
                     portable_tool: None,
                     post_tool_hook_eligible: false,
+                    managed_running_violation: false,
                     tool_duration: elapsed,
                 });
             }
@@ -622,7 +646,10 @@ async fn execute_tool_call_only_with_execution_name_inner(
         // follow-up). Threaded from the loop config so the Bash tool can push a
         // shell's result into this loop on completion. `None` on loops without
         // it wired, leaving the push inert (the poll backstop still runs).
-        ctx.config.bash_completion_sink.as_ref(),
+        ctx.config
+            .bash_completion_sink
+            .as_ref()
+            .filter(|_| bamboo_agent_core::tools::suspension_allowed()),
         // Reuse the args parsed above (for the `ToolStart` event) instead of
         // re-parsing the raw JSON string downstream in the executor (issue #106).
         // `args` came from `parse_tool_args_best_effort`, the same parser the
@@ -663,6 +690,7 @@ async fn execute_tool_call_only_with_execution_name_inner(
             dispatch,
         )
         .await
+        .map(ToolOutcome::enforce_suspension_restriction)
         {
             Ok(ToolOutcome::Completed(result)) => (None, Ok(result), true),
             Ok(ToolOutcome::Running(handle)) => (None, Ok(handle.ack), false),
@@ -704,6 +732,7 @@ async fn execute_tool_call_only_with_execution_name_inner(
         result: result.map_err(|error| error.to_string()),
         needs_human,
         post_tool_hook_eligible,
+        managed_running_violation: false,
         portable_tool: Some(PortableToolExecution {
             name: execution_name.to_owned(),
             input: args,
@@ -731,7 +760,7 @@ async fn hook_ask_outcome(
             result: Err("managed loop cannot wait for hook approval; finish the loop before requesting interactive work".into()),
             needs_human: None,
             portable_tool: None,
-            post_tool_hook_eligible: false,
+            post_tool_hook_eligible: false, managed_running_violation: false,
             tool_duration: std::time::Duration::ZERO,
         });
     }
@@ -778,6 +807,7 @@ async fn hook_ask_outcome(
                 needs_human: None,
                 portable_tool: None,
                 post_tool_hook_eligible: false,
+                managed_running_violation: false,
                 tool_duration: std::time::Duration::ZERO,
             });
         }
@@ -791,6 +821,7 @@ async fn hook_ask_outcome(
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: false,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::ZERO,
         });
     }
@@ -878,6 +909,7 @@ async fn hook_ask_outcome(
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: false,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::ZERO,
         });
     }
@@ -892,6 +924,7 @@ async fn hook_ask_outcome(
         needs_human: None,
         portable_tool: None,
         post_tool_hook_eligible: false,
+        managed_running_violation: false,
         tool_duration: std::time::Duration::ZERO,
     })
 }
@@ -977,14 +1010,48 @@ fn append_post_tool_feedback(
     }
 }
 
+async fn apply_without_suspension<F>(apply: F) -> Result<bool, AgentError>
+where
+    F: std::future::Future<Output = Result<bool, AgentError>>,
+{
+    let (result, observation) =
+        bamboo_agent_core::tools::observe_tool_suspension(true, apply).await;
+    if observation.forbidden_running_seen {
+        if let Some(resources) = bamboo_tools::LocalTaskResources::current() {
+            resources.record_unconfirmed(crate::runtime::loop_control::suspension::RUNNING_REFUSAL);
+        }
+        result?;
+        return Err(AgentError::Tool(
+            crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into(),
+        ));
+    }
+    result
+}
+
 pub(super) async fn apply_tool_execution_outcome(
     ctx: ToolExecutionApplyContext<'_>,
     outcome: ToolExecutionOutcome,
 ) -> Result<bool, AgentError> {
     let noninteractive = crate::runtime::loop_control::suspension::active(ctx.config);
+    let control = ctx.config.loop_control.as_ref();
     let apply = apply_tool_execution_outcome_inner(ctx, outcome);
-    if noninteractive {
-        bamboo_agent_core::tools::with_suspension_disabled(apply).await
+    if let Some(control) = control {
+        let (result, observation) =
+            bamboo_agent_core::tools::observe_tool_suspension(noninteractive, apply).await;
+        if observation.running_seen {
+            control.record_running_observed();
+        }
+        if observation.forbidden_running_seen {
+            if let Some(resources) = bamboo_tools::LocalTaskResources::current() {
+                resources
+                    .record_unconfirmed(crate::runtime::loop_control::suspension::RUNNING_REFUSAL);
+            }
+            result?;
+            return Err(AgentError::Tool(
+                crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into(),
+            ));
+        }
+        result
     } else {
         apply.await
     }
@@ -1052,7 +1119,7 @@ async fn apply_tool_execution_outcome_inner(
         loop_result_checkpointed,
     );
     if noninteractive {
-        bamboo_agent_core::tools::with_suspension_disabled(apply).await
+        apply_without_suspension(apply).await
     } else {
         apply.await
     }
@@ -1178,6 +1245,7 @@ async fn apply_completed_tool_execution_outcome(
         ctx.admitted_execution_name,
     );
 
+    let running_violation = outcome.managed_running_violation;
     // Capture tool lifecycle metadata before the borrow-splitting match.
     let tool_name_for_meta = ctx.tool_call.function.name.clone();
     let tool_call_id_for_meta = ctx.tool_call.id.clone();
@@ -1335,6 +1403,11 @@ async fn apply_completed_tool_execution_outcome(
         )?;
     }
 
+    if running_violation {
+        return Err(AgentError::Tool(
+            crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into(),
+        ));
+    }
     Ok(result)
 }
 
@@ -1415,6 +1488,7 @@ mod task_progress_tests {
                 source: bamboo_agent_core::PendingQuestionSource::PauseTool,
             }),
             post_tool_hook_eligible: true,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::ZERO,
         };
         let mut session = Session::new("shell-progress", "model");
@@ -2197,6 +2271,7 @@ mod hook_tests {
                         result: Ok(ToolResult::text(true, payload.to_string())),
                         needs_human: None,
                         post_tool_hook_eligible: true,
+                        managed_running_violation: false,
                         tool_duration: std::time::Duration::ZERO,
                     };
                     let (event_tx, _event_rx) = mpsc::channel(64);
@@ -3310,6 +3385,7 @@ mod hook_tests {
             }),
             portable_tool: None,
             post_tool_hook_eligible: false,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::from_millis(1),
         };
 
@@ -4182,6 +4258,7 @@ mod hook_tests {
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: true,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::from_millis(7),
         };
 
@@ -4228,6 +4305,7 @@ mod hook_tests {
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: true,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::from_millis(3),
         };
 

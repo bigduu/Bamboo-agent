@@ -567,26 +567,36 @@ impl BuiltinToolExecutor {
             let root_writer = bamboo_agent_core::tools::context::root_actor_tool_writer();
             let call_id = call.id.clone();
             let session_id = ctx.session_id.unwrap_or_default().to_owned();
+            let suspension = bamboo_agent_core::tools::capture_suspension_restriction();
             let invoke = async move {
-                let future = tool.invoke(args, tool_ctx);
-                let future = crate::with_approval_proxy(approval, future);
-                let future =
-                    crate::with_hook_permission_override(permission_override, &call_id, future);
-                let future = bamboo_agent_core::tools::scope_tool_output_cap(
-                    &session_id,
-                    &call_id,
-                    output_cap,
-                    future,
-                );
-                // Preserve absent Host scope versus a present unbound scope.
-                match root_writer {
-                    Some(writer) => {
-                        bamboo_agent_core::tools::context::with_root_actor_tool_writer(
-                            writer, future,
-                        )
-                        .await
-                    }
-                    None => future.await,
+                let invoke = async move {
+                    let future = tool.invoke(args, tool_ctx);
+                    let future = crate::with_approval_proxy(approval, future);
+                    let future =
+                        crate::with_hook_permission_override(permission_override, &call_id, future);
+                    let future = bamboo_agent_core::tools::scope_tool_output_cap(
+                        &session_id,
+                        &call_id,
+                        output_cap,
+                        future,
+                    );
+                    // Preserve absent Host scope versus a present unbound scope.
+                    let result = match root_writer {
+                        Some(writer) => {
+                            bamboo_agent_core::tools::context::with_root_actor_tool_writer(
+                                writer, future,
+                            )
+                            .await
+                        }
+                        None => future.await,
+                    };
+                    enforce_registered_tool_suspension(result)
+                };
+                // Normalize while the child still owns the captured token and
+                // LocalTaskResources, even after its registered awaiter drops.
+                match suspension {
+                    Some(scope) => scope.scope(invoke).await,
+                    None => invoke.await,
                 }
             };
             let registered = resources
@@ -597,10 +607,13 @@ impl BuiltinToolExecutor {
                 ToolError::Execution(
                     "owned tool invocation panicked; stop remains unconfirmed".into(),
                 )
-            })??
+            })?
         } else {
-            tool.invoke(args, ctx.to_tool_ctx()).await?
+            tool.invoke(args, ctx.to_tool_ctx()).await
         };
+        // Inline/custom tools also normalize here. An already normalized
+        // Completed outcome is idempotent and never requests a second kill.
+        let outcome = enforce_registered_tool_suspension(outcome)?;
         if matches!(
             &outcome,
             ToolOutcome::Completed(result) if result.success
@@ -616,6 +629,22 @@ impl BuiltinToolExecutor {
     pub fn build_enhanced_prompt(&self, context: GuideBuildContext) -> String {
         EnhancedPromptBuilder::build(Some(&self.registry), &self.list_tools(), &context)
     }
+}
+
+/// Keep this inside an owned child's captured scope, before sending its
+/// result; the awaiting parent may already have timed out or been dropped.
+fn enforce_registered_tool_suspension(
+    outcome: Result<ToolOutcome, ToolError>,
+) -> Result<ToolOutcome, ToolError> {
+    let outcome = outcome.map(ToolOutcome::enforce_suspension_restriction);
+    if bamboo_agent_core::tools::suspension_running_violated() {
+        if let Some(resources) = crate::LocalTaskResources::current() {
+            resources.record_unconfirmed(
+                "restricted tool returned Running; cooperative kill has no stop receipt",
+            );
+        }
+    }
+    outcome
 }
 
 fn permission_error_to_tool_error(error: PermissionError) -> ToolError {
@@ -5772,6 +5801,131 @@ mod tests {
                 "no detached shell event should be published: {events:?}"
             );
             assert!(crate::tools::bash_runtime::running_shells_for_session(session_id).is_empty());
+        }
+    }
+
+    mod owned_late_running_helper_tests {
+        use super::*;
+        use bamboo_agent_core::tools::{
+            capture_suspension_restriction, with_suspension_disabled, AsyncWaitKind,
+            RunningCompletion, RunningHandle,
+        };
+        use std::{
+            future::Future,
+            pin::Pin,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::{Context, Poll},
+            time::Duration,
+        };
+        struct NeverDrive {
+            polls: Arc<AtomicUsize>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Future for NeverDrive {
+            type Output = ToolResult;
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<ToolResult> {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                panic!("restricted completion must not be polled");
+            }
+        }
+        impl Drop for NeverDrive {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        // This uses the public resource registry and the production helper.
+        // It deliberately does not claim a custom tool is a framework builtin.
+        #[tokio::test]
+        async fn owned_completion_guard_survives_abort_of_registered_awaiter() {
+            for panic_kill in [false, true] {
+                let resources = crate::LocalTaskResources::new(
+                    "late-running-helper",
+                    "private-owned-probe",
+                    chrono::Utc::now(),
+                );
+                let owned_resources = resources.clone();
+                let kills = Arc::new(AtomicUsize::new(0));
+                let polls = Arc::new(AtomicUsize::new(0));
+                let drops = Arc::new(AtomicUsize::new(0));
+                let child_kills = kills.clone();
+                let child_polls = polls.clone();
+                let child_drops = drops.clone();
+                let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+                let parent = tokio::spawn(async move {
+                    with_suspension_disabled(async move {
+                        let token = capture_suspension_restriction().unwrap();
+                        let child_token = token.clone();
+                        let registered = owned_resources
+                            .spawn_owned(async move {
+                                child_token
+                                    .scope(async move {
+                                        let _ = started_tx.send(());
+                                        let _ = release_rx.await;
+                                        let outcome = ToolOutcome::Running(RunningHandle {
+                                            tool_call_id: "late-running".into(),
+                                            ack: ToolResult::text(
+                                                true,
+                                                "must not publish this ack",
+                                            ),
+                                            completion: RunningCompletion::Driven(Box::pin(
+                                                NeverDrive {
+                                                    polls: child_polls,
+                                                    drops: child_drops,
+                                                },
+                                            )),
+                                            wait_kind: AsyncWaitKind::AsyncTools,
+                                            kill: Box::new(move || {
+                                                child_kills.fetch_add(1, Ordering::SeqCst);
+                                                assert!(!panic_kill, "injected cleanup panic");
+                                            }),
+                                        });
+                                        // Exact helper the real owned branch calls before
+                                        // returning to its oneshot. The parent is gone.
+                                        let outcome =
+                                            enforce_registered_tool_suspension(Ok(outcome))
+                                                .unwrap();
+                                        let result =
+                                            enforce_registered_tool_suspension(Ok(outcome))
+                                                .unwrap()
+                                                .into_tool_result();
+                                        let _ = completed_tx.send(result);
+                                    })
+                                    .await;
+                            })
+                            .unwrap();
+                        let _ = observed_tx.send(token);
+                        registered.await
+                    })
+                    .await
+                });
+                let started = tokio::time::timeout(Duration::from_secs(5), started_rx).await;
+                let observed = tokio::time::timeout(Duration::from_secs(5), observed_rx).await;
+                parent.abort();
+                let parent_exit = parent.await;
+                let _ = release_tx.send(());
+                let completed = tokio::time::timeout(Duration::from_secs(5), completed_rx).await;
+                let drained =
+                    tokio::time::timeout(Duration::from_secs(5), resources.close_and_drain()).await;
+                // Join/drain this private domain before checking failure details.
+                assert!(started.unwrap().is_ok());
+                assert!(parent_exit.unwrap_err().is_cancelled());
+                let report = observed.unwrap().unwrap().observation();
+                let result = completed.unwrap().unwrap();
+                assert!(!result.success);
+                assert!(result.result.contains("stop unconfirmed"));
+                assert!(!result.result.contains("must not publish this ack"));
+                assert!(report.running_seen && report.forbidden_running_seen);
+                assert_eq!(kills.load(Ordering::SeqCst), 1);
+                assert_eq!(polls.load(Ordering::SeqCst), 0);
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                let error = drained.unwrap().unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("cooperative kill has no stop receipt"));
+            }
         }
     }
 }

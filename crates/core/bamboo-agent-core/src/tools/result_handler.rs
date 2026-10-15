@@ -531,6 +531,9 @@ async fn execute_sub_actions_with_persistence(
     let available_tools = tools.list_tools();
 
     while let Some(action) = pending.pop_front() {
+        if crate::tools::suspension_running_violated() {
+            break;
+        }
         if processed >= MAX_SUB_ACTIONS {
             let error = format!("Reached max sub-action limit ({MAX_SUB_ACTIONS})");
             let _ = event_tx
@@ -656,6 +659,15 @@ async fn execute_sub_actions_with_persistence(
                     .execute_exact_with_context_outcome(&action, execution_name, tool_ctx)
                     .await
                     .map(crate::tools::ToolOutcome::into_tool_result)
+            } else if crate::tools::capture_suspension_restriction().is_some() {
+                crate::tools::executor::execute_tool_call_with_context_outcome(
+                    &action,
+                    tools,
+                    composition_executor.clone(),
+                    tool_ctx,
+                )
+                .await
+                .map(crate::tools::ToolOutcome::into_tool_result)
             } else {
                 execute_tool_call_with_context(
                     &action,
@@ -669,6 +681,23 @@ async fn execute_sub_actions_with_persistence(
         .await
         {
             Ok(result) => {
+                if crate::tools::suspension_running_violated() {
+                    let error =
+                        "suspension_disabled: detached Running outcome refused; stop unconfirmed"
+                            .to_string();
+                    session.add_message(Message::tool_result_with_status(
+                        action.id.clone(),
+                        error.clone(),
+                        false,
+                    ));
+                    let _ = event_tx
+                        .send(AgentEvent::ToolError {
+                            tool_call_id: action.id.clone(),
+                            error,
+                        })
+                        .await;
+                    break;
+                }
                 if !crate::tools::suspension_allowed() && tool_result_requires_suspension(&result) {
                     refuse_suspension_result(session, &action, event_tx).await;
                     continue;
@@ -750,6 +779,9 @@ async fn execute_sub_actions_with_persistence(
                     false,
                 ));
             }
+        }
+        if crate::tools::suspension_running_violated() {
+            break;
         }
     }
 

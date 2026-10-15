@@ -129,7 +129,11 @@ pub use result_handler::{
     ToolHandlingOutcome, MAX_SUB_ACTIONS,
 };
 pub use smart_code_review::SmartCodeReviewTool;
-pub use suspension::{suspension_allowed, with_suspension_disabled};
+pub use suspension::{
+    capture_suspension_restriction, current_tool_suspension_scope, observe_tool_suspension,
+    suspension_allowed, suspension_running_violated, with_suspension_disabled,
+    with_suspension_disabled_observed, SuspensionRestriction, ToolSuspensionObservation,
+};
 pub use tool_runtime::{
     AsyncToolCompletionInfo, AsyncToolCompletionSink, AsyncWaitKind, RunningCompletion,
     RunningHandle, ToolClass, ToolCtx, ToolOutcome, ToolResultFuture,

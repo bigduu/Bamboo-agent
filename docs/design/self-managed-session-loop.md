@@ -54,6 +54,13 @@ A started managed generation stays within its original live owner. Before Start,
 ordinary permission prompts, questions, child work and native hook suspensions
 retain their existing behavior. Opt-in alone does not disable interaction.
 
+The owner observes generic `ToolOutcome::Running` during this admitted activation,
+including a wrapper that collapses it into an ordinary result. Before Start this
+changes no result, permission, acknowledgement or cleanup authority. An observed
+Running conservatively refuses a later Start in that activation, even when a
+parallel timeout dropped the inner invocation. This is volatile host observation,
+not persisted recovery state or proof that prior detached work has stopped.
+
 Start refuses an enabled Guardian, an existing pending question/wait, active
 children or background Bash. It also refuses native control hooks that may
 suspend at a future Before/AfterRound, Before/AfterToolExecution or BeforeFinalize
@@ -80,6 +87,37 @@ questions, legacy plan/approval payloads and agentic child/question results are
 refused before any question/wait checkpoint or notification. Ordinary failures
 remain paired once and count through the existing tool policy. The owner must
 still receive a real terminal answer to complete an admitted iteration.
+
+An unexpected Running after Start is a terminal tool failure, including custom
+tools that ignore the restriction. The owner requests its cooperative kill once
+and drops a Driven completion without polling or delivering it. It pairs one
+false result, skips post-tool work and later siblings/provider admissions, and
+uses the existing failed-activation checkpoint. It never publishes a successful
+Running acknowledgement or Loop Complete. A unit-returning or panicking kill
+callback is not a physical termination/join receipt: the existing resource domain
+retains stop-unconfirmed, and unfinished counted input fences remain intact.
+Native cleanup callbacks must cooperate; this adds no cleanup worker or join API.
+
+Inline Workflow execution inherits this host scope. A Running refusal cannot
+be converted to success by `ContinueWithError`; later tool calls, Agent retries
+and nested workflow entries recheck the shared report after their admission
+awaits. Already admitted branches keep the existing drain protocol. Independent
+background Workflow Start/Restart retains its existing owned runtime.
+
+The public direct/registered entry also retains its exact logical owner using
+the existing registration quarantine. Its stored opaque host observation is
+checked on ordinary return and synchronously on future Drop; a completed kill
+callback never releases that owner. A new genuine User or queued wake is not
+physical-stop evidence and cannot start a successor over the retained owner.
+The host must explicitly reconcile it under the existing finalization protocol.
+This adds no durable marker, automatic release, restart or recovery path. Loop
+Failed describes the loop outcome and is not a confirmed-stop receipt.
+
+Active managed tool calls use the existing sequential apply boundary. Calls
+previously classified ParallelSafe retain a per-call deadline bounded by the
+smaller existing per-tool and parallel-batch timeout. This is a per-call limit;
+a serialized collection does not have the old parallel batch's total elapsed
+time. Ordinary execution before Start keeps its existing parallel behavior.
 
 The no-progress and terminal safety nets fail an unexpected wait without
 creating a suspension. They do not pretend an unfinished iteration completed.
@@ -198,6 +236,7 @@ stale or budget rejections.
 | Objective accepted | Receipt identifies the next effective iteration; current objective remains admitted. |
 | Checkpoint fails before write or after an uncertain commit | Preserve the checkpoint error, reserve the generation conservatively, stop the execution, publish no success event and make no further provider call. Later error persistence keeps complete pairing and a failed/cancelled generation. |
 | User cancellation at command/checkpoint boundary | Cancellation outcome wins; no successful completion is published. |
+| Unexpected detached Running after Start | Request cooperative cleanup, pair failure and fail the activation; keep stop-unconfirmed and recovery fences, with no later tool/provider admission. |
 | Interrupted persisted live/admitted state | Existing #898 recovery refusal remains in force. No replay, wakeup, receipt-driven restart or budget replenishment. |
 | Terminal/finalizing generation | Edits are rejected. Existing finalization and one-Complete fences remain authoritative. |
 

@@ -307,6 +307,7 @@ async fn json_rows_runtime_child() {
             result: Ok(ToolResult::text(true, raw.clone())),
             needs_human: None,
             post_tool_hook_eligible: true,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::ZERO,
         };
         let output = output_compressor::maybe_compress(

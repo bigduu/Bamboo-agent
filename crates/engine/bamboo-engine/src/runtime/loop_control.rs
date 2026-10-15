@@ -1,7 +1,10 @@
 //! Host-authorized, live self-control over the existing counted runner (#1991).
 //! No target lookup, timer, restart manager or execution authority lives here.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+};
 
 use bamboo_agent_core::{tools::ToolResult, AgentError, Message, Session};
 use serde::{Deserialize, Serialize};
@@ -32,6 +35,7 @@ pub struct LoopControlConfig {
     owner: CountedLoopConfig,
     active: Arc<OnceLock<ManagedActivation>>,
     execution: Arc<OnceLock<ControlExecution>>,
+    observed_running: Arc<AtomicBool>,
 }
 
 struct ManagedActivation {
@@ -64,6 +68,7 @@ impl LoopControlConfig {
             owner: CountedLoopConfig::new(max_iterations, max_total_rounds),
             active: Arc::new(OnceLock::new()),
             execution: Arc::new(OnceLock::new()),
+            observed_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -82,6 +87,7 @@ impl LoopControlConfig {
         self.owner.bind_owner(ownership, session);
         self.active = Arc::new(OnceLock::new());
         self.execution = Arc::new(OnceLock::new());
+        self.observed_running = Arc::new(AtomicBool::new(false));
     }
 
     pub(crate) async fn validate_current_owner(&self, session: &Session) -> Result<(), AgentError> {
@@ -141,6 +147,14 @@ impl LoopControlConfig {
             .get()
             .map(|execution| &execution.cancel)
             .ok_or_else(|| fatal("execution identity absent"))
+    }
+
+    pub(crate) fn record_running_observed(&self) {
+        self.observed_running.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn has_observed_running(&self) -> bool {
+        self.observed_running.load(Ordering::Acquire)
     }
 
     pub(crate) fn active_counted(&self) -> Option<&CountedLoopConfig> {

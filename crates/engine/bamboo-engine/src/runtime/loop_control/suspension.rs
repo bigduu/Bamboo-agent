@@ -3,6 +3,9 @@
 use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::Session;
 
+pub(crate) const RUNNING_REFUSAL: &str =
+    "managed loop refused a detached Running outcome; cleanup requested, stop unconfirmed";
+
 pub(crate) fn active(config: &AgentLoopConfig) -> bool {
     config
         .loop_control
@@ -14,6 +17,15 @@ pub(crate) async fn start_refusal(
     session: &Session,
     config: &AgentLoopConfig,
 ) -> Option<&'static str> {
+    if config
+        .loop_control
+        .as_ref()
+        .is_some_and(|control| control.has_observed_running())
+        || bamboo_agent_core::tools::capture_suspension_restriction()
+            .is_some_and(|scope| scope.observation().running_seen)
+    {
+        return Some("existing_detached_work_incompatible");
+    }
     if config.guardian_active() || config.hook_runner.has_suspending_loop_control_hooks() {
         return Some("suspending_lifecycle_incompatible");
     }

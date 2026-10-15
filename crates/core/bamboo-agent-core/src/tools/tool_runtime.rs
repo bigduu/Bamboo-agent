@@ -62,6 +62,35 @@ impl std::fmt::Debug for ToolOutcome {
 }
 
 impl ToolOutcome {
+    /// Observe any scoped Running. In denial, consume without driving or acking;
+    /// the owner MUST fail its activation after pairing the false result.
+    pub fn enforce_suspension_restriction(self) -> Self {
+        match self {
+            ToolOutcome::Running(handle) => {
+                if !super::suspension::observe_running_outcome() {
+                    return ToolOutcome::Running(handle);
+                }
+                let RunningHandle {
+                    kill, completion, ..
+                } = handle;
+                // Completion stays outside the kill closure and is dropped even
+                // after a cleanup panic. Neither action certifies termination.
+                let kill_panicked =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(kill)).is_err();
+                let drop_panicked =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(completion)))
+                        .is_err();
+                let diagnostic = match (kill_panicked, drop_panicked) {
+                    (true, true) => "cleanup callback and completion drop panicked",
+                    (true, false) => "cleanup callback panicked",
+                    (false, true) => "completion drop panicked",
+                    (false, false) => "cleanup requested",
+                };
+                ToolOutcome::Completed(ToolResult::text(false,format!("suspension_disabled: detached Running outcome refused; {diagnostic}; stop unconfirmed")))
+            }
+            outcome => outcome,
+        }
+    }
     /// TRANSITIONAL: collapse an outcome back to a plain [`ToolResult`] for call
     /// sites that are not yet outcome-aware. `Completed` yields its result;
     /// `Running` yields its synthetic ack (itself a `ToolResult`, preserving the
@@ -69,7 +98,7 @@ impl ToolOutcome {
     /// result (no tool produces it on these paths during the transition). Phase B
     /// makes every consumer outcome-aware and removes this.
     pub fn into_tool_result(self) -> ToolResult {
-        match self {
+        match self.enforce_suspension_restriction() {
             ToolOutcome::Completed(result) => result,
             ToolOutcome::Running(handle) => handle.ack,
             ToolOutcome::NeedsHuman { result, .. } => result,

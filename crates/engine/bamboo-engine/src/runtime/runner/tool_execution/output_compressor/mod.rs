@@ -808,6 +808,7 @@ mod tests {
                         needs_human: None,
                         portable_tool: selected_tool_identity(execution_name),
                         post_tool_hook_eligible: true,
+                        managed_running_violation: false,
                         tool_duration: std::time::Duration::ZERO,
                     };
                     let result = maybe_compress(name, "{}", "exec-cap", outcome, cap, None, None)
@@ -857,6 +858,7 @@ mod tests {
                 needs_human: None,
                 portable_tool: selected_tool_identity(name),
                 post_tool_hook_eligible: true,
+                managed_running_violation: false,
                 tool_duration: std::time::Duration::ZERO,
             };
             let result = maybe_compress(name, "{}", "other-cap", outcome, 1, None, None)
@@ -930,6 +932,7 @@ mod tests {
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: true,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::ZERO,
         };
         for tool_name in ["browser", "default::browser"] {
@@ -1007,6 +1010,7 @@ mod tests {
                 needs_human: None,
                 portable_tool: None,
                 post_tool_hook_eligible: true,
+                managed_running_violation: false,
                 tool_duration: std::time::Duration::ZERO,
             };
             let compressed = maybe_compress(
@@ -1586,6 +1590,7 @@ mod tests {
                 result: Ok(ToolResult::text(true, raw.clone())),
                 needs_human: None,
                 post_tool_hook_eligible: true,
+                managed_running_violation: false,
                 tool_duration: std::time::Duration::ZERO,
             };
             let result =
@@ -1618,6 +1623,7 @@ mod tests {
                     result: Ok(ToolResult::text(success, raw.clone())),
                     needs_human: None,
                     post_tool_hook_eligible: true,
+                    managed_running_violation: false,
                     tool_duration: std::time::Duration::ZERO,
                 };
                 let result = maybe_compress(name, "{}", "output-test", outcome, 128, None, None)
@@ -1637,6 +1643,7 @@ mod tests {
             result: Err(error.clone()),
             needs_human: None,
             post_tool_hook_eligible: true,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::ZERO,
         };
         let result = maybe_compress("skills_read", "{}", "output-test", outcome, 1, None, None)
@@ -1658,6 +1665,7 @@ mod tests {
                     result,
                     needs_human: None,
                     post_tool_hook_eligible: true,
+                    managed_running_violation: false,
                     tool_duration: std::time::Duration::ZERO,
                 };
                 let compressed = maybe_compress(
