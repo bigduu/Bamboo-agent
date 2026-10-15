@@ -399,6 +399,32 @@ impl ToolExecutor for EmptyExecutor {
     }
 }
 
+async fn execute_overlay(
+    tools: &dyn ToolExecutor,
+    name: &str,
+    session: Option<&Session>,
+) -> (bool, Value) {
+    let call = bamboo_agent_core::tools::ToolCall {
+        id: format!("call_{name}"),
+        tool_type: "function".into(),
+        function: bamboo_agent_core::tools::FunctionCall {
+            name: name.into(),
+            arguments: "{}".into(),
+        },
+    };
+    let mut ctx = bamboo_agent_core::tools::ToolExecutionContext::none(&call.id);
+    if let Some(session) = session {
+        ctx.session_id = Some(&session.id);
+        ctx.executing_supervisor =
+            ExecutingSupervisorObservation::capture_from_executing_session(session);
+    }
+    let result = tools.execute_with_context(&call, ctx).await.unwrap();
+    (
+        result.success,
+        serde_json::from_str(&result.result).unwrap(),
+    )
+}
+
 #[tokio::test]
 async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_denial() {
     let root = tempfile::tempdir().unwrap();
@@ -416,10 +442,57 @@ async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_deni
     storage.save_session(&session).await.unwrap();
     let config: Config =
         serde_json::from_value(json!({"features":{"ticket_mutation":true}})).unwrap();
-    let app = Arc::new(
-        TicketApplication::open(root.path(), storage, Arc::new(RwLock::new(config))).await,
-    );
+    let config = Arc::new(RwLock::new(config));
+    let app = Arc::new(TicketApplication::open(root.path(), storage.clone(), config.clone()).await);
     let tools = overlay(Arc::new(EmptyExecutor), app.clone());
+    let names = || {
+        tools
+            .list_tools()
+            .into_iter()
+            .map(|schema| schema.function.name)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let expected_names = std::collections::BTreeSet::from([
+        "work_overview".to_string(),
+        "work_search".to_string(),
+        "work_inspect".to_string(),
+        "work_changes".to_string(),
+        "work_update".to_string(),
+        "work_dispatch".to_string(),
+    ]);
+    assert_eq!(names(), expected_names);
+    assert!(app.service().is_err());
+    assert_eq!(app.status().await["can_initialize"], true);
+    let scope_root = root
+        .path()
+        .join("tickets")
+        .join(session.supervisor_incarnation_id().unwrap().to_string());
+    let stored_before =
+        serde_json::to_value(storage.load_session(&session.id).await.unwrap()).unwrap();
+    let config_before = serde_json::to_value(&*config.read().await).unwrap();
+    let mut ordinary = Session::new("ordinary-ultra", "model");
+    ordinary.set_root_orchestration_only(true).unwrap();
+    for name in NAMES {
+        // Even a canonical executing Supervisor cannot create a scope by
+        // calling a resident definition, including the two mutation tools.
+        let (ok, denied) = execute_overlay(tools.as_ref(), name, Some(&session)).await;
+        assert!(!ok, "uninitialized {name} succeeded");
+        assert_eq!(denied["status_code"], 503, "{name}: {denied}");
+        for caller in [None, Some(&ordinary)] {
+            let (ok, denied) = execute_overlay(tools.as_ref(), name, caller).await;
+            assert!(!ok, "unauthorized {name} succeeded");
+            assert_eq!(denied["status_code"], 403, "{name}: {denied}");
+        }
+    }
+    assert!(
+        !scope_root.exists(),
+        "a tool invocation initialized a scope"
+    );
+    assert!(app.service().is_err());
+    assert_eq!(
+        serde_json::to_value(storage.load_session(&session.id).await.unwrap()).unwrap(),
+        stored_before,
+    );
     let payload = crate::app_state::ticket_application::ScopeInitialization {
         supervisor_session_id: session.id.clone(),
         incarnation_id: session.supervisor_incarnation_id().unwrap(),
@@ -434,35 +507,29 @@ async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_deni
         )
         .await
         .unwrap());
-    let names = tools
-        .list_tools()
-        .into_iter()
-        .map(|s| s.function.name)
-        .collect::<std::collections::BTreeSet<_>>();
-    assert!(
-        NAMES.into_iter().all(|name| names.contains(name)),
-        "initialized Work remained absent from the startup tool executor"
+    assert_eq!(
+        names(),
+        expected_names,
+        "initialization changed the catalog"
     );
-    let fixture = Fixture {
-        _root: root,
-        app,
-        session,
-    };
-    let (ok, result) = invoke(&fixture.tool("work_overview"), json!({}), fixture.ctx()).await;
+    let (ok, result) = execute_overlay(tools.as_ref(), "work_overview", Some(&session)).await;
     assert!(ok);
     assert_eq!(result["data"]["work_count"], 0);
-    let before = fixture.app.service().unwrap().published().unwrap().0;
-    let mut ordinary = Session::new("ordinary-ultra", "model");
-    ordinary.set_root_orchestration_only(true).unwrap();
-    let mut ctx = ToolCtx::none("ordinary");
-    ctx.session_id = Some(Arc::from(ordinary.id.as_str()));
-    ctx.executing_supervisor =
-        ExecutingSupervisorObservation::capture_from_executing_session(&ordinary);
-    let (ok, denied) = invoke(&fixture.tool("work_overview"), json!({}), ctx).await;
-    assert!(!ok);
-    assert_eq!(denied["status_code"], 403);
+    let before = app.service().unwrap().published().unwrap().0;
+    for name in NAMES {
+        for caller in [None, Some(&ordinary)] {
+            let (ok, denied) = execute_overlay(tools.as_ref(), name, caller).await;
+            assert!(!ok, "unauthorized initialized {name} succeeded");
+            assert_eq!(denied["status_code"], 403, "{name}: {denied}");
+        }
+    }
+    assert_eq!(app.service().unwrap().published().unwrap().0, before);
     assert_eq!(
-        fixture.app.service().unwrap().published().unwrap().0,
-        before
+        serde_json::to_value(&*config.read().await).unwrap(),
+        config_before
+    );
+    assert_eq!(
+        serde_json::to_value(storage.load_session(&session.id).await.unwrap()).unwrap(),
+        stored_before,
     );
 }
