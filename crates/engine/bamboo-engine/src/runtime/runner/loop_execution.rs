@@ -127,6 +127,15 @@ pub(crate) async fn run_agent_loop_with_config(
         )
         .await?;
 
+        if config.counted_loop.is_some() {
+            // Capture the initialized run before begin can fail. Its first
+            // checkpoint error must also terminalize this runtime snapshot for
+            // the host's unconditional final error save.
+            counted_runtime_identity = Some((
+                state.runtime_state.run_id.clone(),
+                state.runtime_state.round.last_round_id.clone(),
+            ));
+        }
         counted_generation = crate::runtime::counted_loop::begin(
             session,
             &config,
@@ -134,12 +143,6 @@ pub(crate) async fn run_agent_loop_with_config(
             &initial_message,
         )
         .await?;
-        if counted_generation.is_some() {
-            counted_runtime_identity = Some((
-                state.runtime_state.run_id.clone(),
-                state.runtime_state.round.last_round_id.clone(),
-            ));
-        }
 
         if config
             .hook_runner
@@ -362,7 +365,13 @@ fn fail_counted_runtime(
     if let Some(runtime) = session.agent_runtime_state.as_mut() {
         if runtime.run_id == *run_id
             && runtime.round.last_round_id == *last_round_id
-            && runtime.status == bamboo_domain::AgentStatusState::Completed
+            && matches!(
+                runtime.status,
+                bamboo_domain::AgentStatusState::Initializing
+                    | bamboo_domain::AgentStatusState::Running
+                    | bamboo_domain::AgentStatusState::Finalizing
+                    | bamboo_domain::AgentStatusState::Completed
+            )
         {
             runtime.status = if error.is_cancelled() {
                 bamboo_domain::AgentStatusState::Cancelled

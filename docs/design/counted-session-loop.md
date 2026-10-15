@@ -11,6 +11,9 @@ ownership. Raw execution rejects this opt-in feature even while another caller's
 run owns the same Session; the mere presence of an owner grants no execution.
 
 `ExecuteRequestBuilder::counted_loop(CountedLoopConfig::new(k, rounds))` opts in.
+The same config type is exported by `bamboo_engine`, `bamboo_sdk` (also under
+`agent`), and `bamboo_agent::agent` / `bamboo_agent::CountedLoopConfig`;
+facade callers need no direct engine dependency to construct the request.
 Both bounds are mandatory: 1–100 iterations, at most 1,000 total runner rounds,
 and an initial prompt of 1–16,384 UTF-8 bytes with non-whitespace content. The
 effective round bound is the minimum of the request and existing host run
@@ -51,7 +54,11 @@ conservative round consumption, and explicit status. Each admission is
 checkpointed before dispatch. Checkpoint failure and malformed/unknown state
 fail closed. A failed initial checkpoint marks that exact generation Failed,
 including in memory if its failure checkpoint also fails, so the host's later
-error save cannot leave a phantom Running loop. Only explicit budget/round/cap
+error save cannot leave a phantom Running loop or an Initializing runtime:
+the exact runtime run/round identity is captured before that first save, and
+only that execution's unfinished/success snapshot is corrected on failure.
+The new round identity is also mirrored before a fallible prelude, so an
+admission followed by pre-dispatch cancellation retains the same failure fence. Only explicit budget/round/cap
 reasons map to BudgetExhausted. Ticket question yields and other non-budget
 early exits retain their diagnostic and record recovery_unsupported; they do
 not imply a completed iteration or grant another admission.

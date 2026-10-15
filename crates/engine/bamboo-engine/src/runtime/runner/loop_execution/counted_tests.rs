@@ -718,6 +718,10 @@ async fn counted_initial_checkpoint_failure_cannot_be_resaved_as_live() {
             (0, 0, 0)
         );
         assert_eq!(persistence.remaining.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            session.agent_runtime_state.as_ref().unwrap().status,
+            bamboo_domain::AgentStatusState::Failed
+        );
         // Model the execute boundary's unconditional error save after the
         // transient failure, including failure of the Failed checkpoint itself.
         persistence
@@ -728,6 +732,10 @@ async fn counted_initial_checkpoint_failure_cannot_be_resaved_as_live() {
         assert_eq!(
             read_loop_state(&durable).unwrap().unwrap().status,
             LoopStatus::Failed
+        );
+        assert_eq!(
+            durable.agent_runtime_state.as_ref().unwrap().status,
+            bamboo_domain::AgentStatusState::Failed
         );
         let mut ordinary = config(1, 1);
         ordinary.counted_loop = None;
@@ -744,6 +752,139 @@ async fn counted_initial_checkpoint_failure_cannot_be_resaved_as_live() {
             1,
             "a failed initial save cannot poison ordinary re-entry"
         );
+    }
+}
+
+struct CancelAfterFirstAdmission {
+    inner: Arc<dyn RuntimeSessionPersistence>,
+    cancel: CancellationToken,
+}
+
+#[async_trait]
+impl RuntimeSessionPersistence for CancelAfterFirstAdmission {
+    async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.inner.save_runtime_session(session).await
+    }
+    async fn load_runtime_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+        self.inner.load_runtime_session(id).await
+    }
+    async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.inner.checkpoint_runtime_session(session).await?;
+        if read_loop_state(session)
+            .unwrap()
+            .is_some_and(|state| state.status == LoopStatus::Running && state.rounds_started == 1)
+        {
+            self.cancel.cancel();
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn counted_cancel_after_admission_terminalizes_the_runtime_before_provider_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(2, 4);
+    let mut session = Session::new("counted-fixture", "fake-only");
+    let storage = add_persistence(dir.path(), &mut cfg, &session).await;
+    let cancel = CancellationToken::new();
+    cfg.persistence = Some(Arc::new(CancelAfterFirstAdmission {
+        inner: cfg.persistence.take().unwrap(),
+        cancel: cancel.clone(),
+    }));
+    let provider = Arc::new(FakeProvider::default());
+    let (result, events) = run(&mut session, cfg, provider.clone(), cancel).await;
+    assert!(result.unwrap_err().is_cancelled());
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(complete_count(&events), 0);
+    let state = read_loop_state(&session).unwrap().unwrap();
+    assert_eq!(state.status, LoopStatus::Cancelled);
+    assert_eq!(
+        (
+            state.iterations_started,
+            state.iterations_completed,
+            state.rounds_started
+        ),
+        (1, 0, 1)
+    );
+    let runtime = session.agent_runtime_state.as_ref().unwrap();
+    assert_eq!(runtime.status, bamboo_domain::AgentStatusState::Cancelled);
+    assert!(runtime.round.last_round_id.is_some());
+    let durable = storage.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(read_loop_state(&durable).unwrap().unwrap(), state);
+    assert_eq!(
+        durable.agent_runtime_state.as_ref().unwrap().status,
+        bamboo_domain::AgentStatusState::Cancelled
+    );
+    storage.save_session(&session).await.unwrap();
+    let saved_again = storage.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(
+        saved_again.agent_runtime_state.as_ref().unwrap().status,
+        bamboo_domain::AgentStatusState::Cancelled
+    );
+}
+
+#[test]
+fn counted_failure_correction_requires_the_exact_runtime_snapshot_and_preserves_waits() {
+    use bamboo_domain::AgentStatusState;
+    for status in [
+        AgentStatusState::Initializing,
+        AgentStatusState::Running,
+        AgentStatusState::Finalizing,
+        AgentStatusState::Completed,
+        AgentStatusState::Suspended,
+        AgentStatusState::Idle,
+        AgentStatusState::Failed,
+        AgentStatusState::Cancelled,
+    ] {
+        for changed in ["none", "run", "round"] {
+            for cancelled in [false, true] {
+                let mut session = Session::new("counted-fixture", "fake-only");
+                let mut runtime = bamboo_domain::AgentRuntimeState::new(if changed == "run" {
+                    "successor"
+                } else {
+                    "owned"
+                });
+                runtime.round.last_round_id = Some(
+                    if changed == "round" {
+                        "successor-round"
+                    } else {
+                        "owned-round"
+                    }
+                    .into(),
+                );
+                runtime.status = status;
+                session.agent_runtime_state = Some(runtime);
+                let expected = ("owned".into(), Some("owned-round".into()));
+                let error = if cancelled {
+                    bamboo_agent_core::AgentError::Cancelled
+                } else {
+                    bamboo_agent_core::AgentError::LLM("synthetic failure".into())
+                };
+                fail_counted_runtime(&mut session, Some(&expected), &error);
+                let should_correct = changed == "none"
+                    && matches!(
+                        status,
+                        AgentStatusState::Initializing
+                            | AgentStatusState::Running
+                            | AgentStatusState::Finalizing
+                            | AgentStatusState::Completed
+                    );
+                let expected_status = if should_correct {
+                    if cancelled {
+                        AgentStatusState::Cancelled
+                    } else {
+                        AgentStatusState::Failed
+                    }
+                } else {
+                    status
+                };
+                assert_eq!(
+                    session.agent_runtime_state.as_ref().unwrap().status,
+                    expected_status,
+                    "{status:?}, {changed}, cancelled={cancelled}"
+                );
+            }
+        }
     }
 }
 

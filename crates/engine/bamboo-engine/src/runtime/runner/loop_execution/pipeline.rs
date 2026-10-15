@@ -3128,6 +3128,12 @@ async fn run_pipeline_inner(
             turn_counter as usize,
         );
         state.runtime_state.round.last_round_id = Some(round_id.clone());
+        if config.counted_loop.is_some() {
+            // A prelude may fail before normal round finalization mirrors this
+            // snapshot. Keep the Session on this owned round so the outer
+            // failure correction retains its exact run/round fence.
+            state_bridge::write_runtime_state(session, &state.runtime_state);
+        }
 
         if config
             .hook_runner

@@ -33,6 +33,7 @@ pub use config::{
 // so it is unconstructible outside the engine. Internal call sites reach it via
 // `crate::runtime::config::AgentLoopConfig`. External code drives the loop only
 // through `AgentRuntime::execute`.
+pub use counted_loop::CountedLoopConfig;
 pub use execution::runner_state::{AgentRunner, AgentStatus};
 pub use hooks::{
     test_lifecycle_handler, test_lifecycle_shell_command, HookRunner, LifecycleHookEvent,
