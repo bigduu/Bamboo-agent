@@ -679,7 +679,7 @@ mod tests {
         let before =
             serde_json::to_value(state.storage.load_session(&supervisor.id).await.unwrap())
                 .unwrap();
-        let body = serde_json::json!({"supervisor_session_id":supervisor.id,"incarnation_id":supervisor.supervisor_incarnation_id().unwrap(),"binding_revision":supervisor.root_tool_authority_revision});
+        let mut body = serde_json::json!({"supervisor_session_id":supervisor.id,"incarnation_id":supervisor.supervisor_incarnation_id().unwrap(),"binding_revision":supervisor.root_tool_authority_revision});
         let state = web::Data::new(state);
         let app = test::init_service(
             App::new()
@@ -766,7 +766,17 @@ mod tests {
                 request_body["binding_revision"] =
                     serde_json::json!(standard.root_tool_authority_revision);
             } else if code == "scope_requires_recovery" {
+                supervisor = state
+                    .storage
+                    .load_session(&supervisor.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                supervisor.set_root_orchestration_only(true).unwrap();
                 state.storage.save_session(&supervisor).await.unwrap();
+                body["binding_revision"] =
+                    serde_json::json!(supervisor.root_tool_authority_revision);
+                request_body = body.clone();
                 std::fs::create_dir_all(&scope_root).unwrap();
                 std::fs::write(scope_root.join("foreign"), b"must not be adopted").unwrap();
             }
