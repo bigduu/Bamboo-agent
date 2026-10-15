@@ -1703,3 +1703,44 @@ async fn acknowledged_trigger_left_in_cur_cannot_wake_queue_only_backlog() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn explicit_peer_promotion_preserves_policy_after_ack_and_reopen() {
+    for intent in [
+        SessionMessageDeliveryIntent::QueueOnly,
+        SessionMessageDeliveryIntent::TriggerTurn,
+    ] {
+        let (temp, _store, inbox, source, target) = explicit_peer_fixture().await;
+        let envelope = peer_envelope("sender", "parent");
+        let receipt = inbox
+            .deliver_peer_message_with_intent(&envelope, &source, &target, None, intent)
+            .await
+            .unwrap();
+        for after_ack in [false, true] {
+            let reopened = reopen(&temp).await;
+            for policy in [
+                SessionActivationPolicy::RespectSpecificWait,
+                SessionActivationPolicy::InterruptSpecificWait,
+            ] {
+                let allowed = intent == SessionMessageDeliveryIntent::TriggerTurn
+                    && policy == SessionActivationPolicy::RespectSpecificWait;
+                assert_eq!(
+                    reopened
+                        .mark_message_activation_eligible("parent", &receipt, policy)
+                        .await
+                        .is_ok(),
+                    allowed,
+                    "{intent:?} {policy:?} after_ack={after_ack}"
+                );
+            }
+            if !after_ack {
+                let claim = reopened
+                    .claim_for_turn("parent", 1, Some("active-run"))
+                    .await
+                    .unwrap()
+                    .remove(0);
+                reopened.ack("parent", &claim).await.unwrap();
+            }
+        }
+    }
+}

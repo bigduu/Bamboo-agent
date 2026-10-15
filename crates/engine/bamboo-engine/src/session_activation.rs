@@ -3722,4 +3722,67 @@ mod tests {
         assert!(claims.iter().all(|claim| claim.activation_policy
             == bamboo_domain::SessionActivationPolicy::RespectSpecificWait));
     }
+
+    #[tokio::test]
+    async fn acknowledged_explicit_peer_retry_cannot_activate_or_notify_a_new_owner() {
+        use bamboo_domain::{SessionMessageDeliveryIntent, Storage};
+        for intent in [
+            SessionMessageDeliveryIntent::TriggerTurn,
+            SessionMessageDeliveryIntent::QueueOnly,
+        ] {
+            for active_owner in [false, true] {
+                let fixture = PeerIntentFixture::new().await;
+                let first = fixture
+                    .messenger
+                    .send_peer_with_intent("sender", "target", "ack-operation", "input", intent)
+                    .await
+                    .unwrap();
+                let claim = fixture
+                    .inbox
+                    .claim_for_turn("target", 1, Some("first-run"))
+                    .await
+                    .unwrap()
+                    .remove(0);
+                let mut saved = fixture.store.load_session("target").await.unwrap().unwrap();
+                saved.add_message(claim.envelope.to_provider_message().unwrap());
+                saved.session_inbox_admission_mut().record(
+                    claim.envelope.id.clone(),
+                    claim.generation,
+                );
+                fixture.store.save_session(&saved).await.unwrap();
+                fixture.inbox.ack("target", &claim).await.unwrap();
+
+                // This spawner has no independent Inbox filter. The messenger
+                // must not ask a fresh router to launch an acknowledged input.
+                let restarted = SessionActivationRouter::new();
+                restarted.set_inbox(fixture.inbox.clone());
+                let fresh_spawner = spawner();
+                restarted.set_spawner(fresh_spawner.clone()).await;
+                let mut registration = if active_owner {
+                    Some(restarted.register_run("target", "new-owner").await.unwrap())
+                } else {
+                    None
+                };
+                let messenger = crate::SessionMessenger::new(
+                    fixture.store.clone(),
+                    fixture.inbox.clone(),
+                    restarted,
+                );
+                let retry = messenger
+                    .send_peer_with_intent("sender", "target", "ack-operation", "input", intent)
+                    .await
+                    .unwrap();
+                assert_eq!(retry.delivery, first.delivery);
+                assert_eq!(retry.activation, None, "{intent:?} active={active_owner}");
+                assert!(!retry.active_delivery_notified);
+                assert_eq!(fresh_spawner.reservations.load(Ordering::SeqCst), 0);
+                assert_eq!(fresh_spawner.launches.load(Ordering::SeqCst), 0);
+                if let Some(mut registration) = registration.take() {
+                    assert!(!registration.notifications_mut().has_changed().unwrap());
+                    registration.begin_finalization().await;
+                    assert_eq!(registration.finish(claim.generation).await.unwrap(), None);
+                }
+            }
+        }
+    }
 }
