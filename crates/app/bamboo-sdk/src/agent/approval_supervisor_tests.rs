@@ -527,38 +527,40 @@ async fn supervisor_exact_custom_owner_and_builtin_alias_remain_distinct() {
         1
     );
 
-    // A separately registered namespaced owner is not the canonical
-    // management identity, and cannot enter approval as an alias shortcut.
-    let fixture = Fixture::new().await;
-    let original = setup_supervisor(&fixture).await;
-    *fixture.probe.next_call.lock().unwrap() = Some(management_call());
-    let denied = events(
-        protected_agent_with(
-            &fixture,
-            management_config(),
-            &["session_control", "default::session_control"],
-            false,
-            None,
+    for ultra in [false, true] {
+        // A separately registered namespaced owner is not the canonical
+        // management identity, and cannot enter approval as an alias shortcut.
+        let fixture = Fixture::new().await;
+        let original = setup_supervisor(&fixture).await;
+        let mut session = fixture.reload(&original.session_id).await;
+        session.set_root_orchestration_only(ultra).unwrap();
+        fixture.repo.save(&mut session).await.unwrap();
+        *fixture.probe.next_call.lock().unwrap() = Some(management_call());
+        let denied = events(
+            protected_agent_with(
+                &fixture,
+                management_config(),
+                &["session_control", "default::session_control"],
+                false,
+                None,
+            )
+            .run_stream(session, "attempt exact custom owner"),
         )
-        .run_stream(
-            fixture.reload(&original.session_id).await,
-            "attempt exact custom owner",
-        ),
-    )
-    .await;
-    assert!(!denied
-        .iter()
-        .any(|event| matches!(event, AgentEvent::NeedClarification { .. })));
-    assert!(fixture.probe.calls.lock().unwrap().is_empty());
-    assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        SupervisorSessionService::new(fixture.store.clone())
-            .inspect_scope(&original)
-            .await
-            .unwrap()
-            .state_revision,
-        1
-    );
+        .await;
+        assert!(!denied
+            .iter()
+            .any(|event| matches!(event, AgentEvent::NeedClarification { .. })));
+        assert!(fixture.probe.calls.lock().unwrap().is_empty());
+        assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            SupervisorSessionService::new(fixture.store.clone())
+                .inspect_scope(&original)
+                .await
+                .unwrap()
+                .state_revision,
+            1
+        );
+    }
 }
 
 #[tokio::test]

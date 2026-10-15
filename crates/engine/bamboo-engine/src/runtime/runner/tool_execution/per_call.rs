@@ -329,11 +329,16 @@ async fn execute_tool_call_only_with_execution_name(
     let executing_supervisor = ctx.executing_supervisor.is_some()
         && ctx.session_id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
         && ctx.root_session_id == ctx.session_id;
+    // Filtering a registered exact identity out of the model catalog must
+    // not turn its spelling into a compatibility alias for another owner.
+    let reference = ctx.tool_call.function.name.trim();
+    let exact_owner_shadowed = reference != execution_name && ctx.tools.owns_exact_tool(reference);
     if (ctx.root_orchestration_only || executing_supervisor)
-        && !bamboo_domain::orchestration_only_allows_execution_name_for_supervisor(
-            execution_name,
-            executing_supervisor,
-        )
+        && (exact_owner_shadowed
+            || !bamboo_domain::orchestration_only_allows_execution_name_for_supervisor(
+                execution_name,
+                executing_supervisor,
+            ))
     {
         tracing::warn!(
             "[{}][round:{}] Tool call rejected by Root authority before ToolStart: tool_call_id={}, tool_name={}, execution_name={}",
