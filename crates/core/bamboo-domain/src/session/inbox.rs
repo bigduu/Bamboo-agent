@@ -479,9 +479,10 @@ impl SessionMessageEnvelope {
                 == Some(run_id)
     }
 
-    /// A child completion admitted while its parent Run still owns the turn
-    /// belongs to that Run's successor. The coordinator writes this fence in
-    /// the durable envelope before clearing the parent's wait.
+    /// A wait-bound child completion may belong to its active parent's
+    /// successor. The coordinator keeps wait/Guardian control transitions on
+    /// that owner behind this durable fence. Background-only results remain
+    /// eligible for the active Run's next safe reasoning boundary.
     pub fn child_outcome_waits_for_run(&self, run_id: &str) -> bool {
         self.kind == SessionMessageKind::ChildOutcome
             && matches!(&self.source, SessionMessageSource::Runtime { subsystem }
