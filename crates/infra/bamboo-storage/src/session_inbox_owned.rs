@@ -254,17 +254,54 @@ impl OwnedFilesystem {
         dir: &Path,
         wrapper: &InboxMessage,
         gate: Option<&bamboo_domain::AdmissionGate>,
-    ) -> std::io::Result<bamboo_domain::AdmissionCommit<MsgId>> {
+        expected: Option<ExpectedRunAdmission>,
+        generation: u64,
+    ) -> Result<(bamboo_domain::AdmissionCommit<MsgId>, bool), SessionInboxError> {
         let wrapper = wrapper.clone();
         let gate = gate.cloned();
         self.job("maildir", dir, move |filesystem, dir| {
-            Mailbox::at(dir)
-                .deliver_blocking(&wrapper, gate.as_ref(), |phase, path| {
-                    filesystem.observe(phase, path)
-                })
-                .map_err(std::io::Error::other)
+            // Local to this started job: async cancellation cannot drop the
+            // exact owner while the final rename is still able to commit.
+            let retained =
+                std::cell::RefCell::new(None::<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>>);
+            let conflict = std::cell::RefCell::new(None::<SessionInboxError>);
+            let result =
+                Mailbox::at(dir).deliver_blocking(&wrapper, gate.as_ref(), |phase, path| {
+                    filesystem.observe(phase, path)?;
+                    if phase == "maildir_replace" {
+                        if let Some(expected) = &expected {
+                            match expected.retain() {
+                                Ok(guard) => *retained.borrow_mut() = Some(guard),
+                                Err(error) => {
+                                    *conflict.borrow_mut() = Some(error);
+                                    return Err(std::io::Error::other(
+                                        "expected run admission rejected",
+                                    ));
+                                }
+                            }
+                            filesystem.observe("expected_run_matched", path)?;
+                        }
+                    }
+                    Ok(())
+                });
+            if let Some(error) = conflict.into_inner() {
+                return Ok(Err(error));
+            }
+            let committed = match result {
+                Ok(committed) => committed,
+                Err(error) => return Ok(Err(SessionInboxError::Storage(error.to_string()))),
+            };
+            let notified = matches!(&committed, bamboo_domain::AdmissionCommit::Committed(_))
+                && retained
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|guard| guard.notify_committed_delivery(generation));
+            // The retained guard and original filesystem/authority guards all
+            // remain live until this synchronous job returns.
+            Ok(Ok((committed, notified)))
         })
         .await
+        .map_err(|error| SessionInboxError::Storage(error.to_string()))?
     }
 
     pub(super) async fn cancel(&self, dir: &Path, path: &Path, name: &str) -> std::io::Result<()> {
@@ -835,8 +872,11 @@ impl FileSessionInbox {
                 if current.is_some() && !versioned {
                     return Err(invalid("activation intent requires its v2 watermark"));
                 }
-                if let Some(intent) = current.filter(|intent| intent.delivery().is_some()) {
-                    Self::validate_explicit_message_promotion(Some(intent), policy)?;
+                if let Some(intent) = current
+                    .as_ref()
+                    .filter(|intent| intent.delivery().is_some())
+                {
+                    Self::validate_explicit_message_promotion(Some(intent.clone()), policy)?;
                     return Ok(());
                 }
                 if current.is_some_and(|intent| {
@@ -1021,7 +1061,13 @@ impl FileSessionInbox {
             let (wrapper, stored) = self.read_owned_transport(&path).await?;
             let intent = Self::activation_intent(&wrapper.body)?;
             let activation = Self::message_activation_intent(&wrapper.body)?;
-            if !Self::eligible(generation, prefix, activation) {
+            if intent
+                .as_ref()
+                .is_some_and(|intent| !intent.admits_run(run))
+            {
+                continue;
+            }
+            if !Self::eligible(generation, prefix, activation.clone()) {
                 continue;
             }
             let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())
@@ -1754,7 +1800,7 @@ impl FileSessionInbox {
             let (wrapper, stored) = self.read_owned_transport(&path).await?;
             let intent = Self::activation_intent(&wrapper.body)?;
             let activation = Self::message_activation_intent(&wrapper.body)?;
-            if !Self::wake_eligible(generation, prefix, activation) {
+            if !Self::wake_eligible(generation, prefix, activation.clone()) {
                 continue;
             }
             let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())

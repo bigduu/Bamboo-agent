@@ -118,6 +118,12 @@ fn current_input(
     {
         return Err(ActorInputCheckpointError::Unsupported);
     }
+    if intent
+        .as_ref()
+        .is_some_and(|intent| !intent.admits_run(Some(&request.fence.run_id)))
+    {
+        return Err(ActorDirectoryError::StaleFence.into());
+    }
     let proof = Bookkeeping {
         version: 1,
         envelope_id: envelope.id.as_str().into(),

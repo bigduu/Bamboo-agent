@@ -418,6 +418,61 @@ async fn actor_input_root_child_cold_new_already_and_complete_prefix() {
 }
 
 #[tokio::test]
+async fn actor_input_expected_run_intent_checks_actual_actor_fence_before_checkpoint() {
+    for child in [false, true] {
+        for expected in ["first-run", "another-run"] {
+            let home = tempfile::tempdir().unwrap();
+            let f = fixture(home.path(), child, true).await;
+            let path = f
+                .directory
+                .join("inbox/cur")
+                .join(&f.request.claim.claim.claim_id);
+            // Keep the real Actor fence, lease and envelope. A stale host can
+            // supply this same claim even when the persisted input is bound
+            // to another run; the publication checkpoint must reject it too.
+            let mut transport: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            transport["body"]["session_inbox_activation_intent"] = serde_json::to_value(
+                bamboo_domain::SessionInboxActivationIntent::for_expected_run(expected).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(path, serde_json::to_vec(&transport).unwrap()).unwrap();
+            if expected != f.request.fence.run_id {
+                assert!(matches!(
+                    reject_unchanged(&f, f.request.clone()).await,
+                    ActorInputCheckpointError::Actor(
+                        bamboo_domain::ActorDirectoryError::StaleFence
+                    )
+                ));
+                continue;
+            }
+            let before = protected(&f);
+            let committed = f
+                .inbox
+                .checkpoint_actor_input(f.request.clone())
+                .await
+                .unwrap();
+            assert_eq!(committed.status, ActorInputCheckpointStatus::NewCheckpoint);
+            assert_eq!(protected(&f), before);
+            let cold = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+            let current = cold.load_session(ID).await.unwrap().unwrap();
+            let retry = crate::FileSessionInbox::new(cold, SessionInboxLimits::default())
+                .checkpoint_actor_input(f.request_from(&current))
+                .await
+                .unwrap();
+            assert_eq!(
+                retry.status,
+                ActorInputCheckpointStatus::AlreadyCheckpointed
+            );
+            assert_eq!(
+                retry.session.messages.len(),
+                committed.session.messages.len()
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn actor_input_reserved_and_current_authority_prefix_claim_rejections() {
     let home = tempfile::tempdir().unwrap();
     let f = fixture(home.path(), false, false).await;

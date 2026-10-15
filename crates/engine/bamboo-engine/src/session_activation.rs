@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 
 use async_trait::async_trait;
 use bamboo_domain::{
@@ -202,6 +202,8 @@ pub trait SessionActivationSpawner: Send + Sync {
 #[derive(Debug, Clone)]
 struct ActiveOwner {
     run_id: String,
+    /// Set only by a real registration at its Session-bound execution entry.
+    session_created_at: Option<DateTime<Utc>>,
     finalizing: bool,
     registrations: usize,
     /// Present only while an external actor driver is alive. The payload is a
@@ -407,6 +409,55 @@ impl Drop for ActivationReservationLease {
                     .await;
             });
         }
+    }
+}
+
+struct ExpectedRunDeliveryGuard {
+    target_session_id: String,
+    session_created_at: DateTime<Utc>,
+    run_id: String,
+    states: StdMutex<tokio::sync::OwnedMutexGuard<HashMap<String, TargetActivationState>>>,
+}
+
+impl bamboo_domain::SessionRunDeliveryGuard for ExpectedRunDeliveryGuard {
+    fn matches(
+        &self,
+        target_session_id: &str,
+        target_created_at: DateTime<Utc>,
+        expected_run_id: &str,
+    ) -> bool {
+        self.target_session_id == target_session_id
+            && self.session_created_at == target_created_at
+            && self.run_id == expected_run_id
+    }
+
+    fn notify_committed_delivery(&self, inbox_generation: u64) -> bool {
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(state) = states.get_mut(&self.target_session_id) else {
+            return false;
+        };
+        let Some(owner) = state.owner.as_mut().filter(|owner| {
+            owner.run_id == self.run_id
+                && owner.session_created_at == Some(self.session_created_at)
+                && !owner.finalizing
+                && owner.registrations > 0
+        }) else {
+            return false;
+        };
+        // Same QueueOnly notification contract as v2: never reserve a successor.
+        state.latest_delivery_generation = state.latest_delivery_generation.max(inbox_generation);
+        state.notify.send_replace(inbox_generation);
+        if owner
+            .delivery_sink
+            .as_ref()
+            .is_some_and(|sink| sink.send(inbox_generation).is_err())
+        {
+            owner.delivery_sink = None;
+        }
+        true
     }
 }
 
@@ -900,6 +951,7 @@ impl SessionActivationRouter {
             .or_default()
             .owner = Some(ActiveOwner {
             run_id: run_id.to_string(),
+            session_created_at: None,
             finalizing: false,
             registrations: 0,
             delivery_sink: None,
@@ -914,6 +966,55 @@ impl SessionActivationRouter {
         target_session_id: &str,
         run_id: &str,
     ) -> Result<SessionRunRegistration, SessionRunRegistrationError> {
+        self.register_run_with_birth(target_session_id, run_id, None)
+            .await
+    }
+
+    /// Register from the actual execution's Session, enabling birth-fenced
+    /// steer. This is a trusted host entrypoint, not model-supplied authority.
+    pub async fn register_session_run(
+        self: &Arc<Self>,
+        session: &bamboo_domain::Session,
+        run_id: &str,
+    ) -> Result<SessionRunRegistration, SessionRunRegistrationError> {
+        self.register_run_with_birth(&session.id, run_id, Some(session.created_at))
+            .await
+    }
+
+    pub(crate) async fn bind_run_lifetime(
+        self: &Arc<Self>,
+        ownership: &SessionRunOwnership,
+        session: &bamboo_domain::Session,
+    ) -> bool {
+        if !ownership.matches_router(self) || ownership.target_session_id != session.id {
+            return false;
+        }
+        let mut states = self.states.lock().await;
+        let Some(owner) = states
+            .get_mut(&session.id)
+            .and_then(|state| state.owner.as_mut())
+        else {
+            return false;
+        };
+        if owner.run_id != ownership.run_id
+            || owner.finalizing
+            || owner.registrations == 0
+            || owner
+                .session_created_at
+                .is_some_and(|birth| birth != session.created_at)
+        {
+            return false;
+        }
+        owner.session_created_at = Some(session.created_at);
+        true
+    }
+
+    async fn register_run_with_birth(
+        self: &Arc<Self>,
+        target_session_id: &str,
+        run_id: &str,
+        birth: Option<DateTime<Utc>>,
+    ) -> Result<SessionRunRegistration, SessionRunRegistrationError> {
         loop {
             let (notifications, reservation_wait) = {
                 let mut states = self.states.lock().await;
@@ -927,6 +1028,19 @@ impl SessionActivationRouter {
                         // `dispatch_reserved` publishes the exact owner before
                         // making the task runnable. The task converts that
                         // placeholder into the one live registration here.
+                        if owner
+                            .session_created_at
+                            .is_some_and(|existing| birth.is_some_and(|birth| existing != birth))
+                        {
+                            return Err(SessionRunRegistrationError::OwnerCollision {
+                                target_session_id: target_session_id.into(),
+                                existing_run_id: owner.run_id.clone(),
+                                attempted_run_id: run_id.into(),
+                            });
+                        }
+                        if birth.is_some() {
+                            owner.session_created_at = birth;
+                        }
                         owner.registrations = 1;
                         (Some(state.notify.subscribe()), None)
                     }
@@ -948,6 +1062,7 @@ impl SessionActivationRouter {
                     None => {
                         state.owner = Some(ActiveOwner {
                             run_id: run_id.to_string(),
+                            session_created_at: birth,
                             finalizing: false,
                             registrations: 1,
                             delivery_sink: None,
@@ -1039,6 +1154,7 @@ impl SessionActivationRouter {
             None => {
                 state.owner = Some(ActiveOwner {
                     run_id: run_id.to_string(),
+                    session_created_at: None,
                     finalizing: true,
                     registrations: 0,
                     delivery_sink: None,
@@ -1439,6 +1555,7 @@ impl SessionActivationRouter {
                     }
                     state.owner = Some(ActiveOwner {
                         run_id,
+                        session_created_at: None,
                         finalizing: false,
                         registrations: 0,
                         delivery_sink: None,
@@ -1467,6 +1584,7 @@ impl SessionActivationRouter {
                 }
                 state.owner = Some(ActiveOwner {
                     run_id,
+                    session_created_at: None,
                     finalizing: false,
                     registrations: 0,
                     delivery_sink: None,
@@ -1517,6 +1635,56 @@ impl SessionActivationRouter {
 
 #[async_trait]
 impl SessionActivationPort for SessionActivationRouter {
+    fn retain_expected_run_blocking(
+        &self,
+        target_session_id: &str,
+        target_created_at: DateTime<Utc>,
+        expected_run_id: &str,
+    ) -> Result<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>, bamboo_domain::SessionRunConflict>
+    {
+        use bamboo_domain::{SessionRunConflict, SessionRunConflictReason};
+        let states = self.states.clone().blocking_lock_owned();
+        let owner = states
+            .get(target_session_id)
+            .and_then(|state| state.owner.as_ref());
+        let reason = match owner {
+            None => Some(SessionRunConflictReason::NoActiveRun),
+            Some(owner)
+                if owner
+                    .session_created_at
+                    .is_some_and(|birth| birth != target_created_at) =>
+            {
+                Some(SessionRunConflictReason::SessionBirthChanged)
+            }
+            Some(owner) if owner.finalizing => Some(SessionRunConflictReason::Finalizing),
+            Some(owner) if owner.registrations == 0 => {
+                Some(SessionRunConflictReason::NotRegistered)
+            }
+            Some(owner) if owner.session_created_at.is_none() => {
+                Some(SessionRunConflictReason::UnboundLifetime)
+            }
+            Some(owner) if owner.run_id != expected_run_id => {
+                Some(SessionRunConflictReason::RunChanged)
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = reason {
+            return Err(SessionRunConflict {
+                reason,
+                expected_run_id: expected_run_id.into(),
+                observed_run_id: owner
+                    .filter(|owner| owner.session_created_at == Some(target_created_at))
+                    .map(|owner| owner.run_id.clone()),
+            });
+        }
+        Ok(Arc::new(ExpectedRunDeliveryGuard {
+            target_session_id: target_session_id.into(),
+            session_created_at: target_created_at,
+            run_id: expected_run_id.into(),
+            states: StdMutex::new(states),
+        }))
+    }
+
     async fn notify_active_delivery(&self, target_session_id: &str, inbox_generation: u64) -> bool {
         let mut states = self.states.lock().await;
         let Some(state) = states.get_mut(target_session_id) else {
@@ -3783,5 +3951,151 @@ mod tests {
                 }
             }
         }
+    }
+    #[tokio::test]
+    async fn expected_run_guard_conflicts_and_blocks_finalization_until_publication_finishes() {
+        use bamboo_domain::{SessionRunConflictReason, SessionRunDeliveryGuard};
+        async fn retain(
+            router: Arc<SessionActivationRouter>,
+            birth: DateTime<Utc>,
+            expected: &'static str,
+        ) -> Result<Arc<dyn SessionRunDeliveryGuard>, bamboo_domain::SessionRunConflict> {
+            tokio::task::spawn_blocking(move || {
+                router.retain_expected_run_blocking("target", birth, expected)
+            })
+            .await
+            .unwrap()
+        }
+        let router = SessionActivationRouter::new();
+        let target = bamboo_domain::Session::new("target", "model");
+        let birth = target.created_at;
+        assert_eq!(
+            retain(router.clone(), birth, "run-a")
+                .await
+                .err()
+                .unwrap()
+                .reason,
+            SessionRunConflictReason::NoActiveRun
+        );
+        let mut registration = router.register_session_run(&target, "run-a").await.unwrap();
+        assert_eq!(
+            retain(router.clone(), birth, "replacement")
+                .await
+                .err()
+                .unwrap()
+                .reason,
+            SessionRunConflictReason::RunChanged
+        );
+        let stale_birth = retain(
+            router.clone(),
+            birth + chrono::Duration::seconds(1),
+            "run-a",
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            stale_birth.reason,
+            SessionRunConflictReason::SessionBirthChanged
+        );
+        assert_eq!(stale_birth.observed_run_id, None);
+        let guard = retain(router.clone(), birth, "run-a").await.unwrap();
+        assert!(guard.matches("target", birth, "run-a"));
+        assert!(!guard.matches("other-target", birth, "run-a"));
+        assert!(guard.notify_committed_delivery(7));
+        let mut finalizing = Box::pin(router.begin_finalization("target", "run-a"));
+        assert!(futures::poll!(finalizing.as_mut()).is_pending());
+        drop(guard);
+        finalizing.await;
+        assert_eq!(
+            retain(router.clone(), birth, "run-a")
+                .await
+                .err()
+                .unwrap()
+                .reason,
+            SessionRunConflictReason::Finalizing
+        );
+        assert_eq!(*registration.notifications_mut().borrow(), 7);
+        assert_eq!(registration.finish(0).await.unwrap(), None);
+        assert_eq!(router.current_run_id("target").await, None);
+    }
+
+    #[tokio::test]
+    async fn expected_run_requires_real_lifetime_binding_and_cannot_rebind() {
+        use bamboo_domain::SessionRunConflictReason;
+        let router = SessionActivationRouter::new();
+        let target = bamboo_domain::Session::new("target", "model");
+        let mut registration = router.register_run(&target.id, "run-a").await.unwrap();
+        let query = router.clone();
+        let birth = target.created_at;
+        let conflict = tokio::task::spawn_blocking(move || {
+            query.retain_expected_run_blocking("target", birth, "run-a")
+        })
+        .await
+        .unwrap()
+        .err()
+        .unwrap();
+        assert_eq!(conflict.reason, SessionRunConflictReason::UnboundLifetime);
+        assert_eq!(conflict.observed_run_id, None);
+        let other_router = SessionActivationRouter::new();
+        assert!(
+            !other_router
+                .bind_run_lifetime(&registration.ownership(), &target)
+                .await
+        );
+        assert!(
+            router
+                .bind_run_lifetime(&registration.ownership(), &target)
+                .await
+        );
+        let mut replacement = target.clone();
+        replacement.created_at += chrono::Duration::seconds(1);
+        assert!(
+            !router
+                .bind_run_lifetime(&registration.ownership(), &replacement)
+                .await
+        );
+        let query = router.clone();
+        let guard = tokio::task::spawn_blocking(move || {
+            query.retain_expected_run_blocking("target", birth, "run-a")
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(guard.matches("target", birth, "run-a"));
+        drop(guard);
+        registration.begin_finalization().await;
+        assert!(
+            !router
+                .bind_run_lifetime(&registration.ownership(), &target)
+                .await
+        );
+        assert_eq!(registration.finish(0).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn expected_run_guard_rejects_unregistered_reservations_without_notification() {
+        let router = SessionActivationRouter::new();
+        router
+            .install_owner_placeholder_for_test("target", "run-a")
+            .await;
+        let query = router.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            query.retain_expected_run_blocking("target", Utc::now(), "run-a")
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            result.err().unwrap().reason,
+            bamboo_domain::SessionRunConflictReason::NotRegistered
+        );
+        assert_eq!(
+            router.current_run_id("target").await.as_deref(),
+            Some("run-a")
+        );
+        assert_eq!(
+            router.states.lock().await["target"].latest_delivery_generation,
+            0
+        );
     }
 }
