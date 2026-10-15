@@ -509,4 +509,116 @@ mod tests {
         assert!(!root.join("denied").exists());
         assert_eq!(list(&f.repo()).unwrap().len(), 1);
     }
+    #[test]
+    fn creation_recovers_after_lock_owner_exits_without_drop() {
+        const CHILD_ROOT: &str = "BODHI_WORKTREE_TEST_EXIT_WITH_LOCK";
+        if let Some(repo) = std::env::var_os(CHILD_ROOT) {
+            let path = repository(Path::new(&repo))
+                .unwrap()
+                .join("bodhi-worktree-create.lock");
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            file.try_lock().unwrap();
+            let _lock = CreateLock { path, file };
+            let control = Path::new(&repo).parent().unwrap();
+            fs::write(control.join("lock-owner-ready"), "ready").unwrap();
+            for _ in 0..3000 {
+                if control.join("lock-owner-exit").exists() {
+                    // Skip Rust destructors, as in an abrupt process exit.
+                    std::process::exit(0);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            std::process::exit(9);
+        }
+        let f = Fixture::new();
+        let test_name = std::thread::current().name().unwrap().to_owned();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--test-threads=1"])
+            .env(CHILD_ROOT, f.repo())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        for _ in 0..3000 {
+            if f.0.join("lock-owner-ready").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ready = f.0.join("lock-owner-ready").exists();
+        let live = child.try_wait().unwrap().is_none();
+        let while_live = create(&f.repo(), &f.roots(), "while_live", "while/live");
+        fs::write(f.0.join("lock-owner-exit"), "exit without Drop").unwrap();
+        let status = child.wait().unwrap();
+        assert!(
+            ready && live && status.success(),
+            "Child owner probe did not settle normally"
+        );
+        assert!(while_live.is_err(), "A live owner must never be preempted");
+        assert!(!f.roots().join("while_live").exists());
+        let path = repository(&f.repo())
+            .unwrap()
+            .join("bodhi-worktree-create.lock");
+        assert!(path.exists(), "Child must leave the lock file behind");
+        let created = create(&f.repo(), &f.roots(), "after_exit", "after/exit").unwrap();
+        assert!(created.join(".git").exists());
+    }
+
+    #[test]
+    fn live_lock_blocks_then_reuses_existing_file_without_truncation() {
+        let f = Fixture::new();
+        let path = repository(&f.repo())
+            .unwrap()
+            .join("bodhi-worktree-create.lock");
+        fs::write(&path, "preserve existing metadata content\n").unwrap();
+        let identity = fs::metadata(&path).unwrap();
+        let owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        owner.try_lock().unwrap();
+        assert!(create(&f.repo(), &f.roots(), "while_busy", "while/busy").is_err());
+        assert!(!f.roots().join("while_busy").exists());
+        drop(owner);
+        create(&f.repo(), &f.roots(), "after_close", "after/close").unwrap();
+        create(&f.repo(), &f.roots(), "reuse", "reuse").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "preserve existing metadata content\n"
+        );
+        assert!(same_identity(&identity, &fs::metadata(&path).unwrap()));
+    }
+
+    #[test]
+    fn creation_lock_rejects_symlinks_and_non_regular_paths() {
+        let f = Fixture::new();
+        let path = repository(&f.repo())
+            .unwrap()
+            .join("bodhi-worktree-create.lock");
+        #[cfg(unix)]
+        {
+            let user_file = f.0.join("preserved-content");
+            fs::write(&user_file, "must remain untouched\n").unwrap();
+            std::os::unix::fs::symlink(&user_file, &path).unwrap();
+            assert!(create(&f.repo(), &f.roots(), "linked", "linked").is_err());
+            assert_eq!(
+                fs::read_to_string(&user_file).unwrap(),
+                "must remain untouched\n"
+            );
+            assert!(fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            fs::remove_file(&path).unwrap();
+        }
+        fs::create_dir(&path).unwrap();
+        assert!(create(&f.repo(), &f.roots(), "directory", "directory").is_err());
+        assert!(path.is_dir());
+    }
 }
