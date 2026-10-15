@@ -14,9 +14,9 @@ use crate::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide}
 use crate::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::tools::{
     BashInputTool, BashOutputTool, BashTool, EditTool, ExecCommandTool, ExitPlanModeTool,
-    GetFileInfoTool, GlobTool, GrepTool, KillShellTool, ReadTool, RequestPermissionsTool,
-    SessionNoteTool, SleepTool, TaskTool, ToolRegistry, UpdateGoalTool, ViewImageTool,
-    WebFetchTool, WorkspaceTool, WriteStdinTool, WriteTool,
+    GetFileInfoTool, GlobTool, GrepTool, KillShellTool, LoopControlTool, ReadTool,
+    RequestPermissionsTool, SessionNoteTool, SleepTool, TaskTool, ToolRegistry, UpdateGoalTool,
+    ViewImageTool, WebFetchTool, WorkspaceTool, WriteStdinTool, WriteTool,
 };
 use bamboo_llm::Config;
 use bamboo_plugin_protocol::{
@@ -359,6 +359,7 @@ impl BuiltinToolExecutor {
         let _ = registry.register(GrepTool::new());
         let _ = registry.register(UpdateGoalTool::new());
         let _ = registry.register(KillShellTool::new());
+        let _ = registry.register(LoopControlTool::new());
         let _ = registry.register(SessionNoteTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, ReadTool::new()) {
             framework_tools.insert(name, tool);

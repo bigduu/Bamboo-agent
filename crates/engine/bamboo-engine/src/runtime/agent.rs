@@ -424,6 +424,9 @@ impl Agent {
         if let Some(counted) = req.counted_loop.as_mut() {
             counted.bind_owner(registration.ownership(), session);
         }
+        if let Some(control) = req.loop_control.as_mut() {
+            control.bind_owner(registration.ownership(), session);
+        }
         let result = self.execute_with_inputs(session, req, inputs).await;
 
         // Freeze what this provider execution actually consumed. Compatibility

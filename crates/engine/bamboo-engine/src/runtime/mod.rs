@@ -12,6 +12,7 @@ pub mod goal_state;
 pub mod gold_evaluation;
 pub mod guardian_state;
 pub mod hooks;
+pub mod loop_control;
 pub mod managers;
 pub mod model_roster;
 pub mod runner;
@@ -40,6 +41,7 @@ pub use hooks::{
     LifecycleHookTestOutput, LifecycleScriptRunner, ScriptHook, ShellCommandHook, ShellHookEvent,
     ShellHookTestOutput,
 };
+pub use loop_control::LoopControlConfig;
 pub use managers::{
     LifecycleManager, LlmManager, MemoryManager, MiniLoopExecutor, PromptManager, ToolManager,
 };

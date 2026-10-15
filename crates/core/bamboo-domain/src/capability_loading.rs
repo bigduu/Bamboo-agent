@@ -72,13 +72,14 @@ pub const HOST_ONLY_TOOL_NAMES: [&str; 6] = [
 ];
 
 /// Examples whose deferred status is part of the public migration contract.
-pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 7] = [
+pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 8] = [
     "Glob",
     "GetFileInfo",
     "ViewImage",
     "load_skill",
     "workflow_run",
     "update_goal",
+    "loop_control",
     "session_message",
 ];
 

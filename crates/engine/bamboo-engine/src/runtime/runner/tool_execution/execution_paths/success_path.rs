@@ -152,6 +152,21 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
         })
     );
 
+    if ctx.loop_result_checkpointed {
+        // Keep the durable tool-result message identity. PostToolUse may have
+        // appended feedback after its acceptance checkpoint; do not add a second pair.
+        if let Some(message) = ctx
+            .session
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.tool_call_id.as_deref() == Some(ctx.tool_call.id.as_str()))
+        {
+            message.content = result.result.clone();
+        }
+        return false;
+    }
+
     let outcome = handle_tool_result_with_agentic_support_and_persistence(
         result,
         ctx.tool_call,

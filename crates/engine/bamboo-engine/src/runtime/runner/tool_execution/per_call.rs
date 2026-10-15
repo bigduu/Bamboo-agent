@@ -943,6 +943,33 @@ pub(super) async fn apply_tool_execution_outcome(
     ctx: ToolExecutionApplyContext<'_>,
     mut outcome: ToolExecutionOutcome,
 ) -> Result<bool, AgentError> {
+    let mut loop_result_checkpointed = false;
+    if outcome.portable_tool.as_ref().is_some_and(|tool| {
+        tool.execution_name() == bamboo_tools::tools::loop_control::LOOP_CONTROL_TOOL_NAME
+    }) && outcome.result.as_ref().is_ok_and(|result| result.success)
+        && outcome.needs_human.is_none()
+    {
+        let command = bamboo_tools::tools::loop_control::parse_loop_control_request(
+            &ctx.tool_call.function.arguments,
+        )
+        .map_err(AgentError::Tool)?;
+        crate::runtime::runner::state_bridge::write_runtime_state(ctx.session, ctx.runtime_state);
+        let read_only = ctx.runtime_state.plan_mode.is_some()
+            || ctx.runtime_state.effective_permission_mode()
+                == bamboo_domain::SessionPermissionMode::Plan
+            || ctx.config.permission_mode == Some(bamboo_config::PermissionMode::Plan);
+        outcome.result = Ok(crate::runtime::loop_control::apply_current(
+            ctx.session,
+            ctx.config,
+            &command,
+            &ctx.tool_call.id,
+            ctx.round,
+            outcome.permission_replay_origin.is_some(),
+            read_only,
+        )
+        .await?);
+        loop_result_checkpointed = true;
+    }
     let mut post_tool_feedback = Vec::new();
     let mut deferred_hook_control = None;
     if outcome.post_tool_hook_eligible
@@ -1101,6 +1128,7 @@ pub(super) async fn apply_tool_execution_outcome(
                         permission_replay_origin: outcome.permission_replay_origin.as_ref(),
                         result: &result,
                         task_progress_result,
+                        loop_result_checkpointed,
                         event_tx: ctx.event_tx,
                         metrics_collector: ctx.metrics_collector,
                         session_id: ctx.session_id,

@@ -170,6 +170,12 @@ fn resolve_catalog_with_activation(
     // round, because this list is rebuilt unfiltered every round; with no resolver
     // (SDK/tests) this is the frozen per-run snapshot (#44), unchanged.
     let (disabled_tools, _disabled_skill_ids) = config.resolve_disabled_filters();
+    // Self control is host-opt-in and uses ordinary authority filtering below.
+    if config.loop_control.is_none() {
+        tool_schemas.retain(|schema| {
+            schema.function.name != bamboo_tools::tools::loop_control::LOOP_CONTROL_TOOL_NAME
+        });
+    }
     // The `update_goal` self-report tool is only meaningful while the autonomous
     // goal loop is active; hide it from every ordinary session so it never
     // tempts the model when no goal is set.
