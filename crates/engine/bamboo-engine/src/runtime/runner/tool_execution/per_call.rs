@@ -2719,6 +2719,7 @@ mod hook_tests {
             "Task",
             "session_control",
             "session_history",
+            "loop_control",
             "work_dispatch",
             "exec_command",
             "write_stdin",
