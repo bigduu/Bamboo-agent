@@ -37,6 +37,7 @@ enum Script {
     CancelledUpdate,
     RetiredGeneration,
     DisabledStart,
+    PublicDirect,
 }
 
 struct Observation {
@@ -82,6 +83,9 @@ impl ScriptedProvider {
             (Script::TwoIterations, 1) => start_call(2, 6),
             (Script::TwoIterations, 2) => LLMChunk::Token("First objective answer.".into()),
             (Script::TwoIterations, 3) => LLMChunk::Token("Second iteration answer.".into()),
+            (Script::PublicDirect, 1) => start_call(2, 4),
+            (Script::PublicDirect, 2) => LLMChunk::Token("Public first iteration answer.".into()),
+            (Script::PublicDirect, 3) => LLMChunk::Token("Public second iteration answer.".into()),
             (Script::UpdateObjective, 1) => start_call(2, 8),
             (Script::UpdateObjective, 2) => control_call("inspect", json!({"action":"status"})),
             (Script::UpdateObjective, 3) => {
@@ -1090,4 +1094,356 @@ async fn self_control_real_runner_user_cancel_dominates_checkpoint_error_before_
         );
         fixture.close().await;
     }
+}
+
+struct PublicEntryPersistence {
+    inner: Arc<dyn RuntimeSessionPersistence>,
+    saves: AtomicUsize,
+    checkpoints: AtomicUsize,
+}
+
+#[async_trait]
+impl RuntimeSessionPersistence for PublicEntryPersistence {
+    async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.saves.fetch_add(1, Ordering::SeqCst);
+        self.inner.save_runtime_session(session).await
+    }
+
+    async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.checkpoints.fetch_add(1, Ordering::SeqCst);
+        self.inner.checkpoint_runtime_session(session).await
+    }
+
+    async fn load_runtime_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+        self.inner.load_runtime_session(id).await
+    }
+
+    async fn load_runtime_admission_snapshot(&self, id: &str) -> std::io::Result<Option<Session>> {
+        self.inner.load_runtime_admission_snapshot(id).await
+    }
+}
+
+struct PublicEntryHook {
+    point: bamboo_domain::AgentHookPoint,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl bamboo_agent_core::AgentHook for PublicEntryHook {
+    fn point(&self) -> bamboo_domain::AgentHookPoint {
+        self.point
+    }
+
+    async fn run(
+        &self,
+        _: bamboo_domain::AgentHookPoint,
+        _: &bamboo_domain::HookPayload,
+        _: &Session,
+    ) -> bamboo_domain::HookResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        bamboo_domain::HookResult::Continue
+    }
+}
+
+struct PublicEntryFixture {
+    dir: tempfile::TempDir,
+    session: Session,
+    agent: Arc<crate::runtime::Agent>,
+    provider: Arc<ScriptedProvider>,
+    router: Arc<SessionActivationRouter>,
+    storage: Arc<dyn Storage>,
+    persistence: Arc<PublicEntryPersistence>,
+    hook_calls: Arc<AtomicUsize>,
+}
+
+impl PublicEntryFixture {
+    async fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let workspace = dir.path().join("workspace");
+        tokio::fs::create_dir_all(&config_dir).await.unwrap();
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        let mut config = bamboo_llm::Config::from_data_dir_without_env(Some(config_dir));
+        *config.memory_mut() = Some(bamboo_config::MemoryConfig {
+            project_prompt_injection: false,
+            relevant_recall: false,
+            relevant_recall_rerank: false,
+            project_first_dream: false,
+            ledger_agenda_injection: false,
+            auto_dream_enabled: false,
+            ledger_gardener_enabled: false,
+            ledger_distillation_enabled: false,
+            gardener_enabled: false,
+            dedup_gardener_enabled: false,
+            granularity_freshness_gardener_enabled: false,
+            ..Default::default()
+        });
+        config.features.dynamic_model_routing = false;
+        config.features.final_evidence_check = false;
+        let flags = PromptMemoryFlags::from(config.memory().as_ref().unwrap());
+        assert!(
+            !flags.project_prompt_injection
+                && !flags.relevant_recall
+                && !flags.relevant_recall_rerank
+                && !flags.project_first_dream
+                && !flags.ledger_agenda
+        );
+        let mut session = Session::new(SESSION_ID, "synthetic-only");
+        session.add_message(Message::system(ORIGINAL_CONTEXT));
+        session.add_message(Message::assistant(ORIGINAL_FACT, None));
+        session.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(dir.path().join("sessions"))
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = store.clone();
+        storage.save_session(&session).await.unwrap();
+        let persistence = Arc::new(PublicEntryPersistence {
+            inner: Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone())),
+            saves: AtomicUsize::new(0),
+            checkpoints: AtomicUsize::new(0),
+        });
+        let provider = Arc::new(ScriptedProvider::new(Script::PublicDirect, storage.clone()));
+        let router = SessionActivationRouter::new();
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hook_runner = crate::runtime::HookRunner::new();
+        for point in [
+            bamboo_domain::AgentHookPoint::BeforeSessionSetup,
+            bamboo_domain::AgentHookPoint::BeforeRound,
+            bamboo_domain::AgentHookPoint::AfterSessionEnd,
+        ] {
+            hook_runner.register(Arc::new(PublicEntryHook {
+                point,
+                calls: hook_calls.clone(),
+            }));
+        }
+        let agent = crate::runtime::Agent::builder()
+            .storage(storage.clone())
+            .persistence(persistence.clone())
+            .attachment_reader(store)
+            .skill_manager(Arc::new(bamboo_skills::SkillManager::with_config(
+                bamboo_skills::SkillStoreConfig {
+                    skills_dir: dir.path().join("skills"),
+                    project_dir: Some(workspace),
+                    active_mode: None,
+                },
+            )))
+            .metrics_collector(bamboo_metrics::MetricsCollector::spawn(
+                Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+                    dir.path().join("metrics.db"),
+                )),
+                7,
+            ))
+            .config(Arc::new(tokio::sync::RwLock::new(config)))
+            .activation_router(router.clone())
+            .provider(provider.clone())
+            .memory_store(bamboo_memory::memory_store::MemoryStore::new(
+                dir.path().join("jiandu"),
+            ))
+            .default_tools(Arc::new(bamboo_tools::BuiltinToolExecutor::new()))
+            .hook_runner(Arc::new(hook_runner))
+            .build()
+            .unwrap();
+        Self {
+            dir,
+            session,
+            agent: Arc::new(agent),
+            provider,
+            router,
+            storage,
+            persistence,
+            hook_calls,
+        }
+    }
+
+    fn request(&self, tx: mpsc::Sender<AgentEvent>) -> crate::runtime::ExecuteRequest {
+        crate::runtime::ExecuteRequestBuilder::new(INITIAL_PROMPT, tx, CancellationToken::new())
+            .model("synthetic-only")
+            .app_data_dir(self.dir.path().join("app"))
+            .run_budget(bamboo_config::RunBudgetConfig {
+                max_rounds: Some(4),
+                ..Default::default()
+            })
+            .loop_control(LoopControlConfig::new(2, 6))
+            .build()
+    }
+
+    async fn execute_direct(&mut self) -> (Result<(), AgentError>, Vec<AgentEvent>) {
+        let (tx, mut rx) = mpsc::channel(512);
+        let request = self.request(tx);
+        let agent = self.agent.clone();
+        let storage = self.storage.clone();
+        let run = agent.execute_direct(&mut self.session, request);
+        tokio::pin!(run);
+        let mut events = Vec::new();
+        let result = loop {
+            tokio::select! {
+                result = &mut run => break result,
+                event = rx.recv() => {
+                    if let Some(event) = event {
+                        Fixture::observe_event(storage.as_ref(), &event).await;
+                        events.push(event);
+                    }
+                }
+            }
+        };
+        while let Ok(event) = rx.try_recv() {
+            Fixture::observe_event(storage.as_ref(), &event).await;
+            events.push(event);
+        }
+        (result, events)
+    }
+}
+
+#[tokio::test]
+async fn self_control_public_agent_direct_binds_lease_and_forwards_builder_and_budget() {
+    let mut fixture = PublicEntryFixture::new().await;
+    let (result, events) = fixture.execute_direct().await;
+    result.unwrap();
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(fixture.provider.peak.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.provider.active.load(Ordering::SeqCst), 0);
+    assert!(fixture.hook_calls.load(Ordering::SeqCst) > 0);
+    assert!(fixture.persistence.checkpoints.load(Ordering::SeqCst) > 0);
+    assert!(fixture.persistence.saves.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Complete { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event,
+        AgentEvent::ToolComplete { tool_call_id, .. } if tool_call_id == "start"))
+            .count(),
+        1
+    );
+    let state = read_loop_state(&fixture.session).unwrap().unwrap();
+    assert_eq!(state.status, LoopStatus::Completed);
+    assert_eq!(
+        (
+            state.iterations_started,
+            state.iterations_completed,
+            state.rounds_started
+        ),
+        (2, 2, 3)
+    );
+    assert_eq!(
+        (state.max_iterations, state.max_total_rounds),
+        (2, 4),
+        "the request's round ceiling tightens the host's six-round authority"
+    );
+    assert_eq!(
+        state.owner_execution_id,
+        fixture
+            .session
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .execution_id
+            .as_deref()
+            .unwrap()
+    );
+    assert_eq!(
+        admitted_objectives(&fixture.session.messages),
+        vec![(FIRST_OBJECTIVE, 1), (FIRST_OBJECTIVE, 1)]
+    );
+    let receipt: LoopControlReceipt =
+        serde_json::from_value(paired_result(&fixture.session.messages, "start")).unwrap();
+    assert_eq!(receipt.effective_iteration, Some(1));
+    assert!(!receipt.applied);
+    let durable = fixture
+        .storage
+        .load_session(SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read_loop_state(&durable).unwrap(), Some(state));
+    assert_eq!(
+        paired_result(&durable.messages, "start"),
+        serde_json::to_value(receipt).unwrap()
+    );
+    assert!(
+        fixture.router.current_run_id(SESSION_ID).await.is_none(),
+        "direct lifecycle must release its exact owner"
+    );
+    let seen = fixture.provider.seen.lock().unwrap();
+    assert!(admitted_objectives(&seen[0].messages).is_empty());
+    assert_eq!(
+        admitted_objectives(&seen[1].messages),
+        vec![(FIRST_OBJECTIVE, 1)]
+    );
+    for observation in seen.iter() {
+        assert!(observation
+            .messages
+            .iter()
+            .any(|message| message.content == ORIGINAL_FACT));
+        assert!(!observation.messages.iter().any(|message| message
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("runtime_kind"))
+            .and_then(Value::as_str)
+            == Some("max_rounds_summary")));
+    }
+}
+
+#[tokio::test]
+async fn self_control_public_agent_raw_execute_refuses_unbound_capability_before_effects() {
+    let mut fixture = PublicEntryFixture::new().await;
+    // Another real owner is deliberately present: its router registration is
+    // not an authority source for this raw, unbound request.
+    let registration = fixture
+        .router
+        .register_run(SESSION_ID, "unrelated-legitimate-owner")
+        .await
+        .unwrap();
+    let before = serde_json::to_value(&fixture.session).unwrap();
+    let durable_before = serde_json::to_value(
+        fixture
+            .storage
+            .load_session(SESSION_ID)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let (tx, mut rx) = mpsc::channel(512);
+    let request = fixture.request(tx);
+    let error = fixture
+        .agent
+        .execute(&mut fixture.session, request)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("activation owner"), "{error}");
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.hook_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.persistence.checkpoints.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.persistence.saves.load(Ordering::SeqCst), 0);
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        serde_json::to_value(&fixture.session).unwrap(),
+        before,
+        "raw refusal must precede prompt append and session mutation"
+    );
+    assert_eq!(
+        serde_json::to_value(
+            fixture
+                .storage
+                .load_session(SESSION_ID)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        durable_before
+    );
+    assert_eq!(
+        fixture.router.current_run_id(SESSION_ID).await.as_deref(),
+        Some("unrelated-legitimate-owner")
+    );
+    registration.abandon().await;
 }
