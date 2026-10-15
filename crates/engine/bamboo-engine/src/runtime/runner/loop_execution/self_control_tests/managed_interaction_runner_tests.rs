@@ -428,7 +428,9 @@ async fn assert_managed_interaction_continues(
         runtime.execution_id.as_deref(),
         Some(state.owner_execution_id.as_str())
     );
-    assert_eq!(runtime.round.current_round, expected_rounds as u32);
+    // Runtime exposes the last zero-based round index; the counted state
+    // above separately asserts the full consumed round count.
+    assert_eq!(runtime.round.current_round, expected_rounds as u32 - 1);
     let durable = fixture
         .storage
         .load_session(SESSION_ID)
