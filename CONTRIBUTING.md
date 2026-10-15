@@ -254,6 +254,31 @@ Existing path-scoped Windows/adapter checks retain their own triggers.
    40-character SHA, tree SHA, fresh branch-read receipt, and bounded release
    scope in the release PR. Create `release/<cut-SHA>` at that exact recorded SHA.
    Keep `dev` open for ongoing development after the cut.
+
+   A bounded exception allows an early cut for an accepted backend checkpoint
+   while a known pending frontend consumer awaits its immutable producer. All
+   required backend changes and release controls must already have normally
+   merged into protected `dev`. Use the same fresh actual-HEAD read and normal
+   branch creation above; an old checkpoint is not a substitute for that read.
+   At cut time, explicitly record the known pending consumer: its immutable
+   producer ref, source revision, version and existing acceptance evidence,
+   exact allowed consumer paths, remaining producer/consumer gates, and bounded
+   release scope. Do not describe this known dependency as an unexpected fix.
+
+   Keep one release owner and use an isolated release worktree. Other owners
+   may normally advance `dev` immediately after the branch and cut receipt exist;
+   they need not wait for the consumer or publication. After the producer's
+   accepted publication identity and complete artifact hashes are verified,
+   create the consumer's original head `F` from the frozen release. Apply the
+   full separate `F` release-source and `U` protected-dev integration procedure
+   in step 3, including exact-source review, Linux/macOS/Windows validation,
+   preserved ancestry and normal admission before fast-forwarding only to `F`.
+   Record the verified artifact hashes in `F`'s receipt. A pending or failed
+   producer/consumer gate blocks release promotion and publication, not ongoing
+   development. Never pull unrelated `dev` work into the release; a changed
+   producer identity or expanded consumer scope requires explicit scope review
+   through the normal process. This exception changes ordering only, not gates,
+   protection, publication authority or the `Promotion Source` contract.
 2. Open the release branch's PR into `main`. Freeze its scope: do not repeatedly
    merge the latest `dev` tip or unrelated features into the release to chase
    ongoing development. If a broader release is needed, explicitly choose and
