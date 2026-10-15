@@ -53,8 +53,10 @@ remains durable and restricted to that run; restart or a successor cannot
 silently retarget it. It cannot schedule a successor by itself.
 
 The actual started filesystem job retains the original peer authority and exact
-run through publication and notification even after caller cancellation. The
-existing generation reservation/format preparation may survive a rejected late
+run through publication and notification even after caller cancellation. Owner
+transitions wait on that target's fence; unrelated Sessions keep progressing.
+The global Router state lock covers only memory checks/updates, never disk I/O.
+The existing generation reservation/format preparation may survive a rejected late
 publication, as with other cancelled admission; it is not a message receipt.
 The existing strict zero-tool Child cold-continuation boundary is unchanged.
 

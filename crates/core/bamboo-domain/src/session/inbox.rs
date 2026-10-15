@@ -1896,7 +1896,9 @@ pub trait SessionActivationPort: Send + Sync {
     /// Called only from an already-owned blocking filesystem job. Retain the
     /// exact registered non-finalizing owner across the synchronous publication
     /// boundary. Implementations must not emulate this with a read-then-act.
-    /// The guard must not be held across an async wait or re-enter this router.
+    /// Fence only this target: never retain a runtime-global state lock over
+    /// filesystem I/O. The guard must not be held across an async wait or
+    /// re-enter this router. Notification runs in the same blocking job.
     fn retain_expected_run_blocking(
         &self,
         _target_session_id: &str,

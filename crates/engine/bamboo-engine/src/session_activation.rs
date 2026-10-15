@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
 
 use async_trait::async_trait;
 use bamboo_domain::{
@@ -416,7 +416,8 @@ struct ExpectedRunDeliveryGuard {
     target_session_id: String,
     session_created_at: DateTime<Utc>,
     run_id: String,
-    states: StdMutex<tokio::sync::OwnedMutexGuard<HashMap<String, TargetActivationState>>>,
+    states: Arc<Mutex<HashMap<String, TargetActivationState>>>,
+    _publication: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl bamboo_domain::SessionRunDeliveryGuard for ExpectedRunDeliveryGuard {
@@ -432,10 +433,9 @@ impl bamboo_domain::SessionRunDeliveryGuard for ExpectedRunDeliveryGuard {
     }
 
     fn notify_committed_delivery(&self, inbox_generation: u64) -> bool {
-        let mut states = self
-            .states
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The blocking publication job already holds this target's fence.
+        // Take the global map only for its short notification update.
+        let mut states = self.states.blocking_lock();
         let Some(state) = states.get_mut(&self.target_session_id) else {
             return false;
         };
@@ -465,11 +465,16 @@ impl bamboo_domain::SessionRunDeliveryGuard for ExpectedRunDeliveryGuard {
 #[derive(Clone, Default)]
 pub struct SessionActivationRouter {
     states: Arc<Mutex<HashMap<String, TargetActivationState>>>,
+    /// Live operations for one logical target share a fence. Weak entries are
+    /// pruned on access; idle/deleted targets retain no separate lock state.
+    publication_fences: TargetPublicationFences,
     spawner: Arc<RwLock<Option<Arc<dyn SessionActivationSpawner>>>>,
     inbox: Arc<StdRwLock<Option<Arc<dyn SessionInboxPort>>>>,
     #[cfg(test)]
     terminal_inspection_pause: Arc<Mutex<Option<TerminalInspectionPause>>>,
 }
+
+type TargetPublicationFences = Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>;
 
 #[cfg(test)]
 type TerminalInspectionPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
@@ -688,6 +693,26 @@ impl Drop for SessionRunRegistration {
 }
 
 impl SessionActivationRouter {
+    fn publication_fence(&self, target: &str) -> Arc<Mutex<()>> {
+        let mut fences = self
+            .publication_fences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fences.retain(|_, fence| fence.strong_count() > 0);
+        if let Some(fence) = fences.get(target).and_then(Weak::upgrade) {
+            return fence;
+        }
+        let fence = Arc::new(Mutex::new(()));
+        fences.insert(target.into(), Arc::downgrade(&fence));
+        fence
+    }
+
+    async fn lock_publication(&self, target: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        // Always acquire this target before the map. Never await a target
+        // publication while holding the runtime-wide states mutex.
+        self.publication_fence(target).lock_owned().await
+    }
+
     async fn coordinator_generation(&self, target: &str) -> Result<u64, SessionActivationError> {
         let inbox = self
             .inbox
@@ -945,6 +970,7 @@ impl SessionActivationRouter {
         target_session_id: &str,
         run_id: &str,
     ) {
+        let _publication = self.lock_publication(target_session_id).await;
         let mut states = self.states.lock().await;
         states
             .entry(target_session_id.to_string())
@@ -989,6 +1015,7 @@ impl SessionActivationRouter {
         if !ownership.matches_router(self) || ownership.target_session_id != session.id {
             return false;
         }
+        let _publication = self.lock_publication(&session.id).await;
         let mut states = self.states.lock().await;
         let Some(owner) = states
             .get_mut(&session.id)
@@ -1017,6 +1044,7 @@ impl SessionActivationRouter {
     ) -> Result<SessionRunRegistration, SessionRunRegistrationError> {
         loop {
             let (notifications, reservation_wait) = {
+                let _publication = self.lock_publication(target_session_id).await;
                 let mut states = self.states.lock().await;
                 let state = states.entry(target_session_id.to_string()).or_default();
                 match state.owner.as_mut() {
@@ -1146,6 +1174,7 @@ impl SessionActivationRouter {
     /// `latest_generation` and handed to one successor by
     /// [`finish_finalization`](Self::finish_finalization).
     pub async fn begin_finalization(&self, target_session_id: &str, run_id: &str) {
+        let _publication = self.lock_publication(target_session_id).await;
         let mut states = self.states.lock().await;
         let state = states.entry(target_session_id.to_string()).or_default();
         match state.owner.as_mut() {
@@ -1173,6 +1202,7 @@ impl SessionActivationRouter {
         run_id: &str,
         wakes: &watch::Receiver<u64>,
     ) -> bool {
+        let _publication = self.lock_publication(target_session_id).await;
         let mut states = self.states.lock().await;
         let Some(state) = states.get_mut(target_session_id) else {
             return true;
@@ -1214,6 +1244,7 @@ impl SessionActivationRouter {
             }
         }
         {
+            let _publication = self.lock_publication(target_session_id).await;
             let mut states = self.states.lock().await;
             let Some(state) = states.get_mut(target_session_id) else {
                 return;
@@ -1260,6 +1291,7 @@ impl SessionActivationRouter {
         #[cfg(test)]
         self.pause_after_terminal_inspection().await;
         let (reservation_to_dispatch, previous_high) = {
+            let _publication = self.lock_publication(target_session_id).await;
             let mut states = self.states.lock().await;
             let Some(state) = states.get_mut(target_session_id) else {
                 return;
@@ -1346,6 +1378,7 @@ impl SessionActivationRouter {
         #[cfg(test)]
         self.pause_after_terminal_inspection().await;
         let (reservation_to_dispatch, previous_high) = {
+            let _publication = self.lock_publication(target_session_id).await;
             let mut states = self.states.lock().await;
             let state = states.entry(target_session_id.to_string()).or_default();
             let previous_high = state.last_dispatched_generation;
@@ -1534,6 +1567,7 @@ impl SessionActivationRouter {
             Ok(SessionActivationReserveOutcome::Reserved(launch)) => {
                 let run_id = launch.run_id.clone();
                 {
+                    let _publication = self.lock_publication(target_session_id).await;
                     let mut states = self.states.lock().await;
                     let state = states.entry(target_session_id.to_string()).or_default();
                     if !release_activation_token(state, reservation_token) {
@@ -1576,6 +1610,7 @@ impl SessionActivationRouter {
                 Ok(SessionActivationDisposition::ActivationReserved)
             }
             Ok(SessionActivationReserveOutcome::AlreadyRunning { run_id }) => {
+                let _publication = self.lock_publication(target_session_id).await;
                 let mut states = self.states.lock().await;
                 let state = states.entry(target_session_id.to_string()).or_default();
                 if !release_activation_token(state, reservation_token) {
@@ -1609,6 +1644,7 @@ impl SessionActivationRouter {
                 Ok(SessionActivationDisposition::ActivationCoalesced)
             }
             Ok(SessionActivationReserveOutcome::NotFound) => {
+                let _publication = self.lock_publication(target_session_id).await;
                 let mut states = self.states.lock().await;
                 if states
                     .get(target_session_id)
@@ -1643,7 +1679,12 @@ impl SessionActivationPort for SessionActivationRouter {
     ) -> Result<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>, bamboo_domain::SessionRunConflict>
     {
         use bamboo_domain::{SessionRunConflict, SessionRunConflictReason};
-        let states = self.states.clone().blocking_lock_owned();
+        // Only this target is retained through disk publication. Every owner
+        // installation/release/finalization takes the same target fence first.
+        let publication = self
+            .publication_fence(target_session_id)
+            .blocking_lock_owned();
+        let states = self.states.blocking_lock();
         let owner = states
             .get(target_session_id)
             .and_then(|state| state.owner.as_ref());
@@ -1681,7 +1722,8 @@ impl SessionActivationPort for SessionActivationRouter {
             target_session_id: target_session_id.into(),
             session_created_at: target_created_at,
             run_id: expected_run_id.into(),
-            states: StdMutex::new(states),
+            states: self.states.clone(),
+            _publication: publication,
         }))
     }
 
@@ -4002,7 +4044,12 @@ mod tests {
         let guard = retain(router.clone(), birth, "run-a").await.unwrap();
         assert!(guard.matches("target", birth, "run-a"));
         assert!(!guard.matches("other-target", birth, "run-a"));
-        assert!(guard.notify_committed_delivery(7));
+        let notify = guard.clone();
+        assert!(
+            tokio::task::spawn_blocking(move || notify.notify_committed_delivery(7))
+                .await
+                .unwrap()
+        );
         let mut finalizing = Box::pin(router.begin_finalization("target", "run-a"));
         assert!(futures::poll!(finalizing.as_mut()).is_pending());
         drop(guard);
