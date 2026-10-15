@@ -45,7 +45,7 @@ fn request_tool_schemas_for_loading_mode<'a>(
     mode: bamboo_domain::CapabilityLoadingMode,
     required_tool: Option<&str>,
 ) -> Cow<'a, [ToolSchema]> {
-    if session.root_orchestration_only_enabled() {
+    if session.model_orchestration_only_enabled() {
         // The full bounded catalog is already selected for this Root. A
         // provider-specific discovery gateway must not reintroduce an
         // unapproved tenth tool after that selection.
@@ -407,6 +407,45 @@ mod tests {
                 description: format!("{name} description"),
                 parameters: json!({"type":"object","properties":{}}),
             },
+        }
+    }
+
+    #[test]
+    fn supervisor_delegation_first_provider_projection_never_reintroduces_discovery_or_execution() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        let schemas = [
+            "Read",
+            "SubAgent",
+            "session_control",
+            "session_history",
+            "browser",
+            "exec_command",
+            "discover_capabilities",
+        ]
+        .into_iter()
+        .map(schema)
+        .collect::<Vec<_>>();
+        for ultra in [false, true] {
+            supervisor.set_root_orchestration_only(ultra).unwrap();
+            for mode in [
+                CapabilityLoadingMode::LegacyFullCatalog,
+                CapabilityLoadingMode::StickyFallback,
+                CapabilityLoadingMode::Progressive,
+            ] {
+                let offered =
+                    request_tool_schemas_for_loading_mode(&supervisor, &schemas, mode, None);
+                assert_eq!(
+                    offered
+                        .iter()
+                        .map(|s| s.function.name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["Read", "SubAgent", "session_control", "session_history"]
+                );
+            }
         }
     }
 

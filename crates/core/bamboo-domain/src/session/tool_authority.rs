@@ -156,9 +156,16 @@ impl Session {
         Ok(())
     }
 
+    /// Derived model posture, not a persisted selection or permission grant.
+    /// A trusted Supervisor orchestrates in both thinking modes. Children and
+    /// ordinary Roots retain their own independent mode and permissions.
+    pub fn model_orchestration_only_enabled(&self) -> bool {
+        self.root_orchestration_only_enabled() || self.supervisor_incarnation_id().is_some()
+    }
+
     /// Defense in depth at both catalog projection and final dispatch.
     pub fn allows_model_tool_execution(&self, execution_name: &str) -> bool {
-        !self.root_orchestration_only_enabled()
+        !self.model_orchestration_only_enabled()
             || orchestration_only_allows_execution_name_for_supervisor(
                 execution_name,
                 self.supervisor_incarnation_id().is_some(),
@@ -234,12 +241,31 @@ mod tests {
             supervisor.set_root_orchestration_only(ultra).unwrap();
             let restored: Session =
                 serde_json::from_value(serde_json::to_value(&supervisor).unwrap()).unwrap();
-            for name in ROOT_ORCHESTRATION_TOOLS.into_iter().chain(SUPERVISOR_ORCHESTRATION_TOOLS) {
-                assert!(restored.allows_model_tool_execution(name), "{ultra}: {name}");
+            for name in ROOT_ORCHESTRATION_TOOLS
+                .into_iter()
+                .chain(SUPERVISOR_ORCHESTRATION_TOOLS)
+            {
+                assert!(
+                    restored.allows_model_tool_execution(name),
+                    "{ultra}: {name}"
+                );
             }
-            for name in ["exec_command", "write_stdin", "Bash", "Edit", "Write", "apply_patch",
-                "load_skill", "workflow_run", "mcp__vendor__read", "default::Read"] {
-                assert!(!restored.allows_model_tool_execution(name), "Supervisor {ultra}: {name}");
+            for name in [
+                "exec_command",
+                "write_stdin",
+                "Bash",
+                "Edit",
+                "Write",
+                "apply_patch",
+                "load_skill",
+                "workflow_run",
+                "mcp__vendor__read",
+                "default::Read",
+            ] {
+                assert!(
+                    !restored.allows_model_tool_execution(name),
+                    "Supervisor {ultra}: {name}"
+                );
             }
             let child = Session::new_child_of("worker", &restored, "model", "worker");
             assert!(child.authority_identity.is_ordinary());

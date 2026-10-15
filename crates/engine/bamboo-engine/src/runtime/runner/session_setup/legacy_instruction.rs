@@ -37,6 +37,11 @@ pub(crate) async fn prepare_context(
     debug_logger: &DebugLogger,
     must_resume_pinned_activation: bool,
 ) -> super::super::Result<String> {
+    if session.supervisor_incarnation_id().is_some() {
+        session.validate_root_orchestration_compatibility()
+            .map_err(|error| AgentError::Tool(format!("Supervisor delegation blocker: {error}; clear the incompatible selection and delegate execution to an authorized worker")))?;
+        return Ok(String::new());
+    }
     if config.sdk_skill_execution_host.is_some() || sdk_runtime_active() {
         return Ok(String::new());
     }
@@ -566,6 +571,51 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    #[tokio::test]
+    async fn supervisor_delegation_first_skips_legacy_workflow_activation_and_reports_incompatible_selection(
+    ) {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for ultra in [false, true] {
+            let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+            supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+                incarnation_id: uuid::Uuid::new_v4(),
+            };
+            supervisor.set_root_orchestration_only(ultra).unwrap();
+            let config = AgentLoopConfig::default();
+            let logger = DebugLogger::new(false);
+            let before = serde_json::to_value(&supervisor).unwrap();
+            let context = prepare_context(
+                &mut supervisor,
+                "implement now",
+                &config,
+                DEFAULT_SUPERVISOR_SESSION_ID,
+                &logger,
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(context.is_empty());
+            assert_eq!(serde_json::to_value(&supervisor).unwrap(), before);
+            supervisor.metadata.insert(
+                "selected_skill_ids".into(),
+                "[\"implementation-workflow\"]".into(),
+            );
+            let before = serde_json::to_value(&supervisor).unwrap();
+            let error = prepare_context(
+                &mut supervisor,
+                "implement now",
+                &config,
+                DEFAULT_SUPERVISOR_SESSION_ID,
+                &logger,
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("Supervisor delegation blocker"));
+            assert_eq!(serde_json::to_value(&supervisor).unwrap(), before);
+        }
+    }
 
     struct Repository {
         latest: Option<Session>,

@@ -66,7 +66,22 @@ Verify child evidence, resolve conflicting results, and report completed work, r
 
 const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode: increase task-wide reasoning through independent child planning and narrow delegated execution, followed by Root verification and synthesis. Use the existing read-only Plan for planning. Keep required user goals, constraints and acceptance criteria intact. This product policy is independent of each model call's reasoning effort; it does not claim a native provider Ultra budget.";
 
+const SUPERVISOR_DELEGATION_GUIDANCE: &str = "Supervisor delegation-first policy (trusted runtime identity; applies in Standard and Ultra):\n\
+Own task boundaries, planning, dispatch, progress, coordination, verification and the final synthesis. Delegate execution, including simple implementation tasks, to an authorized worker. Perform only necessary read-only information gathering here, using the dedicated Read/Grep/Glob/GetFileInfo/ViewImage and scoped history tools. A shell command, executable, Skill, Workflow or external tool is not a read-only shortcut.\n\
+Use a bounded SubAgent assignment for a direct child, or work_dispatch within the existing Work authority. Continue or correct the same child by its returned ActorId. Use session_control only for an explicitly attached independent Root whose current scope authorizes the followup; never discover or attach unrelated Sessions. Inspect authoritative progress and verify result evidence before claiming completion; an admitted dispatch is not completed work.\n\
+Use the read-only Plan child when planning is needed; do not delegate the entire Supervisor role. Give implementation workers concrete acceptance and non-goals. Children do not inherit this Supervisor policy; nested delegation requires explicit assignment authorization and necessity.\n\
+If a worker or tool is unavailable, an assignment fails, or scope is denied, report a recoverable blocker with the actual reason and the specific owner/configuration/authorization step needed to continue. Reuse an existing assignment where possible. Do not silently execute it here, create repeated overlapping assignments, retry unchanged failures indefinitely, change gates or permissions, auto-attach Sessions, or restore a broker/cluster. This role policy takes precedence over generic advice to handle simple tasks directly.";
+
 pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Option<ContextBlock> {
+    if session.supervisor_incarnation_id().is_some() {
+        return Some(ContextBlock::new(
+            ContextBlockType::RootOrchestration,
+            ContextBlockPriority::Critical,
+            ContextBlockStability::SessionStable,
+            "Supervisor Delegation Policy",
+            SUPERVISOR_DELEGATION_GUIDANCE,
+        ));
+    }
     (session.root_orchestration_prompt_enabled() || session.root_orchestration_only_enabled()).then(
         || {
             let guidance = if session.root_orchestration_only_enabled() {
@@ -83,6 +98,37 @@ pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Optio
             )
         },
     )
+}
+
+/// Catalog observation only: exposed routes do not prove worker readiness or
+/// target authorization. Real delegation errors remain authoritative.
+pub(crate) fn build_root_orchestration_context_block_for_tools(
+    session: &Session,
+    tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+) -> Option<ContextBlock> {
+    let mut block = build_root_orchestration_context_block(session)?;
+    if session.supervisor_incarnation_id().is_some() {
+        let routes = ["SubAgent", "work_dispatch", "session_control"]
+            .into_iter()
+            .filter(|name| {
+                tool_schemas
+                    .iter()
+                    .any(|schema| schema.function.name == *name)
+            })
+            .collect::<Vec<_>>();
+        let observation = if routes.is_empty() {
+            serde_json::json!({"status":"blocked","reason":"delegation_tools_unavailable",
+                "recovery":"Ask the owner to provide an authorized delegation route; do not perform the execution here."})
+        } else {
+            serde_json::json!({"status":"routes_exposed","routes":routes,
+                "caution":"Tool exposure is not worker readiness or target authorization. Report the actual admission error as a recoverable blocker."})
+        };
+        block.content.push_str(&format!(
+            "\n\nCurrent delegation route observation: {observation}"
+        ));
+        block.stability = ContextBlockStability::RoundDynamic;
+    }
+    Some(block)
 }
 
 #[cfg(test)]
@@ -149,8 +195,16 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
             serde_json::from_value(serde_json::to_value(&supervisor).unwrap()).unwrap();
         let block = build_root_orchestration_context_block(&restored)
             .expect("trusted Supervisor always receives its delegation contract");
-        for concept in ["Supervisor", "Delegate execution", "necessary read-only", "attached",
-            "unavailable", "blocker", "same child", "nested delegation"] {
+        for concept in [
+            "Supervisor",
+            "Delegate execution",
+            "necessary read-only",
+            "attached",
+            "unavailable",
+            "blocker",
+            "same child",
+            "nested delegation",
+        ] {
             assert!(block.content.contains(concept), "missing {concept}");
         }
         let child = Session::new_child_of("child", &restored, "model", "worker");
@@ -159,6 +213,45 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
     let mut ordinary = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
     ordinary.metadata.insert("role".into(), "supervisor".into());
     assert!(build_root_orchestration_context_block(&ordinary).is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn supervisor_delegation_first_reports_unavailable_routes_without_claiming_worker_readiness() {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    let schema = |name: &str| bamboo_agent_core::tools::ToolSchema {
+        schema_type: "function".into(),
+        function: bamboo_agent_core::tools::FunctionSchema {
+            name: name.into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type":"object"}),
+        },
+    };
+    for ultra in [false, true] {
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        let blocked = build_root_orchestration_context_block_for_tools(
+            &supervisor,
+            &[schema("Read"), schema("vendor::SubAgent")],
+        )
+        .unwrap();
+        assert_eq!(blocked.stability, ContextBlockStability::RoundDynamic);
+        assert!(blocked.content.contains("delegation_tools_unavailable"));
+        assert!(blocked.content.contains("Ask the owner"));
+        assert!(!supervisor.allows_model_tool_execution("exec_command"));
+        let exposed =
+            build_root_orchestration_context_block_for_tools(&supervisor, &[schema("SubAgent")])
+                .unwrap();
+        assert!(exposed.content.contains("routes_exposed"));
+        assert!(exposed
+            .content
+            .contains("not worker readiness or target authorization"));
+    }
+    let ordinary = Session::new("ordinary", "model");
+    assert!(build_root_orchestration_context_block_for_tools(&ordinary, &[]).is_none());
 }
 
 /// Build the single provider-visible Workspace block from authoritative

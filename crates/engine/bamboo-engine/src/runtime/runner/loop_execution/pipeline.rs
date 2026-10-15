@@ -640,7 +640,7 @@ async fn ensure_discovery_allowed(
     config: &AgentLoopConfig,
 ) -> Result<(), AgentError> {
     state_bridge::refresh_round_root_tool_authority(session, config.storage.as_ref()).await?;
-    if session.root_orchestration_only_enabled() {
+    if session.model_orchestration_only_enabled() {
         return Err(AgentError::Tool(
             "capability discovery is outside this Root's tool authority".into(),
         ));
@@ -4330,6 +4330,27 @@ fn heuristic_complexity(
     }
 
     TaskComplexity::Standard
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn supervisor_delegation_first_rejects_native_discovery_before_definitions_or_transcript() {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    for ultra in [false, true] {
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        let before = serde_json::to_value(&supervisor).unwrap();
+        let error = ensure_discovery_allowed(&mut supervisor, &AgentLoopConfig::default())
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("outside this Root's tool authority"));
+        assert_eq!(serde_json::to_value(&supervisor).unwrap(), before);
+    }
 }
 
 #[cfg(test)]
