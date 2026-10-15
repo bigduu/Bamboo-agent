@@ -961,3 +961,5 @@ async fn self_control_bound_only_tightening_cannot_strand_an_existing_pending_ob
 mod output_contract_tests;
 
 mod suspension_admission_tests;
+
+mod pending_rounds_tests;
