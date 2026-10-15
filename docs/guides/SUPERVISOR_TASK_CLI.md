@@ -142,12 +142,15 @@ tool results or approval parameters. Defaults omit all those contents.
 Use `submit --watch` for a new submission: it admits chat, connects SSE, then
 executes. An idle session's standalone `events` can immediately replay Complete
 and close, so opening it before submission cannot reserve a future observation.
-The watched flow prints an `execution_receipt` JSON record, skips cached events
-until that real run's ExecutionStarted is observed, then streams session events.
-Missing that start is an explicit error; a subsequent different ExecutionStarted
-ends observation with `session_generation_changed`. Untagged content still has
-session scope. Already-running Supervisor activation can have emitted text before
-subscription; watch promises no exclusive input/output ownership or replay.
+The watched flow prints an `execution_receipt` JSON record. For a newly started
+run it skips cached events until that real run's ExecutionStarted is observed;
+missing that start is an explicit error. An `already_running` Supervisor receipt
+instead starts session observation immediately because its earlier start is not
+replayed. A subsequent different ExecutionStarted ends observation with
+`session_generation_changed`. Untagged content still has session scope.
+Already-running Supervisor activation can have emitted text before subscription;
+watch promises no exclusive input/output ownership or complete replay. A session
+terminal is not proof that the newly admitted input completed.
 This is especially relevant to Supervisor, whose exact visible-output API is
 not implemented. Selected ordinary output can instead be polled.
 

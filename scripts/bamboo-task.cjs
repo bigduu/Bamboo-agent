@@ -239,7 +239,7 @@ async function submit(c, o, ctx) {
     const receipt = { ...ctx, execution_scope: o.supervisor ? 'session_activation' : 'selected_input', execution_status: run.status, event_scope: 'session' };
     if (!o.watch) return receipt;
     emit({ ok: true, ...receipt, record: 'execution_receipt' });
-    return { ...receipt, ...await events(c, observation, ctx, stream, run.run_id), phase: ctx.phase };
+    return { ...receipt, ...await events(c, observation, ctx, stream, run.run_id, run.status === 'started'), phase: ctx.phase };
   } finally { await stream?.body?.cancel().catch(() => {}); }
 }
 async function status(c, o, ctx) {
@@ -276,11 +276,13 @@ async function subscribe(c, o, ctx) {
   if (!r.headers.get('content-type')?.toLowerCase().startsWith('text/event-stream')) { await r.body?.cancel(); fail('expected_event_stream'); }
   return r;
 }
-async function events(c, o, ctx, response, expectedStart) {
+async function events(c, o, ctx, response, expectedRun, awaitStart = true) {
   const r = response || await subscribe(c, o, ctx);
   ctx.phase = 'events';
   const decoder = new TextDecoder('utf-8', { fatal: true });
-  let buffer = '', lines = [], frameBytes = 0, total = 0, count = 0, reason, started = !expectedStart;
+  // An already-running Supervisor's start predates subscription and is not
+  // replayed. Observe its session feed immediately; keep the successor fence.
+  let buffer = '', lines = [], frameBytes = 0, total = 0, count = 0, reason, started = !expectedRun || !awaitStart;
   const line = value => {
     frameBytes += Buffer.byteLength(value) + 1;
     if (frameBytes > MAX_FRAME) fail('event_frame_too_large');
@@ -291,9 +293,9 @@ async function events(c, o, ctx, response, expectedStart) {
     let event; try { event = JSON.parse(data); } catch { fail('invalid_event_json'); }
     if (!event || typeof event.type !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(event.type)) fail('invalid_event_envelope');
     if (!started) {
-      if (event.type !== 'execution_started' || event.run_id !== expectedStart || event.session_id !== o['session-id']) return;
+      if (event.type !== 'execution_started' || event.run_id !== expectedRun || event.session_id !== o['session-id']) return;
       started = true;
-    } else if (expectedStart && event.type === 'execution_started' && event.run_id !== expectedStart) { reason = 'session_generation_changed'; return; }
+    } else if (expectedRun && event.type === 'execution_started' && event.run_id !== expectedRun) { reason = 'session_generation_changed'; return; }
     const view = { ok: true, command: 'events', session_id: o['session-id'], event_scope: 'session', event: { type: event.type } };
     // Never infer run identity for untagged tokens, child events or terminals.
     if (event.run_id !== undefined) view.event.run_id = id(event.run_id, 6);

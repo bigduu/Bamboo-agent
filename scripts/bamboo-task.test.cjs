@@ -190,6 +190,29 @@ test('watched Supervisor admits then subscribes before execute, retaining short 
   assert.equal(last(r).stream_end, 'session_boundary');
 });
 
+for (const successor of [false, true]) test(`already-running Supervisor watch ${successor ? 'ends at a successor generation' : 'observes output without a replayed start'}`, async t => {
+  let observer;
+  const f = await fixture(t, (c, res) => {
+    if (c.path.endsWith('/events')) {
+      observer = res; res.writeHead(200, { 'Content-Type': 'text/event-stream' }); res.flushHeaders(); return true;
+    }
+    if (c.path.endsWith('/execute')) {
+      assert.ok(observer && !observer.destroyed);
+      observer.end(`data: {"type":"token","content":"ongoing session output"}\n\n${successor ? `data: {"type":"execution_started","session_id":"${SUP}","run_id":"successor"}\n\n` : ''}data: {"type":"complete"}\n\n`);
+      json(res, { session_id: SUP, run_id: 'existing-run', status: 'already_running' }); return true;
+    }
+  });
+  const r = await cli(f, ['submit', '--supervisor', '--prompt-file', f.prompt, '--watch', '--include-output']);
+  assert.equal(r.code, 0); assert.equal(r.lines[0].execution_status, 'already_running');
+  assert.equal(last(r).execution_scope, 'session_activation'); assert.equal(last(r).run_id, 'existing-run');
+  const seen = r.lines.filter(l => l.event);
+  assert.deepEqual(seen.map(l => l.event.type), successor ? ['token'] : ['token', 'complete']);
+  assert.equal(seen[0].event.content, 'ongoing session output'); assert.equal(seen[0].event.run_id, undefined);
+  assert.ok(seen.every(l => l.event_scope === 'session'));
+  assert.equal(last(r).stream_end, successor ? 'session_generation_changed' : 'session_boundary');
+  assert.ok(!posts(f).some(c => c.path.endsWith('/stop'))); privateSafe(r);
+});
+
 test('denied watch subscription leaves accepted chat visible and never executes', async t => {
   const f = await fixture(t, (c, res) => { if (c.path.endsWith('/events')) { apiError(res, 403); return true; } });
   const r = await cli(f, ['submit', '--supervisor', '--prompt-file', f.prompt, '--watch']);
