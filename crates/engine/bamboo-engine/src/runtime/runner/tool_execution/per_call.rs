@@ -955,8 +955,6 @@ pub(super) async fn apply_tool_execution_outcome(
         .map_err(AgentError::Tool)?;
         crate::runtime::runner::state_bridge::write_runtime_state(ctx.session, ctx.runtime_state);
         let read_only = ctx.runtime_state.plan_mode.is_some()
-            || ctx.runtime_state.effective_permission_mode()
-                == bamboo_domain::SessionPermissionMode::Plan
             || ctx.config.permission_mode == Some(bamboo_config::PermissionMode::Plan);
         outcome.result = Ok(crate::runtime::loop_control::apply_current(
             ctx.session,

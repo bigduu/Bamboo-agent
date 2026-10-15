@@ -265,7 +265,7 @@ fn managed_config(
             max_rounds: Some(rounds),
             ..Default::default()
         },
-        permission_mode: Some(bamboo_config::PermissionMode::Bypass),
+        permission_mode: Some(bamboo_config::PermissionMode::Default),
         storage: Some(storage.clone()),
         persistence: Some(Arc::new(bamboo_storage::LockedSessionStore::new(
             storage.clone(),
@@ -763,6 +763,7 @@ struct FailStartCheckpoint {
     inner: Arc<dyn RuntimeSessionPersistence>,
     commit_before_error: bool,
     fail_terminal_checkpoint: bool,
+    cancel_at_failure: Option<CancellationToken>,
     start_failed: AtomicBool,
     terminal_failed: AtomicBool,
 }
@@ -797,6 +798,9 @@ impl RuntimeSessionPersistence for FailStartCheckpoint {
         {
             if self.commit_before_error {
                 self.inner.checkpoint_runtime_session(session).await?;
+            }
+            if let Some(cancel) = self.cancel_at_failure.as_ref() {
+                cancel.cancel();
             }
             return Err(std::io::Error::other("synthetic start checkpoint failure"));
         }
@@ -850,6 +854,7 @@ async fn self_control_real_runner_start_checkpoint_fault_matrix_is_conservative(
                 inner: fixture.config.as_mut().unwrap().persistence.take().unwrap(),
                 commit_before_error,
                 fail_terminal_checkpoint,
+                cancel_at_failure: None,
                 start_failed: AtomicBool::new(false),
                 terminal_failed: AtomicBool::new(false),
             });
@@ -1011,4 +1016,78 @@ async fn self_control_real_runner_ultra_root_is_rejected_before_provider() {
     );
     assert!(read_loop_state(&fixture.session).unwrap().is_none());
     fixture.close().await;
+}
+
+#[tokio::test]
+async fn self_control_real_runner_user_cancel_dominates_checkpoint_error_before_and_after_commit() {
+    for commit_before_error in [false, true] {
+        let mut fixture = Fixture::new(2, 6).await;
+        let cancel = CancellationToken::new();
+        let fault = Arc::new(FailStartCheckpoint {
+            inner: fixture.config.as_mut().unwrap().persistence.take().unwrap(),
+            commit_before_error,
+            fail_terminal_checkpoint: false,
+            cancel_at_failure: Some(cancel.clone()),
+            start_failed: AtomicBool::new(false),
+            terminal_failed: AtomicBool::new(false),
+        });
+        fixture.config.as_mut().unwrap().persistence = Some(fault.clone());
+        let provider = Arc::new(ScriptedProvider::new(
+            Script::TwoIterations,
+            fixture.storage.clone(),
+        ));
+        let (result, events) = fixture.run(provider.clone(), cancel.clone()).await;
+        assert!(fault.start_failed.load(Ordering::SeqCst));
+        assert!(cancel.is_cancelled());
+        assert!(matches!(result, Err(AgentError::Cancelled)),
+            "user cancellation must dominate a checkpoint error, commit={commit_before_error}: {result:?}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.active.load(Ordering::SeqCst), 0);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolComplete { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Complete { .. })));
+        let state = read_loop_state(&fixture.session).unwrap().unwrap();
+        assert_eq!(state.status, LoopStatus::Cancelled);
+        assert_eq!(
+            (
+                state.iterations_started,
+                state.iterations_completed,
+                state.rounds_started
+            ),
+            (0, 0, 1)
+        );
+        let runtime = fixture.session.agent_runtime_state.as_ref().unwrap();
+        assert_eq!(runtime.status, bamboo_domain::AgentStatusState::Cancelled);
+        assert_eq!(
+            runtime.execution_id.as_deref(),
+            Some(state.owner_execution_id.as_str())
+        );
+        assert!(admitted_objectives(&fixture.session.messages).is_empty());
+        let receipt: LoopControlReceipt =
+            serde_json::from_value(paired_result(&fixture.session.messages, "start")).unwrap();
+        assert!(!receipt.applied);
+        fault
+            .save_runtime_session(&mut fixture.session)
+            .await
+            .unwrap();
+        let durable = fixture
+            .storage
+            .load_session(SESSION_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_loop_state(&durable).unwrap(), Some(state));
+        assert_eq!(
+            durable.agent_runtime_state,
+            fixture.session.agent_runtime_state
+        );
+        assert_eq!(
+            paired_result(&durable.messages, "start"),
+            serde_json::to_value(receipt).unwrap()
+        );
+        fixture.close().await;
+    }
 }

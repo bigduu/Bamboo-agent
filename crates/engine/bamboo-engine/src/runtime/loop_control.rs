@@ -312,7 +312,7 @@ fn operation_id(command: &LoopControlRequest) -> Option<&str> {
 
 fn fingerprint(command: &LoopControlRequest) -> String {
     let bytes = serde_json::to_vec(command).expect("typed command serializes");
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn control_revision(state: Option<&LoopState>) -> u64 {
@@ -659,7 +659,7 @@ async fn checkpoint_result(
         counted_loop::stage_state(&mut staged, state)?;
     }
     staged.add_message(Message::tool_result_with_status(
-        tool_call_id.into(),
+        tool_call_id,
         result.result.clone(),
         result.success,
     ));
@@ -669,14 +669,17 @@ async fn checkpoint_result(
     // The original error aborts the runner; its one known generation is Failed
     // (or Cancelled), never replayed or silently started a second time.
     *session = staged;
-    checkpoint?;
     if policy
         .execution
         .get()
         .is_some_and(|e| e.cancel.is_cancelled())
     {
+        if let Err(error) = &checkpoint {
+            tracing::warn!(%error, "loop control checkpoint failed during user cancellation");
+        }
         return Err(AgentError::Cancelled);
     }
+    checkpoint?;
     Ok(result)
 }
 
