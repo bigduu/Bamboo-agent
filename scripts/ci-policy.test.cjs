@@ -363,6 +363,10 @@ test("frozen promotion bootstrap is read-only and leaves merge-tree validation i
   assert.match(contributing, /Only if existing branch rules cannot preserve exact\n   `F` ancestry, or the necessary repair cannot stay within the recorded scope/u)
   assert.match(contributing, /this gate alone cannot\n   authorize `U` as the release target/u)
   assert.match(contributing, /Release source and version tags are immutable/u)
+  assert.match(contributing, /known pending frontend consumer awaits its immutable producer/u)
+  assert.match(contributing, /Do not describe this known dependency as an unexpected fix/u)
+  assert.match(contributing, /full separate `F` release-source and `U` protected-dev integration procedure/u)
+  assert.match(contributing, /This exception changes ordering only, not gates,\n   protection, publication authority or the `Promotion Source` contract/u)
   assert.match(readFileSync("AGENTS.md", "utf8"), /CONTRIBUTING\.md#release-process/u)
 })
 
@@ -540,6 +544,7 @@ assert counts == fixture.get("counts", {"release": 2, "dev": 2, "compare": 2}), 
     for (const [name, fixture] of [
       ["original F admitted through strict-compatible U excludes unrelated dev work", {}],
       ["original cut remains accepted after dev advances", { release: [cut, cut], env: { HEAD_SHA: cut } }],
+      ["recorded early cut remains valid while a known consumer F awaits admission and dev progresses", { release: [cut, cut], dev: [feature, feature], env: { HEAD_SHA: cut } }],
       ["later dev tip", { dev: [advanced, advanced] }],
       ["API origin cannot be changed by environment", { env: { GITHUB_API_URL: "https://invalid.example" } }],
       ["dev advances between metadata reads", { dev: [reviewed, advanced], counts: { release: 2, dev: 2, compare: 3 } }],
