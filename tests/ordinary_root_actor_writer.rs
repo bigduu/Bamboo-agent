@@ -194,6 +194,32 @@ impl Host {
         self.stopped = signal == "-STOP";
     }
 
+    async fn stop_clear_of_file_locks(
+        &mut self,
+        _locks: &[(PathBuf, bool)],
+        _on_blocked: impl FnMut(&[PathBuf]),
+    ) -> Result<usize, String> {
+        self.signal("-STOP");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = Command::new("ps")
+                    .args(["-o", "stat=", "-p", &self.child.id().to_string()])
+                    .output()
+                    .unwrap();
+                if String::from_utf8_lossy(&status.stdout)
+                    .trim()
+                    .starts_with('T')
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "fixture-owned Host did not stop within 2s".to_owned())?;
+        Ok(0)
+    }
+
     fn tail(&self) -> String {
         let text = std::fs::read_to_string(&self.log).unwrap_or_default();
         text.lines()
@@ -468,7 +494,14 @@ impl Fixture {
             .json(&json!({}))
             .send()
             .await
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!(
+                    "fixture execute request failed: {error:?}; Host {}; authority {:?}; requests {:?}",
+                    host.tail(),
+                    self.authority(),
+                    self.probe.requests.lock().unwrap()
+                )
+            });
         let status = response.status();
         let body: Value = response.json().await.unwrap();
         assert!(
@@ -640,6 +673,38 @@ async fn ordinary_root_execution_claims_and_finishes_its_production_actor() {
 }
 
 #[actix_web::test]
+async fn pause_boundary_rejects_a_real_conflicting_file_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let lock_path = temp.path().join("fixture-writer.lock");
+    let mut held = Some(std::fs::File::create(&lock_path).unwrap());
+    held.as_ref().unwrap().lock().unwrap();
+    let mut host = Host {
+        child: Command::new("sleep").arg("30").spawn().unwrap(),
+        base: String::new(),
+        log: temp.path().join("unused-host.log"),
+        stopped: false,
+    };
+    let rejected = host
+        .stop_clear_of_file_locks(&[(lock_path.clone(), false)], |blocked| {
+            assert_eq!(blocked, [lock_path.clone()]);
+            drop(held.take());
+        })
+        .await
+        .unwrap();
+    assert!(
+        rejected > 0 && held.is_none(),
+        "the pause must reject a conflicting physical writer before accepting STOP"
+    );
+    let replacement = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    replacement.try_lock().unwrap();
+    assert!(host.stopped);
+}
+
+#[actix_web::test]
 async fn surviving_root_writer_rejects_old_output_after_real_host_lease_reclaim() {
     let mut fixture = Fixture::new().await;
     let a = fixture.start_a().await;
@@ -651,24 +716,11 @@ async fn surviving_root_writer_rejects_old_output_after_real_host_lease_reclaim(
     .await;
     // The account feed stays open after the token stream's terminal event.
     let account = EventTap::open(&fixture.client, &fixture.a, "/stream").await;
-    fixture.a.signal("-STOP");
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let status = Command::new("ps")
-                .args(["-o", "stat=", "-p", &fixture.a.child.id().to_string()])
-                .output()
-                .unwrap();
-            if String::from_utf8_lossy(&status.stdout)
-                .trim()
-                .starts_with('T')
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("fixture-owned A is stopped, not exited or cancelled");
+    fixture
+        .a
+        .stop_clear_of_file_locks(&[], |_| {})
+        .await
+        .expect("fixture-owned A is stopped, not exited or cancelled");
     // Actual wall time and the persisted lease decide expiry. No future `now`,
     // shortened sidecar, A finish, or external A claim substitutes for it.
     tokio::time::timeout(WAIT, async {
