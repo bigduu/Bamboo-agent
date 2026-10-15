@@ -94,8 +94,17 @@ edit. The current iteration keeps its admitted objective through its remaining
 tool rounds and terminal answer. Only the next iteration admission installs the
 new text and objective revision. An older iteration's completion cannot count
 as completion of the new objective. A pending objective cannot be overwritten
-by another edit; stop can discard it. If bounds leave no future iteration or
-round, a new objective edit is rejected.
+by another objective edit; stop can discard it. Bound-only edits may still
+constrain iteration and round admission immediately while that objective is
+pending, but they cannot remove its required future iteration or round. Neither
+a new objective edit nor a bound-only edit retaining an existing pending
+objective is accepted without that future budget.
+
+A bound-only edit does not advance the aggregate `applied_revision` past an
+unapplied objective. Its immutable acceptance receipt retains `applied: false`
+and the next effective iteration; status advances the applied revision only
+when the next iteration admits that objective. Prior acceptance receipts remain
+unchanged after admission.
 
 Stop drains the already-admitted round/tool batch, then prevents the next
 provider admission. It does not cancel a tool that has already started. It

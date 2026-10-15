@@ -518,7 +518,7 @@ fn accept_command(
             if control.stop_requested {
                 return Err("stop_is_terminal");
             }
-            if control.pending_objective.is_some() {
+            if objective.is_some() && control.pending_objective.is_some() {
                 return Err("objective_update_pending");
             }
             let iterations = max_iterations.unwrap_or(state.max_iterations);
@@ -532,9 +532,10 @@ fn accept_command(
             {
                 return Err("bounds_may_only_tighten_without_reset");
             }
-            if objective
-                .as_ref()
-                .is_some_and(|text| *text != state.objective)
+            if (control.pending_objective.is_some()
+                || objective
+                    .as_ref()
+                    .is_some_and(|text| *text != state.objective))
                 && (iterations <= state.iterations_started || rounds <= state.rounds_started)
             {
                 return Err("no_budget_for_new_objective");
@@ -555,7 +556,7 @@ fn accept_command(
                         .filter(|r| *r < u64::MAX)
                         .ok_or("revision_exhausted")?,
                 });
-            } else if state.iterations_started > 0 {
+            } else if control.pending_objective.is_none() && state.iterations_started > 0 {
                 control.applied_revision = control.control_revision;
             }
             state
