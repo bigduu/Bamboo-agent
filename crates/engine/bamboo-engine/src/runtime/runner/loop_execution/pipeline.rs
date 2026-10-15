@@ -1248,6 +1248,11 @@ async fn maybe_suspend_for_orphaned_children(
     if active.is_empty() && !inherited_wait {
         return Ok(None);
     }
+    if crate::runtime::loop_control::suspension::active(config) {
+        return Err(AgentError::Tool(
+            "managed loop cannot establish an asynchronous child wait".into(),
+        ));
+    }
     active.sort();
     active.dedup();
 
@@ -2307,7 +2312,8 @@ async fn handle_no_tool_calls_with_native(
     // Stop path does NOT persist a message the resumed turn re-emits — preserving
     // the exact pre-#343 no-goal guardian behavior (the guardian ran before the
     // assistant message was appended).
-    let add_message_before_gold = config.goal_loop_active() || config.counted_loop.is_some();
+    let add_message_before_gold =
+        config.goal_loop_active() || config.effective_counted_loop().is_some();
     let mut deferred_assistant_message = Some(assistant_with_visible_identity(
         Message::assistant_with_reasoning(content, None, reasoning)
             .with_reasoning_signature(reasoning_signature),
@@ -2328,11 +2334,11 @@ async fn handle_no_tool_calls_with_native(
 
     // Counted repetition is a peer terminal gate inside this same owner. Gold
     // combinations are rejected at startup; no judge is added by this gate.
-    if config.counted_loop.is_some() && cancel_token.is_cancelled() {
+    if config.effective_counted_loop().is_some() && cancel_token.is_cancelled() {
         return Err(AgentError::Cancelled);
     }
     let counted_decision = crate::runtime::counted_loop::terminal(session, config).await?;
-    if config.counted_loop.is_some() && cancel_token.is_cancelled() {
+    if config.effective_counted_loop().is_some() && cancel_token.is_cancelled() {
         return Err(AgentError::Cancelled);
     }
     match counted_decision {
@@ -2599,7 +2605,7 @@ async fn handle_no_tool_calls_with_native(
     );
     // Counted publication belongs to the outer runner, after AfterRound,
     // normal finalization and the terminal LoopState checkpoint all succeed.
-    if config.counted_loop.is_none() {
+    if config.effective_counted_loop().is_none() {
         let _ = event_tx.send(AgentEvent::Complete { usage }).await;
     }
     record_no_tool_calls_round_completed(
@@ -2611,7 +2617,7 @@ async fn handle_no_tool_calls_with_native(
     );
     Ok(TurnOutcome {
         should_break: true,
-        sent_complete: config.counted_loop.is_none(),
+        sent_complete: config.effective_counted_loop().is_none(),
     })
 }
 
@@ -2845,7 +2851,7 @@ async fn handle_tool_calls_path(
                 "runtime.completion_reason".into(),
                 "ticket_question_yield".into(),
             );
-            if frame.config.counted_loop.is_none() {
+            if frame.config.effective_counted_loop().is_none() {
                 let _ = frame
                     .event_tx
                     .send(AgentEvent::Complete {
@@ -2859,7 +2865,7 @@ async fn handle_tool_calls_path(
         }
         return Ok(TurnOutcome {
             should_break: true,
-            sent_complete: ticket_question_yield && frame.config.counted_loop.is_none(),
+            sent_complete: ticket_question_yield && frame.config.effective_counted_loop().is_none(),
         });
     }
 
@@ -2962,7 +2968,7 @@ pub(super) async fn run_pipeline(
         boxed_pipeline_inner(session, event_tx, llm, tools, cancel_token, config, state).await;
     // Stop/budget checkpoint awaits can race Session cancellation. Until a
     // Complete was actually published, cancellation retains its error path.
-    let result = if config.counted_loop.is_some()
+    let result = if config.effective_counted_loop().is_some()
         && cancel_token.is_cancelled()
         && matches!(result, Ok(false))
     {
@@ -3050,7 +3056,7 @@ async fn run_pipeline_inner(
     );
 
     loop {
-        if config.counted_loop.is_some() && cancel_token.is_cancelled() {
+        if config.effective_counted_loop().is_some() && cancel_token.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
         // Startup has already admitted this run's input. A runtime-only wakeup
@@ -3132,7 +3138,7 @@ async fn run_pipeline_inner(
             turn_counter as usize,
         );
         state.runtime_state.round.last_round_id = Some(round_id.clone());
-        if config.counted_loop.is_some() {
+        if config.effective_counted_loop().is_some() {
             // A prelude may fail before normal round finalization mirrors this
             // snapshot. Keep the Session on this owned round so the outer
             // failure correction retains its exact run/round fence.
@@ -3685,6 +3691,14 @@ async fn run_pipeline_inner(
                 // session, suspend instead of completing so background output is not
                 // silently dropped. Independent of the children gate; runs only when
                 // children did not already suspend this pass.
+                if crate::runtime::loop_control::suspension::active(config)
+                    && !bamboo_tools::tools::bash_runtime::running_shells_for_session(&session.id).is_empty()
+                {
+                    terminal_error = Some(AgentError::Tool(
+                        "managed loop cannot establish an asynchronous shell wait".into(),
+                    ));
+                    break;
+                }
                 if let Some(suspend) =
                     maybe_suspend_for_outstanding_bash(session, config, &mut state.runtime_state)
                         .await
@@ -4196,7 +4210,7 @@ async fn run_pipeline_inner(
 
         // Counted loops have a hard total-round cap, including finalizer work.
         // Do not grant an additional model summary beyond either host bound.
-        if config.counted_loop.is_some()
+        if (config.effective_counted_loop().is_some() || config.loop_control.is_some())
             && check_run_budget_exceeded(&state.runtime_state.round, &config.run_budget).is_some()
         {
             crate::runtime::counted_loop::exhaust_budget(session, config).await?;
@@ -4285,7 +4299,9 @@ async fn run_pipeline_inner(
         // the instruction and emitting more tool calls). It can therefore never
         // recurse or extend the loop indefinitely.
         if let Some(max_rounds) = config.run_budget.max_rounds {
-            if config.counted_loop.is_some() && turn_counter >= max_rounds {
+            if (config.effective_counted_loop().is_some() || config.loop_control.is_some())
+                && turn_counter >= max_rounds
+            {
                 crate::runtime::counted_loop::exhaust_budget(session, config).await?;
                 break;
             }

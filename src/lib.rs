@@ -130,7 +130,8 @@ pub use bamboo_sdk::agent;
 pub use bamboo_sdk::{
     Agent, AgentBuilder, AgentHook, AgentHookPoint, CountedLoopConfig, HookPayload, HookResult,
     HookRunner, HookToolOutcome, LifecycleHookEvent, LifecycleHookTestOutput,
-    LifecycleScriptRunner, ScriptHook, SdkSkillInput, ShellCommandHook, ShellHookEvent,
+    LifecycleScriptRunner, LoopControlConfig, ScriptHook, SdkSkillInput, ShellCommandHook,
+    ShellHookEvent,
 };
 
 // Re-export the runtime config crate so consumers can reach config, paths,

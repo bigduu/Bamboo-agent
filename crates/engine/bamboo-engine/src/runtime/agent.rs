@@ -424,7 +424,42 @@ impl Agent {
         if let Some(counted) = req.counted_loop.as_mut() {
             counted.bind_owner(registration.ownership(), session);
         }
-        let result = self.execute_with_inputs(session, req, inputs).await;
+        if let Some(control) = req.loop_control.as_mut() {
+            control.bind_owner(registration.ownership(), session);
+        }
+        let result = if req.loop_control.is_some() {
+            bamboo_agent_core::tools::observe_tool_suspension(false, async {
+                let token = bamboo_agent_core::tools::capture_suspension_restriction().ok_or_else(
+                    || {
+                        bamboo_agent_core::AgentError::Tool(
+                            "direct loop_control execution is missing its host observation scope"
+                                .into(),
+                        )
+                    },
+                )?;
+                // Bind before the runtime is first polled, so cancellation of
+                // this observer still leaves Drop the same sticky host proof.
+                registration.bind_tool_suspension_observation(token);
+                self.execute_with_inputs(session, req, inputs).await
+            })
+            .await
+            .0
+        } else {
+            self.execute_with_inputs(session, req, inputs).await
+        };
+        if registration.observed_forbidden_running() {
+            // No stop receipt exists for this detached outcome, including when
+            // direct Root execution has no LocalTaskResources domain.
+            // Retain the exact owner before migration or ordinary finish can
+            // release it or dispatch a successor. Preserve the runtime error.
+            registration.quarantine().await;
+            return match result {
+                Err(error) => Err(error),
+                Ok(()) => Err(bamboo_agent_core::AgentError::Tool(
+                    "suspension_disabled: detached Running outcome; stop unconfirmed".into(),
+                )),
+            };
+        }
 
         // Freeze what this provider execution actually consumed. Compatibility
         // migration and concurrent deliveries below must remain newer work.

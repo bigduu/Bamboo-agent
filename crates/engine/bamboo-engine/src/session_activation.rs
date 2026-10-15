@@ -440,6 +440,9 @@ pub struct SessionRunRegistration {
     notifications: Option<watch::Receiver<u64>>,
     abort_cleanup: Option<AbortCleanup>,
     quarantine_on_drop: bool,
+    // The host binds the actual opaque scope before polling direct execution.
+    // It is not a Session/model field and cannot grant or weaken authority.
+    tool_suspension_observation: Option<bamboo_agent_core::tools::SuspensionRestriction>,
     selected_input_wakes: Option<watch::Receiver<u64>>,
     armed: bool,
 }
@@ -464,6 +467,19 @@ impl SessionRunOwnership {
 }
 
 impl SessionRunRegistration {
+    pub(crate) fn bind_tool_suspension_observation(
+        &mut self,
+        token: bamboo_agent_core::tools::SuspensionRestriction,
+    ) {
+        self.tool_suspension_observation = Some(token);
+    }
+
+    pub(crate) fn observed_forbidden_running(&self) -> bool {
+        self.tool_suspension_observation
+            .as_ref()
+            .is_some_and(|token| token.observation().forbidden_running_seen)
+    }
+
     pub(crate) fn ownership(&self) -> SessionRunOwnership {
         SessionRunOwnership {
             router: self.router.clone(),
@@ -610,7 +626,7 @@ impl Drop for SessionRunRegistration {
         let target_session_id = self.target_session_id.clone();
         let run_id = self.run_id.clone();
         let abort_cleanup = self.abort_cleanup.take();
-        let quarantine = self.quarantine_on_drop;
+        let quarantine = self.quarantine_on_drop || self.observed_forbidden_running();
         if self.selected_input_wakes.is_some() {
             drop(self.notifications.take());
         }
@@ -968,6 +984,7 @@ impl SessionActivationRouter {
                 notifications,
                 abort_cleanup: None,
                 quarantine_on_drop: false,
+                tool_suspension_observation: None,
                 selected_input_wakes: None,
                 armed: true,
             });
@@ -3781,6 +3798,196 @@ mod tests {
                     registration.begin_finalization().await;
                     assert_eq!(registration.finish(claim.generation).await.unwrap(), None);
                 }
+            }
+        }
+    }
+    mod tool_suspension_registration_tests {
+        use super::*;
+        use bamboo_agent_core::tools::{
+            capture_suspension_restriction, observe_tool_suspension, with_suspension_disabled,
+            AsyncWaitKind, RunningCompletion, RunningHandle, ToolOutcome, ToolResult,
+            ToolSuspensionObservation,
+        };
+
+        async fn bind_running_probe(
+            registration: &mut SessionRunRegistration,
+            deny: bool,
+            kills: Arc<AtomicUsize>,
+        ) -> ToolSuspensionObservation {
+            let (_, report) = observe_tool_suspension(false, async {
+                registration
+                    .bind_tool_suspension_observation(capture_suspension_restriction().unwrap());
+                let collapse = async move {
+                    ToolOutcome::Running(RunningHandle {
+                        tool_call_id: "registration-running-probe".into(),
+                        ack: ToolResult::text(true, "ordinary running ack"),
+                        completion: RunningCompletion::Detached,
+                        wait_kind: AsyncWaitKind::AsyncTools,
+                        kill: Box::new(move || {
+                            kills.fetch_add(1, Ordering::SeqCst);
+                        }),
+                    })
+                    .into_tool_result()
+                };
+                let result = if deny {
+                    with_suspension_disabled(collapse).await
+                } else {
+                    collapse.await
+                };
+                assert_eq!(result.success, !deny);
+            })
+            .await;
+            report
+        }
+
+        #[tokio::test]
+        async fn forbidden_observation_retains_exact_owner_after_drop_or_observer_cancel() {
+            for cancel_observer in [false, true] {
+                let router = SessionActivationRouter::new();
+                let spawner = spawner();
+                router.set_spawner(spawner.clone()).await;
+                let mut registration = router
+                    .register_run("session", "observed-running-owner")
+                    .await
+                    .unwrap();
+                let cleaned = Arc::new(AtomicUsize::new(0));
+                let clean_count = cleaned.clone();
+                registration.set_abort_cleanup(move || async move {
+                    clean_count.fetch_add(1, Ordering::SeqCst);
+                });
+                assert_eq!(
+                    router.request_activation("session", 7).await.unwrap(),
+                    SessionActivationDisposition::ActiveNotified
+                );
+                let kills = Arc::new(AtomicUsize::new(0));
+                let report = if cancel_observer {
+                    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                    let child_kills = kills.clone();
+                    let task = tokio::spawn(async move {
+                        observe_tool_suspension(false, async move {
+                            let report =
+                                bind_running_probe(&mut registration, true, child_kills).await;
+                            assert!(registration.observed_forbidden_running());
+                            let _ = ready_tx.send(report);
+                            std::future::pending::<()>().await;
+                            // Keep the registration owned across the pending
+                            // await; cancellation drops it with its real token.
+                            drop(registration);
+                        })
+                        .await;
+                    });
+                    let ready =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx).await;
+                    task.abort();
+                    let task_exit = task.await;
+                    assert!(task_exit.unwrap_err().is_cancelled());
+                    ready.unwrap().unwrap()
+                } else {
+                    let report = bind_running_probe(&mut registration, true, kills.clone()).await;
+                    assert!(registration.observed_forbidden_running());
+                    // The observer is already gone: only the opaque token
+                    // retained on this exact lease preserves the proof.
+                    drop(registration);
+                    report
+                };
+                assert!(report.running_seen && report.forbidden_running_seen);
+                assert_eq!(kills.load(Ordering::SeqCst), 1);
+
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let finalized = router
+                            .states
+                            .lock()
+                            .await
+                            .get("session")
+                            .and_then(|state| state.owner.as_ref())
+                            .is_some_and(|owner| {
+                                owner.run_id == "observed-running-owner" && owner.finalizing
+                            });
+                        if finalized {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the exact retained owner must enter finalization");
+                assert_eq!(
+                    router.request_activation("session", 8).await.unwrap(),
+                    SessionActivationDisposition::ActivationCoalesced
+                );
+                for attempted in ["successor", "observed-running-owner"] {
+                    let collision = router
+                        .register_run("session", attempted)
+                        .await
+                        .err()
+                        .expect("a quarantined owner cannot be replaced or adopted");
+                    assert_eq!(collision.existing_run_id(), "observed-running-owner");
+                }
+                assert_eq!(cleaned.load(Ordering::SeqCst), 0);
+                assert_eq!(spawner.reservations.load(Ordering::SeqCst), 0);
+                assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
+                let states = router.states.lock().await;
+                let owner = states["session"].owner.as_ref().unwrap();
+                assert_eq!(owner.run_id, "observed-running-owner");
+                assert!(owner.finalizing);
+                assert_eq!(owner.registrations, 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn allowed_observation_preserves_ordinary_drop_and_finish_successors() {
+            for finish_normally in [false, true] {
+                let router = SessionActivationRouter::new();
+                let spawner = spawner();
+                router.set_spawner(spawner.clone()).await;
+                let mut registration = router
+                    .register_run("session", "ordinary-observed-owner")
+                    .await
+                    .unwrap();
+                let cleaned = Arc::new(AtomicUsize::new(0));
+                let clean_count = cleaned.clone();
+                registration.set_abort_cleanup(move || async move {
+                    clean_count.fetch_add(1, Ordering::SeqCst);
+                });
+                let kills = Arc::new(AtomicUsize::new(0));
+                let report = bind_running_probe(&mut registration, false, kills.clone()).await;
+                assert!(report.running_seen);
+                assert!(!report.forbidden_running_seen);
+                assert!(!registration.observed_forbidden_running());
+                assert_eq!(kills.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    router.request_activation("session", 7).await.unwrap(),
+                    SessionActivationDisposition::ActiveNotified
+                );
+                if finish_normally {
+                    registration.begin_finalization().await;
+                    assert_eq!(
+                        registration.finish(0).await.unwrap(),
+                        Some(SessionActivationDisposition::ActivationReserved)
+                    );
+                } else {
+                    drop(registration);
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while spawner.launches.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("ordinary handoff must still launch its one successor");
+                assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+                assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    cleaned.load(Ordering::SeqCst),
+                    usize::from(!finish_normally)
+                );
+                assert!(router.owns_run("session", "run-1").await);
+                let mut successor = router.register_run("session", "run-1").await.unwrap();
+                successor.begin_finalization().await;
+                assert_eq!(successor.finish(7).await.unwrap(), None);
+                assert!(router.current_run_id("session").await.is_none());
+                assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
             }
         }
     }

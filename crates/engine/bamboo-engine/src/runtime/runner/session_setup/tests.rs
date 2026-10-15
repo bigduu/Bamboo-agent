@@ -1353,6 +1353,7 @@ fn supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standar
                 "Write",
                 "load_skill",
                 "workflow_run",
+                "loop_control",
                 "vendor::Read",
                 "default::Read",
                 "vendor::session_control",

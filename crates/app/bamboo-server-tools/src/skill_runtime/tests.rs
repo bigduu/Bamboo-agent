@@ -1013,6 +1013,7 @@ fn test_session_cache(session_id: &str, session: &Session) -> bamboo_engine::Ses
 enum DynamicProviderMode {
     Complete(String),
     NeedsHuman,
+    Running(Arc<AtomicUsize>),
 }
 
 struct DynamicProviderExecutor {
@@ -1043,6 +1044,18 @@ impl ToolExecutor for DynamicProviderExecutor {
         Ok(match &self.mode {
             DynamicProviderMode::Complete(output) => {
                 ToolOutcome::Completed(ToolResult::text(true, output.clone()))
+            }
+            DynamicProviderMode::Running(kills) => {
+                let kills = kills.clone();
+                ToolOutcome::Running(bamboo_agent_core::tools::RunningHandle {
+                    tool_call_id: call.id.clone(),
+                    ack: ToolResult::text(true, "synthetic running context ack"),
+                    completion: bamboo_agent_core::tools::RunningCompletion::Detached,
+                    wait_kind: bamboo_agent_core::tools::AsyncWaitKind::AsyncTools,
+                    kill: Box::new(move || {
+                        kills.fetch_add(1, Ordering::SeqCst);
+                    }),
+                })
             }
             DynamicProviderMode::NeedsHuman => ToolOutcome::NeedsHuman {
                 question: bamboo_agent_core::PendingQuestion {
@@ -1956,4 +1969,89 @@ async fn runtime_skill_store_keeps_project_home_across_workspace_switches() {
     assert!(second.get_skill("project-shared").await.is_ok());
     assert!(second.get_skill("workspace-one-only").await.is_err());
     assert!(second.get_skill("workspace-two-only").await.is_ok());
+}
+
+#[tokio::test]
+async fn restricted_dynamic_context_running_is_cleaned_before_any_later_provider_or_activation() {
+    let directory = tempfile::tempdir().unwrap();
+    let skill = directory.path().join("skills/dynamic-running");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        r#"---
+name: dynamic-running
+description: Synthetic detached context provider
+metadata:
+  dynamic_context:
+    - id: first
+      tool: Read
+      input: {path: input.txt}
+      stop_on_failure: false
+    - id: must-not-dispatch
+      tool: Read
+      input: {path: input.txt}
+      stop_on_failure: false
+---
+Synthetic instructions.
+"#,
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("input.txt"), "fixture input").unwrap();
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: directory.path().join("skills"),
+        project_dir: None,
+        active_mode: None,
+    }));
+    manager.initialize().await.unwrap();
+    let session_id = "restricted-dynamic-running";
+    let mut session = Session::new(session_id, "synthetic-only");
+    session.set_workspace_path_meta(directory.path().to_string_lossy().into_owned());
+    session.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.into(),
+        r#"["dynamic-running"]"#.into(),
+    );
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+    storage.save_session(&session).await.unwrap();
+    let repo = bamboo_engine::SessionRepository::new(
+        test_session_cache(session_id, &session),
+        storage.clone(),
+        Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone())),
+    );
+    let kills = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(DynamicProviderExecutor {
+        mode: DynamicProviderMode::Running(kills.clone()),
+        calls: AtomicUsize::new(0),
+        saw_bypass: AtomicBool::new(false),
+        saw_auto: AtomicBool::new(false),
+        saw_plan: AtomicBool::new(false),
+    });
+    let tool = LoadSkillTool::new(manager, Arc::new(RwLock::new(Config::default())), repo)
+        .with_test_context_tools(provider.clone());
+    let context = ToolExecutionContext {
+        session_id: Some(session_id),
+        ..ToolExecutionContext::none("restricted-dynamic-load")
+    };
+    let result = bamboo_agent_core::tools::with_suspension_disabled(tool.invoke(
+        serde_json::json!({"skill_id":"dynamic-running"}),
+        context.to_tool_ctx(),
+    ))
+    .await;
+    // Old source actually drops both raw handles without cleanup. Check this
+    // witness before checking the error, so RED cannot be a fixture-only error.
+    assert_eq!(kills.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        matches!(result, Err(ToolError::Execution(ref error))
+        if error.contains("Running") && error.contains("stop unconfirmed")),
+        "{result:?}"
+    );
+    let saved = storage.load_session(session_id).await.unwrap().unwrap();
+    for key in [
+        bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY,
+        bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY,
+        bamboo_skills::runtime_metadata::LAST_LOADED_SKILL_ID_METADATA_KEY,
+    ] {
+        assert_eq!(saved.metadata.get(key), session.metadata.get(key));
+    }
+    assert!(saved.pending_question.is_none());
 }

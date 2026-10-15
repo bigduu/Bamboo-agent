@@ -15,6 +15,7 @@ use tokio::io::AsyncWriteExt;
 use super::*;
 
 mod process_exit;
+mod running_await_window_tests;
 
 fn budgets() -> WorkflowBudgets {
     WorkflowBudgets {
@@ -3226,6 +3227,100 @@ async fn unowned_running_tool_is_killed_before_workflow_suspends() {
             .await,
         Err(WorkflowRunError::Preflight(_))
     ));
+}
+
+#[tokio::test]
+async fn restricted_inline_workflow_running_fails_instead_of_creating_a_wait() {
+    struct CountingRunningTools {
+        calls: AtomicUsize,
+        kills: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for CountingRunningTools {
+        async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+            unreachable!("outcome-aware path must be used")
+        }
+
+        async fn execute_with_context_outcome(
+            &self,
+            call: &ToolCall,
+            _ctx: ToolExecutionContext<'_>,
+        ) -> Result<ToolOutcome, ToolError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) != 0 {
+                return Ok(ToolOutcome::Completed(ToolResult::text(true, "later")));
+            }
+            let kills = self.kills.clone();
+            Ok(ToolOutcome::Running(RunningHandle {
+                tool_call_id: call.id.clone(),
+                ack: ToolResult::text(true, "running"),
+                completion: RunningCompletion::Detached,
+                wait_kind: AsyncWaitKind::AsyncTools,
+                kill: Box::new(move || {
+                    kills.fetch_add(1, Ordering::SeqCst);
+                }),
+            }))
+        }
+
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    for (failure, with_later_step) in [
+        (FailurePolicy::FailFast, true),
+        (FailurePolicy::ContinueWithError, true),
+        (FailurePolicy::ContinueWithError, false),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let kills = Arc::new(AtomicUsize::new(0));
+        let tools = Arc::new(CountingRunningTools {
+            calls: AtomicUsize::new(0),
+            kills: kills.clone(),
+        });
+        let repository =
+            Arc::new(FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap());
+        let engine = WorkflowRunEngine::new(
+            repository.clone(),
+            tools.clone(),
+            Arc::new(MockAgents),
+            Arc::new(MockDefinitions::default()),
+            Arc::new(MockPolicy),
+            Arc::new(MockSecrets),
+            budgets(),
+        );
+        let mut first = tool_step("detached", "detached", json!({}));
+        first.failure = failure;
+        let mut steps = vec![first];
+        let mut nodes = vec![choice_leaf("detached")];
+        if with_later_step {
+            let mut later = tool_step("later", "later", json!({}));
+            // A host refusal must remain terminal even if every remaining step
+            // would normally continue after an execution error.
+            later.failure = FailurePolicy::ContinueWithError;
+            steps.push(later);
+            nodes.push(choice_leaf("later"));
+        }
+        let workflow = definition(steps, WorkflowPlan::Sequence { nodes });
+        // Explicit inline run inherits its caller's scope. Independent
+        // background Start/Restart remains outside this host-owned lifetime.
+        let failed = bamboo_agent_core::tools::with_suspension_disabled(
+            engine.run(request(workflow, json!({}))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tools.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+        assert_eq!(failed.status, WorkflowRunStatus::Failed);
+        assert!(failed.suspension.is_none());
+        let error = failed.failure.as_ref().unwrap();
+        assert_eq!(error.code, WorkflowFailureCode::ExecutionFailed);
+        assert!(!error.retryable);
+        assert!(error.message.contains("stop unconfirmed"));
+        let stored = repository.load(&failed.run_id).await.unwrap().unwrap();
+        assert_eq!(stored.status, WorkflowRunStatus::Failed);
+        assert!(stored.suspension.is_none());
+    }
 }
 
 struct UnpricedWorkflowAgents {

@@ -14,6 +14,7 @@ pub mod glob;
 pub mod goal;
 pub mod grep;
 pub mod kill_shell;
+pub mod loop_control;
 pub mod memory_note;
 mod parameter_schema;
 pub mod read;
@@ -42,6 +43,9 @@ pub use glob::GlobTool;
 pub use goal::{UpdateGoalTool, UPDATE_GOAL_TOOL_NAME};
 pub use grep::GrepTool;
 pub use kill_shell::KillShellTool;
+pub use loop_control::{
+    parse_loop_control_request, LoopControlRequest, LoopControlTool, LOOP_CONTROL_TOOL_NAME,
+};
 pub use memory_note::{MemoryNoteTool, SessionNoteTool};
 pub use read::ReadTool;
 pub use registry::ToolRegistry;

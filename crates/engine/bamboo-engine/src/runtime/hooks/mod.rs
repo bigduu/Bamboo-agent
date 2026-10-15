@@ -251,6 +251,20 @@ impl HookRunner {
                 .is_some_and(|root| bamboo_hooks::portable::has_active_hooks_for(root, point)))
     }
 
+    /// Future control seams in this runner, after the model can issue Start.
+    /// Setup is already complete and observer seams never honor suspension.
+    pub(crate) fn has_suspending_loop_control_hooks(&self) -> bool {
+        [
+            AgentHookPoint::BeforeRound,
+            AgentHookPoint::AfterRound,
+            AgentHookPoint::BeforeToolExecution,
+            AgentHookPoint::AfterToolExecution,
+            AgentHookPoint::BeforeFinalize,
+        ]
+        .into_iter()
+        .any(|point| self.dispatcher.has_suspending_hooks_for(point))
+    }
+
     pub fn len(&self) -> usize {
         self.dispatcher.len()
     }
