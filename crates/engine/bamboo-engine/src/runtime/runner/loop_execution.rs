@@ -128,7 +128,10 @@ pub(crate) async fn run_agent_loop_with_config(
         )
         .await?;
 
-        if config.counted_loop.is_some() {
+        if let Some(control) = config.loop_control.as_ref() {
+            control.bind_execution(&state.execution_id, cancel_token.clone())?;
+        }
+        if config.effective_counted_loop().is_some() || config.loop_control.is_some() {
             // Capture the initialized run before begin can fail. Its first
             // checkpoint error must also terminalize this runtime snapshot for
             // the host's unconditional final error save.
@@ -180,7 +183,7 @@ pub(crate) async fn run_agent_loop_with_config(
                         &state.session_id,
                         &config,
                         state.metrics_collector.as_ref(),
-                        config.counted_loop.is_some(),
+                        config.effective_counted_loop().is_some(),
                         &mut state.runtime_state,
                     )
                     .await;
@@ -214,7 +217,7 @@ pub(crate) async fn run_agent_loop_with_config(
         )
         .await;
 
-        if config.counted_loop.is_some() {
+        if config.effective_counted_loop().is_some() || config.loop_control.is_some() {
             // The last round and final-evidence spend have both been committed.
             // Session history totals and the last response alone are not this run.
             counted_usage = super::to_event_token_usage(
@@ -242,7 +245,7 @@ pub(crate) async fn run_agent_loop_with_config(
                     &state.session_id,
                     &config,
                     state.metrics_collector.as_ref(),
-                    config.counted_loop.is_some(),
+                    config.effective_counted_loop().is_some(),
                     &mut state.runtime_state,
                 )
                 .await;
@@ -284,7 +287,7 @@ pub(crate) async fn run_agent_loop_with_config(
             &state.session_id,
             &config,
             state.metrics_collector.as_ref(),
-            sent_complete || config.counted_loop.is_some(),
+            sent_complete || config.effective_counted_loop().is_some(),
             &mut state.runtime_state,
         )
         .await;
@@ -293,6 +296,13 @@ pub(crate) async fn run_agent_loop_with_config(
     }
     .instrument(session_span)
     .await;
+    if counted_generation.is_none() {
+        counted_generation = config
+            .loop_control
+            .as_ref()
+            .and_then(|c| c.generation())
+            .map(str::to_owned);
+    }
     let result = if counted_generation.is_some() && result.is_ok() && cancel_token.is_cancelled() {
         Err(bamboo_agent_core::AgentError::Cancelled)
     } else {
@@ -762,3 +772,6 @@ mod hook_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod self_control_tests;

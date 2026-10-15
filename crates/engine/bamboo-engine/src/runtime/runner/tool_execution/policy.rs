@@ -538,6 +538,7 @@ mod tests {
                     source: bamboo_agent_core::PendingQuestionSource::PauseTool,
                 }),
                 post_tool_hook_eligible: false,
+                managed_running_violation: false,
                 tool_duration: std::time::Duration::ZERO,
             };
         let mut guard = ToolPolicyGuard::new(4, 3);

@@ -549,6 +549,7 @@ fn interrupted_state() -> LoopState {
         iterations_completed: 0,
         rounds_started: 1,
         status: LoopStatus::Running,
+        control: None,
     }
 }
 

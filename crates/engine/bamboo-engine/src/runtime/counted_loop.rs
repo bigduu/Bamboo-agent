@@ -79,8 +79,21 @@ impl CountedLoopConfig {
             && owner.run.is_current(&session.id).await
     }
 
+    pub(crate) async fn has_current_owner(&self, session: &Session) -> bool {
+        match self.owner.as_ref() {
+            Some(owner) => {
+                owner.session_birth == session.created_at && owner.run.is_current(&session.id).await
+            }
+            None => false,
+        }
+    }
+
     /// Idempotent, live-only stop. Ordinary Session cancellation remains
     /// independent and uses the existing cancellation/error path.
+    pub(crate) fn replace_stop(&mut self, stop: CancellationToken) {
+        self.stop = stop;
+    }
+
     pub fn stop(&self) {
         self.stop.cancel();
     }
@@ -119,6 +132,8 @@ pub struct LoopState {
     /// Existing provider retries stay within one round and retain their limits.
     pub rounds_started: u32,
     pub status: LoopStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<super::loop_control::ManagedLoopState>,
 }
 
 fn invalid(reason: &str) -> AgentError {
@@ -139,10 +154,17 @@ fn validate_bounds(iterations: u32, rounds: u32, objective: &str) -> Result<(), 
 impl LoopState {
     fn validate(&self) -> Result<(), AgentError> {
         validate_bounds(self.max_iterations, self.max_total_rounds, &self.objective)?;
-        if self.schema_version != 1
+        let supported_schema = match (self.schema_version, self.control.as_ref()) {
+            (1, None) => self.objective_revision == 1,
+            (2, Some(control)) => {
+                control.validate(self)?;
+                self.objective_revision > 0 && self.objective_revision < u64::MAX
+            }
+            _ => false,
+        };
+        if !supported_schema
             || self.revision == 0
             || self.revision == u64::MAX
-            || self.objective_revision != 1
             || uuid::Uuid::parse_str(&self.generation).is_err()
             || self.owner_execution_id.is_empty()
             || self.owner_execution_id.len() > 128
@@ -197,20 +219,31 @@ async fn checkpoint_state(
     persist_checkpoint(session, persistence).await
 }
 
-fn stage_state(session: &mut Session, mut state: LoopState) -> Result<String, AgentError> {
+/// Validate the exact next checkpoint, including JSON escaping and receipts,
+/// before reserving any control capability or publishing bytes to a Session.
+pub(crate) fn encode_next_state(state: &LoopState) -> Result<String, AgentError> {
+    let mut state = state.clone();
     state.revision = state
         .revision
         .checked_add(1)
         .ok_or_else(|| invalid("state revision exhausted"))?;
     state.validate()?;
     let encoded = serde_json::to_string(&state).map_err(|_| invalid("cannot serialize state"))?;
+    if encoded.len() > MAX_STATE_BYTES {
+        return Err(invalid("persisted state exceeds its byte bound"));
+    }
+    Ok(encoded)
+}
+
+pub(crate) fn stage_state(session: &mut Session, state: LoopState) -> Result<String, AgentError> {
+    let encoded = encode_next_state(&state)?;
     session
         .metadata
         .insert(LOOP_STATE_METADATA_KEY.into(), encoded.clone());
     Ok(encoded)
 }
 
-async fn persist_checkpoint(
+pub(crate) async fn persist_checkpoint(
     session: &mut Session,
     persistence: Option<&dyn bamboo_domain::RuntimeSessionPersistence>,
 ) -> Result<(), AgentError> {
@@ -429,7 +462,28 @@ pub(crate) async fn preflight(
     prompt: &str,
 ) -> Result<(), AgentError> {
     reject_recovery(session)?;
-    if let Some(counted) = config.counted_loop.as_ref() {
+    if let Some(control) = config.loop_control.as_ref() {
+        if config.counted_loop.is_some()
+            || config.ticket_worker_plan.is_some()
+            || config.gold_config.as_ref().is_some_and(|gold| gold.enabled)
+            || config.persistence.is_none()
+        {
+            return Err(invalid(
+                "self control requires an exclusive durable non-Gold execution",
+            ));
+        }
+        control.validate_current_owner(session).await?;
+        if !config
+            .run_budget
+            .max_rounds
+            .is_some_and(|cap| cap <= control.max_total_rounds)
+        {
+            return Err(invalid(
+                "self control host round ceiling must already be enforced",
+            ));
+        }
+    }
+    if let Some(counted) = config.effective_counted_loop() {
         validate_bounds(counted.max_iterations, counted.max_total_rounds, prompt)?;
         validate_bounds(
             counted.max_iterations,
@@ -476,7 +530,7 @@ pub(crate) async fn begin(
     execution_id: &str,
     prompt: &str,
 ) -> Result<Option<String>, AgentError> {
-    let Some(counted) = config.counted_loop.as_ref() else {
+    let Some(counted) = config.effective_counted_loop() else {
         return Ok(None);
     };
     validate_bounds(
@@ -498,6 +552,7 @@ pub(crate) async fn begin(
         iterations_completed: 0,
         rounds_started: 0,
         status: LoopStatus::Running,
+        control: None,
     };
     if let Err(error) = checkpoint(session, config, state).await {
         // The generation exists in memory before its first save returns. Keep
@@ -516,7 +571,7 @@ fn active_state(
     session: &Session,
     config: &AgentLoopConfig,
 ) -> Result<Option<LoopState>, AgentError> {
-    if config.counted_loop.is_none() {
+    if config.effective_counted_loop().is_none() {
         return Ok(None);
     }
     Ok(Some(
@@ -538,8 +593,7 @@ pub(crate) async fn before_round(
         return Err(invalid("execution owner changed"));
     }
     if let Some(owner) = config
-        .counted_loop
-        .as_ref()
+        .effective_counted_loop()
         .and_then(|counted| counted.owner.as_ref())
     {
         if owner.session_birth != session.created_at || !owner.run.is_current(&session.id).await {
@@ -550,8 +604,7 @@ pub(crate) async fn before_round(
         return Ok(false);
     }
     if config
-        .counted_loop
-        .as_ref()
+        .effective_counted_loop()
         .expect("counted config")
         .stop
         .is_cancelled()
@@ -572,7 +625,15 @@ pub(crate) async fn before_round(
     let mut staged_repeat = None;
     if state.status == LoopStatus::Running && state.iterations_started == state.iterations_completed
     {
-        if state.iterations_started > 0 {
+        if let Some(control) = state.control.as_mut() {
+            if let Some(pending) = control.pending_objective.take() {
+                state.objective = pending.objective;
+                state.objective_revision = pending.objective_revision;
+            }
+            control.applied_revision = control.control_revision;
+            control.iteration_objective_revision = state.objective_revision;
+        }
+        if state.iterations_started > 0 || state.control.is_some() {
             let mut message = Message::user(state.objective.clone());
             message.metadata = Some(serde_json::json!({
                 "runtime_kind": "counted_loop_iteration",
@@ -616,6 +677,11 @@ pub(crate) async fn exhaust_budget(
     config: &AgentLoopConfig,
 ) -> Result<(), AgentError> {
     let Some(mut state) = active_state(session, config)? else {
+        if config.loop_control.is_some() {
+            session
+                .metadata
+                .insert("runtime.completion_reason".into(), "budget_exceeded".into());
+        }
         return Ok(());
     };
     state.status = LoopStatus::BudgetExhausted;
@@ -641,15 +707,33 @@ pub(crate) async fn terminal(
     {
         return Err(invalid("terminal without one admitted iteration"));
     }
+    if state
+        .control
+        .as_ref()
+        .is_some_and(|control| control.iteration_objective_revision != state.objective_revision)
+    {
+        return Err(invalid("admitted objective revision changed"));
+    }
     state.iterations_completed += 1;
     let decision = if config
-        .counted_loop
-        .as_ref()
+        .effective_counted_loop()
         .expect("counted config")
         .stop
         .is_cancelled()
     {
         state.status = LoopStatus::Stopped;
+        TerminalDecision::Stop
+    } else if state.iterations_completed == state.max_iterations
+        && state
+            .control
+            .as_ref()
+            .is_some_and(|c| c.pending_objective.is_some())
+    {
+        state.status = LoopStatus::BudgetExhausted;
+        session.metadata.insert(
+            "runtime.completion_reason".into(),
+            "loop_objective_unapplied_budget".into(),
+        );
         TerminalDecision::Stop
     } else if state.iterations_completed == state.max_iterations {
         state.status = LoopStatus::Finalizing;

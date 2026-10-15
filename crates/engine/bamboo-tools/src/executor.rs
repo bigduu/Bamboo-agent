@@ -14,9 +14,9 @@ use crate::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide}
 use crate::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::tools::{
     BashInputTool, BashOutputTool, BashTool, EditTool, ExecCommandTool, ExitPlanModeTool,
-    GetFileInfoTool, GlobTool, GrepTool, KillShellTool, ReadTool, RequestPermissionsTool,
-    SessionNoteTool, SleepTool, TaskTool, ToolRegistry, UpdateGoalTool, ViewImageTool,
-    WebFetchTool, WorkspaceTool, WriteStdinTool, WriteTool,
+    GetFileInfoTool, GlobTool, GrepTool, KillShellTool, LoopControlTool, ReadTool,
+    RequestPermissionsTool, SessionNoteTool, SleepTool, TaskTool, ToolRegistry, UpdateGoalTool,
+    ViewImageTool, WebFetchTool, WorkspaceTool, WriteStdinTool, WriteTool,
 };
 use bamboo_llm::Config;
 use bamboo_plugin_protocol::{
@@ -359,6 +359,7 @@ impl BuiltinToolExecutor {
         let _ = registry.register(GrepTool::new());
         let _ = registry.register(UpdateGoalTool::new());
         let _ = registry.register(KillShellTool::new());
+        let _ = registry.register(LoopControlTool::new());
         let _ = registry.register(SessionNoteTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, ReadTool::new()) {
             framework_tools.insert(name, tool);
@@ -566,26 +567,36 @@ impl BuiltinToolExecutor {
             let root_writer = bamboo_agent_core::tools::context::root_actor_tool_writer();
             let call_id = call.id.clone();
             let session_id = ctx.session_id.unwrap_or_default().to_owned();
+            let suspension = bamboo_agent_core::tools::capture_suspension_restriction();
             let invoke = async move {
-                let future = tool.invoke(args, tool_ctx);
-                let future = crate::with_approval_proxy(approval, future);
-                let future =
-                    crate::with_hook_permission_override(permission_override, &call_id, future);
-                let future = bamboo_agent_core::tools::scope_tool_output_cap(
-                    &session_id,
-                    &call_id,
-                    output_cap,
-                    future,
-                );
-                // Preserve absent Host scope versus a present unbound scope.
-                match root_writer {
-                    Some(writer) => {
-                        bamboo_agent_core::tools::context::with_root_actor_tool_writer(
-                            writer, future,
-                        )
-                        .await
-                    }
-                    None => future.await,
+                let invoke = async move {
+                    let future = tool.invoke(args, tool_ctx);
+                    let future = crate::with_approval_proxy(approval, future);
+                    let future =
+                        crate::with_hook_permission_override(permission_override, &call_id, future);
+                    let future = bamboo_agent_core::tools::scope_tool_output_cap(
+                        &session_id,
+                        &call_id,
+                        output_cap,
+                        future,
+                    );
+                    // Preserve absent Host scope versus a present unbound scope.
+                    let result = match root_writer {
+                        Some(writer) => {
+                            bamboo_agent_core::tools::context::with_root_actor_tool_writer(
+                                writer, future,
+                            )
+                            .await
+                        }
+                        None => future.await,
+                    };
+                    enforce_registered_tool_suspension(result)
+                };
+                // Normalize while the child still owns the captured token and
+                // LocalTaskResources, even after its registered awaiter drops.
+                match suspension {
+                    Some(scope) => scope.scope(invoke).await,
+                    None => invoke.await,
                 }
             };
             let registered = resources
@@ -596,10 +607,13 @@ impl BuiltinToolExecutor {
                 ToolError::Execution(
                     "owned tool invocation panicked; stop remains unconfirmed".into(),
                 )
-            })??
+            })?
         } else {
-            tool.invoke(args, ctx.to_tool_ctx()).await?
+            tool.invoke(args, ctx.to_tool_ctx()).await
         };
+        // Inline/custom tools also normalize here. An already normalized
+        // Completed outcome is idempotent and never requests a second kill.
+        let outcome = enforce_registered_tool_suspension(outcome)?;
         if matches!(
             &outcome,
             ToolOutcome::Completed(result) if result.success
@@ -615,6 +629,22 @@ impl BuiltinToolExecutor {
     pub fn build_enhanced_prompt(&self, context: GuideBuildContext) -> String {
         EnhancedPromptBuilder::build(Some(&self.registry), &self.list_tools(), &context)
     }
+}
+
+/// Keep this inside an owned child's captured scope, before sending its
+/// result; the awaiting parent may already have timed out or been dropped.
+fn enforce_registered_tool_suspension(
+    outcome: Result<ToolOutcome, ToolError>,
+) -> Result<ToolOutcome, ToolError> {
+    let outcome = outcome.map(ToolOutcome::enforce_suspension_restriction);
+    if bamboo_agent_core::tools::suspension_running_violated() {
+        if let Some(resources) = crate::LocalTaskResources::current() {
+            resources.record_unconfirmed(
+                "restricted tool returned Running; cooperative kill has no stop receipt",
+            );
+        }
+    }
+    outcome
 }
 
 fn permission_error_to_tool_error(error: PermissionError) -> ToolError {
@@ -926,6 +956,14 @@ impl ToolExecutor for BuiltinToolExecutor {
                     {
                         continue;
                     }
+                    if !bamboo_agent_core::tools::suspension_allowed() {
+                        // A configless custom checker may prompt inside these
+                        // methods. Do not replace its full gate with is_granted
+                        // or infer an approval: fail closed before calling it.
+                        return Err(ToolError::Execution(
+                            "suspension_disabled: permission approval is unavailable in this execution".into(),
+                        ));
+                    }
                     let decision = if focused_browser_input {
                         // Configless checkers may have cached grants, and the
                         // trait's default forced path checks that cache first.
@@ -991,6 +1029,13 @@ impl ToolExecutor for BuiltinToolExecutor {
                         }
                     }
                 };
+
+                if !bamboo_agent_core::tools::suspension_allowed() {
+                    return Err(ToolError::Execution(
+                        "suspension_disabled: permission approval is unavailable in this execution"
+                            .into(),
+                    ));
+                }
 
                 // A worker/external relay gets the same typed request but only
                 // one-shot decisions are advertised until its protocol supports
@@ -5534,5 +5579,353 @@ mod tests {
         assert!(resources.scope(executor.execute(&call)).await.is_err());
         resources.close_and_drain().await.unwrap();
         assert!(!path.exists());
+    }
+    mod suspension_contract_tests {
+        use super::*;
+        use bamboo_agent_core::tools::{suspension_allowed, with_suspension_disabled};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[tokio::test]
+        async fn disabled_suspension_rejects_typed_ask_before_proxy_event_pending_or_write() {
+            for proxy_enabled in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("must-not-write.txt");
+                let config = Arc::new(crate::permission::PermissionConfig::new());
+                config.set_ask_rules([format!("Write({})", path.display())]);
+                config.register_session_workspace("scope-ask", directory.path().to_string_lossy());
+                let executor = BuiltinToolExecutor::new_with_permissions(Arc::new(
+                    crate::permission::ConfigPermissionChecker::new(config.clone()),
+                ));
+                let call = make_tool_call("Write", json!({"file_path":path,"content":"forbidden"}));
+                let requests = Arc::new(AtomicUsize::new(0));
+                let proxy: Option<Arc<dyn crate::approval::ApprovalProxy>> =
+                    proxy_enabled.then(|| {
+                        Arc::new(RecordingApprovalProxy {
+                            requests: requests.clone(),
+                            approve: false,
+                        }) as Arc<dyn crate::approval::ApprovalProxy>
+                    });
+                let (tx, mut rx) = mpsc::channel(8);
+                let ctx = ToolExecutionContext {
+                    session_id: Some("scope-ask"),
+                    event_tx: Some(&tx),
+                    ..ToolExecutionContext::none(&call.id)
+                };
+                let result = with_suspension_disabled(crate::with_approval_proxy(
+                    proxy,
+                    executor.execute_with_context_outcome(&call, ctx),
+                ))
+                .await;
+                assert!(
+                    matches!(result, Err(ToolError::Execution(ref reason)) if reason.contains("suspension_disabled")),
+                    "{result:?}"
+                );
+                assert_eq!(requests.load(Ordering::SeqCst), 0);
+                assert!(config.pending_request("scope-ask", &call.id).is_none());
+                assert!(rx.try_recv().is_err(), "must not publish an approval event");
+                assert!(!path.exists());
+                assert!(suspension_allowed());
+            }
+        }
+
+        struct InteractiveChecker(Arc<AtomicUsize>);
+        #[async_trait]
+        impl crate::permission::PermissionChecker for InteractiveChecker {
+            async fn needs_confirmation(
+                &self,
+                _: crate::permission::PermissionType,
+                _: &str,
+            ) -> bool {
+                true
+            }
+            async fn request_confirmation(
+                &self,
+                ctx: crate::permission::PermissionContext,
+            ) -> Result<bool, crate::permission::PermissionError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(crate::permission::PermissionError::confirmation_required(
+                    ctx,
+                ))
+            }
+            fn grant_session_permission(&self, _: crate::permission::PermissionType, _: String) {}
+        }
+
+        #[tokio::test]
+        async fn disabled_suspension_rejects_configless_checker_before_real_confirmation() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("must-not-write.txt");
+            let requests = Arc::new(AtomicUsize::new(0));
+            let executor = BuiltinToolExecutor::new_with_permissions(Arc::new(InteractiveChecker(
+                requests.clone(),
+            )));
+            let call = make_tool_call("Write", json!({"file_path":path,"content":"forbidden"}));
+            let (tx, mut rx) = mpsc::channel(8);
+            let ctx = ToolExecutionContext {
+                session_id: Some("configless"),
+                event_tx: Some(&tx),
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let result =
+                with_suspension_disabled(executor.execute_with_context_outcome(&call, ctx)).await;
+            assert!(
+                matches!(result, Err(ToolError::Execution(ref reason)) if reason.contains("suspension_disabled")),
+                "{result:?}"
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 0);
+            assert!(rx.try_recv().is_err());
+            assert!(!path.exists());
+        }
+
+        #[tokio::test]
+        async fn disabled_suspension_keeps_existing_auto_bypass_and_plan_gates() {
+            for (auto, bypass, plan, allowed) in [
+                (true, false, false, true),
+                (false, true, false, true),
+                (true, false, true, false),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("posture.txt");
+                let config = Arc::new(crate::permission::PermissionConfig::new());
+                let executor = BuiltinToolExecutor::new_with_permissions(Arc::new(
+                    crate::permission::ConfigPermissionChecker::new(config),
+                ));
+                let call = make_tool_call(
+                    "Write",
+                    json!({"file_path":path,"content":"explicit posture"}),
+                );
+                let (tx, mut rx) = mpsc::channel(8);
+                let ctx = ToolExecutionContext {
+                    session_id: Some("posture"),
+                    event_tx: Some(&tx),
+                    auto_approve_permissions: auto,
+                    bypass_permissions: bypass,
+                    plan_read_only: plan,
+                    ..ToolExecutionContext::none(&call.id)
+                };
+                let result =
+                    with_suspension_disabled(executor.execute_with_context_outcome(&call, ctx))
+                        .await;
+                assert_eq!(
+                    result.is_ok(),
+                    allowed,
+                    "auto={auto},bypass={bypass},plan={plan}: {result:?}"
+                );
+                assert_eq!(path.exists(), allowed);
+                assert!(rx.try_recv().is_err());
+            }
+        }
+
+        #[tokio::test]
+        async fn ordinary_execution_still_publishes_and_retains_typed_approval() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("ordinary-ask.txt");
+            let config = Arc::new(crate::permission::PermissionConfig::new());
+            config.set_ask_rules([format!("Write({})", path.display())]);
+            let executor = BuiltinToolExecutor::new_with_permissions(Arc::new(
+                crate::permission::ConfigPermissionChecker::new(config.clone()),
+            ));
+            let call = make_tool_call(
+                "Write",
+                json!({"file_path":path,"content":"approval required"}),
+            );
+            let (tx, mut rx) = mpsc::channel(8);
+            let ctx = ToolExecutionContext {
+                session_id: Some("ordinary-ask"),
+                event_tx: Some(&tx),
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let outcome = executor
+                .execute_with_context_outcome(&call, ctx)
+                .await
+                .unwrap();
+            let result = outcome.into_tool_result();
+            assert_eq!(
+                result.display_preference.as_deref(),
+                Some("request_permissions")
+            );
+            assert!(config.pending_request("ordinary-ask", &call.id).is_some());
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                AgentEvent::ToolApprovalRequested { .. }
+            ));
+            assert!(!path.exists());
+        }
+    }
+
+    mod owned_suspension_rebind_tests {
+        use super::*;
+        use bamboo_agent_core::tools::with_suspension_disabled;
+        #[tokio::test]
+        async fn managed_owned_builtin_keeps_suspension_denial_before_background_bash_spawn() {
+            let directory = tempfile::tempdir().unwrap();
+            let session_id = "owned-rebind-background-probe";
+            let resources =
+                crate::LocalTaskResources::new(session_id, "probe-run", chrono::Utc::now());
+            let executor = BuiltinToolExecutor::new();
+            let call = make_tool_call(
+                "Bash",
+                json!({"command":"exit 0","run_in_background":true,"workdir":directory.path()}),
+            );
+            let (tx, mut rx) = mpsc::channel(32);
+            let ctx = ToolExecutionContext {
+                session_id: Some(session_id),
+                event_tx: Some(&tx),
+                can_async_resume: true,
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let result = with_suspension_disabled(
+                resources.scope(executor.execute_with_context_outcome(&call, ctx)),
+            )
+            .await;
+            // A RED may have spawned this fixture's exact short shell. Clean
+            // only its returned handle and drain this fixture before asserting.
+            if let Ok(ToolOutcome::Completed(output)) = &result {
+                if let Some(id) = serde_json::from_str::<serde_json::Value>(&output.result)
+                    .ok()
+                    .and_then(|v| v["bash_id"].as_str().map(str::to_owned))
+                {
+                    if let Some(shell) = crate::tools::bash_runtime::get_shell(&id) {
+                        let _ = shell.kill().await;
+                    }
+                }
+            }
+            let drained = resources.close_and_drain().await;
+            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(
+                matches!(result,Err(ToolError::Execution(ref text)) if text.contains("suspension_disabled")),
+                "{result:?}"
+            );
+            drained.unwrap();
+            assert!(
+                events.is_empty(),
+                "no detached shell event should be published: {events:?}"
+            );
+            assert!(crate::tools::bash_runtime::running_shells_for_session(session_id).is_empty());
+        }
+    }
+
+    mod owned_late_running_helper_tests {
+        use super::*;
+        use bamboo_agent_core::tools::{
+            capture_suspension_restriction, with_suspension_disabled, AsyncWaitKind,
+            RunningCompletion, RunningHandle,
+        };
+        use std::{
+            future::Future,
+            pin::Pin,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::{Context, Poll},
+            time::Duration,
+        };
+        struct NeverDrive {
+            polls: Arc<AtomicUsize>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Future for NeverDrive {
+            type Output = ToolResult;
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<ToolResult> {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                panic!("restricted completion must not be polled");
+            }
+        }
+        impl Drop for NeverDrive {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        // This uses the public resource registry and the production helper.
+        // It deliberately does not claim a custom tool is a framework builtin.
+        #[tokio::test]
+        async fn owned_completion_guard_survives_abort_of_registered_awaiter() {
+            for panic_kill in [false, true] {
+                let resources = crate::LocalTaskResources::new(
+                    "late-running-helper",
+                    "private-owned-probe",
+                    chrono::Utc::now(),
+                );
+                let owned_resources = resources.clone();
+                let kills = Arc::new(AtomicUsize::new(0));
+                let polls = Arc::new(AtomicUsize::new(0));
+                let drops = Arc::new(AtomicUsize::new(0));
+                let child_kills = kills.clone();
+                let child_polls = polls.clone();
+                let child_drops = drops.clone();
+                let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+                let parent = tokio::spawn(async move {
+                    with_suspension_disabled(async move {
+                        let token = capture_suspension_restriction().unwrap();
+                        let child_token = token.clone();
+                        let registered = owned_resources
+                            .spawn_owned(async move {
+                                child_token
+                                    .scope(async move {
+                                        let _ = started_tx.send(());
+                                        let _ = release_rx.await;
+                                        let outcome = ToolOutcome::Running(RunningHandle {
+                                            tool_call_id: "late-running".into(),
+                                            ack: ToolResult::text(
+                                                true,
+                                                "must not publish this ack",
+                                            ),
+                                            completion: RunningCompletion::Driven(Box::pin(
+                                                NeverDrive {
+                                                    polls: child_polls,
+                                                    drops: child_drops,
+                                                },
+                                            )),
+                                            wait_kind: AsyncWaitKind::AsyncTools,
+                                            kill: Box::new(move || {
+                                                child_kills.fetch_add(1, Ordering::SeqCst);
+                                                assert!(!panic_kill, "injected cleanup panic");
+                                            }),
+                                        });
+                                        // Exact helper the real owned branch calls before
+                                        // returning to its oneshot. The parent is gone.
+                                        let outcome =
+                                            enforce_registered_tool_suspension(Ok(outcome))
+                                                .unwrap();
+                                        let result =
+                                            enforce_registered_tool_suspension(Ok(outcome))
+                                                .unwrap()
+                                                .into_tool_result();
+                                        let _ = completed_tx.send(result);
+                                    })
+                                    .await;
+                            })
+                            .unwrap();
+                        let _ = observed_tx.send(token);
+                        registered.await
+                    })
+                    .await
+                });
+                let started = tokio::time::timeout(Duration::from_secs(5), started_rx).await;
+                let observed = tokio::time::timeout(Duration::from_secs(5), observed_rx).await;
+                parent.abort();
+                let parent_exit = parent.await;
+                let _ = release_tx.send(());
+                let completed = tokio::time::timeout(Duration::from_secs(5), completed_rx).await;
+                let drained =
+                    tokio::time::timeout(Duration::from_secs(5), resources.close_and_drain()).await;
+                // Join/drain this private domain before checking failure details.
+                assert!(started.unwrap().is_ok());
+                assert!(parent_exit.unwrap_err().is_cancelled());
+                let report = observed.unwrap().unwrap().observation();
+                let result = completed.unwrap().unwrap();
+                assert!(!result.success);
+                assert!(result.result.contains("stop unconfirmed"));
+                assert!(!result.result.contains("must not publish this ack"));
+                assert!(report.running_seen && report.forbidden_running_seen);
+                assert_eq!(kills.load(Ordering::SeqCst), 1);
+                assert_eq!(polls.load(Ordering::SeqCst), 0);
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                let error = drained.unwrap().unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("cooperative kill has no stop receipt"));
+            }
+        }
     }
 }

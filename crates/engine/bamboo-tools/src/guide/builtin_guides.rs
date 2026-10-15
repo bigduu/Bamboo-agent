@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 18] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 19] = [
     "exec_command",
     "write_stdin",
     "Edit",
@@ -21,6 +21,7 @@ pub const BUILTIN_GUIDE_NAMES: [&str; 18] = [
     "Sleep",
     "Task",
     "update_goal",
+    "loop_control",
     "ViewImage",
     "WebFetch",
     "Workspace",
@@ -445,6 +446,35 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Use short waits between repeated status checks.",
             )],
         )),
+        "loop_control" => Some(guide(
+            "loop_control",
+            ToolCategory::TaskManagement,
+            "Manage one live bounded loop in your current host-admitted Standard ordinary Root execution. Inspect status first; use its generation and control_revision for CAS, preserving operation_id and payload on a retry. Start charges earlier rounds and injects its objective before the next provider call. An accepted objective edit applies only at the next iteration admission; read status to distinguish accepted and applied revisions. Bounds can only tighten. Stop prevents the next provider admission after the current tool batch drains.",
+            "Do not infer host capability or permission from this guide. Do not target another Session, pause/resume, add cadence, extend or reset budgets, restart a stopped generation, or treat an accepted edit as already applied. Existing Plan, Child, Ultra and Supervisor gates still apply. User cancellation and host revocation remain authoritative.",
+            &["Task"],
+            vec![
+                example(
+                    "Inspect this admitted execution",
+                    json!({"action":"status"}),
+                    "Observe current generation, control_revision, objective revisions and remaining host bounds.",
+                ),
+                example(
+                    "Start two bounded iterations",
+                    json!({"action":"start","operation_id":"00000000-0000-4000-8000-000000000001","expected_revision":0,"objective":"Verify the next item using the accumulated context.","max_iterations":2,"max_total_rounds":6}),
+                    "Use a fresh operation UUID. An absent prior loop uses revision zero; a retired prior generation must instead be named with its observed revision. Host ceilings include the round requesting start.",
+                ),
+                example(
+                    "Accept a new objective for the next iteration",
+                    json!({"action":"update","operation_id":"00000000-0000-4000-8000-000000000003","generation":"00000000-0000-4000-8000-000000000002","expected_revision":1,"objective":"Verify the remaining item independently."}),
+                    "Replace the example generation and revision with current status. At most one objective edit may be pending; its receipt names the effective iteration.",
+                ),
+                example(
+                    "Stop this generation",
+                    json!({"action":"stop","operation_id":"00000000-0000-4000-8000-000000000004","generation":"00000000-0000-4000-8000-000000000002","expected_revision":2}),
+                    "Use the observed generation and control revision. Stop is terminal for this generation and cannot replenish this activation.",
+                ),
+            ],
+        )),
         "update_goal" => Some(guide(
             "update_goal",
             ToolCategory::TaskManagement,
@@ -688,6 +718,15 @@ mod tests {
                 "missing builtin guide coverage for {}",
                 name
             );
+        }
+    }
+
+    #[test]
+    fn loop_control_guide_examples_match_the_strict_command_contract() {
+        let guide = builtin_guide_spec("loop_control").expect("registered builtin guide");
+        for example in &guide.examples {
+            crate::tools::loop_control::parse_loop_control_request(&example.parameters.to_string())
+                .unwrap_or_else(|error| panic!("invalid loop_control example: {error}"));
         }
     }
 
