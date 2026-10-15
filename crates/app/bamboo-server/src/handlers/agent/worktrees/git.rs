@@ -443,6 +443,33 @@ mod tests {
         assert!(entry.error.is_none());
     }
 
+    #[test]
+    fn rejects_git_metadata_bare_and_broken_repository_roots() {
+        let f = Fixture::new();
+        let bare = f.0.join("bare.git");
+        fs::create_dir(&bare).unwrap();
+        git(&bare, &["init", "--bare"]).unwrap();
+        let broken = f.0.join("broken");
+        fs::create_dir(&broken).unwrap();
+        fs::create_dir(broken.join("nested")).unwrap();
+        let marker = format!("gitdir: {}\n", f.0.join("missing").display());
+        fs::write(broken.join(".git"), &marker).unwrap();
+        for directory in [
+            f.repo().join(".git"),
+            f.repo().join(".git/objects"),
+            bare.clone(),
+            bare.join("objects"),
+            broken.clone(),
+            broken.join("nested"),
+        ] {
+            assert!(root(&directory).is_err(), "{}", directory.display());
+            assert!(create(&f.repo(), &directory, "blocked", "blocked").is_err());
+            assert!(!directory.join("blocked").exists());
+        }
+        assert_eq!(fs::read_to_string(broken.join(".git")).unwrap(), marker);
+        assert_eq!(list(&f.repo()).unwrap().len(), 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn unwritable_directory_returns_error_without_changing_permissions_or_fallback() {

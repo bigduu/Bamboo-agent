@@ -167,6 +167,8 @@ async fn rejects_unbound_repository_and_offline_root_without_fallback_or_mutatio
     for body in [
         json!({"repository": other, "root": root, "name": "task", "branch": "task"}),
         json!({"repository": repo, "root": base.join("offline"), "name": "task", "branch": "task"}),
+        json!({"repository": repo, "root": repo.join(".git"), "name": "metadata", "branch": "metadata"}),
+        json!({"repository": repo, "root": repo.join(".git/objects"), "name": "objects", "branch": "objects"}),
     ] {
         let response = test::call_service(
             &app,
@@ -187,6 +189,17 @@ async fn rejects_unbound_repository_and_offline_root_without_fallback_or_mutatio
     )
     .await;
     assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+    for metadata in [repo.join(".git"), repo.join(".git/objects")] {
+        let response = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/worktrees/preferences")
+                .set_json(json!({"root": metadata}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+    }
     assert!(state.config.read().await.worktrees.is_empty());
     assert!(!base.join("offline").exists());
     assert!(!root.join("task").exists());
