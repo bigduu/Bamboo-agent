@@ -198,19 +198,65 @@ fn retains_identity(path: &Path, expected: &fs::Metadata) -> bool {
         .is_ok_and(|actual| !actual.file_type().is_symlink() && same_identity(&actual, expected))
 }
 
+// Keep one stable metadata inode. Dropping the handle (including process
+// termination) releases the OS advisory lock; unlinking would permit two
+// cooperating creators to lock different inodes for the same repository.
 struct CreateLock {
     path: PathBuf,
     file: fs::File,
 }
-impl Drop for CreateLock {
-    fn drop(&mut self) {
-        if self
-            .file
-            .metadata()
-            .is_ok_and(|owned| retains_identity(&self.path, &owned))
+impl CreateLock {
+    fn acquire(path: PathBuf) -> Result<Self, String> {
+        let open_error = |error: std::io::Error| {
+            format!(
+                "Cannot open repository creation lock ({}): {error}",
+                path.display()
+            )
+        };
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
         {
-            let _ = fs::remove_file(&self.path);
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = fs::symlink_metadata(&path).map_err(open_error)?;
+                if existing.file_type().is_symlink() || !existing.is_file() {
+                    return Err(format!(
+                        "Repository creation lock is not a regular file: {}",
+                        path.display()
+                    ));
+                }
+                // Never create through a replaced path or truncate old content.
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .map_err(open_error)?
+            }
+            Err(error) => return Err(open_error(error)),
+        };
+        let lock = Self { path, file };
+        if !lock.is_current() {
+            return Err("Repository creation lock changed while opening".into());
         }
+        lock.file.try_lock().map_err(|error| {
+            format!(
+                "Repository worktree creation is busy or locking is unavailable ({}): {error}",
+                lock.path.display()
+            )
+        })?;
+        if !lock.is_current() {
+            return Err("Repository creation lock changed while acquiring".into());
+        }
+        Ok(lock)
+    }
+
+    fn is_current(&self) -> bool {
+        self.file
+            .metadata()
+            .is_ok_and(|owned| owned.is_file() && retains_identity(&self.path, &owned))
     }
 }
 
@@ -238,21 +284,7 @@ pub fn create(
     let root = root(destination_root)?;
     let root_identity = fs::metadata(&root).map_err(|e| e.to_string())?;
     let repo_identity = fs::metadata(&common).map_err(|e| e.to_string())?;
-    let lock_path = common.join("bodhi-worktree-create.lock");
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-        .map_err(|e| {
-            format!(
-                "Repository worktree creation is busy or metadata is not writable ({}): {e}",
-                lock_path.display()
-            )
-        })?;
-    let _lock = CreateLock {
-        path: lock_path,
-        file,
-    };
+    let lock = CreateLock::acquire(common.join("bodhi-worktree-create.lock"))?;
     let target = root.join(name);
     // create_dir reserves the exact destination across processes/repositories.
     // Existing directories (including empty ones and symlinks) are never reused.
@@ -266,6 +298,7 @@ pub fn create(
             || !retains_identity(&root, &root_identity)
             || !retains_identity(&target, &target_identity)
             || !retains_identity(&common, &repo_identity)
+            || !lock.is_current()
         {
             return Err("Repository or destination changed during worktree creation".into());
         }

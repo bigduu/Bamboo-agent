@@ -115,7 +115,10 @@ Unavailable paths are reported rather than dropped or pruned.
 
 Offline volumes, unwritable paths, existing destinations/branches, traversal,
 creation locks and boundary violations return explicit errors. There is no
-fallback directory or automatic retry. Preferences do not migrate checkouts.
+fallback directory or automatic retry. Creation uses a nonblocking OS advisory
+lock whose file is retained without truncation or deletion. An exiting process
+releases ownership; an active owner or unavailable locking returns an error.
+Preferences do not migrate checkouts.
 Opening an existing checkout uses the normal revisioned Project workspace binding
 API before Session selection; creation itself does not add another registry.
 No delete/prune/force operation or runtime-child GC is invoked by these endpoints.
