@@ -110,29 +110,43 @@ pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Optio
 pub(crate) fn build_root_orchestration_context_block_for_tools(
     session: &Session,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+    loading_mode: bamboo_domain::CapabilityLoadingMode,
 ) -> Option<ContextBlock> {
     let mut block = build_root_orchestration_context_block(session)?;
     if session.supervisor_incarnation_id().is_some() {
-        let routes = ["SubAgent", "work_dispatch", "session_control"]
+        let callable = crate::runtime::runner::loop_execution::effective_callable_set_for_round(
+            session,
+            tool_schemas,
+            loading_mode,
+        );
+        let approved_routes = ["SubAgent", "work_dispatch", "session_control"]
             .into_iter()
             .filter(|name| {
-                tool_schemas
-                    .iter()
-                    .any(|schema| schema.function.name == *name)
+                session.allows_model_tool_execution(name)
+                    && tool_schemas
+                        .iter()
+                        .any(|schema| schema.function.name == *name)
             })
             .collect::<Vec<_>>();
-        let observation = if routes.is_empty()
-            && tool_schemas.iter().any(|schema| {
-                schema.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
-            }) {
-            serde_json::json!({"status":"discovery_required",
-                "recovery":"Use the existing read-only discovery gateway to load an already-approved orchestration tool. If no match or worker is available, report the recoverable blocker; never self-execute."})
+        let routes = approved_routes
+            .iter()
+            .copied()
+            .filter(|name| callable.contains_execution_name(name))
+            .collect::<Vec<_>>();
+        let deferred_routes = approved_routes
+            .iter()
+            .copied()
+            .filter(|name| !callable.contains_execution_name(name))
+            .collect::<Vec<_>>();
+        let observation = if routes.is_empty() && !deferred_routes.is_empty() {
+            serde_json::json!({"status":"discovery_required", "deferred_routes":deferred_routes,
+                "recovery":"Use the existing read-only discovery protocol to load an already-approved orchestration tool. If no match or worker is available, report the recoverable blocker; never self-execute."})
         } else if routes.is_empty() {
             serde_json::json!({"status":"blocked","reason":"delegation_tools_unavailable",
                 "recovery":"Ask the owner to provide an authorized delegation route; do not perform the execution here."})
         } else {
-            serde_json::json!({"status":"routes_exposed","routes":routes,
-                "caution":"Tool exposure is not worker readiness or target authorization. Report the actual admission error as a recoverable blocker."})
+            serde_json::json!({"status":"routes_exposed","routes":routes,"deferred_routes":deferred_routes,
+                "caution":"Current callable exposure is not worker readiness or target authorization. Report the actual admission error as a recoverable blocker."})
         };
         block.content.push_str(&format!(
             "\n\nCurrent delegation route observation: {observation}"
@@ -231,7 +245,9 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
 #[cfg(test)]
 #[test]
 fn supervisor_delegation_first_reports_unavailable_routes_without_claiming_worker_readiness() {
-    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    use bamboo_domain::{
+        CapabilityLoadingMode, SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID,
+    };
     let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
     supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
         incarnation_id: uuid::Uuid::new_v4(),
@@ -240,38 +256,51 @@ fn supervisor_delegation_first_reports_unavailable_routes_without_claiming_worke
         schema_type: "function".into(),
         function: bamboo_agent_core::tools::FunctionSchema {
             name: name.into(),
-            description: String::new(),
+            description: name.into(),
             parameters: serde_json::json!({"type":"object"}),
         },
     };
     for ultra in [false, true] {
         supervisor.set_root_orchestration_only(ultra).unwrap();
-        let blocked = build_root_orchestration_context_block_for_tools(
-            &supervisor,
-            &[schema("Read"), schema("vendor::SubAgent")],
-        )
-        .unwrap();
-        assert_eq!(blocked.stability, ContextBlockStability::RoundDynamic);
-        assert!(blocked.content.contains("delegation_tools_unavailable"));
-        assert!(blocked.content.contains("Ask the owner"));
-        assert!(!supervisor.allows_model_tool_execution("exec_command"));
-        let loading = build_root_orchestration_context_block_for_tools(
-            &supervisor,
-            &[bamboo_domain::discovery_control_fallback_schema()],
-        )
-        .unwrap();
-        assert!(loading.content.contains("discovery_required"));
-        assert!(!loading.content.contains("delegation_tools_unavailable"));
-        let exposed =
-            build_root_orchestration_context_block_for_tools(&supervisor, &[schema("SubAgent")])
-                .unwrap();
-        assert!(exposed.content.contains("routes_exposed"));
-        assert!(exposed
-            .content
-            .contains("not worker readiness or target authorization"));
+        for mode in [
+            CapabilityLoadingMode::LegacyFullCatalog,
+            CapabilityLoadingMode::Progressive,
+            CapabilityLoadingMode::StickyFallback,
+        ] {
+            let blocked = build_root_orchestration_context_block_for_tools(
+                &supervisor,
+                &[schema("Read"), schema("vendor::SubAgent")],
+                mode,
+            )
+            .unwrap();
+            assert_eq!(blocked.stability, ContextBlockStability::RoundDynamic);
+            assert!(blocked.content.contains("delegation_tools_unavailable"));
+            assert!(blocked.content.contains("Ask the owner"));
+            assert!(!supervisor.allows_model_tool_execution("exec_command"));
+            let initial = build_root_orchestration_context_block_for_tools(
+                &supervisor,
+                &[schema("Read"), schema("SubAgent")],
+                mode,
+            )
+            .unwrap();
+            if mode == CapabilityLoadingMode::LegacyFullCatalog {
+                assert!(initial.content.contains("routes_exposed"));
+                assert!(initial
+                    .content
+                    .contains("not worker readiness or target authorization"));
+            } else {
+                assert!(initial.content.contains("discovery_required"));
+                assert!(!initial.content.contains("routes_exposed"));
+            }
+        }
     }
     let ordinary = Session::new("ordinary", "model");
-    assert!(build_root_orchestration_context_block_for_tools(&ordinary, &[]).is_none());
+    assert!(build_root_orchestration_context_block_for_tools(
+        &ordinary,
+        &[],
+        CapabilityLoadingMode::Progressive
+    )
+    .is_none());
 }
 
 /// Build the single provider-visible Workspace block from authoritative

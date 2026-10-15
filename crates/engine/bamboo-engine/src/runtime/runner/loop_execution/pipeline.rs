@@ -87,7 +87,7 @@ fn take_test_post_llm_retry_failure(session: &mut Session) -> Option<AgentError>
     ))
 }
 
-fn effective_callable_set_for_round(
+pub(in crate::runtime::runner) fn effective_callable_set_for_round(
     session: &Session,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
     capability_loading_mode: CapabilityLoadingMode,
@@ -3308,7 +3308,7 @@ async fn run_pipeline_inner(
                             error,
                         );
                         let overflow_tool_schemas =
-                            crate::runtime::runner::round_lifecycle::request_tool_schemas_for_session(
+                            crate::runtime::runner::round_lifecycle::context_tool_schemas_for_session(
                                 session,
                                 &llm,
                                 &state.model_name,
@@ -5515,6 +5515,33 @@ mod tests {
             self.mode
         }
 
+        async fn provider_visible_tool_footprint(
+            &self,
+            ir: &bamboo_llm::PromptIR,
+            tools: &[bamboo_agent_core::tools::ToolSchema],
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<bamboo_llm::ProviderVisibleToolFootprint, LLMError> {
+            if self.mode == CapabilityLoadingMode::Progressive {
+                bamboo_llm::providers::openai::OpenAIProvider::new("test")
+                    .with_responses_only_models(vec!["gpt-5*".into()])
+                    .with_tool_search_execution(bamboo_llm::providers::common::openai_responses::ResponsesToolSearchExecution::Client)
+                    .provider_visible_tool_footprint(ir, tools, "gpt-5.6", None)
+                    .await
+            } else {
+                let projected =
+                    bamboo_llm::providers::common::openai_compat::tools_to_openai_compat_json(
+                        tools,
+                    );
+                Ok(bamboo_llm::ProviderVisibleToolFootprint {
+                    segments: vec![bamboo_llm::ProviderVisibleToolSegment {
+                        kind: bamboo_llm::ProviderVisibleToolSegmentKind::InitialFullDefinition,
+                        serialized: serde_json::to_string(&projected)?,
+                    }],
+                })
+            }
+        }
+
         async fn chat_stream(
             &self,
             _: &[Message],
@@ -5786,6 +5813,11 @@ mod tests {
                         !removed.contains_execution_name("SubAgent"),
                         "a saved loading receipt cannot restore a removed tool"
                     );
+                    let observation = crate::runtime::runner::session_setup::prompt_envelope::build_root_orchestration_context_block_for_tools(
+                        &restored, &[], mode,
+                    ).unwrap();
+                    assert!(observation.content.contains("delegation_tools_unavailable"));
+                    assert!(!observation.content.contains("routes_exposed"));
                 }
             }
         }

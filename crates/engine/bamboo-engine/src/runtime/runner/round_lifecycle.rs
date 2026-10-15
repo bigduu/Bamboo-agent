@@ -137,6 +137,31 @@ pub(crate) async fn request_tool_schemas_for_session<'a>(
     )
 }
 
+/// Keep the complete approved Supervisor catalog for host observations and
+/// validated loading state. Its provider wire projection is applied later,
+/// identically for footprint measurement and actual dispatch.
+pub(crate) async fn context_tool_schemas_for_session<'a>(
+    session: &Session,
+    llm: &Arc<dyn LLMProvider>,
+    model_name: &str,
+    tool_schemas: &'a [ToolSchema],
+) -> Cow<'a, [ToolSchema]> {
+    if session.supervisor_incarnation_id().is_some() {
+        return Cow::Owned(
+            tool_schemas
+                .iter()
+                .filter(|schema| {
+                    bamboo_domain::ClassifiedToolSchema::new((**schema).clone()).is_some_and(
+                        |entry| session.allows_model_tool_execution(entry.execution_name()),
+                    )
+                })
+                .cloned()
+                .collect(),
+        );
+    }
+    request_tool_schemas_for_session(session, llm, model_name, tool_schemas).await
+}
+
 pub(crate) struct RoundLlmExecutionOutput {
     pub stream_output: StreamHandlingOutput,
     pub prompt_tokens: u64,
@@ -222,7 +247,7 @@ pub(crate) async fn execute_llm_round(
     prompt_memory_exposure: Option<PromptMemoryExposureFrame<'_>>,
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
     let request_tool_schemas =
-        request_tool_schemas_for_session(session, llm, model_name, tool_schemas).await;
+        context_tool_schemas_for_session(session, llm, model_name, tool_schemas).await;
     let tool_schemas = request_tool_schemas.as_ref();
     let prepared = context_preparation::prepare_round_context(
         session,
