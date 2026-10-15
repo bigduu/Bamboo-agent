@@ -65,7 +65,7 @@ def main():
     env["CARGO_TARGET_DIR"] = str(args.target.resolve())
     env["CARGO_BUILD_JOBS"] = "1"
     for variable, name in [("CARGO_BUILD_BUILD_DIR", "intermediate"), ("TMPDIR", "tmp")]:
-        directory = args.target.resolve().parent() / name
+        directory = args.target.resolve().parent / name
         directory.mkdir(parents=True, exist_ok=True)
         env[variable] = str(directory)
     drivers = {}
