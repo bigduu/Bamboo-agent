@@ -78,3 +78,38 @@ async fn allowed_public_collapse_reports_running_without_changing_ack_or_request
     assert!(report.running_seen);
     assert!(!report.forbidden_running_seen);
 }
+
+#[tokio::test]
+async fn large_tool_future_wrappers_do_not_embed_captured_payload_in_host_state() {
+    fn large_future() -> impl Future<Output = ()> {
+        let payload = [7_u8; 128 * 1024];
+        async move {
+            assert_eq!(std::hint::black_box(&payload)[0], 7);
+        }
+    }
+    let plain = large_future();
+    assert!(std::mem::size_of_val(&plain) >= 128 * 1024);
+    drop(plain);
+    let observed = observe_tool_suspension(false, large_future());
+    let disabled = with_suspension_disabled(large_future());
+    let disabled_report = with_suspension_disabled_observed(large_future());
+    let (token, _) =
+        observe_tool_suspension(false, async { capture_suspension_restriction().unwrap() }).await;
+    let rebound = token.scope(large_future());
+    for size in [
+        std::mem::size_of_val(&observed),
+        std::mem::size_of_val(&disabled),
+        std::mem::size_of_val(&disabled_report),
+        std::mem::size_of_val(&rebound),
+    ] {
+        assert!(
+            size < 4096,
+            "host wrapper retained {size} bytes of captured tool state"
+        );
+    }
+    assert_eq!(observed.await.1, ToolSuspensionObservation::default());
+    disabled.await;
+    assert!(!disabled_report.await.1);
+    rebound.await;
+    assert!(suspension_allowed());
+}

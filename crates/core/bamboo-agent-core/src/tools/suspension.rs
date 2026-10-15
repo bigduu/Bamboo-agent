@@ -32,10 +32,18 @@ impl SuspensionRestriction {
         }
     }
     /// A nested scope inherits the current shared report; denial is monotonic OR.
-    pub async fn scope<F: Future>(&self, future: F) -> F::Output {
-        let mut token = capture_suspension_restriction().unwrap_or_else(|| self.clone());
-        token.deny |= self.deny;
-        TOOL_SUSPENSION_SCOPE.scope(token, future).await
+    pub fn scope<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
+        // Allocate before constructing the async wrapper: embedding a large
+        // tool/runner future in every nested observer can overflow its host.
+        let future = Box::pin(future);
+        let inherited = self.clone();
+        let deny = self.deny;
+        async move {
+            // Resolve task-local inheritance when polled, not constructed.
+            let mut token = capture_suspension_restriction().unwrap_or(inherited);
+            token.deny |= deny;
+            TOOL_SUSPENSION_SCOPE.scope(token, future).await
+        }
     }
 }
 pub fn capture_suspension_restriction() -> Option<SuspensionRestriction> {
@@ -47,24 +55,33 @@ pub fn current_tool_suspension_scope() -> Option<SuspensionRestriction> {
 /// Observing before Start changes no tool result. Nested false cannot weaken true.
 /// Keep a captured token outside a separately imposed timeout if that timeout
 /// could discard this future's returned report.
-pub async fn observe_tool_suspension<F: Future>(
+pub fn observe_tool_suspension<F: Future>(
     deny: bool,
     future: F,
-) -> (F::Output, ToolSuspensionObservation) {
-    let mut token = capture_suspension_restriction().unwrap_or_else(|| SuspensionRestriction {
-        shared: Arc::new(SharedObservation::default()),
-        deny: false,
-    });
-    token.deny |= deny;
-    let output = token.scope(future).await;
-    (output, token.observation())
+) -> impl Future<Output = (F::Output, ToolSuspensionObservation)> {
+    let future = Box::pin(future);
+    async move {
+        let mut token = capture_suspension_restriction().unwrap_or_else(|| SuspensionRestriction {
+            shared: Arc::new(SharedObservation::default()),
+            deny: false,
+        });
+        token.deny |= deny;
+        let output = TOOL_SUSPENSION_SCOPE.scope(token.clone(), future).await;
+        (output, token.observation())
+    }
 }
-pub async fn with_suspension_disabled<F: Future>(future: F) -> F::Output {
-    observe_tool_suspension(true, future).await.0
+pub fn with_suspension_disabled<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let observed = observe_tool_suspension(true, future);
+    async move { observed.await.0 }
 }
-pub async fn with_suspension_disabled_observed<F: Future>(future: F) -> (F::Output, bool) {
-    let (output, seen) = observe_tool_suspension(true, future).await;
-    (output, seen.forbidden_running_seen)
+pub fn with_suspension_disabled_observed<F: Future>(
+    future: F,
+) -> impl Future<Output = (F::Output, bool)> {
+    let observed = observe_tool_suspension(true, future);
+    async move {
+        let (output, seen) = observed.await;
+        (output, seen.forbidden_running_seen)
+    }
 }
 pub fn suspension_allowed() -> bool {
     capture_suspension_restriction().is_none_or(|token| !token.deny)
