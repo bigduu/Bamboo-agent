@@ -673,10 +673,12 @@ async fn counted_public_request_reuses_activation_owner_and_rejects_overlap() {
     storage.save_session(&session).await.unwrap();
     let mut conflicting = session.clone();
     let original_conflicting = serde_json::to_value(&conflicting).unwrap();
+    // Earlier stop/config clones must not inherit the consumed request's owner.
+    let counted = CountedLoopConfig::new(2, 2);
     let request = |tx| {
         ExecuteRequestBuilder::new(PROMPT, tx, CancellationToken::new())
             .model("fake-only")
-            .counted_loop(CountedLoopConfig::new(2, 2))
+            .counted_loop(counted.clone())
             .build()
     };
     let (raw_tx, _) = mpsc::channel(512);
@@ -689,6 +691,17 @@ async fn counted_public_request_reuses_activation_owner_and_rejects_overlap() {
     let (tx, mut rx) = mpsc::channel(512);
     let (result, ()) = tokio::join!(agent.execute_direct(&mut session, request(tx)), async {
         entered.notified().await;
+        let (raw_tx, _) = mpsc::channel(512);
+        let error = agent
+            .execute(&mut conflicting, request(raw_tx))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("activation owner"));
+        assert_eq!(
+            serde_json::to_value(&conflicting).unwrap(),
+            original_conflicting
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         let (conflict_tx, _) = mpsc::channel(512);
         assert!(agent
             .execute_direct(&mut conflicting, request(conflict_tx))
@@ -795,4 +808,116 @@ async fn counted_rejects_mismatched_admitted_initial_input() {
     assert!(result.is_err());
     assert_eq!(serde_json::to_value(&session).unwrap(), before);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+}
+
+struct CancelAfterRound {
+    cancel: CancellationToken,
+    stop: Option<CountedLoopConfig>,
+}
+
+#[async_trait]
+impl AgentHook for CancelAfterRound {
+    fn point(&self) -> AgentHookPoint {
+        AgentHookPoint::AfterRound
+    }
+    async fn run(&self, _: AgentHookPoint, _: &HookPayload, _: &Session) -> HookResult {
+        if let Some(stop) = self.stop.as_ref() {
+            stop.stop();
+        }
+        self.cancel.cancel();
+        HookResult::Continue
+    }
+}
+
+#[tokio::test]
+async fn counted_session_cancel_wins_simultaneous_stop_and_budget_boundaries() {
+    for tools in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let mut cfg = if tools { config(1, 1) } else { config(2, 4) };
+        let stop = (!tools).then(|| cfg.counted_loop.clone().unwrap());
+        let mut hooks = crate::runtime::hooks::HookRunner::new();
+        hooks.register(Arc::new(CancelAfterRound {
+            cancel: cancel.clone(),
+            stop,
+        }));
+        cfg.hook_runner = Arc::new(hooks);
+        let mut session = Session::new("counted-fixture", "fake-only");
+        let storage = add_persistence(dir.path(), &mut cfg, &session).await;
+        let provider = Arc::new(FakeProvider {
+            tools_forever: tools,
+            durable: Some(storage.clone()),
+            ..Default::default()
+        });
+        let (result, events) = run(&mut session, cfg, provider.clone(), cancel).await;
+        assert!(result.unwrap_err().is_cancelled());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(complete_count(&events), 0);
+        let durable = storage.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            read_loop_state(&durable).unwrap().unwrap().status,
+            LoopStatus::Cancelled
+        );
+    }
+}
+
+struct CancelAtTerminalCheckpoint {
+    inner: Arc<dyn RuntimeSessionPersistence>,
+    cancel: CancellationToken,
+}
+
+#[async_trait]
+impl RuntimeSessionPersistence for CancelAtTerminalCheckpoint {
+    async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.inner.save_runtime_session(session).await
+    }
+    async fn load_runtime_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+        self.inner.load_runtime_session(id).await
+    }
+    async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.inner.checkpoint_runtime_session(session).await?;
+        if read_loop_state(session).unwrap().is_some_and(|state| {
+            matches!(
+                state.status,
+                LoopStatus::Stopped | LoopStatus::BudgetExhausted
+            )
+        }) {
+            self.cancel.cancel();
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn counted_cancel_during_terminal_checkpoint_keeps_cancelled_error_and_no_complete() {
+    for tools in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let mut cfg = if tools { config(1, 1) } else { config(2, 4) };
+        if !tools {
+            let mut hooks = crate::runtime::hooks::HookRunner::new();
+            hooks.register(Arc::new(StopAfterRound(cfg.counted_loop.clone().unwrap())));
+            cfg.hook_runner = Arc::new(hooks);
+        }
+        let mut session = Session::new("counted-fixture", "fake-only");
+        let storage = add_persistence(dir.path(), &mut cfg, &session).await;
+        cfg.persistence = Some(Arc::new(CancelAtTerminalCheckpoint {
+            inner: cfg.persistence.take().unwrap(),
+            cancel: cancel.clone(),
+        }));
+        let provider = Arc::new(FakeProvider {
+            tools_forever: tools,
+            durable: Some(storage.clone()),
+            ..Default::default()
+        });
+        let (result, events) = run(&mut session, cfg, provider.clone(), cancel).await;
+        assert!(result.unwrap_err().is_cancelled());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(complete_count(&events), 0);
+        let durable = storage.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            read_loop_state(&durable).unwrap().unwrap().status,
+            LoopStatus::Cancelled
+        );
+    }
 }

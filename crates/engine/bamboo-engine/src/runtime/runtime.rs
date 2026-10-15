@@ -828,10 +828,15 @@ impl AgentRuntime {
             Some(router) => router.current_run_id(&session.id).await,
             None => None,
         };
-        if req.counted_loop.is_some() && guidance_active_run_id.is_none() {
-            return Err(bamboo_agent_core::AgentError::Budget(
-                "counted loop requires the existing Session activation owner".into(),
-            ));
+        if let Some(counted) = req.counted_loop.as_ref() {
+            if !counted
+                .owns_session(self.activation_router.as_ref(), session)
+                .await
+            {
+                return Err(bamboo_agent_core::AgentError::Budget(
+                    "counted loop requires the caller's exact Session activation owner".into(),
+                ));
+            }
         }
         let system_prompt = extract_system_prompt(session);
         let config = self.config.read().await;

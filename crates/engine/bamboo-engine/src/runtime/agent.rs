@@ -370,7 +370,7 @@ impl Agent {
     async fn execute_direct_registered_bound(
         &self,
         session: &mut Session,
-        req: ExecuteRequest,
+        mut req: ExecuteRequest,
         mut lease: DirectExecutionLease,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     ) -> crate::runtime::runner::Result<()> {
@@ -388,6 +388,9 @@ impl Agent {
                 "direct execution lease is missing its router registration".to_string(),
             )
         })?;
+        if let Some(counted) = req.counted_loop.as_mut() {
+            counted.bind_owner(registration.ownership(), session);
+        }
         let result = self.execute_with_inputs(session, req, inputs).await;
 
         // Freeze what this provider execution actually consumed. Compatibility

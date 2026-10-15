@@ -2949,6 +2949,16 @@ pub(super) async fn run_pipeline(
 ) -> super::super::Result<bool> {
     let result =
         boxed_pipeline_inner(session, event_tx, llm, tools, cancel_token, config, state).await;
+    // Stop/budget checkpoint awaits can race Session cancellation. Until a
+    // Complete was actually published, cancellation retains its error path.
+    let result = if config.counted_loop.is_some()
+        && cancel_token.is_cancelled()
+        && matches!(result, Ok(false))
+    {
+        Err(AgentError::Cancelled)
+    } else {
+        result
+    };
 
     // This outer lifecycle fence deliberately catches every return from the
     // implementation below, including `?` from prompt refresh and hook paths.
@@ -3029,6 +3039,9 @@ async fn run_pipeline_inner(
     );
 
     loop {
+        if config.counted_loop.is_some() && cancel_token.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
         // Startup has already admitted this run's input. A runtime-only wakeup
         // cannot spend model calls while the Human progress question is pending,
         // including auxiliary evaluations and prompt-memory work below.

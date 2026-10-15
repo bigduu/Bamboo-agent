@@ -19,11 +19,28 @@ const MAX_STATE_BYTES: usize = MAX_LOOP_PROMPT_BYTES * 8;
 /// Host-supplied bounds for one live generation. There is no implicit default.
 /// Clones share the stop signal. Stop drains an already admitted iteration's
 /// current round/tool batch; it admits no subsequent round or iteration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CountedLoopConfig {
     pub max_iterations: u32,
     pub max_total_rounds: u32,
     stop: CancellationToken,
+    owner: Option<CountedLoopOwner>,
+}
+
+#[derive(Clone)]
+struct CountedLoopOwner {
+    run: crate::session_activation::SessionRunOwnership,
+    session_birth: chrono::DateTime<chrono::Utc>,
+}
+
+impl std::fmt::Debug for CountedLoopConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CountedLoopConfig")
+            .field("max_iterations", &self.max_iterations)
+            .field("max_total_rounds", &self.max_total_rounds)
+            .field("stopped", &self.stop.is_cancelled())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CountedLoopConfig {
@@ -32,7 +49,34 @@ impl CountedLoopConfig {
             max_iterations,
             max_total_rounds,
             stop: CancellationToken::new(),
+            owner: None,
         }
+    }
+
+    /// Bind only the request value after consuming its real execution lease.
+    /// Earlier stop/config clones remain unbound and convey no ownership.
+    pub(crate) fn bind_owner(
+        &mut self,
+        run: crate::session_activation::SessionRunOwnership,
+        session: &Session,
+    ) {
+        self.owner = Some(CountedLoopOwner {
+            run,
+            session_birth: session.created_at,
+        });
+    }
+
+    pub(crate) async fn owns_session(
+        &self,
+        router: Option<&std::sync::Arc<crate::session_activation::SessionActivationRouter>>,
+        session: &Session,
+    ) -> bool {
+        let Some(owner) = self.owner.as_ref() else {
+            return false;
+        };
+        owner.session_birth == session.created_at
+            && router.is_some_and(|router| owner.run.matches_router(router))
+            && owner.run.is_current(&session.id).await
     }
 
     /// Idempotent, live-only stop. Ordinary Session cancellation remains
@@ -279,6 +323,15 @@ pub(crate) async fn before_round(
     if state.owner_execution_id != execution_id {
         return Err(invalid("execution owner changed"));
     }
+    if let Some(owner) = config
+        .counted_loop
+        .as_ref()
+        .and_then(|counted| counted.owner.as_ref())
+    {
+        if owner.session_birth != session.created_at || !owner.run.is_current(&session.id).await {
+            return Err(invalid("execution ownership is no longer current"));
+        }
+    }
     if !state.live() {
         return Ok(false);
     }
@@ -394,10 +447,11 @@ pub(crate) async fn finish(
     if state.generation != generation {
         return Err(invalid("generation changed during execution"));
     }
-    if !state.live() {
+    let cancelled = result.as_ref().is_err_and(|error| error.is_cancelled());
+    if !state.live() && !cancelled {
         return Ok(());
     }
-    state.status = if result.as_ref().is_err_and(|error| error.is_cancelled()) {
+    state.status = if cancelled {
         LoopStatus::Cancelled
     } else if result.is_err() {
         LoopStatus::Failed

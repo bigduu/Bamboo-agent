@@ -5,8 +5,10 @@ Session. It reuses the existing activation owner, runner, provider/context,
 tool policy, cancellation and Session checkpoint. It creates no Session, timer,
 worker, queue or scheduler. A caller must use its existing registered execution
 owner; `Agent::execute_direct` obtains that owner when the shared activation
-router is installed. Raw execution without a registered owner rejects this
-opt-in feature before submission.
+router is installed. Its consumed registration privately binds the exact router,
+Session lifetime and run to that request. Earlier config/stop clones acquire no
+ownership. Raw execution rejects this opt-in feature even while another caller's
+run owns the same Session; the mere presence of an owner grants no execution.
 
 `ExecuteRequestBuilder::counted_loop(CountedLoopConfig::new(k, rounds))` opts in.
 Both bounds are mandatory: 1–100 iterations, at most 1,000 total runner rounds,
@@ -30,6 +32,8 @@ Clones of `CountedLoopConfig` share an idempotent `stop()` signal. Stop drains
 the current admitted round/tool batch and prevents any later round or iteration;
 it does not undo external effects or inject a new prompt. Session cancellation
 retains the normal cancellation/error path and does not fabricate a `Complete`.
+Until a completion has been published, cancellation wins concurrent stop/budget
+early exits, including cancellation during their checkpoint awaits.
 No counted-termination model judge is called. Enabled Gold plus counted mode is
 rejected before either executes: objective binding and combination semantics
 belong to #897. Existing Guardian/final-evidence/Stop-hook gates run only after
