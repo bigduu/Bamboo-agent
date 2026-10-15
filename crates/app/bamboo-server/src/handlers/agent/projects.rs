@@ -360,6 +360,7 @@ fn project_error(error: ProjectStoreError) -> HttpResponse {
         ProjectStoreError::AlreadyExists(_)
         | ProjectStoreError::NotArchived(_)
         | ProjectStoreError::Validation(_)
+        | ProjectStoreError::UnsupportedManifestSchema { .. }
         | ProjectStoreError::InvalidPathComponent(_)
         | ProjectStoreError::ProjectPathUnbindConflict { .. } => {
             (StatusCode::CONFLICT, error.to_string())
