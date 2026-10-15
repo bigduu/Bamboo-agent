@@ -18,6 +18,11 @@ the SemVer sections below are retained for the historical `0.x` releases.
 - Raised the minimum supported Rust version from 1.84 to 1.95 to match the
   locked dependency graph, with an explicit MSRV CI lane and graph audit.
 
+### Fixed
+
+- Reject Responses requests with more than 128 tool entries before conversion
+  output reservation or tool processing (#1799).
+
 ## [0.3.0] - 2026-02-26
 
 ### Security
