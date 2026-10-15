@@ -134,6 +134,7 @@ pub(crate) async fn run_agent_loop_with_config(
             counted_runtime_identity = Some((
                 state.runtime_state.run_id.clone(),
                 state.runtime_state.round.last_round_id.clone(),
+                state.runtime_state.execution_id.clone(),
             ));
         }
         counted_generation = crate::runtime::counted_loop::begin(
@@ -222,6 +223,7 @@ pub(crate) async fn run_agent_loop_with_config(
             counted_runtime_identity = Some((
                 state.runtime_state.run_id.clone(),
                 state.runtime_state.round.last_round_id.clone(),
+                state.runtime_state.execution_id.clone(),
             ));
         }
 
@@ -356,15 +358,16 @@ pub(crate) async fn run_agent_loop_with_config(
 
 fn fail_counted_runtime(
     session: &mut Session,
-    expected: Option<&(String, Option<String>)>,
+    expected: Option<&(String, Option<String>, Option<String>)>,
     error: &bamboo_agent_core::AgentError,
 ) {
-    let Some((run_id, last_round_id)) = expected else {
+    let Some((run_id, last_round_id, execution_id)) = expected else {
         return;
     };
     if let Some(runtime) = session.agent_runtime_state.as_mut() {
         if runtime.run_id == *run_id
             && runtime.round.last_round_id == *last_round_id
+            && runtime.execution_id == *execution_id
             && matches!(
                 runtime.status,
                 bamboo_domain::AgentStatusState::Initializing

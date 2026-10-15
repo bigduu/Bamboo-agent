@@ -183,6 +183,14 @@ pub fn read_loop_state(session: &Session) -> Result<Option<LoopState>, AgentErro
 async fn checkpoint(
     session: &mut Session,
     config: &AgentLoopConfig,
+    state: LoopState,
+) -> Result<(), AgentError> {
+    checkpoint_state(session, config.persistence.as_deref(), state).await
+}
+
+async fn checkpoint_state(
+    session: &mut Session,
+    persistence: Option<&dyn bamboo_domain::RuntimeSessionPersistence>,
     mut state: LoopState,
 ) -> Result<(), AgentError> {
     state.revision = state
@@ -194,13 +202,130 @@ async fn checkpoint(
         LOOP_STATE_METADATA_KEY.into(),
         serde_json::to_string(&state).map_err(|_| invalid("cannot serialize state"))?,
     );
-    if let Some(persistence) = config.persistence.as_ref() {
+    if let Some(persistence) = persistence {
         persistence
             .checkpoint_runtime_session(session)
             .await
             .map_err(|_| invalid("Session checkpoint failed; execution not admitted"))?;
     }
     Ok(())
+}
+
+/// Read-only refusal, also used before outer runtime/adapter finalizers.
+/// A raw caller never gains a lease or write authority by presenting metadata.
+pub(crate) fn reject_recovery(session: &Session) -> Result<(), AgentError> {
+    if read_loop_state(session)?
+        .is_some_and(|state| state.live() || state.status == LoopStatus::RecoveryUnsupported)
+    {
+        return Err(invalid(
+            "recovery unsupported; the prior admission is not replayed",
+        ));
+    }
+    Ok(())
+}
+
+fn interrupted_runtime_matches(
+    session_id: &str,
+    runtime: &bamboo_domain::AgentRuntimeState,
+    state: &LoopState,
+) -> bool {
+    match runtime.execution_id.as_deref() {
+        Some(id) => id == state.owner_execution_id,
+        // Only old snapshots without the typed identity may use the complete
+        // round namespace. A Session-id run_id or absent round proves nothing.
+        None => runtime.round.last_round_id.as_ref().is_some_and(|round| {
+            *round
+                == crate::runtime::runner::round_prelude::build_round_id(
+                    session_id,
+                    &state.owner_execution_id,
+                    runtime.round.current_round as usize,
+                )
+        }),
+    }
+}
+
+fn fail_interrupted_runtime(session: &mut Session, state: &LoopState) {
+    if let Some(runtime) = session.agent_runtime_state.as_mut() {
+        if interrupted_runtime_matches(&session.id, runtime, state)
+            && matches!(
+                runtime.status,
+                bamboo_domain::AgentStatusState::Initializing
+                    | bamboo_domain::AgentStatusState::Running
+                    | bamboo_domain::AgentStatusState::Finalizing
+                    | bamboo_domain::AgentStatusState::Completed
+            )
+        {
+            runtime.status = bamboo_domain::AgentStatusState::Failed;
+        }
+    }
+}
+
+/// Called only at an existing consumed/reserved lease boundary, before any
+/// preparation, tool replay, hooks or outer final save. No admission is minted.
+/// A real registration proves logical exclusion, never Actor write authority:
+/// callers must supply their already-bound execution persistence.
+pub(crate) async fn admit_registered(
+    session: &mut Session,
+    ownership: Option<&crate::session_activation::SessionRunOwnership>,
+    router: Option<&std::sync::Arc<crate::session_activation::SessionActivationRouter>>,
+    persistence: &dyn bamboo_domain::RuntimeSessionPersistence,
+) -> Result<(), AgentError> {
+    let presented = read_loop_state(session)?;
+    // Always read, even when the caller predates the first counted admission.
+    let durable = persistence
+        .load_runtime_session(&session.id)
+        .await
+        .map_err(|_| invalid("cannot inspect durable state; execution not admitted"))?;
+    let stored = durable.as_ref().map(read_loop_state).transpose()?.flatten();
+    if presented != stored
+        || (stored.is_some()
+            && durable
+                .as_ref()
+                .is_some_and(|fresh| fresh.created_at != session.created_at))
+    {
+        return Err(invalid(
+            "recovery unsupported; durable generation or revision changed; reload required",
+        ));
+    }
+    let Some(mut state) = stored else {
+        return Ok(());
+    };
+    if state.status == LoopStatus::RecoveryUnsupported {
+        return reject_recovery(session);
+    }
+    if !state.live() {
+        return Ok(());
+    }
+    let Some(ownership) = ownership else {
+        return reject_recovery(session);
+    };
+    if !router.is_some_and(|router| ownership.matches_router(router))
+        || !ownership.is_current(&session.id).await
+    {
+        return Err(invalid(
+            "recovery unsupported; exact activation owner required",
+        ));
+    }
+    if durable
+        .as_ref()
+        .is_some_and(|fresh| persistence.root_actor_execution_required(fresh))
+    {
+        return Err(invalid("recovery unsupported; bound Actor writer required"));
+    }
+    // Stage from canonical bytes, never from the rejected caller's clone. Its
+    // pending User, older waits or permission changes must not be checkpointed.
+    let mut staged = durable.expect("stored state requires durable Session");
+    fail_interrupted_runtime(&mut staged, &state);
+    state.status = LoopStatus::RecoveryUnsupported;
+    checkpoint_state(&mut staged, Some(persistence), state.clone()).await?;
+    // Reflect only this generation's outcome, preserving caller-owned input
+    // and unrelated runtime/wait state. Every adapter returns before saving it.
+    session.metadata.insert(
+        LOOP_STATE_METADATA_KEY.into(),
+        staged.metadata[LOOP_STATE_METADATA_KEY].clone(),
+    );
+    fail_interrupted_runtime(session, &state);
+    reject_recovery(session)
 }
 
 /// Runs before submission hooks or transcript mutation. A new activation cannot
@@ -210,20 +335,7 @@ pub(crate) async fn preflight(
     config: &AgentLoopConfig,
     prompt: &str,
 ) -> Result<(), AgentError> {
-    if let Some(mut previous) = read_loop_state(session)? {
-        if previous.live() {
-            previous.status = LoopStatus::RecoveryUnsupported;
-            checkpoint(session, config, previous).await?;
-            return Err(invalid(
-                "recovery unsupported; the prior admission is not replayed",
-            ));
-        }
-        if previous.status == LoopStatus::RecoveryUnsupported {
-            return Err(invalid(
-                "recovery unsupported; explicit host reconciliation required",
-            ));
-        }
-    }
+    reject_recovery(session)?;
     if let Some(counted) = config.counted_loop.as_ref() {
         validate_bounds(counted.max_iterations, counted.max_total_rounds, prompt)?;
         validate_bounds(

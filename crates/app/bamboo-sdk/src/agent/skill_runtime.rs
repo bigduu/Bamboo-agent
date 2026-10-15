@@ -167,6 +167,10 @@ impl DefaultSdkSkills {
             }
             result = agent.inner.begin_direct_execution(&session.id) => result?,
         };
+        agent
+            .inner
+            .check_direct_execution_admission(session, &lease)
+            .await?;
         let preparation = async {
             if cancel.is_cancelled() {
                 return Err(SdkError::Unsupported(

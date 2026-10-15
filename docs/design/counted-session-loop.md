@@ -62,11 +62,29 @@ admission followed by pre-dispatch cancellation retains the same failure fence. 
 reasons map to BudgetExhausted. Ticket question yields and other non-budget
 early exits retain their diagnostic and record recovery_unsupported; they do
 not imply a completed iteration or grant another admission.
-Persistence does not imply automatic recovery: a new activation
-finding Running/Finalizing state records `recovery_unsupported` and refuses to
-replay it, including on subsequent ordinary resume attempts. A suspended live
-loop also records this status. The host must explicitly reconcile that state;
-this slice provides no reconciliation or auto-resume API. It does not claim
+Persistence does not imply automatic recovery. Before preparation, tool replay,
+hooks or generic final saves, an existing direct/spawn registration checks the
+presented Session against fresh durable birth and complete LoopState (including
+generation/revision). A mismatch only refuses; it cannot erase newer state even
+when the clone predates the first loop. A raw caller has no ownership and only
+gets a read-only refusal. Registrations never replace the existing Actor writer:
+repair uses the already-bound execution persistence, and the native Child route
+refuses before backend preparation supplies that writer.
+
+For a matched interrupted Running/Finalizing generation, a proven replacement
+owner stages from the fresh canonical Session, records `recovery_unsupported`,
+and marks only the corresponding unfinished runtime Failed in one checkpoint.
+The optional typed `AgentRuntimeState.execution_id` records the actual pipeline
+UUID before the first startup mirror/checkpoint; ordinary new runtimes omit it.
+It matches LoopState.owner_execution_id without changing the stable run_id or
+the sealed SDK execution UUID. Legacy snapshots may match the complete round ID
+only when the typed execution ID is absent. Missing first-round identity,
+foreign runtimes, Suspended status and existing waits are preserved. The rejected
+caller clone's unadmitted input, older permissions or waits are never saved.
+All refusal paths return before normal execution finalizers; they never advance
+the inbox's executed watermark. Subsequent ordinary attempts also refuse.
+The host must explicitly reconcile that state; this slice provides no
+reconciliation or auto-resume API. It does not claim
 exactly-once external effects across crashes or independent processes.
 
 #896 owns start/status/update/pause/resume/stop application APIs, revisions and

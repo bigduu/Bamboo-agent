@@ -251,8 +251,33 @@ impl Agent {
         req: ExecuteRequest,
     ) -> crate::runtime::runner::Result<()> {
         let lease = self.begin_direct_execution(&session.id).await?;
+        self.check_direct_execution_admission(session, &lease)
+            .await?;
         self.prepare_external_session_for_execution(session).await?;
         self.execute_direct_registered(session, req, lease).await
+    }
+
+    /// Check counted-state admission under an already acquired opaque lease.
+    /// SDK facades call this before Project preparation or approved-tool replay.
+    /// This can refuse/fence an interrupted generation; it never replays it.
+    pub async fn check_direct_execution_admission(
+        &self,
+        session: &mut Session,
+        lease: &DirectExecutionLease,
+    ) -> crate::runtime::runner::Result<()> {
+        if lease.target_session_id != session.id {
+            return Err(bamboo_agent_core::AgentError::LLM(
+                "direct execution lease target does not match session".into(),
+            ));
+        }
+        let ownership = lease.registration.as_ref().map(|run| run.ownership());
+        super::counted_loop::admit_registered(
+            session,
+            ownership.as_ref(),
+            self.activation_router(),
+            self.persistence().as_ref(),
+        )
+        .await
     }
 
     /// Validate and publish Project/Workspace context for a caller-owned
@@ -341,6 +366,8 @@ impl Agent {
         lease: DirectExecutionLease,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     ) -> crate::runtime::runner::Result<()> {
+        self.check_direct_execution_admission(session, &lease)
+            .await?;
         let inherited = self.persistence().inherited_child_wait().or_else(|| {
             (!self.runtime.inherited_child_wait_captured)
                 .then(|| bamboo_domain::InheritedChildWait::capture(session))

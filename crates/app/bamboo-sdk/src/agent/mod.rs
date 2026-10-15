@@ -580,6 +580,10 @@ impl Agent {
                 Some(lease) => lease,
                 None => execution.inner.begin_direct_execution(&session.id).await?,
             };
+            execution
+                .inner
+                .check_direct_execution_admission(session, &direct_lease)
+                .await?;
             let sdk_guard = match (supplied_guard, execution.sdk_skills.as_ref()) {
                 (Some(guard), _) => Some(guard),
                 (None, Some(skills)) => {
@@ -2660,6 +2664,84 @@ mod reexecute_and_child_approval_tests {
             .expect("first owner task must not panic")
             .expect("first owner execution must succeed");
         assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn counted_recovery_refusal_precedes_sdk_approved_tool_replay() {
+        for status in ["running", "finalizing"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("config.json"),
+                r#"{
+                "provider":"anthropic",
+                "providers":{"anthropic":{"api_key":"test-key","model":"claude-test"}}
+            }"#,
+            )
+            .unwrap();
+            let tool = Arc::new(RealOutputTool::new());
+            let provider = Arc::new(CountingDoneProvider {
+                calls: AtomicUsize::new(0),
+            });
+            let agent = AgentBuilder::new()
+                .model("claude-test")
+                .instruction("must not replace the rejected System")
+                .provider(provider.clone())
+                .tool_shared(tool.clone())
+                .session_delivery(bamboo_engine::SessionActivationRouter::new())
+                .with_defaults_for_data_dir(dir.path().to_path_buf())
+                .await
+                .unwrap()
+                .build()
+                .unwrap();
+            let mut session = seed_gated_tool_session("counted-sdk-recovery", "approved-call");
+            session.metadata.insert(
+                PERMISSION_REEXECUTE_METADATA_KEY.into(),
+                "approved-call".into(),
+            );
+            session.add_message(Message::user("unreplayed approval"));
+            session.metadata.insert("runtime.counted_loop".into(), serde_json::json!({
+                "schema_version":1, "generation":"00000000-0000-4000-8000-000000000001",
+                "revision":4, "objective_revision":1, "owner_execution_id":"old-owner",
+                "objective":"bounded fixture", "max_iterations":1, "max_total_rounds":2,
+                "iterations_started":1, "iterations_completed": if status=="finalizing" {1} else {0},
+                "rounds_started":1, "status":status
+            }).to_string());
+            let runtime = session.agent_runtime_state.as_mut().unwrap();
+            runtime.execution_id = Some("old-owner".into());
+            runtime.status = bamboo_domain::AgentStatusState::Running;
+            agent.storage().save_session(&session).await.unwrap();
+            let original_messages = session.messages.clone();
+            let error = agent.run_session(&mut session).await.unwrap_err();
+            assert!(error.to_string().contains("recovery unsupported"));
+            assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(session.messages, original_messages);
+            let durable = agent
+                .storage()
+                .load_session(&session.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(durable.messages, original_messages);
+            assert_eq!(
+                durable
+                    .metadata
+                    .get(PERMISSION_REEXECUTE_METADATA_KEY)
+                    .map(String::as_str),
+                Some("approved-call")
+            );
+            assert_eq!(
+                durable.agent_runtime_state.unwrap().status,
+                bamboo_domain::AgentStatusState::Failed
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    &durable.metadata["runtime.counted_loop"]
+                )
+                .unwrap()["status"],
+                "recovery_unsupported"
+            );
+        }
     }
 
     #[tokio::test]

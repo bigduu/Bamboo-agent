@@ -767,6 +767,9 @@ impl AgentRuntime {
         req: ExecuteRequest,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     ) -> crate::runtime::runner::Result<()> {
+        // Refusals are not executions: never reach SessionEnd or the generic
+        // final checkpoint, and never mutate another counted owner's clone.
+        super::counted_loop::reject_recovery(session)?;
         struct SdkFinish {
             host: Option<Arc<dyn crate::runtime::config::SdkSkillExecutionHost>>,
             session_id: String,

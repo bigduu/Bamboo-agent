@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use tokio::sync::Notify;
 
+mod recovery_tests;
+
 const PROMPT: &str = "Inspect the next item using the accumulated context.";
 
 #[derive(Default)]
@@ -50,6 +52,15 @@ impl LLMProvider for FakeProvider {
                 .unwrap()
                 .unwrap();
             let state = read_loop_state(&stored).unwrap().unwrap();
+            assert_eq!(
+                stored
+                    .agent_runtime_state
+                    .as_ref()
+                    .unwrap()
+                    .execution_id
+                    .as_deref(),
+                Some(state.owner_execution_id.as_str())
+            );
             assert_eq!(
                 state.rounds_started, n as u32,
                 "admission precedes dispatch durably"
@@ -557,6 +568,22 @@ async fn counted_restart_is_explicitly_unsupported_and_never_replays_an_admissio
     storage.save_session(&session).await.unwrap();
     for _ in 0..2 {
         let mut reloaded = storage.load_session(&session.id).await.unwrap().unwrap();
+        let router = crate::session_activation::SessionActivationRouter::new();
+        let registration = router
+            .register_run(&session.id, "replacement-owner")
+            .await
+            .unwrap();
+        let persistence = bamboo_storage::LockedSessionStore::new(storage.clone());
+        let refused = crate::runtime::counted_loop::admit_registered(
+            &mut reloaded,
+            Some(&registration.ownership()),
+            Some(&router),
+            &persistence,
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.to_string().contains("recovery unsupported"));
+        registration.abandon().await;
         let mut cfg = config(3, 6);
         cfg.counted_loop = None; // even an ordinary resume must not replay it
         cfg.persistence = Some(Arc::new(bamboo_storage::LockedSessionStore::new(
@@ -836,7 +863,7 @@ fn counted_failure_correction_requires_the_exact_runtime_snapshot_and_preserves_
         AgentStatusState::Failed,
         AgentStatusState::Cancelled,
     ] {
-        for changed in ["none", "run", "round"] {
+        for changed in ["none", "run", "round", "execution"] {
             for cancelled in [false, true] {
                 let mut session = Session::new("counted-fixture", "fake-only");
                 let mut runtime = bamboo_domain::AgentRuntimeState::new(if changed == "run" {
@@ -852,9 +879,18 @@ fn counted_failure_correction_requires_the_exact_runtime_snapshot_and_preserves_
                     }
                     .into(),
                 );
+                runtime.execution_id = Some(if changed == "execution" {
+                    "successor-execution".into()
+                } else {
+                    "owned-execution".into()
+                });
                 runtime.status = status;
                 session.agent_runtime_state = Some(runtime);
-                let expected = ("owned".into(), Some("owned-round".into()));
+                let expected = (
+                    "owned".into(),
+                    Some("owned-round".into()),
+                    Some("owned-execution".into()),
+                );
                 let error = if cancelled {
                     bamboo_agent_core::AgentError::Cancelled
                 } else {
@@ -1041,6 +1077,7 @@ async fn counted_public_request_reuses_activation_owner_and_rejects_overlap() {
     assert!(error.to_string().contains("activation owner"));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     let (tx, mut rx) = mpsc::channel(512);
+    let session_id = session.id.clone();
     let (result, ()) = tokio::join!(agent.execute_direct(&mut session, request(tx)), async {
         entered.notified().await;
         let (raw_tx, _) = mpsc::channel(512);
@@ -1053,6 +1090,30 @@ async fn counted_public_request_reuses_activation_owner_and_rejects_overlap() {
             serde_json::to_value(&conflicting).unwrap(),
             original_conflicting
         );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        // An ordinary raw request has no ownership either. Its live snapshot
+        // must not fence or checkpoint the physically executing counted owner.
+        let mut ordinary = storage.load_session(&session_id).await.unwrap().unwrap();
+        let ordinary_before = serde_json::to_value(&ordinary).unwrap();
+        let durable_before =
+            serde_json::to_value(storage.load_session(&session_id).await.unwrap().unwrap())
+                .unwrap();
+        let (ordinary_tx, mut ordinary_rx) = mpsc::channel(512);
+        let error = agent
+            .execute(
+                &mut ordinary,
+                ExecuteRequestBuilder::new(PROMPT, ordinary_tx, CancellationToken::new()).build(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("recovery unsupported"));
+        assert_eq!(serde_json::to_value(&ordinary).unwrap(), ordinary_before);
+        assert_eq!(
+            serde_json::to_value(storage.load_session(&session_id).await.unwrap().unwrap())
+                .unwrap(),
+            durable_before
+        );
+        assert!(ordinary_rx.try_recv().is_err());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         let (conflict_tx, _) = mpsc::channel(512);
         assert!(agent
