@@ -29,6 +29,40 @@ pub(crate) fn sdk_runtime_active() -> bool {
     SDK_RUNTIME.try_with(|_| ()).is_ok()
 }
 
+/// Reject execution posture before legacy metadata can become ordinary prompt
+/// history. Old checkpoints need not have a canonical selected-ID mirror.
+/// Keep the original evidence intact for an explicit host correction.
+pub(super) fn validate_execution_selection(session: &Session) -> super::super::Result<()> {
+    if !session.model_orchestration_only_enabled() {
+        return Ok(());
+    }
+    let role = if session.supervisor_incarnation_id().is_some() {
+        "Supervisor delegation blocker"
+    } else {
+        "Root orchestration blocker"
+    };
+    let blocker = |reason: String| {
+        AgentError::Tool(format!(
+            "{role}: {reason}; clear the incompatible selection and delegate execution to an authorized worker"
+        ))
+    };
+    session
+        .validate_root_orchestration_compatibility()
+        .map_err(|error| blocker(error.to_string()))?;
+    if [
+        bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY,
+        bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY,
+        bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY,
+        SKILL_RUNTIME_PINNED_SNAPSHOT_KEY,
+    ]
+    .iter()
+    .any(|key| session.metadata.contains_key(*key))
+    {
+        return Err(blocker("persisted Skill or Workflow activation is incompatible with orchestration-only execution".into()));
+    }
+    Ok(())
+}
+
 pub(crate) async fn prepare_context(
     session: &mut Session,
     initial_message: &str,
@@ -37,9 +71,8 @@ pub(crate) async fn prepare_context(
     debug_logger: &DebugLogger,
     must_resume_pinned_activation: bool,
 ) -> super::super::Result<String> {
+    validate_execution_selection(session)?;
     if session.supervisor_incarnation_id().is_some() {
-        session.validate_root_orchestration_compatibility()
-            .map_err(|error| AgentError::Tool(format!("Supervisor delegation blocker: {error}; clear the incompatible selection and delegate execution to an authorized worker")))?;
         return Ok(String::new());
     }
     if config.sdk_skill_execution_host.is_some() || sdk_runtime_active() {

@@ -1519,7 +1519,7 @@ async fn sdk_real_loaded_instruction_converts_checkpointed_history_once_and_rest
 
 #[tokio::test]
 async fn supervisor_delegation_first_sdk_legacy_history_rejects_before_conversion_and_restart() {
-    for ultra in [false, true] {
+    for (trusted_supervisor, ultra) in [(true, false), (true, true), (false, true)] {
         for canonical_selection in [false, true] {
             let home = tempfile::tempdir().unwrap();
             let root = home.path().join("skills/sdk-loaded-history");
@@ -1532,17 +1532,25 @@ async fn supervisor_delegation_first_sdk_legacy_history_rejects_before_conversio
                 agent.new_session("legacy-history-fixture").unwrap(),
             )
             .await;
-            let bootstrap = agent
-                .supervisor_sessions()
-                .get_or_create_default("claude-test")
-                .await
-                .unwrap();
-            let mut session = agent
-                .storage()
-                .load_session(&bootstrap.session_id)
-                .await
-                .unwrap()
-                .unwrap();
+            let (mut session, incarnation) = if trusted_supervisor {
+                let bootstrap = agent
+                    .supervisor_sessions()
+                    .get_or_create_default("claude-test")
+                    .await
+                    .unwrap();
+                let session = agent
+                    .storage()
+                    .load_session(&bootstrap.session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                (session, Some(bootstrap.incarnation_id))
+            } else {
+                (
+                    agent.new_session("ordinary-ultra-legacy-history").unwrap(),
+                    None,
+                )
+            };
             session.set_root_orchestration_only(ultra).unwrap();
             // Model an old trusted Supervisor checkpoint with an actually loaded
             // Instruction episode. Current Supervisor tool admission stays on;
@@ -1553,10 +1561,7 @@ async fn supervisor_delegation_first_sdk_legacy_history_rejects_before_conversio
                 session.set_selected_skill_ids(vec!["sdk-loaded-history".into()]);
             }
             session = serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
-            assert_eq!(
-                session.supervisor_incarnation_id(),
-                Some(bootstrap.incarnation_id)
-            );
+            assert_eq!(session.supervisor_incarnation_id(), incarnation);
             assert_eq!(
                 session
                     .selected_skill_ids()
@@ -1600,7 +1605,7 @@ async fn supervisor_delegation_first_sdk_legacy_history_rejects_before_conversio
                     .unwrap()
                     .unwrap();
                 let result = resumed_agent.run_session(&mut resumed).await;
-                assert!(result.is_err(), "Supervisor Ultra={ultra}, canonical={canonical_selection}, restart={restart}: legacy Skill reached the provider");
+                assert!(result.is_err(), "Supervisor={trusted_supervisor}, Ultra={ultra}, canonical={canonical_selection}, restart={restart}: legacy Skill reached the provider");
                 assert!(result.unwrap_err().to_string().contains("delegat"));
                 assert!(
                     provider.0.lock().unwrap().is_empty(),
@@ -1617,10 +1622,8 @@ async fn supervisor_delegation_first_sdk_legacy_history_rejects_before_conversio
                     .sessions
                     .cache()
                     .get(&session.id)
-                    .unwrap()
-                    .read()
-                    .clone();
-                for snapshot in [&resumed, &durable, &cached] {
+                    .map(|entry| entry.read().clone());
+                for snapshot in [&resumed, &durable].into_iter().chain(cached.as_ref()) {
                     for (key, value) in &legacy_metadata {
                         assert_eq!(
                             snapshot.metadata.get(key),

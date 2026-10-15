@@ -3034,3 +3034,78 @@ fn disabling_cache_freeze_restores_live_guide_expansion() {
         .metadata
         .contains_key("prompt_tool_exposure_activated"));
 }
+
+#[tokio::test]
+async fn supervisor_delegation_first_legacy_selection_refuses_before_setup_side_effects() {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    for (trusted_supervisor, ultra) in [(true, false), (true, true), (false, true)] {
+        for key in [
+            bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY,
+            bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY,
+            bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY,
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY,
+        ] {
+            let mut session = if trusted_supervisor {
+                let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+                session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: uuid::Uuid::new_v4(),
+                };
+                session
+            } else {
+                Session::new("ordinary-ultra-old-activation", "model")
+            };
+            session.set_root_orchestration_only(ultra).unwrap();
+            session.metadata.insert(key.into(), "{}".into());
+            session.metadata.insert(
+                bamboo_skills::WORKFLOW_ACTIVATION_EVENT_METADATA_KEY.into(),
+                serde_json::json!({"type":"workflow.activated", "workflow_id":"old", "revision":1})
+                    .to_string(),
+            );
+            session.add_message(Message::system("Original system\n<!-- BAMBOO_SKILL_CONTEXT_START -->old execution instructions<!-- BAMBOO_SKILL_CONTEXT_END -->"));
+            let before = serde_json::to_value(&session).unwrap();
+            let persistence = Arc::new(RecordingPersistence::default());
+            let config = crate::runtime::config::AgentLoopConfig {
+                persistence: Some(persistence.clone()),
+                ..Default::default()
+            };
+            let tools = RecordingToolExecutor::default();
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+            let session_id = session.id.clone();
+            let result = super::prepare_session_for_loop(
+                &mut session,
+                "must not append this User",
+                &config,
+                &tools,
+                None,
+                &session_id,
+                &crate::runtime::runner::logging::DebugLogger::new(false),
+                false,
+                &event_tx,
+            )
+            .await;
+            assert!(result.unwrap_err().to_string().contains("delegat"));
+            assert_eq!(serde_json::to_value(&session).unwrap(), before);
+            assert!(persistence.sessions.lock().unwrap().is_empty());
+            assert!(tools.calls.lock().unwrap().is_empty());
+            assert!(event_rx.try_recv().is_err());
+        }
+    }
+
+    // A legacy checkpoint does not invent either Supervisor identity or Ultra.
+    let mut ordinary = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    ordinary.metadata.insert("role".into(), "supervisor".into());
+    ordinary.metadata.insert(
+        bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY.into(),
+        "{}".into(),
+    );
+    let child = Session::new_child_of("legacy-worker", &ordinary, "model", "worker");
+    for mut session in [ordinary, child] {
+        session.metadata.insert(
+            bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY.into(),
+            "{}".into(),
+        );
+        let before = serde_json::to_value(&session).unwrap();
+        super::legacy_instruction::validate_execution_selection(&session).unwrap();
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+    }
+}
