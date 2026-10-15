@@ -6940,6 +6940,17 @@ impl Storage for SessionStoreV2 {
         self.load_session_unlocked(session_id).await
     }
 
+    async fn load_execution_admission_snapshot(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Session>> {
+        validate_session_id(session_id)?;
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let _session = self.acquire_session_maintenance_lock(session_id).await?;
+        self.load_execution_admission_unchecked(session_id).await
+    }
+
     async fn delete_session(&self, session_id: &str) -> io::Result<bool> {
         // Historical API deletes sessions. In V2, treat this as recursive and forced.
         self.delete_session_recursive(session_id, true).await
