@@ -5542,6 +5542,34 @@ mod tests {
             )));
             let messages = ir.flatten();
             let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            let marker = "Current delegation route observation: ";
+            let latest = messages
+                .iter()
+                .rev()
+                .find_map(|message| {
+                    message
+                        .content
+                        .rfind(marker)
+                        .map(|index| &message.content[index + marker.len()..])
+                })
+                .expect("Supervisor request must report current delegation state");
+            let observation = serde_json::Deserializer::from_str(latest)
+                .into_iter::<serde_json::Value>()
+                .next()
+                .unwrap()
+                .unwrap();
+            if count == 0 {
+                assert_eq!(
+                    observation["status"], "discovery_required",
+                    "deferred definitions are not callable yet"
+                );
+            } else {
+                assert_eq!(
+                    observation["status"], "routes_exposed",
+                    "validated discovery must be reflected in the next request"
+                );
+                assert_eq!(observation["routes"], serde_json::json!(["SubAgent"]));
+            }
             if self.mode == CapabilityLoadingMode::StickyFallback {
                 assert!(tools.iter().any(|schema| schema.function.name
                     == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
