@@ -23,6 +23,9 @@ use super::errors::plugin_error_response;
 use crate::app_state::AppState;
 use crate::plugin_installer::ServerPluginInstaller;
 
+mod lifecycle;
+pub use lifecycle::start_nova_app;
+
 const NOVA_PUBLIC_KEY: &str = "e3c429e1be50098b12c6f45737abf457189b668535875b5b3e2b4349be86ea59";
 const MAX_ARCHIVE: u64 = 128 * 1024 * 1024;
 const MAX_OUTPUT: u64 = 64 * 1024;
@@ -166,6 +169,8 @@ struct Setup {
     manual_guidance: String,
     desktop_server_id: Option<String>,
     desktop_readiness: &'static str,
+    observation: lifecycle::Observation,
+    start: Availability,
 }
 
 struct Inspection {
@@ -676,7 +681,7 @@ async fn inspect_locked(
     };
     let mut app = None;
     let mut command = None;
-    let mut desktop_id = None;
+    let mut desktop_manifest = None;
     let config = state.config.read().await;
     if let Some(entry) = entry {
         connector.state = if entry.status == PluginInstallStatus::Installing {
@@ -705,8 +710,8 @@ async fn inspect_locked(
                 {
                     connector.state = "verified";
                     connector.reason = None;
-                    desktop_id = desktop_server_id(entry, &manifest, &host.os, &config.mcp.servers);
                     command = Some(binary);
+                    desktop_manifest = Some(manifest);
                 }
             }
         }
@@ -766,6 +771,19 @@ async fn inspect_locked(
         .as_ref()
         .map(|report| report.next_action.clone())
         .unwrap_or_else(|| manual_guidance(unavailable));
+    // CLI status can take time. Recheck the exact owned transport against the
+    // current configuration before associating an MCP snapshot with this App.
+    let desktop_id = match (entry, desktop_manifest.as_ref()) {
+        (Some(entry), Some(manifest)) => desktop_server_id(
+            entry,
+            manifest,
+            &host.os,
+            &state.config.read().await.mcp.servers,
+        ),
+        _ => None,
+    };
+    let start = lifecycle::start_availability(&host, &connector, &capability, app.as_ref());
+    let observation = lifecycle::observe(state, desktop_id.as_deref());
     Ok(Inspection {
         command,
         report: Setup {
@@ -782,6 +800,8 @@ async fn inspect_locked(
             manual_guidance: guidance,
             desktop_server_id: desktop_id,
             desktop_readiness: "not_tested",
+            observation,
+            start,
         },
     })
 }

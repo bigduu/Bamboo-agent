@@ -1107,3 +1107,5 @@ async fn already_installed_is_reported_without_retrying_or_replacing_the_app() {
         "already_installed"
     );
 }
+
+mod lifecycle_tests;
