@@ -191,17 +191,29 @@ async fn checkpoint(
 async fn checkpoint_state(
     session: &mut Session,
     persistence: Option<&dyn bamboo_domain::RuntimeSessionPersistence>,
-    mut state: LoopState,
+    state: LoopState,
 ) -> Result<(), AgentError> {
+    stage_state(session, state)?;
+    persist_checkpoint(session, persistence).await
+}
+
+fn stage_state(session: &mut Session, mut state: LoopState) -> Result<String, AgentError> {
     state.revision = state
         .revision
         .checked_add(1)
         .ok_or_else(|| invalid("state revision exhausted"))?;
     state.validate()?;
-    session.metadata.insert(
-        LOOP_STATE_METADATA_KEY.into(),
-        serde_json::to_string(&state).map_err(|_| invalid("cannot serialize state"))?,
-    );
+    let encoded = serde_json::to_string(&state).map_err(|_| invalid("cannot serialize state"))?;
+    session
+        .metadata
+        .insert(LOOP_STATE_METADATA_KEY.into(), encoded.clone());
+    Ok(encoded)
+}
+
+async fn persist_checkpoint(
+    session: &mut Session,
+    persistence: Option<&dyn bamboo_domain::RuntimeSessionPersistence>,
+) -> Result<(), AgentError> {
     if let Some(persistence) = persistence {
         persistence
             .checkpoint_runtime_session(session)
@@ -214,11 +226,85 @@ async fn checkpoint_state(
 /// Read-only refusal, also used before outer runtime/adapter finalizers.
 /// A raw caller never gains a lease or write authority by presenting metadata.
 pub(crate) fn reject_recovery(session: &Session) -> Result<(), AgentError> {
-    if read_loop_state(session)?
-        .is_some_and(|state| state.live() || state.status == LoopStatus::RecoveryUnsupported)
-    {
+    if read_loop_state(session)?.is_some_and(|state| {
+        state.live()
+            || state.status == LoopStatus::RecoveryUnsupported
+            || has_pending_repeat(session, &state)
+    }) {
         return Err(invalid(
             "recovery unsupported; the prior admission is not replayed",
+        ));
+    }
+    Ok(())
+}
+
+// A generated continuation is not a new external admission. Match the exact
+// unfinished iteration; older completed repeats in this generation are history.
+fn has_pending_repeat(session: &Session, state: &LoopState) -> bool {
+    if state.iterations_started == state.iterations_completed {
+        return false;
+    }
+    let counted = |message: &Message| {
+        message
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("runtime_kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("counted_loop_iteration")
+    };
+    let pending = session.messages.iter().rposition(|message| {
+        message.role == bamboo_agent_core::Role::User
+            && counted(message)
+            && message.metadata.as_ref().is_some_and(|meta| {
+                meta.get("loop_generation")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(state.generation.as_str())
+                    && meta
+                        .get("objective_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(state.objective_revision)
+                    && meta.get("iteration").and_then(serde_json::Value::as_u64)
+                        == Some(u64::from(state.iterations_started))
+            })
+    });
+    pending.is_some_and(|position| {
+        !session.messages[position + 1..].iter().any(|message| {
+            message.role == bamboo_agent_core::Role::User
+                && !counted(message)
+                && !bamboo_domain::session::is_system_resume_message(message)
+        })
+    })
+}
+
+/// A failed error save can leave an unfinished terminal clone without the
+/// repeat already committed on disk. Public raw execution checks this before
+/// any hooks/finalizers. Reading never grants a lease or checkpoint authority.
+pub(crate) async fn reject_ambiguous_reentry(
+    session: &Session,
+    persistence: &dyn bamboo_domain::RuntimeSessionPersistence,
+) -> Result<(), AgentError> {
+    reject_recovery(session)?;
+    let Some(state) = read_loop_state(session)? else {
+        return Ok(());
+    };
+    if state.iterations_started == state.iterations_completed {
+        return Ok(());
+    }
+    let durable = persistence
+        .load_runtime_admission_snapshot(&session.id)
+        .await
+        .map_err(|_| invalid("cannot inspect durable state; recovery unsupported"))?;
+    let Some(durable) = durable else {
+        return Err(invalid(
+            "recovery unsupported; durable state missing; reload required",
+        ));
+    };
+    reject_recovery(&durable)?;
+    if durable.created_at != session.created_at
+        || read_loop_state(&durable)?.as_ref() != Some(&state)
+    {
+        return Err(invalid(
+            "recovery unsupported; durable generation or revision changed; reload required",
         ));
     }
     Ok(())
@@ -273,7 +359,7 @@ pub(crate) async fn admit_registered(
     let presented = read_loop_state(session)?;
     // Always read, even when the caller predates the first counted admission.
     let durable = persistence
-        .load_runtime_session(&session.id)
+        .load_runtime_admission_snapshot(&session.id)
         .await
         .map_err(|_| invalid("cannot inspect durable state; execution not admitted"))?;
     let stored = durable.as_ref().map(read_loop_state).transpose()?.flatten();
@@ -294,6 +380,13 @@ pub(crate) async fn admit_registered(
         return reject_recovery(session);
     }
     if !state.live() {
+        reject_recovery(session)?;
+        // A failed error-save can leave the live clone without the repeat
+        // that was already committed. Only canonical input can clear that
+        // ambiguity; a preappend SDK submission is not a recovery capability.
+        if let Some(fresh) = durable.as_ref() {
+            reject_recovery(fresh)?;
+        }
         return Ok(());
     }
     let Some(ownership) = ownership else {
@@ -476,6 +569,7 @@ pub(crate) async fn before_round(
         checkpoint(session, config, state).await?;
         return Ok(false);
     }
+    let mut staged_repeat = None;
     if state.status == LoopStatus::Running && state.iterations_started == state.iterations_completed
     {
         if state.iterations_started > 0 {
@@ -486,12 +580,28 @@ pub(crate) async fn before_round(
                 "objective_revision": state.objective_revision,
                 "iteration": state.iterations_started + 1,
             }));
-            session.add_message(message);
+            let mut staged = session.clone();
+            staged.add_message(message);
+            staged_repeat = Some(staged);
         }
         state.iterations_started += 1;
     }
     state.rounds_started += 1;
-    checkpoint(session, config, state).await?;
+    if let Some(mut staged) = staged_repeat {
+        // Do not expose a queued User before its checkpoint succeeds. Retain
+        // conservative counters on an indeterminate write, without publishing
+        // uncommitted input into the live execution or its later error save.
+        let admitted_state = stage_state(&mut staged, state)?;
+        if let Err(error) = persist_checkpoint(&mut staged, config.persistence.as_deref()).await {
+            session
+                .metadata
+                .insert(LOOP_STATE_METADATA_KEY.into(), admitted_state);
+            return Err(error);
+        }
+        *session = staged;
+    } else {
+        checkpoint(session, config, state).await?;
+    }
     Ok(true)
 }
 

@@ -83,8 +83,26 @@ foreign runtimes, Suspended status and existing waits are preserved. The rejecte
 caller clone's unadmitted input, older permissions or waits are never saved.
 All refusal paths return before normal execution finalizers; they never advance
 the inbox's executed watermark. Subsequent ordinary attempts also refuse.
-The host must explicitly reconcile that state; this slice provides no
-reconciliation or auto-resume API. It does not claim
+Repeated Users are staged and published into the live Session only after
+their admission checkpoint succeeds. A failed checkpoint retains conservative
+consumption and the original failure. If the write committed before returning
+an error, append-safe history may retain the generated User as a fact. That
+exact unfinished generation/objective-revision/iteration token cannot become a
+new external admission, regardless of the terminal reason. System resume and
+other counted messages do not clear it. Registered entry checks both the live
+and fresh canonical history; a pending canonical token requires explicit host
+reconciliation or an already-persisted genuine new User. This slice does not
+add a typed-preappend recovery grant. Public raw execution also reads fresh
+canonical state for unfinished terminal snapshots before any hooks or generic
+error save; an absent/stale durable snapshot refuses. This covers a committed
+repeat followed by failing finish and host saves, even when the returned live
+clone has no repeat. Both admission checks use the durable admission snapshot
+port, bypassing SessionRepository's ordinary runtime cache while retaining
+bound-reader checks and leaving cache publication alone. Custom cached
+persisters must supply that durable read or fail closed. This read does not
+mint a writer or lease. Older completed
+iteration tokens remain ordinary history. The host must explicitly reconcile ambiguous state; this
+slice provides no reconciliation or auto-resume API. It does not claim
 exactly-once external effects across crashes or independent processes.
 
 #896 owns start/status/update/pause/resume/stop application APIs, revisions and

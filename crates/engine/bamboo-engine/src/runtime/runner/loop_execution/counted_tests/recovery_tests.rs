@@ -1,9 +1,19 @@
 use super::*;
+
+mod repeat_admission_tests;
 use crate::runtime::{Agent, ExecuteRequestBuilder};
 
 async fn fixture(
     dir: &std::path::Path,
     provider: Arc<FakeProvider>,
+) -> (Arc<Agent>, Arc<dyn Storage>) {
+    fixture_with_cache(dir, provider, Default::default()).await
+}
+
+async fn fixture_with_cache(
+    dir: &std::path::Path,
+    provider: Arc<FakeProvider>,
+    cache: crate::SessionCache,
 ) -> (Arc<Agent>, Arc<dyn Storage>) {
     let store = Arc::new(
         bamboo_storage::SessionStoreV2::new(dir.join("sessions"))
@@ -13,8 +23,10 @@ async fn fixture(
     let storage: Arc<dyn Storage> = store.clone();
     let agent = Agent::builder()
         .storage(storage.clone())
-        .persistence(Arc::new(bamboo_storage::LockedSessionStore::new(
+        .persistence(Arc::new(crate::SessionRepository::new(
+            cache,
             storage.clone(),
+            Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone())),
         )))
         .attachment_reader(store)
         .skill_manager(Arc::new(bamboo_skills::SkillManager::new()))

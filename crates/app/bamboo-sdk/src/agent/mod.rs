@@ -2668,7 +2668,7 @@ mod reexecute_and_child_approval_tests {
 
     #[tokio::test]
     async fn counted_recovery_refusal_precedes_sdk_approved_tool_replay() {
-        for status in ["running", "finalizing"] {
+        for status in ["running", "finalizing", "failed"] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(
                 dir.path().join("config.json"),
@@ -2702,13 +2702,27 @@ mod reexecute_and_child_approval_tests {
             session.metadata.insert("runtime.counted_loop".into(), serde_json::json!({
                 "schema_version":1, "generation":"00000000-0000-4000-8000-000000000001",
                 "revision":4, "objective_revision":1, "owner_execution_id":"old-owner",
-                "objective":"bounded fixture", "max_iterations":1, "max_total_rounds":2,
-                "iterations_started":1, "iterations_completed": if status=="finalizing" {1} else {0},
-                "rounds_started":1, "status":status
+                "objective":"bounded fixture", "max_iterations":if status=="failed" {3} else {1}, "max_total_rounds":if status=="failed" {4} else {2},
+                "iterations_started":if status=="failed" {3} else {1},
+                "iterations_completed":if status=="failed" {2} else if status=="finalizing" {1} else {0},
+                "rounds_started":if status=="failed" {3} else {1}, "status":status
             }).to_string());
             let runtime = session.agent_runtime_state.as_mut().unwrap();
             runtime.execution_id = Some("old-owner".into());
-            runtime.status = bamboo_domain::AgentStatusState::Running;
+            runtime.status = if status == "failed" {
+                bamboo_domain::AgentStatusState::Failed
+            } else {
+                bamboo_domain::AgentStatusState::Running
+            };
+            if status == "failed" {
+                let mut pending = Message::user("bounded fixture");
+                pending.metadata = Some(serde_json::json!({
+                    "runtime_kind":"counted_loop_iteration",
+                    "loop_generation":"00000000-0000-4000-8000-000000000001",
+                    "objective_revision":1, "iteration":3
+                }));
+                session.add_message(pending);
+            }
             agent.storage().save_session(&session).await.unwrap();
             let original_messages = session.messages.clone();
             let error = agent.run_session(&mut session).await.unwrap_err();
@@ -2745,7 +2759,11 @@ mod reexecute_and_child_approval_tests {
                     &durable.metadata["runtime.counted_loop"]
                 )
                 .unwrap()["status"],
-                "recovery_unsupported"
+                if status == "failed" {
+                    "failed"
+                } else {
+                    "recovery_unsupported"
+                }
             );
         }
     }

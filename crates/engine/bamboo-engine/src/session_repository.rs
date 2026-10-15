@@ -966,6 +966,24 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         self.try_load(session_id).await
     }
 
+    async fn load_runtime_admission_snapshot(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        if self.root_actor_owner.is_some() {
+            // The bound loader already validates the exact Actor fence and
+            // reads storage. An admission read must retain those checks.
+            return self.load_runtime_session(session_id).await;
+        }
+        // Runtime/tool reads remain cache-first. An execution admission must
+        // observe durable facts without publishing a stale or rejected clone.
+        bamboo_domain::RuntimeSessionPersistence::load_runtime_admission_snapshot(
+            self.persistence.as_ref(),
+            session_id,
+        )
+        .await
+    }
+
     async fn clear_legacy_pending_messages(
         &self,
         session_id: &str,

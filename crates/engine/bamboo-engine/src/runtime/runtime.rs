@@ -769,7 +769,7 @@ impl AgentRuntime {
     ) -> crate::runtime::runner::Result<()> {
         // Refusals are not executions: never reach SessionEnd or the generic
         // final checkpoint, and never mutate another counted owner's clone.
-        super::counted_loop::reject_recovery(session)?;
+        super::counted_loop::reject_ambiguous_reentry(session, self.persistence.as_ref()).await?;
         struct SdkFinish {
             host: Option<Arc<dyn crate::runtime::config::SdkSkillExecutionHost>>,
             session_id: String,
