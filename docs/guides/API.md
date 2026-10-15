@@ -82,7 +82,9 @@ worktree registry; Core configuration stores directory preferences only.
 A preference write is `{"root":"/Volumes/External/worktrees"}` for the global
 scope, or includes `"project_id":"<id>"` for one Project override. `root` is
 required; explicit `null` clears only that scope. The directory must already
-exist, be readable and writable, and be outside an existing Git checkout.
+exist, be readable and writable, and be outside any Git checkout, bare repository,
+or Git metadata directory. Broken `.git` markers and unexpected Git discovery
+errors are rejected; they are never treated as proof of an outside directory.
 The existing configuration transaction persists the change before publication;
 other Project overrides and unrelated configuration remain intact.
 

@@ -24,6 +24,8 @@ fn command(repo: &Path, args: &[&str]) -> Result<Output, String> {
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env("LC_ALL", "C")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
@@ -91,8 +93,29 @@ pub fn root(path: &Path) -> Result<PathBuf, String> {
     }
     fs::read_dir(&canonical)
         .map_err(|e| format!("Cannot read worktree root {}: {e}", canonical.display()))?;
-    if workspace_root(&canonical).is_ok() {
-        return Err("Worktree root must be outside an existing Git checkout".into());
+    // Metadata and bare repositories have no --show-toplevel. Discover the
+    // Git directory instead, and retain broken/restricted .git boundaries.
+    let discovery = command(&canonical, &["rev-parse", "--absolute-git-dir"])?;
+    let marker = canonical
+        .ancestors()
+        .any(|parent| fs::symlink_metadata(parent.join(".git")).is_ok());
+    if discovery.status.success() || marker {
+        return Err(
+            "Worktree root must be outside an existing Git repository and its metadata".into(),
+        );
+    }
+    let diagnostic = String::from_utf8_lossy(&discovery.stderr);
+    // command() fixes the locale. Only an explicit not-a-repository result
+    // establishes an outside directory; permission/config/discovery errors fail.
+    if discovery.status.code() != Some(128)
+        || !diagnostic.starts_with("fatal: not a git repository (or any")
+    {
+        return Err(format!(
+            "Git could not verify worktree root {} ({}): {}",
+            canonical.display(),
+            discovery.status,
+            diagnostic.trim()
+        ));
     }
     Ok(canonical)
 }
@@ -237,7 +260,7 @@ pub fn create(
         .map_err(|e| format!("Cannot reserve worktree path {}: {e}", target.display()))?;
     let target_identity = fs::symlink_metadata(&target).map_err(|e| e.to_string())?;
     let create = || -> Result<(), String> {
-        if fs::canonicalize(destination_root).map_err(|e| e.to_string())? != root
+        if self::root(destination_root)? != root
             || fs::canonicalize(&target).map_err(|e| e.to_string())? != target
             || repository(repo)? != common
             || !retains_identity(&root, &root_identity)
