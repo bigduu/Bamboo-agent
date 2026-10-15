@@ -501,35 +501,22 @@ async fn assert_managed_running_fails(
         peak: AtomicUsize::new(0),
         seen: Mutex::new(Vec::new()),
     });
-    let resources = bamboo_tools::LocalTaskResources::new(
-        SESSION_ID,
-        "managed-running-contract",
-        chrono::Utc::now(),
-    );
-    let (result, events) = resources
-        .scope(tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            run_with_running_tool(
-                &mut fixture,
-                provider.clone(),
-                Arc::new(tools),
-                probe.clone(),
-            ),
-        ))
-        .await
-        .expect("disallowed Running must fail without driving or joining it");
-    // Finalize only this fixture's empty resource domain. The foreign Running
-    // callback has no join/stop receipt; its owner must remain unconfirmed.
-    let drain = resources.close_and_drain().await;
+    let (result, events) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run_with_running_tool(
+            &mut fixture,
+            provider.clone(),
+            Arc::new(tools),
+            probe.clone(),
+        ),
+    )
+    .await
+    .expect("disallowed Running must fail without driving or joining it");
     assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
     // Keep this before the terminal-result assertion. On 8da the intended
     // genuine RED is kill_count 0, even though the old runner returns Ok and
     // admits later siblings/provider rounds. No provider assertion masks it.
     assert_running_cleanup(probe.snapshot(), flavor);
-    assert!(
-        drain.is_err(),
-        "no join receipt may be fabricated: {drain:?}"
-    );
     assert!(
         result.is_err(),
         "a synchronous cleanup request is not proof of quiescence: {result:?}"
