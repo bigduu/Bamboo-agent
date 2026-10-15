@@ -11,7 +11,7 @@ const MAX_STREAM = 16 * 1024 * 1024;
 const DEFAULT_SUPERVISOR = 'bamboo-default-supervisor';
 const COMMANDS = {
   inspect: [],
-  submit: ['supervisor', 'new', 'session-id', 'prompt-file', 'request-id', 'model', 'provider', 'workspace', 'project-id'],
+  submit: ['supervisor', 'new', 'session-id', 'session-created-at', 'prompt-file', 'request-id', 'model', 'provider', 'workspace', 'project-id'],
   status: ['session-id', 'run-id', 'session-created-at', 'include-output'],
   events: ['session-id', 'max-events', 'include-output'],
   stop: ['session-id', 'run-id'],
@@ -21,6 +21,7 @@ const HELP = `bamboo-task (Node 22+) — client of an already running loopback B
   inspect
   submit (--supervisor | --session-id ID | --new) --prompt-file PATH|-
          [--request-id ID] [--model ID --provider ID]
+         [--session-created-at RFC3339]  (existing ordinary Root only)
          [--workspace ABSOLUTE_PATH --project-id ID]  (new Root only)
   status --session-id ID [--run-id ID --session-created-at RFC3339] [--include-output]
   events --session-id ID [--max-events N] [--include-output]
@@ -72,6 +73,7 @@ function parse(argv) {
   if (command === 'submit') {
     if ([o.supervisor, o.new, o['session-id']].filter(Boolean).length !== 1 || !o['prompt-file']) fail('submit_requires_target_and_prompt_file', 2);
     if (o['session-id'] === DEFAULT_SUPERVISOR) fail('use_explicit_supervisor_bootstrap', 2);
+    if (o['session-created-at'] && !o['session-id']) fail('expected_birth_requires_existing_root', 2);
     if (Boolean(o.model) !== Boolean(o.provider)) fail('model_and_provider_required_together', 2);
     for (const key of ['model', 'provider']) if (o[key] && (Buffer.byteLength(o[key]) > 256 || /[\x00-\x1f\x7f]/.test(o[key]))) fail('invalid_model_selection', 2);
     if ((o.workspace || o['project-id']) && !o.new) fail('workspace_and_project_are_new_root_only', 2);
@@ -195,11 +197,17 @@ async function submit(c, o, ctx) {
   } else if (o.new) {
     const { data } = await c.post('/sessions', { ...model, ...(o.workspace ? { workspace_path: o.workspace } : {}), ...(o['project-id'] ? { project_id: o['project-id'] } : {}) }, key('create'), 'create');
     sid = id(data.session?.id, 6);
+    ctx.session_created_at = birth(data.session.created_at, 6);
     ctx.admission.create = 'accepted';
   }
   ctx.session_id = sid;
   ctx.phase = 'session_read';
   const s = await c.session(sid);
+  const expectedBirth = ctx.session_created_at || o['session-created-at'];
+  if (expectedBirth && instant(expectedBirth) !== instant(s.created_at)) {
+    ctx.session_created_at = expectedBirth;
+    fail('session_lifetime_changed');
+  }
   ctx.session_created_at = s.created_at;
   if (s.kind !== 'root' || s.parent_session_id != null) fail('submission_requires_root');
   // An explicit message_id selects referenced/legacy ingress on the server.

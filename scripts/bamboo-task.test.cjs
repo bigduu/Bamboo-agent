@@ -165,6 +165,25 @@ test('new Root creation precedes birth read/chat and leaves created identity vis
   assert.equal(posts(f)[0].body.workspace_path, '/tmp/public-fixture'); assert.equal(posts(f)[0].body.permission_mode, undefined);
 });
 
+test('new Root replaced between creation receipt and read receives no input', async t => {
+  const f = await fixture(t, (c, res) => {
+    if (c.path === '/api/v1/sessions/root') { json(res, { session: session('root', { created_at: '2026-10-15T11:00:00Z' }) }); return true; }
+  });
+  const r = await cli(f, ['submit', '--new', '--prompt-file', f.prompt]);
+  assert.equal(r.code, 7);
+  assert.equal(last(r).session_created_at, BIRTH);
+  assert.deepEqual(posts(f).map(c => c.path), ['/api/v1/sessions']);
+});
+
+test('existing Root retry can pin its original birth and refuse replacement before chat', async t => {
+  const f = await fixture(t);
+  const rejected = await cli(f, [...submit(f), '--session-created-at', '2026-10-15T09:00:00Z']);
+  assert.equal(rejected.code, 6); assert.equal(last(rejected).error.code, 'session_lifetime_changed');
+  assert.equal(posts(f).length, 0);
+  const accepted = await cli(f, [...submit(f), '--session-created-at', '2026-10-15T12:00:00.123456789+02:00']);
+  assert.equal(accepted.code, 0); assert.equal(last(accepted).run_id, 'run-1');
+});
+
 test('accepted chat + HTTP/auth/server execute rejection stays partial/unknown; no duplicate or rollback', async t => {
   for (const code of [401, 403, 409, 503]) {
     const f = await fixture(t, (c, res) => { if (c.path.endsWith('/execute')) { apiError(res, code); return true; } });

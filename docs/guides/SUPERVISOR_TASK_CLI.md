@@ -74,7 +74,10 @@ task ID. Acceptance is not proof of successful task completion:
 | `session_activation` | Supervisor: chat admits a referenced User input; ordinary execute may start or observe an existing run. The receipt does not prove this input exclusively owns that run. |
 
 New ordinary Roots are explicitly created first so their birth is known before
-chat. All writes retain the server's authorization, permission and runtime
+chat. The creation receipt's birth must match the following read; a recreated
+Root receives no chat. Existing ordinary targets can pin the original birth with
+`--session-created-at RFC3339`, including on an operator-directed retry.
+All writes retain the server's authorization, permission and runtime
 guards. A concurrent Root replacement can still accept chat before selected
 execute rejects the old birth; the CLI reports partial admission and never
 deletes that input. Supervisor activation has the existing session-level
@@ -85,6 +88,7 @@ The create/chat/execute requests use distinct stable Idempotency-Key values.
 There are no automatic POST retries. Operator-directed retry requires the same
 target, request ID, body and original server process/receipt window; the server
 cache is bounded (currently ten minutes) and not durable across restart.
+For an existing ordinary Root, supply the original `--session-created-at` too.
 After an uncertain outcome, inspect known IDs first. Repeating a whole submit
 after expiry/restart can admit another input; this is not exactly-once delivery.
 
