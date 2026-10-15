@@ -1,6 +1,7 @@
 mod background_outcomes {
     use super::*;
     use crate::runtime::runner::state_bridge::refresh_turn_boundary_with_inbox_for_run;
+    use bamboo_domain::RuntimeSessionPersistence;
 
     async fn active_parent(
         store: &bamboo_storage::SessionStoreV2,
