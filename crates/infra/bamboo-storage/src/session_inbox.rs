@@ -49,6 +49,18 @@ struct StoredInboxReceipt {
     lease: Option<StoredLease>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiptLookupMode {
+    Enqueue,
+    Observe { max_bytes: usize },
+}
+
+impl ReceiptLookupMode {
+    fn is_observation(self) -> bool {
+        matches!(self, Self::Observe { .. })
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VersionedActivationWatermark {
@@ -795,14 +807,12 @@ impl FileSessionInbox {
         dir.join(ADMITTED_DIR).join(format!("{encoded}.json"))
     }
 
-    async fn deliver_peer_impl(
-        &self,
+    fn validate_peer_route(
         envelope: &SessionMessageEnvelope,
         source: &bamboo_domain::ActorSession,
         target: &bamboo_domain::ActorSession,
         reply_to: Option<&SessionMessageEnvelope>,
-        intent: Option<SessionMessageDeliveryIntent>,
-    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
+    ) -> Result<(), SessionInboxError> {
         let reply_route_matches = match (&envelope.in_reply_to, reply_to) {
             (None, None) => true,
             (Some(id), Some(proof)) => {
@@ -830,6 +840,18 @@ impl FileSessionInbox {
                 "peer delivery identity differs from its observations".into(),
             ));
         }
+        Ok(())
+    }
+
+    async fn deliver_peer_impl(
+        &self,
+        envelope: &SessionMessageEnvelope,
+        source: &bamboo_domain::ActorSession,
+        target: &bamboo_domain::ActorSession,
+        reply_to: Option<&SessionMessageEnvelope>,
+        intent: Option<SessionMessageDeliveryIntent>,
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
+        Self::validate_peer_route(envelope, source, target, reply_to)?;
         let authority = self
             .sessions
             .lock_peer_delivery(source, target, reply_to)
@@ -997,6 +1019,31 @@ impl FileSessionInbox {
         Ok(count)
     }
 
+    /// Observation reads are bounded even when persisted evidence is corrupt.
+    async fn read_receipt_bytes(path: &Path, mode: ReceiptLookupMode) -> std::io::Result<Vec<u8>> {
+        let ReceiptLookupMode::Observe { max_bytes } = mode else {
+            return tokio::fs::read(path).await;
+        };
+        let file = tokio::fs::File::open(path).await?;
+        if file.metadata().await?.len() > max_bytes as u64 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "peer receipt exceeds byte limit",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(max_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() > max_bytes {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "peer receipt exceeds byte limit",
+            ));
+        }
+        Ok(bytes)
+    }
+
     /// Look up only the permanent admitted tombstone.
     ///
     /// This is deliberately distinct from [`existing_receipt`], which also
@@ -1006,9 +1053,17 @@ impl FileSessionInbox {
         dir: &Path,
         requested: &SessionMessageEnvelope,
     ) -> Result<Option<StoredInboxReceipt>, SessionInboxError> {
+        Self::admitted_receipt_in_mode(dir, requested, ReceiptLookupMode::Enqueue).await
+    }
+
+    async fn admitted_receipt_in_mode(
+        dir: &Path,
+        requested: &SessionMessageEnvelope,
+        mode: ReceiptLookupMode,
+    ) -> Result<Option<StoredInboxReceipt>, SessionInboxError> {
         let id = &requested.id;
         let admitted_path = Self::admitted_path(dir, id);
-        match tokio::fs::read(&admitted_path).await {
+        match Self::read_receipt_bytes(&admitted_path, mode).await {
             Ok(bytes) => {
                 let receipt: serde_json::Value = serde_json::from_slice(&bytes)
                     .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
@@ -1069,7 +1124,24 @@ impl FileSessionInbox {
         requested_intent: Option<SessionInboxActivationIntent>,
         filesystem: &OwnedFilesystem,
     ) -> Result<Option<SessionInboxDeliveryReceipt>, SessionInboxError> {
-        if let Some(receipt) = Self::admitted_receipt(dir, requested).await? {
+        Self::lookup_receipt(
+            dir,
+            requested,
+            requested_intent,
+            filesystem,
+            ReceiptLookupMode::Enqueue,
+        )
+        .await
+    }
+
+    async fn lookup_receipt(
+        dir: &Path,
+        requested: &SessionMessageEnvelope,
+        requested_intent: Option<SessionInboxActivationIntent>,
+        filesystem: &OwnedFilesystem,
+        mode: ReceiptLookupMode,
+    ) -> Result<Option<SessionInboxDeliveryReceipt>, SessionInboxError> {
+        if let Some(receipt) = Self::admitted_receipt_in_mode(dir, requested, mode).await? {
             if receipt.intent != requested_intent {
                 return Err(SessionInboxError::InvalidClaim(
                     "message id was reused with different activation intent".into(),
@@ -1083,14 +1155,27 @@ impl FileSessionInbox {
         let id = &requested.id;
         let requested_digest = Self::delivery_digest(requested, requested_intent)?;
         for queue in ["new", "cur", "cancelled", "dead"] {
-            for (generation, _name, path) in
-                Self::owned_queue_entries(dir, queue, filesystem).await?
-            {
-                let Ok(bytes) = tokio::fs::read(path).await else {
-                    continue;
+            let entries = match mode {
+                ReceiptLookupMode::Enqueue => {
+                    Self::owned_queue_entries(dir, queue, filesystem).await?
+                }
+                // Observing a receipt cannot repair the queue as a side effect.
+                ReceiptLookupMode::Observe { .. } => {
+                    Self::queue_entries(dir, queue, Some(filesystem), false).await?
+                }
+            };
+            for (generation, _name, path) in entries {
+                let bytes = match Self::read_receipt_bytes(&path, mode).await {
+                    Ok(bytes) => bytes,
+                    Err(error) if mode.is_observation() => {
+                        return Err(SessionInboxError::Storage(error.to_string()));
+                    }
+                    Err(_) => continue,
                 };
-                let Ok((wrapper, lease)) = Self::decode_owned_wrapper(&bytes) else {
-                    continue;
+                let (wrapper, lease) = match Self::decode_owned_wrapper(&bytes) {
+                    Ok(decoded) => decoded,
+                    Err(error) if mode.is_observation() => return Err(error),
+                    Err(_) => continue,
                 };
                 if lease.is_some() && !Self::owned_enabled(dir).await? {
                     return Err(SessionInboxError::InvalidClaim(
@@ -1098,13 +1183,29 @@ impl FileSessionInbox {
                     ));
                 }
                 if wrapper.kind != InboxKind::SessionEnvelope {
+                    if mode.is_observation() {
+                        return Err(SessionInboxError::InvalidClaim(
+                            "unsupported peer receipt transport kind".into(),
+                        ));
+                    }
                     continue;
                 }
                 let intent = Self::activation_intent(&wrapper.body)?;
-                let Ok(envelope) = serde_json::from_value::<SessionMessageEnvelope>(wrapper.body)
-                else {
-                    continue;
+                let envelope = match serde_json::from_value::<SessionMessageEnvelope>(wrapper.body)
+                {
+                    Ok(envelope) => envelope,
+                    Err(_) if mode.is_observation() => {
+                        return Err(SessionInboxError::InvalidClaim(
+                            "invalid peer receipt envelope".into(),
+                        ));
+                    }
+                    Err(_) => continue,
                 };
+                if mode.is_observation() {
+                    envelope
+                        .validate()
+                        .map_err(|error| SessionInboxError::InvalidClaim(error.to_string()))?;
+                }
                 if &envelope.id == id {
                     if Self::delivery_digest(&envelope, intent)? != requested_digest
                         || intent != requested_intent
@@ -1673,6 +1774,59 @@ impl SessionInboxPort for FileSessionInbox {
         self.deliver_peer_impl(envelope, source, target, reply_to, None)
             .await
             .map(|receipt| receipt.delivery)
+    }
+
+    async fn existing_peer_message_with_intent(
+        &self,
+        envelope: &SessionMessageEnvelope,
+        source: &bamboo_domain::ActorSession,
+        target: &bamboo_domain::ActorSession,
+        reply_to: Option<&SessionMessageEnvelope>,
+        intent: SessionMessageDeliveryIntent,
+    ) -> Result<Option<SessionInboxDeliveryReceipt>, SessionInboxError> {
+        #[cfg(test)]
+        let _scope_drop = owned::ScopeDrop(self.owned_scope_drop.clone());
+        Self::validate_peer_route(envelope, source, target, reply_to)?;
+        envelope
+            .validate()
+            .map_err(|error| SessionInboxError::InvalidClaim(error.to_string()))?;
+        let payload = serde_json::to_vec(envelope)
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        if payload.len() > self.limits.max_payload_bytes {
+            return Err(SessionInboxError::PayloadTooLarge {
+                actual: payload.len(),
+                limit: self.limits.max_payload_bytes,
+            });
+        }
+        let authority = self
+            .sessions
+            .lock_peer_delivery(source, target, reply_to)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        // Retain exactly the original authority; do not reacquire lifecycle or
+        // call delivery to discover an earlier operation's result.
+        let (dir, filesystem) = self
+            .filesystem_with_authority(
+                &envelope.target_session_id,
+                InboxAuthority::Peer { _guard: authority },
+            )
+            .await?;
+        let receipt = Self::lookup_receipt(
+            &dir,
+            envelope,
+            Some(SessionInboxActivationIntent::with_delivery(intent)),
+            &filesystem,
+            ReceiptLookupMode::Observe {
+                max_bytes: self.max_transport_bytes(),
+            },
+        )
+        .await?;
+        if receipt.is_some() && !Self::read_activation_watermark(&dir).await?.1 {
+            return Err(SessionInboxError::InvalidClaim(
+                "activation intent requires its v2 watermark".into(),
+            ));
+        }
+        Ok(receipt)
     }
 
     async fn deliver_peer_message_with_intent(
