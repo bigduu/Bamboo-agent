@@ -14,6 +14,8 @@ use tokio::io::AsyncWriteExt;
 
 use super::*;
 
+mod process_exit;
+
 fn budgets() -> WorkflowBudgets {
     WorkflowBudgets {
         max_concurrency: 4,
