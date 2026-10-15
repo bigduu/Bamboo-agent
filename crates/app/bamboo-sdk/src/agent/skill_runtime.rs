@@ -160,6 +160,11 @@ impl DefaultSdkSkills {
         ),
         SdkError,
     > {
+        if session.model_orchestration_only_enabled() && !input.selections.is_empty() {
+            return Err(SdkError::Unsupported(
+                "Skill submission is unavailable in orchestration-only sessions; delegate execution to an authorized worker".into(),
+            ));
+        }
         let lease = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -679,7 +684,7 @@ impl SdkSkillExecutionHost for SdkSkillHost {
                 "SDK Skill metadata execution identity changed",
             )));
         }
-        if session.root_orchestration_only_enabled() || self.run.cancel.is_cancelled() {
+        if session.model_orchestration_only_enabled() || self.run.cancel.is_cancelled() {
             return Ok(String::new());
         }
         let current = self
