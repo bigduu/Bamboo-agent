@@ -24,11 +24,13 @@ The client does not read Bamboo configuration, log in, pair a device, load
 environment credentials, install a CLI, start a server or change app settings.
 An existing access denial is exit 4; use an already authorized local connection.
 
-`inspect` first validates Bamboo's bootstrap envelope, then makes a read-only
+`inspect` first validates Bamboo's bootstrap envelope and requires its explicit
+`http.native_receipt_run.v1` capability before enabling mutations. It then makes a read-only
 GET to a random nonexistent Root's selected-output route, **without** a birth
-header. Only the native API's structured 400 (`Exact output requires one
-Bamboo-Session-Created-At header`) is a positive detection. This identifies the
-Bamboo receipt/run API introduced after fenced HTTP stop (#1951/#1953). It is
+header. The native API's structured 400 (`Exact output requires one
+Bamboo-Session-Created-At header`) also must match. The route alone is insufficient:
+Actor-mode Chat receipts landed later. The composite capability advertises those
+real Chat receipts, receipt-selected execute, birth-selected output and fenced stop. It is
 feature detection for the supported Bamboo implementation, not authentication
 or an attestation of arbitrary servers. Submit/stop repeat this check before
 any POST. A bootstrap version of `0.0.0` or a realtime stop capability alone
@@ -46,7 +48,9 @@ route first appeared at `c2476c6f0080e786b85023272a36adaaba56194a`;
 `c7d36a5fd68a5e76be4f4754028d07e52342a86d` adds its replacement read lock.
 Fenced stop/receipt execute entered at `403e2c92a68bd7ea3ce2ff7c40f0d7c195b085de`;
 real Actor-mode Root Chat receipts also require the subsequent
-`18f9b6c2552fc007d8cc4c4b6986c82cf6299405`. Use a separately built, recorded
+`18f9b6c2552fc007d8cc4c4b6986c82cf6299405`. The explicit composite bootstrap
+capability is introduced with this client in PR1998; prior development binaries
+also remain mutation-disabled. Use a separately built, recorded
 current development source containing these fixes and the Supervisor authority
 contract; no minimum published package version has been established. Legacy
 session stop and SSE cannot supply the same exact-run cancellation/output loop.

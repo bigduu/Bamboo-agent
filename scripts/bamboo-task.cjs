@@ -10,6 +10,7 @@ const MAX_JSON = 1024 * 1024;
 const MAX_FRAME = 256 * 1024;
 const MAX_STREAM = 16 * 1024 * 1024;
 const DEFAULT_SUPERVISOR = 'bamboo-default-supervisor';
+const RECEIPT_CAPABILITY = 'http.native_receipt_run.v1';
 const COMMANDS = {
   inspect: [],
   submit: ['supervisor', 'new', 'session-id', 'session-created-at', 'prompt-file', 'request-id', 'model', 'provider', 'workspace', 'project-id', 'watch', 'include-output', 'max-events'],
@@ -149,13 +150,14 @@ class Client {
     this.context.phase = 'compatibility';
     const { data: b } = await this.json('/bootstrap');
     if (b.schema_version !== 1 || b.server?.product !== 'bamboo' || b.api?.name !== 'bamboo.agent' || b.api?.canonical_base_path !== '/api/v1' || b.api.min_version !== 1 || !(b.api.max_version >= 1)) fail('incompatible_bootstrap');
-    // Read-only feature detection of the native receipt/run API added after
-    // fenced stop (#1951/#1953). No POST probe or claim about arbitrary servers.
+    // The route predates Actor-mode Chat receipts. Require the canonical
+    // composite capability as well; probing a route alone cannot authorize POST.
+    const receiptCapability = Array.isArray(b.capabilities) && b.capabilities.includes(RECEIPT_CAPABILITY);
     const probe = `/sessions/bamboo-cli-probe-${randomUUID()}/runs/cli-probe/output`;
     const { r, data } = await this.json(probe, 'GET', undefined, undefined, true);
     const supported = r.status === 400 && data?.error?.type === 'api_error' && data?.error?.message === 'Exact output requires one Bamboo-Session-Created-At header';
-    if (required && !supported) fail('receipt_run_api_unavailable');
-    return { bootstrap_schema: 1, receipt_run_api_detected: supported, mutations_supported: supported, probe_http_status: r.status };
+    if (required && !(supported && receiptCapability)) fail('receipt_run_api_unavailable');
+    return { bootstrap_schema: 1, actor_chat_receipt_capability: receiptCapability, receipt_run_api_detected: supported, mutations_supported: supported && receiptCapability, probe_http_status: r.status };
   }
   async session(sid) {
     const { data } = await this.json(`/sessions/${encodeURIComponent(sid)}`);

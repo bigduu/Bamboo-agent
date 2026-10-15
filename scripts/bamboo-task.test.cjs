@@ -14,7 +14,7 @@ const SUP = 'bamboo-default-supervisor';
 const session = (id = 'root', extra = {}) => ({ id, created_at: BIRTH, kind: 'root', parent_session_id: null,
   is_running: false, has_pending_question: false, message_count: 2, title: SECRET, last_run_error: SECRET, ...extra });
 const bootstrap = { schema_version: 1, server: { product: 'bamboo', version: '0.0.0' },
-  api: { name: 'bamboo.agent', canonical_base_path: '/api/v1', min_version: 1, max_version: 1 }, capabilities: ['realtime.stop_control.v1'] };
+  api: { name: 'bamboo.agent', canonical_base_path: '/api/v1', min_version: 1, max_version: 1 }, capabilities: ['realtime.stop_control.v1', 'http.native_receipt_run.v1'] };
 function json(res, value, status = 200, headers = {}) { res.writeHead(status, { 'Content-Type': 'application/json', ...headers }); res.end(JSON.stringify(value)); }
 function apiError(res, status, message = SECRET) { json(res, { error: { type: 'api_error', message } }, status); }
 async function fixture(t, override = () => false) {
@@ -105,6 +105,19 @@ test('old server that ignores run headers receives no submit/bootstrap/stop POST
     const r = await cli(f, args); assert.equal(r.code, 6); assert.equal(last(r).error.code, 'receipt_run_api_unavailable'); privateSafe(r);
   }
   assert.equal(posts(f).length, 0); assert.equal(cancelledSuccessor, false);
+});
+
+test('output route without Actor chat receipt capability cannot admit any mutations', async t => {
+  const f = await fixture(t, (c, res) => {
+    if (c.path === '/api/v1/bootstrap') { json(res, { ...bootstrap, capabilities: ['realtime.stop_control.v1'] }); return true; }
+  });
+  const inspection = await cli(f, ['inspect']);
+  assert.equal(last(inspection).receipt_run_api_detected, true);
+  assert.equal(last(inspection).mutations_supported, false);
+  for (const args of [submit(f), ['submit', '--new', '--prompt-file', f.prompt], ['submit', '--supervisor', '--prompt-file', f.prompt], ['stop', '--session-id', 'root', '--run-id', 'old']]) {
+    const r = await cli(f, args); assert.equal(r.code, 6); privateSafe(r);
+  }
+  assert.equal(posts(f).length, 0);
 });
 
 test('ordinary submission binds original birth and accepted receipt to real run without retries', async t => {
