@@ -762,6 +762,20 @@ impl FileSessionInbox {
         Ok(result)
     }
 
+    fn validate_explicit_message_promotion(
+        intent: Option<SessionInboxActivationIntent>,
+        policy: SessionActivationPolicy,
+    ) -> Result<(), SessionInboxError> {
+        if intent.is_some_and(|intent| {
+            intent.delivery().is_some()
+                && (intent.is_queue_only()
+                    || policy == SessionActivationPolicy::InterruptSpecificWait)
+        }) {
+            return Err(invalid("explicit peer delivery intent cannot be promoted"));
+        }
+        Ok(())
+    }
+
     pub(super) async fn mark_message_activation_eligible_impl(
         &self,
         target: &str,
@@ -782,13 +796,16 @@ impl FileSessionInbox {
             Ok(bytes) => {
                 let terminal: serde_json::Value = serde_json::from_slice(&bytes)
                     .map_err(|_| invalid("invalid Inbox admitted receipt"))?;
-                return if terminal["id"].as_str() == Some(receipt.id.as_str())
-                    && terminal["generation"].as_u64() == Some(receipt.generation)
+                if terminal["id"].as_str() != Some(receipt.id.as_str())
+                    || terminal["generation"].as_u64() != Some(receipt.generation)
                 {
-                    Ok(())
-                } else {
-                    Err(invalid("message activation receipt identity mismatch"))
-                };
+                    return Err(invalid("message activation receipt identity mismatch"));
+                }
+                Self::validate_explicit_message_promotion(
+                    Self::activation_intent(&terminal)?,
+                    policy,
+                )?;
+                return Ok(());
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(SessionInboxError::Storage(error.to_string())),
@@ -817,6 +834,10 @@ impl FileSessionInbox {
                 let (prefix, versioned) = Self::read_activation_watermark(&dir).await?;
                 if current.is_some() && !versioned {
                     return Err(invalid("activation intent requires its v2 watermark"));
+                }
+                if let Some(intent) = current.filter(|intent| intent.delivery().is_some()) {
+                    Self::validate_explicit_message_promotion(Some(intent), policy)?;
+                    return Ok(());
                 }
                 if current.is_some_and(|intent| {
                     intent.policy().ok().is_some_and(|current| {
@@ -1733,7 +1754,7 @@ impl FileSessionInbox {
             let (wrapper, stored) = self.read_owned_transport(&path).await?;
             let intent = Self::activation_intent(&wrapper.body)?;
             let activation = Self::message_activation_intent(&wrapper.body)?;
-            if !Self::eligible(generation, prefix, activation) {
+            if !Self::wake_eligible(generation, prefix, activation) {
                 continue;
             }
             let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())
