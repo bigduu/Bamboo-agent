@@ -41,6 +41,16 @@ on :9562 with a valid bootstrap, but the selected-output route returned 404.
 That installed backend is unsupported for mutations by this client. No live
 task was submitted and no provider was invoked in this verification.
 
+The installed Bamboo reports `0.0.0`, which gives no source revision. The output
+route first appeared at `c2476c6f0080e786b85023272a36adaaba56194a`;
+`c7d36a5fd68a5e76be4f4754028d07e52342a86d` adds its replacement read lock.
+Fenced stop/receipt execute entered at `403e2c92a68bd7ea3ce2ff7c40f0d7c195b085de`;
+real Actor-mode Root Chat receipts also require the subsequent
+`18f9b6c2552fc007d8cc4c4b6986c82cf6299405`. Use a separately built, recorded
+current development source containing these fixes and the Supervisor authority
+contract; no minimum published package version has been established. Legacy
+session stop and SSE cannot supply the same exact-run cancellation/output loop.
+
 ## Submit and track
 
 Put a task in a UTF-8 file (maximum 128 KiB), avoiding prompt text in shell

@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
-const { spawn } = require('node:child_process');
+const { spawn, execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -246,11 +246,23 @@ test('replaced/wrong-kind/unretained runs preserve HTTP distinctions without his
   for (const code of [403, 409, 410, 503]) {
     const f = await fixture(t, (c, res) => { if (c.path.endsWith('/output')) { apiError(res, code); return true; } });
     const r = await cli(f, exact); assert.equal(r.code, code === 403 ? 4 : 5); assert.equal(last(r).error.http_status, code); privateSafe(r);
-    assert.equal(f.calls.length, 2); assert.equal(posts(f).length, 0);
+    assert.equal(f.calls.length, 1); assert.equal(posts(f).length, 0);
   }
   for (const change of [{ run_id: 'successor' }, { session_created_at: '2026-10-15T10:00:00.123456780Z' }]) {
     const f = await fixture(t, (c, res) => { if (c.path.endsWith('/output')) { json(res, { ...output(), ...change }); return true; } });
     const r = await cli(f, exact); assert.equal(r.code, 6);
+  }
+});
+
+test('exact lookup preserves 410/503 even when session metadata would mask them', async t => {
+  for (const [metadataCode, exactCode] of [[404, 410], [500, 503]]) {
+    const f = await fixture(t, (c, res) => {
+      if (c.path === '/api/v1/sessions/root') { apiError(res, metadataCode); return true; }
+      if (c.path.endsWith('/output')) { apiError(res, exactCode); return true; }
+    });
+    const r = await cli(f, exact);
+    assert.equal(last(r).error.http_status, exactCode);
+    assert.deepEqual(f.calls.map(c => c.path), ['/api/v1/sessions/root/runs/run-1/output']);
   }
 });
 
@@ -317,5 +329,23 @@ test('invalid/oversize/empty prompt is rejected before any HTTP or Supervisor cr
     const r = await cli(f, ['submit', '--supervisor', '--prompt-file', '-'], { input }); assert.equal(r.code, 2);
   }
   const missing = await cli(f, ['submit', '--supervisor', '--prompt-file', path.join(os.tmpdir(), 'bamboo-no-such-prompt-1997')]); assert.equal(missing.code, 2);
+  assert.equal(f.calls.length, 0);
+});
+
+test('case-insensitive and Unicode-whitespace goal controls never reach HTTP', async t => {
+  const f = await fixture(t);
+  for (const input of ['/GOAL off', '/Goal clear', '\u0085/GoAl\u0085off']) {
+    const r = await cli(f, ['submit', '--supervisor', '--prompt-file', '-'], { input });
+    assert.equal(r.code, 2); assert.equal(last(r).error.code, 'goal_control_is_not_task_submission');
+  }
+  assert.equal(f.calls.length, 0);
+});
+
+test('named-pipe prompt is rejected without blocking open or making an HTTP request', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t);
+  const fifo = path.join(path.dirname(f.prompt), 'prompt.pipe');
+  execFileSync('mkfifo', [fifo]);
+  const r = await cli(f, ['submit', '--supervisor', '--prompt-file', fifo, '--timeout-ms', '150']);
+  assert.equal(r.code, 2); assert.equal(last(r).error.code, 'prompt_must_be_regular_file');
   assert.equal(f.calls.length, 0);
 });

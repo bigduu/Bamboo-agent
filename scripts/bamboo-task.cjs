@@ -3,6 +3,7 @@
 'use strict';
 const { randomUUID } = require('node:crypto');
 const fs = require('node:fs/promises');
+const { constants: fsConstants } = require('node:fs');
 const path = require('node:path');
 
 const MAX_JSON = 1024 * 1024;
@@ -97,7 +98,7 @@ async function readPrompt(file, signal) {
   } else {
     let handle;
     try {
-      handle = await fs.open(file, 'r');
+      handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
       const stat = await handle.stat();
       if (!stat.isFile()) fail('prompt_must_be_regular_file', 2);
       const data = Buffer.alloc(128 * 1024 + 1);
@@ -109,7 +110,8 @@ async function readPrompt(file, signal) {
   }
   let text; try { text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)); } catch { fail('prompt_must_be_utf8', 2); }
   if (!text.trim()) fail('prompt_empty', 2);
-  if (/^\s*\/goal(?:\s|$)/.test(text)) fail('goal_control_is_not_task_submission', 2);
+  // Rust char::is_whitespace also includes NEL (U+0085), unlike JS \s.
+  if (/^[\s\u0085]*\/goal(?:[\s\u0085]|$)/i.test(text)) fail('goal_control_is_not_task_submission', 2);
   return text;
 }
 
@@ -227,18 +229,17 @@ async function submit(c, o, ctx) {
   return { ...ctx, execution_scope: o.supervisor ? 'session_activation' : 'selected_input', execution_status: run.status, event_scope: 'session' };
 }
 async function status(c, o, ctx) {
-  ctx.phase = 'session_read';
-  const s = await c.session(o['session-id']);
-  if (!o['run-id']) return { ...summary(s) };
+  const sid = o['session-id'];
+  if (!o['run-id']) { ctx.phase = 'session_read'; return summary(await c.session(sid)); }
   ctx.phase = 'exact_output';
-  const { data } = await c.json(`/sessions/${encodeURIComponent(s.id)}/runs/${encodeURIComponent(o['run-id'])}/output`, 'GET', undefined, { 'Bamboo-Session-Created-At': o['session-created-at'] });
-  if (data.session_id !== s.id || data.run_id !== o['run-id'] || data.output_scope !== 'visible_messages' || !['pending', 'running', 'completed', 'cancelled', 'error'].includes(data.runner_status) || !data.output || !Array.isArray(data.output.messages)) fail('invalid_exact_output');
+  const { data } = await c.json(`/sessions/${encodeURIComponent(sid)}/runs/${encodeURIComponent(o['run-id'])}/output`, 'GET', undefined, { 'Bamboo-Session-Created-At': o['session-created-at'] });
+  if (data.session_id !== sid || data.run_id !== o['run-id'] || data.output_scope !== 'visible_messages' || !['pending', 'running', 'completed', 'cancelled', 'error'].includes(data.runner_status) || !data.output || !Array.isArray(data.output.messages)) fail('invalid_exact_output');
   birth(data.session_created_at, 6);
   // Compare instants without dropping nanoseconds (offsets allowed by API).
   if (instant(data.session_created_at) !== instant(o['session-created-at'])) fail('output_birth_mismatch');
   const output = data.output;
   if (!Number.isSafeInteger(output.version) || output.version < 0 || typeof output.history_committed !== 'boolean' || ![null, 'complete', 'error', 'cancelled'].includes(output.terminal)) fail('invalid_visible_output');
-  const result = { session_id: s.id, run_id: data.run_id, session_created_at: data.session_created_at, observation_scope: 'exact_run', runner_status: data.runner_status,
+  const result = { session_id: sid, run_id: data.run_id, session_created_at: data.session_created_at, observation_scope: 'exact_run', runner_status: data.runner_status,
     output: { version: output.version, terminal: output.terminal, history_committed: output.history_committed, message_count: output.messages.length } };
   if (o['include-output']) result.output.messages = output.messages.map(m => {
     if (!isId(m.id) || typeof m.content !== 'string') fail('invalid_visible_message');
