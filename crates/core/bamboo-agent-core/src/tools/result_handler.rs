@@ -19,7 +19,7 @@ pub enum ToolHandlingOutcome {
     WaitingForChildren,
 }
 
-fn is_waiting_for_children_control(result: &ToolResult) -> bool {
+pub fn is_waiting_for_children_control(result: &ToolResult) -> bool {
     if result.display_preference.as_deref() == Some("runtime_control:waiting_for_children") {
         return true;
     }
@@ -240,6 +240,17 @@ pub fn try_parse_agentic_result(result: &ToolResult) -> Option<AgenticToolResult
         }
         _ => None,
     }
+}
+
+/// True only for a successful tool result requesting a durable wait.
+/// This is a pure classifier; it changes neither state nor authority.
+pub fn tool_result_requires_suspension(result: &ToolResult) -> bool {
+    result.success
+        && (is_waiting_for_children_control(result)
+            || matches!(
+                try_parse_agentic_result(result),
+                Some(AgenticToolResult::NeedClarification { .. })
+            ))
 }
 
 pub async fn handle_tool_result_with_agentic_support(
@@ -1548,5 +1559,163 @@ mod tests {
 
         assert_eq!(parsed, serde_json::json!({}));
         assert!(warning.is_some());
+    }
+    mod suspension_contract_tests {
+        use super::*;
+        use crate::tools::with_suspension_disabled;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn question() -> ToolResult {
+            ToolResult::text(
+                true,
+                serde_json::to_string(&AgenticToolResult::NeedClarification {
+                    question: "Choose a direction".into(),
+                    options: None,
+                })
+                .unwrap(),
+            )
+        }
+        fn waiting() -> ToolResult {
+            let mut result =
+                ToolResult::text(true, "{\"runtime_control\":\"waiting_for_children\"}");
+            result.display_preference = Some("runtime_control:waiting_for_children".into());
+            result
+        }
+        struct NoClarificationSave(AtomicUsize);
+        #[async_trait]
+        impl bamboo_domain::RuntimeSessionPersistence for NoClarificationSave {
+            async fn save_runtime_session(&self, _: &mut Session) -> std::io::Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        fn assert_not_waiting(session: &Session) {
+            assert!(session.pending_question.is_none());
+            assert!(!session.metadata.contains_key("runtime.suspend_reason"));
+        }
+        fn assert_refusal_pair(session: &Session, id: &str) {
+            let pairs = session
+                .messages
+                .iter()
+                .filter(|message| message.tool_call_id.as_deref() == Some(id))
+                .collect::<Vec<_>>();
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(pairs[0].tool_success, Some(false));
+            assert!(pairs[0].content.contains("suspension_disabled"));
+        }
+
+        #[test]
+        fn pure_suspension_classifier_only_accepts_successful_wait_requests() {
+            for mut result in [question(), waiting()] {
+                assert!(tool_result_requires_suspension(&result));
+                result.success = false;
+                assert!(!tool_result_requires_suspension(&result));
+            }
+            assert!(!tool_result_requires_suspension(&ToolResult::text(
+                true, "ordinary"
+            )));
+        }
+
+        #[tokio::test]
+        async fn disabled_suspension_refuses_before_wait_metadata_or_clarification_persistence() {
+            for result in [question(), waiting()] {
+                let mut session = Session::new("no-wait", "synthetic-only");
+                let call = make_tool_call("denied-question", "custom_question", "{}");
+                let tools = StaticExecutor::new(HashMap::new());
+                let saves = Arc::new(NoClarificationSave(AtomicUsize::new(0)));
+                let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> = saves.clone();
+                let (tx, mut rx) = mpsc::channel(32);
+                let outcome = with_suspension_disabled(
+                    handle_tool_result_with_agentic_support_and_persistence(
+                        &result,
+                        &call,
+                        &tx,
+                        &mut session,
+                        &tools,
+                        ToolExecutionSessionFlags::default(),
+                        None,
+                        Some(&persistence),
+                    ),
+                )
+                .await;
+                assert_eq!(outcome, ToolHandlingOutcome::Continue);
+                assert_refusal_pair(&session, "denied-question");
+                assert_not_waiting(&session);
+                assert_eq!(saves.0.load(Ordering::SeqCst), 0);
+                let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+                assert_eq!(events.iter().filter(|event|matches!(event,AgentEvent::ToolError{tool_call_id,..} if tool_call_id=="denied-question")).count(),1);
+                assert!(!events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::NeedClarification { .. })));
+            }
+        }
+
+        struct NestedQuestions {
+            entered: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl ToolExecutor for NestedQuestions {
+            async fn execute(&self, call: &ToolCall) -> crate::tools::executor::Result<ToolResult> {
+                self.entered
+                    .lock()
+                    .unwrap()
+                    .push(call.function.name.clone());
+                assert!(
+                    !crate::tools::suspension_allowed(),
+                    "the nested queue must retain the host scope"
+                );
+                Ok(match call.function.name.as_str() {
+                    "outer" => ToolResult::text(
+                        true,
+                        serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+                            actions: vec![
+                                make_tool_call("nested-question", "nested", "{}"),
+                                make_tool_call("nested-wait", "wait", "{}"),
+                                make_tool_call("ordinary-after", "ordinary", "{}"),
+                            ],
+                            reason: "nested work".into(),
+                        })
+                        .unwrap(),
+                    ),
+                    "nested" => question(),
+                    "wait" => waiting(),
+                    _ => ToolResult::text(true, "ordinary completed"),
+                })
+            }
+            fn list_tools(&self) -> Vec<ToolSchema> {
+                Vec::new()
+            }
+        }
+        #[tokio::test]
+        async fn disabled_suspension_reaches_recursive_subactions_without_relaxing_other_dispatch()
+        {
+            let tools = NestedQuestions {
+                entered: std::sync::Mutex::new(Vec::new()),
+            };
+            let mut session = Session::new("nested-no-wait", "synthetic-only");
+            let (tx, mut rx) = mpsc::channel(64);
+            let outcome = with_suspension_disabled(execute_sub_actions(
+                &[make_tool_call("outer-call", "outer", "{}")],
+                &tx,
+                &mut session,
+                &tools,
+                ToolExecutionSessionFlags::default(),
+                None,
+            ))
+            .await;
+            assert_eq!(outcome, ToolHandlingOutcome::Continue);
+            assert_eq!(
+                *tools.entered.lock().unwrap(),
+                ["outer", "nested", "wait", "ordinary"]
+            );
+            assert_refusal_pair(&session, "nested-question");
+            assert_refusal_pair(&session, "nested-wait");
+            assert_not_waiting(&session);
+            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::NeedClarification { .. })));
+            assert!(!events.iter().any(|event|matches!(event,AgentEvent::ToolComplete{tool_call_id,result} if ["nested-question","nested-wait"].contains(&tool_call_id.as_str()) && result.success)));
+        }
     }
 }

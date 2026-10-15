@@ -5536,4 +5536,175 @@ mod tests {
         resources.close_and_drain().await.unwrap();
         assert!(!path.exists());
     }
+    mod suspension_contract_tests {
+        use super::*;
+        use bamboo_agent_core::tools::{suspension_allowed, with_suspension_disabled};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[tokio::test]
+        async fn disabled_suspension_rejects_typed_ask_before_proxy_event_pending_or_write() {
+            for proxy_enabled in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("must-not-write.txt");
+                let config = Arc::new(crate::permission::PermissionConfig::new());
+                config.set_ask_rules([format!("Write({})", path.display())]);
+                config.register_session_workspace("scope-ask", directory.path().to_string_lossy());
+                let executor = BuiltinToolExecutor::new_with_permissions(Arc::new(
+                    crate::permission::ConfigPermissionChecker::new(config.clone()),
+                ));
+                let call = make_tool_call("Write", json!({"file_path":path,"content":"forbidden"}));
+                let requests = Arc::new(AtomicUsize::new(0));
+                let proxy: Option<Arc<dyn crate::approval::ApprovalProxy>> =
+                    proxy_enabled.then(|| {
+                        Arc::new(RecordingApprovalProxy {
+                            requests: requests.clone(),
+                            approve: false,
+                        }) as Arc<dyn crate::approval::ApprovalProxy>
+                    });
+                let (tx, mut rx) = mpsc::channel(8);
+                let ctx = ToolExecutionContext {
+                    session_id: Some("scope-ask"),
+                    event_tx: Some(&tx),
+                    ..ToolExecutionContext::none(&call.id)
+                };
+                let result = with_suspension_disabled(crate::with_approval_proxy(
+                    proxy,
+                    executor.execute_with_context_outcome(&call, ctx),
+                ))
+                .await;
+                assert!(
+                    matches!(result, Err(ToolError::Execution(ref reason)) if reason.contains("suspension_disabled")),
+                    "{result:?}"
+                );
+                assert_eq!(requests.load(Ordering::SeqCst), 0);
+                assert!(config.pending_request("scope-ask", &call.id).is_none());
+                assert!(rx.try_recv().is_err(), "must not publish an approval event");
+                assert!(!path.exists());
+                assert!(suspension_allowed());
+            }
+        }
+
+        struct InteractiveChecker(Arc<AtomicUsize>);
+        #[async_trait]
+        impl crate::permission::PermissionChecker for InteractiveChecker {
+            async fn needs_confirmation(
+                &self,
+                _: crate::permission::PermissionType,
+                _: &str,
+            ) -> bool {
+                true
+            }
+            async fn request_confirmation(
+                &self,
+                ctx: crate::permission::PermissionContext,
+            ) -> Result<bool, crate::permission::PermissionError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(crate::permission::PermissionError::confirmation_required(
+                    ctx,
+                ))
+            }
+            fn grant_session_permission(&self, _: crate::permission::PermissionType, _: String) {}
+        }
+
+        #[tokio::test]
+        async fn disabled_suspension_rejects_configless_checker_before_real_confirmation() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("must-not-write.txt");
+            let requests = Arc::new(AtomicUsize::new(0));
+            let executor = BuiltinToolExecutor::new_with_permissions(Arc::new(InteractiveChecker(
+                requests.clone(),
+            )));
+            let call = make_tool_call("Write", json!({"file_path":path,"content":"forbidden"}));
+            let (tx, mut rx) = mpsc::channel(8);
+            let ctx = ToolExecutionContext {
+                session_id: Some("configless"),
+                event_tx: Some(&tx),
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let result =
+                with_suspension_disabled(executor.execute_with_context_outcome(&call, ctx)).await;
+            assert!(
+                matches!(result, Err(ToolError::Execution(ref reason)) if reason.contains("suspension_disabled")),
+                "{result:?}"
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 0);
+            assert!(rx.try_recv().is_err());
+            assert!(!path.exists());
+        }
+
+        #[tokio::test]
+        async fn disabled_suspension_keeps_existing_auto_bypass_and_plan_gates() {
+            for (auto, bypass, plan, allowed) in [
+                (true, false, false, true),
+                (false, true, false, true),
+                (true, false, true, false),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("posture.txt");
+                let config = Arc::new(crate::permission::PermissionConfig::new());
+                let executor = BuiltinToolExecutor::new_with_permissions(Arc::new(
+                    crate::permission::ConfigPermissionChecker::new(config),
+                ));
+                let call = make_tool_call(
+                    "Write",
+                    json!({"file_path":path,"content":"explicit posture"}),
+                );
+                let (tx, mut rx) = mpsc::channel(8);
+                let ctx = ToolExecutionContext {
+                    session_id: Some("posture"),
+                    event_tx: Some(&tx),
+                    auto_approve_permissions: auto,
+                    bypass_permissions: bypass,
+                    plan_read_only: plan,
+                    ..ToolExecutionContext::none(&call.id)
+                };
+                let result =
+                    with_suspension_disabled(executor.execute_with_context_outcome(&call, ctx))
+                        .await;
+                assert_eq!(
+                    result.is_ok(),
+                    allowed,
+                    "auto={auto},bypass={bypass},plan={plan}: {result:?}"
+                );
+                assert_eq!(path.exists(), allowed);
+                assert!(rx.try_recv().is_err());
+            }
+        }
+
+        #[tokio::test]
+        async fn ordinary_execution_still_publishes_and_retains_typed_approval() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("ordinary-ask.txt");
+            let config = Arc::new(crate::permission::PermissionConfig::new());
+            config.set_ask_rules([format!("Write({})", path.display())]);
+            let executor = BuiltinToolExecutor::new_with_permissions(Arc::new(
+                crate::permission::ConfigPermissionChecker::new(config.clone()),
+            ));
+            let call = make_tool_call(
+                "Write",
+                json!({"file_path":path,"content":"approval required"}),
+            );
+            let (tx, mut rx) = mpsc::channel(8);
+            let ctx = ToolExecutionContext {
+                session_id: Some("ordinary-ask"),
+                event_tx: Some(&tx),
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let outcome = executor
+                .execute_with_context_outcome(&call, ctx)
+                .await
+                .unwrap();
+            let result = outcome.into_tool_result();
+            assert_eq!(
+                result.display_preference.as_deref(),
+                Some("request_permissions")
+            );
+            assert!(config.pending_request("ordinary-ask", &call.id).is_some());
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                AgentEvent::ToolApprovalRequested { .. }
+            ));
+            assert!(!path.exists());
+        }
+    }
 }
