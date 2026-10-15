@@ -1016,9 +1016,17 @@ pub struct AgentLoopConfig {
     /// stamp, visible notification, exactly one final summary turn).
     pub(crate) run_budget: bamboo_config::RunBudgetConfig,
     pub(crate) counted_loop: Option<super::counted_loop::CountedLoopConfig>,
+    pub(crate) loop_control: Option<super::loop_control::LoopControlConfig>,
 }
 
 impl AgentLoopConfig {
+    /// A host-prestarted loop or the sole model-started generation in this run.
+    pub(crate) fn effective_counted_loop(&self) -> Option<&super::counted_loop::CountedLoopConfig> {
+        self.counted_loop
+            .as_ref()
+            .or_else(|| self.loop_control.as_ref().and_then(|c| c.active_counted()))
+    }
+
     /// Data-only execution transport. This accessor does not classify or grant.
     pub fn initial_untrusted_inputs(&self) -> Option<&UntrustedExecutionInputs> {
         self.initial_untrusted_inputs.as_ref()
@@ -1093,6 +1101,7 @@ impl Default for AgentLoopConfig {
             mcp_tool_guidance: None,
             run_budget: bamboo_config::RunBudgetConfig::default(),
             counted_loop: None,
+            loop_control: None,
         }
     }
 }

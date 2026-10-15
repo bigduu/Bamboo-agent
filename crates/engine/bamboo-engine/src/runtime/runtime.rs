@@ -366,6 +366,8 @@ pub struct ExecuteRequest {
     /// Opt-in live counted repetition under the caller's existing execution owner.
     /// Requires the shared activation router and an already registered run.
     pub counted_loop: Option<super::counted_loop::CountedLoopConfig>,
+    /// Explicit finite authority for the model to start one loop in this activation.
+    pub loop_control: Option<super::loop_control::LoopControlConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +421,7 @@ pub struct ExecuteRequestBuilder {
     app_data_dir: Option<std::path::PathBuf>,
     run_budget: Option<bamboo_config::RunBudgetConfig>,
     counted_loop: Option<super::counted_loop::CountedLoopConfig>,
+    loop_control: Option<super::loop_control::LoopControlConfig>,
 }
 
 impl ExecuteRequestBuilder {
@@ -461,6 +464,7 @@ impl ExecuteRequestBuilder {
             app_data_dir: None,
             run_budget: None,
             counted_loop: None,
+            loop_control: None,
         }
     }
 
@@ -669,6 +673,13 @@ impl ExecuteRequestBuilder {
         self
     }
 
+    /// Authorize live self start/status/update/stop within explicit host ceilings.
+    /// This starts no loop and grants no Session ownership.
+    pub fn loop_control(mut self, config: super::loop_control::LoopControlConfig) -> Self {
+        self.loop_control = Some(config);
+        self
+    }
+
     /// Materialize the underlying [`ExecuteRequest`].
     ///
     /// `gold_config` is an internal feature flag with only a crate-visible
@@ -712,6 +723,7 @@ impl ExecuteRequestBuilder {
             app_data_dir: self.app_data_dir,
             run_budget: self.run_budget,
             counted_loop: self.counted_loop,
+            loop_control: self.loop_control,
         }
     }
 }
@@ -770,6 +782,11 @@ impl AgentRuntime {
         // Refusals are not executions: never reach SessionEnd or the generic
         // final checkpoint, and never mutate another counted owner's clone.
         super::counted_loop::reject_ambiguous_reentry(session, self.persistence.as_ref()).await?;
+        if let Some(control) = req.loop_control.as_ref() {
+            control
+                .validate_admission(session, self.activation_router.as_ref())
+                .await?;
+        }
         struct SdkFinish {
             host: Option<Arc<dyn crate::runtime::config::SdkSkillExecutionHost>>,
             session_id: String,
@@ -867,6 +884,7 @@ impl AgentRuntime {
             app_data_dir,
             run_budget,
             counted_loop,
+            loop_control,
         } = req;
         let tools = tools.unwrap_or_else(|| self.default_tools.clone());
         let llm = provider_override.unwrap_or_else(|| self.provider.clone());
@@ -906,6 +924,16 @@ impl AgentRuntime {
                 )
             });
 
+        let mut effective_run_budget = config.run_budget.merged_with_override(run_budget.as_ref());
+        if let Some(control) = loop_control.as_ref() {
+            effective_run_budget.max_rounds = Some(
+                effective_run_budget
+                    .max_rounds
+                    .map_or(control.max_total_rounds, |cap| {
+                        cap.min(control.max_total_rounds)
+                    }),
+            );
+        }
         let loop_config = AgentLoopConfig {
             ticket_worker_plan: ticket_worker_plan.clone(),
             guidance_active_run_id,
@@ -1010,8 +1038,9 @@ impl AgentRuntime {
             // can loosen the operator's ceiling. Merging here (rather than in
             // the HTTP layer) means every caller — HTTP, schedules, connect,
             // the in-proc SDK — gets the same clamped fallback for free.
-            run_budget: config.run_budget.merged_with_override(run_budget.as_ref()),
+            run_budget: effective_run_budget,
             counted_loop,
+            loop_control,
             stream_timeout: config.stream_timeout,
             ..Default::default()
         };

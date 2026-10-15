@@ -40,6 +40,15 @@ pub trait AgentHook: Send + Sync {
         true
     }
 
+    /// Whether this hook can request a resumable suspension. Unknown native
+    /// hooks conservatively can. Hosts may declare a hook non-suspending only
+    /// when it never returns `Suspend`; violating that declaration aborts the
+    /// operation rather than creating a wait. The declaration is frozen at
+    /// registration. Allow/Deny/Ask remain independent.
+    fn may_suspend(&self) -> bool {
+        true
+    }
+
     /// Optional priority (lower runs first). Default is 100.
     fn priority(&self) -> u32 {
         100

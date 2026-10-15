@@ -188,14 +188,10 @@ async fn execute_and_apply_single_tool_call(
                 needs_human: None,
                 portable_tool: None,
                 post_tool_hook_eligible: false,
+                managed_running_violation: false,
                 result: Err(format!("Plan mode: {} operation blocked", tool_name)),
                 tool_duration: std::time::Duration::ZERO,
             };
-            policy_guard.observe_execution_outcome(
-                tool_call,
-                &outcome,
-                admitted_execution_name.as_deref(),
-            );
             let task_hint = build_task_compression_hint(task_context);
             let outcome = output_compressor::maybe_compress(
                 &tool_call.function.name,
@@ -212,6 +208,8 @@ async fn execute_and_apply_single_tool_call(
             .await;
             let should_break = per_call::apply_tool_execution_outcome(
                 per_call::ToolExecutionApplyContext {
+                    policy_guard,
+                    admitted_execution_name: admitted_execution_name.as_deref(),
                     tool_call,
                     event_tx,
                     metrics_collector,
@@ -243,7 +241,10 @@ async fn execute_and_apply_single_tool_call(
         admitted_execution_name.as_deref(),
     ) {
         Ok(()) => {
-            per_call::execute_model_requested_tool_call_only(
+            let managed_parallel_call = crate::runtime::loop_control::suspension::active(config)
+                && scheduling_mode_for_tool_call(tool_call, tools)
+                    == ToolSchedulingMode::ParallelSafe;
+            let dispatch = per_call::execute_model_requested_tool_call_only(
                 effective_callable_set,
                 per_call::ToolExecutionOnlyContext {
                     vision_support,
@@ -267,8 +268,51 @@ async fn execute_and_apply_single_tool_call(
                     session_flags,
                     available_tool_schemas,
                 },
-            )
-            .await?
+            );
+            if managed_parallel_call {
+                // Routing an active managed call through the sequential apply
+                // boundary must retain the old parallel path's finite limits.
+                let timeout = std::time::Duration::from_secs(
+                    config
+                        .per_tool_timeout_secs
+                        .min(config.parallel_batch_timeout_secs),
+                );
+                match tokio::time::timeout(timeout, dispatch).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        let violation = bamboo_agent_core::tools::suspension_running_violated();
+                        if violation {
+                            if let Some(resources) = bamboo_tools::LocalTaskResources::current() {
+                                resources.record_unconfirmed(
+                                    crate::runtime::loop_control::suspension::RUNNING_REFUSAL,
+                                );
+                            }
+                        }
+                        per_call::ToolExecutionOutcome {
+                            output_cap: None,
+                            permission_replay_origin: None,
+                            needs_human: None,
+                            portable_tool: per_call::portable_tool_for_admitted_call(
+                                effective_callable_set,
+                                tool_call,
+                            ),
+                            post_tool_hook_eligible: !violation,
+                            managed_running_violation: violation,
+                            result: Err(if violation {
+                                crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into()
+                            } else {
+                                format!(
+                                    "Tool '{}' timed out after {:?}",
+                                    tool_call.function.name, timeout
+                                )
+                            }),
+                            tool_duration: timeout,
+                        }
+                    }
+                }
+            } else {
+                dispatch.await?
+            }
         }
         Err(violation) => {
             stop_round = violation.should_stop_round();
@@ -287,6 +331,7 @@ async fn execute_and_apply_single_tool_call(
                 needs_human: None,
                 portable_tool: None,
                 post_tool_hook_eligible: false,
+                managed_running_violation: false,
                 result: Err(message),
                 tool_duration: std::time::Duration::ZERO,
             }
@@ -317,12 +362,10 @@ async fn execute_and_apply_single_tool_call(
         task_hint.as_ref(),
     )
     .await;
-    // The output budget may turn an otherwise successful browser download
-    // into a bounded failure. Count the result the model actually receives.
-    policy_guard.observe_execution_outcome(tool_call, &outcome, admitted_execution_name.as_deref());
-
     let should_break = per_call::apply_tool_execution_outcome(
         per_call::ToolExecutionApplyContext {
+            policy_guard,
+            admitted_execution_name: admitted_execution_name.as_deref(),
             tool_call,
             event_tx,
             metrics_collector,
@@ -482,6 +525,35 @@ pub(crate) struct RoundToolExecution<'a, 'frame> {
 pub(crate) async fn execute_round_tool_calls(
     execution: RoundToolExecution<'_, '_>,
 ) -> Result<RoundToolExecutionResult, AgentError> {
+    // Retain observation outside the pre-Start parallel timeouts. Per-call
+    // observers share this token, even if their futures are dropped.
+    let control = execution.frame.config.loop_control.as_ref();
+    let dispatch = execute_round_tool_calls_inner(execution);
+    if let Some(control) = control {
+        let (result, observation) =
+            bamboo_agent_core::tools::observe_tool_suspension(false, dispatch).await;
+        if observation.running_seen {
+            control.record_running_observed();
+        }
+        if observation.forbidden_running_seen {
+            if let Some(resources) = bamboo_tools::LocalTaskResources::current() {
+                resources
+                    .record_unconfirmed(crate::runtime::loop_control::suspension::RUNNING_REFUSAL);
+            }
+            result?;
+            return Err(AgentError::Tool(
+                crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into(),
+            ));
+        }
+        result
+    } else {
+        dispatch.await
+    }
+}
+
+async fn execute_round_tool_calls_inner(
+    execution: RoundToolExecution<'_, '_>,
+) -> Result<RoundToolExecutionResult, AgentError> {
     let RoundToolExecution {
         tool_calls,
         frame,
@@ -544,7 +616,11 @@ pub(crate) async fn execute_round_tool_calls(
     'tool_calls: while next_index < tool_calls.len() {
         let tool_call = &tool_calls[next_index];
 
-        if scheduling_modes[next_index] == ToolSchedulingMode::ParallelSafe {
+        // Managed calls must retain one owned cleanup/apply boundary. Re-read
+        // after each call: Start may have activated within this same batch.
+        if scheduling_modes[next_index] == ToolSchedulingMode::ParallelSafe
+            && !crate::runtime::loop_control::suspension::active(config)
+        {
             let batch_start = next_index;
             while next_index < tool_calls.len()
                 && scheduling_modes[next_index] == ToolSchedulingMode::ParallelSafe
@@ -729,6 +805,7 @@ pub(crate) async fn execute_round_tool_calls(
                                     tool_call,
                                 ),
                                 post_tool_hook_eligible: true,
+                                managed_running_violation: false,
                                 result: Err(format!(
                                     "Tool '{}' timed out after {:?}",
                                     tool_call.function.name, timeout
@@ -759,6 +836,7 @@ pub(crate) async fn execute_round_tool_calls(
                                 batch_call,
                             ),
                             post_tool_hook_eligible: true,
+                            managed_running_violation: false,
                             result: Err(format!(
                                 "Parallel batch timed out after {:?}",
                                 batch_timeout
@@ -837,16 +915,13 @@ pub(crate) async fn execute_round_tool_calls(
                 .await;
 
             for (batch_call, outcome) in batch.iter().zip(compressed) {
-                policy_guard.observe_execution_outcome(
-                    batch_call,
-                    &outcome,
-                    effective_callable_set
-                        .resolve_callable_reference(&batch_call.function.name)
-                        .as_deref(),
-                );
+                let admitted_execution_name =
+                    effective_callable_set.resolve_callable_reference(&batch_call.function.name);
 
                 let should_break = per_call::apply_tool_execution_outcome(
                     per_call::ToolExecutionApplyContext {
+                        policy_guard,
+                        admitted_execution_name: admitted_execution_name.as_deref(),
                         tool_call: batch_call,
                         event_tx,
                         metrics_collector,

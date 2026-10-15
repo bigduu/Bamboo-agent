@@ -23,6 +23,10 @@ use session_effects::{
     emit_need_clarification_event, persist_session_after_question,
 };
 
+pub(super) fn requires_suspension(tool_call: &ToolCall, result: &ToolResult) -> bool {
+    should_handle_user_question_tool(tool_call, result)
+}
+
 fn stable_plan_hash(plan: &str) -> String {
     let mut hasher = DefaultHasher::new();
     plan.hash(&mut hasher);

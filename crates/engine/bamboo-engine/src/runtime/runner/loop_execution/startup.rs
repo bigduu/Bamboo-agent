@@ -198,7 +198,7 @@ pub(super) async fn initialize_loop_state(
     );
     // Persist the actual pipeline UUID before its first mirror/checkpoint.
     // Ordinary executions deliberately do not inherit a prior counted owner.
-    if config.counted_loop.is_some() {
+    if config.effective_counted_loop().is_some() || config.loop_control.is_some() {
         runtime_state.execution_id = Some(execution_id.clone());
     }
     // Permission mode is a per-session sticky posture (set via PATCH /sessions

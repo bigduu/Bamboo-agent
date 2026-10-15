@@ -39,6 +39,8 @@ pub(super) struct SuccessPathContext<'a> {
     /// Task progress uses observed command completion rather than shell-tool
     /// transport success. The model-visible result remains unchanged.
     pub task_progress_result: TaskProgressResult,
+    /// True only after the exact live owner service durably paired this result.
+    pub loop_result_checkpointed: bool,
     pub event_tx: &'a mpsc::Sender<AgentEvent>,
     pub metrics_collector: Option<&'a MetricsCollector>,
     pub session_id: &'a str,
