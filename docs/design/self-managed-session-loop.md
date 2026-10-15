@@ -10,14 +10,16 @@ ledger throughout the run.
 ## Host admission
 
 Pass `LoopControlConfig::new(max_iterations, max_total_rounds)` to
-`ExecuteRequestBuilder::loop_control`. Execute through the existing `Agent`
-registered/direct lease path. A raw request without that execution's private
+`ExecuteRequestBuilder::loop_control`. Execute through the existing Engine
+`Agent` (re-exported as SDK `RuntimeAgent`) registered/direct lease path. A raw request without that execution's private
 owner proof fails before startup hooks or transcript writes. There must be
 durable Session checkpoint support. This capability cannot be combined with a
 host-prestarted `CountedLoopConfig`, enabled Gold, or a Ticket worker plan.
 
 ```rust,ignore
-use bamboo_sdk::{ExecuteRequestBuilder, LoopControlConfig};
+use bamboo_sdk::{ExecuteRequestBuilder, LoopControlConfig, RuntimeAgent};
+
+// agent: &RuntimeAgent, with the normal host dependencies and activation router.
 
 let control = LoopControlConfig::new(3, 12);
 let request = ExecuteRequestBuilder::new(prompt, event_tx, user_cancel)
@@ -34,6 +36,9 @@ to start, inspecting status, or requesting changes remain charged. A start
 must leave at least one round for each requested iteration. This is a finite
 execution boundary, not a monetary or wall-clock guarantee: existing provider
 retries, tools and auxiliary-model policies retain their own limits.
+
+The ergonomic SDK `Agent::run` facade does not implicitly opt in; advanced hosts
+use the typed `RuntimeAgent` request path above.
 
 The tool is present only with host opt-in and remains subject to exact callable
 identity, disabled-tool, permission and Session authority checks. The supported
