@@ -1381,9 +1381,21 @@ async fn workflow_choice_retry_switch_clears_only_current_map_scope_outputs() {
         assert_eq!(skipped.status, WorkflowStepStatus::Skipped);
         assert_eq!(skipped.attempts, 1);
         assert!(skipped.output.is_none());
+        assert_eq!(
+            skipped.topology.as_ref().unwrap().map_index_path,
+            vec![0, index]
+        );
+        assert_eq!(
+            skipped.topology.as_ref().unwrap().plan_node_path,
+            vec![0, 0, 1, 0, 0, 0]
+        );
         let sibling = &result.steps[&format!("mapped@root[1][{index}]")];
         assert_eq!(sibling.status, WorkflowStepStatus::Succeeded);
         assert_eq!(sibling.output, Some(json!(index)));
+        assert_eq!(
+            sibling.topology.as_ref().unwrap().map_index_path,
+            vec![1, index]
+        );
     }
     assert_eq!(
         result.steps["transient@root[0]"].status,
@@ -1541,6 +1553,7 @@ async fn workflow_choice_recovery_retains_pinned_plan_without_false_completion()
     running.steps.insert(
         "yes".to_string(),
         WorkflowStepSnapshot {
+            topology: None,
             id: "yes".to_string(),
             status: WorkflowStepStatus::Running,
             input_hash: String::new(),
@@ -1622,6 +1635,14 @@ async fn engine_runs_sequence_parallel_map_and_rebuilds_progress_from_sequence()
         .unwrap();
     assert_eq!(snapshot.status, WorkflowRunStatus::Succeeded);
     assert_eq!(snapshot.output, Some(json!([1, 2, 3])));
+    let topology = serde_json::to_value(&snapshot.steps).unwrap();
+    assert_eq!(topology["first"]["topology"]["plan_node_path"], json!([0]));
+    for index in 0..3 {
+        assert_eq!(
+            topology[format!("mapped@root[{index}]")]["topology"],
+            json!({"planned_step_id":"mapped", "plan_node_path":[2,0], "map_index_path":[index]})
+        );
+    }
     assert_eq!(
         snapshot
             .steps
@@ -1956,6 +1977,14 @@ async fn retry_wrapping_map_retries_transient_items_with_cumulative_attempts() {
     assert_eq!(succeeded.usage.retries, 1);
     assert_eq!(succeeded.steps["mapped@root[0]"].attempts, 2);
     assert_eq!(succeeded.steps["mapped@root[1]"].attempts, 2);
+    for index in 0..2 {
+        let topology = succeeded.steps[&format!("mapped@root[{index}]")]
+            .topology
+            .as_ref()
+            .unwrap();
+        assert_eq!(topology.plan_node_path, vec![0, 0]);
+        assert_eq!(topology.map_index_path, vec![index]);
+    }
     let events = engine.progress(&succeeded.run_id, 0).await.unwrap().events;
     assert!(events.iter().any(|event| {
         event.step_id.as_deref() == Some("mapped@root[0]")
@@ -2854,6 +2883,7 @@ async fn recovery_suspends_running_steps_without_false_completion() {
     running.steps.insert(
         "echo".to_string(),
         WorkflowStepSnapshot {
+            topology: None,
             id: "echo".to_string(),
             status: WorkflowStepStatus::Running,
             input_hash: "abc".to_string(),
@@ -2880,6 +2910,7 @@ async fn recovery_suspends_running_steps_without_false_completion() {
     );
     let recovered = engine.recover().await.unwrap().pop().unwrap();
     assert_eq!(recovered.status, WorkflowRunStatus::Suspended);
+    assert_eq!(recovered.steps["echo"].topology, None);
     assert_eq!(
         recovered.steps["echo"].status,
         WorkflowStepStatus::Suspended
@@ -3702,6 +3733,7 @@ fn completed_prefix_checkpoint(run_id: &str) -> WorkflowRunSnapshot {
     checkpoint.steps.insert(
         "prefix".into(),
         WorkflowStepSnapshot {
+            topology: None,
             id: "prefix".into(),
             status: WorkflowStepStatus::Succeeded,
             input_hash: hex::encode(Sha256::digest(
@@ -4314,3 +4346,5 @@ async fn completed_prefix_corrupt_saved_run_id_refuses_without_owner_or_other_ru
         "both runs' saved bytes must remain unchanged"
     );
 }
+
+mod topology;
