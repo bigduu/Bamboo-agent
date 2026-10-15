@@ -127,6 +127,9 @@ Referenced/ticket and Root ingress keep their existing scheduling rules.
 
 Watch terminal A for live events; subscribing after execution can miss response tokens. The browser uses the shared `/v2/stream` WebSocket; legacy SSE routes remain available.
 
+Responses forwarding at `/openai/v1/responses` accepts up to 128 tool entries
+per request; see the [Responses tool limit](./docs/guides/API.md#responses-tool-limit).
+
 ### Use it as a Rust SDK (in-process)
 
 For SDK embedding, `bamboo_sdk::agent::Agent` provides `run`, `run_stream`, and
