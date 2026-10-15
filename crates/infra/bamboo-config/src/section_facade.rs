@@ -16064,7 +16064,9 @@ mod worktree_settings_tests {
             .worktrees
             .project_roots
             .insert("project-a".into(), "/work/overrides".into());
-        persist_facade_effective_config(dir.path(), &config).unwrap();
+        // AppState's metadata updater uses the process facade so Core keeps
+        // its existing revision and credential authority checks.
+        persist_facade_effective_config_with_adoption(dir.path(), &config, &facade).unwrap();
         drop(facade);
         let restarted = ConfigFacade::open_or_migrate(dir.path()).unwrap();
         assert_eq!(restarted.effective_config().worktrees, config.worktrees);
