@@ -119,6 +119,15 @@ fallback directory or automatic retry. Creation uses a nonblocking OS advisory
 lock whose file is retained without truncation or deletion. An exiting process
 releases ownership; an active owner or unavailable locking returns an error.
 Preferences do not migrate checkouts.
+
+Manager Git calls disable fsmonitor, hooks, recursive submodule inspection,
+automatic maintenance and lazy fetching. Configured clean/smudge/process filters
+are suppressed per command without changing repository configuration. When
+conversion is needed, the operation fails explicitly instead of materializing
+raw content or silently bypassing a required filter. Existing CLI-created
+checkouts remain discoverable/openable. Submodule working-copy changes are not
+inspected: known parent/Gitlink changes remain dirty, otherwise a checkout with
+Gitlinks reports unknown dirty state and an explicit diagnostic.
 Opening an existing checkout uses the normal revisioned Project workspace binding
 API before Session selection; creation itself does not add another registry.
 No delete/prune/force operation or runtime-child GC is invoked by these endpoints.

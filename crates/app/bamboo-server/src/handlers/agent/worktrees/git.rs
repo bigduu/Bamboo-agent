@@ -15,19 +15,83 @@ pub struct Worktree {
     pub error: Option<String>,
 }
 
-fn command(repo: &Path, args: &[&str]) -> Result<Output, String> {
-    Command::new("git")
+fn git_command(repo: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "submodule.recurse=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+        ])
         .arg("-C")
         .arg(repo)
-        .args(args)
         .env_remove("GIT_DIR")
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
         .env("LC_ALL", "C")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "");
+    command
+}
+
+fn command(repo: &Path, args: &[&str]) -> Result<Output, String> {
+    let mut command = git_command(repo);
+    if args.first() == Some(&"status") || args.starts_with(&["worktree", "add"]) {
+        // Reading configuration names does not execute filters. Include every
+        // scope and include file, but never read/log their potentially secret values.
+        let configured = git_command(repo)
+            .args(["config", "--includes", "--null", "--name-only", "--list"])
+            .output()
+            .map_err(|e| format!("Cannot inspect Git filter configuration: {e}"))?;
+        if !configured.status.success() {
+            return Err(format!(
+                "Cannot inspect Git filter configuration: {}",
+                String::from_utf8_lossy(&configured.stderr).trim()
+            ));
+        }
+        let names = std::str::from_utf8(&configured.stdout)
+            .map_err(|_| "Git filter names must be UTF-8")?;
+        let mut drivers = std::collections::BTreeSet::new();
+        for name in names.split('\0') {
+            if let Some((driver, kind)) = name
+                .strip_prefix("filter.")
+                .and_then(|s| s.rsplit_once('.'))
+            {
+                if matches!(kind, "clean" | "smudge" | "process") {
+                    // -c splits at the first '='. Never let a subsection name
+                    // change which key is overridden.
+                    if driver.contains('=') {
+                        return Err("Git filter names containing '=' are unsupported".into());
+                    }
+                    drivers.insert(driver);
+                }
+            }
+        }
+        for driver in drivers {
+            for kind in ["clean", "smudge", "process"] {
+                command.args(["-c", &format!("filter.{driver}.{kind}=")]);
+            }
+            // A checkout needing conversion must fail explicitly, rather than
+            // silently materialize raw pointers or report an inaccurate status.
+            command.args(["-c", &format!("filter.{driver}.required=true")]);
+        }
+    }
+    command
+        .args(args)
         .output()
         .map_err(|e| format!("Git at {}: {e}", repo.display()))
 }
@@ -159,10 +223,24 @@ pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
             if repository(&canonical)? != common || workspace_root(&canonical)? != canonical {
                 return Err("Worktree path now belongs to a different repository".into());
             }
+            let index = git(&canonical, &["ls-files", "--stage", "-z"])?;
+            let has_submodules = index.split('\0').any(|entry| entry.starts_with("160000 "));
             let status = git(
                 &canonical,
-                &["status", "--porcelain", "-z", "--untracked-files=normal"],
+                &[
+                    "status",
+                    "--porcelain",
+                    "-z",
+                    "--untracked-files=normal",
+                    "--ignore-submodules=dirty",
+                ],
             )?;
+            if status.is_empty() && has_submodules {
+                return Err(
+                    "Submodule working-copy changes were not inspected; dirty state is unknown"
+                        .into(),
+                );
+            }
             Ok((canonical, !status.is_empty()))
         };
         match inspect() {
