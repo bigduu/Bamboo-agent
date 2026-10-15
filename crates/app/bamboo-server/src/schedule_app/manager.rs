@@ -1043,7 +1043,7 @@ async fn dispatch_scheduled_workflow(
                 }
             };
             #[cfg(test)]
-            progress.watch("workflow_terminal_observed");
+            progress.watch("workflow_progress_read_returned");
             let status = match workflow_progress.snapshot.status {
                 bamboo_domain::WorkflowRunStatus::Succeeded => Some(ScheduleRunStatus::Success),
                 bamboo_domain::WorkflowRunStatus::Failed => Some(ScheduleRunStatus::Failed),
@@ -1055,6 +1055,8 @@ async fn dispatch_scheduled_workflow(
                 // return. Preserve overlap accounting until the existing engine
                 // reports that this run has actually left the active set.
                 if access.is_run_active(&snapshot.run_id) {
+                    #[cfg(test)]
+                    progress.watch("workflow_terminal_waiting_for_exit");
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     continue;
                 }
@@ -1909,7 +1911,7 @@ budgets:
     }
 
     mod guard_metadata_tests {
-        use super::{guard_metadata, GuardRecord, ScheduleGuardProgress};
+        use super::{guard_metadata, ScheduleGuardProgress};
         use chrono::Utc;
         use serde_json::json;
 
