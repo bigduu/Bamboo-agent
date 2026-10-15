@@ -99,7 +99,7 @@ execute rejects the old birth; the CLI reports partial admission and never
 deletes that input. Supervisor activation has the existing session-level
 lifetime semantics, not selected-input fencing.
 
-`request_id` defaults to a UUID, or accepts an explicit 1–64-character safe ID.
+`request_id` defaults to a UUID, or accepts an explicit 1–64-character safe ID without `..`.
 The create/chat/execute requests use distinct stable Idempotency-Key values.
 There are no automatic POST retries. Operator-directed retry requires the same
 target, request ID, body and original server process/receipt window; the server

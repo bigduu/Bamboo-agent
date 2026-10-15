@@ -72,6 +72,7 @@ function parse(argv) {
   o.maxEvents = number(o['max-events'], 1000, 10000);
   for (const key of ['session-id', 'run-id', 'project-id', 'request-id']) if (o[key] !== undefined) id(o[key]);
   if (o['request-id']?.length > 64) fail('request_id_too_long', 2);
+  if (o['request-id']?.includes('..')) fail('invalid_request_id', 2);
   if (o['session-created-at']) birth(o['session-created-at']);
   if (command === 'submit') {
     if ([o.supervisor, o.new, o['session-id']].filter(Boolean).length !== 1 || !o['prompt-file']) fail('submit_requires_target_and_prompt_file', 2);
@@ -112,7 +113,7 @@ async function readPrompt(file, signal) {
     finally { await handle?.close(); }
   }
   let text; try { text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)); } catch { fail('prompt_must_be_utf8', 2); }
-  if (!text.trim()) fail('prompt_empty', 2);
+  if (/^[\s\u0085]*$/.test(text)) fail('prompt_empty', 2);
   // Rust char::is_whitespace also includes NEL (U+0085), unlike JS \s.
   if (/^[\s\u0085]*\/goal(?:[\s\u0085]|$)/i.test(text)) fail('goal_control_is_not_task_submission', 2);
   return text;

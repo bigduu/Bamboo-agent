@@ -412,6 +412,24 @@ test('case-insensitive and Unicode-whitespace goal controls never reach HTTP', a
   assert.equal(f.calls.length, 0);
 });
 
+test('Supervisor request IDs follow canonical message ID rules before bootstrap', async t => {
+  const f = await fixture(t);
+  for (const requestId of ['a..b', 'a...', 'x..']) {
+    const r = await cli(f, ['submit', '--supervisor', '--prompt-file', f.prompt, '--request-id', requestId]);
+    assert.equal(r.code, 2); assert.equal(last(r).error.code, 'invalid_request_id');
+  }
+  assert.equal(f.calls.length, 0);
+});
+
+test('NEL-only and mixed Rust-whitespace prompts are empty before Supervisor bootstrap', async t => {
+  const f = await fixture(t);
+  for (const input of ['\u0085', ' \u0085\r\n\t\u3000']) {
+    const r = await cli(f, ['submit', '--supervisor', '--prompt-file', '-'], { input });
+    assert.equal(r.code, 2); assert.equal(last(r).error.code, 'prompt_empty');
+  }
+  assert.equal(f.calls.length, 0);
+});
+
 test('named-pipe prompt is rejected without blocking open or making an HTTP request', { skip: process.platform === 'win32' }, async t => {
   const f = await fixture(t);
   const fifo = path.join(path.dirname(f.prompt), 'prompt.pipe');
