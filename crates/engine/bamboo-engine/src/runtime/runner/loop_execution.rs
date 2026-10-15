@@ -15,6 +15,9 @@ mod gold;
 mod pipeline;
 mod startup;
 
+#[cfg(test)]
+mod counted_tests;
+
 use pipeline::run_pipeline;
 pub(in crate::runtime::runner) use pipeline::{
     legacy_browser_loaded_result_content, legacy_browser_needs_discovery,
@@ -50,7 +53,9 @@ pub(crate) async fn run_agent_loop_with_config(
     config: AgentLoopConfig,
 ) -> super::Result<()> {
     let session_span = tracing::info_span!("agent_loop", session_id = %session.id);
-    async {
+    let mut counted_generation = None;
+    let result = async {
+        crate::runtime::counted_loop::preflight(session, &config, &initial_message).await?;
         let session_start_source = session
             .metadata
             .remove(crate::session_app::chat::SESSION_START_SOURCE_METADATA_KEY)
@@ -117,6 +122,14 @@ pub(crate) async fn run_agent_loop_with_config(
             &config,
             tools.as_ref(),
             &event_tx,
+        )
+        .await?;
+
+        counted_generation = crate::runtime::counted_loop::begin(
+            session,
+            &config,
+            &state.execution_id,
+            &initial_message,
         )
         .await?;
 
@@ -252,7 +265,23 @@ pub(crate) async fn run_agent_loop_with_config(
         Ok(())
     }
     .instrument(session_span)
-    .await
+    .await;
+    let checkpoint = crate::runtime::counted_loop::finish(
+        session,
+        &config,
+        counted_generation.as_deref(),
+        &result,
+    )
+    .await;
+    match result {
+        Err(error) => {
+            if let Err(checkpoint_error) = checkpoint {
+                tracing::warn!(%checkpoint_error, "counted-loop terminal checkpoint failed");
+            }
+            Err(error)
+        }
+        Ok(()) => checkpoint,
+    }
 }
 
 #[cfg(test)]

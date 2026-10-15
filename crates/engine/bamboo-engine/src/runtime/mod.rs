@@ -4,6 +4,7 @@ pub mod agent;
 pub mod complexity_classifier;
 pub mod config;
 pub mod context;
+pub mod counted_loop;
 pub mod execution;
 pub(crate) mod final_evidence;
 pub mod goal_recovery;
