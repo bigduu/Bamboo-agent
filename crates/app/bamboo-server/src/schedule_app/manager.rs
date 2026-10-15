@@ -164,6 +164,21 @@ fn guard_progress_for_job(
     observers.lock().unwrap().get(&job.run_id).cloned()
 }
 
+#[cfg(test)]
+fn guard_progress_for_received_job(
+    observers: &ScheduleGuardObservers,
+    job: &ScheduleRunJob,
+) -> Option<Arc<ScheduleGuardProgress>> {
+    // A duplicate still contributes to the receive count, but it must not
+    // replace the original attempt's worker or watcher boundaries.
+    guard_progress_for_job(observers, job).filter(|progress| {
+        progress
+            .received
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            == 0
+    })
+}
+
 impl ScheduleManager {
     pub fn new(ctx: ScheduleContext) -> Self {
         let (tx, mut rx) = mpsc::channel::<ScheduleRunJob>(128);
@@ -179,12 +194,7 @@ impl ScheduleManager {
                 while let Some(job) = rx.recv().await {
                     #[cfg(test)]
                     let progress = {
-                        let progress = guard_progress_for_job(&guard_progress, &job);
-                        if let Some(progress) = progress.as_ref() {
-                            progress
-                                .received
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
+                        let progress = guard_progress_for_received_job(&guard_progress, &job);
                         progress.at("occurrence_claim_pending");
                         progress
                     };
@@ -1916,8 +1926,8 @@ budgets:
 
     mod guard_metadata_tests {
         use super::{
-            guard_metadata, guard_progress_for_job, ScheduleGuardObservers, ScheduleGuardProgress,
-            ScheduleRunJob,
+            guard_metadata, guard_progress_for_job, guard_progress_for_received_job,
+            ObserveScheduleGuard, ScheduleGuardObservers, ScheduleGuardProgress, ScheduleRunJob,
         };
         use chrono::Utc;
         use serde_json::json;
@@ -1961,6 +1971,46 @@ budgets:
             assert!(poison.is_err());
             job.run_config.workflow_target = None;
             assert!(guard_progress_for_job(&observers, &job).is_none());
+        }
+
+        #[test]
+        fn duplicate_receives_preserve_the_first_attempt_boundaries() {
+            let observers = ScheduleGuardObservers::default();
+            let progress = Arc::new(ScheduleGuardProgress::default());
+            let at = Utc::now();
+            let job = ScheduleRunJob {
+                run_id: "observed-run".into(),
+                schedule_id: "fixture-schedule".into(),
+                schedule_name: "fixture".into(),
+                run_config: serde_json::from_value(json!({
+                    "auto_execute": true,
+                    "workflow_target": {"workflow_id": "fixture", "revision": 1, "args": {}}
+                }))
+                .unwrap(),
+                scheduled_for: at,
+                claimed_at: at,
+                was_catch_up: false,
+            };
+            observers
+                .lock()
+                .unwrap()
+                .insert(job.run_id.clone(), progress.clone());
+            let first = guard_progress_for_received_job(&observers, &job).unwrap();
+            assert!(Arc::ptr_eq(&first, &progress));
+            first.at("workflow_correlated");
+            first.watch("workflow_terminal_read_pending");
+            let original_boundaries = *progress.boundaries.lock().unwrap();
+
+            let duplicate = guard_progress_for_received_job(&observers, &job);
+            duplicate.at("occurrence_claim_pending");
+            duplicate.at("occurrence_claim_skipped");
+            assert!(duplicate.is_none());
+            assert_eq!(*progress.boundaries.lock().unwrap(), original_boundaries);
+            assert_eq!(progress.received.load(super::Ordering::Relaxed), 2);
+            assert!(Arc::ptr_eq(
+                &guard_progress_for_job(&observers, &job).unwrap(),
+                &first
+            ));
         }
 
         #[test]
