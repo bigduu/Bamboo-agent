@@ -654,4 +654,199 @@ mod tests {
         assert!(create(&f.repo(), &f.roots(), "directory", "directory").is_err());
         assert!(path.is_dir());
     }
+
+    #[cfg(unix)]
+    fn callback_script(f: &Fixture, name: &str) -> (PathBuf, PathBuf, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = f.0.join(name);
+        fs::write(&script, "#!/bin/sh\n: > \"$0.proof\"\nexit 1\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let proof = PathBuf::from(format!("{}.proof", script.display()));
+        let command = format!("'{}'", script.to_str().unwrap().replace('\'', "'\\''"));
+        (script, proof, command)
+    }
+
+    #[cfg(unix)]
+    fn commit_fixture(repo: &Path) {
+        git(repo, &["add", "."]).unwrap();
+        git(
+            repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "tracked fixture",
+            ],
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_never_executes_repository_fsmonitor() {
+        let f = Fixture::new();
+        fs::write(f.repo().join("tracked.txt"), "tracked\n").unwrap();
+        commit_fixture(&f.repo());
+        let (_, proof, callback) = callback_script(&f, "fsmonitor");
+        git(&f.repo(), &["config", "core.fsmonitor", &callback]).unwrap();
+        let inventory = list(&f.repo()).unwrap();
+        assert_eq!(inventory[0].dirty, Some(false));
+        assert!(!proof.exists(), "Inventory executed repository fsmonitor");
+        assert_eq!(
+            git(&f.repo(), &["config", "--local", "core.fsmonitor"])
+                .unwrap()
+                .trim(),
+            callback
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creation_never_executes_repository_checkout_hook() {
+        let f = Fixture::new();
+        let (script, proof, _) = callback_script(&f, "post-checkout");
+        fs::write(&script, "#!/bin/sh\n: > \"$0.proof\"\nexit 0\n").unwrap();
+        git(
+            &f.repo(),
+            &[
+                "config",
+                "core.hooksPath",
+                script.parent().unwrap().to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        create(&f.repo(), &f.roots(), "no_hook", "no/hook").unwrap();
+        assert!(
+            !proof.exists(),
+            "Creation executed repository post-checkout"
+        );
+        assert!(script.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_filters_are_not_executed_or_silently_bypassed() {
+        let mut observations = Vec::new();
+        for (kind, driver, included) in [
+            ("clean", "task-filter", false),
+            ("smudge", "task-filter", false),
+            ("process", "task-filter", false),
+            ("smudge", "task=filter", false),
+            ("smudge", "task-filter", true),
+        ] {
+            let f = Fixture::new();
+            fs::write(
+                f.repo().join(".gitattributes"),
+                format!("*.txt filter={driver}\n"),
+            )
+            .unwrap();
+            fs::write(f.repo().join("tracked.txt"), "tracked\n").unwrap();
+            commit_fixture(&f.repo());
+            let (_, proof, callback) = callback_script(&f, "filter");
+            let key = format!("filter.{driver}.{kind}");
+            if included {
+                let config = f.0.join("included.config");
+                git(
+                    &f.repo(),
+                    &[
+                        "config",
+                        "--file",
+                        config.to_str().unwrap(),
+                        &key,
+                        &callback,
+                    ],
+                )
+                .unwrap();
+                git(
+                    &f.repo(),
+                    &["config", "include.path", config.to_str().unwrap()],
+                )
+                .unwrap();
+            } else {
+                git(&f.repo(), &["config", &key, &callback]).unwrap();
+            }
+            let explicit_error = if kind == "clean" {
+                fs::write(f.repo().join("tracked.txt"), "changed\n").unwrap();
+                let entries = list(&f.repo()).unwrap();
+                entries[0].dirty.is_none()
+                    && entries[0]
+                        .error
+                        .as_ref()
+                        .is_some_and(|e| e.contains("filter"))
+            } else {
+                create(&f.repo(), &f.roots(), "no_filter", "no/filter")
+                    .is_err_and(|e| e.contains("filter"))
+            };
+            let unchanged = git(&f.repo(), &["config", &key]).unwrap().trim() == callback;
+            observations.push((
+                kind,
+                driver,
+                included,
+                proof.exists(),
+                explicit_error,
+                unchanged,
+            ));
+        }
+        assert!(
+            observations
+                .iter()
+                .all(|(_, _, _, executed, explicit, unchanged)| !executed
+                    && *explicit
+                    && *unchanged),
+            "Unsafe filter observations: {observations:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_repository_filters_are_not_run_for_parent_inventory() {
+        let f = Fixture::new();
+        let child = f.repo().join("nested");
+        fs::create_dir(&child).unwrap();
+        git(&child, &["init", "-b", "main"]).unwrap();
+        fs::write(child.join(".gitattributes"), "*.txt filter=nested\n").unwrap();
+        fs::write(child.join("tracked.txt"), "tracked\n").unwrap();
+        commit_fixture(&child);
+        let head = git(&child, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(
+            f.repo().join(".gitmodules"),
+            "[submodule \"nested\"]\npath = nested\nurl = ../unused\n",
+        )
+        .unwrap();
+        git(
+            &f.repo(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{},nested", head.trim()),
+            ],
+        )
+        .unwrap();
+        commit_fixture(&f.repo());
+        git(&f.repo(), &["config", "submodule.nested.active", "true"]).unwrap();
+        git(&f.repo(), &["config", "diff.ignoreSubmodules", "none"]).unwrap();
+        let (_, proof, callback) = callback_script(&f, "nested-filter");
+        git(&child, &["config", "filter.nested.clean", &callback]).unwrap();
+        fs::write(child.join("tracked.txt"), "changed\n").unwrap();
+        let inventory = list(&f.repo()).unwrap();
+        assert!(!proof.exists(), "Inventory ran a nested repository filter");
+        assert!(inventory[0].dirty.is_none());
+        assert!(inventory[0]
+            .error
+            .as_ref()
+            .is_some_and(|e| e.contains("Submodule")));
+        fs::write(
+            f.repo().join("untracked.txt"),
+            "parent dirtiness is still known\n",
+        )
+        .unwrap();
+        assert_eq!(list(&f.repo()).unwrap()[0].dirty, Some(true));
+        assert!(!proof.exists());
+    }
 }
