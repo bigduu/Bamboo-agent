@@ -119,7 +119,9 @@ node scripts/bamboo-task.cjs events --session-id SESSION_ID --max-events 100
 
 Plain `status` returns session metadata with `observation_scope=session`, omitting
 titles, paths and raw errors. Exact ordinary Root status uses the original birth
-and run ID, with nanosecond precision preserved. Its replacement snapshot exposes
+and run ID, with nanosecond precision preserved. Calendar days, leap years,
+clock and offset components are checked locally; invalid dates are rejected
+rather than normalized into another lifetime. Its replacement snapshot exposes
 runner status, visible version/terminal and `history_committed`; text is omitted
 unless `--include-output` is explicit. An output terminal does not itself prove
 history was saved. Replacement, eviction and restart can end output retention.

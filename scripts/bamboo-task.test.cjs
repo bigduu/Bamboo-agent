@@ -332,6 +332,41 @@ test('metadata status works on old backend and excludes private title, errors an
 const output = () => ({ session_id: 'root', run_id: 'run-1', session_created_at: BIRTH, output_scope: 'visible_messages', runner_status: 'completed',
   input: { message_id: 'request-1', ingress_seq: 7 }, output: { version: 4, messages: [{ id: 'assistant-1', content: SECRET }], terminal: 'complete', history_committed: true } });
 const exact = ['status', '--session-id', 'root', '--run-id', 'run-1', '--session-created-at', BIRTH];
+
+for (const command of ['submit', 'status']) test(`calendar-invalid birth rejects ${command} before any HTTP`, async t => {
+  const f = await fixture(t, (c, res) => {
+    if (c.path === '/api/v1/sessions/root') { json(res, { session: session('root', { created_at: '2026-03-01T00:00:00Z' }) }); return true; }
+  });
+  for (const invalid of ['2026-02-29T00:00:00Z', '1900-02-29T00:00:00Z', '2026-04-31T00:00:00Z', '2026-11-31T00:00:00Z',
+    '2026-00-01T00:00:00Z', '2026-13-01T00:00:00Z', '2026-01-00T00:00:00Z', '2026-01-32T00:00:00Z',
+    '2026-01-01T24:00:00Z', '2026-01-01T00:60:00Z', '2026-01-01T00:00:60Z', '2026-01-01T00:00:00+24:00', '2026-01-01T00:00:00+00:60']) {
+    const args = command === 'submit' ? [...submit(f), '--session-created-at', invalid]
+      : ['status', '--session-id', 'root', '--run-id', 'run-1', '--session-created-at', invalid];
+    const r = await cli(f, args);
+    assert.equal(r.code, 2, JSON.stringify({ result: last(r), calls: f.calls.map(c => ({ method: c.method, path: c.path })) }));
+    assert.equal(last(r).error.code, 'invalid_session_birth');
+  }
+  assert.equal(f.calls.length, 0);
+});
+
+test('valid Gregorian leap years, century boundaries, offsets and nanoseconds remain exact', async t => {
+  for (const valid of ['0000-02-29T00:00:00Z', '1900-02-28T23:59:59.123456789Z', '2000-02-29T00:00:00.000000001+05:30',
+    '2024-02-29T23:59:59.123456789-03:30', '2026-04-30T12:34:56Z']) {
+    const f = await fixture(t, (c, res) => { if (c.path.endsWith('/output')) { json(res, { ...output(), session_created_at: valid }); return true; } });
+    const r = await cli(f, ['status', '--session-id', 'root', '--run-id', 'run-1', '--session-created-at', valid]);
+    assert.equal(r.code, 0); assert.equal(last(r).session_created_at, valid); privateSafe(r);
+    assert.equal(f.calls[0].headers['bamboo-session-created-at'], valid);
+  }
+});
+
+test('calendar-invalid backend birth is a protocol error before chat admission', async t => {
+  const f = await fixture(t, (c, res) => {
+    if (c.path === '/api/v1/sessions/root') { json(res, { session: session('root', { created_at: '2026-02-29T00:00:00Z' }) }); return true; }
+  });
+  const r = await cli(f, submit(f));
+  assert.equal(r.code, 6); assert.equal(last(r).error.code, 'invalid_session_birth'); assert.equal(posts(f).length, 0); privateSafe(r);
+});
+
 test('exact status uses original nanosecond birth; visible output requires explicit opt-in', async t => {
   const f = await fixture(t, (c, res) => { if (c.path.endsWith('/output')) { assert.equal(c.headers['bamboo-session-created-at'], BIRTH); json(res, output()); return true; } });
   const r = await cli(f, exact); assert.equal(r.code, 0); assert.equal(last(r).runner_status, 'completed'); assert.equal(last(r).output.message_count, 1); privateSafe(r);

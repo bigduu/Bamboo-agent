@@ -42,7 +42,17 @@ const isId = s => typeof s === 'string' && /^[A-Za-z0-9_-][A-Za-z0-9_.:-]{0,127}
 function id(s, exit = 2) { if (!isId(s)) fail('invalid_identity', exit); return s; }
 function birth(s, exit = 2) {
   // Preserve sub-millisecond precision. Never serialize through JS Date.
-  if (typeof s !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?(?:Z|[+-]\d\d:\d\d)$/.test(s) || !Number.isFinite(Date.parse(s))) fail('invalid_session_birth', exit);
+  const match = typeof s === 'string' && /^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d{1,9}))?(?:Z|[+-](\d\d):(\d\d))$/.exec(s);
+  if (!match) fail('invalid_session_birth', exit);
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  // Date.parse normalizes e.g. February 29 in a non-leap year and 24:00.
+  // Such input must never compare equal to another Root's actual lifetime.
+  if (month < 1 || month > 12 || day < 1 || day > days ||
+      hour > 23 || minute > 59 || second > 59 ||
+      Number(match[8] || 0) > 23 || Number(match[9] || 0) > 59 ||
+      !Number.isFinite(Date.parse(s))) fail('invalid_session_birth', exit);
   return s;
 }
 function number(s, fallback, max) {
