@@ -361,6 +361,7 @@ fn project_error(error: ProjectStoreError) -> HttpResponse {
         | ProjectStoreError::NotArchived(_)
         | ProjectStoreError::Validation(_)
         | ProjectStoreError::UnsupportedManifestSchema { .. }
+        | ProjectStoreError::LegacyMigrationConflict { .. }
         | ProjectStoreError::InvalidPathComponent(_)
         | ProjectStoreError::ProjectPathUnbindConflict { .. } => {
             (StatusCode::CONFLICT, error.to_string())
