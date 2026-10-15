@@ -1977,6 +1977,54 @@ async fn peer_steer_rechecks_owner_at_actual_rename_after_preflight_race() {
 }
 
 #[tokio::test]
+async fn peer_steer_publication_error_releases_guard_without_notification_or_delivery() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (_temp, store, mut inbox, source, target) = explicit_peer_fixture().await;
+    let envelope = peer_envelope("sender", "parent");
+    let original =
+        serde_json::to_value(store.load_session("parent").await.unwrap().unwrap()).unwrap();
+    let run = SteerRunPort::new(Some("run-a"));
+    let observed = run.clone();
+    inbox.owned_fs_hook = Some(Arc::new(move |phase, _| {
+        if phase == "expected_run_matched" {
+            assert_eq!(observed.live.load(SeqCst), 1);
+            assert_eq!(observed.notified.load(SeqCst), 0);
+            return Err(std::io::Error::other(
+                "injected final publication I/O failure",
+            ));
+        }
+        Ok(())
+    }));
+    assert!(matches!(
+        inbox
+            .deliver_peer_steer(&envelope, &source, &target, "run-a", run.clone())
+            .await,
+        Err(SessionInboxError::Storage(_))
+    ));
+    assert_eq!(run.live.load(SeqCst), 0);
+    assert_eq!(run.notified.load(SeqCst), 0);
+    let dir = inbox.inbox_dir("parent").await.unwrap();
+    assert_eq!(std::fs::read_dir(dir.join("new")).unwrap().count(), 0);
+    let backlog = inbox.inspect("parent").await.unwrap();
+    assert_eq!((backlog.pending, backlog.claimed), (0, 0));
+    assert!(!backlog.activation_pending());
+    assert!(!inbox.was_admitted("parent", &envelope.id).await.unwrap());
+    assert_eq!(
+        serde_json::to_value(store.load_session("parent").await.unwrap().unwrap()).unwrap(),
+        original
+    );
+    inbox.owned_fs_hook = None;
+    let accepted = inbox
+        .deliver_peer_steer(&envelope, &source, &target, "run-a", run.clone())
+        .await
+        .unwrap();
+    assert!(!accepted.replayed);
+    assert_eq!(accepted.delivery.generation, 2);
+    assert!(accepted.active_delivery_notified);
+    assert_eq!(run.notified.load(SeqCst), 1);
+}
+
+#[tokio::test]
 async fn peer_steer_rejects_impossible_replayed_generations_without_owner_check_or_repair() {
     for acknowledged in [false, true] {
         for generation in [0_u64, 20] {
