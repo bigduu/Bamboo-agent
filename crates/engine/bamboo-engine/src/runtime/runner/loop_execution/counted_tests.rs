@@ -879,7 +879,7 @@ impl RuntimeSessionPersistence for CancelAtTerminalCheckpoint {
         if read_loop_state(session).unwrap().is_some_and(|state| {
             matches!(
                 state.status,
-                LoopStatus::Stopped | LoopStatus::BudgetExhausted
+                LoopStatus::Stopped | LoopStatus::BudgetExhausted | LoopStatus::Finalizing
             )
         }) {
             self.cancel.cancel();
@@ -890,11 +890,20 @@ impl RuntimeSessionPersistence for CancelAtTerminalCheckpoint {
 
 #[tokio::test]
 async fn counted_cancel_during_terminal_checkpoint_keeps_cancelled_error_and_no_complete() {
-    for tools in [false, true] {
+    for boundary in [
+        LoopStatus::Stopped,
+        LoopStatus::BudgetExhausted,
+        LoopStatus::Finalizing,
+    ] {
+        let tools = boundary == LoopStatus::BudgetExhausted;
         let dir = tempfile::tempdir().unwrap();
         let cancel = CancellationToken::new();
-        let mut cfg = if tools { config(1, 1) } else { config(2, 4) };
-        if !tools {
+        let mut cfg = if boundary == LoopStatus::Stopped {
+            config(2, 4)
+        } else {
+            config(1, 1)
+        };
+        if boundary == LoopStatus::Stopped {
             let mut hooks = crate::runtime::hooks::HookRunner::new();
             hooks.register(Arc::new(StopAfterRound(cfg.counted_loop.clone().unwrap())));
             cfg.hook_runner = Arc::new(hooks);
