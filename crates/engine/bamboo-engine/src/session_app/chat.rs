@@ -225,7 +225,7 @@ pub fn prepare_chat_turn_from_authoritative_session_with_workspace_policy(
     if let Some(enabled) = input.root_orchestration_only {
         session.set_root_orchestration_only(enabled)?;
     }
-    if session.root_orchestration_only_enabled() {
+    if session.model_orchestration_only_enabled() {
         session.validate_root_orchestration_compatibility()?;
         // A typed Workflow can remain pending or active without a valid
         // selected-skill mirror. Treat malformed authority as incompatible.
@@ -1546,6 +1546,41 @@ mod tests {
                 bamboo_domain::RootToolAuthorityError::LegacyPlanActive
             ))
         ));
+    }
+
+    #[test]
+    fn supervisor_delegation_first_rejects_execution_workflow_selection_in_both_modes() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for ultra in [false, true] {
+            let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+            supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+                incarnation_id: uuid::Uuid::new_v4(),
+            };
+            supervisor.set_root_orchestration_only(ultra).unwrap();
+            let mut input = chat_turn_input(None);
+            input.session_id = supervisor.id.clone();
+            let prepared = prepare_chat_turn_from_authoritative_session(
+                Some(supervisor.clone()),
+                input,
+                "",
+                "base",
+            )
+            .unwrap();
+            assert_eq!(
+                prepared.root_thinking_mode(),
+                supervisor.root_thinking_mode()
+            );
+            assert!(prepared.model_orchestration_only_enabled());
+            let mut input = chat_turn_input(None);
+            input.session_id = supervisor.id.clone();
+            input.selected_skill_ids = Some(vec!["implementation-workflow".into()]);
+            assert!(matches!(
+                prepare_chat_turn_from_authoritative_session(Some(supervisor), input, "", "base"),
+                Err(ChatError::RootToolAuthority(
+                    bamboo_domain::RootToolAuthorityError::WorkflowSelected
+                ))
+            ));
+        }
     }
 
     #[test]

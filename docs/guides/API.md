@@ -106,12 +106,23 @@ tool permissions.
 
 Root sessions can also select `"root_orchestration_only": true`. This durable
 execution mode supplies the same delegation guidance even when
-`root_orchestration_prompt` is unset. It limits the Root to these nine exact
-tool execution identities: `SubAgent`, `Plan`, `Task`,
-`session_history_current`, `Read`, `Grep`, `Glob`, `GetFileInfo`, and
-`ViewImage`. Other tools, including shell and editing tools, are unavailable
-to that Root; delegated children retain their own tool authority. The mode and
-the prompt-only choice are independent.
+`root_orchestration_prompt` is unset. It limits the Root to these exact tool
+execution identities: `SubAgent`, `Plan`, `Task`, `session_history_current`,
+`session_message`, `Read`, `Grep`, `Glob`, `GetFileInfo`, `ViewImage`,
+`work_overview`, `work_search`, `work_inspect`, `work_changes`, `work_update`,
+and `work_dispatch`. Exposure still follows configuration and each tool's live
+authorization checks. Shell and editing tools are unavailable to that Root;
+delegated children retain their own tool authority. The mode and the prompt-only
+choice are independent.
+
+The trusted default Supervisor uses this bounded orchestration posture in both
+Standard and Ultra, with `session_control` and scoped `session_history` admitted
+only through their existing Supervisor checks. Its independent-Root followup
+requires an explicitly attached target in current authorized Project/lifetime
+scope. Ordinary Ultra Roots do not gain that exception. Neither mode nor tool
+exposure initializes Work, enables its feature flags, or proves worker readiness.
+Unavailable delegation is a recoverable blocker; the Supervisor does not switch
+to direct implementation. See [Supervisor role and scope](../supervisor-identity.md#model-role-and-thinking-mode).
 
 The first chat request for a new Root may select this mode with
 `root_orchestration_only`. For an **existing** Root, omit that field from

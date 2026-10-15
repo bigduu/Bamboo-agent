@@ -87,7 +87,7 @@ fn take_test_post_llm_retry_failure(session: &mut Session) -> Option<AgentError>
     ))
 }
 
-fn effective_callable_set_for_round(
+pub(in crate::runtime::runner) fn effective_callable_set_for_round(
     session: &Session,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
     capability_loading_mode: CapabilityLoadingMode,
@@ -318,6 +318,7 @@ impl CompleteCapabilityDiscovery {
             .iter()
             .cloned()
             .filter_map(ClassifiedToolSchema::new)
+            .filter(|entry| session.allows_model_tool_execution(entry.execution_name()))
             .collect::<Vec<_>>();
         let searchable_tool_catalog = catalog.iter().filter(|entry| {
             entry.loading_class() == CapabilityLoadingClass::Deferred
@@ -326,7 +327,7 @@ impl CompleteCapabilityDiscovery {
         let tools = bamboo_tools::tool_search::ToolSearchIndex::from_resolved_catalog(
             searchable_tool_catalog,
         );
-        if browser_only || !include_commands {
+        if browser_only || !include_commands || session.model_orchestration_only_enabled() {
             // Tool search does not depend on Skill applicability or its store.
             return Ok(Self {
                 catalog,
@@ -640,11 +641,14 @@ async fn ensure_discovery_allowed(
     config: &AgentLoopConfig,
 ) -> Result<(), AgentError> {
     state_bridge::refresh_round_root_tool_authority(session, config.storage.as_ref()).await?;
-    if session.root_orchestration_only_enabled() {
+    if session.root_orchestration_only_enabled() && session.supervisor_incarnation_id().is_none() {
         return Err(AgentError::Tool(
             "capability discovery is outside this Root's tool authority".into(),
         ));
     }
+    // A trusted Supervisor may load its already-approved orchestration tools.
+    // CompleteCapabilityDiscovery re-filters exact names and never opens its
+    // Skill/Workflow store. Discovery does not grant execution authority.
     Ok(())
 }
 
@@ -3375,7 +3379,7 @@ async fn run_pipeline_inner(
                             error,
                         );
                         let overflow_tool_schemas =
-                            crate::runtime::runner::round_lifecycle::request_tool_schemas_for_session(
+                            crate::runtime::runner::round_lifecycle::context_tool_schemas_for_session(
                                 session,
                                 &llm,
                                 &state.model_name,
@@ -4417,6 +4421,78 @@ fn heuristic_complexity(
 }
 
 #[cfg(test)]
+#[tokio::test]
+async fn supervisor_delegation_first_discovery_is_readonly_bounded_and_keeps_ordinary_ultra_denial()
+{
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    let schemas = [
+        "Read",
+        "SubAgent",
+        "exec_command",
+        "load_skill",
+        "workflow_run",
+        "vendor::Read",
+    ]
+    .into_iter()
+    .map(|name| bamboo_agent_core::tools::ToolSchema {
+        schema_type: "function".into(),
+        function: bamboo_agent_core::tools::FunctionSchema {
+            name: name.into(),
+            description: name.into(),
+            parameters: serde_json::json!({"type":"object"}),
+        },
+    })
+    .collect::<Vec<_>>();
+    let config = AgentLoopConfig::default();
+    for ultra in [false, true] {
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        let before = serde_json::to_value(&supervisor).unwrap();
+        ensure_discovery_allowed(&mut supervisor, &config)
+            .await
+            .unwrap();
+        let discovery =
+            CompleteCapabilityDiscovery::new(&supervisor, &config, &schemas, false, true)
+                .await
+                .unwrap();
+        assert!(
+            discovery.commands.is_none(),
+            "Supervisor must not open Skill/Workflow discovery"
+        );
+        assert_eq!(
+            discovery
+                .catalog
+                .iter()
+                .map(|entry| entry.execution_name())
+                .collect::<Vec<_>>(),
+            ["Read", "SubAgent"]
+        );
+        let request = serde_json::from_value(
+            serde_json::json!({"query":"SubAgent","kinds":["tool"],"limit":1}),
+        )
+        .unwrap();
+        let found = discovery.discover_complete_schemas(&request).unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|schema| schema.function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["SubAgent"]
+        );
+        assert_eq!(serde_json::to_value(&supervisor).unwrap(), before);
+    }
+    let mut ordinary = Session::new("ordinary-ultra", "model");
+    ordinary.metadata.insert("role".into(), "supervisor".into());
+    ordinary.set_root_orchestration_only(true).unwrap();
+    assert!(ensure_discovery_allowed(&mut ordinary, &config)
+        .await
+        .is_err());
+}
+
+#[cfg(test)]
 mod tests {
     #[tokio::test]
     async fn ql_main_pipeline_observes_real_new_then_terminal_or_cancel_drops_owner() {
@@ -4561,9 +4637,9 @@ mod tests {
         AgentStatusState, ChildWaitPolicy, WaitingForChildrenState,
     };
     use bamboo_domain::{
-        AgentHookPoint, AgentRuntimeState, HookPayload, HookResult, ProjectId,
-        ProjectResourceSummary, SessionActivationPolicy, SessionInboxLimits, SessionInboxPort,
-        SessionMessageEnvelope,
+        AgentHookPoint, AgentRuntimeState, CapabilityLoadingMode, HookPayload, HookResult,
+        ProjectId, ProjectResourceSummary, SessionActivationPolicy, SessionInboxLimits,
+        SessionInboxPort, SessionMessageEnvelope,
     };
     use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use bamboo_metrics::{
@@ -5500,6 +5576,379 @@ mod tests {
                 assert_ne!(serde_json::to_value(gateway).unwrap(), serde_json::to_value(&complete_tools[1]).unwrap(),
                     "explicit command must narrow an existing generic gateway even at the full limit=2");
             }
+        }
+    }
+
+    struct SupervisorLoadingProvider {
+        mode: CapabilityLoadingMode,
+        calls: AtomicUsize,
+        failure: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for SupervisorLoadingProvider {
+        async fn capability_loading_mode(
+            &self,
+            _: &str,
+            required: Option<&str>,
+        ) -> CapabilityLoadingMode {
+            assert!(
+                required.is_none(),
+                "delegation must not become a forced named-tool call"
+            );
+            self.mode
+        }
+
+        async fn provider_visible_tool_footprint(
+            &self,
+            ir: &bamboo_llm::PromptIR,
+            tools: &[bamboo_agent_core::tools::ToolSchema],
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<bamboo_llm::ProviderVisibleToolFootprint, LLMError> {
+            if self.mode == CapabilityLoadingMode::Progressive {
+                bamboo_llm::providers::openai::OpenAIProvider::new("test")
+                    .with_responses_only_models(vec!["gpt-5*".into()])
+                    .with_tool_search_execution(bamboo_llm::providers::common::openai_responses::ResponsesToolSearchExecution::Client)
+                    .provider_visible_tool_footprint(ir, tools, "gpt-5.6", None)
+                    .await
+            } else {
+                let projected =
+                    bamboo_llm::providers::common::openai_compat::tools_to_openai_compat_json(
+                        tools,
+                    );
+                Ok(bamboo_llm::ProviderVisibleToolFootprint {
+                    segments: vec![bamboo_llm::ProviderVisibleToolSegment {
+                        kind: bamboo_llm::ProviderVisibleToolSegmentKind::InitialFullDefinition,
+                        serialized: serde_json::to_string(&projected)?,
+                    }],
+                })
+            }
+        }
+
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            panic!("the controlled provider must receive the real PromptIR");
+        }
+
+        async fn chat_stream_ir(
+            &self,
+            ir: &bamboo_llm::PromptIR,
+            tools: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+            options: Option<&bamboo_llm::LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            assert!(options
+                .and_then(|options| options.required_tool.as_ref())
+                .is_none());
+            assert!(tools.iter().all(|schema| !matches!(
+                schema.function.name.as_str(),
+                "exec_command" | "load_skill" | "vendor::SubAgent"
+            )));
+            let messages = ir.flatten();
+            let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            let marker = "Current delegation route observation: ";
+            let latest = messages
+                .iter()
+                .rev()
+                .find_map(|message| {
+                    message
+                        .content
+                        .rfind(marker)
+                        .map(|index| &message.content[index + marker.len()..])
+                })
+                .expect("Supervisor request must report current delegation state");
+            let observation = serde_json::Deserializer::from_str(latest)
+                .into_iter::<serde_json::Value>()
+                .next()
+                .unwrap()
+                .unwrap();
+            if count == 0 {
+                assert_eq!(
+                    observation["status"], "discovery_required",
+                    "deferred definitions are not callable yet"
+                );
+            } else {
+                assert_eq!(
+                    observation["status"], "routes_exposed",
+                    "validated discovery must be reflected in the next request"
+                );
+                assert_eq!(observation["routes"], serde_json::json!(["SubAgent"]));
+            }
+            if self.mode == CapabilityLoadingMode::StickyFallback {
+                assert!(tools.iter().any(|schema| schema.function.name
+                    == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
+                assert!(!tools
+                    .iter()
+                    .any(|schema| schema.function.name == "SubAgent"));
+            } else {
+                let response_options = ir.responses_request_options(None);
+                let body = bamboo_llm::providers::common::openai_responses::build_responses_body_with_capability_loading(
+                    "gpt-5.6", &messages, tools, None, None, Some(&response_options), None, None,
+                    CapabilityLoadingMode::Progressive,
+                    bamboo_llm::providers::common::openai_responses::ResponsesToolSearchExecution::Client);
+                let initial = body["tools"].as_array().unwrap();
+                assert!(initial
+                    .iter()
+                    .any(|tool| tool["type"] == "tool_search" && tool["execution"] == "client"));
+                assert!(initial
+                    .iter()
+                    .all(|tool| tool["name"] != "SubAgent" && tool["name"] != "exec_command"));
+            }
+            let chunks = match count {
+                0 if self.mode == CapabilityLoadingMode::StickyFallback => vec![
+                    Ok(LLMChunk::ToolCalls(vec![activation_call(
+                        "supervisor-search",
+                        bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                        r#"{"query":"SubAgent","kinds":["tool"],"limit":1}"#,
+                    )])),
+                    Ok(LLMChunk::Done),
+                ],
+                0 => vec![
+                    Ok(LLMChunk::ProviderTranscriptItem(
+                        native_client_search_item_for("supervisor-search", "SubAgent"),
+                    )),
+                    Ok(LLMChunk::Done),
+                ],
+                1 => {
+                    if self.mode == CapabilityLoadingMode::StickyFallback {
+                        let result = messages
+                            .iter()
+                            .find(|message| {
+                                message.tool_call_id.as_deref() == Some("supervisor-search")
+                            })
+                            .unwrap();
+                        let definitions = sticky_result_definition_values(result).unwrap();
+                        assert_eq!(definitions.len(), 1);
+                        assert_eq!(definitions[0]["function"]["name"], "SubAgent");
+                    } else {
+                        let result = ir
+                            .provider_transcript_groups
+                            .iter()
+                            .flat_map(|group| group.items())
+                            .find(|item| item.payload()["type"] == "tool_search_output")
+                            .unwrap();
+                        assert_eq!(result.payload()["tools"].as_array().unwrap().len(), 1);
+                        assert_eq!(result.payload()["tools"][0]["name"], "SubAgent");
+                    }
+                    vec![
+                        Ok(LLMChunk::ToolCalls(vec![activation_call(
+                            "supervisor-delegate",
+                            "SubAgent",
+                            r#"{"message":"Implement only the assigned change and return verification evidence."}"#,
+                        )])),
+                        Ok(LLMChunk::Done),
+                    ]
+                }
+                2 => {
+                    let result = messages
+                        .iter()
+                        .find(|message| {
+                            message.tool_call_id.as_deref() == Some("supervisor-delegate")
+                        })
+                        .unwrap();
+                    assert_eq!(result.tool_success, Some(self.failure.is_none()));
+                    if let Some(reason) = self.failure {
+                        assert!(result.content.contains(reason));
+                    }
+                    let text = if self.failure.is_some() {
+                        "Delegation blocked; owner action is required before a retry."
+                    } else {
+                        "Delegation admitted; the worker result is still pending."
+                    };
+                    vec![Ok(LLMChunk::Token(text.into())), Ok(LLMChunk::Done)]
+                }
+                _ => panic!("unexpected Supervisor request {count}"),
+            };
+            Ok(Box::pin(stream::iter(chunks)))
+        }
+    }
+
+    struct SupervisorLoadingExecutor {
+        calls: AtomicUsize,
+        failure: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for SupervisorLoadingExecutor {
+        async fn execute(
+            &self,
+            call: &ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<bamboo_agent_core::tools::ToolResult>
+        {
+            assert_eq!(
+                call.function.name, "SubAgent",
+                "only delegated work may enter the executor"
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.failure {
+                Some(reason) => Err(bamboo_agent_core::tools::ToolError::Execution(
+                    reason.into(),
+                )),
+                None => Ok(bamboo_agent_core::tools::ToolResult::text(
+                    true,
+                    "child assignment admitted",
+                )),
+            }
+        }
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            [
+                "Read",
+                "SubAgent",
+                "exec_command",
+                "load_skill",
+                "vendor::SubAgent",
+            ]
+            .into_iter()
+            .map(|name| {
+                let mut schema = loading_test_schema_with_description(name, name);
+                if name == "SubAgent" {
+                    schema.function.parameters = serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "message": {"type": "string"},
+                            "intent": {"type": "string"},
+                            "role": {"type": "string"},
+                            "target": {"type": "string"},
+                            "reply_to": {"type": "string"}
+                        },
+                        "required": ["message"],
+                        "additionalProperties": false
+                    });
+                }
+                schema
+            })
+            .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_delegation_first_real_runner_loads_only_scoped_delegation_and_reports_worker_blockers(
+    ) {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for ultra in [false, true] {
+            for mode in [
+                CapabilityLoadingMode::StickyFallback,
+                CapabilityLoadingMode::Progressive,
+            ] {
+                for failure in [
+                    None,
+                    Some("worker_unavailable: configure an authorized worker"),
+                    Some("scope_denied: target is not attached"),
+                ] {
+                    let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "gpt-5.6");
+                    session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                        incarnation_id: uuid::Uuid::new_v4(),
+                    };
+                    session.set_root_orchestration_only(ultra).unwrap();
+                    session.add_message(Message::user(
+                        "Delegate the scoped implementation and report its admission or blocker.",
+                    ));
+                    let provider = Arc::new(SupervisorLoadingProvider {
+                        mode,
+                        calls: AtomicUsize::new(0),
+                        failure,
+                    });
+                    let executor = Arc::new(SupervisorLoadingExecutor {
+                        calls: AtomicUsize::new(0),
+                        failure,
+                    });
+                    let config = AgentLoopConfig {
+                        provider_name: Some("supervisor-loading-test".into()),
+                        provider_type: Some("openai".into()),
+                        model_name: Some("gpt-5.6".into()),
+                        ..delegation_loop_config()
+                    };
+                    let (tx, _rx) = tokio::sync::mpsc::channel(256);
+                    let mut state = e2e_loop_state(&session.id);
+                    state.model_name = "gpt-5.6".into();
+                    assert!(super::run_pipeline(
+                        &mut session,
+                        &tx,
+                        provider.clone(),
+                        executor.clone(),
+                        &tokio_util::sync::CancellationToken::new(),
+                        &config,
+                        &mut state
+                    )
+                    .await
+                    .unwrap());
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+                    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+                    let mut restored: Session =
+                        serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+                    let current = super::resolve_tool_schemas_for_round(
+                        &config,
+                        executor.as_ref(),
+                        &mut restored,
+                    );
+                    let callable = effective_callable_set_for_round(&restored, &current, mode);
+                    assert!(callable.contains_execution_name("SubAgent"));
+                    assert!(!callable.contains_execution_name("exec_command"));
+                    assert!(!callable.contains_execution_name("load_skill"));
+                    let removed = effective_callable_set_for_round(&restored, &[], mode);
+                    assert!(
+                        !removed.contains_execution_name("SubAgent"),
+                        "a saved loading receipt cannot restore a removed tool"
+                    );
+                    let observation = crate::runtime::runner::session_setup::prompt_envelope::build_root_orchestration_context_block_for_tools(
+                        &restored, &[], mode,
+                    ).unwrap();
+                    assert!(observation.content.contains("delegation_tools_unavailable"));
+                    assert!(!observation.content.contains("routes_exposed"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_delegation_first_repeated_worker_failures_keep_existing_bounded_circuit() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for ultra in [false, true] {
+            let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+            session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                incarnation_id: uuid::Uuid::new_v4(),
+            };
+            session.set_root_orchestration_only(ultra).unwrap();
+            session.add_message(Message::user("Delegate scoped work"));
+            let provider = Arc::new(DelegationLoopProvider {
+                calls: AtomicUsize::new(0),
+                finish_after: None,
+                calls_per_round: 1,
+            });
+            let executor = Arc::new(SupervisorLoadingExecutor {
+                calls: AtomicUsize::new(0),
+                failure: Some("worker_unavailable: owner must configure an authorized worker"),
+            });
+            let (tx, _rx) = tokio::sync::mpsc::channel(256);
+            let mut state = e2e_loop_state(&session.id);
+            let error = super::run_pipeline(
+                &mut session,
+                &tx,
+                provider.clone(),
+                executor.clone(),
+                &tokio_util::sync::CancellationToken::new(),
+                &delegation_loop_config(),
+                &mut state,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error,AgentError::Tool(ref reason) if reason.contains("3 consecutive failures"))
+            );
+            assert_eq!(executor.calls.load(Ordering::SeqCst), 3);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+            assert!(session
+                .messages
+                .iter()
+                .any(|message| message.tool_success == Some(false)
+                    && message.content.contains("worker_unavailable")));
         }
     }
 
