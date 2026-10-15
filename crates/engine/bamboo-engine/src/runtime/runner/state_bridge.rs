@@ -2343,7 +2343,10 @@ mod tests {
             .unwrap();
         let id = bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID;
         let mut running = store.load_root_authority(id).await.unwrap().unwrap();
-        assert!(running.allows_model_tool_execution("Bash"));
+        assert!(!running.root_orchestration_only_enabled());
+        assert!(running.model_orchestration_only_enabled());
+        assert!(!running.allows_model_tool_execution("Bash"));
+        assert!(running.allows_model_tool_execution("SubAgent"));
         let operation = bamboo_domain::RootModeOperationRequest {
             session_id: id.to_string(),
             operation_id: format!("0:{}", uuid::Uuid::new_v4()),
