@@ -49,6 +49,10 @@ pub(crate) fn plugin_scope() -> impl HttpServiceFactory {
             web::post().to(agent::plugin::install_nova_app),
         )
         .route(
+            "/nova/app/start",
+            web::post().to(agent::plugin::start_nova_app),
+        )
+        .route(
             "/official/jiandu/install",
             web::post().to(agent::plugin::install_official_jiandu),
         )

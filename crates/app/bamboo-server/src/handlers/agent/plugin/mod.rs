@@ -35,4 +35,4 @@ pub use handlers::{
     install_plugin, list_plugins, plugin_hooks, remove_plugin, review_plugin_hooks, update_plugin,
 };
 pub use official_jiandu::{install_official_jiandu, jiandu_setup};
-pub use official_nova::{install_nova_app, nova_app};
+pub use official_nova::{install_nova_app, nova_app, start_nova_app};
