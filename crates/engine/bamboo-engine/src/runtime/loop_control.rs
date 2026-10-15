@@ -584,11 +584,17 @@ fn accept_command(
             {
                 return Err("bounds_may_only_tighten_without_reset");
             }
+            // A tool-containing round cannot also finish its active
+            // iteration. Keep its later terminal round plus the pending
+            // objective's admission; before the first iteration only one.
+            let required_rounds =
+                1 + u32::from(state.iterations_started > state.iterations_completed);
             if (control.pending_objective.is_some()
                 || objective
                     .as_ref()
                     .is_some_and(|text| *text != state.objective))
-                && (iterations <= state.iterations_started || rounds <= state.rounds_started)
+                && (iterations <= state.iterations_started
+                    || rounds.saturating_sub(state.rounds_started) < required_rounds)
             {
                 return Err("no_budget_for_new_objective");
             }

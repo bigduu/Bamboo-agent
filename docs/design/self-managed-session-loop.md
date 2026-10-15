@@ -139,7 +139,11 @@ by another objective edit; stop can discard it. Bound-only edits may still
 constrain iteration and round admission immediately while that objective is
 pending, but they cannot remove its required future iteration or round. Neither
 a new objective edit nor a bound-only edit retaining an existing pending
-objective is accepted without that future budget.
+objective is accepted without that future budget. While an iteration is active,
+this minimum is two remaining rounds: one for its later terminal answer and one
+for the pending objective's admission/answer. Before the first iteration, one
+remaining round suffices. These are minimum admissible paths; they do not grant
+extra rounds or guarantee success if the current iteration needs more work.
 
 A bound-only edit does not advance the aggregate `applied_revision` past an
 unapplied objective. Its immutable acceptance receipt retains `applied: false`
