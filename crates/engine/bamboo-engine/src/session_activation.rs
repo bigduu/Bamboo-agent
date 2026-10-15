@@ -206,6 +206,9 @@ struct ActiveOwner {
     session_created_at: Option<DateTime<Utc>>,
     finalizing: bool,
     registrations: usize,
+    /// Scheduling boundary for this owner, not durable queue/authority state.
+    /// Keep wait/Guardian outcomes together until this exact Run leaves.
+    child_completions_need_successor: bool,
     /// Present only while an external actor driver is alive. The payload is a
     /// wake generation; that driver remains the single consumer of the
     /// canonical FileSessionInbox and forwards the claimed typed envelope.
@@ -794,6 +797,23 @@ impl SessionActivationRouter {
             .and_then(|state| state.owner.as_ref().map(|owner| owner.run_id.clone()))
     }
 
+    /// Select a completion's successor fence under the current owner lock.
+    /// Once a wait or Guardian transition belongs to this owner, later sibling
+    /// callbacks keep that boundary even after the durable wait was cleared.
+    /// A background-only reasoning owner can instead consume its next safe point.
+    pub(crate) async fn child_completion_successor_run(
+        &self,
+        target_session_id: &str,
+        wait_or_guardian_transition: bool,
+        previous_fenced_run: Option<&str>,
+    ) -> Option<String> {
+        let mut states = self.states.lock().await;
+        let owner = states.get_mut(target_session_id)?.owner.as_mut()?;
+        owner.child_completions_need_successor |=
+            wait_or_guardian_transition || previous_fenced_run == Some(owner.run_id.as_str());
+        (owner.finalizing || owner.child_completions_need_successor).then(|| owner.run_id.clone())
+    }
+
     /// Bind the durable inbox used by abandoned-run reconciliation.
     pub fn set_inbox(&self, inbox: Arc<dyn SessionInboxPort>) {
         *self
@@ -996,6 +1016,7 @@ impl SessionActivationRouter {
             session_created_at: None,
             finalizing: false,
             registrations: 0,
+            child_completions_need_successor: false,
             delivery_sink: None,
         });
     }
@@ -1109,6 +1130,7 @@ impl SessionActivationRouter {
                             session_created_at: birth,
                             finalizing: false,
                             registrations: 1,
+                            child_completions_need_successor: false,
                             delivery_sink: None,
                         });
                         (Some(state.notify.subscribe()), None)
@@ -1203,6 +1225,7 @@ impl SessionActivationRouter {
                     session_created_at: None,
                     finalizing: true,
                     registrations: 0,
+                    child_completions_need_successor: false,
                     delivery_sink: None,
                 });
             }
@@ -1609,6 +1632,7 @@ impl SessionActivationRouter {
                         session_created_at: None,
                         finalizing: false,
                         registrations: 0,
+                        child_completions_need_successor: false,
                         delivery_sink: None,
                     });
                     state.last_dispatched_generation =
@@ -1639,6 +1663,7 @@ impl SessionActivationRouter {
                     session_created_at: None,
                     finalizing: false,
                     registrations: 0,
+                    child_completions_need_successor: false,
                     delivery_sink: None,
                 });
                 state.notify.send_replace(generation);
@@ -4386,3 +4411,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "session_activation_child_completion_tests.rs"]
+mod child_completion_fence_tests;
