@@ -323,7 +323,7 @@ impl Fixture {
 
     async fn run(
         &mut self,
-        provider: Arc<ScriptedProvider>,
+        provider: Arc<dyn LLMProvider>,
         cancel: CancellationToken,
     ) -> (Result<(), AgentError>, Vec<AgentEvent>) {
         let (tx, mut rx) = mpsc::channel(512);
@@ -1458,3 +1458,6 @@ async fn self_control_public_agent_raw_execute_refuses_unbound_capability_before
     );
     registration.abandon().await;
 }
+
+mod output_contract_tests;
+mod policy_contract_tests;
