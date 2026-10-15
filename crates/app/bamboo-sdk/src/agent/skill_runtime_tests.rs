@@ -889,6 +889,108 @@ async fn sdk_typed_real_portable_hook_once_before_f_and_append_with_same_images(
 }
 
 #[tokio::test]
+async fn supervisor_delegation_first_sdk_denies_selected_skill_before_append_and_hides_metadata() {
+    for ultra in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        write_skill(home.path(), "sdk-supervisor", true);
+        let provider = Arc::new(PassiveProvider::default());
+        let agent = build(home.path(), provider.clone()).await;
+        let bootstrap = agent
+            .supervisor_sessions()
+            .get_or_create_default("claude-test")
+            .await
+            .unwrap();
+        let mut session = agent
+            .storage()
+            .load_session(&bootstrap.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        session.set_root_orchestration_only(ultra).unwrap();
+        let defaults = agent.sdk_skills.as_ref().unwrap();
+        defaults.sessions.save(&mut session).await.unwrap();
+        // Exercise the restored typed identity, not an SDK-only role flag.
+        session = serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        assert_eq!(
+            session.supervisor_incarnation_id(),
+            Some(bootstrap.incarnation_id)
+        );
+        let before = serde_json::to_value(&session).unwrap();
+        let cache_before = defaults
+            .sessions
+            .cache()
+            .get(&session.id)
+            .map(|entry| serde_json::to_value(&*entry.read()).unwrap());
+        let result = agent
+            .run_with_skills(
+                &mut session,
+                SdkSkillInput::new(
+                    "explicit implementation Skill must be delegated",
+                    selections(&agent, &["sdk-supervisor"]).await,
+                ),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "Supervisor Ultra={ultra}: selected Skill reached the provider"
+        );
+        assert!(result.unwrap_err().to_string().contains("delegat"));
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(
+                agent
+                    .storage()
+                    .load_session(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            before,
+            "denial must precede durable input or runtime publication",
+        );
+        assert_eq!(
+            defaults
+                .sessions
+                .cache()
+                .get(&session.id)
+                .map(|entry| serde_json::to_value(&*entry.read()).unwrap()),
+            cache_before
+        );
+        assert!(provider.0.lock().unwrap().is_empty());
+        assert!(defaults
+            .manager
+            .pinned_activation_for_workspace(&session.id, None)
+            .await
+            .unwrap()
+            .is_none());
+
+        // An ordinary typed User remains usable. Automatic Skill metadata is
+        // absent even though this defaults-backed host has a matching Skill.
+        agent
+            .run_with_skills(
+                &mut session,
+                SdkSkillInput::new("coordinate the authorized work", vec![]),
+            )
+            .await
+            .unwrap();
+        let trace = provider.0.lock().unwrap();
+        assert!(!trace.is_empty());
+        for (messages, schemas) in trace.iter() {
+            assert!(!schemas.iter().any(|name| matches!(
+                name.as_str(),
+                "skills_list" | "skills_read" | "load_skill" | "workflow_run"
+            )));
+            assert!(!messages
+                .iter()
+                .any(|message| message.content.contains("Using Skills")
+                    || message.content.contains("### Explicit Skill")
+                    || message.content.contains("MAIN_EOF_sdk-supervisor")));
+        }
+    }
+}
+
+#[tokio::test]
 async fn sdk_defaults_ultra_keeps_exact_registered_authority_intersection_and_denies_skill_input() {
     let home = tempfile::tempdir().unwrap();
     write_skill(home.path(), "sdk-ultra", true);
