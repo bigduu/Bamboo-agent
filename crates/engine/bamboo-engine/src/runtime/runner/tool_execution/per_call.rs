@@ -2673,6 +2673,50 @@ mod hook_tests {
     }
 
     #[tokio::test]
+    async fn supervisor_delegation_first_final_gate_rejects_stale_execution_schemas_in_both_modes() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let names = ["Read", "SubAgent", "Plan", "Task", "session_control", "session_history",
+            "work_dispatch", "exec_command", "write_stdin", "Edit", "load_skill",
+            "vendor::Read", "default::Read"];
+        let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        // The supplied catalog deliberately predates any restriction.
+        let callable = effective_callable_set(&names, CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        for ultra in [false, true] {
+            supervisor.set_root_orchestration_only(ultra).unwrap();
+            let observation = ExecutingSupervisorObservation::capture_from_executing_session(&supervisor);
+            let concrete = Arc::new(NameRecordingExecutor::new(&names));
+            let tools: Arc<dyn ToolExecutor> = concrete.clone();
+            let (tx, mut rx) = mpsc::channel(128);
+            for name in names {
+                let call = probe_call(name);
+                let outcome = execute_model_requested_tool_call_only(&callable, ToolExecutionOnlyContext {
+                    vision_support: true, output_cap: None, executing_supervisor: observation,
+                    tool_call: &call, event_tx: &tx, metrics_collector: None,
+                    session_id: &supervisor.id, root_session_id: &supervisor.root_session_id,
+                    root_orchestration_only: ultra, round_id: "delegation-first", round: 0,
+                    tools: &tools, config: &AgentLoopConfig::default(), hook_session: None,
+                    hook_runtime_state: None, session_flags: ToolExecutionSessionFlags::from_session(&supervisor),
+                    available_tool_schemas: &[],
+                }).await.unwrap();
+                let allowed = matches!(name, "Read" | "SubAgent" | "Plan" | "Task" |
+                    "session_control" | "session_history" | "work_dispatch");
+                assert_eq!(outcome.result.is_ok(), allowed, "ultra={ultra}: {name}");
+                if !allowed {
+                    assert!(!outcome.post_tool_hook_eligible);
+                    assert!(outcome.portable_tool.is_none());
+                }
+            }
+            let expected = vec!["Read", "SubAgent", "Plan", "Task", "session_control", "session_history", "work_dispatch"];
+            assert_eq!(concrete.entered(), expected);
+            assert_eq!(std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|event| matches!(event, AgentEvent::ToolStart { .. })).count(), expected.len());
+        }
+    }
+
+    #[tokio::test]
     async fn supervisor_ultra_final_gate_uses_original_observation_and_exact_management_tool() {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
         let names = [

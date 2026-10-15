@@ -1340,6 +1340,39 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
 }
 
 #[test]
+fn supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standard_and_ultra() {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let tools = StaticToolExecutor {
+        schemas: bamboo_domain::ROOT_ORCHESTRATION_TOOLS.into_iter()
+            .chain(bamboo_domain::SUPERVISOR_ORCHESTRATION_TOOLS)
+            .chain(["exec_command", "write_stdin", "Edit", "Write", "load_skill", "workflow_run",
+                "vendor::Read", "default::Read", "vendor::session_control"])
+            .map(schema).collect(),
+    };
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    for ultra in [false, true] {
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &supervisor);
+        let names = catalog.iter().map(|entry| entry.execution_name().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = bamboo_domain::ROOT_ORCHESTRATION_TOOLS.into_iter()
+            .chain(bamboo_domain::SUPERVISOR_ORCHESTRATION_TOOLS).map(str::to_owned).collect();
+        assert_eq!(names, expected, "Supervisor ultra={ultra}");
+        let provider = resolve_available_tool_schemas_for_session(&config, &tools, &supervisor)
+            .into_iter().map(|entry| entry.function.name).collect();
+        let discovery = crate::capability_discovery::project_classified_tool_capability_metadata(&catalog)
+            .into_iter().map(|entry| entry.canonical_name).collect();
+        assert_eq!(names, provider);
+        assert_eq!(names, discovery);
+        assert!(super::tool_schemas::effective_guide_activation(&config, &supervisor).contains("SubAgent"));
+    }
+}
+
+#[test]
 fn supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials() {
     use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
     let tools = StaticToolExecutor {

@@ -135,6 +135,32 @@ fn orchestration_only_root_receives_guidance_without_prompt_only_selection() {
     assert!(!prompt_only.content.contains("Ultra Root thinking mode"));
 }
 
+#[cfg(test)]
+#[test]
+fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_changes() {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    for ultra in [false, true, false] {
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        let restored: Session =
+            serde_json::from_value(serde_json::to_value(&supervisor).unwrap()).unwrap();
+        let block = build_root_orchestration_context_block(&restored)
+            .expect("trusted Supervisor always receives its delegation contract");
+        for concept in ["Supervisor", "Delegate execution", "necessary read-only", "attached",
+            "unavailable", "blocker", "same child", "nested delegation"] {
+            assert!(block.content.contains(concept), "missing {concept}");
+        }
+        let child = Session::new_child_of("child", &restored, "model", "worker");
+        assert!(build_root_orchestration_context_block(&child).is_none());
+    }
+    let mut ordinary = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    ordinary.metadata.insert("role".into(), "supervisor".into());
+    assert!(build_root_orchestration_context_block(&ordinary).is_none());
+}
+
 /// Build the single provider-visible Workspace block from authoritative
 /// session metadata. Project identity is included only in its redacted,
 /// path-free form so the active workspace path appears exactly once.

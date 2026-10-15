@@ -224,6 +224,37 @@ mod tests {
     use crate::session::{AgentRuntimeState, ModelContextState, PlanModeState, PlanModeStatus};
 
     #[test]
+    fn supervisor_delegation_first_does_not_depend_on_ultra_or_leak_to_children() {
+        use crate::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        for ultra in [false, true, false] {
+            supervisor.set_root_orchestration_only(ultra).unwrap();
+            let restored: Session =
+                serde_json::from_value(serde_json::to_value(&supervisor).unwrap()).unwrap();
+            for name in ROOT_ORCHESTRATION_TOOLS.into_iter().chain(SUPERVISOR_ORCHESTRATION_TOOLS) {
+                assert!(restored.allows_model_tool_execution(name), "{ultra}: {name}");
+            }
+            for name in ["exec_command", "write_stdin", "Bash", "Edit", "Write", "apply_patch",
+                "load_skill", "workflow_run", "mcp__vendor__read", "default::Read"] {
+                assert!(!restored.allows_model_tool_execution(name), "Supervisor {ultra}: {name}");
+            }
+            let child = Session::new_child_of("worker", &restored, "model", "worker");
+            assert!(child.authority_identity.is_ordinary());
+            assert!(child.allows_model_tool_execution("Edit"));
+            assert!(child.allows_model_tool_execution("exec_command"));
+        }
+        let mut ordinary = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        ordinary.metadata.insert("role".into(), "supervisor".into());
+        assert!(ordinary.allows_model_tool_execution("Edit"));
+        ordinary.set_root_orchestration_only(true).unwrap();
+        assert!(!ordinary.allows_model_tool_execution("session_control"));
+        assert!(!ordinary.allows_model_tool_execution("session_history"));
+    }
+
+    #[test]
     fn trusted_supervisor_session_management_survives_thinking_mode_selection() {
         use crate::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
         let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
