@@ -513,6 +513,13 @@ async fn self_control_host_opt_in_without_start_preserves_ordinary_foreign_quest
         InteractionSequence::WithoutStart,
         fixture.storage.clone(),
     ));
+    let persistence = fixture
+        .config
+        .as_ref()
+        .unwrap()
+        .persistence
+        .clone()
+        .unwrap();
     let (result, events) = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         run_interaction_fixture(&mut fixture, provider.clone(), Arc::new(tools)),
@@ -520,6 +527,12 @@ async fn self_control_host_opt_in_without_start_preserves_ordinary_foreign_quest
     .await
     .expect("ordinary synthetic question must suspend promptly");
     result.unwrap();
+    // The helper invokes the runner below Agent's final host checkpoint.
+    // Save its real pending question and Suspended state without clearing it.
+    persistence
+        .checkpoint_runtime_session(&mut fixture.session)
+        .await
+        .unwrap();
     assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(provider.peak.load(Ordering::SeqCst), 1);
