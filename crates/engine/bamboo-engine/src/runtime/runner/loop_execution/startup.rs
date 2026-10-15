@@ -196,6 +196,11 @@ pub(super) async fn initialize_loop_state(
             .or_else(|| config.ticket_worker_plan.as_ref().map(|plan| plan.run_id()))
             .unwrap_or(&session_id),
     );
+    // Persist the actual pipeline UUID before its first mirror/checkpoint.
+    // Ordinary executions deliberately do not inherit a prior counted owner.
+    if config.counted_loop.is_some() {
+        runtime_state.execution_id = Some(execution_id.clone());
+    }
     // Permission mode is a per-session sticky posture (set via PATCH /sessions
     // and persisted in runtime.json). Each run rebuilds a fresh runtime state,
     // so carry the exact typed mode forward instead of resetting it.

@@ -341,6 +341,10 @@ impl SessionPermissionMode {
 pub struct AgentRuntimeState {
     pub version: u32,
     pub run_id: String,
+    /// Exact pipeline execution owning a counted loop. Old/ordinary runtimes
+    /// omit this; the stable Session/Ticket run_id is not an execution proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
     #[serde(default)]
     pub status: AgentStatusState,
     #[serde(default)]
@@ -406,6 +410,7 @@ impl AgentRuntimeState {
         Self {
             version: AGENT_RUNTIME_STATE_VERSION,
             run_id: run_id.into(),
+            execution_id: None,
             status: AgentStatusState::Idle,
             round: RoundRuntimeState::default(),
             suspension: None,
@@ -449,6 +454,7 @@ impl Default for AgentRuntimeState {
         Self {
             version: AGENT_RUNTIME_STATE_VERSION,
             run_id: String::new(),
+            execution_id: None,
             status: AgentStatusState::Idle,
             round: RoundRuntimeState::default(),
             suspension: None,
@@ -759,5 +765,26 @@ mod tests {
             let restored: PlanModeStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(variant, &restored, "round-trip failed for {:?}", variant);
         }
+    }
+}
+
+#[cfg(test)]
+mod counted_execution_identity_tests {
+    use super::*;
+
+    #[test]
+    fn counted_execution_identity_round_trips_and_old_snapshots_default_to_none() {
+        let old = AgentRuntimeState::new("stable-session-id");
+        let old_json = serde_json::to_value(&old).unwrap();
+        assert!(old_json.get("execution_id").is_none());
+        let decoded: AgentRuntimeState = serde_json::from_value(old_json).unwrap();
+        assert_eq!(decoded.execution_id, None);
+        let mut counted = old;
+        counted.execution_id = Some("actual-pipeline-uuid".into());
+        let decoded: AgentRuntimeState =
+            serde_json::from_str(&serde_json::to_string(&counted).unwrap()).unwrap();
+        assert_eq!(decoded.execution_id, counted.execution_id);
+        assert_eq!(decoded.run_id, "stable-session-id");
+        assert_eq!(AgentRuntimeState::new(&decoded.run_id).execution_id, None);
     }
 }

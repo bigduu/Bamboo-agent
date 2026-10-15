@@ -441,7 +441,34 @@ pub struct SessionRunRegistration {
     armed: bool,
 }
 
+/// Private proof derived from a real registration, never reconstructed from
+/// metadata or the presence of another caller's active run.
+#[derive(Clone)]
+pub(crate) struct SessionRunOwnership {
+    router: Arc<SessionActivationRouter>,
+    target_session_id: String,
+    run_id: String,
+}
+
+impl SessionRunOwnership {
+    pub(crate) fn matches_router(&self, router: &Arc<SessionActivationRouter>) -> bool {
+        Arc::ptr_eq(&self.router, router)
+    }
+
+    pub(crate) async fn is_current(&self, session_id: &str) -> bool {
+        self.target_session_id == session_id && self.router.owns_run(session_id, &self.run_id).await
+    }
+}
+
 impl SessionRunRegistration {
+    pub(crate) fn ownership(&self) -> SessionRunOwnership {
+        SessionRunOwnership {
+            router: self.router.clone(),
+            target_session_id: self.target_session_id.clone(),
+            run_id: self.run_id.clone(),
+        }
+    }
+
     /// Observe independent producer wakeups without consuming the runtime's
     /// normal receiver. A selected input must not promote unrelated durable
     /// backlog merely by releasing its own registration. This is an existing

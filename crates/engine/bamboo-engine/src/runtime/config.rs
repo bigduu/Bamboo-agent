@@ -1015,6 +1015,7 @@ pub struct AgentLoopConfig {
     /// a configured cap keeps the issue #29 exhaustion contract (metadata
     /// stamp, visible notification, exactly one final summary turn).
     pub(crate) run_budget: bamboo_config::RunBudgetConfig,
+    pub(crate) counted_loop: Option<super::counted_loop::CountedLoopConfig>,
 }
 
 impl AgentLoopConfig {
@@ -1091,6 +1092,7 @@ impl Default for AgentLoopConfig {
             disabled_filter_resolver: None,
             mcp_tool_guidance: None,
             run_budget: bamboo_config::RunBudgetConfig::default(),
+            counted_loop: None,
         }
     }
 }
