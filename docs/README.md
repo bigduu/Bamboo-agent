@@ -17,6 +17,7 @@ Task-oriented, kept current with the shipped codebase.
 | [`guides/PLUGINS.md`](guides/PLUGINS.md) | Install/update/remove plugins, and the three-layer URL trust model. |
 | [`guides/DEPLOY.md`](guides/DEPLOY.md) | Run `bamboo serve` long-lived: bare binary, systemd, Docker, reverse proxy, backups. |
 | [`guides/API.md`](guides/API.md) | HTTP/SSE API reference. |
+| [`guides/SUPERVISOR_TASK_CLI.md`](guides/SUPERVISOR_TASK_CLI.md) | Thin local Supervisor/Root task client: real run IDs, JSON status, bounded events and fenced stop. |
 | [`guides/MIGRATION_GUIDE.md`](guides/MIGRATION_GUIDE.md) | Upgrading across breaking changes. |
 | [`architecture-crates.md`](architecture-crates.md) | The Cargo workspace's crate layers and dependency direction — useful when extending Bamboo itself, not just using it. |
 | [`claude-code-executor.md`](claude-code-executor.md) | Protocol reference for driving the `claude` CLI as a sub-agent executor (`subagents.executor = "claude_code"` in the [config reference](config-reference.md#sub-agents--external-cli-executors)). |
