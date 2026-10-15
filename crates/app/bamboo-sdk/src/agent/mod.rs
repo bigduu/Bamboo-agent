@@ -2715,14 +2715,20 @@ mod reexecute_and_child_approval_tests {
             assert!(error.to_string().contains("recovery unsupported"));
             assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
             assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
-            assert_eq!(session.messages, original_messages);
+            assert_eq!(
+                serde_json::to_value(&session.messages).unwrap(),
+                serde_json::to_value(&original_messages).unwrap()
+            );
             let durable = agent
                 .storage()
                 .load_session(&session.id)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(durable.messages, original_messages);
+            assert_eq!(
+                serde_json::to_value(&durable.messages).unwrap(),
+                serde_json::to_value(&original_messages).unwrap()
+            );
             assert_eq!(
                 durable
                     .metadata

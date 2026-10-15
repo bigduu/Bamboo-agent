@@ -94,7 +94,10 @@ async fn counted_registered_refusal_uses_canonical_snapshot_and_skips_direct_fin
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     assert!(rx.try_recv().is_err());
     let durable = storage.load_session(&canonical.id).await.unwrap().unwrap();
-    assert_eq!(durable.messages, canonical.messages);
+    assert_eq!(
+        serde_json::to_value(&durable.messages).unwrap(),
+        serde_json::to_value(&canonical.messages).unwrap()
+    );
     assert_eq!(durable.last_run_status(), canonical.last_run_status());
     assert_eq!(
         read_loop_state(&durable).unwrap().unwrap().status,
@@ -338,7 +341,10 @@ async fn counted_spawn_refusal_skips_completion_hooks_and_final_checkpoint() {
     assert_eq!(hooks.load(Ordering::SeqCst), 0);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     let durable = storage.load_session(&canonical.id).await.unwrap().unwrap();
-    assert_eq!(durable.messages, canonical.messages);
+    assert_eq!(
+        serde_json::to_value(&durable.messages).unwrap(),
+        serde_json::to_value(&canonical.messages).unwrap()
+    );
     assert_eq!(
         read_loop_state(&durable).unwrap().unwrap().status,
         LoopStatus::RecoveryUnsupported
