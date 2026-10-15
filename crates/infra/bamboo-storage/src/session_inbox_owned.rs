@@ -818,6 +818,14 @@ impl FileSessionInbox {
                 if current.is_some() && !versioned {
                     return Err(invalid("activation intent requires its v2 watermark"));
                 }
+                if let Some(intent) = current.filter(|intent| intent.delivery().is_some()) {
+                    if intent.is_queue_only()
+                        || policy == SessionActivationPolicy::InterruptSpecificWait
+                    {
+                        return Err(invalid("explicit peer delivery intent cannot be promoted"));
+                    }
+                    return Ok(());
+                }
                 if current.is_some_and(|intent| {
                     intent.policy().ok().is_some_and(|current| {
                         current == policy
@@ -1733,7 +1741,7 @@ impl FileSessionInbox {
             let (wrapper, stored) = self.read_owned_transport(&path).await?;
             let intent = Self::activation_intent(&wrapper.body)?;
             let activation = Self::message_activation_intent(&wrapper.body)?;
-            if !Self::eligible(generation, prefix, activation) {
+            if !Self::wake_eligible(generation, prefix, activation) {
                 continue;
             }
             let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())

@@ -104,6 +104,13 @@ covers child planning, progress checks, correction, scope control, and final
 evidence. Child sessions do not receive it. This prompt choice does not change
 tool permissions.
 
+The `session_message` tool accepts optional `delivery_intent` on send/reply:
+`queue_only` admits durable input without starting an idle/finalizing receiver;
+`trigger_turn` permits activation through the existing router. Both explicit
+intents respect existing waits. Omission keeps legacy behavior. See the
+[delivery and receipt contract](SESSION_MESSAGING.md); an accepted message or
+activation receipt is not terminal completion.
+
 Root sessions can also select `"root_orchestration_only": true`. This durable
 execution mode supplies the same delegation guidance even when
 `root_orchestration_prompt` is unset. It limits the Root to these exact tool

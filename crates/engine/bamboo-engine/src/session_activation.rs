@@ -213,6 +213,8 @@ struct ActiveOwner {
 #[derive(Debug)]
 struct TargetActivationState {
     latest_generation: u64,
+    /// Delivery notification only. Never participates in successor scheduling.
+    latest_delivery_generation: u64,
     /// Highest generation for which this process already launched an execution.
     /// Adopting an independently running owner does not consume this retry. If a
     /// launched execution leaves the same poison claim pending,
@@ -247,6 +249,7 @@ impl Default for TargetActivationState {
         let (notify, _receiver) = watch::channel(0);
         Self {
             latest_generation: 0,
+            latest_delivery_generation: 0,
             last_dispatched_generation: 0,
             last_dispatched_coordinator_generation: 0,
             owner_completion_epoch: 0,
@@ -989,7 +992,10 @@ impl SessionActivationRouter {
         }
         owner.delivery_sink = Some(sink.clone());
         let run_id = owner.run_id.clone();
-        if state.latest_generation > 0 && sink.send(state.latest_generation).is_err() {
+        let delivery_generation = state
+            .latest_generation
+            .max(state.latest_delivery_generation);
+        if delivery_generation > 0 && sink.send(delivery_generation).is_err() {
             owner.delivery_sink = None;
             return None;
         }
@@ -1511,6 +1517,26 @@ impl SessionActivationRouter {
 
 #[async_trait]
 impl SessionActivationPort for SessionActivationRouter {
+    async fn notify_active_delivery(&self, target_session_id: &str, inbox_generation: u64) -> bool {
+        let mut states = self.states.lock().await;
+        let Some(state) = states.get_mut(target_session_id) else {
+            return false;
+        };
+        let Some(owner) = state.owner.as_mut().filter(|owner| !owner.finalizing) else {
+            return false;
+        };
+        state.latest_delivery_generation = state.latest_delivery_generation.max(inbox_generation);
+        state.notify.send_replace(inbox_generation);
+        if owner
+            .delivery_sink
+            .as_ref()
+            .is_some_and(|sink| sink.send(inbox_generation).is_err())
+        {
+            owner.delivery_sink = None;
+        }
+        true
+    }
+
     async fn request_activation(
         &self,
         target_session_id: &str,
@@ -3480,5 +3506,203 @@ mod tests {
         .unwrap();
         assert_eq!(spawner.reservations.load(Ordering::SeqCst), 0);
         assert_eq!(inbox.inspect("selected").await.unwrap().pending, 1);
+    }
+    struct PeerIntentFixture {
+        _temp: tempfile::TempDir,
+        store: Arc<bamboo_storage::SessionStoreV2>,
+        inbox: Arc<bamboo_storage::FileSessionInbox>,
+        router: Arc<SessionActivationRouter>,
+        spawner: Arc<RecordingSpawner>,
+        messenger: crate::SessionMessenger,
+    }
+
+    impl PeerIntentFixture {
+        async fn new() -> Self {
+            use bamboo_domain::{Session, SessionInboxLimits, Storage};
+            let temp = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(temp.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let target = Session::new("target", "model");
+            let source = Session::new_child_of("sender", &target, "model", "task");
+            store.save_session(&target).await.unwrap();
+            store.save_session(&source).await.unwrap();
+            let inbox = Arc::new(bamboo_storage::FileSessionInbox::new(
+                store.clone(),
+                SessionInboxLimits::default(),
+            ));
+            let router = SessionActivationRouter::new();
+            router.set_inbox(inbox.clone());
+            let spawner = spawner();
+            router.set_spawner(spawner.clone()).await;
+            let messenger =
+                crate::SessionMessenger::new(store.clone(), inbox.clone(), router.clone());
+            Self {
+                _temp: temp,
+                store,
+                inbox,
+                router,
+                spawner,
+                messenger,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_only_delivery_never_schedules_idle_finalizing_or_restarted_target() {
+        use bamboo_domain::SessionMessageDeliveryIntent::QueueOnly;
+        for timing in ["idle", "active", "finalizing", "after_terminal_inspection"] {
+            let fixture = PeerIntentFixture::new().await;
+            let mut registration = if timing == "idle" {
+                None
+            } else {
+                Some(
+                    fixture
+                        .router
+                        .register_run("target", "manual-run")
+                        .await
+                        .unwrap(),
+                )
+            };
+            if timing == "finalizing" || timing == "after_terminal_inspection" {
+                registration.as_mut().unwrap().begin_finalization().await;
+            }
+            let mut race = None;
+            let release = Arc::new(Notify::new());
+            if timing == "after_terminal_inspection" {
+                let entered = Arc::new(Notify::new());
+                *fixture.router.terminal_inspection_pause.lock().await =
+                    Some((entered.clone(), release.clone()));
+                let registration = registration.take().unwrap();
+                race = Some(tokio::spawn(async move { registration.finish(0).await }));
+                tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+                    .await
+                    .unwrap();
+            }
+            let receipt = fixture
+                .messenger
+                .send_peer_with_intent("sender", "target", "queue", "queued", QueueOnly)
+                .await
+                .unwrap();
+            assert_eq!(receipt.activation, None, "{timing}");
+            assert_eq!(receipt.active_delivery_notified, timing == "active");
+            if let Some(mut registration) = registration {
+                registration.begin_finalization().await;
+                assert_eq!(registration.finish(0).await.unwrap(), None);
+            }
+            if let Some(race) = race {
+                release.notify_one();
+                assert_eq!(race.await.unwrap().unwrap(), None);
+            }
+            assert_eq!(
+                fixture.spawner.reservations.load(Ordering::SeqCst),
+                0,
+                "{timing}"
+            );
+            assert_eq!(fixture.spawner.launches.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.inbox.inspect("target").await.unwrap().pending, 1);
+            // Startup recovery uses the durable Inbox, not the live router hint.
+            let restarted = SessionActivationRouter::new();
+            restarted.set_inbox(fixture.inbox.clone());
+            restarted.set_spawner(fixture.spawner.clone()).await;
+            assert_eq!(
+                restarted
+                    .reconcile_wake("target", Utc::now())
+                    .await
+                    .unwrap()
+                    .disposition,
+                None
+            );
+            assert_eq!(fixture.spawner.reservations.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_only_notifies_late_bound_active_driver_and_checkpoints_at_safe_point() {
+        use bamboo_domain::{SessionMessageDeliveryIntent::QueueOnly, Storage};
+        let fixture = PeerIntentFixture::new().await;
+        let mut registration = fixture
+            .router
+            .register_run("target", "manual-run")
+            .await
+            .unwrap();
+        let receipt = fixture
+            .messenger
+            .send_peer_with_intent("sender", "target", "queue", "queued", QueueOnly)
+            .await
+            .unwrap();
+        assert!(receipt.active_delivery_notified);
+        assert!(registration.notifications_mut().has_changed().unwrap());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            fixture
+                .router
+                .attach_delivery_sink("target", tx)
+                .await
+                .as_deref(),
+            Some("manual-run")
+        );
+        assert_eq!(rx.try_recv().unwrap(), receipt.delivery.generation);
+        let claims = fixture
+            .inbox
+            .claim_for_turn("target", 8, Some("manual-run"))
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        let mut saved = fixture.store.load_session("target").await.unwrap().unwrap();
+        saved.add_message(claims[0].envelope.to_provider_message().unwrap());
+        fixture.store.save_session(&saved).await.unwrap();
+        fixture.inbox.ack("target", &claims[0]).await.unwrap();
+        registration.begin_finalization().await;
+        assert_eq!(
+            registration
+                .finish(receipt.delivery.generation)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(fixture.spawner.reservations.load(Ordering::SeqCst), 0);
+        let saved = fixture.store.load_session("target").await.unwrap().unwrap();
+        assert_eq!(
+            saved
+                .messages
+                .iter()
+                .filter(|message| message.id == receipt.delivery.id.as_str())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_trigger_turn_can_start_a_turn_after_queue_only_delivery() {
+        use bamboo_domain::SessionMessageDeliveryIntent::{QueueOnly, TriggerTurn};
+        let fixture = PeerIntentFixture::new().await;
+        fixture
+            .messenger
+            .send_peer_with_intent("sender", "target", "queue", "queued", QueueOnly)
+            .await
+            .unwrap();
+        assert_eq!(fixture.spawner.reservations.load(Ordering::SeqCst), 0);
+        let followup = fixture
+            .messenger
+            .send_peer_with_intent("sender", "target", "followup", "followup", TriggerTurn)
+            .await
+            .unwrap();
+        assert_eq!(
+            followup.activation,
+            Some(SessionActivationDisposition::ActivationReserved)
+        );
+        assert_eq!(fixture.spawner.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.spawner.launches.load(Ordering::SeqCst), 1);
+        let claims = fixture
+            .inbox
+            .claim_for_turn("target", 8, Some("run-1"))
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 2);
+        assert!(claims.iter().all(|claim| claim.activation_policy
+            == bamboo_domain::SessionActivationPolicy::RespectSpecificWait));
     }
 }

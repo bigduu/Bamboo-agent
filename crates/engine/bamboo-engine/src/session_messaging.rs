@@ -13,8 +13,9 @@ use bamboo_agent_core::storage::Storage;
 use bamboo_domain::{
     ActorSession, Session, SessionActivationDisposition, SessionActivationError,
     SessionActivationPolicy, SessionActivationPort, SessionInboxError, SessionInboxPort,
-    SessionInboxReceipt, SessionMessageBody, SessionMessageContent, SessionMessageEnvelope,
-    SessionMessageId, SessionMessageKind, SessionMessageSource, SupervisorReference,
+    SessionInboxReceipt, SessionMessageBody, SessionMessageContent, SessionMessageDeliveryIntent,
+    SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
+    SupervisorReference,
 };
 
 /// A followup is one bounded peer instruction, not a context export or file transfer.
@@ -130,6 +131,36 @@ impl SessionMessagingMetrics {
 pub struct SessionMessengerReceipt {
     pub delivery: SessionInboxReceipt,
     pub activation: SessionActivationDisposition,
+}
+
+/// A durable peer delivery receipt. No field proves context consumption,
+/// a terminal run, or an answer. None means activation was not requested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPeerDeliveryReceipt {
+    pub delivery: SessionInboxReceipt,
+    pub activation: Option<SessionActivationDisposition>,
+    pub active_delivery_notified: bool,
+}
+
+impl From<SessionMessengerReceipt> for SessionPeerDeliveryReceipt {
+    fn from(receipt: SessionMessengerReceipt) -> Self {
+        Self {
+            delivery: receipt.delivery,
+            activation: Some(receipt.activation),
+            active_delivery_notified: false,
+        }
+    }
+}
+
+impl SessionPeerDeliveryReceipt {
+    fn into_legacy(self) -> SessionMessengerReceipt {
+        SessionMessengerReceipt {
+            delivery: self.delivery,
+            activation: self
+                .activation
+                .expect("legacy peer delivery requests activation"),
+        }
+    }
 }
 
 /// Durable admission separated from activation so coordinators can commit
@@ -308,6 +339,45 @@ impl SessionMessenger {
         operation_id: &str,
         message: &str,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        self.send_peer_delivery(
+            caller_session_id,
+            target_session_id,
+            operation_id,
+            message,
+            None,
+        )
+        .await
+        .map(SessionPeerDeliveryReceipt::into_legacy)
+    }
+
+    /// Explicit scheduling over the same lifetime-fenced Inbox. Omission on
+    /// the old send_peer API keeps legacy interrupt/activation behavior.
+    pub async fn send_peer_with_intent(
+        &self,
+        caller_session_id: &str,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        intent: SessionMessageDeliveryIntent,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
+        self.send_peer_delivery(
+            caller_session_id,
+            target_session_id,
+            operation_id,
+            message,
+            Some(intent),
+        )
+        .await
+    }
+
+    async fn send_peer_delivery(
+        &self,
+        caller_session_id: &str,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        intent: Option<SessionMessageDeliveryIntent>,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         Self::validate_peer_input(operation_id, message)?;
         let (caller, target) = self.peer_pair(caller_session_id, target_session_id).await?;
         let id = Self::peer_message_id(&caller, &target, operation_id);
@@ -320,7 +390,7 @@ impl SessionMessenger {
             id.to_string(),
             None,
         );
-        self.send_peer_envelope(envelope, &caller, &target, None)
+        self.send_peer_envelope(envelope, &caller, &target, None, intent)
             .await
     }
 
@@ -333,6 +403,45 @@ impl SessionMessenger {
         operation_id: &str,
         message: &str,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        self.reply_peer_delivery(
+            caller_session_id,
+            received_message_id,
+            operation_id,
+            message,
+            None,
+        )
+        .await
+        .map(SessionPeerDeliveryReceipt::into_legacy)
+    }
+
+    /// Derive recipient/thread from the canonical received peer message while
+    /// opting into explicit scheduling. Reply observations never grant authority.
+    pub async fn reply_peer_with_intent(
+        &self,
+        caller_session_id: &str,
+        received_message_id: &str,
+        operation_id: &str,
+        message: &str,
+        intent: SessionMessageDeliveryIntent,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
+        self.reply_peer_delivery(
+            caller_session_id,
+            received_message_id,
+            operation_id,
+            message,
+            Some(intent),
+        )
+        .await
+    }
+
+    async fn reply_peer_delivery(
+        &self,
+        caller_session_id: &str,
+        received_message_id: &str,
+        operation_id: &str,
+        message: &str,
+        intent: Option<SessionMessageDeliveryIntent>,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         Self::validate_peer_input(operation_id, message)?;
         Self::validate_peer_session_id(caller_session_id)?;
         let received_id = SessionMessageId::parse(received_message_id)
@@ -394,7 +503,7 @@ impl SessionMessenger {
             thread,
             Some(original.id.clone()),
         );
-        self.send_peer_envelope(envelope, &caller, &target, Some(&original))
+        self.send_peer_envelope(envelope, &caller, &target, Some(&original), intent)
             .await
     }
 
@@ -531,7 +640,8 @@ impl SessionMessenger {
         caller: &Session,
         target: &Session,
         reply_to: Option<&SessionMessageEnvelope>,
-    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        intent: Option<SessionMessageDeliveryIntent>,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         let started = Instant::now();
         let source = ActorSession::from_session(caller)
             .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
@@ -540,11 +650,19 @@ impl SessionMessenger {
         // These are the same births used for the stable message id. The inbox
         // must revalidate them under its retained lifecycle authority; a fresh
         // relationship read before generic delivery would still race rebirth.
-        let delivery = match self
-            .inbox
-            .deliver_peer_message(&envelope, &source, &target, reply_to)
-            .await
-        {
+        let result = match intent {
+            Some(intent) => {
+                self.inbox
+                    .deliver_peer_message_with_intent(&envelope, &source, &target, reply_to, intent)
+                    .await
+            }
+            None => {
+                self.inbox
+                    .deliver_peer_message(&envelope, &source, &target, reply_to)
+                    .await
+            }
+        };
+        let delivery = match result {
             Ok(receipt) => receipt,
             Err(error) => {
                 let error = SessionMessengerError::Inbox(error);
@@ -553,7 +671,18 @@ impl SessionMessenger {
             }
         };
         let admission = self.record_admission(envelope, delivery, started);
-        self.activate_prepared(&admission).await
+        if intent == Some(SessionMessageDeliveryIntent::QueueOnly) {
+            let active_delivery_notified = self
+                .activation
+                .notify_active_delivery(&admission.target_session_id, admission.delivery.generation)
+                .await;
+            return Ok(SessionPeerDeliveryReceipt {
+                delivery: admission.delivery,
+                activation: None,
+                active_delivery_notified,
+            });
+        }
+        self.activate_prepared(&admission).await.map(Into::into)
     }
 
     /// Follow an already-attached Ordinary Root from the original executing
@@ -1483,6 +1612,23 @@ mod tests {
         assert!(error
             .to_string()
             .contains("lifetime-fenced peer SessionInbox admission is unsupported"));
+        for intent in [
+            SessionMessageDeliveryIntent::QueueOnly,
+            SessionMessageDeliveryIntent::TriggerTurn,
+        ] {
+            assert!(messenger
+                .send_peer_with_intent(
+                    "peer-left",
+                    "peer-right",
+                    "unsupported-explicit",
+                    "message",
+                    intent
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("explicit peer delivery intent is unsupported"));
+        }
         assert_eq!(inbox.inspect("peer-right").await.unwrap().pending, 0);
         assert!(activation.calls.lock().await.is_empty());
     }
@@ -2186,5 +2332,112 @@ mod tests {
         assert_eq!(metrics.payload_too_large, 1);
         assert_eq!(metrics.backlog_full, 1);
         assert_eq!(activation.calls.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_peer_intent_keeps_legacy_compatibility_and_fences_changed_retry_after_ack() {
+        let (_temp, store, activation, messenger) = fixture().await;
+        seed_peer_tree(store.as_ref()).await;
+        let receipt = messenger
+            .send_peer_with_intent(
+                "peer-left",
+                "peer-right",
+                "queue-operation",
+                "input",
+                SessionMessageDeliveryIntent::QueueOnly,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.activation, None);
+        assert!(!receipt.active_delivery_notified);
+        assert!(activation.calls.lock().await.is_empty());
+        let original =
+            admit_peer_for_test(store.as_ref(), messenger.inbox().as_ref(), "peer-right").await;
+        assert_eq!(
+            messenger
+                .send_peer_with_intent(
+                    "peer-left",
+                    "peer-right",
+                    "queue-operation",
+                    "input",
+                    SessionMessageDeliveryIntent::QueueOnly
+                )
+                .await
+                .unwrap()
+                .delivery,
+            receipt.delivery
+        );
+        assert!(messenger
+            .send_peer_with_intent(
+                "peer-left",
+                "peer-right",
+                "queue-operation",
+                "input",
+                SessionMessageDeliveryIntent::TriggerTurn
+            )
+            .await
+            .is_err());
+        assert!(activation.calls.lock().await.is_empty());
+        let reply = messenger
+            .reply_peer_with_intent(
+                "peer-right",
+                original.id.as_str(),
+                "reply-operation",
+                "reply",
+                SessionMessageDeliveryIntent::TriggerTurn,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.activation,
+            Some(SessionActivationDisposition::ActiveNotified)
+        );
+        assert_eq!(activation.calls.lock().await.len(), 1);
+        let claims = messenger.inbox().claim("peer-left", 8).await.unwrap();
+        assert_eq!(claims[0].envelope.in_reply_to, Some(original.id));
+        assert_eq!(
+            claims[0].activation_policy,
+            SessionActivationPolicy::RespectSpecificWait
+        );
+        messenger
+            .send_peer("peer-left", "peer-right", "legacy-operation", "legacy")
+            .await
+            .unwrap();
+        let claims = messenger.inbox().claim("peer-right", 8).await.unwrap();
+        assert_eq!(
+            claims[0].activation_policy,
+            SessionActivationPolicy::InterruptSpecificWait
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_peer_intents_deny_foreign_roots_before_admission_or_wake() {
+        let (_temp, store, activation, messenger) = fixture().await;
+        seed_peer_tree(store.as_ref()).await;
+        store
+            .save_session(&Session::new("foreign-root", "model"))
+            .await
+            .unwrap();
+        for intent in [
+            SessionMessageDeliveryIntent::QueueOnly,
+            SessionMessageDeliveryIntent::TriggerTurn,
+        ] {
+            assert!(matches!(
+                messenger
+                    .send_peer_with_intent("peer-left", "foreign-root", "denied", "input", intent)
+                    .await,
+                Err(SessionMessengerError::Unauthorized { .. })
+            ));
+        }
+        assert_eq!(
+            messenger
+                .inbox()
+                .inspect("foreign-root")
+                .await
+                .unwrap()
+                .pending,
+            0
+        );
+        assert!(activation.calls.lock().await.is_empty());
     }
 }

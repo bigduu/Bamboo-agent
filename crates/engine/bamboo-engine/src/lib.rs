@@ -51,6 +51,7 @@ pub use session_app::child_completion_coordinator::ChildCompletionCoordinator;
 pub use session_messaging::{
     SessionMessagingMetrics, SessionMessagingMetricsSnapshot, SessionMessenger,
     SessionMessengerAdmission, SessionMessengerError, SessionMessengerReceipt,
+    SessionPeerDeliveryReceipt,
 };
 
 // Re-export commonly used types from agent (via dependency)

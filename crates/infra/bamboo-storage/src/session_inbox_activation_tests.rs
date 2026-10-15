@@ -1334,3 +1334,293 @@ async fn exact_promotion_rejects_wrong_pending_identity_and_cancelled_deliveries
         .is_err());
     assert!(!inbox.inspect("parent").await.unwrap().activation_pending());
 }
+
+async fn explicit_peer_fixture() -> (
+    TempDir,
+    Arc<SessionStoreV2>,
+    FileSessionInbox,
+    bamboo_domain::ActorSession,
+    bamboo_domain::ActorSession,
+) {
+    let (temp, store, inbox) = fixture().await;
+    let parent = store.load_session("parent").await.unwrap().unwrap();
+    let child = Session::new_child_of("sender", &parent, "model", "task");
+    store.save_session(&child).await.unwrap();
+    let source = bamboo_domain::ActorSession::from_session(&child).unwrap();
+    let target = bamboo_domain::ActorSession::from_session(&parent).unwrap();
+    (temp, store, inbox, source, target)
+}
+
+#[tokio::test]
+async fn queue_only_survives_reopen_and_ack_without_wake_and_binds_intent_to_digest() {
+    let (temp, _store, inbox, source, target) = explicit_peer_fixture().await;
+    let envelope = peer_envelope("sender", "parent");
+    let receipt = inbox
+        .deliver_peer_message_with_intent(
+            &envelope,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::QueueOnly,
+        )
+        .await
+        .unwrap();
+    let reopened = reopen(&temp).await;
+    assert_eq!(
+        reopened
+            .deliver_peer_message_with_intent(
+                &envelope,
+                &source,
+                &target,
+                None,
+                SessionMessageDeliveryIntent::QueueOnly
+            )
+            .await
+            .unwrap(),
+        receipt
+    );
+    let backlog = reopened.inspect("parent").await.unwrap();
+    assert_eq!(backlog.pending, 1);
+    assert!(!backlog.activation_pending());
+    assert!(!backlog.interrupt_pending());
+    assert_eq!(
+        reopened
+            .inspect_wake_readiness("parent", Utc::now())
+            .await
+            .unwrap()
+            .ready,
+        None
+    );
+    assert!(matches!(
+        reopened
+            .deliver_peer_message_with_intent(
+                &envelope,
+                &source,
+                &target,
+                None,
+                SessionMessageDeliveryIntent::TriggerTurn
+            )
+            .await,
+        Err(SessionInboxError::InvalidClaim(_))
+    ));
+    let claims = reopened
+        .claim_for_turn("parent", 8, Some("manual-run"))
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].envelope, envelope);
+    assert_eq!(
+        claims[0].activation_policy,
+        SessionActivationPolicy::RespectSpecificWait
+    );
+    reopened.ack("parent", &claims[0]).await.unwrap();
+    let dir = reopened.inbox_dir("parent").await.unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(
+        &tokio::fs::read(FileSessionInbox::admitted_path(&dir, &envelope.id))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw[ACTIVATION_INTENT_KEY]["delivery"], "queue_only");
+    assert_eq!(
+        raw["semantic_digest"],
+        FileSessionInbox::delivery_digest(
+            &envelope,
+            Some(SessionInboxActivationIntent::with_delivery(
+                SessionMessageDeliveryIntent::QueueOnly
+            ))
+        )
+        .unwrap()
+    );
+    assert_ne!(
+        raw["semantic_digest"],
+        FileSessionInbox::semantic_digest(&envelope).unwrap()
+    );
+    let reopened = reopen(&temp).await;
+    assert_eq!(
+        reopened
+            .deliver_peer_message_with_intent(
+                &envelope,
+                &source,
+                &target,
+                None,
+                SessionMessageDeliveryIntent::QueueOnly
+            )
+            .await
+            .unwrap(),
+        receipt
+    );
+    assert!(reopened
+        .deliver_peer_message_with_intent(
+            &envelope,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::TriggerTurn
+        )
+        .await
+        .is_err());
+    assert!(reopened
+        .deliver_peer_message(&envelope, &source, &target, None)
+        .await
+        .is_err());
+    assert_eq!(reopened.inspect("parent").await.unwrap().pending, 0);
+}
+
+#[tokio::test]
+async fn explicit_intents_do_not_promote_staged_siblings_or_inherit_interrupt_grants() {
+    let (_temp, _store, inbox, source, target) = explicit_peer_fixture().await;
+    let staged = staged_child();
+    inbox.deliver(&staged).await.unwrap();
+    let queued = peer_envelope("sender", "parent");
+    let queue_receipt = inbox
+        .deliver_peer_message_with_intent(
+            &queued,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::QueueOnly,
+        )
+        .await
+        .unwrap();
+    let trigger = peer_envelope("sender", "parent");
+    let trigger_receipt = inbox
+        .deliver_peer_message_with_intent(
+            &trigger,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::TriggerTurn,
+        )
+        .await
+        .unwrap();
+    let ready = inbox
+        .inspect_wake_readiness("parent", Utc::now())
+        .await
+        .unwrap()
+        .ready
+        .unwrap();
+    assert_eq!(ready.id, trigger.id);
+    assert_eq!(
+        ready.activation_policy,
+        SessionActivationPolicy::RespectSpecificWait
+    );
+    let claims = inbox
+        .claim_for_turn("parent", 8, Some("active-run"))
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 2);
+    assert_eq!(claims[0].envelope, queued);
+    assert_eq!(claims[1].envelope, trigger);
+    assert!(claims
+        .iter()
+        .all(|claim| claim.activation_policy == SessionActivationPolicy::RespectSpecificWait));
+    inbox.ack("parent", &claims[1]).await.unwrap();
+    assert!(!inbox.inspect("parent").await.unwrap().activation_pending());
+    assert_eq!(
+        inbox
+            .inspect_wake_readiness("parent", Utc::now())
+            .await
+            .unwrap()
+            .ready,
+        None
+    );
+    // A coordinator can release its own staged prefix, but cannot turn an
+    // explicit QueueOnly into a wake or upgrade either explicit wait policy.
+    inbox
+        .mark_activation_eligible(
+            "parent",
+            trigger_receipt.generation,
+            SessionActivationPolicy::InterruptSpecificWait,
+        )
+        .await
+        .unwrap();
+    assert!(inbox
+        .mark_message_activation_eligible(
+            "parent",
+            &queue_receipt,
+            SessionActivationPolicy::InterruptSpecificWait,
+        )
+        .await
+        .is_err());
+    let claims = inbox
+        .claim_for_turn("parent", 8, Some("active-run"))
+        .await
+        .unwrap();
+    let staged_claim = claims
+        .iter()
+        .find(|claim| claim.envelope.id == staged.id)
+        .unwrap();
+    inbox.ack("parent", staged_claim).await.unwrap();
+    let queued_claim = claims
+        .iter()
+        .find(|claim| claim.envelope.id == queued.id)
+        .unwrap();
+    assert_eq!(
+        queued_claim.activation_policy,
+        SessionActivationPolicy::RespectSpecificWait
+    );
+    assert!(!inbox.inspect("parent").await.unwrap().activation_pending());
+    assert_eq!(
+        inbox
+            .inspect_wake_readiness("parent", Utc::now())
+            .await
+            .unwrap()
+            .ready,
+        None
+    );
+}
+
+#[tokio::test]
+async fn queue_only_owned_claim_expiry_does_not_schedule_recovery_or_change_policy() {
+    let (temp, _store, inbox, source, target) = explicit_peer_fixture().await;
+    let envelope = peer_envelope("sender", "parent");
+    inbox
+        .deliver_peer_message_with_intent(
+            &envelope,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::QueueOnly,
+        )
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let request = bamboo_domain::SessionInboxLeaseRequest {
+        consumer: bamboo_domain::SessionInboxConsumerId::new(),
+        now,
+        duration: chrono::Duration::seconds(10),
+    };
+    let first = inbox
+        .claim_owned("parent", 1, Some("run-1"), &request)
+        .await
+        .unwrap()
+        .remove(0);
+    let later = now + chrono::Duration::seconds(20);
+    let reopened = reopen(&temp).await;
+    let readiness = reopened
+        .inspect_wake_readiness("parent", later)
+        .await
+        .unwrap();
+    assert_eq!(readiness.ready, None);
+    assert_eq!(readiness.next_due_at, None);
+    let request = bamboo_domain::SessionInboxLeaseRequest {
+        consumer: bamboo_domain::SessionInboxConsumerId::new(),
+        now: later,
+        duration: chrono::Duration::seconds(10),
+    };
+    let second = reopened
+        .claim_owned("parent", 1, Some("run-2"), &request)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(second.claim.envelope, envelope);
+    assert!(second.lease.epoch > first.lease.epoch);
+    assert_eq!(
+        second.claim.activation_policy,
+        SessionActivationPolicy::RespectSpecificWait
+    );
+    assert!(reopened.ack_owned("parent", &first, later).await.is_err());
+    reopened.ack_owned("parent", &second, later).await.unwrap();
+    assert_eq!(reopened.inspect("parent").await.unwrap().pending, 0);
+}
