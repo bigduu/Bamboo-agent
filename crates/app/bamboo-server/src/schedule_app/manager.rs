@@ -160,9 +160,7 @@ fn guard_progress_for_job(
     observers: &ScheduleGuardObservers,
     job: &ScheduleRunJob,
 ) -> Option<Arc<ScheduleGuardProgress>> {
-    if job.run_config.workflow_target.is_none() {
-        return None;
-    }
+    job.run_config.workflow_target.as_ref()?;
     observers.lock().unwrap().get(&job.run_id).cloned()
 }
 
