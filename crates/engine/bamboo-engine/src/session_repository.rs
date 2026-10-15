@@ -974,10 +974,37 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         &self,
         session_id: &str,
     ) -> std::io::Result<Option<Session>> {
-        if self.root_actor_owner.is_some() {
-            // The bound loader already validates the exact Actor fence and
-            // reads storage. An admission read must retain those checks.
-            return self.load_runtime_session(session_id).await;
+        if let Some((directory, owner)) = self.root_actor_owner.as_ref() {
+            if session_id != owner.fence.actor_id {
+                return Err(root_actor_binding_error(
+                    "bound execution cannot admit another Root",
+                ));
+            }
+            directory
+                .validate_fence(&owner.fence, chrono::Utc::now())
+                .await
+                .map_err(root_actor_binding_error)?;
+            let loaded = self
+                .storage
+                .load_execution_admission_snapshot(session_id)
+                .await?;
+            let Some(snapshot) = loaded.as_ref() else {
+                return Err(root_actor_binding_error("bound Root no longer exists"));
+            };
+            if snapshot.id != owner.fence.actor_id
+                || snapshot.created_at != owner.created_at
+                || snapshot.kind != bamboo_domain::SessionKind::Root
+                || !snapshot.authority_identity.is_ordinary()
+            {
+                return Err(root_actor_binding_error("bound Root identity changed"));
+            }
+            // A takeover or delete/rebirth during the full durable read cannot
+            // release even a previously materialized snapshot to this owner.
+            directory
+                .validate_fence(&owner.fence, chrono::Utc::now())
+                .await
+                .map_err(root_actor_binding_error)?;
+            return Ok(loaded);
         }
         // Runtime/tool reads remain cache-first. An execution admission must
         // observe durable facts without publishing a stale or rejected clone.
