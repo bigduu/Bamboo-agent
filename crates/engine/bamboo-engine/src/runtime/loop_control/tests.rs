@@ -684,3 +684,252 @@ async fn self_control_malformed_schema_two_and_oversized_writes_fail_closed() {
         );
     }
 }
+
+#[tokio::test]
+async fn self_control_pending_objective_allows_bound_only_tightening_without_early_application() {
+    for (iterations, rounds, expected_limits) in [
+        (Some(3), None, (3, 20)),
+        (None, Some(10), (4, 10)),
+        (Some(3), Some(10), (3, 10)),
+    ] {
+        let mut h = Harness::new().await;
+        assert!(h.command(&start("A", 4, 20), 0).await.success);
+        h.admit().await;
+        let update_b = h.update(Some("B".into()), None, None);
+        assert!(h.command(&update_b, 1).await.success);
+        let pending_b = h.state();
+        assert_eq!(pending_b.control.as_ref().unwrap().control_revision, 2);
+        let command = h.update(None, iterations, rounds);
+        let result = h.command(&command, 1).await;
+        assert!(
+            result.success,
+            "bound-only {iterations:?}/{rounds:?}: {}",
+            result.result
+        );
+        let receipt: LoopControlReceipt = serde_json::from_value(value(&result)).unwrap();
+        assert_eq!(
+            (
+                receipt.accepted_revision,
+                receipt.applied_revision_at_acceptance
+            ),
+            (3, 1)
+        );
+        assert_eq!(
+            (
+                receipt.objective_revision,
+                receipt.effective_iteration,
+                receipt.applied
+            ),
+            (2, Some(2), false)
+        );
+        assert_eq!(receipt.generation, pending_b.generation);
+        let tightened = h.state();
+        assert_eq!(
+            (tightened.max_iterations, tightened.max_total_rounds),
+            expected_limits
+        );
+        assert_eq!(
+            (
+                tightened.iterations_started,
+                tightened.iterations_completed,
+                tightened.rounds_started
+            ),
+            (1, 0, 2)
+        );
+        assert_eq!(
+            (tightened.objective.as_str(), tightened.objective_revision),
+            ("A", 1)
+        );
+        let control = tightened.control.as_ref().unwrap();
+        assert_eq!(
+            (
+                control.control_revision,
+                control.applied_revision,
+                control.iteration_objective_revision
+            ),
+            (3, 1, 1)
+        );
+        assert_eq!(
+            control.pending_objective,
+            pending_b.control.as_ref().unwrap().pending_objective
+        );
+        assert_eq!(control.operations.len(), 3);
+        assert_eq!(control.operations.last().unwrap().receipt, receipt);
+        let durable = h
+            .storage
+            .load_session(&h.session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            counted_loop::read_loop_state(&durable).unwrap().unwrap(),
+            tightened
+        );
+
+        // Identical retries keep the original pending receipt before CAS;
+        // stale or payload-changed requests cannot mutate the queued objective.
+        assert_eq!(h.command(&command, 1).await.result, result.result);
+        assert_eq!(h.state(), tightened);
+        let mut conflicting = command.clone();
+        if let LoopControlRequest::Update { objective, .. } = &mut conflicting {
+            *objective = Some("C".into());
+        }
+        denied(
+            &h.command(&conflicting, 1).await,
+            "operation_payload_conflict",
+        );
+        let mut stale = h.update(None, Some(expected_limits.0), None);
+        if let LoopControlRequest::Update {
+            expected_revision, ..
+        } = &mut stale
+        {
+            *expected_revision = 2;
+        }
+        denied(&h.command(&stale, 1).await, "stale_generation_or_revision");
+        let mut foreign_generation = h.update(None, None, Some(expected_limits.1));
+        if let LoopControlRequest::Update { generation, .. } = &mut foreign_generation {
+            *generation = uuid::Uuid::new_v4().to_string();
+        }
+        denied(
+            &h.command(&foreign_generation, 1).await,
+            "stale_generation_or_revision",
+        );
+        let update_c = h.update(Some("C".into()), None, None);
+        denied(&h.command(&update_c, 1).await, "objective_update_pending");
+        assert_eq!(h.state(), tightened);
+        let status = value(&h.command(&LoopControlRequest::Status, 1).await);
+        assert_eq!(status["loop"]["control_revision"], 3);
+        assert_eq!(status["loop"]["applied_revision"], 1);
+        assert_eq!(status["loop"]["pending_objective"], "B");
+
+        assert!(matches!(
+            counted_loop::terminal(&mut h.session, &h.config)
+                .await
+                .unwrap(),
+            counted_loop::TerminalDecision::Continue
+        ));
+        let completed_a = h.state();
+        assert_eq!(
+            (
+                completed_a.objective.as_str(),
+                completed_a.objective_revision
+            ),
+            ("A", 1)
+        );
+        assert_eq!(completed_a.iterations_completed, 1);
+        assert_eq!(completed_a.control.as_ref().unwrap().applied_revision, 1);
+        h.admit().await;
+        let admitted_b = h.state();
+        assert_eq!(
+            (admitted_b.objective.as_str(), admitted_b.objective_revision),
+            ("B", 2)
+        );
+        assert_eq!(
+            (
+                admitted_b.iterations_started,
+                admitted_b.iterations_completed,
+                admitted_b.rounds_started
+            ),
+            (2, 1, 3)
+        );
+        let applied = admitted_b.control.as_ref().unwrap();
+        assert_eq!(
+            (
+                applied.control_revision,
+                applied.applied_revision,
+                applied.iteration_objective_revision
+            ),
+            (3, 3, 2)
+        );
+        assert!(applied.pending_objective.is_none());
+        assert_eq!(
+            applied.operations[1].receipt,
+            pending_b.control.as_ref().unwrap().operations[1].receipt
+        );
+        assert_eq!(
+            applied.operations[2].receipt, receipt,
+            "historical receipts are immutable after application"
+        );
+        assert_eq!(h.command(&command, 2).await.result, result.result);
+        assert_eq!(
+            h.state(),
+            admitted_b,
+            "receipt replay must not reset goal admission or budget"
+        );
+        let objective_messages = h
+            .session
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == Role::User
+                    && message
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("runtime_kind"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("counted_loop_iteration")
+            })
+            .map(|message| {
+                (
+                    message.content.as_str(),
+                    message.metadata.as_ref().unwrap()["objective_revision"]
+                        .as_u64()
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(objective_messages, vec![("A", 1), ("B", 2)]);
+    }
+}
+
+#[tokio::test]
+async fn self_control_bound_only_tightening_cannot_strand_an_existing_pending_objective() {
+    let mut h = Harness::new().await;
+    assert!(h.command(&start("A", 2, 20), 0).await.success);
+    h.admit().await;
+    let update_b = h.update(Some("B".into()), None, None);
+    assert!(h.command(&update_b, 1).await.success);
+    let pending_b = h.state();
+    for (iterations, rounds) in [(Some(1), None), (None, Some(2)), (Some(1), Some(2))] {
+        let command = h.update(None, iterations, rounds);
+        denied(&h.command(&command, 1).await, "no_budget_for_new_objective");
+        assert_eq!(
+            h.state(),
+            pending_b,
+            "no ledger or receipt change on a rejected tightening"
+        );
+        let durable = h
+            .storage
+            .load_session(&h.session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            counted_loop::read_loop_state(&durable).unwrap().unwrap(),
+            pending_b
+        );
+    }
+    assert!(matches!(
+        counted_loop::terminal(&mut h.session, &h.config)
+            .await
+            .unwrap(),
+        counted_loop::TerminalDecision::Continue
+    ));
+    h.admit().await;
+    let state = h.state();
+    assert_eq!(
+        (state.objective.as_str(), state.objective_revision),
+        ("B", 2)
+    );
+    assert_eq!(
+        (state.iterations_started, state.iterations_completed),
+        (2, 1)
+    );
+    assert_eq!(
+        (
+            state.control.as_ref().unwrap().control_revision,
+            state.control.as_ref().unwrap().applied_revision
+        ),
+        (2, 2)
+    );
+}
