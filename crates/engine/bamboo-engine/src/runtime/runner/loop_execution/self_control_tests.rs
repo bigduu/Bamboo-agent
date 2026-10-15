@@ -1465,3 +1465,5 @@ mod policy_contract_tests;
 mod post_hook_contract_tests;
 
 mod suspension_contract_tests;
+
+mod managed_interaction_runner_tests;
