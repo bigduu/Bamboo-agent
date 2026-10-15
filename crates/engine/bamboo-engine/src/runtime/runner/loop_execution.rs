@@ -55,6 +55,7 @@ pub(crate) async fn run_agent_loop_with_config(
     let session_span = tracing::info_span!("agent_loop", session_id = %session.id);
     let mut counted_generation = None;
     let mut counted_usage = super::to_event_token_usage(0, 0);
+    let mut counted_runtime_identity = None;
     let result = async {
         crate::runtime::counted_loop::preflight(session, &config, &initial_message).await?;
         let session_start_source = session
@@ -133,6 +134,12 @@ pub(crate) async fn run_agent_loop_with_config(
             &initial_message,
         )
         .await?;
+        if counted_generation.is_some() {
+            counted_runtime_identity = Some((
+                state.runtime_state.run_id.clone(),
+                state.runtime_state.round.last_round_id.clone(),
+            ));
+        }
 
         if config
             .hook_runner
@@ -209,6 +216,10 @@ pub(crate) async fn run_agent_loop_with_config(
                 state.runtime_state.round.total_prompt_tokens,
                 state.runtime_state.round.total_completion_tokens,
             );
+            counted_runtime_identity = Some((
+                state.runtime_state.run_id.clone(),
+                state.runtime_state.round.last_round_id.clone(),
+            ));
         }
 
         let sent_complete = match pipeline_result {
@@ -281,6 +292,9 @@ pub(crate) async fn run_agent_loop_with_config(
     } else {
         result
     };
+    if let Err(error) = &result {
+        fail_counted_runtime(session, counted_runtime_identity.as_ref(), error);
+    }
     let checkpoint = crate::runtime::counted_loop::finish(
         session,
         &config,
@@ -313,7 +327,11 @@ pub(crate) async fn run_agent_loop_with_config(
                 }
                 Ok(()) => Ok(()),
             };
-            if completion.is_err() {
+            if let Err(error) = &completion {
+                // LoopState may be missing, malformed or from another generation.
+                // Correct only this run's runtime snapshot before that fence can
+                // reject the LoopState write, preserving the host's error save.
+                fail_counted_runtime(session, counted_runtime_identity.as_ref(), error);
                 // A failed Completed checkpoint must not leave in-memory success
                 // for the host's final error save. Cancellation can also win
                 // during that checkpoint or while the event channel is full.
@@ -329,6 +347,28 @@ pub(crate) async fn run_agent_loop_with_config(
                 }
             }
             completion
+        }
+    }
+}
+
+fn fail_counted_runtime(
+    session: &mut Session,
+    expected: Option<&(String, Option<String>)>,
+    error: &bamboo_agent_core::AgentError,
+) {
+    let Some((run_id, last_round_id)) = expected else {
+        return;
+    };
+    if let Some(runtime) = session.agent_runtime_state.as_mut() {
+        if runtime.run_id == *run_id
+            && runtime.round.last_round_id == *last_round_id
+            && runtime.status == bamboo_domain::AgentStatusState::Completed
+        {
+            runtime.status = if error.is_cancelled() {
+                bamboo_domain::AgentStatusState::Cancelled
+            } else {
+                bamboo_domain::AgentStatusState::Failed
+            };
         }
     }
 }

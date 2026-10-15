@@ -875,6 +875,7 @@ async fn counted_session_cancel_wins_simultaneous_stop_and_budget_boundaries() {
 struct CancelAtTerminalCheckpoint {
     inner: Arc<dyn RuntimeSessionPersistence>,
     cancel: CancellationToken,
+    trigger_status: LoopStatus,
 }
 
 #[async_trait]
@@ -887,15 +888,10 @@ impl RuntimeSessionPersistence for CancelAtTerminalCheckpoint {
     }
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         self.inner.checkpoint_runtime_session(session).await?;
-        if read_loop_state(session).unwrap().is_some_and(|state| {
-            matches!(
-                state.status,
-                LoopStatus::Stopped
-                    | LoopStatus::BudgetExhausted
-                    | LoopStatus::Finalizing
-                    | LoopStatus::Completed
-            )
-        }) {
+        if read_loop_state(session)
+            .unwrap()
+            .is_some_and(|state| state.status == self.trigger_status)
+        {
             self.cancel.cancel();
         }
         Ok(())
@@ -928,6 +924,7 @@ async fn counted_cancel_during_terminal_checkpoint_keeps_cancelled_error_and_no_
         cfg.persistence = Some(Arc::new(CancelAtTerminalCheckpoint {
             inner: cfg.persistence.take().unwrap(),
             cancel: cancel.clone(),
+            trigger_status: boundary,
         }));
         let provider = Arc::new(FakeProvider {
             tools_forever: tools,
@@ -1167,51 +1164,100 @@ async fn counted_after_round_failure_has_no_premature_complete() {
     );
 }
 
-struct ChangeFinalizingGeneration(Arc<dyn RuntimeSessionPersistence>);
+#[derive(Clone, Copy)]
+enum TerminalStateFault {
+    Generation,
+    Missing,
+    Malformed,
+}
+
+struct ChangeFinalizingState {
+    inner: Arc<dyn RuntimeSessionPersistence>,
+    fault: TerminalStateFault,
+}
 
 #[async_trait]
-impl RuntimeSessionPersistence for ChangeFinalizingGeneration {
+impl RuntimeSessionPersistence for ChangeFinalizingState {
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
-        self.0.save_runtime_session(session).await
+        self.inner.save_runtime_session(session).await
     }
     async fn load_runtime_session(&self, id: &str) -> std::io::Result<Option<Session>> {
-        self.0.load_runtime_session(id).await
+        self.inner.load_runtime_session(id).await
     }
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         if let Some(mut state) = read_loop_state(session).unwrap() {
             if state.status == LoopStatus::Finalizing {
-                state.generation = uuid::Uuid::new_v4().to_string();
-                session.metadata.insert(
-                    LOOP_STATE_METADATA_KEY.into(),
-                    serde_json::to_string(&state).unwrap(),
-                );
+                match self.fault {
+                    TerminalStateFault::Generation => {
+                        state.generation = uuid::Uuid::new_v4().to_string();
+                        session.metadata.insert(
+                            LOOP_STATE_METADATA_KEY.into(),
+                            serde_json::to_string(&state).unwrap(),
+                        );
+                    }
+                    TerminalStateFault::Missing => {
+                        session.metadata.remove(LOOP_STATE_METADATA_KEY);
+                    }
+                    TerminalStateFault::Malformed => {
+                        session
+                            .metadata
+                            .insert(LOOP_STATE_METADATA_KEY.into(), "{bad".into());
+                    }
+                }
             }
         }
-        self.0.checkpoint_runtime_session(session).await
+        self.inner.checkpoint_runtime_session(session).await
     }
 }
 
 #[tokio::test]
-async fn counted_generation_change_fails_before_complete() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut cfg = config(1, 1);
-    let mut session = Session::new("counted-fixture", "fake-only");
-    add_persistence(dir.path(), &mut cfg, &session).await;
-    cfg.persistence = Some(Arc::new(ChangeFinalizingGeneration(
-        cfg.persistence.take().unwrap(),
-    )));
-    let (result, events) = run(
-        &mut session,
-        cfg,
-        Arc::new(FakeProvider::default()),
-        CancellationToken::new(),
-    )
-    .await;
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("generation changed"));
-    assert_eq!(complete_count(&events), 0);
+async fn counted_invalid_terminal_state_has_no_complete_and_host_save_keeps_failure() {
+    for fault in [
+        TerminalStateFault::Generation,
+        TerminalStateFault::Missing,
+        TerminalStateFault::Malformed,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(1, 1);
+        let mut session = Session::new("counted-fixture", "fake-only");
+        let storage = add_persistence(dir.path(), &mut cfg, &session).await;
+        cfg.persistence = Some(Arc::new(ChangeFinalizingState {
+            inner: cfg.persistence.take().unwrap(),
+            fault,
+        }));
+        let (result, events) = run(
+            &mut session,
+            cfg,
+            Arc::new(FakeProvider::default()),
+            CancellationToken::new(),
+        )
+        .await;
+        let expected_error = match fault {
+            TerminalStateFault::Generation => "generation changed",
+            TerminalStateFault::Missing => "missing terminal state",
+            TerminalStateFault::Malformed => "malformed",
+        };
+        assert!(result.unwrap_err().to_string().contains(expected_error));
+        assert_eq!(complete_count(&events), 0);
+        assert_eq!(
+            session.agent_runtime_state.as_ref().unwrap().status,
+            bamboo_domain::AgentStatusState::Failed
+        );
+        storage.save_session(&session).await.unwrap();
+        let stored = storage.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.agent_runtime_state.as_ref().unwrap().status,
+            bamboo_domain::AgentStatusState::Failed
+        );
+        match fault {
+            TerminalStateFault::Generation => assert_eq!(
+                read_loop_state(&stored).unwrap().unwrap().status,
+                LoopStatus::Finalizing
+            ),
+            TerminalStateFault::Missing => assert!(read_loop_state(&stored).unwrap().is_none()),
+            TerminalStateFault::Malformed => assert!(read_loop_state(&stored).is_err()),
+        }
+    }
 }
 
 struct CountedStopHook(AtomicUsize);
