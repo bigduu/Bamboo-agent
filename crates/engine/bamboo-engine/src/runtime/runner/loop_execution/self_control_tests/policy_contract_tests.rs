@@ -122,19 +122,23 @@ fn tool_start_count(events: &[AgentEvent], id: &str) -> usize {
         .count()
 }
 
-fn completed_result<'a>(events: &'a [AgentEvent], id: &str) -> &'a ToolResult {
+fn published_result(events: &[AgentEvent], id: &str) -> ToolResult {
     let results = events
         .iter()
         .filter_map(|event| match event {
             AgentEvent::ToolComplete {
                 tool_call_id,
                 result,
-            } if tool_call_id == id => Some(result),
+            } if tool_call_id == id => Some(result.clone()),
+            AgentEvent::ToolError {
+                tool_call_id,
+                error,
+            } if tool_call_id == id => Some(ToolResult::text(false, format!("Error: {error}"))),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(results.len(), 1, "one ToolComplete for {id}");
-    results[0]
+    assert_eq!(results.len(), 1, "one ToolComplete or ToolError for {id}");
+    results.into_iter().next().unwrap()
 }
 
 fn assert_policy_run_integrity(
@@ -163,7 +167,7 @@ fn assert_policy_run_integrity(
         .filter_map(|message| message.tool_calls.as_ref())
         .flatten()
     {
-        let result = completed_result(events, &call.id);
+        let result = published_result(events, &call.id);
         let paired = fixture
             .session
             .messages
@@ -195,7 +199,7 @@ async fn self_control_owner_rejections_open_the_same_batch_policy_circuit() {
     assert_policy_run_integrity(&fixture, &provider, &events, 3);
     assert_eq!(tool_start_count(&events, "start"), 1);
     for (index, id) in STALE_IDS.iter().enumerate() {
-        let result = completed_result(&events, id);
+        let result = published_result(&events, id);
         assert!(!result.success, "{id}");
         if index < 2 {
             assert_eq!(tool_start_count(&events, id), 1, "owner must handle {id}");
@@ -268,7 +272,7 @@ async fn self_control_successful_status_charges_the_round_call_budget_once() {
     result.unwrap();
     assert_policy_run_integrity(&fixture, &provider, &events, 2);
     for (index, id) in STATUS_IDS.iter().enumerate() {
-        let result = completed_result(&events, id);
+        let result = published_result(&events, id);
         if index < 3 {
             assert_eq!(
                 tool_start_count(&events, id),
