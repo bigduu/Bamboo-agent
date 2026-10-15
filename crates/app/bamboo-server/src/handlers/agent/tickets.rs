@@ -78,7 +78,7 @@ pub async fn initialize(
     match state.tickets.initialize_scope(principal, body.into_inner()).await {
         Ok(created) => Ok(HttpResponse::Ok().json(serde_json::json!({"created":created,"scope":state.tickets.status().await}))),
         Err(error) => Ok(HttpResponse::build(StatusCode::from_u16(error.status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE))
-            .json(serde_json::json!({"error":error.error,"code":error.code,"scope":state.tickets.status().await}))),
+            .json(serde_json::json!({"error":crate::error::error_value(error.error),"code":error.code,"scope":state.tickets.status().await}))),
     }
 }
 
@@ -697,6 +697,13 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let denied: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(denied["error"]["type"], "api_error");
+        assert!(denied["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("verified owner"));
+        assert!(denied.get("scope").is_none());
         let request = test::TestRequest::post()
             .uri("/api/v1/tickets/initialize")
             .peer_addr("127.0.0.1:5700".parse().unwrap())
@@ -709,6 +716,13 @@ mod tests {
             });
         let response = test::call_service(&app, request).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let denied: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(denied["error"]["type"], "api_error");
+        assert!(denied["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("verified owner"));
+        assert!(denied.get("scope").is_none());
         let mut unknown = body.clone();
         unknown["enable_feature"] = serde_json::json!(true);
         let response = test::call_service(
@@ -727,6 +741,76 @@ mod tests {
                 .unwrap(),
             before
         );
+        // All known failures must share the native HTTP envelope while
+        // keeping the top-level refusal code and freshly read owner scope.
+        state.config.write().await.features.ticket_mutation = false;
+        let mut standard = supervisor.clone();
+        standard.set_root_orchestration_only(false).unwrap();
+        for (expected_status, code, message) in [
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ticket_mutation_disabled",
+                "Ticket mutation feature is disabled",
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                "supervisor_mode_required",
+                "Supervisor orchestration authority required",
+            ),
+            (StatusCode::CONFLICT, "scope_requires_recovery", ""),
+        ] {
+            let mut request_body = body.clone();
+            if code == "supervisor_mode_required" {
+                state.config.write().await.features.ticket_mutation = true;
+                state.storage.save_session(&standard).await.unwrap();
+                request_body["binding_revision"] =
+                    serde_json::json!(standard.root_tool_authority_revision);
+            } else if code == "scope_requires_recovery" {
+                state.storage.save_session(&supervisor).await.unwrap();
+                std::fs::create_dir_all(&scope_root).unwrap();
+                std::fs::write(scope_root.join("foreign"), b"must not be adopted").unwrap();
+            }
+            let session_before =
+                serde_json::to_value(state.storage.load_session(&supervisor.id).await.unwrap())
+                    .unwrap();
+            let config_before = serde_json::to_value(&*state.config.read().await).unwrap();
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/tickets/initialize")
+                    .peer_addr("127.0.0.1:5700".parse().unwrap())
+                    .set_json(request_body)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), expected_status, "{code}");
+            let result: serde_json::Value = test::read_body_json(response).await;
+            assert_eq!(result["error"]["type"], "api_error", "{result}");
+            let actual_message = result["error"]["message"].as_str().unwrap();
+            assert!(!actual_message.is_empty());
+            if !message.is_empty() {
+                assert_eq!(actual_message, message);
+            }
+            assert_eq!(result["code"], code);
+            assert_eq!(result["scope"], state.tickets.status().await);
+            assert_eq!(result["scope"]["readable"], false);
+            assert!(!scope_root.join("HEAD").exists());
+            assert!(state.tickets.service().is_err());
+            assert_eq!(
+                serde_json::to_value(state.storage.load_session(&supervisor.id).await.unwrap())
+                    .unwrap(),
+                session_before,
+            );
+            assert_eq!(
+                serde_json::to_value(&*state.config.read().await).unwrap(),
+                config_before
+            );
+        }
+        assert_eq!(
+            std::fs::read(scope_root.join("foreign")).unwrap(),
+            b"must not be adopted"
+        );
+        std::fs::remove_file(scope_root.join("foreign")).unwrap();
         for created in [true, false] {
             let response = test::call_service(
                 &app,
@@ -756,7 +840,13 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let result: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(
+            result["error"]["message"],
+            "Supervisor scope binding changed"
+        );
+        assert_eq!(result["error"]["type"], "api_error");
         assert_eq!(result["code"], "scope_binding_mismatch");
+        assert_eq!(result["scope"], state.tickets.status().await);
         assert_eq!(result["scope"]["readable"], true);
         assert_eq!(result["scope"]["availability"]["kind"], "ready");
     }
