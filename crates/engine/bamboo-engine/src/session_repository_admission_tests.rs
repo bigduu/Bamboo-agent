@@ -195,7 +195,10 @@ async fn bound_root_admission_rechecks_fence_after_snapshot_materialization() {
         binding.disarm_abandonment();
         if rebirth {
             assert!(store.delete_session(&root.id).await.unwrap());
-            let mut recreated = Session::new(&root.id, "new-model");
+            let mut recreated = store
+                .recreate_root_session(&root.id, "new-model")
+                .await
+                .unwrap();
             assert_ne!(recreated.created_at, root.created_at);
             recreated.add_message(Message::user("new Root private history"));
             store.save_session(&recreated).await.unwrap();
