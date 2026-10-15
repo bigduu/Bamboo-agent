@@ -1467,3 +1467,5 @@ mod post_hook_contract_tests;
 mod suspension_contract_tests;
 
 mod managed_interaction_runner_tests;
+
+mod start_hook_scope_tests;
