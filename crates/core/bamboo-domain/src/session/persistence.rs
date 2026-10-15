@@ -547,6 +547,18 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         Ok(None)
     }
 
+    /// Read a canonical snapshot for execution admission without publishing or
+    /// trusting a cached clone. Preserve the same bound-reader checks as the
+    /// runtime loader. A persister with a cache must override this operation to
+    /// read its durable source (or return Unsupported); the default serves
+    /// uncached/legacy loaders. This read never grants execution/write authority.
+    async fn load_runtime_admission_snapshot(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Session>> {
+        self.load_runtime_session(session_id).await
+    }
+
     /// Clear the bounded compatibility queue iff it still equals the entries
     /// that were durably copied into SessionInbox. Implementations with a
     /// per-session transaction should override this method.
@@ -808,6 +820,13 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
 
     async fn load_runtime_session(&self, session_id: &str) -> io::Result<Option<Session>> {
         (**self).load_runtime_session(session_id).await
+    }
+
+    async fn load_runtime_admission_snapshot(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Session>> {
+        (**self).load_runtime_admission_snapshot(session_id).await
     }
 
     async fn clear_legacy_pending_messages(

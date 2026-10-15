@@ -4,6 +4,7 @@ pub mod agent;
 pub mod complexity_classifier;
 pub mod config;
 pub mod context;
+pub mod counted_loop;
 pub mod execution;
 pub(crate) mod final_evidence;
 pub mod goal_recovery;
@@ -32,6 +33,7 @@ pub use config::{
 // so it is unconstructible outside the engine. Internal call sites reach it via
 // `crate::runtime::config::AgentLoopConfig`. External code drives the loop only
 // through `AgentRuntime::execute`.
+pub use counted_loop::CountedLoopConfig;
 pub use execution::runner_state::{AgentRunner, AgentStatus};
 pub use hooks::{
     test_lifecycle_handler, test_lifecycle_shell_command, HookRunner, LifecycleHookEvent,

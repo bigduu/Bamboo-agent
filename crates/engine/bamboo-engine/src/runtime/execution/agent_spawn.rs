@@ -1007,6 +1007,29 @@ pub fn spawn_session_execution_with_inputs(
                 execution_reservation.abandon().await;
                 return;
             }
+            let ownership = match &execution_reservation.activation {
+                SessionExecutionActivationOwnership::Registered(run) => Some(run.ownership()),
+                _ => None,
+            };
+            let admission_persistence = execution_reservation
+                .execution_persistence()
+                .unwrap_or_else(|| agent.persistence().clone());
+            if let Err(error) = crate::runtime::counted_loop::admit_registered(
+                &mut session,
+                ownership.as_ref(),
+                agent.activation_router(),
+                admission_persistence.as_ref(),
+            )
+            .await
+            {
+                let _ = mpsc_tx
+                    .send(AgentEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                execution_reservation.abandon().await;
+                return;
+            }
             let mut root_actor = execution_reservation.root_actor.take().map(|owner| *owner);
             let root_actor_bound = root_actor.is_some();
             let persistence = execution_reservation
