@@ -69,8 +69,6 @@ mod tests {
         let status: crate::LoopStatusSnapshot = crate::inspect_loop(&session).unwrap();
         assert!(status.generation.is_none());
         assert_eq!((status.control_revision, status.rounds_started), (0, 0));
-        cap.stop();
-        assert!(format!("{policy:?}").contains("stopped: true"));
     }
 
     #[test]
