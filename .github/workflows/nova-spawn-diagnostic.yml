@@ -1,0 +1,193 @@
+name: Nova workspace spawn diagnostic (not a release gate)
+
+on:
+  push:
+    branches: [bamboo/diagnostic/nova-spawn-f8-20261015]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nova-spawn-f8-workspace-diagnostic
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONDONTWRITEBYTECODE: "1"
+  RUST_MIN_STACK: "8388608"
+
+jobs:
+  workspace-diagnostic:
+    name: Original workspace command with errno diagnostics
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Bind the isolated diagnostic source
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          base = 'a7630d7f2c06a15d7eb13e26a3880eb2cb8a2e2a'
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^'], text=True).strip() == base
+          paths = subprocess.check_output(['git', 'diff', '--name-only', base, 'HEAD'], text=True).splitlines()
+          assert sorted(paths) == sorted([
+              '.github/workflows/nova-spawn-diagnostic.yml',
+              'crates/app/bamboo-server/src/handlers/agent/plugin/official_nova.rs',
+          ]), paths
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'nova-spawn-workspace-diagnostic'
+          out.mkdir()
+          receipt = {'source': os.environ['GITHUB_SHA'], 'originalF8': base,
+                     'changedPaths': paths, 'releaseGate': False,
+                     'localMacRustUsed': False, 'productionResultChanged': False}
+          (out / 'source.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          print(json.dumps(receipt))
+          PY
+
+      - name: Install the actual failed F8 compiler
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.1
+          components: rustfmt
+
+      - name: Verify compiler and diagnostic formatting
+        shell: bash
+        run: |
+          rustc -Vv | tee "$RUNNER_TEMP/nova-spawn-workspace-diagnostic/rustc.txt"
+          rustc -V | grep -F 'rustc 1.99.1 (58cf8f9c3 2026-10-13)'
+          rustfmt --check --edition 2021 crates/app/bamboo-server/src/handlers/agent/plugin/official_nova.rs
+
+      - name: Observe an owned fork-inherited writer independently of Cargo
+        continue-on-error: true
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime, errno, json, os, pathlib, signal, subprocess, tempfile, time
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'nova-spawn-workspace-diagnostic'
+          receipt = {'startedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                     'independentKernelProbe': True, 'originalFailureCauseProven': False}
+          owned_pid = None
+          control_write = None
+          write_fd = None
+          with tempfile.TemporaryDirectory(prefix='nova-owned-fork-writer-') as directory:
+              path = pathlib.Path(directory) / 'owned-snapshot'
+              try:
+                  write_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o500)
+                  payload = b"#!/bin/sh\nprintf 'owned fork writer probe\\n'\n"
+                  assert os.write(write_fd, payload) == len(payload)
+                  os.fsync(write_fd)
+                  os.fchmod(write_fd, 0o500)
+                  receipt['writerCloseOnExec'] = not os.get_inheritable(write_fd)
+                  control_read, control_write = os.pipe2(os.O_CLOEXEC)
+                  owned_pid = os.fork()
+                  if owned_pid == 0:
+                      os.close(control_write)
+                      os.read(control_read, 1)
+                      os.close(write_fd)
+                      os.close(control_read)
+                      os._exit(0)
+                  os.close(control_read)
+                  os.close(write_fd)
+                  write_fd = None
+                  receipt['parentWriterClosedBeforeSpawn'] = True
+                  try:
+                      attempted = subprocess.run([str(path)], capture_output=True, timeout=3)
+                      receipt['busySpawnErrno'] = None
+                      receipt['unexpectedSpawnExitCode'] = attempted.returncode
+                  except OSError as error:
+                      receipt['busySpawnErrno'] = error.errno
+                      receipt['busySpawnErrorClass'] = type(error).__name__
+                  receipt['expectedBusyClassObserved'] = receipt.get('busySpawnErrno') == errno.ETXTBSY
+              finally:
+                  if write_fd is not None:
+                      os.close(write_fd)
+                  if control_write is not None:
+                      try:
+                          os.write(control_write, b'x')
+                      except OSError:
+                          pass
+                      os.close(control_write)
+                  if owned_pid:
+                      deadline = time.monotonic() + 3
+                      while time.monotonic() < deadline:
+                          reaped, status = os.waitpid(owned_pid, os.WNOHANG)
+                          if reaped:
+                              receipt['ownedChildReaped'] = True
+                              owned_pid = None
+                              break
+                          time.sleep(0.01)
+                      if owned_pid:
+                          os.kill(owned_pid, signal.SIGKILL)
+                          os.waitpid(owned_pid, 0)
+                          receipt['ownedChildReaped'] = True
+                          receipt['ownedChildRequiredKill'] = True
+                          owned_pid = None
+              after = subprocess.run([str(path)], capture_output=True, text=True, timeout=3)
+              receipt['afterWriterReleaseExitCode'] = after.returncode
+              receipt['afterWriterReleaseOriginalBytesExecuted'] = (
+                  after.returncode == 0 and after.stdout == 'owned fork writer probe\n')
+          receipt['finishedAt'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+          (out / 'fork-writer-probe.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          print(json.dumps(receipt))
+          assert receipt['expectedBusyClassObserved'], 'Kernel probe did not reproduce ETXTBSY'
+          assert receipt['afterWriterReleaseOriginalBytesExecuted']
+          assert receipt['ownedChildReaped']
+          PY
+
+      - name: Read the existing all-features dependency cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-e2e-${{ runner.os }}
+          save-if: false
+
+      - name: Execute the complete original workspace command
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --all-features --lib --tests 2>&1 | tee "$RUNNER_TEMP/nova-spawn-workspace-diagnostic/workspace-runtime.log"
+          result=${PIPESTATUS[0]}
+          printf '%s\n' "$result" > "$RUNNER_TEMP/nova-spawn-workspace-diagnostic/workspace-exit-code.txt"
+          set -e
+          python3 - <<'PY'
+          import datetime, hashlib, json, os, pathlib, re
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'nova-spawn-workspace-diagnostic'
+          log = out / 'workspace-runtime.log'
+          raw = log.read_bytes()
+          text = re.sub(r'\x1b\[[0-9;]*m', '', raw.decode(errors='replace'))
+          result = {'finishedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    'source': os.environ['GITHUB_SHA'], 'originalF8': 'a7630d7f2c06a15d7eb13e26a3880eb2cb8a2e2a',
+                    'command': 'cargo test --locked --all-features --lib --tests',
+                    'rustCompiler': '1.99.1 (58cf8f9c3 2026-10-13)',
+                    'rustMinStack': os.environ['RUST_MIN_STACK'],
+                    'exitCode': int((out / 'workspace-exit-code.txt').read_text()),
+                    'runtimeLogSha256': hashlib.sha256(raw).hexdigest(),
+                    'spawnErrorDiagnostics': re.findall(r'Nova verified CLI spawn failed: kind=[^\n]+', text),
+                    'testResults': re.findall(r'test result: (?:ok|FAILED)\. [^\n]+', text),
+                    'originalFailureCauseProvenByProbeAlone': False, 'releaseGate': False,
+                    'wholeWorkspaceCommandExecuted': True, 'directServerOnlyHarness': False}
+          (out / 'runtime-result.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(result))
+          PY
+          exit "$result"
+
+      - name: Preserve exact source after diagnostic execution
+        if: always()
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Preserve original diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nova-spawn-workspace-diagnostic-${{ github.sha }}
+          path: ${{ runner.temp }}/nova-spawn-workspace-diagnostic/
+          if-no-files-found: error
+          retention-days: 14

@@ -576,7 +576,17 @@ async fn run_cli(
         .kill_on_drop(cfg!(not(unix)));
     #[cfg(unix)]
     process.process_group(0);
-    let child = process.spawn().map_err(|_| "status_failed")?;
+    let child = process.spawn().map_err(|error| {
+        #[cfg(test)]
+        eprintln!(
+            "Nova verified CLI spawn failed: kind={:?} os_error={:?}",
+            error.kind(),
+            error.raw_os_error()
+        );
+        #[cfg(not(test))]
+        let _ = error;
+        "status_failed"
+    })?;
     #[cfg(unix)]
     let mut child = ProcessGroup { child, armed: true };
     #[cfg(not(unix))]
