@@ -22,6 +22,10 @@ pub(super) struct Model {
 // OpenAI Responses API (v1/responses) - Minimal compatibility layer
 // ============================================================================
 
+/// Maximum caller-supplied Responses tool entries, including unsupported types.
+/// Bounds conversion work/output reservation after body-limited JSON parsing.
+pub(super) const MAX_RESPONSES_TOOLS: usize = 128;
+
 /// OpenAI Responses API request (subset).
 ///
 /// We intentionally accept a subset of the spec to support common SDK usage:
@@ -29,7 +33,7 @@ pub(super) struct Model {
 /// - `input` (string or array of message-like objects)
 /// - `instructions` (forwarded as top-level Responses API instructions)
 /// - `previous_response_id` (passed via flattened parameters for stateful continuation)
-/// - `tools` (Responses-API flat tool entries; legacy nested shape tolerated)
+/// - `tools` (up to 128 entries; Responses flat tools and legacy nested shape)
 /// - `stream`
 /// - `max_output_tokens` (mapped to provider max tokens)
 #[derive(Debug, Deserialize, Clone, Default)]
