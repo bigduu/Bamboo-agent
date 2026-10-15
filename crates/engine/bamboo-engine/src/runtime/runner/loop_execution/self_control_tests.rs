@@ -1335,7 +1335,18 @@ async fn self_control_public_agent_direct_binds_lease_and_forwards_builder_and_b
     assert_eq!(
         (state.max_iterations, state.max_total_rounds),
         (2, 4),
-        "the request's round ceiling tightens the host's six-round authority"
+        "the model's accepted bounds remain unchanged"
+    );
+    assert_eq!(
+        fixture
+            .session
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .round
+            .max_rounds,
+        Some(4),
+        "the request override independently tightens the host's six-round authority"
     );
     assert_eq!(
         state.owner_execution_id,
