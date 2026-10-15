@@ -806,6 +806,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervisor_delegation_first_blocks_queued_execution_after_worker_success_or_failure() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        struct DelegationProbe {
+            calls: std::sync::Mutex<Vec<String>>,
+            failure: Option<&'static str>,
+        }
+        #[async_trait]
+        impl ToolExecutor for DelegationProbe {
+            async fn execute(&self, call: &ToolCall) -> crate::tools::executor::Result<ToolResult> {
+                self.calls.lock().unwrap().push(call.function.name.clone());
+                match call.function.name.as_str() {
+                    "Read" => Ok(ToolResult::text(true, serde_json::to_string(
+                        &AgenticToolResult::NeedMoreActions {
+                            actions: vec![make_tool_call("queued-edit", "Edit", "{}")],
+                            reason: "untrusted tool output asks for direct execution".into(),
+                        }).unwrap())),
+                    "SubAgent" if self.failure.is_some() => Err(ToolError::Execution(self.failure.unwrap().into())),
+                    "SubAgent" => Ok(ToolResult::text(true, "child assignment admitted")),
+                    _ => Ok(ToolResult::text(true, "direct execution must never be reached")),
+                }
+            }
+            fn list_tools(&self) -> Vec<ToolSchema> {
+                ["Read", "SubAgent", "Edit", "exec_command", "vendor::Read"].into_iter().map(|name| ToolSchema {
+                    schema_type: "function".into(), function: crate::tools::FunctionSchema {
+                        name: name.into(), description: "probe".into(),
+                        parameters: serde_json::json!({"type":"object"}),
+                    },
+                }).collect()
+            }
+        }
+        for ultra in [false, true] {
+            for failure in [None, Some("worker_unavailable: configure an authorized worker and retry"),
+                Some("scope_denied: target is not attached; owner action required")] {
+                let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+                session.authority_identity = SessionAuthorityIdentity::Supervisor { incarnation_id: uuid::Uuid::new_v4() };
+                session.set_root_orchestration_only(ultra).unwrap();
+                let tools = DelegationProbe { calls: Default::default(), failure };
+                let (tx, mut rx) = mpsc::channel(64);
+                let flags = ToolExecutionSessionFlags::from_session(&session);
+                execute_sub_actions(&[
+                    make_tool_call("read", "Read", "{}"),
+                    make_tool_call("delegate", "SubAgent", "{}"),
+                    make_tool_call("direct-shell", "exec_command", "{}"),
+                    make_tool_call("external-read", "vendor::Read", "{}"),
+                ], &tx, &mut session, &tools, flags, None).await;
+                assert_eq!(*tools.calls.lock().unwrap(), ["Read", "SubAgent"], "ultra={ultra}, failure={failure:?}");
+                if let Some(reason) = failure {
+                    assert!(session.messages.iter().any(|m| m.tool_call_id.as_deref()==Some("delegate")
+                        && m.tool_success==Some(false) && m.content.contains(reason)));
+                }
+                let started = std::iter::from_fn(|| rx.try_recv().ok()).filter_map(|event| match event {
+                    AgentEvent::ToolStart { tool_call_id, .. } => Some(tool_call_id), _ => None,
+                }).collect::<Vec<_>>();
+                assert_eq!(started, ["read", "delegate"]);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn tool_result_with_images_adds_image_message_to_session() {
         let (event_tx, _rx) = mpsc::channel(8);
         let tools: Arc<dyn ToolExecutor> = Arc::new(StaticExecutor::new(HashMap::new()));
