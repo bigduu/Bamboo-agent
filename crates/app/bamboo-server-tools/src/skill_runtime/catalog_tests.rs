@@ -4053,6 +4053,22 @@ async fn supervisor_delegation_first_catalog_and_factory_keep_skill_authority_de
 {
     for ultra in [false, true] {
         let mut fixture = Fixture::new(2).await;
+        let storage = Arc::new(
+            bamboo_storage::SessionStoreV2::new(fixture._directory.path().join("supervisor-data"))
+                .await
+                .unwrap(),
+        );
+        fixture.repo = bamboo_engine::SessionRepository::new(
+            bamboo_engine::SessionCache::default(),
+            storage.clone(),
+            Arc::new(bamboo_storage::LockedSessionStore::new(storage)),
+        );
+        fixture.tool = SkillsListTool::new(
+            fixture.manager.clone(),
+            fixture.config.clone(),
+            fixture.repo.clone(),
+            fixture.resolver.clone(),
+        );
         let bootstrap = bamboo_engine::session_app::supervisor::SupervisorSessionService::new(
             fixture.repo.storage().clone(),
         )
