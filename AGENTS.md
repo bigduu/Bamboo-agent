@@ -61,7 +61,9 @@ integration is accepted. Preserve dirty or uncertain worktrees.
 
 Follow the authoritative [Release Process](./CONTRIBUTING.md#release-process):
 cut a same-repository `release/<40-character-cut-SHA>` from the freshly read
-actual protected-`dev` HEAD after required changes and controls have merged.
+actual protected-`dev` HEAD after the Release Process prerequisites have merged.
+Its bounded early-cut route permits a known pending frontend consumer only when
+recorded at the cut and later admitted through the full separate `F`/`U` procedure.
 Record the cut timestamp, SHA, tree, fresh-read receipt, and bounded scope;
 review must verify the receipt and normal branch creation. Promote that frozen
 branch to `main`. Keep `dev` open; never chase its moving tip in a release. Necessary
