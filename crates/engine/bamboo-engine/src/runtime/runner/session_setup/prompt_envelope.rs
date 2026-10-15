@@ -70,16 +70,21 @@ const SUPERVISOR_DELEGATION_GUIDANCE: &str = "Supervisor delegation-first policy
 Own task boundaries, planning, dispatch, progress, coordination, verification and the final synthesis. Delegate execution, including simple implementation tasks, to an authorized worker. Perform only necessary read-only information gathering here, using the dedicated Read/Grep/Glob/GetFileInfo/ViewImage and scoped history tools. A shell command, executable, Skill, Workflow or external tool is not a read-only shortcut.\n\
 Use a bounded SubAgent assignment for a direct child, or work_dispatch within the existing Work authority. Continue or correct the same child by its returned ActorId. Use session_control only for an explicitly attached independent Root whose current scope authorizes the followup; never discover or attach unrelated Sessions. Inspect authoritative progress and verify result evidence before claiming completion; an admitted dispatch is not completed work.\n\
 Use the read-only Plan child when planning is needed; do not delegate the entire Supervisor role. Give implementation workers concrete acceptance and non-goals. Children do not inherit this Supervisor policy; nested delegation requires explicit assignment authorization and necessity.\n\
-If a worker or tool is unavailable, an assignment fails, or scope is denied, report a recoverable blocker with the actual reason and the specific owner/configuration/authorization step needed to continue. Reuse an existing assignment where possible. Do not silently execute it here, create repeated overlapping assignments, retry unchanged failures indefinitely, change gates or permissions, auto-attach Sessions, or restore a broker/cluster. This role policy takes precedence over generic advice to handle simple tasks directly.";
+If a worker or tool is unavailable, an assignment fails, or scope is denied, report a recoverable blocker with the actual reason and the specific owner/configuration/authorization step needed to continue. Inspect the owned tree or dispatch receipt for an existing or uncertain assignment before retrying. Reuse that assignment where possible. Do not silently execute it here, create repeated overlapping assignments, retry unchanged failures indefinitely, change gates or permissions, auto-attach Sessions, or restore a broker/cluster. This role policy takes precedence over generic advice to handle simple tasks directly.";
 
 pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Option<ContextBlock> {
     if session.supervisor_incarnation_id().is_some() {
+        let guidance = if session.root_orchestration_only_enabled() {
+            format!("{SUPERVISOR_DELEGATION_GUIDANCE}\n\n{ULTRA_ROOT_GUIDANCE}")
+        } else {
+            SUPERVISOR_DELEGATION_GUIDANCE.to_string()
+        };
         return Some(ContextBlock::new(
             ContextBlockType::RootOrchestration,
             ContextBlockPriority::Critical,
             ContextBlockStability::SessionStable,
             "Supervisor Delegation Policy",
-            SUPERVISOR_DELEGATION_GUIDANCE,
+            guidance,
         ));
     }
     (session.root_orchestration_prompt_enabled() || session.root_orchestration_only_enabled()).then(
@@ -195,6 +200,8 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
             serde_json::from_value(serde_json::to_value(&supervisor).unwrap()).unwrap();
         let block = build_root_orchestration_context_block(&restored)
             .expect("trusted Supervisor always receives its delegation contract");
+        assert_eq!(block.content.contains("Ultra Root thinking mode"), ultra);
+        assert!(block.content.contains("before retrying"));
         for concept in [
             "Supervisor",
             "Delegate execution",
