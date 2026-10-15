@@ -468,5 +468,18 @@ pub(crate) async fn finish(
     } else {
         LoopStatus::Failed
     };
+    if result.is_err() {
+        if let Some(runtime) = session.agent_runtime_state.as_mut() {
+            // A late checkpoint/publication cancellation can follow normal
+            // finalization. The host's error save must not retain that success.
+            if runtime.status == bamboo_domain::AgentStatusState::Completed {
+                runtime.status = if cancelled {
+                    bamboo_domain::AgentStatusState::Cancelled
+                } else {
+                    bamboo_domain::AgentStatusState::Failed
+                };
+            }
+        }
+    }
     checkpoint(session, config, state).await
 }

@@ -943,6 +943,12 @@ async fn counted_cancel_during_terminal_checkpoint_keeps_cancelled_error_and_no_
             read_loop_state(&durable).unwrap().unwrap().status,
             LoopStatus::Cancelled
         );
+        if boundary == LoopStatus::Completed {
+            assert_eq!(
+                durable.agent_runtime_state.as_ref().unwrap().status,
+                bamboo_domain::AgentStatusState::Cancelled
+            );
+        }
     }
 }
 
@@ -1044,6 +1050,14 @@ async fn counted_complete_waits_for_terminal_checkpoint_and_never_publishes_fail
             LoopStatus::Completed
         };
         assert_eq!(read_loop_state(&session).unwrap().unwrap().status, expected);
+        assert_eq!(
+            session.agent_runtime_state.as_ref().unwrap().status,
+            if fail {
+                bamboo_domain::AgentStatusState::Failed
+            } else {
+                bamboo_domain::AgentStatusState::Completed
+            }
+        );
         let stored = storage.load_session(&session.id).await.unwrap().unwrap();
         assert_eq!(read_loop_state(&stored).unwrap().unwrap().status, expected);
         // The host's later normal/error save cannot accidentally restore the
