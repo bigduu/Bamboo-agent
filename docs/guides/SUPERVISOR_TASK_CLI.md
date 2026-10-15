@@ -59,6 +59,8 @@ After verifying the existing provider/account cost boundary, choose one target:
 
 ```bash
 node scripts/bamboo-task.cjs submit --supervisor --prompt-file /tmp/task.txt
+node scripts/bamboo-task.cjs submit --supervisor --prompt-file /tmp/task.txt \
+  --watch --include-output
 node scripts/bamboo-task.cjs submit --session-id ROOT_ID --prompt-file /tmp/task.txt
 node scripts/bamboo-task.cjs submit --new --workspace /absolute/public/fixture \
   --prompt-file /tmp/task.txt --request-id sample-1997-1
@@ -126,10 +128,17 @@ Events are bounded NDJSON over **session** SSE. Each record says
 Untagged tokens and Complete replay must never be attributed to a selected run.
 `--include-output` adds visible Token content only, not reasoning, tool arguments,
 tool results or approval parameters. Defaults omit all those contents.
-Subscribe before execution to observe live tokens; later subscriptions can miss
-text. This is especially relevant to Supervisor, whose exact visible-output
-API is not implemented. Use an existing session's event command in another
-terminal before submission. Selected ordinary output can instead be polled.
+Use `submit --watch` for a new submission: it admits chat, connects SSE, then
+executes. An idle session's standalone `events` can immediately replay Complete
+and close, so opening it before submission cannot reserve a future observation.
+The watched flow prints an `execution_receipt` JSON record, skips cached events
+until that real run's ExecutionStarted is observed, then streams session events.
+Missing that start is an explicit error; a subsequent different ExecutionStarted
+ends observation with `session_generation_changed`. Untagged content still has
+session scope. Already-running Supervisor activation can have emitted text before
+subscription; watch promises no exclusive input/output ownership or replay.
+This is especially relevant to Supervisor, whose exact visible-output API is
+not implemented. Selected ordinary output can instead be polled.
 
 A stream ends at a session terminal, clarification pause, clean EOF, event limit
 (default 1000, maximum 10000), timeout or interrupt. `session_boundary`,

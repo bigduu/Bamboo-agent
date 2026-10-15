@@ -12,17 +12,18 @@ const MAX_STREAM = 16 * 1024 * 1024;
 const DEFAULT_SUPERVISOR = 'bamboo-default-supervisor';
 const COMMANDS = {
   inspect: [],
-  submit: ['supervisor', 'new', 'session-id', 'session-created-at', 'prompt-file', 'request-id', 'model', 'provider', 'workspace', 'project-id'],
+  submit: ['supervisor', 'new', 'session-id', 'session-created-at', 'prompt-file', 'request-id', 'model', 'provider', 'workspace', 'project-id', 'watch', 'include-output', 'max-events'],
   status: ['session-id', 'run-id', 'session-created-at', 'include-output'],
   events: ['session-id', 'max-events', 'include-output'],
   stop: ['session-id', 'run-id'],
 };
-const BOOL = new Set(['supervisor', 'new', 'include-output', 'help']);
+const BOOL = new Set(['supervisor', 'new', 'watch', 'include-output', 'help']);
 const HELP = `bamboo-task (Node 22+) — client of an already running loopback Bamboo
   inspect
   submit (--supervisor | --session-id ID | --new) --prompt-file PATH|-
          [--request-id ID] [--model ID --provider ID]
          [--session-created-at RFC3339]  (existing ordinary Root only)
+         [--watch [--include-output] [--max-events N]]
          [--workspace ABSOLUTE_PATH --project-id ID]  (new Root only)
   status --session-id ID [--run-id ID --session-created-at RFC3339] [--include-output]
   events --session-id ID [--max-events N] [--include-output]
@@ -75,6 +76,7 @@ function parse(argv) {
     if ([o.supervisor, o.new, o['session-id']].filter(Boolean).length !== 1 || !o['prompt-file']) fail('submit_requires_target_and_prompt_file', 2);
     if (o['session-id'] === DEFAULT_SUPERVISOR) fail('use_explicit_supervisor_bootstrap', 2);
     if (o['session-created-at'] && !o['session-id']) fail('expected_birth_requires_existing_root', 2);
+    if ((o['include-output'] || o['max-events']) && !o.watch) fail('submit_output_requires_watch', 2);
     if (Boolean(o.model) !== Boolean(o.provider)) fail('model_and_provider_required_together', 2);
     for (const key of ['model', 'provider']) if (o[key] && (Buffer.byteLength(o[key]) > 256 || /[\x00-\x1f\x7f]/.test(o[key]))) fail('invalid_model_selection', 2);
     if ((o.workspace || o['project-id']) && !o.new) fail('workspace_and_project_are_new_root_only', 2);
@@ -221,12 +223,21 @@ async function submit(c, o, ctx) {
   ctx.message_id = chat.message_id;
   ctx.ingress_seq = chat.ingress_seq;
   const selected = o.supervisor ? {} : { 'Bamboo-Input-Id': chat.message_id, 'Bamboo-Ingress-Seq': String(chat.ingress_seq), 'Bamboo-Session-Created-At': s.created_at };
-  const { r, data: run } = await c.post(`/sessions/${encodeURIComponent(sid)}/execute`, {}, { ...key('execute'), ...selected }, 'execute');
-  if (run.session_id !== sid || !isId(run.run_id) || !['started', 'already_running'].includes(run.status)) fail('invalid_execution_receipt');
-  ctx.run_id = run.run_id;
-  if (!o.supervisor && (r.status !== 202 || run.status !== 'started' || r.headers.get('Bamboo-Input-Id') !== chat.message_id || r.headers.get('Bamboo-Ingress-Seq') !== String(chat.ingress_seq) || r.headers.get('Bamboo-Output-Scope') !== 'activation-receipt' || instant(r.headers.get('Bamboo-Session-Created-At')) !== instant(s.created_at))) fail('selected_execution_not_acknowledged');
-  ctx.admission.execute = 'accepted';
-  return { ...ctx, execution_scope: o.supervisor ? 'session_activation' : 'selected_input', execution_status: run.status, event_scope: 'session' };
+  const observation = { ...o, 'session-id': sid };
+  // An idle session's events command can terminate immediately. Admission
+  // must precede subscribe, and the subscription must connect before execute.
+  const stream = o.watch ? await subscribe(c, observation, ctx) : undefined;
+  try {
+    const { r, data: run } = await c.post(`/sessions/${encodeURIComponent(sid)}/execute`, {}, { ...key('execute'), ...selected }, 'execute');
+    if (run.session_id !== sid || !isId(run.run_id) || !['started', 'already_running'].includes(run.status)) fail('invalid_execution_receipt');
+    ctx.run_id = run.run_id;
+    if (!o.supervisor && (r.status !== 202 || run.status !== 'started' || r.headers.get('Bamboo-Input-Id') !== chat.message_id || r.headers.get('Bamboo-Ingress-Seq') !== String(chat.ingress_seq) || r.headers.get('Bamboo-Output-Scope') !== 'activation-receipt' || instant(r.headers.get('Bamboo-Session-Created-At')) !== instant(s.created_at))) fail('selected_execution_not_acknowledged');
+    ctx.admission.execute = 'accepted';
+    const receipt = { ...ctx, execution_scope: o.supervisor ? 'session_activation' : 'selected_input', execution_status: run.status, event_scope: 'session' };
+    if (!o.watch) return receipt;
+    emit({ ok: true, ...receipt, record: 'execution_receipt' });
+    return { ...receipt, ...await events(c, observation, ctx, stream, run.run_id), phase: ctx.phase };
+  } finally { await stream?.body?.cancel().catch(() => {}); }
 }
 async function status(c, o, ctx) {
   const sid = o['session-id'];
@@ -252,13 +263,18 @@ function instant(s) {
   const fraction = (s.match(/\.(\d+)/)?.[1] || '').padEnd(9, '0');
   return BigInt(Date.parse(s.replace(/\.\d+/, ''))) * 1000000n + BigInt(fraction);
 }
-async function events(c, o, ctx) {
-  ctx.phase = 'events';
+async function subscribe(c, o, ctx) {
+  ctx.phase = 'events_subscribe';
   const r = await c.response(`/sessions/${encodeURIComponent(o['session-id'])}/events`);
   if (!r.ok) { await r.body?.cancel(); fail(r.status === 401 || r.status === 403 ? 'access_denied' : 'http_rejected', r.status === 401 || r.status === 403 ? 4 : 5, { http_status: r.status }); }
   if (!r.headers.get('content-type')?.toLowerCase().startsWith('text/event-stream')) { await r.body?.cancel(); fail('expected_event_stream'); }
+  return r;
+}
+async function events(c, o, ctx, response, expectedStart) {
+  const r = response || await subscribe(c, o, ctx);
+  ctx.phase = 'events';
   const decoder = new TextDecoder('utf-8', { fatal: true });
-  let buffer = '', lines = [], frameBytes = 0, total = 0, count = 0, reason;
+  let buffer = '', lines = [], frameBytes = 0, total = 0, count = 0, reason, started = !expectedStart;
   const line = value => {
     frameBytes += Buffer.byteLength(value) + 1;
     if (frameBytes > MAX_FRAME) fail('event_frame_too_large');
@@ -268,6 +284,10 @@ async function events(c, o, ctx) {
     if (data === '[DONE]') { reason = 'session_boundary'; return; }
     let event; try { event = JSON.parse(data); } catch { fail('invalid_event_json'); }
     if (!event || typeof event.type !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(event.type)) fail('invalid_event_envelope');
+    if (!started) {
+      if (event.type !== 'execution_started' || event.run_id !== expectedStart || event.session_id !== o['session-id']) return;
+      started = true;
+    } else if (expectedStart && event.type === 'execution_started' && event.run_id !== expectedStart) { reason = 'session_generation_changed'; return; }
     const view = { ok: true, command: 'events', session_id: o['session-id'], event_scope: 'session', event: { type: event.type } };
     // Never infer run identity for untagged tokens, child events or terminals.
     if (event.run_id !== undefined) view.event.run_id = id(event.run_id, 6);
@@ -297,6 +317,7 @@ async function events(c, o, ctx) {
       reason = 'eof';
     }
   } finally { await r.body?.cancel().catch(() => {}); }
+  if (!started) fail('execution_start_not_observed');
   return { session_id: o['session-id'], event_scope: 'session', stream_end: reason, event_count: count };
 }
 

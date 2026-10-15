@@ -77,6 +77,7 @@ test('loopback, path identities, unknown/duplicate flags and incomplete selectio
     ['submit', '--supervisor', '--session-id', 'root', '--prompt-file', '-'],
     ['submit', '--session-id', SUP, '--prompt-file', '-'],
     [...submit(f), '--permission-mode', 'bypass'], [...submit(f), '--model', 'model'],
+    [...submit(f), '--include-output'],
     [...submit(f), '--workspace', '/tmp'],
   ]) { const r = await cli(f, args); assert.equal(r.code, 2, r.stdout); privateSafe(r); }
   for (const base of ['http://example.com', 'http://localhost:9562', 'file:///tmp/api', 'http://u:p@127.0.0.1', 'http://127.0.0.1/api/v1?key=secret', 'http://127.0.0.1/api/v1/../secret']) {
@@ -146,6 +147,63 @@ test('Supervisor bootstrap preserves session activation scope and does not fabri
   assert.deepEqual(posts(f).map(c => c.path), ['/api/v1/supervisor/default', '/api/v1/chat', `/api/v1/sessions/${SUP}/execute`]);
   assert.equal(posts(f).at(-1).headers['bamboo-input-id'], undefined);
   privateSafe(r);
+});
+
+test('watched Supervisor admits then subscribes before execute, retaining short output past stale terminal replay', async t => {
+  let pending = false, observer;
+  const f = await fixture(t, (c, res) => {
+    if (c.path === '/api/v1/chat') { pending = true; json(res, { session_id: SUP, message_id: 'watch-input', ingress_seq: 1 }); return true; }
+    if (c.path.endsWith('/events')) {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' }); res.flushHeaders();
+      if (!pending) res.end('data: {"type":"complete"}\n\n');
+      else { observer = res; res.write('data: {"type":"complete"}\n\n'); }
+      return true;
+    }
+    if (c.path.endsWith('/execute')) {
+      assert.ok(observer && !observer.destroyed, 'subscription must be connected before execute');
+      observer.end(`data: {"type":"execution_started","session_id":"${SUP}","run_id":"watch-run"}\n\ndata: {"type":"token","content":"apple and pear"}\n\ndata: {"type":"complete"}\n\n`);
+      json(res, { session_id: SUP, run_id: 'watch-run', status: 'started' }, 202); return true;
+    }
+  });
+  const idle = await cli(f, ['events', '--session-id', SUP]); assert.equal(last(idle).stream_end, 'session_boundary');
+  const r = await cli(f, ['submit', '--supervisor', '--prompt-file', f.prompt, '--watch', '--include-output']);
+  assert.equal(r.code, 0, r.stdout); assert.equal(r.lines[0].record, 'execution_receipt');
+  const seen = r.lines.filter(l => l.event);
+  assert.deepEqual(seen.map(l => l.event.type), ['execution_started', 'token', 'complete']);
+  assert.equal(seen[1].event.content, 'apple and pear'); assert.equal(seen[1].event.run_id, undefined);
+  assert.ok(seen.every(l => l.event_scope === 'session')); assert.equal(last(r).run_id, 'watch-run');
+  assert.equal(last(r).stream_end, 'session_boundary');
+});
+
+test('denied watch subscription leaves accepted chat visible and never executes', async t => {
+  const f = await fixture(t, (c, res) => { if (c.path.endsWith('/events')) { apiError(res, 403); return true; } });
+  const r = await cli(f, ['submit', '--supervisor', '--prompt-file', f.prompt, '--watch']);
+  assert.equal(r.code, 7); assert.equal(last(r).error.cause_exit_code, 4);
+  assert.equal(last(r).admission.chat, 'accepted'); assert.equal(last(r).admission.execute, 'not_sent');
+  assert.ok(!posts(f).some(c => c.path.endsWith('/execute'))); privateSafe(r);
+});
+
+test('failed execute closes the preconnected observer without any stop fallback', async t => {
+  let closed;
+  const f = await fixture(t, (c, res) => {
+    if (c.path.endsWith('/events')) { closed = new Promise(resolve => res.once('close', resolve)); res.writeHead(200, { 'Content-Type': 'text/event-stream' }); res.flushHeaders(); return true; }
+    if (c.path.endsWith('/execute')) { apiError(res, 409); return true; }
+  });
+  const r = await cli(f, ['submit', '--supervisor', '--prompt-file', f.prompt, '--watch']);
+  assert.equal(r.code, 7); assert.equal(last(r).admission.execute, 'rejected');
+  assert.ok(closed); await Promise.race([closed, new Promise((_, reject) => { const timer = setTimeout(() => reject(new Error('observer left open')), 1000); timer.unref(); })]);
+  assert.ok(!posts(f).some(c => c.path.endsWith('/stop'))); privateSafe(r);
+});
+
+test('watch cannot claim output when the acknowledged execution start was never observed', async t => {
+  let observer;
+  const f = await fixture(t, (c, res) => {
+    if (c.path.endsWith('/events')) { observer = res; res.writeHead(200, { 'Content-Type': 'text/event-stream' }); res.flushHeaders(); return true; }
+    if (c.path.endsWith('/execute')) { observer.end(`data: {"type":"token","content":"${SECRET}"}\n\ndata: {"type":"complete"}\n\n`); json(res, { session_id: SUP, run_id: 'unseen-run', status: 'started' }, 202); return true; }
+  });
+  const r = await cli(f, ['submit', '--supervisor', '--prompt-file', f.prompt, '--watch', '--include-output']);
+  assert.equal(r.code, 7); assert.equal(last(r).run_id, 'unseen-run'); assert.equal(last(r).error.code, 'execution_start_not_observed');
+  assert.equal(r.lines[0].record, 'execution_receipt'); privateSafe(r);
 });
 
 test('denied Supervisor bootstrap and child target append no chat', async t => {
