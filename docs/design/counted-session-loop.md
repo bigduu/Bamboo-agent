@@ -49,7 +49,13 @@ persistence. A generation has an immutable objective revision of 1, an execution
 owner, monotonically increasing state revision, iteration admissions/completions,
 conservative round consumption, and explicit status. Each admission is
 checkpointed before dispatch. Checkpoint failure and malformed/unknown state
-fail closed. Persistence does not imply automatic recovery: a new activation
+fail closed. A failed initial checkpoint marks that exact generation Failed,
+including in memory if its failure checkpoint also fails, so the host's later
+error save cannot leave a phantom Running loop. Only explicit budget/round/cap
+reasons map to BudgetExhausted. Ticket question yields and other non-budget
+early exits retain their diagnostic and record recovery_unsupported; they do
+not imply a completed iteration or grant another admission.
+Persistence does not imply automatic recovery: a new activation
 finding Running/Finalizing state records `recovery_unsupported` and refuses to
 replay it, including on subsequent ordinary resume attempts. A suspended live
 loop also records this status. The host must explicitly reconcile that state;

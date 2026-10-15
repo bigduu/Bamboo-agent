@@ -25,6 +25,7 @@ struct FakeProvider {
     durable: Option<Arc<dyn Storage>>,
     barrier: Option<(Arc<Notify>, Arc<Notify>)>,
     tools_forever: bool,
+    task_question: bool,
     reported_usage: Option<(u64, u64)>,
     fail_at: Option<usize>,
 }
@@ -66,7 +67,20 @@ impl LLMProvider for FakeProvider {
                 "authentication error: synthetic terminal failure".into(),
             ));
         }
-        let output = if self.tools_forever {
+        let output = if self.task_question {
+            LLMChunk::ToolCalls(vec![ToolCall {
+                id: format!("task-question-{n}"),
+                tool_type: "function".into(),
+                function: bamboo_agent_core::tools::FunctionCall {
+                    name: "Task".into(),
+                    arguments: serde_json::json!({
+                        "tasks": [{"id":"own", "content":"Own blocked step", "status":"blocked"}],
+                        "question": {"prompt":"Own precise question"}
+                    })
+                    .to_string(),
+                },
+            }])
+        } else if self.tools_forever {
             LLMChunk::ToolCalls(vec![ToolCall {
                 id: format!("read-{n}"),
                 tool_type: "function".into(),
@@ -635,6 +649,192 @@ async fn counted_failed_checkpoint_never_dispatches_the_provider() {
     assert!(result.is_err());
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     assert_eq!(complete_count(&events), 0);
+}
+
+struct FailInitialCheckpoints {
+    inner: Arc<dyn RuntimeSessionPersistence>,
+    remaining: AtomicUsize,
+}
+
+#[async_trait]
+impl RuntimeSessionPersistence for FailInitialCheckpoints {
+    async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.inner.save_runtime_session(session).await
+    }
+    async fn load_runtime_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+        self.inner.load_runtime_session(id).await
+    }
+    async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        if read_loop_state(session).unwrap().is_some()
+            && self
+                .remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            return Err(std::io::Error::other(
+                "synthetic initial checkpoint failure",
+            ));
+        }
+        self.inner.checkpoint_runtime_session(session).await
+    }
+}
+
+#[tokio::test]
+async fn counted_initial_checkpoint_failure_cannot_be_resaved_as_live() {
+    for failures in [1, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(2, 2);
+        let mut session = Session::new("counted-fixture", "fake-only");
+        let storage = add_persistence(dir.path(), &mut cfg, &session).await;
+        let persistence = Arc::new(FailInitialCheckpoints {
+            inner: cfg.persistence.take().unwrap(),
+            remaining: AtomicUsize::new(failures),
+        });
+        cfg.persistence = Some(persistence.clone());
+        let provider = Arc::new(FakeProvider::default());
+        let (result, events) = run(
+            &mut session,
+            cfg,
+            provider.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Session checkpoint failed"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(complete_count(&events), 0);
+        let state = read_loop_state(&session).unwrap().unwrap();
+        assert_eq!(state.status, LoopStatus::Failed);
+        assert_eq!(
+            (
+                state.iterations_started,
+                state.iterations_completed,
+                state.rounds_started
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(persistence.remaining.load(Ordering::SeqCst), 0);
+        // Model the execute boundary's unconditional error save after the
+        // transient failure, including failure of the Failed checkpoint itself.
+        persistence
+            .checkpoint_runtime_session(&mut session)
+            .await
+            .unwrap();
+        let mut durable = storage.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            read_loop_state(&durable).unwrap().unwrap().status,
+            LoopStatus::Failed
+        );
+        let mut ordinary = config(1, 1);
+        ordinary.counted_loop = None;
+        let (result, _) = run(
+            &mut durable,
+            ordinary,
+            provider.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "a failed initial save cannot poison ordinary re-entry"
+        );
+    }
+}
+
+#[tokio::test]
+async fn counted_ticket_question_yield_preserves_wait_without_claiming_budget_exhaustion() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixture = crate::ticket_worker_plan::tests::Fixture::new();
+    let plan = Arc::new(fixture.plan());
+    plan.bind_session(&mut fixture.session).unwrap();
+    let mut cfg = config(2, 4);
+    cfg.bind_ticket_worker_plan(plan);
+    let storage = add_persistence(dir.path(), &mut cfg, &fixture.session).await;
+    let provider = Arc::new(FakeProvider {
+        task_question: true,
+        ..Default::default()
+    });
+    let tools = Arc::new(
+        bamboo_tools::BuiltinToolExecutorBuilder::new()
+            .with_tool(bamboo_tools::TaskTool::new())
+            .unwrap()
+            .build(),
+    );
+    let (tx, mut rx) = mpsc::channel(512);
+    run_agent_loop_with_config(
+        &mut fixture.session,
+        PROMPT.into(),
+        tx,
+        provider.clone(),
+        tools,
+        CancellationToken::new(),
+        cfg,
+    )
+    .await
+    .unwrap();
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    assert_eq!(
+        complete_count(&events),
+        1,
+        "one activation terminal event, not a completed iteration"
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    let state = read_loop_state(&fixture.session).unwrap().unwrap();
+    assert_eq!(state.status, LoopStatus::RecoveryUnsupported);
+    assert_eq!(
+        (
+            state.iterations_started,
+            state.iterations_completed,
+            state.rounds_started
+        ),
+        (1, 0, 1)
+    );
+    assert_eq!(
+        fixture.session.metadata["runtime.completion_reason"],
+        "ticket_question_yield"
+    );
+    let snapshot = fixture.service.published().unwrap().1;
+    let request_id = snapshot.assignments[&fixture.assignment]
+        .awaiting_request
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        snapshot.requests[request_id].kind,
+        bamboo_tickets::RequestKind::Question
+    );
+    assert!(snapshot.submissions.is_empty());
+    let mut durable = storage
+        .load_session(&fixture.session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read_loop_state(&durable).unwrap().unwrap(), state);
+    assert_eq!(
+        durable.metadata[crate::ticket_worker_plan::TICKET_QUESTION_YIELD_KEY],
+        fixture.session.metadata[crate::ticket_worker_plan::TICKET_QUESTION_YIELD_KEY]
+    );
+    let mut ordinary = config(1, 1);
+    ordinary.counted_loop = None;
+    let (result, events) = run(
+        &mut durable,
+        ordinary,
+        provider.clone(),
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(complete_count(&events), 0);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.service.published().unwrap().1.seq, snapshot.seq);
 }
 
 #[tokio::test]

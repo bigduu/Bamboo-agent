@@ -294,7 +294,16 @@ pub(crate) async fn begin(
         rounds_started: 0,
         status: LoopStatus::Running,
     };
-    checkpoint(session, config, state).await?;
+    if let Err(error) = checkpoint(session, config, state).await {
+        // The generation exists in memory before its first save returns. Keep
+        // the original failure, but fence and terminate that exact generation
+        // so the host's later error save cannot persist a phantom live loop.
+        let failure = Err(error);
+        if let Err(checkpoint_error) = finish(session, config, Some(&generation), &failure).await {
+            tracing::warn!(%checkpoint_error, "counted-loop initial failure checkpoint failed");
+        }
+        return failure.map(|()| Some(generation));
+    }
     Ok(Some(generation))
 }
 
@@ -461,8 +470,18 @@ pub(crate) async fn finish(
         })
     {
         LoopStatus::RecoveryUnsupported
-    } else if session.metadata.contains_key("runtime.completion_reason") {
-        LoopStatus::BudgetExhausted
+    } else if let Some(reason) = session.metadata.get("runtime.completion_reason") {
+        match reason.as_str() {
+            "counted_loop_round_limit"
+            | "counted_loop_budget_exhausted"
+            | "budget_exceeded"
+            | "max_rounds_reached"
+            | "stop_hook_continuation_cap" => LoopStatus::BudgetExhausted,
+            // Ticket questions and other non-budget early exits retain their
+            // diagnostic and require explicit host reconciliation, just like
+            // a suspended live generation. They never imply target completion.
+            _ => LoopStatus::RecoveryUnsupported,
+        }
     } else if state.iterations_completed == state.max_iterations {
         LoopStatus::Completed
     } else {
