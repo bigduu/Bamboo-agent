@@ -56,6 +56,16 @@ before activation. Intent is persisted with the delivery and bound into its
 semantic digest after ACK. Existing birth/operation identity checks still apply.
 Explicit intent uses versioned records that older readers reject safely.
 
+## Receiver capability boundary
+
+TriggerTurn grants scheduling permission, subject to the existing receiver route;
+it does not certify that every Child can resume every backlog shape. The strict
+owned zero-tool Actor Child continuation currently admits one fresh pending
+input. A queued input plus a later followup exceeds that existing cold-continuation
+shape. This slice does not widen its admission, lease or completion protocol;
+that route's multi-input continuation remains P1 follow-up acceptance in #2000.
+Other supported consumers can admit queued input at their existing safe points.
+
 ## Compatibility and later phases
 
 `SubAgent.send_message` is unchanged: `auto_run` still defaults to true; idle

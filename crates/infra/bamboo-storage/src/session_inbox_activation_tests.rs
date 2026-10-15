@@ -1624,3 +1624,82 @@ async fn queue_only_owned_claim_expiry_does_not_schedule_recovery_or_change_poli
     reopened.ack_owned("parent", &second, later).await.unwrap();
     assert_eq!(reopened.inspect("parent").await.unwrap().pending, 0);
 }
+
+#[tokio::test]
+async fn acknowledged_trigger_left_in_cur_cannot_wake_queue_only_backlog() {
+    let (temp, store, mut inbox, source, target) = explicit_peer_fixture().await;
+    let queued = peer_envelope("sender", "parent");
+    inbox
+        .deliver_peer_message_with_intent(
+            &queued,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::QueueOnly,
+        )
+        .await
+        .unwrap();
+    let trigger = peer_envelope("sender", "parent");
+    inbox
+        .deliver_peer_message_with_intent(
+            &trigger,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::TriggerTurn,
+        )
+        .await
+        .unwrap();
+    let request = bamboo_domain::SessionInboxLeaseRequest {
+        consumer: bamboo_domain::SessionInboxConsumerId::new(),
+        now: Utc::now(),
+        duration: chrono::Duration::seconds(10),
+    };
+    let claims = inbox
+        .claim_owned("parent", 8, Some("manual-run"), &request)
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 2);
+    assert_eq!(claims[1].claim.envelope, trigger);
+    let mut saved = store.load_session("parent").await.unwrap().unwrap();
+    saved.add_message(trigger.to_provider_message().unwrap());
+    saved
+        .session_inbox_admission_mut()
+        .record(trigger.id.clone(), claims[1].claim.generation);
+    store.save_session(&saved).await.unwrap();
+    inbox.owned_ack_after_receipt_failure = true;
+    assert!(inbox
+        .ack_owned("parent", &claims[1], request.now)
+        .await
+        .is_err());
+    assert!(inbox.was_admitted("parent", &trigger.id).await.unwrap());
+    // The physical cur entry stays present; both wake APIs must exclude the
+    // exact durable ACK and keep the unacknowledged QueueOnly inert.
+    let reopened = reopen(&temp).await;
+    let backlog = reopened.inspect("parent").await.unwrap();
+    assert_eq!(backlog.claimed, 2);
+    assert!(!backlog.activation_pending());
+    assert!(!backlog.interrupt_pending());
+    assert_eq!(
+        reopened
+            .inspect_wake_readiness("parent", request.now)
+            .await
+            .unwrap()
+            .ready,
+        None
+    );
+    // A mismatched receipt cannot be used to suppress otherwise real work.
+    let dir = reopened.inbox_dir("parent").await.unwrap();
+    let receipt_path = FileSessionInbox::admitted_path(&dir, &trigger.id);
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&receipt_path).await.unwrap()).unwrap();
+    raw["generation"] = serde_json::json!(claims[1].claim.generation + 1);
+    tokio::fs::write(&receipt_path, serde_json::to_vec(&raw).unwrap())
+        .await
+        .unwrap();
+    assert!(reopened.inspect("parent").await.is_err());
+    assert!(reopened
+        .inspect_wake_readiness("parent", request.now)
+        .await
+        .is_err());
+}

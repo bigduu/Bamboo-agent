@@ -683,7 +683,8 @@ impl FileSessionInbox {
         &self,
         path: &Path,
         versioned: bool,
-    ) -> Result<Option<SessionInboxActivationIntent>, SessionInboxError> {
+        terminal_receipt: Option<(&Path, &str, u64)>,
+    ) -> Result<(Option<SessionInboxActivationIntent>, bool), SessionInboxError> {
         let file = tokio::fs::File::open(path).await.map_err(|error| {
             SessionInboxError::Storage(format!("read inbox activation intent: {error}"))
         })?;
@@ -722,7 +723,7 @@ impl FileSessionInbox {
         // Corrupt legacy transports remain claim-time quarantine work. Their
         // presence alone must never grant immediate execution permission.
         let Ok((wrapper, lease)) = Self::decode_owned_wrapper(&bytes) else {
-            return Ok(None);
+            return Ok((None, false));
         };
         if lease.is_some()
             && !Self::owned_enabled(path.parent().and_then(Path::parent).ok_or_else(|| {
@@ -735,7 +736,7 @@ impl FileSessionInbox {
             ));
         }
         if wrapper.kind != InboxKind::SessionEnvelope {
-            return Ok(None);
+            return Ok((None, false));
         }
         let intent = Self::message_activation_intent(&wrapper.body)?;
         if intent.is_some() && !versioned {
@@ -743,7 +744,32 @@ impl FileSessionInbox {
                 "activation intent requires its v2 watermark".into(),
             ));
         }
-        Ok(intent)
+        // Wake inspection must agree with exact lease readiness after an ACK
+        // receipt commits but cur removal fails. Claims keep their existing
+        // cleanup path; inspection never removes or reclaims an item.
+        let mut acknowledged = false;
+        if let Some((dir, target, generation)) = terminal_receipt {
+            if let Ok(envelope) =
+                serde_json::from_value::<SessionMessageEnvelope>(wrapper.body.clone())
+            {
+                if let Some(receipt) = Self::admitted_receipt(dir, &envelope).await? {
+                    if envelope.target_session_id != target
+                        || receipt.delivery.generation != generation
+                        || receipt.intent != Self::activation_intent(&wrapper.body)?
+                        || !StoredLease::same_optional_identity(
+                            receipt.lease.as_ref(),
+                            lease.as_ref(),
+                        )
+                    {
+                        return Err(SessionInboxError::InvalidClaim(
+                            "Inbox terminal lease mismatch".into(),
+                        ));
+                    }
+                    acknowledged = true;
+                }
+            }
+        }
+        Ok((intent, acknowledged))
     }
 
     fn claim_generation(claim_id: &str) -> Result<u64, SessionInboxError> {
@@ -1740,7 +1766,7 @@ impl SessionInboxPort for FileSessionInbox {
         let mut eligible = Vec::new();
         for queue in ["cur", "new"] {
             for (generation, name, path) in Self::valid_queue_entries(&dir, queue).await? {
-                let intent = self.queue_intent(&path, versioned).await?;
+                let (intent, _) = self.queue_intent(&path, versioned, None).await?;
                 if Self::eligible(generation, activation_generation, intent) {
                     if let Some(run_id) = active_run_id {
                         let path = dir.join(queue).join(&name);
@@ -1969,8 +1995,14 @@ impl SessionInboxPort for FileSessionInbox {
         for queue in ["new", "cur"] {
             for (generation, _, path) in Self::owned_queue_entries(&dir, queue, &filesystem).await?
             {
-                let intent = self.queue_intent(&path, versioned).await?;
-                if Self::wake_eligible(generation, prefix, intent) {
+                let (intent, acknowledged) = self
+                    .queue_intent(
+                        &path,
+                        versioned,
+                        Some((&dir, target_session_id, generation)),
+                    )
+                    .await?;
+                if !acknowledged && Self::wake_eligible(generation, prefix, intent) {
                     wake_pending = true;
                     activation_generation = activation_generation.max(generation);
                     if Self::effective_activation_policy(

@@ -3553,7 +3553,14 @@ mod tests {
     #[tokio::test]
     async fn queue_only_delivery_never_schedules_idle_finalizing_or_restarted_target() {
         use bamboo_domain::SessionMessageDeliveryIntent::QueueOnly;
-        for timing in ["idle", "active", "finalizing", "after_terminal_inspection"] {
+        for timing in [
+            "idle",
+            "active",
+            "finalizing",
+            "after_terminal_inspection",
+            "selected_finish",
+            "selected_abandon",
+        ] {
             let fixture = PeerIntentFixture::new().await;
             let mut registration = if timing == "idle" {
                 None
@@ -3566,6 +3573,9 @@ mod tests {
                         .unwrap(),
                 )
             };
+            if timing == "selected_finish" || timing == "selected_abandon" {
+                registration.as_mut().unwrap().restrict_to_selected_input();
+            }
             if timing == "finalizing" || timing == "after_terminal_inspection" {
                 registration.as_mut().unwrap().begin_finalization().await;
             }
@@ -3587,10 +3597,17 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(receipt.activation, None, "{timing}");
-            assert_eq!(receipt.active_delivery_notified, timing == "active");
+            assert_eq!(
+                receipt.active_delivery_notified,
+                matches!(timing, "active" | "selected_finish" | "selected_abandon")
+            );
             if let Some(mut registration) = registration {
-                registration.begin_finalization().await;
-                assert_eq!(registration.finish(0).await.unwrap(), None);
+                if timing == "selected_abandon" {
+                    registration.abandon().await;
+                } else {
+                    registration.begin_finalization().await;
+                    assert_eq!(registration.finish(0).await.unwrap(), None);
+                }
             }
             if let Some(race) = race {
                 release.notify_one();
