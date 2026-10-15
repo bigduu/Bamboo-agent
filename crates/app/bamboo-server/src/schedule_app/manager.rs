@@ -2356,7 +2356,7 @@ budgets:
                 }
             })
             .await
-            .unwrap();
+            .unwrap_or_else(|_| guard.failed("workflow_correlation", None, None));
             assert_eq!(record.status, ScheduleRunStatus::Running);
             if cancel {
                 access
