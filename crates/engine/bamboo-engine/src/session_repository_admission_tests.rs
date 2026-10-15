@@ -24,7 +24,7 @@ async fn finish(binding: &mut RootActorExecutionBinding) {
         .finish_activation(
             &binding.owner.fence,
             chrono::Utc::now(),
-            ActorActivationFinish::Completed,
+            ActorActivationFinish::Succeeded,
         )
         .await
         .unwrap();
