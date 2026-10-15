@@ -191,11 +191,6 @@ async fn execute_and_apply_single_tool_call(
                 result: Err(format!("Plan mode: {} operation blocked", tool_name)),
                 tool_duration: std::time::Duration::ZERO,
             };
-            policy_guard.observe_execution_outcome(
-                tool_call,
-                &outcome,
-                admitted_execution_name.as_deref(),
-            );
             let task_hint = build_task_compression_hint(task_context);
             let outcome = output_compressor::maybe_compress(
                 &tool_call.function.name,
@@ -212,6 +207,8 @@ async fn execute_and_apply_single_tool_call(
             .await;
             let should_break = per_call::apply_tool_execution_outcome(
                 per_call::ToolExecutionApplyContext {
+                    policy_guard,
+                    admitted_execution_name: admitted_execution_name.as_deref(),
                     tool_call,
                     event_tx,
                     metrics_collector,
@@ -317,12 +314,10 @@ async fn execute_and_apply_single_tool_call(
         task_hint.as_ref(),
     )
     .await;
-    // The output budget may turn an otherwise successful browser download
-    // into a bounded failure. Count the result the model actually receives.
-    policy_guard.observe_execution_outcome(tool_call, &outcome, admitted_execution_name.as_deref());
-
     let should_break = per_call::apply_tool_execution_outcome(
         per_call::ToolExecutionApplyContext {
+            policy_guard,
+            admitted_execution_name: admitted_execution_name.as_deref(),
             tool_call,
             event_tx,
             metrics_collector,
@@ -837,16 +832,13 @@ pub(crate) async fn execute_round_tool_calls(
                 .await;
 
             for (batch_call, outcome) in batch.iter().zip(compressed) {
-                policy_guard.observe_execution_outcome(
-                    batch_call,
-                    &outcome,
-                    effective_callable_set
-                        .resolve_callable_reference(&batch_call.function.name)
-                        .as_deref(),
-                );
+                let admitted_execution_name =
+                    effective_callable_set.resolve_callable_reference(&batch_call.function.name);
 
                 let should_break = per_call::apply_tool_execution_outcome(
                     per_call::ToolExecutionApplyContext {
+                        policy_guard,
+                        admitted_execution_name: admitted_execution_name.as_deref(),
                         tool_call: batch_call,
                         event_tx,
                         metrics_collector,

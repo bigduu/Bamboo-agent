@@ -81,6 +81,29 @@ impl Harness {
         replay: bool,
         plan: bool,
     ) -> Result<ToolResult, AgentError> {
+        self.command_with_flags_and_cap(command, round, replay, plan, 0)
+            .await
+    }
+
+    async fn command_with_cap(
+        &mut self,
+        command: &LoopControlRequest,
+        round: usize,
+        cap: u32,
+    ) -> ToolResult {
+        self.command_with_flags_and_cap(command, round, false, false, cap)
+            .await
+            .unwrap()
+    }
+
+    async fn command_with_flags_and_cap(
+        &mut self,
+        command: &LoopControlRequest,
+        round: usize,
+        replay: bool,
+        plan: bool,
+        cap: u32,
+    ) -> Result<ToolResult, AgentError> {
         // Use the public parser even in service tests; never feed an invalid
         // constructed DTO past the actual tool's static validation boundary.
         let json = serde_json::to_string(command).unwrap();
@@ -106,6 +129,7 @@ impl Harness {
             round,
             replay,
             plan,
+            cap,
         )
         .await
     }
@@ -933,3 +957,5 @@ async fn self_control_bound_only_tightening_cannot_strand_an_existing_pending_ob
         (2, 2)
     );
 }
+
+mod output_contract_tests;

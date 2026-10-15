@@ -123,6 +123,29 @@ emitting a successful ToolComplete. Approved permission replay cannot mutate a
 loop; it requires a fresh owner command. Status and rejections also retain the
 normal complete tool transcript pairing.
 
+The owner uses the exact output cap admitted for that tool dispatch, before
+checkpointing any result. Large status projections may omit only current and
+pending objective text, reporting their omitted UTF-8 byte counts while keeping
+canonical goals and all version/budget fields. A mutation is accepted only if
+its complete immutable receipt fits; a cap too small for that receipt rejects
+before installing generation, revision, receipt or stop effects. Zero means the
+existing unlimited policy. A budget-delivery failure does not claim that an
+already accepted duplicate operation was unapplied; very small positive caps
+can require an empty failure result.
+
+AfterToolUse receives the first bounded, checkpointed owner result. Optional
+feedback is per-call output metadata (`hook_feedback` and
+`hook_feedback_omitted_bytes`), bounded inside the same JSON object. These
+optional fields remain parseable by the public receipt DTO, but are forbidden
+inside canonical stored receipts. Duplicate operations retain the original
+canonical receipt even when a new tool call produces different feedback. If
+feedback changes the delivered result, the owner checkpoints the same unique
+ToolResult pair again before publication. A failed feedback checkpoint keeps the
+accepted operation and conservative pair, stops execution, and publishes no
+ToolComplete for that call. Cancellation wins during hooks, either checkpoint,
+and a blocked acknowledgement publisher. The existing policy circuit observes
+the final owner result exactly once, including stale or budget rejections.
+
 | Boundary | Behavior |
 | --- | --- |
 | Invalid/stale command, receipt quota or oversized edit | Rejection result; no loop state, budget or stop-token mutation. |

@@ -153,17 +153,8 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
     );
 
     if ctx.loop_result_checkpointed {
-        // Keep the durable tool-result message identity. PostToolUse may have
-        // appended feedback after its acceptance checkpoint; do not add a second pair.
-        if let Some(message) = ctx
-            .session
-            .messages
-            .iter_mut()
-            .rev()
-            .find(|m| m.tool_call_id.as_deref() == Some(ctx.tool_call.id.as_str()))
-        {
-            message.content = result.result.clone();
-        }
+        // The live owner already checkpointed this exact final pair, including
+        // bounded hook feedback, before ToolComplete. Never mutate it here.
         return false;
     }
 

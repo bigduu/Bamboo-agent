@@ -16,6 +16,8 @@ use super::counted_loop::{
     MAX_LOOP_ROUNDS,
 };
 
+pub(crate) mod output_limits;
+
 const MAX_OPERATIONS: usize = 64;
 
 /// Explicit host ceilings for a model-managed loop in one existing activation.
@@ -133,6 +135,13 @@ impl LoopControlConfig {
             .map_err(|_| fatal("execution capability already consumed"))
     }
 
+    pub(crate) fn execution_cancel(&self) -> Result<&CancellationToken, AgentError> {
+        self.execution
+            .get()
+            .map(|execution| &execution.cancel)
+            .ok_or_else(|| fatal("execution identity absent"))
+    }
+
     pub(crate) fn active_counted(&self) -> Option<&CountedLoopConfig> {
         self.active.get().map(|active| &active.counted)
     }
@@ -152,6 +161,11 @@ pub struct LoopControlReceipt {
     pub objective_revision: u64,
     pub effective_iteration: Option<u32>,
     pub applied: bool,
+    /// Per-call output metadata; never part of the canonical operation ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_feedback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_feedback_omitted_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,7 +223,9 @@ impl ManagedLoopState {
         let mut seen = std::collections::BTreeSet::new();
         for operation in &self.operations {
             let receipt = &operation.receipt;
-            if uuid::Uuid::parse_str(&receipt.operation_id).is_err()
+            if receipt.hook_feedback.is_some()
+                || receipt.hook_feedback_omitted_bytes.is_some()
+                || uuid::Uuid::parse_str(&receipt.operation_id).is_err()
                 || !seen.insert(&receipt.operation_id)
                 || receipt.generation != state.generation
                 || receipt.accepted_revision == 0
@@ -333,6 +349,7 @@ pub(crate) async fn apply_current(
     round: usize,
     approved_replay: bool,
     plan_read_only: bool,
+    max_tool_output_tokens: u32,
 ) -> Result<ToolResult, AgentError> {
     let policy = config
         .loop_control
@@ -351,6 +368,12 @@ pub(crate) async fn apply_current(
     }
     if config.ticket_worker_plan.is_some() || config.goal_loop_active() {
         return Err(fatal("incompatible execution mode"));
+    }
+    if session.messages.iter().any(|message| {
+        message.role == bamboo_domain::Role::Tool
+            && message.tool_call_id.as_deref() == Some(tool_call_id)
+    }) {
+        return Err(fatal("tool result already paired"));
     }
     let current = counted_loop::read_loop_state(session)?;
     let result = if matches!(command, LoopControlRequest::Status) {
@@ -406,21 +429,39 @@ pub(crate) async fn apply_current(
                             .expect("accepted operation")
                             .receipt,
                     );
-                    return checkpoint_result(
-                        session,
-                        config,
-                        policy,
-                        tool_call_id,
-                        result,
-                        Some(state),
-                    )
-                    .await;
+                    if !output_limits::fits(&result, max_tool_output_tokens) {
+                        // No command, OnceLock or stop side effect is installed
+                        // unless its entire immutable acknowledgement fits.
+                        output_limits::budget_failure(max_tool_output_tokens)
+                    } else if let Err(code) = install_command_effects(policy, &state, command) {
+                        rejected(code)
+                    } else {
+                        return checkpoint_result(
+                            session,
+                            config,
+                            policy,
+                            tool_call_id,
+                            result,
+                            Some(state),
+                            max_tool_output_tokens,
+                        )
+                        .await;
+                    }
                 }
                 Err(code) => rejected(code),
             }
         }
     };
-    checkpoint_result(session, config, policy, tool_call_id, result, None).await
+    checkpoint_result(
+        session,
+        config,
+        policy,
+        tool_call_id,
+        result,
+        None,
+        max_tool_output_tokens,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -602,11 +643,21 @@ fn accept_command(
             objective_revision: pending.map_or(state.objective_revision, |p| p.objective_revision),
             effective_iteration: (!applied).then_some(state.iterations_started.saturating_add(1)),
             applied,
+            hook_feedback: None,
+            hook_feedback_omitted_bytes: None,
         },
     });
     // A valid text-byte bound can expand under JSON escaping. Check the exact
     // persisted representation before any OnceLock or cancellation side effect.
     counted_loop::encode_next_state(&state).map_err(|_| "state_checkpoint_bound_exceeded")?;
+    Ok(state)
+}
+
+fn install_command_effects(
+    policy: &LoopControlConfig,
+    state: &LoopState,
+    command: &LoopControlRequest,
+) -> Result<(), &'static str> {
     if matches!(command, LoopControlRequest::Start { .. }) {
         let mut counted = policy.owner.clone();
         counted.max_iterations = state.max_iterations;
@@ -625,7 +676,7 @@ fn accept_command(
             .ok_or("managed_generation_required")?
             .stop();
     }
-    Ok(state)
+    Ok(())
 }
 
 fn validate_current(
@@ -654,7 +705,9 @@ async fn checkpoint_result(
     tool_call_id: &str,
     result: ToolResult,
     state: Option<LoopState>,
+    max_tool_output_tokens: u32,
 ) -> Result<ToolResult, AgentError> {
+    let result = output_limits::bound_result(result, max_tool_output_tokens);
     let mut staged = session.clone();
     if let Some(state) = state {
         counted_loop::stage_state(&mut staged, state)?;
@@ -664,6 +717,60 @@ async fn checkpoint_result(
         result.result.clone(),
         result.success,
     ));
+    persist_staged(session, config, policy, staged).await?;
+    Ok(result)
+}
+
+/// Finalize the exact first-checkpoint pair after hooks, without appending a
+/// second ToolResult or changing the accepted operation's immutable receipt.
+pub(crate) async fn finish_checkpointed_result(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    tool_call_id: &str,
+    before_hooks: &ToolResult,
+    result: &ToolResult,
+) -> Result<(), AgentError> {
+    let policy = config
+        .loop_control
+        .as_ref()
+        .ok_or_else(|| fatal("host capability absent"))?;
+    let authority = policy.validate_current_owner(session).await;
+    if policy.execution_cancel()?.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+    authority?;
+    let mut pairs = session.messages.iter().enumerate().filter(|(_, message)| {
+        message.role == bamboo_domain::Role::Tool
+            && message.tool_call_id.as_deref() == Some(tool_call_id)
+    });
+    let (index, pair) = pairs
+        .next()
+        .ok_or_else(|| fatal("checkpointed tool result absent"))?;
+    if pairs.next().is_some()
+        || pair.content != before_hooks.result
+        || pair.tool_success != Some(before_hooks.success)
+    {
+        return Err(fatal("checkpointed tool result identity changed"));
+    }
+    if pair.content != result.result || pair.tool_success != Some(result.success) {
+        let mut staged = session.clone();
+        staged.messages[index].content = result.result.clone();
+        staged.messages[index].tool_success = Some(result.success);
+        persist_staged(session, config, policy, staged).await?;
+    }
+    // Includes the no-feedback path: cancellation during AfterToolUse wins.
+    if policy.execution_cancel()?.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+    Ok(())
+}
+
+async fn persist_staged(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    policy: &LoopControlConfig,
+    mut staged: Session,
+) -> Result<(), AgentError> {
     let checkpoint =
         counted_loop::persist_checkpoint(&mut staged, config.persistence.as_deref()).await;
     // An uncertain write reserves this operation/consumption conservatively.
@@ -680,8 +787,7 @@ async fn checkpoint_result(
         }
         return Err(AgentError::Cancelled);
     }
-    checkpoint?;
-    Ok(result)
+    checkpoint
 }
 
 #[cfg(test)]

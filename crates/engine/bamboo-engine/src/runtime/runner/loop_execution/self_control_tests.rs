@@ -1461,3 +1461,5 @@ async fn self_control_public_agent_raw_execute_refuses_unbound_capability_before
 
 mod output_contract_tests;
 mod policy_contract_tests;
+
+mod post_hook_contract_tests;

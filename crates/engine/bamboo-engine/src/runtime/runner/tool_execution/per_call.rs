@@ -120,6 +120,8 @@ pub(super) struct ToolExecutionOnlyContext<'a> {
 }
 
 pub(super) struct ToolExecutionApplyContext<'a> {
+    pub policy_guard: &'a mut policy::ToolPolicyGuard,
+    pub admitted_execution_name: Option<&'a str>,
     pub tool_call: &'a ToolCall,
     pub event_tx: &'a mpsc::Sender<AgentEvent>,
     pub metrics_collector: Option<&'a MetricsCollector>,
@@ -953,6 +955,15 @@ pub(super) async fn apply_tool_execution_outcome(
     ctx: ToolExecutionApplyContext<'_>,
     mut outcome: ToolExecutionOutcome,
 ) -> Result<bool, AgentError> {
+    // Capture the exact dispatch budget once, before owner projection or hooks.
+    let feedback_cap = outcome
+        .output_cap
+        .unwrap_or_else(|| {
+            ctx.session
+                .effective_token_budget()
+                .map(|budget| budget.max_tool_output_tokens)
+        })
+        .unwrap_or(0);
     let mut loop_result_checkpointed = false;
     if outcome.portable_tool.as_ref().is_some_and(|tool| {
         tool.execution_name() == bamboo_tools::tools::loop_control::LOOP_CONTROL_TOOL_NAME
@@ -974,10 +985,18 @@ pub(super) async fn apply_tool_execution_outcome(
             ctx.round,
             outcome.permission_replay_origin.is_some(),
             read_only,
+            feedback_cap,
         )
         .await?);
         loop_result_checkpointed = true;
     }
+    let loop_result_before_hooks = loop_result_checkpointed.then(|| {
+        outcome
+            .result
+            .as_ref()
+            .expect("checkpointed owner result")
+            .clone()
+    });
     let mut post_tool_feedback = Vec::new();
     let mut deferred_hook_control = None;
     if outcome.post_tool_hook_eligible
@@ -1056,29 +1075,45 @@ pub(super) async fn apply_tool_execution_outcome(
     // Read the shell envelope before post-hook feedback appends prose. Only
     // the admitted exact identity selects command-specific task accounting.
     let task_progress_result = task_progress_result_for_outcome(&outcome);
-    let feedback_cap = outcome
-        .output_cap
-        .unwrap_or_else(|| {
-            ctx.session
-                .effective_token_budget()
-                .map(|budget| budget.max_tool_output_tokens)
-        })
-        .unwrap_or(0);
-    append_post_tool_feedback(
-        &mut outcome.result,
-        post_tool_feedback,
-        outcome
-            .portable_tool
-            .as_ref()
-            .map(|tool| tool.execution_name()),
-        feedback_cap,
+    if let Some(before_hooks) = &loop_result_before_hooks {
+        let result = outcome.result.as_mut().expect("checkpointed owner result");
+        crate::runtime::loop_control::output_limits::append_feedback(
+            result,
+            post_tool_feedback,
+            feedback_cap,
+        );
+        crate::runtime::loop_control::finish_checkpointed_result(
+            ctx.session,
+            ctx.config,
+            &ctx.tool_call.id,
+            before_hooks,
+            result,
+        )
+        .await?;
+    } else {
+        append_post_tool_feedback(
+            &mut outcome.result,
+            post_tool_feedback,
+            outcome
+                .portable_tool
+                .as_ref()
+                .map(|tool| tool.execution_name()),
+            feedback_cap,
+        );
+    }
+    // Exactly one common observation sees the final owner/compression result.
+    // Raw observation remains at dispatch, before compression and owner apply.
+    ctx.policy_guard.observe_execution_outcome(
+        ctx.tool_call,
+        &outcome,
+        ctx.admitted_execution_name,
     );
 
     // Capture tool lifecycle metadata before the borrow-splitting match.
     let tool_name_for_meta = ctx.tool_call.function.name.clone();
     let tool_call_id_for_meta = ctx.tool_call.id.clone();
     let tool_duration_ms = outcome.tool_duration.as_millis() as u64;
-    let is_success = outcome.result.is_ok();
+    let is_success = outcome.result.as_ref().is_ok_and(|result| result.success);
 
     let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name_for_meta)
         == bamboo_tools::orchestrator::ToolMutability::Mutating;
@@ -1130,7 +1165,19 @@ pub(super) async fn apply_tool_execution_outcome(
     } else {
         match outcome.result {
             Ok(result) => {
-                let r = execution_paths::handle_successful_tool_result(
+                let loop_cancel = if loop_result_checkpointed {
+                    Some(
+                        ctx.config
+                            .loop_control
+                            .as_ref()
+                            .expect("checkpointed owner capability")
+                            .execution_cancel()?
+                            .clone(),
+                    )
+                } else {
+                    None
+                };
+                let apply_success = execution_paths::handle_successful_tool_result(
                     execution_paths::SuccessPathContext {
                         tool_call: ctx.tool_call,
                         permission_replay_origin: outcome.permission_replay_origin.as_ref(),
@@ -1150,9 +1197,18 @@ pub(super) async fn apply_tool_execution_outcome(
                         state: ctx.state,
                         tool_duration: outcome.tool_duration,
                     },
-                )
-                .await;
-                r
+                );
+                if let Some(cancel) = loop_cancel {
+                    // A blocked ToolComplete publisher must not outlive this
+                    // execution's cancellation. Ordinary tools keep their path.
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(AgentError::Cancelled),
+                        result = apply_success => result,
+                    }
+                } else {
+                    apply_success.await
+                }
             }
             Err(error_message) => {
                 execution_paths::handle_tool_execution_error(
@@ -1301,6 +1357,8 @@ mod task_progress_tests {
         let mut context = Some(task);
         apply_tool_execution_outcome(
             ToolExecutionApplyContext {
+                policy_guard: &mut policy::ToolPolicyGuard::default(),
+                admitted_execution_name: Some(execution_name),
                 tool_call: &call,
                 event_tx: &event_tx,
                 metrics_collector: None,
@@ -1545,6 +1603,8 @@ mod task_progress_tests {
             let mut task = Some(active_task(&[false, false]));
             apply_tool_execution_outcome(
                 ToolExecutionApplyContext {
+                    policy_guard: &mut policy::ToolPolicyGuard::default(),
+                    admitted_execution_name: Some(execution_name),
                     tool_call: &call,
                     event_tx: &event_tx,
                     metrics_collector: None,
@@ -3130,8 +3190,14 @@ mod hook_tests {
             session,
             config.permission_mode.unwrap_or_default(),
         );
+        let admitted_execution_name = outcome
+            .portable_tool
+            .as_ref()
+            .map(|tool| tool.execution_name().to_owned());
         apply_tool_execution_outcome(
             ToolExecutionApplyContext {
+                policy_guard: &mut policy::ToolPolicyGuard::default(),
+                admitted_execution_name: admitted_execution_name.as_deref(),
                 tool_call,
                 event_tx,
                 metrics_collector: None,
