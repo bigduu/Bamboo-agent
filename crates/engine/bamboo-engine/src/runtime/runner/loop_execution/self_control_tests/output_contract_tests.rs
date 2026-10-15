@@ -386,22 +386,60 @@ async fn run_large_status_case(with_feedback: bool) {
     if with_feedback {
         assert_eq!(feedback.calls.load(Ordering::SeqCst), 1);
         assert!(
-            status.get("hook_feedback").is_some(),
-            "feedback must stay structured JSON"
+            status.get("hook_feedback").is_none(),
+            "paired status stays immutable"
         );
         let before = feedback.checkpointed_before_hook.lock().unwrap();
-        let before = before.as_ref().unwrap();
-        assert_ne!(*before, completed_result(&events, STATUS_CALL).result);
-        let before: Value = serde_json::from_str(before).unwrap();
         assert_eq!(
-            before["loop"], status["loop"],
-            "feedback may not rewrite status fields"
+            before.as_ref().unwrap(),
+            &completed_result(&events, STATUS_CALL).result
         );
+        let contexts = &durable.agent_runtime_state.as_ref().unwrap().hook_contexts;
+        let matching = contexts
+            .iter()
+            .filter(|context| {
+                serde_json::from_str::<Value>(context)
+                    .ok()
+                    .is_some_and(|body| body["tool_call_id"] == STATUS_CALL)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        let context = matching[0];
+        let body: Value = serde_json::from_str(context).unwrap();
+        assert!(!body["hook_feedback"].as_str().unwrap().is_empty());
+        assert!(body["hook_feedback_omitted_bytes"].as_u64().unwrap() > 0);
+        let counter = TiktokenTokenCounter::default();
         assert!(
-            status_checkpoints
+            counter.count_text(&completed_result(&events, STATUS_CALL).result)
+                + counter.count_text(context)
+                + counter.count_text("\n\n---\n\n")
+                <= STATUS_CAP
+        );
+        for observation in seen.iter().skip(3) {
+            assert!(observation
+                .messages
                 .iter()
-                .any(|pair| pair.content == completed_result(&events, STATUS_CALL).result),
-            "feedback must be checkpointed on the same pair before publication"
+                .any(|message| message.content.contains(context)));
+            assert_eq!(
+                &observation
+                    .durable
+                    .agent_runtime_state
+                    .as_ref()
+                    .unwrap()
+                    .hook_contexts,
+                contexts
+            );
+        }
+        assert!(
+            snapshots.iter().any(|session| {
+                session
+                    .agent_runtime_state
+                    .as_ref()
+                    .is_some_and(|state| state.hook_contexts.contains(context))
+                    && result_pair(&session.messages, STATUS_CALL).content
+                        == completed_result(&events, STATUS_CALL).result
+            }),
+            "native feedback must be checkpointed in the existing runtime context plane"
         );
     } else {
         assert_eq!(feedback.calls.load(Ordering::SeqCst), 0);
@@ -415,7 +453,7 @@ async fn owner_status_output_is_bounded_before_checkpoint_and_matches_provider_p
 }
 
 #[tokio::test]
-async fn owner_status_feedback_remains_bounded_json_and_is_checkpointed_on_same_pair() {
+async fn owner_status_feedback_uses_bounded_checkpointed_hook_context_without_rewriting_pair() {
     run_large_status_case(true).await;
 }
 

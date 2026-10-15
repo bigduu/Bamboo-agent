@@ -990,13 +990,6 @@ pub(super) async fn apply_tool_execution_outcome(
         .await?);
         loop_result_checkpointed = true;
     }
-    let loop_result_before_hooks = loop_result_checkpointed.then(|| {
-        outcome
-            .result
-            .as_ref()
-            .expect("checkpointed owner result")
-            .clone()
-    });
     let mut post_tool_feedback = Vec::new();
     let mut deferred_hook_control = None;
     if outcome.post_tool_hook_eligible
@@ -1075,10 +1068,11 @@ pub(super) async fn apply_tool_execution_outcome(
     // Read the shell envelope before post-hook feedback appends prose. Only
     // the admitted exact identity selects command-specific task accounting.
     let task_progress_result = task_progress_result_for_outcome(&outcome);
-    if let Some(before_hooks) = &loop_result_before_hooks {
-        let result = outcome.result.as_mut().expect("checkpointed owner result");
-        crate::runtime::loop_control::output_limits::append_feedback(
+    if loop_result_checkpointed {
+        let result = outcome.result.as_ref().expect("checkpointed owner result");
+        let feedback = crate::runtime::loop_control::output_limits::feedback_context(
             result,
+            &ctx.tool_call.id,
             post_tool_feedback,
             feedback_cap,
         );
@@ -1086,8 +1080,9 @@ pub(super) async fn apply_tool_execution_outcome(
             ctx.session,
             ctx.config,
             &ctx.tool_call.id,
-            before_hooks,
             result,
+            ctx.runtime_state,
+            feedback,
         )
         .await?;
     } else {

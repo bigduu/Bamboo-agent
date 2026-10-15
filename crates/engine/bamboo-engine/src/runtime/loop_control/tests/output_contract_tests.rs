@@ -1,6 +1,36 @@
-//! Owner receipt preflight and canonical-versus-output feedback contracts.
+//! Owner receipt and bounded existing hook-context projection contracts.
 
 use super::*;
+
+const FEEDBACK_CONTEXT_SEPARATOR: &str = "\n\n---\n\n";
+
+fn service_feedback_body(context: &str) -> serde_json::Value {
+    let body: serde_json::Value =
+        serde_json::from_str(context).expect("one complete associated JSON context");
+    assert!(body.is_object());
+    assert!(body["tool_call_id"].is_string());
+    assert!(body["hook_feedback"].is_string());
+    assert!(body.as_object().unwrap().keys().all(|key| matches!(
+        key.as_str(),
+        "tool_call_id" | "hook_feedback" | "hook_feedback_omitted_bytes"
+    )));
+    body
+}
+
+fn assert_service_feedback_budget(base: &ToolResult, context: &str, cap: u32) {
+    use bamboo_compression::TokenCounter;
+    let counter = bamboo_compression::TiktokenTokenCounter::default();
+    if cap != 0 {
+        assert!(
+            counter
+                .count_text(&base.result)
+                .saturating_add(counter.count_text(context))
+                .saturating_add(counter.count_text(FEEDBACK_CONTEXT_SEPARATOR))
+                <= cap,
+            "base ToolResult + JSON context + full standard separator exceed cap {cap}"
+        );
+    }
+}
 
 fn assert_service_cap_rejection(result: &ToolResult, cap: u32) {
     assert!(!result.success, "cap {cap}: {}", result.result);
@@ -88,8 +118,6 @@ async fn self_control_active_update_and_stop_preflight_caps_before_any_command_e
             assert_eq!(receipt.operation_id, operation);
             assert_eq!(receipt.accepted_revision, 2);
             assert_eq!(receipt.applied, stop);
-            assert!(receipt.hook_feedback.is_none());
-            assert!(receipt.hook_feedback_omitted_bytes.is_none());
             let committed = h.state();
             assert_eq!(
                 (
@@ -145,88 +173,82 @@ async fn self_control_active_update_and_stop_preflight_caps_before_any_command_e
     }
 }
 
-#[tokio::test]
-async fn self_control_output_feedback_is_forbidden_in_persisted_canonical_receipts() {
-    let mut h = Harness::new().await;
-    assert!(h.command(&start("A", 3, 20), 0).await.success);
-    let clean = h.state();
-    let canonical = clean.control.as_ref().unwrap().operations[0]
-        .receipt
-        .clone();
-    let canonical_bytes = serde_json::to_string(&canonical).unwrap();
-    assert!(!canonical_bytes.contains("hook_feedback"));
-    let legacy: LoopControlReceipt = serde_json::from_str(&canonical_bytes).unwrap();
-    assert_eq!(legacy, canonical);
-    assert!(legacy.hook_feedback.is_none());
-    assert!(legacy.hook_feedback_omitted_bytes.is_none());
-    let original_metadata = h.session.metadata.clone();
+#[test]
+fn self_control_feedback_context_counts_full_json_and_separator_with_utf8() {
+    use bamboo_compression::TokenCounter;
+    let counter = bamboo_compression::TiktokenTokenCounter::default();
+    let base = ToolResult::text(true, r#"{"accepted":true}"#);
+    let base_bytes = base.result.clone();
+    let call_id = "call-\"quoted\"-界\\line\nnext";
+    let feedback = "native \"feedback\"\\path\n界😀".repeat(2_000);
 
-    // A clean terminal baseline permits recovery inspection, so the failures
-    // below cannot pass merely because every persisted live loop is refused.
-    let mut retired = clean.clone();
-    retired.status = LoopStatus::Failed;
-    let mut retired_session = h.session.clone();
-    retired_session.metadata.insert(
-        counted_loop::LOOP_STATE_METADATA_KEY.into(),
-        serde_json::to_string(&retired).unwrap(),
+    let full = output_limits::feedback_context(&base, call_id, vec![feedback.clone()], 0)
+        .expect("cap zero retains existing unlimited semantics");
+    let full_body = service_feedback_body(&full);
+    assert_eq!(full_body["tool_call_id"], call_id);
+    assert_eq!(full_body["hook_feedback"], feedback);
+    assert_eq!(
+        full_body
+            .get("hook_feedback_omitted_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        0
     );
-    assert!(counted_loop::reject_recovery(&retired_session).is_ok());
-    h.storage.save_session(&retired_session).await.unwrap();
-    let proof = h.registration.ownership();
-    let mut clean_candidate = retired_session.clone();
-    counted_loop::admit_registered(
-        &mut clean_candidate,
-        Some(&proof),
-        Some(&h.router),
-        h.config.persistence.as_deref().unwrap(),
-    )
-    .await
-    .unwrap();
+    assert_eq!(base.result, base_bytes);
+    assert!(base.success);
 
-    for omitted_bytes in [false, true] {
-        let mut bad = retired.clone();
-        let receipt = &mut bad.control.as_mut().unwrap().operations[0].receipt;
-        if omitted_bytes {
-            receipt.hook_feedback_omitted_bytes = Some(0);
-        } else {
-            receipt.hook_feedback = Some(String::new());
-        }
-        assert!(counted_loop::encode_next_state(&bad).is_err());
-        let mut stage_attempt = h.session.clone();
-        assert!(counted_loop::stage_state(&mut stage_attempt, bad.clone()).is_err());
-        assert_eq!(stage_attempt.metadata, original_metadata);
-        assert_eq!(h.session.metadata, original_metadata);
-
-        let mut corrupt = retired_session.clone();
-        corrupt.metadata.insert(
-            counted_loop::LOOP_STATE_METADATA_KEY.into(),
-            serde_json::to_string(&bad).unwrap(),
+    let base_tokens = counter.count_text(&base.result);
+    for cap in [1, base_tokens, base_tokens.saturating_add(1)] {
+        assert!(
+            output_limits::feedback_context(&base, call_id, vec![feedback.clone()], cap).is_none(),
+            "base and minimum complete association envelope cannot fit cap {cap}"
         );
-        assert!(counted_loop::read_loop_state(&corrupt).is_err());
-        assert!(counted_loop::reject_recovery(&corrupt).is_err());
-        h.storage.save_session(&corrupt).await.unwrap();
-        let durable = h.storage.load_session(&corrupt.id).await.unwrap().unwrap();
-        assert!(counted_loop::read_loop_state(&durable).is_err());
-        let mut candidate = durable.clone();
-        let before = serde_json::to_value(&candidate).unwrap();
-        assert!(counted_loop::admit_registered(
-            &mut candidate,
-            Some(&proof),
-            Some(&h.router),
-            h.config.persistence.as_deref().unwrap()
-        )
-        .await
-        .is_err());
-        assert_eq!(serde_json::to_value(&candidate).unwrap(), before);
-        assert_eq!(serde_json::to_string(&canonical).unwrap(), canonical_bytes);
-        assert!(!serde_json::to_string(&clean)
-            .unwrap()
-            .contains("hook_feedback"));
+    }
+    let mut delivered_truncated_context = false;
+    for cap in [64, 128, 256, 512] {
+        let Some(context) =
+            output_limits::feedback_context(&base, call_id, vec![feedback.clone()], cap)
+        else {
+            continue;
+        };
+        assert_service_feedback_budget(&base, &context, cap);
+        let body = service_feedback_body(&context);
+        assert_eq!(body["tool_call_id"], call_id);
+        let kept = body["hook_feedback"].as_str().unwrap();
+        assert!(
+            feedback.starts_with(kept),
+            "retain a valid UTF-8 prefix, never split a codepoint"
+        );
+        let omitted = body
+            .get("hook_feedback_omitted_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        assert_eq!(kept.len() + omitted, feedback.len());
+        delivered_truncated_context |= omitted > 0;
+        assert_eq!(
+            base.result, base_bytes,
+            "context is separate from the immutable paired receipt"
+        );
+        assert!(base.success);
+    }
+    assert!(
+        delivered_truncated_context,
+        "exercise an actually delivered bounded prefix, not only None"
+    );
+
+    // Metadata and JSON escaping must fit too; raw feedback token length alone
+    // is insufficient. An oversized call identity cannot be truncated or forged.
+    assert!(
+        output_limits::feedback_context(&base, &"界\\\"".repeat(1_000), vec!["x".into()], 64)
+            .is_none()
+    );
+    for empty in [Vec::<String>::new(), vec![" \n\t ".into()]] {
+        assert!(output_limits::feedback_context(&base, call_id, empty, 0).is_none());
     }
 }
 
 #[tokio::test]
-async fn self_control_feedback_projection_parses_public_dto_without_polluting_canonical_receipt() {
+async fn self_control_feedback_context_leaves_canonical_receipt_bytes_and_ledger_unchanged() {
     let mut h = Harness::new().await;
     let command = start("A", 3, 20);
     let accepted = h.command(&command, 0).await;
@@ -236,32 +258,41 @@ async fn self_control_feedback_projection_parses_public_dto_without_polluting_ca
         .receipt
         .clone();
     let canonical_bytes = serde_json::to_string(&canonical).unwrap();
-    let mut projected = accepted.clone();
-    output_limits::append_feedback(
-        &mut projected,
-        vec!["quoted \"feedback\"\n界".repeat(1_000)],
-        256,
-    );
-    assert!(projected.success);
-    assert!(output_limits::fits(&projected, 256));
-    let mut public: LoopControlReceipt = serde_json::from_str(&projected.result).unwrap();
-    assert!(public.hook_feedback.is_some());
-    assert!(public
-        .hook_feedback_omitted_bytes
-        .is_some_and(|bytes| bytes > 0));
-    public.hook_feedback = None;
-    public.hook_feedback_omitted_bytes = None;
-    assert_eq!(public, canonical);
-    assert_eq!(serde_json::to_string(&public).unwrap(), canonical_bytes);
-    assert_eq!(
-        h.state(),
-        before,
-        "rendering output cannot mutate the operation ledger"
-    );
-    assert_service_cap_durable(&h, &before).await;
+    assert_eq!(accepted.result, canonical_bytes);
+    assert!(!canonical_bytes.contains("hook_feedback"));
+    let feedback = "quoted \"feedback\"\n界😀".repeat(1_000);
+    for cap in [128, 256, 512, 0] {
+        let rendered = output_limits::feedback_context(
+            &accepted,
+            "actual-associated-call",
+            vec![feedback.clone()],
+            cap,
+        );
+        if let Some(context) = rendered {
+            assert_service_feedback_budget(&accepted, &context, cap);
+            let body = service_feedback_body(&context);
+            assert_eq!(body["tool_call_id"], "actual-associated-call");
+            let kept = body["hook_feedback"].as_str().unwrap();
+            assert!(feedback.starts_with(kept));
+            if cap == 0 {
+                assert_eq!(kept, feedback);
+            }
+        } else {
+            assert_ne!(cap, 0, "unlimited nonempty feedback must be retained");
+        }
+        let strict: LoopControlReceipt = serde_json::from_str(&accepted.result).unwrap();
+        assert_eq!(strict, canonical);
+        assert_eq!(serde_json::to_string(&strict).unwrap(), canonical_bytes);
+        assert_eq!(
+            h.state(),
+            before,
+            "pure rendering cannot mutate state or the immutable operation ledger"
+        );
+        assert_service_cap_durable(&h, &before).await;
+    }
     let replay = h.command_with_cap(&command, 0, 0).await;
     assert!(replay.success);
-    assert_eq!(replay.result, accepted.result);
+    assert_eq!(replay.result, canonical_bytes);
     assert_eq!(h.state(), before);
     assert_service_cap_durable(&h, &before).await;
 }

@@ -161,11 +161,6 @@ pub struct LoopControlReceipt {
     pub objective_revision: u64,
     pub effective_iteration: Option<u32>,
     pub applied: bool,
-    /// Per-call output metadata; never part of the canonical operation ledger.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hook_feedback: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hook_feedback_omitted_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,9 +218,7 @@ impl ManagedLoopState {
         let mut seen = std::collections::BTreeSet::new();
         for operation in &self.operations {
             let receipt = &operation.receipt;
-            if receipt.hook_feedback.is_some()
-                || receipt.hook_feedback_omitted_bytes.is_some()
-                || uuid::Uuid::parse_str(&receipt.operation_id).is_err()
+            if uuid::Uuid::parse_str(&receipt.operation_id).is_err()
                 || !seen.insert(&receipt.operation_id)
                 || receipt.generation != state.generation
                 || receipt.accepted_revision == 0
@@ -643,8 +636,6 @@ fn accept_command(
             objective_revision: pending.map_or(state.objective_revision, |p| p.objective_revision),
             effective_iteration: (!applied).then_some(state.iterations_started.saturating_add(1)),
             applied,
-            hook_feedback: None,
-            hook_feedback_omitted_bytes: None,
         },
     });
     // A valid text-byte bound can expand under JSON escaping. Check the exact
@@ -721,14 +712,16 @@ async fn checkpoint_result(
     Ok(result)
 }
 
-/// Finalize the exact first-checkpoint pair after hooks, without appending a
-/// second ToolResult or changing the accepted operation's immutable receipt.
+/// Keep the first-checkpoint pair immutable. Native post-tool feedback uses
+/// the existing volatile hook-context plane; the append-safe checkpoint cannot
+/// rewrite a durable ToolResult and no history-rewrite authority is granted.
 pub(crate) async fn finish_checkpointed_result(
     session: &mut Session,
     config: &AgentLoopConfig,
     tool_call_id: &str,
-    before_hooks: &ToolResult,
     result: &ToolResult,
+    runtime_state: &mut bamboo_domain::AgentRuntimeState,
+    feedback_context: Option<String>,
 ) -> Result<(), AgentError> {
     let policy = config
         .loop_control
@@ -739,28 +732,53 @@ pub(crate) async fn finish_checkpointed_result(
         return Err(AgentError::Cancelled);
     }
     authority?;
-    let mut pairs = session.messages.iter().enumerate().filter(|(_, message)| {
-        message.role == bamboo_domain::Role::Tool
-            && message.tool_call_id.as_deref() == Some(tool_call_id)
-    });
-    let (index, pair) = pairs
-        .next()
-        .ok_or_else(|| fatal("checkpointed tool result absent"))?;
-    if pairs.next().is_some()
-        || pair.content != before_hooks.result
-        || pair.tool_success != Some(before_hooks.success)
-    {
-        return Err(fatal("checkpointed tool result identity changed"));
-    }
-    if pair.content != result.result || pair.tool_success != Some(result.success) {
+    validate_checkpointed_pair(session, tool_call_id, result)?;
+    if let Some(context) = feedback_context {
+        let expected_index = runtime_state.hook_contexts.len();
+        let mut next_runtime = runtime_state.clone();
+        next_runtime.hook_contexts.push(context.clone());
         let mut staged = session.clone();
-        staged.messages[index].content = result.result.clone();
-        staged.messages[index].tool_success = Some(result.success);
-        persist_staged(session, config, policy, staged).await?;
+        crate::runtime::runner::state_bridge::write_runtime_state(&mut staged, &next_runtime);
+        let checkpoint = persist_staged(session, config, policy, staged).await;
+        // Preserve the same conservative context in the loop's local state as
+        // in its staged Session even if the checkpoint outcome was uncertain.
+        if let Some(saved_runtime) =
+            crate::runtime::runner::state_bridge::read_runtime_state(session)
+        {
+            *runtime_state = saved_runtime;
+        }
+        checkpoint?;
+        if runtime_state.hook_contexts.len() != expected_index + 1
+            || runtime_state.hook_contexts.get(expected_index) != Some(&context)
+        {
+            return Err(fatal("hook feedback checkpoint did not retain context"));
+        }
+        validate_checkpointed_pair(session, tool_call_id, result)?;
     }
     // Includes the no-feedback path: cancellation during AfterToolUse wins.
     if policy.execution_cancel()?.is_cancelled() {
         return Err(AgentError::Cancelled);
+    }
+    Ok(())
+}
+
+fn validate_checkpointed_pair(
+    session: &Session,
+    tool_call_id: &str,
+    result: &ToolResult,
+) -> Result<(), AgentError> {
+    let mut pairs = session.messages.iter().filter(|message| {
+        message.role == bamboo_domain::Role::Tool
+            && message.tool_call_id.as_deref() == Some(tool_call_id)
+    });
+    let pair = pairs
+        .next()
+        .ok_or_else(|| fatal("checkpointed tool result absent"))?;
+    if pairs.next().is_some()
+        || pair.content != result.result
+        || pair.tool_success != Some(result.success)
+    {
+        return Err(fatal("checkpointed tool result identity changed"));
     }
     Ok(())
 }

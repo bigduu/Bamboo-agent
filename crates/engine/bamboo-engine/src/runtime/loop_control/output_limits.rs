@@ -49,10 +49,15 @@ pub(crate) fn bound_result(mut result: ToolResult, cap: u32) -> ToolResult {
     }
 }
 
-/// Keep original protocol fields and success unchanged. This renderer never
-/// checkpoints: caller replaces the existing paired result and checkpoints it
-/// again BEFORE ToolComplete when the returned text has changed.
-pub(crate) fn append_feedback(result: &mut ToolResult, feedback: Vec<String>, cap: u32) {
+/// Project optional native feedback into the existing per-run hook context.
+/// The immutable result plus this complete correlated block and its framework
+/// separator share the exact output cap captured at dispatch.
+pub(crate) fn feedback_context(
+    result: &ToolResult,
+    tool_call_id: &str,
+    feedback: Vec<String>,
+    cap: u32,
+) -> Option<String> {
     let feedback = feedback
         .into_iter()
         .filter_map(|text| {
@@ -61,59 +66,40 @@ pub(crate) fn append_feedback(result: &mut ToolResult, feedback: Vec<String>, ca
         })
         .collect::<Vec<_>>();
     if feedback.is_empty() || !fits(result, cap) {
-        return;
-    }
-    let Ok(Value::Object(original)) = serde_json::from_str::<Value>(&result.result) else {
-        // Includes the truthful empty failure used when cap cannot fit JSON.
-        return;
-    };
-    if original.contains_key("hook_feedback")
-        || original.contains_key("hook_feedback_omitted_bytes")
-    {
-        return;
+        return None;
     }
     let feedback = feedback.join("\n");
-    let success = result.success;
-    let candidate = |prefix: &str| -> Option<String> {
-        let mut body = original.clone();
-        body.insert(
-            "hook_feedback".to_string(),
-            Value::String(prefix.to_string()),
-        );
-        if prefix.len() < feedback.len() {
-            body.insert(
-                "hook_feedback_omitted_bytes".to_string(),
-                json!(feedback.len() - prefix.len()),
-            );
-        }
-        let text = Value::Object(body).to_string();
-        let proposed = ToolResult::text(success, &text);
-        fits(&proposed, cap).then_some(text)
-    };
-    if let Some(text) = candidate(&feedback) {
-        result.result = text;
-        return;
-    }
-    let Some(mut best) = candidate("") else {
-        // Even omission metadata does not fit. Preserve the already-capped
-        // original rather than appending an over-budget marker or fake ACK.
-        return;
-    };
     let counter = TiktokenTokenCounter::default();
+    let base_tokens = counter.count_text(&result.result);
+    // build_agent_hook_context_block uses this exact inter-context separator.
+    let separator_tokens = counter.count_text("\n\n---\n\n");
+    let candidate = |prefix: &str| -> Option<String> {
+        let mut body = json!({"tool_call_id": tool_call_id, "hook_feedback": prefix});
+        if prefix.len() < feedback.len() {
+            body["hook_feedback_omitted_bytes"] = json!(feedback.len() - prefix.len());
+        }
+        let context = body.to_string();
+        let tokens = base_tokens
+            .saturating_add(separator_tokens)
+            .saturating_add(counter.count_text(&context));
+        (cap == 0 || tokens <= cap).then_some(context)
+    };
+    if let Some(context) = candidate(&feedback) {
+        return Some(context);
+    }
+    let mut best = candidate("")?;
     let (mut low, mut high) = (0, counter.count_text(&feedback).min(cap));
     while low < high {
         let middle = low + (high - low) / 2 + 1;
         let prefix = counter.truncate_to_token_prefix(&feedback, middle);
-        if let Some(text) = candidate(&prefix) {
-            best = text;
+        if let Some(context) = candidate(&prefix) {
+            best = context;
             low = middle;
         } else {
             high = middle - 1;
         }
     }
-    // BPE token counts need not be perfectly monotone with added prefix bytes;
-    // only candidates whose FINAL serialized JSON was counted can become best.
-    if fits(&ToolResult::text(result.success, &best), cap) {
-        result.result = best;
-    }
+    // Only a final serialized candidate whose complete token count was checked
+    // may be retained; no monotonic BPE-size assumption can admit excess text.
+    Some(best)
 }

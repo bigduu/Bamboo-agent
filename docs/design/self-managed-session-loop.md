@@ -62,7 +62,7 @@ cannot be promoted to another runner; only `status` is read-only.
 | `stop` | `operation_id`, `generation`, `expected_revision` | A sticky stop for this generation. No later provider round or iteration is admitted. |
 
 Identifiers are UUID strings. Objectives are nonblank and at most 16 KiB of
-UTF-8. The complete serialized checkpoint, including escaping, a possible
+UTF-8. The serialized LoopState management record, including escaping, a possible
 pending objective and receipts, must also fit the existing 128 KiB read bound.
 An oversized edit is rejected while the prior state remains readable.
 
@@ -133,18 +133,19 @@ existing unlimited policy. A budget-delivery failure does not claim that an
 already accepted duplicate operation was unapplied; very small positive caps
 can require an empty failure result.
 
-AfterToolUse receives the first bounded, checkpointed owner result. Optional
-feedback is per-call output metadata (`hook_feedback` and
-`hook_feedback_omitted_bytes`), bounded inside the same JSON object. These
-optional fields remain parseable by the public receipt DTO, but are forbidden
-inside canonical stored receipts. Duplicate operations retain the original
-canonical receipt even when a new tool call produces different feedback. If
-feedback changes the delivered result, the owner checkpoints the same unique
-ToolResult pair again before publication. A failed feedback checkpoint keeps the
-accepted operation and conservative pair, stops execution, and publishes no
-ToolComplete for that call. Cancellation wins during hooks, either checkpoint,
-and a blocked acknowledgement publisher. The existing policy circuit observes
-the final owner result exactly once, including stale or budget rejections.
+AfterToolUse receives the bounded, checkpointed owner result. Optional native
+feedback is correlated by tool-call ID and projected through the existing
+volatile lifecycle-hook context. The result and complete added context,
+including its inter-context separator, share the captured tool-output cap.
+Canonical receipts and the unique paired result remain byte-for-byte unchanged;
+ordinary append-safe checkpoints never rewrite existing transcript messages.
+Before ToolComplete, a second checkpoint saves any added hook context through
+the existing runtime state and verifies that the original pair is intact. A
+failed feedback checkpoint keeps the accepted operation and conservative state,
+stops execution, and publishes no ToolComplete for that call. Cancellation wins
+during hooks, either checkpoint, and a blocked acknowledgement publisher. The
+existing policy circuit observes the final owner result exactly once, including
+stale or budget rejections.
 
 | Boundary | Behavior |
 | --- | --- |

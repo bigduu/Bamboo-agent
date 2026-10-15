@@ -1,4 +1,5 @@
-//! Post-hook output/checkpoint/cancellation contracts for the same live owner.
+//! V2 TMP-only proposal: strict canonical receipt bytes stay immutable; native
+//! feedback uses existing AgentRuntimeState.hook_contexts and ordinary checkpoint.
 //! Real BuiltinToolExecutor, Router proof and LockedSessionStore come from Fixture.
 
 use super::*;
@@ -32,18 +33,64 @@ fn post_result<'a>(events: &'a [AgentEvent], id: &str) -> &'a ToolResult {
 
 fn post_receipt(text: &str) -> LoopControlReceipt {
     assert!(TiktokenTokenCounter::default().count_text(text) <= POST_CAP);
-    serde_json::from_str(text).expect("feedback result must remain a public receipt DTO")
-}
-
-fn receipt_core(mut receipt: LoopControlReceipt) -> LoopControlReceipt {
-    receipt.hook_feedback = None;
-    receipt.hook_feedback_omitted_bytes = None;
-    receipt
+    let body: Value = serde_json::from_str(text).expect("strict canonical receipt JSON");
+    assert!(body.get("hook_feedback").is_none());
+    assert!(body.get("hook_feedback_omitted_bytes").is_none());
+    serde_json::from_str(text).expect("the original public receipt DTO stays unchanged")
 }
 
 fn assert_canonical_receipt(receipt: &LoopControlReceipt) {
-    assert!(receipt.hook_feedback.is_none());
-    assert!(receipt.hook_feedback_omitted_bytes.is_none());
+    let encoded = serde_json::to_string(receipt).unwrap();
+    let decoded = post_receipt(&encoded);
+    assert_eq!(&decoded, receipt);
+    assert!(uuid::Uuid::parse_str(&receipt.operation_id).is_ok());
+    assert!(uuid::Uuid::parse_str(&receipt.generation).is_ok());
+}
+
+fn post_contexts(session: &Session) -> &[String] {
+    session
+        .agent_runtime_state
+        .as_ref()
+        .map(|runtime| runtime.hook_contexts.as_slice())
+        .unwrap_or_default()
+}
+
+fn find_post_context<'a>(session: &'a Session, id: &str) -> Option<&'a str> {
+    let mut matches = post_contexts(session).iter().filter_map(|text| {
+        let body: Value = serde_json::from_str(text).ok()?;
+        (body["tool_call_id"].as_str() == Some(id)).then_some(text.as_str())
+    });
+    let context = matches.next();
+    assert!(
+        matches.next().is_none(),
+        "duplicate feedback context for {id}"
+    );
+    context
+}
+
+fn post_feedback_text(id: &str) -> String {
+    format!("{id}: native feedback with \"quotes\" and newline\n界").repeat(4_000)
+}
+
+fn assert_feedback_context(base: &str, context: &str, id: &str) {
+    let body: Value = serde_json::from_str(context).expect("feedback context must be JSON");
+    assert_eq!(body.as_object().unwrap().len(), 3);
+    assert_eq!(body["tool_call_id"], id);
+    let retained = body["hook_feedback"].as_str().unwrap();
+    let omitted = body["hook_feedback_omitted_bytes"].as_u64().unwrap() as usize;
+    let original = post_feedback_text(id);
+    assert!(omitted > 0, "large native feedback must be bounded");
+    assert!(original.starts_with(retained));
+    assert_eq!(retained.len() + omitted, original.len());
+    let counter = TiktokenTokenCounter::default();
+    let total = counter
+        .count_text(base)
+        .saturating_add(counter.count_text(context))
+        .saturating_add(counter.count_text("\n\n---\n\n"));
+    assert!(
+        total <= POST_CAP,
+        "receipt+complete context+separator used {total} tokens"
+    );
 }
 
 #[derive(Clone)]
@@ -82,19 +129,15 @@ impl RuntimeSessionPersistence for PostHookPersistence {
                     .as_ref()
                     .is_some_and(|control| control.operations.len() == 1)
         });
-        let has_feedback = session
-            .messages
-            .iter()
-            .find(|message| {
-                message.role == Role::Tool && message.tool_call_id.as_deref() == Some("start")
-            })
-            .and_then(|pair| serde_json::from_str::<Value>(&pair.content).ok())
-            .is_some_and(|body| {
-                body.get("hook_feedback").is_some()
-                    || body.get("hook_feedback_omitted_bytes").is_some()
-            });
+        let has_feedback = find_post_context(session, "start").is_some();
         if let Some(fault) = self.fault.as_ref() {
             if running && has_feedback && !self.failed.swap(true, Ordering::SeqCst) {
+                let pair = post_pair(&session.messages, "start");
+                assert_feedback_context(
+                    &pair.content,
+                    find_post_context(session, "start").unwrap(),
+                    "start",
+                );
                 *self.feedback_attempt.lock().unwrap() = Some(session.clone());
                 if fault.commit_before_error {
                     self.inner.checkpoint_runtime_session(session).await?;
@@ -104,7 +147,7 @@ impl RuntimeSessionPersistence for PostHookPersistence {
                     cancel.cancel();
                 }
                 return Err(std::io::Error::other(
-                    "synthetic owner feedback checkpoint failure",
+                    "synthetic owner feedback context checkpoint failure",
                 ));
             }
         }
@@ -160,6 +203,11 @@ impl bamboo_agent_core::AgentHook for PostMutationHook {
         assert_canonical_receipt(canonical);
         assert_eq!(&received, canonical);
         let pair = post_pair(&session.messages, tool_call_id);
+        assert_eq!(pair.content, serde_json::to_string(canonical).unwrap());
+        assert!(
+            find_post_context(session, tool_call_id).is_none(),
+            "this call's feedback cannot precede its own native hook"
+        );
         let committed = self.persistence.committed.lock().unwrap();
         assert_eq!(
             post_pair(&committed.last().unwrap().messages, tool_call_id).content,
@@ -176,8 +224,7 @@ impl bamboo_agent_core::AgentHook for PostMutationHook {
         }
         if self.feedback {
             bamboo_domain::HookResult::InjectContext {
-                text: format!("{tool_call_id}: native feedback with \"quotes\" and newline\n界")
-                    .repeat(4_000),
+                text: post_feedback_text(tool_call_id),
             }
         } else {
             bamboo_domain::HookResult::Continue
@@ -285,7 +332,7 @@ impl LLMProvider for ReceiptRetryProvider {
 }
 
 #[tokio::test]
-async fn mutation_feedback_is_typed_bounded_and_retry_preserves_canonical_receipt() {
+async fn mutation_feedback_context_and_retry_preserve_exact_canonical_receipt_bytes() {
     let (mut fixture, persistence, hook) = post_fixture(true, None, None).await;
     let provider = Arc::new(ReceiptRetryProvider {
         storage: fixture.storage.clone(),
@@ -324,39 +371,78 @@ async fn mutation_feedback_is_typed_bounded_and_retry_preserves_canonical_receip
     );
     let control = state.control.as_ref().unwrap();
     assert_eq!(control.control_revision, 1);
+    assert_eq!(control.applied_revision, 1);
     assert_eq!(control.operations.len(), 1);
     let canonical = &control.operations[0].receipt;
     assert_canonical_receipt(canonical);
     assert_eq!(canonical.operation_id, START_OPERATION);
+    assert_eq!(canonical.generation, state.generation);
+    assert_eq!(canonical.accepted_revision, 1);
+    assert_eq!(canonical.applied_revision_at_acceptance, 0);
+    assert_eq!(canonical.objective_revision, 1);
     assert!(!canonical.applied);
     assert_eq!(canonical.effective_iteration, Some(1));
+    let canonical_bytes = serde_json::to_string(canonical).unwrap();
+    assert_eq!(post_contexts(&fixture.session), post_contexts(&durable));
+    assert_eq!(post_contexts(&durable).len(), 2);
 
     for id in ["start", RETRY_CALL] {
         let result = post_result(&events, id);
         assert!(result.success);
-        let receipt = post_receipt(&result.result);
-        assert!(receipt.hook_feedback.is_some());
-        assert!(receipt
-            .hook_feedback_omitted_bytes
-            .is_some_and(|bytes| bytes > 0));
-        assert_eq!(receipt_core(receipt), *canonical);
+        assert_eq!(post_receipt(&result.result), *canonical);
+        assert_eq!(
+            result.result, canonical_bytes,
+            "delivery feedback must never rewrite a receipt"
+        );
         for session in [&fixture.session, &durable] {
-            assert_eq!(post_pair(&session.messages, id).content, result.result);
+            let pair = post_pair(&session.messages, id);
+            assert_eq!(pair.tool_success, Some(true));
+            assert_eq!(pair.content, canonical_bytes);
+            let context = find_post_context(session, id).expect("one separate per-call context");
+            assert_feedback_context(&pair.content, context, id);
         }
     }
-    assert_ne!(
+    assert_eq!(
         post_result(&events, "start").result,
-        post_result(&events, RETRY_CALL).result,
-        "per-call feedback may change while the immutable receipt core does not"
+        post_result(&events, RETRY_CALL).result
+    );
+    assert_ne!(
+        find_post_context(&durable, "start"),
+        find_post_context(&durable, RETRY_CALL),
+        "different calls carry their own associated feedback, not different receipt bytes"
     );
     let seen = provider.seen.lock().unwrap().clone();
     for (index, id) in [(1, "start"), (2, RETRY_CALL)] {
         let pair = post_pair(&seen[index].messages, id);
-        assert_eq!(pair.content, post_result(&events, id).result);
+        assert_eq!(pair.content, canonical_bytes);
         assert_eq!(
             post_pair(&seen[index].durable.messages, id).content,
-            pair.content
+            canonical_bytes
         );
+    }
+    for (index, observation) in seen.iter().enumerate().skip(1) {
+        let expected_ids: &[&str] = if index == 1 {
+            &["start"]
+        } else {
+            &["start", RETRY_CALL]
+        };
+        assert_eq!(
+            post_contexts(&observation.durable).len(),
+            expected_ids.len()
+        );
+        for id in expected_ids {
+            let persisted = find_post_context(&observation.durable, id).unwrap();
+            assert_eq!(Some(persisted), find_post_context(&durable, id));
+            assert!(
+                observation
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains(persisted)),
+                "provider round {} must see the exact durable feedback context for {id}",
+                index + 1
+            );
+            assert_feedback_context(&canonical_bytes, persisted, id);
+        }
     }
     let before_retry = read_loop_state(&seen[1].durable).unwrap().unwrap();
     let after_retry = read_loop_state(&seen[2].durable).unwrap().unwrap();
@@ -365,50 +451,31 @@ async fn mutation_feedback_is_typed_bounded_and_retry_preserves_canonical_receip
         before_retry.iterations_started,
         after_retry.iterations_started
     );
-    assert_eq!(
-        after_retry.rounds_started,
-        before_retry.rounds_started + 1,
-        "only the normal provider-round admission is charged for the retry"
-    );
+    assert_eq!(after_retry.rounds_started, before_retry.rounds_started + 1,
+        "only normal provider-round admission is charged for the retry with stale expected_revision=0");
     {
         let witnessed = hook.witnessed.lock().unwrap();
         let committed = persistence.committed.lock().unwrap();
         assert_eq!(witnessed.len(), 2);
         for witness in witnessed.iter() {
             let final_pair = post_pair(&durable.messages, &witness.call_id);
-            assert_eq!(final_pair.id, witness.before_feedback.id);
+            assert_eq!(
+                serde_json::to_value(final_pair).unwrap(),
+                serde_json::to_value(&witness.before_feedback).unwrap(),
+                "the entire accepted ToolResult, including its UUID, must remain immutable"
+            );
             assert_eq!(&witness.canonical, canonical);
+            let final_context = find_post_context(&durable, &witness.call_id).unwrap();
             assert!(
-                committed
-                    .iter()
-                    .any(|session| session.messages.iter().any(|pair| {
-                        pair.role == Role::Tool
-                            && pair.tool_call_id.as_deref() == Some(witness.call_id.as_str())
-                            && pair.id == witness.before_feedback.id
-                            && pair.content == final_pair.content
-                    })),
-                "feedback rewrite must be committed on the original pair before ToolComplete"
+                committed.iter().any(|session| {
+                    find_post_context(session, &witness.call_id) == Some(final_context)
+                        && serde_json::to_value(post_pair(&session.messages, &witness.call_id))
+                            .unwrap()
+                            == serde_json::to_value(&witness.before_feedback).unwrap()
+                }),
+                "context must be committed before ACK while the original pair stays byte-identical"
             );
         }
-    }
-
-    // The public DTO accepts these delivery-only fields, but the retained
-    // operation history must reject either field, including omission-only data.
-    for (feedback, omitted) in [
-        (Some("delivery-only".to_string()), None),
-        (None, Some(1)),
-        (Some("delivery-only".to_string()), Some(1)),
-    ] {
-        let mut polluted = state.clone();
-        let receipt = &mut polluted.control.as_mut().unwrap().operations[0].receipt;
-        receipt.hook_feedback = feedback;
-        receipt.hook_feedback_omitted_bytes = omitted;
-        assert!(polluted
-            .control
-            .as_ref()
-            .unwrap()
-            .validate(&polluted)
-            .is_err());
     }
     fixture.close().await;
 }
@@ -477,7 +544,16 @@ async fn assert_post_hook_terminal(
         Some(true),
         "the operation was already accepted"
     );
-    assert_eq!(receipt_core(post_receipt(&final_pair.content)), *canonical);
+    assert_eq!(post_receipt(&final_pair.content), *canonical);
+    assert_eq!(
+        final_pair.content,
+        serde_json::to_string(canonical).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(first_pair).unwrap(),
+        serde_json::to_value(final_pair).unwrap(),
+        "feedback checkpoint failure/cancel must not rewrite the first accepted pair"
+    );
 
     // An outer conservative save must preserve one accepted operation/pair;
     // it must never turn the failed/cancelled delivery into another execution.
@@ -496,6 +572,7 @@ async fn assert_post_hook_terminal(
         durable.agent_runtime_state,
         fixture.session.agent_runtime_state
     );
+    assert_eq!(post_contexts(&durable), post_contexts(&fixture.session));
     assert_eq!(post_pair(&durable.messages, "start").id, first_pair.id);
     assert_eq!(
         post_pair(&durable.messages, "start").content,
@@ -528,7 +605,7 @@ async fn owner_after_tool_user_cancel_prevents_ack_even_without_feedback() {
 }
 
 #[tokio::test]
-async fn feedback_second_checkpoint_error_keeps_one_pair_and_accepted_operation() {
+async fn feedback_context_checkpoint_error_keeps_one_pair_and_accepted_operation() {
     for commit_before_error in [false, true] {
         let (mut fixture, persistence, hook) = post_fixture(
             true,
@@ -548,7 +625,7 @@ async fn feedback_second_checkpoint_error_keeps_one_pair_and_accepted_operation(
             .await;
         assert!(
             persistence.failed.load(Ordering::SeqCst),
-            "second feedback checkpoint was not exercised"
+            "second runtime-context checkpoint was not exercised"
         );
         assert!(
             matches!(result, Err(AgentError::Budget(ref reason))
@@ -560,8 +637,16 @@ async fn feedback_second_checkpoint_error_keeps_one_pair_and_accepted_operation(
         assert_eq!(hook.witnessed.lock().unwrap().len(), 1);
         {
             let attempted = persistence.feedback_attempt.lock().unwrap();
-            let pair = post_pair(&attempted.as_ref().unwrap().messages, "start");
-            assert!(post_receipt(&pair.content).hook_feedback.is_some());
+            let attempted = attempted.as_ref().unwrap();
+            let pair = post_pair(&attempted.messages, "start");
+            let context = find_post_context(attempted, "start").unwrap();
+            assert_feedback_context(&pair.content, context, "start");
+            let state = read_loop_state(attempted).unwrap().unwrap();
+            assert_eq!(
+                pair.content,
+                serde_json::to_string(&state.control.as_ref().unwrap().operations[0].receipt)
+                    .unwrap()
+            );
         }
         assert_post_hook_terminal(&mut fixture, &persistence, &events, LoopStatus::Failed).await;
         fixture.close().await;
@@ -569,7 +654,7 @@ async fn feedback_second_checkpoint_error_keeps_one_pair_and_accepted_operation(
 }
 
 #[tokio::test]
-async fn user_cancel_dominates_feedback_checkpoint_error_before_and_after_commit() {
+async fn user_cancel_dominates_feedback_context_checkpoint_error_before_and_after_commit() {
     for commit_before_error in [false, true] {
         let cancel = CancellationToken::new();
         let (mut fixture, persistence, hook) = post_fixture(

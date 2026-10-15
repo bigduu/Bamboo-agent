@@ -153,8 +153,8 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
     );
 
     if ctx.loop_result_checkpointed {
-        // The live owner already checkpointed this exact final pair, including
-        // bounded hook feedback, before ToolComplete. Never mutate it here.
+        // The owner checkpointed this immutable pair, then any bounded native
+        // feedback in the existing hook-context plane. Never rewrite the pair.
         return false;
     }
 

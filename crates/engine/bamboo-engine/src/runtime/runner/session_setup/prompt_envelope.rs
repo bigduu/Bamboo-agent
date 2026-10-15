@@ -414,7 +414,7 @@ pub(crate) fn build_goal_context_block(goal: Option<&str>) -> Option<ContextBloc
     ))
 }
 
-/// Build context injected by `SessionStart` hooks as a volatile block. The
+/// Build context injected by lifecycle hooks as a volatile block. The
 /// source strings live in the current run's structured runtime state, so they
 /// never mutate or invalidate the cached base system prompt.
 pub(crate) fn build_agent_hook_context_block(session: &Session) -> Option<ContextBlock> {
