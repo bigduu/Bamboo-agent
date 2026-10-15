@@ -134,6 +134,34 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         .streaming(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
+// Nonblocking probes close each independent descriptor immediately. They
+// never create lock files, retain authority, or change a production lease.
+fn blocked_file_locks(locks: &[(PathBuf, bool)]) -> std::io::Result<Vec<PathBuf>> {
+    let mut blocked = Vec::new();
+    for (path, shared) in locks {
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let result = if *shared {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        };
+        match result {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => blocked.push(path.clone()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+    Ok(blocked)
+}
+
 struct Host {
     child: Child,
     base: String,
@@ -196,28 +224,49 @@ impl Host {
 
     async fn stop_clear_of_file_locks(
         &mut self,
-        _locks: &[(PathBuf, bool)],
-        _on_blocked: impl FnMut(&[PathBuf]),
+        locks: &[(PathBuf, bool)],
+        mut on_blocked: impl FnMut(&[PathBuf]),
     ) -> Result<usize, String> {
-        self.signal("-STOP");
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let mut rejected = 0;
+        let mut last_blocked = Vec::new();
+        // A lease cannot release an OS file lock held by a SIGSTOPed process.
+        // Pause only between the same physical boundaries B must cross. The
+        // original total 2s stop budget includes every resumed retry.
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let status = Command::new("ps")
-                    .args(["-o", "stat=", "-p", &self.child.id().to_string()])
-                    .output()
-                    .unwrap();
-                if String::from_utf8_lossy(&status.stdout)
-                    .trim()
-                    .starts_with('T')
-                {
-                    break;
+                self.signal("-STOP");
+                loop {
+                    let status = Command::new("ps")
+                        .args(["-o", "stat=", "-p", &self.child.id().to_string()])
+                        .output()
+                        .unwrap();
+                    if String::from_utf8_lossy(&status.stdout)
+                        .trim()
+                        .starts_with('T')
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
+                last_blocked = blocked_file_locks(locks).map_err(|error| error.to_string())?;
+                if last_blocked.is_empty() {
+                    return Ok(rejected);
+                }
+                rejected += 1;
+                on_blocked(&last_blocked);
+                self.signal("-CONT");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .map_err(|_| "fixture-owned Host did not stop within 2s".to_owned())?;
-        Ok(0)
+        .await;
+        if !matches!(result, Ok(Ok(_))) && self.stopped {
+            self.signal("-CONT");
+        }
+        result.map_err(|_| {
+            format!(
+                "fixture-owned Host cannot pause clear of file locks within 2s: {last_blocked:?}"
+            )
+        })?
     }
 
     fn tail(&self) -> String {
@@ -487,6 +536,46 @@ impl Fixture {
         .expect("real independent Host becomes healthy");
     }
 
+    fn pause_boundary_locks(&self) -> Vec<(PathBuf, bool)> {
+        let mut locks = vec![
+            (self.data.join(".session-lifecycle.lock"), true),
+            (self.data.join(".runtime-task-transactions.lock"), true),
+            (self.data.join(".sessions-index.lock"), false),
+            (self.data.join("events/.account-journal.lock"), false),
+            (
+                self.data
+                    .join("sessions")
+                    .join(&self.root)
+                    .join("inbox/.session-inbox.lock"),
+                false,
+            ),
+        ];
+        for name in [".session-write-locks", ".actor-tree-locks"] {
+            let entries = match std::fs::read_dir(self.data.join(name)) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("fixture lock inventory: {error}"),
+            };
+            for entry in entries {
+                let entry = entry.unwrap();
+                if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "lock")
+                {
+                    assert!(entry.file_type().unwrap().is_file());
+                    locks.push((entry.path(), false));
+                }
+            }
+        }
+        locks.sort();
+        assert!(
+            locks.len() <= 32,
+            "bounded disposable fixture lock inventory"
+        );
+        locks
+    }
+
     async fn execute(&self, host: &Host) -> Value {
         let response = self
             .client
@@ -496,8 +585,11 @@ impl Fixture {
             .await
             .unwrap_or_else(|error| {
                 panic!(
-                    "fixture execute request failed: {error:?}; Host {}; authority {:?}; requests {:?}",
+                    "fixture execute request failed: {error:?}; target {}; A {}; B {}; blocked locks {:?}; authority {:?}; requests {:?}",
                     host.tail(),
+                    self.a.tail(),
+                    self.b.tail(),
+                    blocked_file_locks(&self.pause_boundary_locks()),
                     self.authority(),
                     self.probe.requests.lock().unwrap()
                 )
@@ -716,11 +808,22 @@ async fn surviving_root_writer_rejects_old_output_after_real_host_lease_reclaim(
     .await;
     // The account feed stays open after the token stream's terminal event.
     let account = EventTap::open(&fixture.client, &fixture.a, "/stream").await;
-    fixture
+    let locks = fixture.pause_boundary_locks();
+    let rejected = fixture
         .a
-        .stop_clear_of_file_locks(&[], |_| {})
+        .stop_clear_of_file_locks(&locks, |_| {})
         .await
-        .expect("fixture-owned A is stopped, not exited or cancelled");
+        .unwrap_or_else(|reason| {
+            panic!(
+                "{reason}; A {}; B {}; authority {:?}",
+                fixture.a.tail(),
+                fixture.b.tail(),
+                fixture.authority()
+            )
+        });
+    if rejected > 0 {
+        eprintln!("fixture rejected {rejected} pauses inside physical writer boundaries");
+    }
     // Actual wall time and the persisted lease decide expiry. No future `now`,
     // shortened sidecar, A finish, or external A claim substitutes for it.
     tokio::time::timeout(WAIT, async {
