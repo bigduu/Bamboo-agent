@@ -43,16 +43,18 @@ they update the existing cumulative `attempts` count. Separate nested workflow
 runs have their own plan root and index path.
 
 An unexpanded skipped subtree or timeout frontier can create a zero-attempt
-placeholder. Its index path is only the known prefix of already-entered outer
-Maps. For example, `[2]` for a leaf under two Maps means the inner Map was never
+placeholder. Only a skipped/failed zero-attempt row with no input hash or
+output may publish a shorter index path. Its index path is only the known prefix
+of already-entered outer Maps. For example, `[2]` for a leaf under two Maps means the inner Map was never
 expanded; it does not identify inner item zero. Previously materialized steps
 retain their full index paths when later skipped or cancelled. An unexpanded
 placeholder and subsequent concrete instances can coexist under the same leaf.
 
 The mapping is persisted alongside each step before publication. File snapshot
 reload, journal recovery, cancellation and same-run continuation preserve stored
-metadata. Restart-as-new derives the same topology from the pinned definition
-and inputs under the new run ID.
+metadata. Restart-as-new creates instances under a new run ID using the pinned
+definition. Leaf addresses stay fixed; index paths reflect the new execution's
+enumerated Map inputs.
 
 Historical snapshots without `topology` remain readable and public steps omit
 the field. Clients should retain those rows as unmapped until explicit metadata

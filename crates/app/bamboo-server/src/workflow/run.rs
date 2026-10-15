@@ -1036,6 +1036,27 @@ fn public_workflow_failure(failure: WorkflowFailure) -> PublicWorkflowFailure {
     }
 }
 
+// Called only after the unique leaf/address check. This counts static Map
+// ancestors, without consulting item values or parsing an opaque runtime ID.
+fn workflow_step_map_depth(plan: &WorkflowPlan, step_id: &str) -> Option<usize> {
+    match plan {
+        WorkflowPlan::Step { step } => (step == step_id).then_some(0),
+        WorkflowPlan::Sequence { nodes } | WorkflowPlan::Parallel { nodes } => nodes
+            .iter()
+            .find_map(|node| workflow_step_map_depth(node, step_id)),
+        WorkflowPlan::Choice {
+            then_branch,
+            else_branch,
+            ..
+        } => workflow_step_map_depth(then_branch, step_id)
+            .or_else(|| workflow_step_map_depth(else_branch, step_id)),
+        WorkflowPlan::Map { body, .. } => {
+            workflow_step_map_depth(body, step_id).map(|depth| depth + 1)
+        }
+        WorkflowPlan::Retry { node, .. } => workflow_step_map_depth(node, step_id),
+    }
+}
+
 fn public_workflow_step(
     step: WorkflowStepSnapshot,
     plan: &WorkflowPlan,
@@ -1043,9 +1064,23 @@ fn public_workflow_step(
     PublicWorkflowStepSnapshot {
         id: step.id,
         topology: step.topology.filter(|topology| {
-            plan.step_topology(&topology.planned_step_id, topology.map_index_path.clone())
+            if plan
+                .step_topology(&topology.planned_step_id, topology.map_index_path.clone())
                 .as_ref()
-                == Some(topology)
+                != Some(topology)
+            {
+                return false;
+            }
+            let complete = workflow_step_map_depth(plan, &topology.planned_step_id)
+                == Some(topology.map_index_path.len());
+            let unexpanded_placeholder = step.attempts == 0
+                && matches!(
+                    step.status,
+                    WorkflowStepStatus::Skipped | WorkflowStepStatus::Failed
+                )
+                && step.input_hash.is_empty()
+                && step.output.is_none();
+            complete || unexpanded_placeholder
         }),
         status: step.status,
         failure: step.failure.map(public_workflow_failure),
@@ -1928,6 +1963,67 @@ mod tests {
         assert_eq!(public["plan"]["nodes"][0]["node_path"], json!([0]));
         assert_eq!(public["plan"]["nodes"][1]["node_path"], json!([1]));
         assert!(public["steps"]["inspect"].get("topology").is_none());
+    }
+
+    #[test]
+    fn public_workflow_topology_rejects_truncated_materialized_indices() {
+        let mut snapshot = private_workflow_snapshot(WorkflowRunStatus::Succeeded);
+        let prefix = snapshot
+            .definition
+            .plan
+            .step_topology("inspect", vec![])
+            .unwrap();
+        let complete = snapshot
+            .definition
+            .plan
+            .step_topology("inspect", vec![2])
+            .unwrap();
+        for status in [
+            WorkflowStepStatus::Queued,
+            WorkflowStepStatus::Running,
+            WorkflowStepStatus::Suspended,
+            WorkflowStepStatus::Succeeded,
+            WorkflowStepStatus::Failed,
+            WorkflowStepStatus::Cancelled,
+            WorkflowStepStatus::Skipped,
+        ] {
+            for attempts in [0, 1] {
+                let step = snapshot.steps.get_mut("inspect").unwrap();
+                step.status = status;
+                step.attempts = attempts;
+                step.input_hash.clear();
+                step.output = None;
+                step.topology = Some(prefix.clone());
+                let public = public_workflow_snapshot(snapshot.clone());
+                assert_eq!(
+                    public.steps["inspect"].topology.is_some(),
+                    attempts == 0
+                        && matches!(
+                            status,
+                            WorkflowStepStatus::Skipped | WorkflowStepStatus::Failed
+                        ),
+                    "invalid partial mapping for {status:?}, attempts={attempts}"
+                );
+                snapshot.steps.get_mut("inspect").unwrap().topology = Some(complete.clone());
+                assert!(public_workflow_snapshot(snapshot.clone()).steps["inspect"]
+                    .topology
+                    .is_some());
+            }
+        }
+        let step = snapshot.steps.get_mut("inspect").unwrap();
+        step.status = WorkflowStepStatus::Skipped;
+        step.attempts = 0;
+        step.topology = Some(prefix);
+        step.input_hash = "PRIVATE-INPUT-HASH".into();
+        assert!(public_workflow_snapshot(snapshot.clone()).steps["inspect"]
+            .topology
+            .is_none());
+        let step = snapshot.steps.get_mut("inspect").unwrap();
+        step.input_hash.clear();
+        step.output = Some(json!({"private":"PRIVATE-OUTPUT"}));
+        assert!(public_workflow_snapshot(snapshot).steps["inspect"]
+            .topology
+            .is_none());
     }
 
     #[test]
