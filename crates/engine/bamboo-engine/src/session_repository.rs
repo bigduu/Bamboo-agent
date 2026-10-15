@@ -29,6 +29,10 @@ mod parent_outcome;
 pub use parent_outcome::{ParentOutcomeRoute, ParentOutcomeWriter};
 
 #[cfg(test)]
+#[path = "session_repository_admission_tests.rs"]
+mod admission_tests;
+
+#[cfg(test)]
 type PostDurableHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// Framework-owned coordinator over a session's cache / storage / persistence
