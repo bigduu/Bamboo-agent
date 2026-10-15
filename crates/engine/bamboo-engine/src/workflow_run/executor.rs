@@ -225,6 +225,7 @@ struct RunContext {
     semaphore: Arc<Semaphore>,
     items: HashMap<String, Value>,
     scope: String,
+    map_index_path: Vec<usize>,
     depth: u32,
     ledger: Arc<Mutex<WorkflowBudgetUsage>>,
     root_limits: WorkflowBudgets,
@@ -247,6 +248,7 @@ impl Clone for RunContext {
             semaphore: self.semaphore.clone(),
             items: self.items.clone(),
             scope: self.scope.clone(),
+            map_index_path: self.map_index_path.clone(),
             depth: self.depth,
             ledger: self.ledger.clone(),
             root_limits: self.root_limits.clone(),
@@ -661,6 +663,7 @@ impl WorkflowRunEngine {
             semaphore: Arc::new(Semaphore::new(root_limits.max_concurrency)),
             items: HashMap::new(),
             scope: "root".into(),
+            map_index_path: Vec::new(),
             depth: 0,
             ledger,
             root_limits,
@@ -840,6 +843,7 @@ impl WorkflowRunEngine {
             semaphore,
             items: HashMap::new(),
             scope: "root".to_string(),
+            map_index_path: Vec::new(),
             depth,
             ledger,
             root_limits,
@@ -1622,6 +1626,7 @@ impl WorkflowRunEngine {
             }
             let state_id = step_id.clone();
             let state_error = error.clone();
+            let topology = plan.step_topology(&step_id, Vec::new());
             self.transition(
                 snapshot,
                 Some(step_id),
@@ -1633,6 +1638,7 @@ impl WorkflowRunEngine {
                         state_id.clone(),
                         WorkflowStepSnapshot {
                             id: state_id,
+                            topology,
                             status: WorkflowStepStatus::Failed,
                             input_hash: String::new(),
                             output: None,
@@ -1800,6 +1806,7 @@ impl RunContext {
                         // cumulative when Retry wraps Map and gives nested
                         // Parallel invocations an item-local cancellation domain.
                         child.scope = format!("{}[{index}]", self.scope);
+                        child.map_index_path.push(index);
                         async move { child.execute_node(body, &format!("{path}[{index}]")).await }
                     });
                     let results = join_all(futures).await;
@@ -1888,11 +1895,7 @@ impl RunContext {
                 false,
             )
         })?;
-        let instance_id = if self.scope == "root" {
-            step_id.to_string()
-        } else {
-            format!("{step_id}@{}", self.scope)
-        };
+        let instance_id = self.instance_id(step_id);
         let input = match &step.kind {
             WorkflowStepKind::Tool { args, .. } | WorkflowStepKind::Workflow { args, .. } => {
                 self.resolve_template(args).await?
@@ -1910,6 +1913,11 @@ impl RunContext {
                 .entry(instance_id.clone())
                 .or_insert_with(|| WorkflowStepSnapshot {
                     id: instance_id.clone(),
+                    topology: self
+                        .compiled
+                        .definition
+                        .plan
+                        .step_topology(step_id, self.map_index_path.clone()),
                     status: WorkflowStepStatus::Queued,
                     input_hash: input_hash.clone(),
                     output: None,
@@ -2605,13 +2613,13 @@ impl RunContext {
             snapshot
                 .steps
                 .iter()
-                .filter(|(id, step)| {
+                .filter(|(_, step)| {
                     matches!(
                         step.status,
                         WorkflowStepStatus::Queued | WorkflowStepStatus::Running
                     ) && sibling_steps
                         .iter()
-                        .any(|step_id| instance_is_in_scope(id, step_id, &self.scope))
+                        .any(|step_id| self.step_is_in_scope(step, step_id))
                 })
                 .map(|(id, _)| id.clone())
                 .collect::<Vec<_>>()
@@ -2706,20 +2714,16 @@ impl RunContext {
         Box::pin(async move {
             match plan {
                 WorkflowPlan::Step { step } => {
-                    let instance_id = if self.scope == "root" {
-                        step.clone()
-                    } else {
-                        format!("{step}@{}", self.scope)
-                    };
+                    let instance_id = self.instance_id(step);
                     // A previous Retry attempt may have materialized Map items
                     // in this branch. Close only instances in the current scope.
                     let mut instances = {
                         let snapshot = self.snapshot.lock().await;
                         snapshot
                             .steps
-                            .keys()
-                            .filter(|id| instance_is_in_scope(id, step, &self.scope))
-                            .cloned()
+                            .iter()
+                            .filter(|(_, state)| self.step_is_in_scope(state, step))
+                            .map(|(id, _)| id.clone())
                             .collect::<Vec<_>>()
                     };
                     if instances.is_empty() {
@@ -2737,6 +2741,11 @@ impl RunContext {
                                 let state = snapshot.steps.entry(state_id.clone()).or_insert(
                                     WorkflowStepSnapshot {
                                         id: state_id,
+                                        topology: self
+                                            .compiled
+                                            .definition
+                                            .plan
+                                            .step_topology(step, self.map_index_path.clone()),
                                         status: WorkflowStepStatus::Skipped,
                                         input_hash: String::new(),
                                         output: None,
@@ -2825,7 +2834,7 @@ impl RunContext {
             ),
             ValueRef::Step { step, pointer } => {
                 let snapshot = self.snapshot.lock().await;
-                let exact = format!("{step}@{}", self.scope);
+                let exact = self.instance_id(step);
                 let output = snapshot
                     .steps
                     .get(&exact)
@@ -2863,6 +2872,30 @@ impl RunContext {
                 )
             })
         }
+    }
+
+    // Keep existing opaque IDs unless a declared step would occupy the same
+    // key. Scoped IDs end in a numeric scope plus optional '@' suffixes, so
+    // distinct scoped instances cannot alias each other or a declared step.
+    fn instance_id(&self, step_id: &str) -> String {
+        if self.scope == "root" {
+            return step_id.to_owned();
+        }
+        let mut id = format!("{step_id}@{}", self.scope);
+        while self.compiled.steps.contains_key(&id) {
+            id.push('@');
+        }
+        id
+    }
+
+    fn step_is_in_scope(&self, state: &WorkflowStepSnapshot, step_id: &str) -> bool {
+        state.topology.as_ref().map_or_else(
+            || instance_is_in_scope(&state.id, step_id, &self.scope),
+            |topology| {
+                topology.planned_step_id == step_id
+                    && topology.map_index_path.starts_with(&self.map_index_path)
+            },
+        )
     }
 
     fn check_cancelled(&self) -> Result<(), WorkflowFailure> {
