@@ -275,6 +275,25 @@ pub async fn handle_tool_result_with_agentic_support(
     .await
 }
 
+async fn refuse_suspension_result(
+    session: &mut Session,
+    tool_call: &ToolCall,
+    event_tx: &mpsc::Sender<AgentEvent>,
+) {
+    let error = "suspension_disabled: this execution cannot wait for a user or child".to_string();
+    session.add_message(Message::tool_result_with_status(
+        tool_call.id.clone(),
+        error.clone(),
+        false,
+    ));
+    let _ = event_tx
+        .send(AgentEvent::ToolError {
+            tool_call_id: tool_call.id.clone(),
+            error,
+        })
+        .await;
+}
+
 /// Engine integration variant that makes an agentic clarification durable
 /// before publishing `NeedClarification`. The compatibility wrapper above is
 /// retained for in-process callers without a persistence adapter.
@@ -289,14 +308,24 @@ pub async fn handle_tool_result_with_agentic_support_and_persistence(
     composition_executor: Option<Arc<CompositionExecutor>>,
     clarification_persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
 ) -> ToolHandlingOutcome {
-    let should_wait_for_children = is_waiting_for_children_control(result);
+    if !crate::tools::suspension_allowed() && tool_result_requires_suspension(result) {
+        refuse_suspension_result(session, tool_call, event_tx).await;
+        return ToolHandlingOutcome::Continue;
+    }
+    let should_wait_for_children = is_waiting_for_children_control(result)
+        && (result.success || crate::tools::suspension_allowed());
     if should_wait_for_children {
         session.metadata.insert(
             "runtime.suspend_reason".to_string(),
             "waiting_for_children".to_string(),
         );
     }
-    let Some(agentic_result) = try_parse_agentic_result(result) else {
+    let parsed = if !crate::tools::suspension_allowed() && !result.success {
+        None
+    } else {
+        try_parse_agentic_result(result)
+    };
+    let Some(agentic_result) = parsed else {
         // Image-producing tools (e.g. MCP `screenshot`) carry the picture in
         // `images`; route those into content_parts so the model actually sees
         // them. Text-only results keep the original (cheaper) path.
@@ -640,6 +669,10 @@ async fn execute_sub_actions_with_persistence(
         .await
         {
             Ok(result) => {
+                if !crate::tools::suspension_allowed() && tool_result_requires_suspension(&result) {
+                    refuse_suspension_result(session, &action, event_tx).await;
+                    continue;
+                }
                 let _ = event_tx
                     .send(AgentEvent::ToolComplete {
                         tool_call_id: action.id.clone(),
@@ -647,7 +680,12 @@ async fn execute_sub_actions_with_persistence(
                     })
                     .await;
 
-                match try_parse_agentic_result(&result) {
+                let parsed = if !crate::tools::suspension_allowed() && !result.success {
+                    None
+                } else {
+                    try_parse_agentic_result(&result)
+                };
+                match parsed {
                     Some(AgenticToolResult::Success { result }) => {
                         session.add_message(Message::tool_result(action.id.clone(), result));
                     }

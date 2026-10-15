@@ -553,6 +553,13 @@ impl Tool for BashTool {
             ));
         }
 
+        if !bamboo_agent_core::tools::suspension_allowed()
+            && (parsed.interactive == Some(true) || parsed.run_in_background == Some(true))
+        {
+            return Err(ToolError::Execution(
+                "suspension_disabled: background or interactive Bash is unavailable in this execution".into(),
+            ));
+        }
         let _ = parsed.description;
         let timeout_ms = Self::effective_timeout_ms(parsed.timeout);
         let session_workspace = workspace_state::workspace_or_process_cwd(ctx.session_id());
@@ -657,11 +664,12 @@ impl Tool for BashTool {
                 // for and self-resume a backgrounded shell (`can_async_resume`):
                 // on hook-less paths (schedule / external-child loops) it stays
                 // purely synchronous so a long command's output is never orphaned.
-                let promote_after_ms = if ctx.can_async_resume {
-                    Some(PROMOTE_TO_BACKGROUND_AFTER_MS)
-                } else {
-                    None
-                };
+                let promote_after_ms =
+                    if ctx.can_async_resume && bamboo_agent_core::tools::suspension_allowed() {
+                        Some(PROMOTE_TO_BACKGROUND_AFTER_MS)
+                    } else {
+                        None
+                    };
                 self.run_streaming_command(command, timeout_ms, promote_after_ms, &cwd, ctx)
                     .await
                     .map(ToolOutcome::Completed)

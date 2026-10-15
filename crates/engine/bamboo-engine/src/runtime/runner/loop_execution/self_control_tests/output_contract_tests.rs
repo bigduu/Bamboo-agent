@@ -183,6 +183,10 @@ struct LargeStatusFeedback {
 
 #[async_trait]
 impl bamboo_agent_core::AgentHook for LargeStatusFeedback {
+    fn may_suspend(&self) -> bool {
+        false
+    }
+
     fn point(&self) -> bamboo_domain::AgentHookPoint {
         bamboo_domain::AgentHookPoint::AfterToolExecution
     }

@@ -12,6 +12,11 @@ pub(crate) async fn pause_for_no_progress(
     event_tx: &mpsc::Sender<AgentEvent>,
     config: &AgentLoopConfig,
 ) -> Result<bool, AgentError> {
+    if crate::runtime::loop_control::suspension::active(config) {
+        return Err(AgentError::Tool(
+            "managed loop cannot pause for progress clarification".into(),
+        ));
+    }
     if session.kind != SessionKind::Root
         || runtime_state.no_human_approver
         || session.pending_question.is_some()

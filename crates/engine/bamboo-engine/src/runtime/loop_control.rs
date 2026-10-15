@@ -17,6 +17,7 @@ use super::counted_loop::{
 };
 
 pub(crate) mod output_limits;
+pub(crate) mod suspension;
 
 const MAX_OPERATIONS: usize = 64;
 
@@ -369,6 +370,19 @@ pub(crate) async fn apply_current(
         return Err(fatal("tool result already paired"));
     }
     let current = counted_loop::read_loop_state(session)?;
+    let start_refusal = if policy.active.get().is_none() {
+        let refusal = suspension::start_refusal(session, config).await;
+        // The child/status observation may yield. It grants no stale owner or
+        // cancelled execution permission to install a generation afterwards.
+        let authority = policy.validate_current_owner(session).await;
+        if execution.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        authority?;
+        refusal
+    } else {
+        None
+    };
     let result = if matches!(command, LoopControlRequest::Status) {
         ToolResult::text(true, serde_json::json!({
             "loop":inspect_loop(session)?,
@@ -376,7 +390,7 @@ pub(crate) async fn apply_current(
             "host_max_total_rounds":policy.max_total_rounds.min(config.run_budget.max_rounds.unwrap_or(MAX_LOOP_ROUNDS)),
             "activation_rounds_spent":round.saturating_add(1),
             "host_remaining_rounds":policy.max_total_rounds.min(config.run_budget.max_rounds.unwrap_or(MAX_LOOP_ROUNDS)).saturating_sub(u32::try_from(round.saturating_add(1)).unwrap_or(u32::MAX)),
-            "can_start":policy.active.get().is_none() && !policy.stop.is_cancelled(),
+            "can_start":policy.active.get().is_none() && !policy.stop.is_cancelled() && start_refusal.is_none(),
         }).to_string())
     } else if plan_read_only {
         rejected("plan_read_only")
@@ -409,6 +423,10 @@ pub(crate) async fn apply_current(
         } else if policy.stop.is_cancelled() && !matches!(command, LoopControlRequest::Stop { .. })
         {
             rejected("host_stop_requested")
+        } else if let Some(reason) =
+            start_refusal.filter(|_| matches!(command, LoopControlRequest::Start { .. }))
+        {
+            rejected(reason)
         } else {
             match accept_command(policy, config, current, command, &execution.id, round, hash) {
                 Ok(state) => {

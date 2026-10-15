@@ -212,6 +212,11 @@ impl Tool for PlanTool {
         let parsed: PlanArgs = serde_json::from_value(args)
             .map_err(|error| ToolError::InvalidArguments(format!("Invalid Plan args: {error}")))?;
         let task = normalize_task(parsed.task)?;
+        if !bamboo_agent_core::tools::suspension_allowed() {
+            return Err(ToolError::Execution(
+                "suspension_disabled: Plan requires a child wait".into(),
+            ));
+        }
         let title = plan_title(parsed.title, &task);
         if parsed
             .fork_last_messages

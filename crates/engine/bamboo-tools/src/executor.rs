@@ -927,6 +927,14 @@ impl ToolExecutor for BuiltinToolExecutor {
                     {
                         continue;
                     }
+                    if !bamboo_agent_core::tools::suspension_allowed() {
+                        // A configless custom checker may prompt inside these
+                        // methods. Do not replace its full gate with is_granted
+                        // or infer an approval: fail closed before calling it.
+                        return Err(ToolError::Execution(
+                            "suspension_disabled: permission approval is unavailable in this execution".into(),
+                        ));
+                    }
                     let decision = if focused_browser_input {
                         // Configless checkers may have cached grants, and the
                         // trait's default forced path checks that cache first.
@@ -992,6 +1000,13 @@ impl ToolExecutor for BuiltinToolExecutor {
                         }
                     }
                 };
+
+                if !bamboo_agent_core::tools::suspension_allowed() {
+                    return Err(ToolError::Execution(
+                        "suspension_disabled: permission approval is unavailable in this execution"
+                            .into(),
+                    ));
+                }
 
                 // A worker/external relay gets the same typed request but only
                 // one-shot decisions are advertised until its protocol supports

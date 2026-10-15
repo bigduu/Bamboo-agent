@@ -48,6 +48,47 @@ currently blocks the whole tool; its read-only `status` classification does not
 override that gate. Host code can call `inspect_loop` on a Session value it is
 already authorized to read. There is no target lookup or read grant in that API.
 
+## Interaction boundary
+
+A started managed generation stays within its original live owner. Before Start,
+ordinary permission prompts, questions, child work and native hook suspensions
+retain their existing behavior. Opt-in alone does not disable interaction.
+
+Start refuses an enabled Guardian, an existing pending question/wait, active
+children or background Bash. It also refuses native control hooks that may
+suspend at a future Before/AfterRound, Before/AfterToolExecution or BeforeFinalize
+seam. Unknown native hooks conservatively may suspend. A programmatic host may
+override `AgentHook::may_suspend` to `false` for a handler that never suspends;
+the declaration is frozen when registered. Returning Suspend despite that
+declaration aborts under the ordinary failure contract, preserving injected
+context instead of creating a wait or ignoring a trusted control decision.
+Observer hooks and already completed setup seams keep their existing behavior.
+
+After Start, each tool dispatch derives a host-only, invocation-local restriction
+from the actual active generation, including siblings after Start in the same
+batch. An actual permission Ask is rejected before a proxy, prompt or pending
+request; it never becomes approval. Typed Allow/Deny, existing explicit Auto or
+Bypass, Plan, exact identity and authority checks remain in force. Configless
+custom checkers are conservatively refused before a potentially interactive
+confirmation method; a cached grant is not inferred by replacing their gate.
+
+Plan and SubAgent operations that create, update, launch, message or wait for
+child work are refused before their effects, including auto_run=false variants.
+Existing read/cancel authority paths remain. Explicit background/interactive
+legacy Bash is refused before spawn; auto Bash stays foreground. Typed human
+questions, legacy plan/approval payloads and agentic child/question results are
+refused before any question/wait checkpoint or notification. Ordinary failures
+remain paired once and count through the existing tool policy. The owner must
+still receive a real terminal answer to complete an admitted iteration.
+
+The no-progress and terminal safety nets fail an unexpected wait without
+creating a suspension. They do not pretend an unfinished iteration completed.
+Interactive work must occur in a later ordinary host activation outside the
+managed generation; Stop still drains its admitted batch and grants no next
+round. The existing failed-iteration and persisted-crash replay fences remain
+unchanged. This prevention contract adds no pause/resume, automatic recovery,
+new execution owner or replenished budget.
+
 ## Commands and versions
 
 `loop_control` implicitly addresses the executing Session. Every action rejects

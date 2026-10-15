@@ -1130,6 +1130,10 @@ struct PublicEntryHook {
 
 #[async_trait]
 impl bamboo_agent_core::AgentHook for PublicEntryHook {
+    fn may_suspend(&self) -> bool {
+        false
+    }
+
     fn point(&self) -> bamboo_domain::AgentHookPoint {
         self.point
     }

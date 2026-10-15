@@ -323,6 +323,19 @@ pub(super) async fn execute_tool_call_only(
 
 async fn execute_tool_call_only_with_execution_name(
     execution_name: &str,
+    ctx: ToolExecutionOnlyContext<'_>,
+) -> Result<ToolExecutionOutcome, AgentError> {
+    let noninteractive = crate::runtime::loop_control::suspension::active(ctx.config);
+    let dispatch = execute_tool_call_only_with_execution_name_inner(execution_name, ctx);
+    if noninteractive {
+        bamboo_agent_core::tools::with_suspension_disabled(dispatch).await
+    } else {
+        dispatch.await
+    }
+}
+
+async fn execute_tool_call_only_with_execution_name_inner(
+    execution_name: &str,
     mut ctx: ToolExecutionOnlyContext<'_>,
 ) -> Result<ToolExecutionOutcome, AgentError> {
     // Recheck the resolved exact executor identity even if the provider cites a
@@ -602,7 +615,9 @@ async fn execute_tool_call_only_with_execution_name(
         // `bash_resume_hook` AND persistence are both wired (issue #84, phase
         // 2d). On hook-less paths (e.g. the schedule loop) this is false, so the
         // auto path stays synchronous and never orphans a promoted shell.
-        ctx.config.bash_resume_hook.is_some() && ctx.config.persistence.is_some(),
+        bamboo_agent_core::tools::suspension_allowed()
+            && ctx.config.bash_resume_hook.is_some()
+            && ctx.config.persistence.is_some(),
         // Loop-facing background-Bash completion sink (issue #84 Phase 2b
         // follow-up). Threaded from the loop config so the Bash tool can push a
         // shell's result into this loop on completion. `None` on loops without
@@ -709,6 +724,17 @@ async fn hook_ask_outcome(
     runtime_state: &AgentRuntimeState,
     args: &serde_json::Value,
 ) -> Option<ToolExecutionOutcome> {
+    if !bamboo_agent_core::tools::suspension_allowed() {
+        return Some(ToolExecutionOutcome {
+            output_cap: None,
+            permission_replay_origin: None,
+            result: Err("managed loop cannot wait for hook approval; finish the loop before requesting interactive work".into()),
+            needs_human: None,
+            portable_tool: None,
+            post_tool_hook_eligible: false,
+            tool_duration: std::time::Duration::ZERO,
+        });
+    }
     let tool_name = tool_call.function.name.trim().to_string();
     let browser_execution = execution_name.trim().eq_ignore_ascii_case("browser");
     let focused_browser_input =
@@ -953,8 +979,34 @@ fn append_post_tool_feedback(
 
 pub(super) async fn apply_tool_execution_outcome(
     ctx: ToolExecutionApplyContext<'_>,
+    outcome: ToolExecutionOutcome,
+) -> Result<bool, AgentError> {
+    let noninteractive = crate::runtime::loop_control::suspension::active(ctx.config);
+    let apply = apply_tool_execution_outcome_inner(ctx, outcome);
+    if noninteractive {
+        bamboo_agent_core::tools::with_suspension_disabled(apply).await
+    } else {
+        apply.await
+    }
+}
+
+async fn apply_tool_execution_outcome_inner(
+    ctx: ToolExecutionApplyContext<'_>,
     mut outcome: ToolExecutionOutcome,
 ) -> Result<bool, AgentError> {
+    // Normalize before post hooks, policy accounting or any question/wait write.
+    // An already checkpointed loop receipt never has a waiting result shape.
+    if !bamboo_agent_core::tools::suspension_allowed()
+        && (outcome.needs_human.is_some()
+            || outcome.result.as_ref().is_ok_and(|result| {
+                bamboo_agent_core::tools::tool_result_requires_suspension(result)
+                    || super::clarification::requires_suspension(ctx.tool_call, result)
+            }))
+    {
+        outcome.needs_human = None;
+        outcome.result = Err("managed loop cannot wait for a question, approval or child; finish or stop the loop before interactive work".into());
+        outcome.post_tool_hook_eligible = false;
+    }
     // Capture the exact dispatch budget once, before owner projection or hooks.
     let feedback_cap = outcome
         .output_cap
@@ -990,6 +1042,28 @@ pub(super) async fn apply_tool_execution_outcome(
         .await?);
         loop_result_checkpointed = true;
     }
+    // Start can install its generation during owner apply above. Re-enter
+    // the restriction now, before even its own native AfterTool hook runs.
+    let noninteractive = crate::runtime::loop_control::suspension::active(ctx.config);
+    let apply = apply_completed_tool_execution_outcome(
+        ctx,
+        outcome,
+        feedback_cap,
+        loop_result_checkpointed,
+    );
+    if noninteractive {
+        bamboo_agent_core::tools::with_suspension_disabled(apply).await
+    } else {
+        apply.await
+    }
+}
+
+async fn apply_completed_tool_execution_outcome(
+    ctx: ToolExecutionApplyContext<'_>,
+    mut outcome: ToolExecutionOutcome,
+    feedback_cap: u32,
+    loop_result_checkpointed: bool,
+) -> Result<bool, AgentError> {
     let mut post_tool_feedback = Vec::new();
     let mut deferred_hook_control = None;
     if outcome.post_tool_hook_eligible

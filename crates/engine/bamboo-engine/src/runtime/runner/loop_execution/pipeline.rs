@@ -1248,6 +1248,11 @@ async fn maybe_suspend_for_orphaned_children(
     if active.is_empty() && !inherited_wait {
         return Ok(None);
     }
+    if crate::runtime::loop_control::suspension::active(config) {
+        return Err(AgentError::Tool(
+            "managed loop cannot establish an asynchronous child wait".into(),
+        ));
+    }
     active.sort();
     active.dedup();
 
@@ -3686,6 +3691,14 @@ async fn run_pipeline_inner(
                 // session, suspend instead of completing so background output is not
                 // silently dropped. Independent of the children gate; runs only when
                 // children did not already suspend this pass.
+                if crate::runtime::loop_control::suspension::active(config)
+                    && !bamboo_tools::tools::bash_runtime::running_shells_for_session(&session.id).is_empty()
+                {
+                    terminal_error = Some(AgentError::Tool(
+                        "managed loop cannot establish an asynchronous shell wait".into(),
+                    ));
+                    break;
+                }
                 if let Some(suspend) =
                     maybe_suspend_for_outstanding_bash(session, config, &mut state.runtime_state)
                         .await
