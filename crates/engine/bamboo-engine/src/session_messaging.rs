@@ -2388,11 +2388,16 @@ mod tests {
             )
             .await
             .unwrap();
+        // This fixture records activation requests as reservations. Active
+        // owner delivery is covered by the real router's safe-point tests.
         assert_eq!(
             reply.activation,
-            Some(SessionActivationDisposition::ActiveNotified)
+            Some(SessionActivationDisposition::ActivationReserved)
         );
-        assert_eq!(activation.calls.lock().await.len(), 1);
+        assert_eq!(
+            activation.calls.lock().await.as_slice(),
+            &[("peer-left".to_string(), reply.delivery.generation)]
+        );
         let claims = messenger.inbox().claim("peer-left", 8).await.unwrap();
         assert_eq!(claims[0].envelope.in_reply_to, Some(original.id));
         assert_eq!(
