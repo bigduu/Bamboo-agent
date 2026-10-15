@@ -47,6 +47,26 @@ This endpoint is independent of `ticket_mutation` and `ticket_dispatch`: it
 does not change either flag or attach/import a Ticket scope. Session-list GETs
 remain read-only and include the real empty Supervisor after it is opened.
 
+### Responses Tool Limit
+
+Ordinary forwarding through `POST /openai/v1/responses` accepts at most
+**128 top-level `tools` entries** per request, including unsupported or malformed
+entries. Both Responses route registrations use this same bound. For otherwise
+valid forwarding requests, a larger collection returns HTTP 400 with
+`error.type: "api_error"` and
+`error.message: "Bad request: Responses tools[] supports at most 128 entries"`
+before reserving conversion output or processing any tool, with no provider call.
+
+Within the limit, flat Responses function declarations and legacy nested
+function declarations retain their existing behavior. Existing skips for
+unsupported types and errors for malformed function declarations or missing
+string `type` fields are unchanged, as are provider routing and wire protocol
+selection.
+
+This bound limits tool conversion work and output reservation after parsing.
+Initial JSON deserialization still relies on the shared **25 MiB** request-body
+limit; the count guard does not bound total request memory.
+
 ### Chat Operations
 
 #### Create Chat Message
