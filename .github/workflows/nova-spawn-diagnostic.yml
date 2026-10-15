@@ -1,0 +1,168 @@
+name: Nova spawn diagnostic (not a release gate)
+
+on:
+  push:
+    branches: [bamboo/diagnostic/nova-spawn-f7-20261015]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nova-spawn-f7-diagnostic
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONDONTWRITEBYTECODE: "1"
+  RUST_MIN_STACK: "8388608"
+
+jobs:
+  server-diagnostic:
+    name: Failed Server target only (diagnostic)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Bind the separate diagnostic source
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          base = '02534690fee8079d44a0d97858bdd3a9d0f94f0f'
+          actual = subprocess.check_output(['git', 'diff', '--name-only', base, 'HEAD'], text=True).splitlines()
+          assert sorted(actual) == sorted([
+              '.github/workflows/nova-spawn-diagnostic.yml',
+              'crates/app/bamboo-server/src/handlers/agent/plugin/official_nova.rs',
+          ]), actual
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'nova-spawn-diagnostic'
+          out.mkdir()
+          print(json.dumps({'diagnosticSource': os.environ['GITHUB_SHA'], 'originalF7': base,
+                            'changedPaths': actual, 'releaseGate': False, 'localMacRustUsed': False}))
+          PY
+
+      - name: Install the original E2E compiler
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          components: rustfmt
+
+      - name: Verify compiler and diagnostic formatting
+        shell: bash
+        run: |
+          rustc -Vv | tee "$RUNNER_TEMP/nova-spawn-diagnostic/rustc.txt"
+          rustc -V | grep -F 'rustc 1.99.0 (b940084d7 2026-09-28)'
+          rustfmt --check --edition 2021 crates/app/bamboo-server/src/handlers/agent/plugin/official_nova.rs
+
+      - name: Read the existing E2E dependency cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-e2e-${{ runner.os }}
+          save-if: false
+
+      - name: Compile the original workspace all-features graph without running it
+        shell: bash
+        run: |
+          cargo test --locked --all-features --lib --tests --no-run --message-format=json > "$RUNNER_TEMP/nova-spawn-diagnostic/build.jsonl"
+          cargo metadata --locked --all-features --no-deps --format-version=1 > "$RUNNER_TEMP/nova-spawn-diagnostic/metadata.json"
+
+      - name: Execute only the failed Server target with errno diagnostics
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime, hashlib, json, os, pathlib, re, shutil, subprocess, sys
+          root = pathlib.Path.cwd().resolve()
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'nova-spawn-diagnostic'
+          manifest = root / 'crates/app/bamboo-server/Cargo.toml'
+          target = root / 'target'
+          messages = [json.loads(line) for line in (out / 'build.jsonl').read_text().splitlines() if line.startswith('{')]
+          compiled = [m for m in messages if m.get('reason') == 'compiler-artifact']
+          packages = json.loads((out / 'metadata.json').read_text())['packages']
+          package, = [p for p in packages if p['name'] == 'bamboo-server' and pathlib.Path(p['manifest_path']) == manifest]
+          artifact, = [m for m in compiled if m['package_id'] == package['id'] and
+                       m['target']['name'] == 'bamboo_server' and m['target']['kind'] == ['lib'] and
+                       m['profile']['test'] is True and m.get('executable')]
+          assert artifact['fresh'] is False, 'The diagnostic Server binary must be compiled from this checkout'
+          assert {'test-utils', 'ticket-runtime-fixtures'} <= set(artifact['features'])
+          binary = pathlib.Path(artifact['executable']).resolve(strict=True)
+          assert binary.is_relative_to(target) and binary.is_file()
+          digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+          runtime = os.environ.copy()
+          version = package['version']
+          major, minor, patch = version.split('-', 1)[0].split('.')
+          runtime.update(CARGO=shutil.which('cargo'), CARGO_MANIFEST_DIR=str(manifest.parent),
+                         CARGO_MANIFEST_PATH=str(manifest), CARGO_PKG_NAME=package['name'],
+                         CARGO_PKG_VERSION=version, CARGO_PKG_VERSION_MAJOR=major,
+                         CARGO_PKG_VERSION_MINOR=minor, CARGO_PKG_VERSION_PATCH=patch,
+                         CARGO_PKG_VERSION_PRE=version.split('-', 1)[1] if '-' in version else '',
+                         CARGO_PKG_AUTHORS=':'.join(package['authors']))
+          for name, key in [('DESCRIPTION', 'description'), ('HOMEPAGE', 'homepage'),
+                            ('REPOSITORY', 'repository'), ('LICENSE', 'license'),
+                            ('LICENSE_FILE', 'license_file'), ('RUST_VERSION', 'rust_version'),
+                            ('README', 'readme')]:
+              runtime['CARGO_PKG_' + name] = package.get(key) or ''
+          paths = [target / 'debug/deps', target / 'debug']
+          for message in messages:
+              if message.get('reason') == 'build-script-executed':
+                  for value in message.get('linked_paths', []):
+                      path = pathlib.Path(value.split('=', 1)[-1]).resolve()
+                      if path.is_relative_to(target) and path.is_dir():
+                          paths.append(path)
+          sysroot = pathlib.Path(subprocess.check_output(['rustc', '--print', 'sysroot'], text=True).strip())
+          host = re.search(r'^host: (.+)$', (out / 'rustc.txt').read_text(), re.M)[1]
+          paths.append(sysroot / 'lib/rustlib' / host / 'lib')
+          runtime['LD_LIBRARY_PATH'] = ':'.join(dict.fromkeys(map(str, paths))) + (
+              ':' + runtime['LD_LIBRARY_PATH'] if runtime.get('LD_LIBRARY_PATH') else '')
+          listing = subprocess.check_output([str(binary), '--list'], cwd=manifest.parent, env=runtime, text=True)
+          cases = [line[:-6] for line in listing.splitlines() if line.endswith(': test')]
+          assert len(cases) == 2601, len(cases)
+          failed_case = 'handlers::agent::plugin::official_nova::tests::lifecycle_tests::failed_start_can_retry_without_config_changes_or_false_ready'
+          assert failed_case in cases
+          receipt = {'startedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                     'source': os.environ['GITHUB_SHA'], 'originalF7': '02534690fee8079d44a0d97858bdd3a9d0f94f0f',
+                     'binary': str(binary), 'binarySha256': digest(binary), 'features': artifact['features'],
+                     'workspaceCompileOnlyCommand': 'cargo test --locked --all-features --lib --tests --no-run --message-format=json',
+                     'runtimeCommand': [str(binary)], 'runtimeCwd': str(manifest.parent),
+                     'runtimeEnvironmentKeysReconstructedFromCargoMetadata': sorted(k for k in runtime if k.startswith('CARGO_PKG_') or k in ('CARGO_MANIFEST_DIR', 'CARGO_MANIFEST_PATH', 'LD_LIBRARY_PATH')),
+                     'rustMinStack': runtime['RUST_MIN_STACK'], 'availableServerCases': len(cases),
+                     'cpuCount': os.cpu_count(), 'onlyServerTargetExecuted': True,
+                     'otherWorkspaceTargetsTested': False, 'releaseGate': False,
+                     'trackedSourceScope': 'Original F7 plus test-only spawn error logging and this non-promotion diagnostic controller; generated revision metadata binds the diagnostic commit',
+                     'directBinaryHarnessNotCargoRuntime': True, 'diagnosticRuntimeLimitSeconds': 900}
+          (out / 'runtime-start.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          print(json.dumps({'event': 'SERVER_DIAGNOSTIC_START', 'source': receipt['source'],
+                            'availableServerCases': len(cases), 'otherTargetsTested': False}), flush=True)
+          log = out / 'server-runtime.log'
+          with log.open('wb') as stream:
+              result = subprocess.run(['timeout', '--signal=TERM', '--kill-after=5s', '900s', str(binary)],
+                                      cwd=manifest.parent, env=runtime, stdout=stream, stderr=subprocess.STDOUT, timeout=920)
+          text = log.read_text(errors='replace')
+          print(text, flush=True)
+          receipt.update(finishedAt=datetime.datetime.now(datetime.timezone.utc).isoformat(), exitCode=result.returncode,
+                         runtimeLogSha256=digest(log),
+                         spawnErrorDiagnostics=re.findall(r'Nova verified CLI spawn failed: kind=[^\n]+', text),
+                         reportedResults=re.findall(r'test result: (?:ok|FAILED)\. [^\n]+', text))
+          (out / 'runtime-result.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          sys.exit(result.returncode)
+          PY
+
+      - name: Preserve the exact diagnostic source after execution
+        if: always()
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Preserve diagnostic evidence without a publication claim
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nova-spawn-diagnostic-${{ github.sha }}
+          path: ${{ runner.temp }}/nova-spawn-diagnostic/
+          if-no-files-found: error
+          retention-days: 14
