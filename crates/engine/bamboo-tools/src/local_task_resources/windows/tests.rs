@@ -230,13 +230,22 @@ async fn local_task_resources_windows_background_scope_drain() {
             // This branch always fails, even if cleanup succeeds. Status and
             // fixture PIDs are evidence, not process ownership or acceptance.
             panic!(
-                "background readiness failed: {reason}; phases={phases:?}; shell={selected:?}; env_source={}; before_status={before_status}; before_exit={before_exit:?}; owned_cleanup={cleanup:?}; after_status={}; after_exit={:?}; captured_tail={tail:?}",
+                "background readiness failed: {reason}; phases={phases:?}; shell={selected:?}; env_source={}; before_status={before_status}; before_exit={before_exit:?}; owned_cleanup={cleanup:?}; after_status={}; after_exit={:?}; command_utf16_units={}; captured_tail={tail:?}",
                 shell.environment.source.as_str(),
                 shell.status(),
                 shell.exit_code().await,
+                command.encode_utf16().count(),
             );
         }
     };
+    eprintln!(
+        "background readiness observed: leader_marker={}; spawn_marker={}; descendant_marker={}; shell={:?}; command_utf16_units={}",
+        directory.path().join("leader-started").is_file(),
+        directory.path().join("spawn-returned").is_file(),
+        directory.path().join("descendant-started").is_file(),
+        bamboo_infrastructure::process::preferred_bash_shell(),
+        command.encode_utf16().count(),
+    );
     let (receipt, ()) = tokio::join!(scope.close_and_drain(), actually_stopped(descendant));
     receipt.unwrap();
     assert_eq!(shell.status(), "completed");
