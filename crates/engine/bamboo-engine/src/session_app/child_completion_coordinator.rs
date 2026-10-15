@@ -3836,6 +3836,7 @@ impl ChildCompletionCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("child_completion_background_tests.rs");
     use bamboo_domain::session::runtime_state::SuspensionState;
 
     #[test]
