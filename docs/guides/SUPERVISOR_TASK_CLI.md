@@ -57,8 +57,12 @@ session stop and SSE cannot supply the same exact-run cancellation/output loop.
 
 ## Submit and track
 
-Put a task in a UTF-8 file (maximum 128 KiB), avoiding prompt text in shell
-arguments. `--prompt-file -` reads stdin. `/goal` controls are rejected locally.
+Put a task in a UTF-8 file, avoiding prompt text in shell arguments.
+`--prompt-file -` reads stdin. Input is bounded at 128 KiB; the JSON-encoded
+prompt string, including quotes and escaping, is also capped at 64 KiB before
+any HTTP request. This conservative limit reserves room for the native inbox
+envelope and chat wrapping within its 256 KiB budget. `/goal` controls are
+rejected locally.
 After verifying the existing provider/account cost boundary, choose one target:
 
 ```bash
@@ -186,7 +190,9 @@ deletion, legacy token fallback or unfenced stop is used.
 
 Exit 7 takes precedence after accepted/uncertain writes, preserving
 `cause_exit_code`, `request_id`, known real IDs, HTTP stage and per-stage admission
-states. A lost/malformed acknowledgement is **unknown**, not success. Raw backend
+states. If stdout closes, exit 7 still takes precedence after accepted/uncertain
+writes even though no further JSON can reach the pipe reader. A lost/malformed
+acknowledgement is **unknown**, not success. Raw backend
 error bodies, prompt text, cookies and credentials are never printed. Default
 output is suitable for sanitized evidence; explicitly requested visible text
 must be handled as user data.

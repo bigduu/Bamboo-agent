@@ -488,6 +488,63 @@ test('invalid/oversize/empty prompt is rejected before any HTTP or Supervisor cr
   assert.equal(f.calls.length, 0);
 });
 
+for (const [label, input] of [['quotes', '"'.repeat(128 * 1024)], ['backslashes', '\\'.repeat(128 * 1024)], ['controls', '\u0001'.repeat(64 * 1024)]]) {
+  test(`JSON-expanded ${label} prompt is rejected before any HTTP`, async t => {
+    const f = await fixture(t, (c, res) => {
+      if (c.path === '/api/v1/chat' && Buffer.byteLength(JSON.stringify(c.body)) > 256 * 1024) {
+        apiError(res, 400, 'serialized inbox envelope too large'); return true;
+      }
+    });
+    const r = await cli(f, ['submit', '--supervisor', '--prompt-file', '-'], { input });
+    assert.equal(r.code, 2); assert.equal(last(r).error.code, 'prompt_json_too_large');
+    assert.equal(f.calls.length, 0); privateSafe(r);
+  });
+}
+
+test('encoded prompt limit accepts its boundary and refuses the next byte before HTTP', async t => {
+  const f = await fixture(t);
+  for (const input of ['x'.repeat(64 * 1024 - 2), '"'.repeat(32 * 1024 - 1), '\u0001'.repeat(10922) + 'xx']) {
+    assert.equal(Buffer.byteLength(JSON.stringify(input)), 64 * 1024);
+    const r = await cli(f, ['submit', '--supervisor', '--prompt-file', '-'], { input });
+    assert.equal(r.code, 0, r.stdout);
+  }
+  const before = f.calls.length;
+  const r = await cli(f, ['submit', '--supervisor', '--prompt-file', '-'], { input: 'x'.repeat(64 * 1024 - 1) });
+  assert.equal(r.code, 2); assert.equal(last(r).error.code, 'prompt_json_too_large');
+  assert.equal(f.calls.length, before);
+});
+
+test('closed stdout after an accepted execution preserves partial-write exit without cancelling', async t => {
+  let observer, closed;
+  const f = await fixture(t, (c, res) => {
+    if (c.path.endsWith('/events')) {
+      observer = res; closed = new Promise(resolve => res.once('close', resolve));
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' }); res.flushHeaders(); return true;
+    }
+    if (c.path.endsWith('/execute')) {
+      json(res, { session_id: SUP, run_id: 'running-past-closed-pipe', status: 'started' }, 202); return true;
+    }
+  });
+  const r = await cli(f, ['submit', '--supervisor', '--prompt-file', f.prompt, '--watch'], {
+    started(child) { child.stdout.destroy(); },
+  });
+  assert.equal(r.code, 7); assert.equal(r.stderr, '');
+  assert.deepEqual(posts(f).map(c => c.path), ['/api/v1/supervisor/default', '/api/v1/chat', `/api/v1/sessions/${SUP}/execute`]);
+  assert.ok(observer && closed);
+  await closed;
+});
+
+test('closed stdout preserves uncertain chat admission while read-only failure stays transport', async t => {
+  const f = await fixture(t, (c, res) => {
+    if (c.path === '/api/v1/chat') { res.destroy(); return true; }
+  });
+  const started = child => child.stdout.destroy();
+  const unknown = await cli(f, submit(f), { started });
+  assert.equal(unknown.code, 7); assert.equal(unknown.stderr, ''); assert.equal(posts(f).length, 1);
+  const read = await cli(f, ['inspect'], { started });
+  assert.equal(read.code, 3); assert.equal(read.stderr, ''); assert.equal(posts(f).length, 1);
+});
+
 test('case-insensitive and Unicode-whitespace goal controls never reach HTTP', async t => {
   const f = await fixture(t);
   for (const input of ['/GOAL off', '/Goal clear', '\u0085/GoAl\u0085off']) {

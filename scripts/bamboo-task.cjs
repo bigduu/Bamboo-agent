@@ -7,6 +7,9 @@ const { constants: fsConstants } = require('node:fs');
 const path = require('node:path');
 
 const MAX_JSON = 1024 * 1024;
+// Native chat can carry content more than once; reserve the rest of the
+// 256 KiB inbox envelope for its fields and server-provided prompt metadata.
+const MAX_PROMPT_JSON = 64 * 1024;
 const MAX_FRAME = 256 * 1024;
 const MAX_STREAM = 16 * 1024 * 1024;
 const DEFAULT_SUPERVISOR = 'bamboo-default-supervisor';
@@ -126,6 +129,7 @@ async function readPrompt(file, signal) {
   if (/^[\s\u0085]*$/.test(text)) fail('prompt_empty', 2);
   // Rust char::is_whitespace also includes NEL (U+0085), unlike JS \s.
   if (/^[\s\u0085]*\/goal(?:[\s\u0085]|$)/i.test(text)) fail('goal_control_is_not_task_submission', 2);
+  if (Buffer.byteLength(JSON.stringify(text)) > MAX_PROMPT_JSON) fail('prompt_json_too_large', 2);
   return text;
 }
 
@@ -339,11 +343,15 @@ async function events(c, o, ctx, response, expectedRun, awaitStart = true) {
   return { session_id: o['session-id'], event_scope: 'session', stream_end: reason, event_count: count };
 }
 
+const hasPossibleWrite = ctx => Object.values(ctx.admission || {}).some(v => v === 'accepted' || v === 'unknown');
 async function main() {
   let o, ctx = { command: 'unknown', phase: 'arguments' }, timer;
   const controller = new AbortController();
   const interrupt = () => controller.abort('interrupted');
   process.once('SIGINT', interrupt);
+  // Final writes can fail asynchronously after main's finally. Keep the
+  // handler's live admission context even when no JSON can reach the reader.
+  process.stdout.on('error', () => { process.exit(hasPossibleWrite(ctx) ? 7 : 3); });
   try {
     o = parse(process.argv.slice(2));
     if (o.help) { emit({ ok: true, help: HELP }); return; }
@@ -372,7 +380,7 @@ async function main() {
     let error = e instanceof Failure ? e : new Failure('transport_or_protocol_failed', 3);
     if (controller.signal.aborted) error = new Failure(controller.signal.reason === 'interrupted' ? 'interrupted' : 'timeout', controller.signal.reason === 'interrupted' ? 130 : 124);
     const values = Object.values(ctx.admission || {});
-    const partial = values.some(v => v === 'accepted' || v === 'unknown');
+    const partial = hasPossibleWrite(ctx);
     const exit = partial ? 7 : error.exit;
     emit({ ok: false, ...ctx, ...(partial ? { admission_outcome: values.includes('unknown') ? 'unknown' : 'partial' } : {}),
       error: { code: error.code, exit_code: exit, ...(partial ? { cause_exit_code: error.exit } : {}), ...(error.http_status ? { http_status: error.http_status } : {}) } });
@@ -380,5 +388,4 @@ async function main() {
   } finally { clearTimeout(timer); process.removeListener('SIGINT', interrupt); }
 }
 
-process.stdout.on('error', () => { process.exit(3); });
 if (require.main === module) main();
