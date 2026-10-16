@@ -53,6 +53,32 @@ pub(crate) async fn run_agent_loop_with_config(
     cancel_token: CancellationToken,
     config: AgentLoopConfig,
 ) -> super::Result<()> {
+    let observation =
+        bamboo_infrastructure::telemetry::Observation::agent(&session.id, &session.root_session_id);
+    let result = observation
+        .scope(run_agent_loop_with_config_inner(
+            session,
+            initial_message,
+            event_tx,
+            llm,
+            tools,
+            cancel_token,
+            config,
+        ))
+        .await;
+    observation.finish(super::telemetry_outcome(&result));
+    result
+}
+
+async fn run_agent_loop_with_config_inner(
+    session: &mut Session,
+    initial_message: String,
+    event_tx: mpsc::Sender<AgentEvent>,
+    llm: Arc<dyn LLMProvider>,
+    tools: Arc<dyn ToolExecutor>,
+    cancel_token: CancellationToken,
+    config: AgentLoopConfig,
+) -> super::Result<()> {
     let scoped_transport = config
         .loop_control
         .as_ref()
@@ -131,6 +157,11 @@ pub(crate) async fn run_agent_loop_with_config(
             &event_tx,
         )
         .await?;
+
+        bamboo_infrastructure::telemetry::record_execution_identity(
+            &state.execution_id,
+            &state.runtime_state.run_id,
+        );
 
         if config.effective_counted_loop().is_some() || config.loop_control.is_some() {
             // Capture the initialized run before any owner checkpoint or binding can fail. Its first
