@@ -1,0 +1,60 @@
+name: Nova Linux busy backoff RED GREEN (not a release gate)
+
+on:
+  push:
+    branches: [bamboo/diagnostic/nova-busy-backoff-20261016]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nova-busy-backoff-red-green
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  PYTHONDONTWRITEBYTECODE: "1"
+  RUST_MIN_STACK: "8388608"
+
+jobs:
+  regression:
+    name: Owned Linux busy writer tests before and after the bounded fix
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 4
+          persist-credentials: false
+
+      - name: Preserve the controller separately from the tested source
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          cp scripts/nova-spawn-regression.py "$RUNNER_TEMP/nova-spawn-regression-controller.py"
+
+      - name: Install the exact existing Linux regression compiler
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.1
+          components: rustfmt
+
+      - name: Read existing Linux dependencies without saving a cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-e2e-${{ runner.os }}
+          save-if: false
+
+      - name: Verify real RED then GREEN on their separate immutable sources
+        shell: bash
+        run: python3 "$RUNNER_TEMP/nova-spawn-regression-controller.py"
+
+      - name: Preserve original RED and GREEN evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nova-spawn-red-green-${{ github.sha }}
+          path: ${{ runner.temp }}/nova-spawn-red-green/
+          if-no-files-found: error
+          retention-days: 14
