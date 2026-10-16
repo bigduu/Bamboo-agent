@@ -7,8 +7,8 @@ use actix_web::{web, HttpResponse};
 use bamboo_domain::{ProjectId, ProjectManifest, ProjectStatus};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 
 type Response = Result<HttpResponse, AppError>;
 
@@ -116,12 +116,11 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
         .cloned()
         .or(preferences.default_root);
     let repositories = blocking(move || {
-        // Resolve each persisted session once, rather than invoking Git for
-        // every worktree/session pair in a repository with many checkouts.
-        let sessions: Vec<_> = sessions.into_iter().map(|session| {
-            let checkout = session.workspace_path.as_ref().and_then(|workspace| git::workspace_root(Path::new(workspace)).ok());
-            (session, checkout)
-        }).collect();
+        // Inspect only namespaces selected by this Project or discovered by
+        // native worktree inventory. Historical Session paths elsewhere may be
+        // offline and must not trigger filesystem/Git work for this request.
+        let bound_sources: Vec<_> = project.workspace_roots().map(PathBuf::from).collect();
+        let mut session_checkouts = HashMap::<PathBuf, Option<PathBuf>>::new();
         let mut repositories = Vec::<Value>::new();
         let mut seen = HashSet::new();
         for source in project.workspace_roots() {
@@ -136,11 +135,36 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
             if !seen.insert(common.clone()) { continue; }
             match git::list(&path) {
                 Ok(entries) => {
+                    for session in &sessions {
+                        let Some(workspace) = session.workspace_path.as_deref().map(Path::new) else { continue; };
+                        // A lexical parent component cannot establish scoped
+                        // membership without following unrelated filesystem paths.
+                        if !workspace.is_absolute() || workspace.components().any(|c| matches!(c, Component::ParentDir)) { continue; }
+                        let within = |root: &Path| root.is_absolute()
+                            && !root.components().any(|c| matches!(c, Component::ParentDir))
+                            && workspace.starts_with(root);
+                        if !entries.iter().any(|entry| within(&entry.path))
+                            && !bound_sources.iter().any(|source| within(source)) { continue; }
+                        // Deduplicate across Sessions and repositories. An exact
+                        // inventory path already has a known checkout root; only
+                        // scoped subdirectories/aliases need an additional query.
+                        session_checkouts.entry(workspace.to_path_buf()).or_insert_with(|| {
+                            if entries.iter().any(|entry| entry.path == workspace) {
+                                Some(workspace.to_path_buf())
+                            } else {
+                                git::workspace_root(workspace).ok()
+                            }
+                        });
+                    }
                     let worktrees: Vec<_> = entries.into_iter().map(|entry| {
-                        let related: Vec<_> = sessions.iter().filter(|(session, checkout)| {
-                            checkout.as_ref() == Some(&entry.path)
-                                || (checkout.is_none() && session.workspace_path.as_deref().map(Path::new) == Some(entry.path.as_path()))
-                        }).map(|(session, _)| json!({"id": session.id, "title": session.title,
+                        let related: Vec<_> = sessions.iter().filter(|session| {
+                            let Some(workspace) = session.workspace_path.as_deref().map(Path::new) else { return false; };
+                            match session_checkouts.get(workspace) {
+                                Some(Some(checkout)) => checkout == &entry.path,
+                                Some(None) => workspace == entry.path.as_path(),
+                                None => false,
+                            }
+                        }).map(|session| json!({"id": session.id, "title": session.title,
                             "active": running.contains(&session.id)
                                 || matches!(session.last_run_status.as_deref(), Some("running" | "pending"))
                                 || session.has_pending_question})).collect();
