@@ -324,6 +324,13 @@ impl LLMProvider for FailingVisionProvider {
             "oversized" => Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Token(
                 "x".repeat(16 * 1024 + 1),
             ))]))),
+            "done-open" => Ok(Box::pin(futures::StreamExt::chain(
+                stream::iter(vec![
+                    Ok(LLMChunk::Token("completed visual description".into())),
+                    Ok(LLMChunk::Done),
+                ]),
+                stream::pending(),
+            ))),
             _ => Ok(Box::pin(stream::iter(vec![
                 Ok(LLMChunk::Token("   ".into())),
                 Ok(LLMChunk::Done),
@@ -480,4 +487,21 @@ async fn configured_nonvision_fallback_is_rejected_before_any_auxiliary_request(
     };
     assert!(error.to_string().contains("does not support Vision"));
     assert!(recording.models.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn vision_done_completes_description_without_waiting_for_transport_eof() {
+    let target = bamboo_llm::ResolvedModel::new(
+        Arc::new(FailingVisionProvider("done-open")),
+        "configured-vision",
+    );
+    let mut result = tool_image();
+    let started = tokio::time::Instant::now();
+    super::describe_tool_images(&target, &mut result)
+        .await
+        .expect("a completed description must not wait for a still-open stream");
+    assert!(started.elapsed() < super::VISION_TIMEOUT);
+    assert!(result.images.is_empty());
+    assert!(result.result.contains("completed visual description"));
+    assert!(result.result.contains("Vision model output"));
 }

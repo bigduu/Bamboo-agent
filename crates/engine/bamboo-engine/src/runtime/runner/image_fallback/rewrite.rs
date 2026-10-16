@@ -185,7 +185,11 @@ async fn describe_image_via_llm(
                 }
                 description.push_str(&text);
             }
-            Ok(_) => {} // Skip ResponseId, ReasoningToken, ToolCalls, Done
+            // Done is a semantic terminal event. Do not wait for transport EOF
+            // or allow a still-open connection to turn a completed description
+            // into a timeout.
+            Ok(LLMChunk::Done) => break,
+            Ok(_) => {} // Skip response IDs, reasoning, tool calls and usage.
             Err(_) => {
                 return Err("Vision model stream failed; no image or partial description was sent to the main model.".into());
             }

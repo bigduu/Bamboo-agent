@@ -48,6 +48,8 @@ that legacy general-message transform.
 Images and returned descriptions are untrusted data. Description text has a
 clear Vision-model label and JSON quoting. Provider errors are sanitized;
 failed, empty, overlong or timed-out descriptions are explicit tool errors.
+A semantic `Done` event finishes a valid description without waiting for
+transport EOF; an open connection after completion is not a timeout.
 The request/stream remain inside cancellation scopes, with bounded time/output
 and the existing cumulative encoded tool-image budget.
 
