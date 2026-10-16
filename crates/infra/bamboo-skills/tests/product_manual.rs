@@ -1,4 +1,4 @@
-use bamboo_config::{Config, MemoryConfig, SectionId, CONFIG_VALUE_FIELD_OWNERS};
+use bamboo_config::{Config, SectionId, CONFIG_VALUE_FIELD_OWNERS};
 use bamboo_skills::store::builtin::{load_builtin_skill_bundles, BUILTIN_SKILL_FILES};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -6,6 +6,9 @@ use std::collections::BTreeSet;
 #[allow(dead_code)]
 #[path = "../build/product_manual.rs"]
 mod packaging;
+
+#[path = "../manual/config_catalog.rs"]
+mod config_catalog;
 
 fn resource(path: &str) -> &'static [u8] {
     let full = format!("bamboo-manual/{path}");
@@ -118,37 +121,85 @@ fn native_hook_example_uses_the_real_configuration_contract() {
 }
 
 fn typed_value(config: &Config, key: &str) -> Value {
-    let memory = config
-        .memory()
-        .clone()
-        .unwrap_or_else(MemoryConfig::default);
-    match key {
-        "server.port" => json!(config.server.port),
-        "server.workers" => json!(config.server.workers),
-        "tools.disabled" => json!(config.tools.disabled),
-        "skills.disabled" => json!(config.skills.disabled),
-        "memory.auto_dream_enabled" => json!(memory.auto_dream_enabled),
-        "memory.project_prompt_injection" => json!(memory.project_prompt_injection),
-        "memory.relevant_recall" => json!(memory.relevant_recall),
-        "memory.relevant_recall_rerank" => json!(memory.relevant_recall_rerank),
-        "memory.ledger_agenda_injection" => json!(memory.ledger_agenda_injection),
-        "lifecycle_hooks.enabled" => json!(config.lifecycle_hooks.enabled),
-        "context_management.strategy" => json!(config.context_management.strategy),
-        _ => panic!("catalog entry lacks a typed accessor: {key}"),
-    }
+    let entry = config_catalog::entries()
+        .into_iter()
+        .find(|entry| entry.key == key)
+        .unwrap_or_else(|| panic!("catalog entry lacks a typed accessor: {key}"));
+    (entry.read)(config)
 }
 
 fn input(key: &str, value: Value) -> Value {
+    if let Some(field) = key.strip_prefix("server.tls.") {
+        let mut tls = json!({"cert_file":"example-cert.pem", "key_file":"example-key.pem"});
+        tls[field] = value;
+        return json!({"server":{"tls":tls}});
+    }
     key.split('.')
         .rev()
         .fold(value, |child, field| json!({field: child}))
 }
 
 #[test]
+fn catalog_is_reproducible_and_root_coverage_cannot_drift_silently() {
+    assert_eq!(
+        std::str::from_utf8(resource("references/config-keys.json")).unwrap(),
+        config_catalog::render(),
+        "run the catalog generator --write and review the diff"
+    );
+    let catalog = config_catalog::catalog();
+    let roots: BTreeSet<_> = catalog["root_coverage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|root| root["root"].as_str().unwrap())
+        .collect();
+    let expected: BTreeSet<_> = CONFIG_VALUE_FIELD_OWNERS
+        .iter()
+        .map(|(root, _)| *root)
+        .chain(["memory"])
+        .collect();
+    assert_eq!(roots, expected);
+    assert!(catalog["root_coverage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|root| root["coverage"] == "not_documented"));
+    assert_eq!(catalog["coverage"], "bounded_typed_catalog_not_full_schema");
+    let entries = catalog["entries"].as_array().unwrap();
+    for key in [
+        "memory.background_model",
+        "server.tls",
+        "server.static_dir",
+        "worktrees.default_root",
+    ] {
+        let entry = entries.iter().find(|entry| entry["key"] == key).unwrap();
+        assert!(
+            entry["default"].is_null(),
+            "omitted Option still needs documentation"
+        );
+    }
+    let extra = catalog["root_coverage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|root| root["root"] == "extra")
+        .unwrap();
+    assert_eq!(extra["kind"], "flattened_dynamic_map_not_literal_key");
+    assert_eq!(
+        entries
+            .iter()
+            .find(|e| e["key"] == "memory.dream_refine_mode")
+            .unwrap()["status"],
+        "deprecated_ignored"
+    );
+}
+
+#[test]
 fn catalog_defaults_examples_aliases_and_owners_match_real_typed_config() {
     let catalog: Value = serde_json::from_slice(resource("references/config-keys.json")).unwrap();
     let entries = catalog["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 11, "update typed coverage deliberately");
+    assert_eq!(entries.len(), config_catalog::entries().len());
+    assert!(entries.len() > 11, "expand the original bounded slice");
     let mut keys = BTreeSet::new();
     for entry in entries {
         let key = entry["key"].as_str().unwrap();
@@ -203,6 +254,25 @@ fn catalog_defaults_examples_aliases_and_owners_match_real_typed_config() {
         .is_err()
     );
     assert!(serde_json::from_value::<Config>(json!({"server": {"port": 65536}})).is_err());
+    for field in [
+        "transport_idle_timeout_secs",
+        "first_semantic_timeout_secs",
+        "semantic_idle_timeout_secs",
+    ] {
+        for invalid in [0, 86401] {
+            assert!(
+                serde_json::from_value::<Config>(json!({"stream_timeout": {field: invalid}}))
+                    .is_err()
+            );
+        }
+    }
+    // These are preserved dynamic values, never catalog entries or typed keys.
+    let preserved: Config =
+        serde_json::from_value(json!({"server":{"future_unknown":42}})).unwrap();
+    assert_eq!(preserved.server.extra["future_unknown"], 42);
+    assert!(!entries
+        .iter()
+        .any(|entry| entry["key"] == "server.future_unknown"));
 }
 
 #[tokio::test]
@@ -233,6 +303,7 @@ async fn builtin_manual_reads_without_repository_via_existing_paginated_reader()
     for path in [
         "manifest.json",
         "references/configuration.md",
+        "references/config-keys.json",
         "references/memory.md",
         "references/hooks.md",
     ] {
