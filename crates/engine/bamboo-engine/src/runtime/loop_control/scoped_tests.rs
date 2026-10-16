@@ -1025,3 +1025,5 @@ async fn scoped_host_stop_during_successful_claim_leaves_update_unconsumed_and_s
 mod stop_backlog_tests;
 
 mod stop_backlog_authority_tests;
+
+mod remote_objective_contract_tests;

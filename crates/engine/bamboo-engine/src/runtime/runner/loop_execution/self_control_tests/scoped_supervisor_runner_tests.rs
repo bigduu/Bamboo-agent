@@ -959,3 +959,5 @@ async fn scoped_public_registration_failure_terminalizes_runtime_before_any_gene
     assert!(f.router.current_run_id(TARGET_ID).await.is_none());
     f.assert_no_successor();
 }
+
+mod terminal_retirement_tests;

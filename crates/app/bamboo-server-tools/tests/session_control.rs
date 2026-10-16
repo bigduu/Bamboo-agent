@@ -906,107 +906,160 @@ mod loop_adapter_tests {
         assert!(f.activation.calls.lock().await.is_empty());
     }
 
+    // The remote draft now has an explicit scalar cap in addition to the
+    // unchanged self DTO's UTF-8 byte cap. Keep those two expectations separate.
+    async fn assert_remote_objective_case(
+        f: &Fixture,
+        validator: &jsonschema::Validator,
+        label: &str,
+        objective: &str,
+        self_valid: bool,
+        remote_valid: bool,
+    ) {
+        for mut arguments in [start(), update()] {
+            arguments["command"]["objective"] = json!(objective);
+            assert_eq!(arguments["expected_link_revision"], 2);
+            assert_eq!(f.tool.classify(&arguments), ToolClass::MUTATING_SERIAL);
+            let request: bamboo_domain::LoopControlRequest =
+                serde_json::from_value(arguments["command"].clone()).unwrap();
+            let action = request.action();
+            let dimensions = (objective.len(), objective.chars().count());
+            assert_eq!(
+                request.validate().is_ok(),
+                self_valid,
+                "{label}/{action}: self DTO changed, (bytes, scalars)={dimensions:?}"
+            );
+            assert_eq!(
+                validator.validate(&arguments).is_ok(),
+                remote_valid,
+                "{label}/{action}: remote schema differs, (bytes, scalars)={dimensions:?}"
+            );
+            let outcome = f.tool.invoke(arguments.clone(), f.ctx.clone()).await;
+            if remote_valid {
+                // This fixture has no target Loop grant. Execution is the
+                // existing authority refusal, never a claimed applied receipt.
+                assert!(
+                    matches!(outcome, Err(ToolError::Execution(_))),
+                    "{label}/{action}"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, Err(ToolError::InvalidArguments(_))),
+                    "{label}/{action}: must reject before Inbox delivery"
+                );
+            }
+            let mut roundtrip = arguments;
+            roundtrip["command"] = serde_json::to_value(request).unwrap();
+            assert_eq!(roundtrip["command"]["objective"].as_str(), Some(objective));
+            assert_eq!(
+                validator.validate(&roundtrip).is_ok(),
+                remote_valid,
+                "{label}/{action}: typed null defaults changed schema acceptance"
+            );
+            let inbox = f.inbox.inspect("a").await.unwrap();
+            assert_eq!((inbox.generation, inbox.pending, inbox.claimed), (0, 0, 0));
+            assert!(f.activation.calls.lock().await.is_empty());
+        }
+    }
+
     #[tokio::test]
-    async fn advertised_nested_objective_preserves_full_utf8_byte_boundaries() {
+    async fn advertised_remote_objective_scalar_bound_accepts_all_widths_and_raw_text() {
+        let f = Fixture::new().await;
+        let validator = advertised_validator(&f);
+        for (label, objective) in [
+            ("ASCII boundary", "x".repeat(4096)),
+            ("two-byte boundary", "é".repeat(4096)),
+            ("CJK boundary", "界".repeat(4096)),
+            ("emoji boundary exact 16 KiB", "😀".repeat(4096)),
+            ("mixed boundary", "aé界😀".repeat(1024)),
+            ("FEFF content boundary", "\u{feff}".repeat(4096)),
+            (
+                "NEL around FEFF",
+                format!("{}\u{feff}", "\u{0085}".repeat(4095)),
+            ),
+            (
+                "surrounding spaces count without trimming",
+                format!("{}x", " ".repeat(4095)),
+            ),
+        ] {
+            assert_eq!(objective.chars().count(), 4096, "{label}");
+            assert_remote_objective_case(&f, &validator, label, &objective, true, true).await;
+        }
+        let standalone =
+            bamboo_tools::tools::loop_control::LoopControlTool::new().parameters_schema();
+        let standalone_validator = jsonschema::validator_for(&standalone).unwrap();
+        let mut self_start = start()["command"].clone();
+        self_start["objective"] = json!("x".repeat(16_384));
+        assert!(
+            standalone_validator.validate(&self_start).is_ok(),
+            "the standalone self-tool schema is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_scalar_contract_explicitly_restricts_previous_full_byte_candidates() {
         let f = Fixture::new().await;
         let validator = advertised_validator(&f);
         let limit = bamboo_domain::session::loop_control_request::MAX_OBJECTIVE_BYTES;
         assert_eq!(limit, 16_384);
         for (label, objective, expected_bytes) in [
-            ("ASCII at limit", "x".repeat(16_384), 16_384),
+            ("ASCII at old limit", "x".repeat(16_384), 16_384),
             ("5000 CJK", "界".repeat(5000), 15_000),
-            ("CJK below limit", "界".repeat(5461), 16_383),
+            ("CJK below old limit", "界".repeat(5461), 16_383),
             (
-                "CJK plus ASCII at limit",
+                "CJK plus ASCII at old limit",
                 format!("{}a", "界".repeat(5461)),
                 16_384,
             ),
-            ("two-byte at limit", "é".repeat(8192), 16_384),
-            ("four-byte at limit", "😀".repeat(4096), 16_384),
+            ("two-byte at old limit", "é".repeat(8192), 16_384),
             (
-                "mixed ASCII and CJK at limit",
+                "mixed ASCII and CJK at old limit",
                 format!("{}{}", "x".repeat(8191), "界".repeat(2731)),
                 16_384,
             ),
             (
-                "mixed all widths at limit",
+                "mixed all widths at old limit",
                 format!("{}abcd", "aé界😀".repeat(1638)),
                 16_384,
+            ),
+            ("one extra scalar ASCII", "x".repeat(4097), 4097),
+            (
+                "one extra raw space",
+                format!("{}x", " ".repeat(4096)),
+                4097,
             ),
         ] {
             assert_eq!(objective.len(), expected_bytes, "{label}");
             assert!(objective.len() <= limit, "{label}");
-            assert_objective_schema_case(&f, &validator, label, &objective, true).await;
+            assert!(objective.chars().count() > 4096, "{label}");
+            // This is a disclosed change to an unpublished remote candidate,
+            // not full old byte-contract parity and not a change to self.
+            assert_remote_objective_case(&f, &validator, label, &objective, true, false).await;
         }
-        assert_eq!(f.inbox.inspect("a").await.unwrap().generation, 0);
-        assert!(f.activation.calls.lock().await.is_empty());
     }
 
-    // The advertised schema is a character filter; shared typed validation
-    // enforces UTF-8 bytes before delivery. This does not assert byte parity.
     #[tokio::test]
-    async fn nested_objective_byte_guard_rejects_oversize_despite_schema_character_filter() {
+    async fn remote_scalar_schema_and_adapter_both_reject_byte_overflow_before_inbox() {
         let f = Fixture::new().await;
         let validator = advertised_validator(&f);
         let limit = bamboo_domain::session::loop_control_request::MAX_OBJECTIVE_BYTES;
-        let before = f.inbox.inspect("a").await.unwrap();
-        assert_eq!(
-            (before.generation, before.pending, before.claimed),
-            (0, 0, 0)
-        );
-        for (label, objective, advertised_accepts) in [
-            ("reported 5500 CJK", "界".repeat(5500), true),
-            ("CJK beyond byte limit", "界".repeat(5462), true),
-            ("two-byte beyond limit", "é".repeat(8193), true),
-            ("four-byte beyond limit", "😀".repeat(4097), true),
+        for (label, objective) in [
+            ("reported 5500 CJK", "界".repeat(5500)),
+            ("CJK beyond byte limit", "界".repeat(5462)),
+            ("two-byte beyond limit", "é".repeat(8193)),
+            ("emoji beyond limit", "😀".repeat(4097)),
             (
                 "mixed beyond byte limit",
                 format!("{}{}x", "x".repeat(8191), "界".repeat(2731)),
-                true,
             ),
             (
-                "exact character cap but one extra byte",
+                "old character cap one extra byte",
                 format!("{}é", "x".repeat(16_383)),
-                true,
             ),
-            (
-                "ASCII beyond both limits control",
-                "x".repeat(16_385),
-                false,
-            ),
+            ("ASCII beyond old byte limit", "x".repeat(16_385)),
         ] {
-            assert!(!objective.trim().is_empty(), "{label}");
             assert!(objective.len() > limit, "{label}");
-            for mut arguments in [start(), update()] {
-                arguments["command"]["objective"] = json!(&objective);
-                assert_eq!(arguments["expected_link_revision"], 2);
-                assert_eq!(f.tool.classify(&arguments), ToolClass::MUTATING_SERIAL);
-                let request: bamboo_domain::LoopControlRequest =
-                    serde_json::from_value(arguments["command"].clone()).unwrap();
-                let action = request.action();
-                // This remains the existing registered full validator. The
-                // advertised character bound cannot assert a UTF-8 byte bound.
-                assert_eq!(
-                    validator.validate(&arguments).is_ok(),
-                    advertised_accepts,
-                    "{label}/{action}: unexpected advertised acceptance"
-                );
-                assert!(
-                    request.validate().is_err(),
-                    "{label}/{action}: the shared DTO must enforce its byte bound"
-                );
-                assert!(matches!(
-                    f.tool.invoke(arguments, f.ctx.clone()).await,
-                    Err(ToolError::InvalidArguments(_))
-                ));
-                let after = f.inbox.inspect("a").await.unwrap();
-                assert_eq!(
-                    (after.generation, after.pending, after.claimed),
-                    (before.generation, before.pending, before.claimed),
-                    "{label}/{action}: rejected objective changed Inbox admission"
-                );
-                assert!(f.activation.calls.lock().await.is_empty());
-            }
+            assert_remote_objective_case(&f, &validator, label, &objective, false, false).await;
         }
     }
 

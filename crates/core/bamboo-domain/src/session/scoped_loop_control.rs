@@ -341,3 +341,6 @@ pub struct ScopedLoopControlCheckpoint<'a> {
     pub input: Option<(Arc<dyn SessionInboxPort>, ScopedLoopControlClaim)>,
     pub publish: RootActorRuntimePublisher,
 }
+
+#[cfg(test)]
+mod objective_contract_tests;
