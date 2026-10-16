@@ -8,7 +8,12 @@ async fn initial_release_batch_waits_for_every_owned_host_receipt() {
     use bamboo_subagent::executor::SteerMessage;
     use bamboo_subagent::proto::{InitialInputRelease, InitialInputReleaseRequest};
     for count in [2, 4] {
-        for case in ["accepted", "wrong-last-nonce", "cancel-before-last"] {
+        for case in [
+            "accepted",
+            "duplicate-releases",
+            "wrong-last-nonce",
+            "cancel-before-last",
+        ] {
             let host_temp = tempfile::tempdir().unwrap();
             let host = Arc::new(SessionStoreV2::new(host_temp.path().into()).await.unwrap());
             let parent = Session::new("batch-release-parent", "model");
@@ -166,6 +171,14 @@ async fn initial_release_batch_waits_for_every_owned_host_receipt() {
                         .await
                         .unwrap();
                 }
+                if case == "duplicate-releases" {
+                    // A retry may have been emitted before the first Host
+                    // reply arrived. Both replies carry the actual ACK and
+                    // must leave the next input barrier intact.
+                    steer_tx
+                        .send(SteerMessage::InitialInputRelease(release.clone()))
+                        .unwrap();
+                }
                 steer_tx
                     .send(SteerMessage::InitialInputRelease(release))
                     .unwrap();
@@ -176,7 +189,7 @@ async fn initial_release_batch_waits_for_every_owned_host_receipt() {
                 .unwrap();
             {
                 let calls = provider.calls.lock().unwrap();
-                if case == "accepted" {
+                if matches!(case, "accepted" | "duplicate-releases") {
                     assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
                     assert_eq!(calls.len(), 1);
                     let actual = calls[0]
@@ -201,7 +214,7 @@ async fn initial_release_batch_waits_for_every_owned_host_receipt() {
             for (slot, envelope) in envelopes.iter().enumerate() {
                 assert_eq!(
                     inbox.was_admitted(&child.id, &envelope.id).await.unwrap(),
-                    slot + 1 < count || case == "accepted"
+                    slot + 1 < count || matches!(case, "accepted" | "duplicate-releases")
                 );
             }
         }
