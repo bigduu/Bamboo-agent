@@ -203,7 +203,9 @@ impl VerifiedCli {
                 .map_err(|_| ())?;
         }
         file.sync_all().await.map_err(|_| ())?;
-        // Close every writer before spawning (also avoids ETXTBSY on Linux).
+        // Close this process's writer before exposing the private snapshot.
+        // A concurrent fork can briefly retain a duplicate; Linux spawn handles
+        // that exact transient within the original operation budget.
         drop(file.into_std().await);
         Ok(Self {
             _temporary: temporary,
@@ -561,6 +563,52 @@ fn confirm_zombie_group(group: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+async fn spawn_verified_cli(
+    process: &mut tokio::process::Command,
+    budget: Duration,
+) -> Result<(tokio::process::Child, Duration), &'static str> {
+    spawn_verified_cli_with(budget, || process.spawn()).await
+}
+
+#[cfg(target_os = "linux")]
+async fn spawn_verified_cli_with(
+    budget: Duration,
+    mut spawn: impl FnMut() -> std::io::Result<tokio::process::Child>,
+) -> Result<(tokio::process::Child, Duration), &'static str> {
+    let started = tokio::time::Instant::now();
+    let mut retry_delay = Duration::from_millis(1);
+    let error = loop {
+        match spawn() {
+            Ok(child) => return Ok((child, budget.saturating_sub(started.elapsed()))),
+            Err(error) => {
+                // ETXTBSY refuses exec before the CLI can run. Retry only this
+                // condition, using the same verified private path and args.
+                let remaining = budget.saturating_sub(started.elapsed());
+                if error.raw_os_error() != Some(libc::ETXTBSY) || remaining.is_zero() {
+                    break error;
+                }
+                // Failed exec can still create a process. Back off a persistent
+                // busy writer instead of forking every millisecond for minutes.
+                tokio::time::sleep(remaining.min(retry_delay)).await;
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(1));
+                if started.elapsed() >= budget {
+                    break error;
+                }
+            }
+        }
+    };
+    #[cfg(test)]
+    eprintln!(
+        "Nova verified CLI spawn failed: kind={:?} raw_os_error={:?}",
+        error.kind(),
+        error.raw_os_error()
+    );
+    #[cfg(not(test))]
+    let _ = error;
+    Err("status_failed")
+}
+
 async fn run_cli(
     command: &VerifiedCli,
     args: &[OsString],
@@ -576,7 +624,10 @@ async fn run_cli(
         .kill_on_drop(cfg!(not(unix)));
     #[cfg(unix)]
     process.process_group(0);
-    let child = process.spawn().map_err(|_| "status_failed")?;
+    #[cfg(target_os = "linux")]
+    let (child, read_timeout) = spawn_verified_cli(&mut process, timeout).await?;
+    #[cfg(not(target_os = "linux"))]
+    let (child, read_timeout) = (process.spawn().map_err(|_| "status_failed")?, timeout);
     #[cfg(unix)]
     let mut child = ProcessGroup { child, armed: true };
     #[cfg(not(unix))]
@@ -587,7 +638,7 @@ async fn run_cli(
     let pipes = &mut child;
     let stdout = pipes.stdout.take().expect("piped Nova stdout");
     let stderr = pipes.stderr.take().expect("piped Nova stderr");
-    let result = tokio::time::timeout(timeout, async {
+    let result = tokio::time::timeout(read_timeout, async {
         #[cfg(unix)]
         let wait = child.wait_without_reaping();
         #[cfg(not(unix))]

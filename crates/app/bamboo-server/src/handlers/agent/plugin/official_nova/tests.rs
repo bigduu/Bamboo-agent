@@ -1109,3 +1109,6 @@ async fn already_installed_is_reported_without_retrying_or_replacing_the_app() {
 }
 
 mod lifecycle_tests;
+
+#[cfg(target_os = "linux")]
+mod spawn_busy;
