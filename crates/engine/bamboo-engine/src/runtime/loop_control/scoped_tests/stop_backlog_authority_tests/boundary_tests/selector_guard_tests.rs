@@ -40,9 +40,10 @@ async fn scoped_stop_selector_preserves_unmatched_corruption_without_blocking_re
     let dir = inbox_directory(&h);
     let gate = install_gate(&mut h, GatePhase::BeforeCheckpoint);
     let control = gate.clone();
+    let pending_tail_id = tail_id.clone();
     let injector = async move {
         control.entered.notified().await;
-        let (tail_name, tail_bytes) = raw_pending(&dir, &tail_id).await;
+        let (tail_name, tail_bytes) = raw_pending(&dir, &pending_tail_id).await;
         let mut foreign = serde_json::from_slice::<Value>(&tail_bytes).unwrap();
         foreign["body"]["body"]["data"]["binding"]["execution_id"] =
             serde_json::json!("other-execution-not-this-owner");
