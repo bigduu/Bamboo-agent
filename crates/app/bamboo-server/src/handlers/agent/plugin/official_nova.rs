@@ -577,6 +577,7 @@ async fn spawn_verified_cli_with(
     mut spawn: impl FnMut() -> io::Result<tokio::process::Child>,
 ) -> Result<(tokio::process::Child, Duration), &'static str> {
     let started = tokio::time::Instant::now();
+    let mut retry_delay = Duration::from_millis(1);
     let error = loop {
         match spawn() {
             Ok(child) => return Ok((child, budget.saturating_sub(started.elapsed()))),
@@ -587,7 +588,10 @@ async fn spawn_verified_cli_with(
                 if error.raw_os_error() != Some(libc::ETXTBSY) || remaining.is_zero() {
                     break error;
                 }
-                tokio::time::sleep(remaining.min(Duration::from_millis(1))).await;
+                // Failed exec can still create a process. Back off a persistent
+                // busy writer instead of forking every millisecond for minutes.
+                tokio::time::sleep(remaining.min(retry_delay)).await;
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(1));
                 if started.elapsed() >= budget {
                     break error;
                 }
