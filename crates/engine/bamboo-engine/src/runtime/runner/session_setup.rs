@@ -124,6 +124,9 @@ pub(crate) async fn prepare_session_for_loop(
     must_resume_pinned_activation: bool,
     event_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
 ) -> super::Result<Option<TaskLoopContext>> {
+    // Reject before migration, outbox publication or any checkpoint can turn
+    // a prohibited legacy activation into ordinary model-visible history.
+    legacy_instruction::validate_execution_selection(session)?;
     // Resume compatibility: recover metadata before any workspace-scoped skill
     // or instruction lookup, then permanently remove the legacy prompt marker.
     migrate_legacy_workspace_prompt(session);

@@ -1,9 +1,11 @@
 //! Bound cumulative tool-image URL bytes before native request cloning/serialization.
-use bamboo_domain::{Message, MessagePart, Role};
+use bamboo_domain::{Message, MessagePart, Role, ToolResultImage};
 
 pub(crate) const MAX_TOOL_IMAGE_URL_BYTES: usize = 32 * 1024 * 1024;
 
-pub(crate) fn validate_tool_image_budget<'a>(
+/// Check a borrowed request's cumulative tool-image transport size before
+/// cloning, rewriting to an auxiliary request, or provider serialization.
+pub fn validate_tool_image_budget<'a>(
     messages: impl IntoIterator<Item = &'a Message>,
 ) -> Result<(), String> {
     let mut total = 0usize;
@@ -14,12 +16,32 @@ pub(crate) fn validate_tool_image_budget<'a>(
         for part in message.content_parts.iter().flatten() {
             if let MessagePart::ImageUrl { image_url } = part {
                 let size = image_url.url.len();
-                if size > MAX_TOOL_IMAGE_URL_BYTES.saturating_sub(total) {
-                    return Err("Tool image batch exceeds the 32 MiB cumulative encoded-image limit; no request was sent and image history was preserved. Use smaller images or a smaller batch.".into());
-                }
-                total += size;
+                add_image_size(&mut total, size)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn add_image_size(total: &mut usize, size: usize) -> Result<(), String> {
+    if size > MAX_TOOL_IMAGE_URL_BYTES.saturating_sub(*total) {
+        return Err("Tool image batch exceeds the 32 MiB cumulative encoded-image limit; no request was sent and image history was preserved. Use smaller images or a smaller batch.".into());
+    }
+    *total += size;
+    Ok(())
+}
+
+/// Check borrowed tool images before a Vision fallback clones them or changes
+/// their transport role from tool output to an auxiliary user-image request.
+pub fn validate_tool_result_images(images: &[ToolResultImage]) -> Result<(), String> {
+    let mut total = 0usize;
+    for image in images {
+        let size = image
+            .data
+            .len()
+            .saturating_add(image.mime_type.len())
+            .saturating_add("data:;base64,".len());
+        add_image_size(&mut total, size)?;
     }
     Ok(())
 }

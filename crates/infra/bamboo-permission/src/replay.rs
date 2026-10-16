@@ -14,7 +14,7 @@ tokio::task_local! {
 struct PermissionReplayIdentity {
     session_id: String,
     request_id: String,
-    request_generation: String,
+    request_generation: Option<String>,
 }
 
 /// Run one tool dispatch with its exact approved request identity installed.
@@ -27,14 +27,28 @@ pub async fn with_permission_replay_generation<F, T>(
 where
     F: Future<Output = T>,
 {
-    let identity = request_generation
-        .filter(|generation| !generation.trim().is_empty())
-        .map(|generation| PermissionReplayIdentity {
-            session_id: session_id.to_string(),
-            request_id: request_id.to_string(),
-            request_generation: generation.to_string(),
-        });
+    // Retain exact replay presence even for legacy approvals with no typed
+    // generation. Absence of a generation still cannot install a typed grant.
+    let identity = Some(PermissionReplayIdentity {
+        session_id: session_id.to_string(),
+        request_id: request_id.to_string(),
+        request_generation: request_generation
+            .filter(|generation| !generation.trim().is_empty())
+            .map(str::to_owned),
+    });
     PERMISSION_REPLAY.scope(identity, future).await
+}
+
+/// True only for the exact host-selected replay, including legacy replay
+/// without a generation. This observation never grants a permission.
+pub fn permission_replay_active(session_id: &str, tool_call_id: &str) -> bool {
+    PERMISSION_REPLAY
+        .try_with(|identity| {
+            identity.as_ref().is_some_and(|identity| {
+                identity.session_id == session_id && identity.request_id == tool_call_id
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Return the generation only for the exact replay currently being dispatched.
@@ -42,8 +56,11 @@ pub fn current_permission_replay_generation(session_id: &str, request_id: &str) 
     PERMISSION_REPLAY
         .try_with(|identity| {
             identity.as_ref().and_then(|identity| {
-                (identity.session_id == session_id && identity.request_id == request_id)
-                    .then(|| identity.request_generation.clone())
+                if identity.session_id == session_id && identity.request_id == request_id {
+                    identity.request_generation.clone()
+                } else {
+                    None
+                }
             })
         })
         .ok()
@@ -79,5 +96,41 @@ mod tests {
             current_permission_replay_generation("session-1", "request-1"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn replay_presence_includes_legacy_none_without_changing_generation_or_scope() {
+        for generation in [Some("generation-1"), None, Some("")] {
+            assert!(!permission_replay_active("session-1", "request-1"));
+            with_permission_replay_generation("session-1", "request-1", generation, async {
+                assert!(permission_replay_active("session-1", "request-1"));
+                assert!(!permission_replay_active("session-2", "request-1"));
+                assert!(!permission_replay_active("session-1", "request-2"));
+                assert_eq!(
+                    current_permission_replay_generation("session-1", "request-1").as_deref(),
+                    generation.filter(|value| !value.trim().is_empty()),
+                );
+                with_permission_replay_generation("session-2", "request-2", None, async {
+                    assert!(permission_replay_active("session-2", "request-2"));
+                    assert!(!permission_replay_active("session-1", "request-1"));
+                    assert_eq!(
+                        current_permission_replay_generation("session-2", "request-2"),
+                        None
+                    );
+                })
+                .await;
+                assert!(permission_replay_active("session-1", "request-1"));
+                assert_eq!(
+                    current_permission_replay_generation("session-1", "request-1").as_deref(),
+                    generation.filter(|value| !value.trim().is_empty()),
+                );
+            })
+            .await;
+            assert!(!permission_replay_active("session-1", "request-1"));
+            assert_eq!(
+                current_permission_replay_generation("session-1", "request-1"),
+                None
+            );
+        }
     }
 }

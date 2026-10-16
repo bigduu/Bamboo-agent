@@ -1965,7 +1965,13 @@ impl RunContext {
             },
         )
         .await?;
-        let result = self.dispatch(&step, input, &instance_id).await;
+        let result = self
+            .dispatch(&step, input, &instance_id)
+            .await
+            .and_then(|output| {
+                self.check_suspension_restriction()?;
+                Ok(output)
+            });
         let result = match result {
             Ok(output) => {
                 if let Some(schema) = &step.output_schema {
@@ -2058,6 +2064,9 @@ impl RunContext {
                     },
                 )
                 .await?;
+                // A host-owned Running refusal is terminal even when the
+                // definition normally continues after execution errors.
+                self.check_suspension_restriction()?;
                 match step.failure {
                     FailurePolicy::ContinueWithError => Ok(serde_json::json!({"error": error})),
                     FailurePolicy::SkipDependents => Err(failure(
@@ -2071,12 +2080,24 @@ impl RunContext {
         }
     }
 
+    fn check_suspension_restriction(&self) -> Result<(), WorkflowFailure> {
+        if bamboo_agent_core::tools::suspension_running_violated() {
+            return Err(failure(
+                WorkflowFailureCode::ExecutionFailed,
+                "workflow cannot continue after a forbidden Running outcome; cleanup requested, stop unconfirmed",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
     async fn dispatch(
         &self,
         step: &WorkflowStepDefinition,
         input: Value,
         instance_id: &str,
     ) -> Result<Value, WorkflowFailure> {
+        self.check_suspension_restriction()?;
         let session_id = { self.snapshot.lock().await.session_id.clone() };
         match &step.kind {
             WorkflowStepKind::Tool {
@@ -2143,11 +2164,15 @@ impl RunContext {
                         false,
                     ));
                 }
+                // A parallel sibling may have set the shared host flag
+                // while authorization, secret or session flags were awaited.
+                self.check_suspension_restriction()?;
                 let outcome = self
                     .engine
                     .tools
                     .execute_with_context_outcome(&call, context)
                     .await
+                    .map(ToolOutcome::enforce_suspension_restriction)
                     .map_err(|error| {
                         let (code, message, retryable) = match error {
                             bamboo_agent_core::tools::ToolError::NotFound(_) => (
@@ -2168,6 +2193,7 @@ impl RunContext {
                         };
                         failure(code, message, retryable)
                     })?;
+                self.check_suspension_restriction()?;
                 match outcome {
                     ToolOutcome::Completed(result) => {
                         let output = parse_tool_result(result)?;
@@ -2255,6 +2281,7 @@ impl RunContext {
                         self.ledger.lock().await.cost_micros = None;
                     }
                     self.checkpoint_usage("agent_reserved").await?;
+                    self.check_suspension_restriction()?;
                     match self
                         .engine
                         .agents
@@ -2352,6 +2379,7 @@ impl RunContext {
                     allowed_capabilities: self.allowed_capabilities.iter().cloned().collect(),
                 };
                 let parent_run_id = self.snapshot.lock().await.run_id.clone();
+                self.check_suspension_restriction()?;
                 let result = Box::pin(self.engine.run_internal(
                     nested,
                     self.bundle.clone(),

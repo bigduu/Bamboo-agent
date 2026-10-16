@@ -239,6 +239,13 @@ impl SkillInputFactory {
                 "Skill input is already appended or its ID collides".into(),
             ));
         }
+        if session.model_orchestration_only_enabled()
+            && (caller.invocation.is_some() || !selections.is_empty())
+        {
+            return Err(ToolError::Execution(
+                "Skill input is unavailable in orchestration-only sessions; delegate execution to an authorized worker".into(),
+            ));
+        }
         let access = SkillCatalogEligibility {
             ceiling: caller.ceiling.clone(),
             explicit: requested,
@@ -250,7 +257,7 @@ impl SkillInputFactory {
                 .disabled_skill_ids()
                 .into_iter()
                 .collect(),
-            deny_all: session.root_orchestration_only_enabled(),
+            deny_all: session.model_orchestration_only_enabled(),
         };
         // No Skill intent needs no publication, but still uses the same final
         // caller, Config and durable Session acceptance below.
@@ -611,7 +618,7 @@ impl SkillsListTool {
                 .disabled_skill_ids()
                 .into_iter()
                 .collect(),
-            deny_all: session.root_orchestration_only_enabled(),
+            deny_all: session.model_orchestration_only_enabled(),
         };
         let store = self.access.skill_store_for_session(&session).await?;
         #[cfg(test)]
@@ -819,7 +826,7 @@ fn scope_identity(
     (
         session.workspace_path_meta(),
         session.project_id_meta(),
-        session.root_orchestration_only_enabled(),
+        session.model_orchestration_only_enabled(),
         session.root_tool_authority_revision,
     )
 }

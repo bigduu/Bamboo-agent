@@ -100,6 +100,7 @@ mod output_cap_observation;
 pub mod registry;
 pub mod result_handler;
 pub mod smart_code_review;
+mod suspension;
 pub mod tool_runtime;
 pub mod types;
 
@@ -122,11 +123,17 @@ pub use registry::{
 };
 pub use result_handler::{
     execute_sub_actions, handle_tool_result_with_agentic_support,
-    handle_tool_result_with_agentic_support_and_persistence, parse_tool_args,
-    parse_tool_args_best_effort, send_clarification_request, tool_start_arguments_for_display,
-    try_parse_agentic_result, ToolHandlingOutcome, MAX_SUB_ACTIONS,
+    handle_tool_result_with_agentic_support_and_persistence, is_waiting_for_children_control,
+    parse_tool_args, parse_tool_args_best_effort, send_clarification_request,
+    tool_result_requires_suspension, tool_start_arguments_for_display, try_parse_agentic_result,
+    ToolHandlingOutcome, MAX_SUB_ACTIONS,
 };
 pub use smart_code_review::SmartCodeReviewTool;
+pub use suspension::{
+    capture_suspension_restriction, current_tool_suspension_scope, observe_tool_suspension,
+    suspension_allowed, suspension_running_violated, with_suspension_disabled,
+    with_suspension_disabled_observed, SuspensionRestriction, ToolSuspensionObservation,
+};
 pub use tool_runtime::{
     AsyncToolCompletionInfo, AsyncToolCompletionSink, AsyncWaitKind, RunningCompletion,
     RunningHandle, ToolClass, ToolCtx, ToolOutcome, ToolResultFuture,
@@ -155,6 +162,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "memory_note",
     "session_history",
     "session_history_current",
+    "bamboo_diagnostics",
     "recall",
     "session_inspector",
     "archive_context",
@@ -210,6 +218,17 @@ pub fn plan_mode_allows_tool(tool_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_is_read_only_in_shared_plan_gate() {
+        assert_eq!(
+            classify_tool("bamboo_diagnostics"),
+            ToolMutability::ReadOnly
+        );
+        assert!(plan_mode_allows_tool("bamboo_diagnostics"));
+        assert!(plan_mode_allows_tool("BAMBOO_DIAGNOSTICS"));
+        assert!(!plan_mode_allows_tool("bamboo_diagnostics_repair"));
+    }
 
     #[test]
     fn classify_compact_context_as_read_only() {

@@ -236,6 +236,47 @@ pub(crate) fn sys_keepalive_envelope() -> ServerEnvelope {
     ServerEnvelope::control("sys", 0, serde_json::json!({ "type": "keepalive" }))
 }
 
+/// Opt-in observation continuity; never an execution capability.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ActorResumeRequest {
+    pub epoch: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ActorResumeRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ResumeVisitor;
+        impl<'de> serde::de::Visitor<'de> for ResumeVisitor {
+            type Value = ActorResumeRequest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an Actor resume object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut epoch = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key != "epoch" {
+                        return Err(serde::de::Error::unknown_field(&key, &["epoch"]));
+                    }
+                    if epoch.is_some() {
+                        return Err(serde::de::Error::duplicate_field("epoch"));
+                    }
+                    epoch = Some(map.next_value::<Option<String>>()?);
+                }
+                Ok(ActorResumeRequest {
+                    epoch: epoch.flatten(),
+                })
+            }
+        }
+        // Derived struct deserialization also accepts positional arrays. This
+        // opt-in protocol requires an object in JSON and MessagePack alike.
+        deserializer.deserialize_map(ResumeVisitor)
+    }
+}
+
 /// A client→server frame, tagged by `type`.
 ///
 /// Unknown / malformed frames deserialize to [`ClientFrame::Unknown`] (via the
@@ -257,6 +298,8 @@ pub(crate) enum ClientFrame {
         ch: String,
         #[serde(default)]
         since: Option<u64>,
+        #[serde(default)]
+        actor_resume: Option<ActorResumeRequest>,
     },
     /// Root tree continuity uses an opaque, scope-bound durable cursor rather
     /// than the numeric process-local Actor event sequence.
@@ -417,7 +460,8 @@ mod tests {
             f,
             ClientFrame::Subscribe {
                 ch: "feed".to_string(),
-                since: Some(1006)
+                since: Some(1006),
+                actor_resume: None,
             }
         );
         let tree: ClientFrame = serde_json::from_str(
@@ -437,9 +481,59 @@ mod tests {
             f,
             ClientFrame::Subscribe {
                 ch: "agent.s1".to_string(),
-                since: None
+                since: None,
+                actor_resume: None,
             }
         );
+    }
+
+    #[test]
+    fn actor_resume_opt_in_has_identical_json_and_msgpack_shapes() {
+        for epoch in [
+            serde_json::Value::Null,
+            json!("123e4567-e89b-42d3-a456-426614174000"),
+        ] {
+            let value = json!({"type":"subscribe","ch":"actor.child","since":5,"actor_resume":{"epoch":epoch}});
+            let expected = ClientFrame::Subscribe {
+                ch: "actor.child".into(),
+                since: Some(5),
+                actor_resume: Some(ActorResumeRequest {
+                    epoch: epoch.as_str().map(str::to_owned),
+                }),
+            };
+            assert_eq!(
+                decode_client_frame(Encoding::Json, &serde_json::to_vec(&value).unwrap()).unwrap(),
+                expected
+            );
+            assert_eq!(
+                decode_client_frame(Encoding::Msgpack, &rmp_serde::to_vec_named(&value).unwrap())
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn actor_resume_rejects_private_unknown_and_wrong_typed_fields() {
+        for resume in [
+            json!({"epoch":12}),
+            json!({"epoch":null,"worker_token":"private"}),
+            json!([]),
+            json!([null]),
+        ] {
+            let value = json!({"type":"subscribe","ch":"actor.child","actor_resume":resume});
+            assert!(
+                decode_client_frame(Encoding::Json, &serde_json::to_vec(&value).unwrap()).is_err()
+            );
+            assert!(decode_client_frame(
+                Encoding::Msgpack,
+                &rmp_serde::to_vec_named(&value).unwrap()
+            )
+            .is_err());
+        }
+        assert!(decode_client_frame(Encoding::Json,
+            br#"{"type":"subscribe","ch":"actor.child","actor_resume":{"epoch":null,"epoch":null}}"#
+        ).is_err());
     }
 
     #[test]
@@ -614,10 +708,12 @@ mod tests {
             ClientFrame::Subscribe {
                 ch: "feed".into(),
                 since: Some(1006),
+                actor_resume: None,
             },
             ClientFrame::Subscribe {
                 ch: "agent.s1".into(),
                 since: None,
+                actor_resume: None,
             },
             ClientFrame::SubscribeTree {
                 ch: "tree.root".into(),
@@ -637,7 +733,7 @@ mod tests {
                 ClientFrame::Hello { device_id, token } => {
                     json!({ "type": "hello", "device_id": device_id, "token": token })
                 }
-                ClientFrame::Subscribe { ch, since } => {
+                ClientFrame::Subscribe { ch, since, .. } => {
                     json!({ "type": "subscribe", "ch": ch, "since": since })
                 }
                 ClientFrame::SubscribeTree { ch, cursor } => {
@@ -688,7 +784,8 @@ mod tests {
             decoded,
             ClientFrame::Subscribe {
                 ch: "feed".into(),
-                since: Some(5)
+                since: Some(5),
+                actor_resume: None,
             }
         );
     }

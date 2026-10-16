@@ -54,7 +54,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 pub use builder::AgentBuilder;
-pub use execute_request::{CountedLoopConfig, ExecuteRequestBuilder};
+pub use execute_request::{
+    inspect_loop, CountedLoopConfig, ExecuteRequestBuilder, LoopControlConfig, LoopControlReceipt,
+    LoopStatusSnapshot,
+};
 use tokio::sync::mpsc;
 
 use approval_replay::ReplayDisposition;

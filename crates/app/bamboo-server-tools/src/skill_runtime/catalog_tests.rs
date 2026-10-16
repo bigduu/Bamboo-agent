@@ -4047,3 +4047,114 @@ async fn skill_factory_self_owned_waits_for_owner_without_retaining_config_read_
             .is_ok()
     );
 }
+
+#[tokio::test]
+async fn supervisor_delegation_first_catalog_and_factory_keep_skill_authority_denied_in_both_modes()
+{
+    for ultra in [false, true] {
+        let mut fixture = Fixture::new(2).await;
+        let storage = Arc::new(
+            bamboo_storage::SessionStoreV2::new(fixture._directory.path().join("supervisor-data"))
+                .await
+                .unwrap(),
+        );
+        fixture.repo = bamboo_engine::SessionRepository::new(
+            bamboo_engine::SessionCache::default(),
+            storage.clone(),
+            Arc::new(bamboo_storage::LockedSessionStore::new(storage)),
+        );
+        fixture.tool = SkillsListTool::new(
+            fixture.manager.clone(),
+            fixture.config.clone(),
+            fixture.repo.clone(),
+            fixture.resolver.clone(),
+        );
+        let bootstrap = bamboo_engine::session_app::supervisor::SupervisorSessionService::new(
+            fixture.repo.storage().clone(),
+        )
+        .get_or_create_default("model")
+        .await
+        .unwrap();
+        let mut session = fixture
+            .repo
+            .storage()
+            .load_session(&bootstrap.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        session.set_root_orchestration_only(ultra).unwrap();
+        fixture.repo.save(&mut session).await.unwrap();
+        let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
+        fixture.ctx.session_id = Some(session.id.clone().into());
+        fixture
+            .resolver
+            .0
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .session_id = session.id.clone();
+        let before = serde_json::to_value(&session).unwrap();
+        let prepared = fixture
+            .input_factory()
+            .prepare_input(
+                &fixture.ctx,
+                &user,
+                SkillInputSession::Existing,
+                &selections,
+            )
+            .await;
+        assert!(
+            prepared.is_err(),
+            "Supervisor Ultra={ultra}: factory prepared an execution Skill"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                fixture
+                    .repo
+                    .storage()
+                    .load_session(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            before
+        );
+
+        session.add_message(user);
+        fixture.repo.save(&mut session).await.unwrap();
+        let before = serde_json::to_value(&session).unwrap();
+        assert_eq!(
+            fixture
+                .tool
+                .render_catalog(&fixture.ctx)
+                .await
+                .unwrap()
+                .included_count,
+            0
+        );
+        assert!(fixture.page(None, 20).await.unwrap().1["skills"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(fixture
+            .tool
+            .selected_source(&fixture.ctx, "catalog-0", "SKILL.md")
+            .await
+            .is_err());
+        assert_eq!(
+            serde_json::to_value(
+                fixture
+                    .repo
+                    .storage()
+                    .load_session(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            before
+        );
+    }
+}

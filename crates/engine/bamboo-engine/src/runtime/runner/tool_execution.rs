@@ -18,7 +18,7 @@ use bamboo_domain::{
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 
-pub(crate) use no_progress::pause_for_no_progress;
+pub(crate) use no_progress::{pause_for_no_progress, pause_for_quiet_polling};
 pub(crate) use policy::ToolPolicyGuard;
 
 fn build_context_pressure(session: &Session) -> Option<output_compressor::ContextPressure> {
@@ -64,6 +64,7 @@ mod per_call;
 mod policy;
 #[cfg(test)]
 mod progress_hint_tests;
+mod quiet_poll;
 #[cfg(test)]
 mod supervisor_dispatch_tests;
 mod task;
@@ -188,14 +189,10 @@ async fn execute_and_apply_single_tool_call(
                 needs_human: None,
                 portable_tool: None,
                 post_tool_hook_eligible: false,
+                managed_running_violation: false,
                 result: Err(format!("Plan mode: {} operation blocked", tool_name)),
                 tool_duration: std::time::Duration::ZERO,
             };
-            policy_guard.observe_execution_outcome(
-                tool_call,
-                &outcome,
-                admitted_execution_name.as_deref(),
-            );
             let task_hint = build_task_compression_hint(task_context);
             let outcome = output_compressor::maybe_compress(
                 &tool_call.function.name,
@@ -212,6 +209,8 @@ async fn execute_and_apply_single_tool_call(
             .await;
             let should_break = per_call::apply_tool_execution_outcome(
                 per_call::ToolExecutionApplyContext {
+                    policy_guard,
+                    admitted_execution_name: admitted_execution_name.as_deref(),
                     tool_call,
                     event_tx,
                     metrics_collector,
@@ -236,14 +235,43 @@ async fn execute_and_apply_single_tool_call(
         }
     }
 
+    let quiet_guard_active = no_progress::quiet_poll_guard_active(session, runtime_state, config);
+    if quiet_guard_active && policy_guard.quiet_polls.pending() {
+        policy_guard.quiet_polls.retain_owned_handles(
+            &bamboo_tools::tools::bash_runtime::uncollected_polled_shells_for_session(session_id),
+        );
+    }
+    let suppressed = quiet_guard_active
+        .then(|| {
+            policy_guard
+                .quiet_polls
+                .suppress(tool_call, admitted_execution_name.as_deref())
+        })
+        .flatten();
     let mut stop_round = false;
     let outcome = match policy_guard.check_before_execution_for_name(
         tool_call,
         reserved_calls,
         admitted_execution_name.as_deref(),
     ) {
+        Ok(()) if suppressed.is_some() => per_call::ToolExecutionOutcome {
+            output_cap: None,
+            permission_replay_origin: None,
+            needs_human: None,
+            portable_tool: per_call::portable_tool_for_admitted_call(
+                effective_callable_set,
+                tool_call,
+            ),
+            post_tool_hook_eligible: false,
+            managed_running_violation: false,
+            result: Ok(suppressed.expect("checked suppression")),
+            tool_duration: std::time::Duration::ZERO,
+        },
         Ok(()) => {
-            per_call::execute_model_requested_tool_call_only(
+            let managed_parallel_call = crate::runtime::loop_control::suspension::active(config)
+                && scheduling_mode_for_tool_call(tool_call, tools)
+                    == ToolSchedulingMode::ParallelSafe;
+            let dispatch = per_call::execute_model_requested_tool_call_only(
                 effective_callable_set,
                 per_call::ToolExecutionOnlyContext {
                     vision_support,
@@ -267,8 +295,51 @@ async fn execute_and_apply_single_tool_call(
                     session_flags,
                     available_tool_schemas,
                 },
-            )
-            .await?
+            );
+            if managed_parallel_call {
+                // Routing an active managed call through the sequential apply
+                // boundary must retain the old parallel path's finite limits.
+                let timeout = std::time::Duration::from_secs(
+                    config
+                        .per_tool_timeout_secs
+                        .min(config.parallel_batch_timeout_secs),
+                );
+                match bamboo_infrastructure::telemetry::with_timeout(timeout, dispatch).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        let violation = bamboo_agent_core::tools::suspension_running_violated();
+                        if violation {
+                            if let Some(resources) = bamboo_tools::LocalTaskResources::current() {
+                                resources.record_unconfirmed(
+                                    crate::runtime::loop_control::suspension::RUNNING_REFUSAL,
+                                );
+                            }
+                        }
+                        per_call::ToolExecutionOutcome {
+                            output_cap: None,
+                            permission_replay_origin: None,
+                            needs_human: None,
+                            portable_tool: per_call::portable_tool_for_admitted_call(
+                                effective_callable_set,
+                                tool_call,
+                            ),
+                            post_tool_hook_eligible: !violation,
+                            managed_running_violation: violation,
+                            result: Err(if violation {
+                                crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into()
+                            } else {
+                                format!(
+                                    "Tool '{}' timed out after {:?}",
+                                    tool_call.function.name, timeout
+                                )
+                            }),
+                            tool_duration: timeout,
+                        }
+                    }
+                }
+            } else {
+                dispatch.await?
+            }
         }
         Err(violation) => {
             stop_round = violation.should_stop_round();
@@ -287,6 +358,7 @@ async fn execute_and_apply_single_tool_call(
                 needs_human: None,
                 portable_tool: None,
                 post_tool_hook_eligible: false,
+                managed_running_violation: false,
                 result: Err(message),
                 tool_duration: std::time::Duration::ZERO,
             }
@@ -295,6 +367,17 @@ async fn execute_and_apply_single_tool_call(
 
     // Compare raw output: changing evidence hidden by compression is still progress.
     policy_guard.observe_raw_observation(tool_call, &outcome.result);
+    if quiet_guard_active {
+        policy_guard
+            .quiet_polls
+            .observe(tool_call, &outcome, admitted_execution_name.as_deref());
+        // Foreign implementations under the reserved spelling cannot retain
+        // evidence for an absent handle or another owner's command. Expired
+        // handles must not permanently occupy the bounded policy capacity.
+        policy_guard.quiet_polls.retain_owned_handles(
+            &bamboo_tools::tools::bash_runtime::uncollected_polled_shells_for_session(session_id),
+        );
+    }
     // Use exactly the scalar observed by this dispatch, including unknown/zero.
     // Pre-dispatch failures retain the original local projection.
     let max_tool_tokens = outcome
@@ -317,12 +400,10 @@ async fn execute_and_apply_single_tool_call(
         task_hint.as_ref(),
     )
     .await;
-    // The output budget may turn an otherwise successful browser download
-    // into a bounded failure. Count the result the model actually receives.
-    policy_guard.observe_execution_outcome(tool_call, &outcome, admitted_execution_name.as_deref());
-
     let should_break = per_call::apply_tool_execution_outcome(
         per_call::ToolExecutionApplyContext {
+            policy_guard,
+            admitted_execution_name: admitted_execution_name.as_deref(),
             tool_call,
             event_tx,
             metrics_collector,
@@ -482,6 +563,35 @@ pub(crate) struct RoundToolExecution<'a, 'frame> {
 pub(crate) async fn execute_round_tool_calls(
     execution: RoundToolExecution<'_, '_>,
 ) -> Result<RoundToolExecutionResult, AgentError> {
+    // Retain observation outside the pre-Start parallel timeouts. Per-call
+    // observers share this token, even if their futures are dropped.
+    let control = execution.frame.config.loop_control.as_ref();
+    let dispatch = execute_round_tool_calls_inner(execution);
+    if let Some(control) = control {
+        let (result, observation) =
+            bamboo_agent_core::tools::observe_tool_suspension(false, dispatch).await;
+        if observation.running_seen {
+            control.record_running_observed();
+        }
+        if observation.forbidden_running_seen {
+            if let Some(resources) = bamboo_tools::LocalTaskResources::current() {
+                resources
+                    .record_unconfirmed(crate::runtime::loop_control::suspension::RUNNING_REFUSAL);
+            }
+            result?;
+            return Err(AgentError::Tool(
+                crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into(),
+            ));
+        }
+        result
+    } else {
+        dispatch.await
+    }
+}
+
+async fn execute_round_tool_calls_inner(
+    execution: RoundToolExecution<'_, '_>,
+) -> Result<RoundToolExecutionResult, AgentError> {
     let RoundToolExecution {
         tool_calls,
         frame,
@@ -536,7 +646,18 @@ pub(crate) async fn execute_round_tool_calls(
     } else {
         tool_calls
             .iter()
-            .map(|tc| scheduling_mode_for_tool_call(tc, tools))
+            .map(|tc| {
+                if no_progress::quiet_poll_guard_active(session, runtime_state, config)
+                    && effective_callable_set
+                        .resolve_callable_reference(&tc.function.name)
+                        .as_deref()
+                        == Some("write_stdin")
+                {
+                    ToolSchedulingMode::Sequential
+                } else {
+                    scheduling_mode_for_tool_call(tc, tools)
+                }
+            })
             .collect()
     };
 
@@ -544,7 +665,11 @@ pub(crate) async fn execute_round_tool_calls(
     'tool_calls: while next_index < tool_calls.len() {
         let tool_call = &tool_calls[next_index];
 
-        if scheduling_modes[next_index] == ToolSchedulingMode::ParallelSafe {
+        // Managed calls must retain one owned cleanup/apply boundary. Re-read
+        // after each call: Start may have activated within this same batch.
+        if scheduling_modes[next_index] == ToolSchedulingMode::ParallelSafe
+            && !crate::runtime::loop_control::suspension::active(config)
+        {
             let batch_start = next_index;
             while next_index < tool_calls.len()
                 && scheduling_modes[next_index] == ToolSchedulingMode::ParallelSafe
@@ -688,12 +813,12 @@ pub(crate) async fn execute_round_tool_calls(
             let output_cap = session
                 .effective_token_budget()
                 .map(|budget| budget.max_tool_output_tokens);
-            let outcomes = tokio::time::timeout(
+            let outcomes = bamboo_infrastructure::telemetry::with_timeout(
                 batch_timeout,
                 join_all(batch.iter().map(|tool_call| {
                     let timeout = per_tool_timeout;
                     async move {
-                        tokio::time::timeout(
+                        bamboo_infrastructure::telemetry::with_timeout(
                             timeout,
                             per_call::execute_model_requested_tool_call_only(
                                 effective_callable_set,
@@ -729,6 +854,7 @@ pub(crate) async fn execute_round_tool_calls(
                                     tool_call,
                                 ),
                                 post_tool_hook_eligible: true,
+                                managed_running_violation: false,
                                 result: Err(format!(
                                     "Tool '{}' timed out after {:?}",
                                     tool_call.function.name, timeout
@@ -759,6 +885,7 @@ pub(crate) async fn execute_round_tool_calls(
                                 batch_call,
                             ),
                             post_tool_hook_eligible: true,
+                            managed_running_violation: false,
                             result: Err(format!(
                                 "Parallel batch timed out after {:?}",
                                 batch_timeout
@@ -837,16 +964,13 @@ pub(crate) async fn execute_round_tool_calls(
                 .await;
 
             for (batch_call, outcome) in batch.iter().zip(compressed) {
-                policy_guard.observe_execution_outcome(
-                    batch_call,
-                    &outcome,
-                    effective_callable_set
-                        .resolve_callable_reference(&batch_call.function.name)
-                        .as_deref(),
-                );
+                let admitted_execution_name =
+                    effective_callable_set.resolve_callable_reference(&batch_call.function.name);
 
                 let should_break = per_call::apply_tool_execution_outcome(
                     per_call::ToolExecutionApplyContext {
+                        policy_guard,
+                        admitted_execution_name: admitted_execution_name.as_deref(),
                         tool_call: batch_call,
                         event_tx,
                         metrics_collector,
@@ -2877,13 +3001,34 @@ mod tests {
                 parallel_batch_timeout_secs: if batch_timeout { 1 } else { 10 },
                 ..Default::default()
             };
-            cap_fixture_round(&mut session, executor.clone(), config).await;
+            let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+            trace
+                .scope(cap_fixture_round(&mut session, executor.clone(), config))
+                .await;
+            let spans = trace.spans();
+            assert_eq!(spans.len(), 2);
             assert_eq!(
                 executor.seen.lock().unwrap().len(),
                 2,
                 "both actual dispatch scopes started"
             );
             for id in ["cap-a", "cap-b"] {
+                let matching = spans
+                    .iter()
+                    .filter(|span| {
+                        span.attributes.iter().any(|kv| {
+                            kv.key.as_str() == "gen_ai.tool.call.id" && kv.value.to_string() == id
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(matching.len(), 1);
+                assert_eq!(matching[0].name, "execute_tool cap_probe");
+                for (key, value) in [("error.type", "timeout"), ("bamboo.outcome", "error")] {
+                    assert!(matching[0]
+                        .attributes
+                        .iter()
+                        .any(|kv| kv.key.as_str() == key && kv.value.to_string() == value));
+                }
                 let replies: Vec<_> = session
                     .messages
                     .iter()
@@ -2913,6 +3058,33 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|(_, cap)| *cap == Some(0)));
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_cancelled_tool_dispatches_are_not_timeouts() {
+        for parallel in [false, true] {
+            let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+            let mut session = Session::new("cap-cancelled", "model");
+            let executor = cap_executor(parallel, true);
+            let mut run = Box::pin(trace.scope(cap_fixture_round(
+                &mut session,
+                executor.clone(),
+                Default::default(),
+            )));
+            assert!(futures::poll!(run.as_mut()).is_pending());
+            let expected = if parallel { 2 } else { 1 };
+            assert_eq!(executor.seen.lock().unwrap().len(), expected);
+            drop(run);
+            let spans = trace.spans();
+            assert_eq!(spans.len(), expected);
+            for span in spans {
+                for key in ["error.type", "bamboo.outcome"] {
+                    assert!(span
+                        .attributes
+                        .iter()
+                        .any(|kv| kv.key.as_str() == key && kv.value.to_string() == "cancelled"));
+                }
+            }
         }
     }
 }

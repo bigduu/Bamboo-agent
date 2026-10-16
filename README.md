@@ -92,6 +92,8 @@ Headless runs use the full agent runtime and the configured provider. If an inte
 
 No key yet? `bamboo -p "ping" --echo` is a **transport smoke test only**: it uses an echo executor, not an LLM, and does not demonstrate model reasoning or successful tool work.
 
+To submit to an already running Bamboo or Bodhi backend from a source checkout, use the [local Supervisor task client](./docs/guides/SUPERVISOR_TASK_CLI.md): `node scripts/bamboo-task.cjs inspect`. It reports backend compatibility before enabling submission or exact-run cancellation.
+
 ### Call it from your application
 
 With a configured provider and running server, the legacy HTTP/SSE sequence is **chat → subscribe → execute**. Native `chat` saves session configuration and admits a typed Inbox message with its own RespectSpecificWait intent. Canonical history and `MessageAppended` appear when an existing same-session consumer checkpoints and ACKs it; `execute` starts the agent loop. The example requires `curl` and `jq`; replace the model with one your account supports. In terminal A, create the session and open its live event stream:
@@ -124,6 +126,9 @@ does not release staged child/Bash outcomes; their coordinator retains that orde
 Referenced/ticket and Root ingress keep their existing scheduling rules.
 
 Watch terminal A for live events; subscribing after execution can miss response tokens. The browser uses the shared `/v2/stream` WebSocket; legacy SSE routes remain available.
+
+Responses forwarding at `/openai/v1/responses` accepts up to 128 tool entries
+per request; see the [Responses tool limit](./docs/guides/API.md#responses-tool-limit).
 
 ### Use it as a Rust SDK (in-process)
 

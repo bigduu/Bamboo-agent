@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 18] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 19] = [
     "exec_command",
     "write_stdin",
     "Edit",
@@ -21,6 +21,7 @@ pub const BUILTIN_GUIDE_NAMES: [&str; 18] = [
     "Sleep",
     "Task",
     "update_goal",
+    "loop_control",
     "ViewImage",
     "WebFetch",
     "Workspace",
@@ -134,14 +135,14 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "write_stdin" => Some(guide(
             "write_stdin",
             ToolCategory::CommandExecution,
-            "Pull output and completion from an exec_command session owned by this conversation. Use chars=\"\" to wait/poll; yield_time_ms is bounded to 250–30000 ms (default 10000). Running results retain session_id; final results omit it and include exit_code when available. Output is incremental and bounded by max_output_tokens (default 2000, maximum 8192); output_omitted_bytes reports discarded bytes. For interactive=true sessions, nonempty chars writes exact bytes to the stdin pipe; include your own newline and use eof=true to close stdin. A lone Ctrl-C (\\u0003) stops the process.",
-            "Do not use a conversation ID or legacy Bash ID as session_id. Do not poll a finished session or wait for an automatic completion message. Input requires an interactive stdin pipe and does not provide PTY terminal behavior.",
+            "Pull output and completion from an exec_command session owned by this conversation. Use chars=\"\" to wait/poll; yield_time_ms is bounded to 250–30000 ms (default 10000). Running results retain session_id; final results omit it and include exit_code when available. Running polling metadata reports state, elapsed_ms, output_idle_ms, consecutive_empty_readouts and exit_observed. False exit_observed means no exit has been observed, not verified liveness; true still waits for terminal output capture. After repeated empty readouts and sustained silence, a polling advisory asks you to do useful work or inspect one command-owned progress signal before polling again. Continue waiting when appropriate, or report a concrete blocker, retaining the handle for final status. Repeatedly ignoring the quiet reminder can pause polling in a Human-controlled Root; the command remains pending. Handles are local to this Host; unread terminal results keep their existing five-minute expiry after completion, including during a diagnostic pause. Output is incremental and bounded by max_output_tokens (default 2000, maximum 8192); output_omitted_bytes reports discarded bytes. For interactive=true sessions, nonempty chars writes exact bytes to the stdin pipe; include your own newline and use eof=true to close stdin. A lone Ctrl-C (\\u0003) stops the process.",
+            "Do not use a conversation ID or legacy Bash ID as session_id. Do not blindly repeat identical empty polls, infer completion from silence or an existing report, or stop/restart a command only because it is quiet. Do not poll a finished session or wait for an automatic completion message. Input requires an interactive stdin pipe and does not provide PTY terminal behavior.",
             &["exec_command"],
             vec![
                 example(
                     "Pull a command's next output and exit status",
                     json!({"session_id":"<session_id-from-exec_command>","chars":"","yield_time_ms":1000}),
-                    "Repeat while status=running; a nonzero exit_code is a command outcome to inspect.",
+                    "While status=running, use polling progress and follow any advisory before another empty poll. Preserve the handle until final status; a nonzero exit_code is a command outcome to inspect.",
                 ),
                 example(
                     "Answer an interactive prompt and close input",
@@ -246,7 +247,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "ViewImage" => Some(guide(
             "ViewImage",
             ToolCategory::FileReading,
-            "Load a local raster image for visual inspection. With hooks.image_fallback enabled in vision mode, Bamboo replaces the image with the resolved vision model's description; otherwise the tool returns base64 multimodal image content.",
+            "Load a local raster image for visual inspection. Vision-capable main models receive multimodal image content. When the main model has Vision disabled, Bamboo uses the explicitly configured Vision model and returns a labeled description as untrusted tool data. This fallback applies only to this tool. Direct conversation image uploads to a main model without Vision remain rejected, even when a Vision model is configured. Missing or unsupported Vision configuration is an actionable tool error. The main model is unchanged.",
             "Do not use for text files, directories, SVG/vector files, or images larger than 10 MB; use Read for textual content.",
             &["Read", "GetFileInfo"],
             vec![example(
@@ -445,6 +446,35 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Use short waits between repeated status checks.",
             )],
         )),
+        "loop_control" => Some(guide(
+            "loop_control",
+            ToolCategory::TaskManagement,
+            "Manage one live bounded loop in your current host-admitted Standard ordinary Root execution. Inspect status first; use its generation and control_revision for CAS, preserving operation_id and payload on a retry. Start charges earlier rounds and injects its objective before the next provider call. An accepted objective edit applies only at the next iteration admission; read status to distinguish accepted and applied revisions. Bounds can only tighten. Stop prevents the next provider admission after the current tool batch drains.",
+            "Do not infer host capability or permission from this guide. Do not target another Session, pause/resume, add cadence, extend or reset budgets, restart a stopped generation, or treat an accepted edit as already applied. Existing Plan, Child, Ultra and Supervisor gates still apply. User cancellation and host revocation remain authoritative.",
+            &["Task"],
+            vec![
+                example(
+                    "Inspect this admitted execution",
+                    json!({"action":"status"}),
+                    "Observe current generation, control_revision, objective revisions and remaining host bounds.",
+                ),
+                example(
+                    "Start two bounded iterations",
+                    json!({"action":"start","operation_id":"00000000-0000-4000-8000-000000000001","expected_revision":0,"objective":"Verify the next item using the accumulated context.","max_iterations":2,"max_total_rounds":6}),
+                    "Use a fresh operation UUID. An absent prior loop uses revision zero; a retired prior generation must instead be named with its observed revision. Host ceilings include the round requesting start.",
+                ),
+                example(
+                    "Accept a new objective for the next iteration",
+                    json!({"action":"update","operation_id":"00000000-0000-4000-8000-000000000003","generation":"00000000-0000-4000-8000-000000000002","expected_revision":1,"objective":"Verify the remaining item independently."}),
+                    "Replace the example generation and revision with current status. At most one objective edit may be pending; its receipt names the effective iteration.",
+                ),
+                example(
+                    "Stop this generation",
+                    json!({"action":"stop","operation_id":"00000000-0000-4000-8000-000000000004","generation":"00000000-0000-4000-8000-000000000002","expected_revision":2}),
+                    "Use the observed generation and control revision. Stop is terminal for this generation and cannot replenish this activation.",
+                ),
+            ],
+        )),
         "update_goal" => Some(guide(
             "update_goal",
             ToolCategory::TaskManagement,
@@ -537,7 +567,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             "SubAgent",
             ToolCategory::TaskManagement,
             "Use only intent, target, role, message, and reply_to; omit unused fields. For chat (the default intent), put the complete assignment and needed paths in message: omit target to create a child, or reuse its returned logical ActorId to correct or continue it. role selects a profile only on creation; tools and permissions come from the runtime. intent=inspect with message=tree shows the owned tree; with target, message selects overview, diagnostics, messages, result, or error. For a page or selected full message, JSON-encode view/cursor/message_id inside message and omit unused query fields. intent=control uses target and message=cancel or retry. Children use intent=ask_parent with a bounded question. Direct parents reply with intent=chat, the exact pending ParentRequest id in reply_to, and the answer in message, omitting target and role; forced permission accepts exactly approve_once or deny. The runtime manages activation and waiting.",
-            "Do not use proactively for simple one-step tasks; from a child session, create a nested child only when the current assignment explicitly authorizes nested delegation and it is necessary; do not create multiple overlapping children with unclear responsibilities.",
+            "For ordinary executing Sessions, do not use proactively for simple one-step tasks. A trusted Supervisor delegates execution even for simple tasks and reports a recoverable blocker if no authorized worker is available. From a child session, create a nested child only when the current assignment explicitly authorizes nested delegation and it is necessary; do not create multiple overlapping children with unclear responsibilities.",
             &["Task"],
             vec![
                 example(
@@ -692,6 +722,15 @@ mod tests {
     }
 
     #[test]
+    fn loop_control_guide_examples_match_the_strict_command_contract() {
+        let guide = builtin_guide_spec("loop_control").expect("registered builtin guide");
+        for example in &guide.examples {
+            crate::tools::loop_control::parse_loop_control_request(&example.parameters.to_string())
+                .unwrap_or_else(|error| panic!("invalid loop_control example: {error}"));
+        }
+    }
+
+    #[test]
     fn default_shell_guides_teach_pull_results_and_keep_legacy_lookup_explicit() {
         let exec = builtin_guide_spec("exec_command").unwrap();
         assert!(exec.when_to_use.contains("session_id"));
@@ -702,6 +741,11 @@ mod tests {
         let poll = builtin_guide_spec("write_stdin").unwrap();
         assert!(poll.when_to_use.contains("final results omit it"));
         assert!(poll.when_to_use.contains("include your own newline"));
+        assert!(poll.when_to_use.contains("polling advisory"));
+        assert!(poll.when_to_use.contains("not verified liveness"));
+        assert!(poll
+            .when_not_to_use
+            .contains("infer completion from silence"));
         assert_eq!(poll.examples[0].parameters["chars"], "");
         for legacy in ["Bash", "BashInput", "BashOutput", "KillShell"] {
             assert!(!BUILTIN_GUIDE_NAMES.contains(&legacy));
