@@ -505,3 +505,127 @@ async fn vision_done_completes_description_without_waiting_for_transport_eof() {
     assert!(result.result.contains("completed visual description"));
     assert!(result.result.contains("Vision model output"));
 }
+
+struct MixedVisionProvider {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    failure: &'static str,
+}
+#[async_trait]
+impl LLMProvider for MixedVisionProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if call == 2 {
+            return FailingVisionProvider(self.failure)
+                .chat_stream(messages, tools, max, model)
+                .await;
+        }
+        Ok(Box::pin(stream::iter(vec![
+            Ok(LLMChunk::Token(format!("visible image {call}"))),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+fn legacy_image_messages(count: usize) -> Vec<Message> {
+    let mut parts = vec![ContentPart::Text {
+        text: "text before images".into(),
+    }];
+    for _ in 0..count {
+        parts.push(ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,DO-NOT-ECHO".into(),
+                detail: None,
+            },
+        });
+    }
+    parts.push(ContentPart::Text {
+        text: "text after images".into(),
+    });
+    vec![Message::user_with_parts(
+        "legacy image request",
+        parts.into_iter().map(Into::into).collect(),
+    )]
+}
+
+#[tokio::test]
+async fn legacy_vision_hook_omits_only_failed_images_while_viewimage_stays_strict() {
+    for failure in ["request", "stream"] {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn LLMProvider> = Arc::new(MixedVisionProvider {
+            calls: calls.clone(),
+            failure,
+        });
+        let mut messages = legacy_image_messages(3);
+        apply_image_fallback_to_llm_messages(
+            &mut messages,
+            ImageFallbackConfig {
+                mode: ImageFallbackMode::Vision,
+                vision_model: Some("configured-vision".into()),
+            },
+            None,
+            Some(&provider),
+        )
+        .await
+        .expect("the independent legacy hook continues after a per-image failure");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let text = &messages[0].content;
+        assert!(text.contains("visible image 1") && text.contains("visible image 3"));
+        assert!(text.contains("omitted (vision failed)"));
+        assert!(text.contains("text before images") && text.contains("text after images"));
+        assert!(!text.contains("DO-NOT-ECHO") && !text.contains("private-provider-token"));
+        assert!(messages[0].content_parts.is_none());
+
+        let strict_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let target = bamboo_llm::ResolvedModel::new(
+            Arc::new(MixedVisionProvider {
+                calls: strict_calls.clone(),
+                failure,
+            }),
+            "configured-vision",
+        );
+        let mut result = tool_image();
+        result.images = vec![result.images[0].clone(); 3];
+        let before = serde_json::to_value(&result).unwrap();
+        let error = super::describe_tool_images(&target, &mut result)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(strict_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(!error.contains("DO-NOT-ECHO") && !error.contains("private-provider-token"));
+        assert_eq!(serde_json::to_value(&result).unwrap(), before);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_vision_hook_omits_timed_out_images_and_drops_pending_work() {
+    for stall_request in [true, false] {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider: Arc<dyn LLMProvider> = Arc::new(StalledVisionProvider {
+            stall_request,
+            dropped: dropped.clone(),
+        });
+        let mut messages = legacy_image_messages(1);
+        let started = tokio::time::Instant::now();
+        apply_image_fallback_to_llm_messages(
+            &mut messages,
+            ImageFallbackConfig {
+                mode: ImageFallbackMode::Vision,
+                vision_model: Some("configured-vision".into()),
+            },
+            None,
+            Some(&provider),
+        )
+        .await
+        .expect("a legacy timeout produces an omitted-image placeholder");
+        assert!(started.elapsed() >= super::VISION_TIMEOUT);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(messages[0].content.contains("omitted (vision failed)"));
+        assert!(messages[0].content_parts.is_none());
+    }
+}

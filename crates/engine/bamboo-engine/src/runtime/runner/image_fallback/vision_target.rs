@@ -17,6 +17,7 @@ fn configuration_error() -> AgentError {
 /// permission to send local image bytes to another model or provider account.
 fn configured_target(
     config: &Config,
+    _active_provider: &str,
 ) -> Result<(ProviderModelRef, ProviderInstanceConfig), AgentError> {
     let legacy = bamboo_config::synthesize_legacy_instances(config);
     let find_instance = |provider: &str| {
@@ -80,13 +81,15 @@ fn configured_target(
 pub(crate) fn configured_vision_resolver(
     config: Arc<RwLock<Config>>,
     app_data_dir: Option<PathBuf>,
+    active_provider: String,
 ) -> VisionModelResolver {
     Arc::new(move || {
         let config = config.clone();
         let app_data_dir = app_data_dir.clone();
+        let active_provider = active_provider.clone();
         Box::pin(async move {
             let snapshot = config.read().await.clone();
-            let (target, instance) = configured_target(&snapshot)?;
+            let (target, instance) = configured_target(&snapshot, &active_provider)?;
             // Reuse the common instance factory for native Anthropic, Gemini,
             // Copilot, Bodhi and OpenAI protocols and their credential handling.
             // Do not initialize or probe any other provider.
