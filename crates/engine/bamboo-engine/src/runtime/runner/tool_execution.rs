@@ -236,6 +236,11 @@ async fn execute_and_apply_single_tool_call(
     }
 
     let quiet_guard_active = no_progress::quiet_poll_guard_active(session, runtime_state, config);
+    if quiet_guard_active && policy_guard.quiet_polls.pending() {
+        policy_guard.quiet_polls.retain_owned_handles(
+            &bamboo_tools::tools::bash_runtime::uncollected_polled_shells_for_session(session_id),
+        );
+    }
     let suppressed = quiet_guard_active
         .then(|| {
             policy_guard
@@ -366,15 +371,12 @@ async fn execute_and_apply_single_tool_call(
         policy_guard
             .quiet_polls
             .observe(tool_call, &outcome, admitted_execution_name.as_deref());
-        if let Some(handle) = policy_guard.quiet_polls.pending_handle() {
-            if !bamboo_tools::tools::bash_runtime::retain_polled_result_for_diagnosis(
-                session_id, handle,
-            ) {
-                // Foreign host implementations under the reserved spelling
-                // cannot pin an absent handle or another owner's command.
-                policy_guard.quiet_polls = Default::default();
-            }
-        }
+        // Foreign implementations under the reserved spelling cannot retain
+        // evidence for an absent handle or another owner's command. Expired
+        // handles must not permanently occupy the bounded policy capacity.
+        policy_guard.quiet_polls.retain_owned_handles(
+            &bamboo_tools::tools::bash_runtime::uncollected_polled_shells_for_session(session_id),
+        );
     }
     // Use exactly the scalar observed by this dispatch, including unknown/zero.
     // Pre-dispatch failures retain the original local projection.

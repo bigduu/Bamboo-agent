@@ -847,16 +847,7 @@ mod process_tests {
         let last_running = payload(poll_result(&shell, 0, None).await);
         assert!(last_running["polling"]["advisory"].is_string());
         assert_eq!(last_running["polling"]["state"], "needs_diagnosis");
-        assert!(
-            !state.retain_for_diagnosis(),
-            "diagnostics alone do not extend ordinary cache lifetime"
-        );
-        assert!(!bash_runtime::retain_polled_result_for_diagnosis(
-            "other-owner",
-            id
-        ));
-        assert!(bash_runtime::retain_polled_result_for_diagnosis(&owner, id));
-        assert!(state.retain_for_diagnosis());
+        assert_eq!(last_running["polling"]["terminal_result_ttl_ms"], 300_000);
         // Successful input/EOF interrupts the empty-readout streak even when
         // this command makes no stdout/stderr response to the input.
         for request in [
@@ -874,12 +865,6 @@ mod process_tests {
             assert!(after_input["polling"].get("advisory").is_none());
         }
         std::fs::write(release, b"release").unwrap();
-        state.wait(5_000).await;
-        bash_runtime::remove_expired_polled_shell(id);
-        assert!(
-            bash_runtime::get_shell(id).is_some(),
-            "diagnostic pause retains an unread terminal result past cache expiry"
-        );
         let terminal = poll(id, &owner).await;
         assert_eq!(terminal["status"], "completed");
         assert_eq!(terminal["output"], "tail");
@@ -887,6 +872,64 @@ mod process_tests {
         assert!(terminal.get("session_id").is_none());
         assert!(terminal.get("polling").is_none());
         assert!(bash_runtime::get_shell(id).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_terminal_cache_expiry_releases_capture_without_inventing_an_outcome() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("quiet-cache-{}", uuid::Uuid::new_v4());
+        let release = directory.path().join("release");
+        let _cleanup = InitialProcessCleanup {
+            owner: &owner,
+            release: release.clone(),
+        };
+        workspace_state::publish_resolved_workspace(&owner, directory.path().to_path_buf());
+        let first = start(
+            "while [ ! -f release ]; do sleep 0.01; done; printf tail; exit 7".into(),
+            &owner,
+            false,
+        )
+        .await;
+        let id = first["session_id"].as_str().unwrap();
+        let shell = bash_runtime::get_shell(id).unwrap();
+        let capture = Arc::downgrade(shell.polled.as_ref().unwrap());
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(
+            bash_runtime::get_shell(id).is_some(),
+            "running handles do not use the terminal-cache TTL"
+        );
+        assert!(WriteStdinTool::new()
+            .invoke(json!({"session_id":id}), context("different-owner"))
+            .await
+            .is_err());
+        tokio::time::resume();
+        std::fs::write(release, b"release").unwrap();
+        shell.polled.as_ref().unwrap().wait(5_000).await;
+        assert!(shell.polled.as_ref().unwrap().is_complete().await);
+        assert!(
+            bash_runtime::get_shell(id).is_some(),
+            "terminal result is initially readable"
+        );
+        tokio::time::pause();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(
+            bash_runtime::COMPLETED_SESSION_TTL_SECS + 1,
+        ))
+        .await;
+        tokio::task::yield_now().await;
+        assert!(bash_runtime::get_shell(id).is_none());
+        let expired = WriteStdinTool::new()
+            .invoke(json!({"session_id":id}), context(&owner))
+            .await;
+        assert!(
+            matches!(expired, Err(ToolError::Execution(ref text)) if text.contains("expire") && text.contains("Host restart"))
+        );
+        drop(shell);
+        assert!(
+            capture.upgrade().is_none(),
+            "expired capture releases its retained-session permit"
+        );
     }
 
     #[tokio::test]

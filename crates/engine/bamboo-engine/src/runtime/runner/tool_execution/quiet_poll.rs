@@ -112,8 +112,15 @@ impl QuietPollGuard {
         self.pending.is_some()
     }
 
-    pub(super) fn pending_handle(&self) -> Option<&str> {
-        self.pending.as_deref()
+    pub(super) fn retain_owned_handles(&mut self, handles: &[String]) {
+        self.readouts.retain(|id, _| handles.contains(id));
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|id| !handles.contains(id))
+        {
+            self.pending = None;
+        }
     }
 
     pub(super) fn suppress(&self, call: &ToolCall, admitted: Option<&str>) -> Option<ToolResult> {
@@ -214,6 +221,21 @@ mod tests {
                 Some("write_stdin")
             )
             .is_none());
+        assert!(guard
+            .suppress(
+                &call("Read", serde_json::json!({"session_id":"handle"})),
+                Some("Read")
+            )
+            .is_none());
+        assert!(guard
+            .suppress(
+                &call(
+                    "write_stdin",
+                    serde_json::json!({"session_id":"handle","eof":true})
+                ),
+                Some("write_stdin")
+            )
+            .is_none());
         // Explicit input remains dispatchable and real progress releases the gate.
         let input = call(
             "write_stdin",
@@ -271,6 +293,44 @@ mod tests {
         guard.observe(&poll, &failed, Some("write_stdin"));
         assert!(!guard.pending());
         guard.observe(&poll, &outcome(5, ""), Some("write_stdin"));
+        assert!(!guard.pending());
+    }
+
+    #[test]
+    fn expired_or_foreign_handles_release_the_bounded_guard_capacity() {
+        let mut guard = QuietPollGuard::default();
+        let mut handles = Vec::new();
+        for index in 0..MAX_HANDLES {
+            let id = format!("old-{index}");
+            handles.push(id.clone());
+            let poll = call("write_stdin", serde_json::json!({"session_id":id}));
+            let mut result = outcome(1, "");
+            let mut value: serde_json::Value =
+                serde_json::from_str(&result.result.as_ref().unwrap().result).unwrap();
+            value["session_id"] = id.into();
+            result.result = Ok(ToolResult::text(true, value.to_string()));
+            for _ in 0..READOUTS_AFTER_REMINDER {
+                guard.observe(&poll, &result, Some("write_stdin"));
+            }
+        }
+        guard.retain_owned_handles(&handles);
+        assert!(guard.pending());
+        let old = call(
+            "write_stdin",
+            serde_json::json!({"session_id":handles.last().unwrap()}),
+        );
+        assert!(guard.suppress(&old, Some("write_stdin")).is_some());
+        // Cache expiry, terminal consumption, or a different owner snapshot
+        // must free policy capacity as well as release any pending suppression.
+        guard.retain_owned_handles(&["handle".into()]);
+        assert!(!guard.pending());
+        assert!(guard.suppress(&old, Some("write_stdin")).is_none());
+        let current = call("write_stdin", serde_json::json!({"session_id":"handle"}));
+        for tick in 0..READOUTS_AFTER_REMINDER as u64 {
+            guard.observe(&current, &outcome(tick, ""), Some("write_stdin"));
+        }
+        assert!(guard.suppress(&current, Some("write_stdin")).is_some());
+        guard.retain_owned_handles(&[]);
         assert!(!guard.pending());
     }
 }

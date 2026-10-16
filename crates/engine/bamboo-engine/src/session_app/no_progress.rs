@@ -11,7 +11,7 @@ pub const CONTINUE_OPTION: &str = "Continue";
 pub const STOP_OPTION: &str = "Stop";
 const QUESTION_KIND: &str = "observation_progress_pause";
 pub(crate) const QUESTION_TEXT: &str = "The same successful file observations stayed unchanged for six consecutive rounds, including three rounds after the progress reminder. The run is paused. Continue, stop, or provide a different approach.";
-pub(crate) const QUIET_POLL_QUESTION_TEXT: &str = "Repeated command polls produced no new output after the quiet-command reminder. Polling is paused for diagnosis; the command remains pending and its handle is retained. Silence does not prove completion or failure. Continue waiting, stop this run, or provide a different approach.";
+pub(crate) const QUIET_POLL_QUESTION_TEXT: &str = "Repeated command polls produced no new output after the quiet-command reminder. Polling is paused for diagnosis; the command remains pending. Continue waiting, stop this run, or provide a different approach. The handle belongs to this Host; an unread terminal result expires five minutes after completion. Silence does not prove completion or failure.";
 
 /// Match our own persisted runtime question, not another tool with a similar name.
 pub fn is_no_progress_question(session: &Session, pending: &PendingQuestion) -> bool {

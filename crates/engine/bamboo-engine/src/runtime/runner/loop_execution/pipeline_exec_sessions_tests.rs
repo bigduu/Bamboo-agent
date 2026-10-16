@@ -14,6 +14,15 @@ use serde_json::{json, Value};
 // Release the command even when an assertion unwinds before the explicit poll.
 struct ReleaseGate(PathBuf);
 
+struct SideProcessCleanup(String);
+impl Drop for SideProcessCleanup {
+    fn drop(&mut self) {
+        if let Some(shell) = bamboo_tools::tools::bash_runtime::get_shell(&self.0) {
+            let _ = futures::FutureExt::now_or_never(shell.kill());
+        }
+    }
+}
+
 impl Drop for ReleaseGate {
     fn drop(&mut self) {
         let _ = std::fs::write(&self.0, b"release");
@@ -32,6 +41,7 @@ struct IgnoredQuietReminder {
     command: String,
     calls: AtomicUsize,
     handle: Mutex<Option<String>>,
+    side_handle: String,
 }
 
 #[async_trait::async_trait]
@@ -57,7 +67,7 @@ impl LLMProvider for IgnoredQuietReminder {
                 // Virtual time advances only the real capture/poll clocks, not
                 // the gated OS child or its actual wait/exit status.
                 tokio::time::advance(Duration::from_secs(90)).await;
-                (0..8)
+                let mut polls: Vec<_> = (0..8)
                     .map(|index| {
                         tool_call(
                             &format!("ignored-poll-{index}"),
@@ -66,7 +76,14 @@ impl LLMProvider for IgnoredQuietReminder {
                         "max_output_tokens":100+index}),
                         )
                     })
-                    .collect()
+                    .collect();
+                polls.push(tool_call("other-input", "write_stdin", json!({"session_id":self.side_handle,"chars":"side-input","eof":true,"yield_time_ms":250})));
+                polls.push(tool_call(
+                    "other-operation",
+                    "exec_command",
+                    json!({"cmd":"printf independent","yield_time_ms":250}),
+                ));
+                polls
             }
             round => panic!("quiet polling must pause before another provider request: {round}"),
         };
@@ -80,6 +97,8 @@ impl LLMProvider for IgnoredQuietReminder {
 struct ReadQuietCompletion {
     handle: String,
     calls: AtomicUsize,
+    gate: PathBuf,
+    wait_before_release: bool,
 }
 
 #[async_trait::async_trait]
@@ -91,7 +110,33 @@ impl LLMProvider for ReadQuietCompletion {
         _: Option<u32>,
         _: &str,
     ) -> Result<LLMStream, LLMError> {
-        let chunks = match self.calls.fetch_add(1, Ordering::SeqCst) {
+        let round = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.wait_before_release && round == 0 {
+            return Ok(Box::pin(stream::iter([
+                Ok(LLMChunk::ToolCalls(
+                    (0..3)
+                        .map(|index| {
+                            tool_call(
+                                &format!("continued-wait-{index}"),
+                                "write_stdin",
+                                json!({"session_id":self.handle,"yield_time_ms":250}),
+                            )
+                        })
+                        .collect(),
+                )),
+                Ok(LLMChunk::Done),
+            ])));
+        }
+        if self.wait_before_release && round == 1 {
+            for index in 0..3 {
+                let result = result_for(messages, &format!("continued-wait-{index}"));
+                assert_eq!(result["status"], "running");
+                assert_eq!(result["polling"]["exit_observed"], false);
+                assert!(result["polling"].get("poll_suppressed").is_none());
+            }
+            std::fs::write(&self.gate, b"release").unwrap();
+        }
+        let chunks = match round - usize::from(self.wait_before_release) {
             0 => vec![
                 Ok(LLMChunk::ToolCalls(vec![tool_call(
                     "quiet-final",
@@ -104,6 +149,7 @@ impl LLMProvider for ReadQuietCompletion {
                 let result = result_for(messages, "quiet-final");
                 assert_eq!(result["status"], "completed");
                 assert_eq!(result["exit_code"], 7);
+                assert_eq!(result["output"], "quiet-finished");
                 assert!(result.get("session_id").is_none());
                 vec![
                     Ok(LLMChunk::Token("Observed command exit 7.".into())),
@@ -116,21 +162,107 @@ impl LLMProvider for ReadQuietCompletion {
     }
 }
 
+struct FinishBeforePause {
+    gate: PathBuf,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl bamboo_agent_core::AgentHook for FinishBeforePause {
+    fn point(&self) -> bamboo_domain::AgentHookPoint {
+        bamboo_domain::AgentHookPoint::AfterToolExecution
+    }
+    async fn run(
+        &self,
+        _: bamboo_domain::AgentHookPoint,
+        payload: &bamboo_domain::HookPayload,
+        _: &Session,
+    ) -> bamboo_domain::HookResult {
+        if let bamboo_domain::HookPayload::ToolResult { outcome, .. } = payload {
+            if let Some(value) = outcome
+                .result
+                .as_ref()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            {
+                if value["polling"]["state"] == "needs_diagnosis"
+                    && !self.fired.swap(true, Ordering::SeqCst)
+                {
+                    tokio::time::resume();
+                    std::fs::write(&self.gate, b"release").unwrap();
+                    let id = value["session_id"].as_str().unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while bamboo_tools::tools::bash_runtime::get_shell(id)
+                            .unwrap()
+                            .status()
+                            == "running"
+                        {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+        bamboo_domain::HookResult::Continue
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn ignored_quiet_polling_pauses_without_killing_and_resumes_the_same_real_handle() {
+    quiet_pause_fixture(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn output_and_exit_between_suppression_and_pause_are_read_once_after_resume() {
+    quiet_pause_fixture(true).await;
+}
+
+async fn quiet_pause_fixture(finish_before_pause: bool) {
     let dir = tempfile::tempdir().unwrap();
     let gate = dir.path().join("release");
     let _release = ReleaseGate(gate.clone());
     let quoted_gate = gate.to_string_lossy().replace('\'', "'\\''");
+    let (mut session, mut config, mut state) = fixture(if finish_before_pause {
+        "quiet-exit-race"
+    } else {
+        "ignored-quiet-polling"
+    });
+    let executor = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let mut side_ctx = ToolCtx::none("side-start");
+    side_ctx.session_id = Some(Arc::from(session.id.as_str()));
+    let ToolOutcome::Completed(side) = executor
+        .registry()
+        .get("exec_command")
+        .unwrap()
+        .invoke(
+            json!({"cmd":"cat","interactive":true,"yield_time_ms":250}),
+            side_ctx.clone(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("side command must use the ordinary exec protocol");
+    };
+    let side: Value = serde_json::from_str(&side.result).unwrap();
+    let _side_cleanup = SideProcessCleanup(side["session_id"].as_str().unwrap().to_owned());
     let provider = Arc::new(IgnoredQuietReminder {
         command: format!(
             "while [ ! -f '{quoted_gate}' ]; do sleep 0.01; done; printf quiet-finished; exit 7"
         ),
         calls: AtomicUsize::new(0),
         handle: Mutex::new(None),
+        side_handle: side["session_id"].as_str().unwrap().to_owned(),
     });
-    let (mut session, config, mut state) = fixture("ignored-quiet-polling");
-    let executor = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let race = Arc::new(FinishBeforePause {
+        gate: gate.clone(),
+        fired: std::sync::atomic::AtomicBool::new(false),
+    });
+    if finish_before_pause {
+        let mut hooks = crate::runtime::hooks::HookRunner::new();
+        hooks.register(race.clone());
+        config.hook_runner = Arc::new(hooks);
+    }
     let (tx, mut rx) = mpsc::channel(256);
     run_pipeline(
         &mut session,
@@ -158,7 +290,15 @@ async fn ignored_quiet_polling_pauses_without_killing_and_resumes_the_same_real_
     assert!(pending.question.contains("command remains pending"));
     let handle = provider.handle.lock().unwrap().clone().unwrap();
     let shell = bamboo_tools::tools::bash_runtime::get_shell(&handle).unwrap();
-    assert_eq!(shell.status(), "running");
+    assert_eq!(
+        shell.status(),
+        if finish_before_pause {
+            "completed"
+        } else {
+            "running"
+        }
+    );
+    assert_eq!(race.fired.load(Ordering::SeqCst), finish_before_pause);
     let mut suppressed = 0;
     for index in 0..8 {
         let result = result_for(&session.messages, &format!("ignored-poll-{index}"));
@@ -174,7 +314,7 @@ async fn ignored_quiet_polling_pauses_without_killing_and_resumes_the_same_real_
     let mut questions = 0;
     let mut dispatched_polls = 0;
     while let Ok(event) = rx.try_recv() {
-        if matches!(&event, bamboo_agent_core::AgentEvent::ToolStart { tool_name, .. } if tool_name == "write_stdin")
+        if matches!(&event, bamboo_agent_core::AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id.starts_with("ignored-poll-"))
         {
             dispatched_polls += 1;
         }
@@ -186,6 +326,10 @@ async fn ignored_quiet_polling_pauses_without_killing_and_resumes_the_same_real_
         }
     }
     assert_eq!(questions, 1);
+    for id in ["other-input", "other-operation"] {
+        let other = result_for(&session.messages, id);
+        assert!(other["polling"].get("poll_suppressed").is_none());
+    }
     assert_eq!(
         dispatched_polls + suppressed,
         8,
@@ -193,14 +337,57 @@ async fn ignored_quiet_polling_pauses_without_killing_and_resumes_the_same_real_
     );
     // No synthetic completion or process control is needed to resume. Restore
     // real time before letting the real OS child produce its ordinary exit.
-    tokio::time::resume();
-    std::fs::write(&gate, b"release").unwrap();
+    if !finish_before_pause {
+        tokio::time::resume();
+    }
+    for id in ["other-input", "other-operation"] {
+        let initial = result_for(&session.messages, id);
+        let mut output = initial["output"].as_str().unwrap().to_owned();
+        if let Some(handle) = initial["session_id"].as_str() {
+            let ToolOutcome::Completed(last) = executor
+                .registry()
+                .get("write_stdin")
+                .unwrap()
+                .invoke(
+                    json!({"session_id":handle,"yield_time_ms":5000}),
+                    side_ctx.clone(),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("side command poll must stay ordinary");
+            };
+            let last: Value = serde_json::from_str(&last.result).unwrap();
+            assert_eq!(last["exit_code"], 0);
+            output.push_str(last["output"].as_str().unwrap());
+        }
+        assert_eq!(
+            output,
+            if id == "other-input" {
+                "side-input"
+            } else {
+                "independent"
+            }
+        );
+    }
+    if !finish_before_pause {
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert_eq!(
+            shell.status(),
+            "running",
+            "silence is not a short process timeout"
+        );
+        tokio::time::resume();
+    }
     session.add_message(Message::user(
         "Continue waiting and read the command result.",
     ));
     let resumed = Arc::new(ReadQuietCompletion {
         handle: handle.clone(),
         calls: AtomicUsize::new(0),
+        gate,
+        wait_before_release: !finish_before_pause,
     });
     run_pipeline(
         &mut session,
@@ -214,7 +401,122 @@ async fn ignored_quiet_polling_pauses_without_killing_and_resumes_the_same_real_
     .await
     .unwrap();
     assert!(session.pending_question.is_none());
-    assert_eq!(resumed.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        resumed.calls.load(Ordering::SeqCst),
+        if finish_before_pause { 2 } else { 3 }
+    );
+    assert!(bamboo_tools::tools::bash_runtime::get_shell(&handle).is_none());
+}
+
+struct CancelledPollProvider {
+    handle: String,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for CancelledPollProvider {
+    async fn chat_stream(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+        Ok(Box::pin(stream::iter([
+            Ok(LLMChunk::ToolCalls(vec![tool_call(
+                "cancel-poll",
+                "write_stdin",
+                json!({"session_id":self.handle,"yield_time_ms":30_000}),
+            )])),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn cancelling_the_runner_during_a_poll_keeps_the_delivered_command_readable() {
+    let (mut session, config, mut state) = fixture("cancel-quiet-poll");
+    let executor = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let mut ctx = ToolCtx::none("cancel-start");
+    ctx.session_id = Some(Arc::from(session.id.as_str()));
+    let ToolOutcome::Completed(start) = executor
+        .registry()
+        .get("exec_command")
+        .unwrap()
+        .invoke(
+            json!({"cmd":"cat","interactive":true,"yield_time_ms":250}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected an ordinary start result");
+    };
+    let start: Value = serde_json::from_str(&start.result).unwrap();
+    let handle = start["session_id"].as_str().unwrap().to_owned();
+    let _cleanup = SideProcessCleanup(handle.clone());
+    let provider = Arc::new(CancelledPollProvider {
+        handle: handle.clone(),
+        calls: AtomicUsize::new(0),
+    });
+    let (tx, mut rx) = mpsc::channel(256);
+    let cancel = CancellationToken::new();
+    let observer = async {
+        while let Some(event) = rx.recv().await {
+            if matches!(event, bamboo_agent_core::AgentEvent::ToolStart { ref tool_call_id, .. } if tool_call_id == "cancel-poll")
+            {
+                cancel.cancel();
+                return;
+            }
+        }
+        panic!("poll did not enter the real runner");
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            run_pipeline(
+                &mut session,
+                &tx,
+                provider.clone(),
+                executor.clone(),
+                &cancel,
+                &config,
+                &mut state
+            ),
+            observer
+        )
+    })
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(AgentError::Cancelled)));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        bamboo_tools::tools::bash_runtime::get_shell(&handle)
+            .unwrap()
+            .status(),
+        "running"
+    );
+    assert!(session
+        .messages
+        .iter()
+        .filter(|m| m.tool_call_id.as_deref() == Some("cancel-poll"))
+        .all(|m| m.tool_success != Some(true)));
+    let ToolOutcome::Completed(final_result) = executor
+        .registry()
+        .get("write_stdin")
+        .unwrap()
+        .invoke(
+            json!({"session_id":handle,"chars":"survived","eof":true,"yield_time_ms":5000}),
+            ctx,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("explicit continuation returns its actual result");
+    };
+    let final_result: Value = serde_json::from_str(&final_result.result).unwrap();
+    assert_eq!(final_result["exit_code"], 0);
+    assert_eq!(final_result["output"], "survived");
     assert!(bamboo_tools::tools::bash_runtime::get_shell(&handle).is_none());
 }
 

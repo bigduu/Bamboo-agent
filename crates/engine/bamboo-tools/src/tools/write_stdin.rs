@@ -63,7 +63,7 @@ impl Tool for WriteStdinTool {
         let shell = bash_runtime::get_shell(&parsed.session_id)
             .filter(|shell| shell.polled.is_some() && shell.session_id.as_deref() == Some(owner))
             .ok_or_else(|| {
-                ToolError::Execution("Exec session not found or not owned by this session".into())
+                ToolError::Execution("Exec session not found or not owned by this session (unread completed results expire after five minutes; handles do not survive Host restart)".into())
             })?;
         if parsed.chars.len() > MAX_INPUT_BYTES {
             return Err(ToolError::InvalidArguments(

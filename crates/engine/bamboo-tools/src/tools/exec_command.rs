@@ -58,9 +58,6 @@ pub(crate) struct PolledShellState {
     // A reaped parent may still have descendants holding its output pipes.
     // This observation does not publish a terminal capture result.
     process_exited: AtomicBool,
-    // A diagnostic pause must not expire the unread terminal result before
-    // the caller resumes. Retention remains bounded by the 64-session permit.
-    retain_for_diagnosis: AtomicBool,
     #[cfg(test)]
     fail_cleanup_after_reap: AtomicBool,
     capture_stop: watch::Sender<bool>,
@@ -80,7 +77,6 @@ impl PolledShellState {
             output: Mutex::new(CapturedOutput::default()),
             completed: Notify::new(),
             process_exited: AtomicBool::new(false),
-            retain_for_diagnosis: AtomicBool::new(false),
             #[cfg(test)]
             fail_cleanup_after_reap: AtomicBool::new(false),
             capture_stop: watch::channel(false).0,
@@ -180,14 +176,6 @@ impl PolledShellState {
         )
     }
 
-    pub(crate) fn hold_for_diagnosis(&self) {
-        self.retain_for_diagnosis.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn retain_for_diagnosis(&self) -> bool {
-        self.retain_for_diagnosis.load(Ordering::Acquire)
-    }
-
     fn take_locked(
         output: &mut CapturedOutput,
         shell_id: &str,
@@ -206,6 +194,7 @@ impl PolledShellState {
             let now = Instant::now();
             let idle = now.duration_since(output.last_output_at);
             ExecSessionProgress {
+                terminal_result_ttl_ms: bash_runtime::COMPLETED_SESSION_TTL_SECS * 1000,
                 state: if idle >= QUIET_POLL_ADVISORY_AFTER
                     && output.consecutive_empty_readouts >= QUIET_POLL_DIAGNOSIS_READOUTS
                 {
@@ -355,6 +344,7 @@ struct ExecSessionResult {
 /// Capture observations, never a liveness probe or evidence of a hung process.
 #[derive(Debug, Serialize)]
 struct ExecSessionProgress {
+    terminal_result_ttl_ms: u64,
     state: &'static str,
     elapsed_ms: u64,
     output_idle_ms: u64,
