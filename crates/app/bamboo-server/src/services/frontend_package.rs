@@ -682,6 +682,11 @@ mod tests {
     static FRONTEND_PACKAGE_ENV_LOCK: Mutex<()> = Mutex::new(());
     const TEST_INDEX_HTML: &[u8] = b"<html><body>ok</body></html>";
 
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/zip_test_fixture.rs"
+    ));
+
     struct ScopedFrontendPackageEnv {
         previous: Option<OsString>,
     }
@@ -748,6 +753,18 @@ mod tests {
         let bundled = manifest_fixture();
         let temp = tempdir().unwrap();
         assert!(should_refresh_frontend(&bundled, None, temp.path()));
+    }
+
+    #[test]
+    fn rejects_undecodable_utf8_zip_names_before_extraction() {
+        let fixture = tempdir().unwrap();
+        let path = fixture.path().join("frontend.zip");
+        write_test_zip(&path, &manifest_fixture());
+        let bytes = zip_with_invalid_utf8_name(std::fs::read(path).unwrap(), "index.html");
+        let target = tempdir().unwrap();
+        let error = extract_frontend_zip_bytes(&bytes, target.path()).unwrap_err();
+        assert!(matches!(error, FrontendPackageError::Zip(_)));
+        assert!(std::fs::read_dir(target.path()).unwrap().next().is_none());
     }
 
     #[test]

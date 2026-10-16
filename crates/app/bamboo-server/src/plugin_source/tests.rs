@@ -17,6 +17,11 @@ use ed25519_dalek::{Signer, SigningKey};
 use super::*;
 use crate::app_state::AppState;
 
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/zip_test_fixture.rs"
+));
+
 fn hello_manifest_json(id: &str) -> String {
     serde_json::json!({
         "id": id,
@@ -154,6 +159,30 @@ fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         writer.finish().unwrap();
     }
     buffer
+}
+
+#[tokio::test]
+async fn rejects_undecodable_utf8_zip_names_before_any_file_write() {
+    let root = tempfile::tempdir().unwrap();
+    let bytes = zip_with_invalid_utf8_name(build_zip(&[("bamboo", b"payload")]), "bamboo");
+    let plugin = root.path().join("plugin");
+    std::fs::create_dir(&plugin).unwrap();
+    let error = extract_zip_sync(&bytes, &plugin, 1024).unwrap_err();
+    assert!(matches!(error, PluginError::InvalidManifest(_)));
+    assert!(std::fs::read_dir(&plugin).unwrap().next().is_none());
+
+    let artifact = root.path().join("artifact");
+    let error = extract_artifact_archive(
+        bytes,
+        ArchiveKind::Zip,
+        artifact.clone(),
+        "bamboo".into(),
+        1024,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, PluginError::InvalidManifest(_)));
+    assert!(std::fs::read_dir(&artifact).unwrap().next().is_none());
 }
 
 #[tokio::test]
