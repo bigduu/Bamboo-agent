@@ -756,15 +756,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_undecodable_utf8_zip_names_before_extraction() {
+    fn extracts_legacy_cp437_zip_names() {
         let fixture = tempdir().unwrap();
         let path = fixture.path().join("frontend.zip");
         write_test_zip(&path, &manifest_fixture());
-        let bytes = zip_with_invalid_utf8_name(std::fs::read(path).unwrap(), "index.html");
+        let bytes = zip_with_cp437_name(std::fs::read(path).unwrap(), "index.html");
         let target = tempdir().unwrap();
-        let error = extract_frontend_zip_bytes(&bytes, target.path()).unwrap_err();
-        assert!(matches!(error, FrontendPackageError::Zip(_)));
-        assert!(std::fs::read_dir(target.path()).unwrap().next().is_none());
+        extract_frontend_zip_bytes(&bytes, target.path()).unwrap();
+        assert_eq!(
+            std::fs::read(target.path().join("éndex.html")).unwrap(),
+            TEST_INDEX_HTML
+        );
+        assert!(!target.path().join("index.html").exists());
     }
 
     #[test]

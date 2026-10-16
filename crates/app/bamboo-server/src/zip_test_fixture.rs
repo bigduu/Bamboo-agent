@@ -1,5 +1,5 @@
-// Keep ZIP structure and payload CRCs intact while making one UTF-8 name invalid.
-fn zip_with_invalid_utf8_name(mut bytes: Vec<u8>, name: &str) -> Vec<u8> {
+// Keep ZIP structure and payload CRCs intact; encode the first letter as CP437 é.
+fn zip_with_cp437_name(mut bytes: Vec<u8>, name: &str) -> Vec<u8> {
     let mut changed = 0;
     for (signature, flags, start, length) in
         [(*b"PK\x03\x04", 6, 30, 26), (*b"PK\x01\x02", 8, 46, 28)]
@@ -22,9 +22,9 @@ fn zip_with_invalid_utf8_name(mut bytes: Vec<u8>, name: &str) -> Vec<u8> {
                 bytes[offset + flags..offset + flags + 2]
                     .try_into()
                     .unwrap(),
-            ) | (1 << 11);
+            ) & !(1 << 11);
             bytes[offset + flags..offset + flags + 2].copy_from_slice(&value.to_le_bytes());
-            bytes[offset + start] = 0xff;
+            bytes[offset + start] = 0x82;
             changed += 1;
         }
     }

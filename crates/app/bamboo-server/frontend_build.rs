@@ -425,13 +425,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_undecodable_utf8_zip_names() {
-        let fixture = package_fixture(&[("index.html", b"<html>ok</html>")]);
+    fn accepts_legacy_cp437_zip_names() {
+        let fixture = package_fixture(&[
+            ("index.html", b"<html>ok</html>"),
+            ("cafe.txt", b"legacy payload"),
+        ]);
         let path = fixture.path().join("lotus-frontend.zip");
-        let bytes = zip_with_invalid_utf8_name(fs::read(&path).unwrap(), "index.html");
-        fs::write(path, bytes).unwrap();
-        let error = validate_frontend_package(fixture.path()).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let bytes = zip_with_cp437_name(fs::read(&path).unwrap(), "cafe.txt");
+        fs::write(path, &bytes).unwrap();
+        let package = validate_frontend_package(fixture.path()).unwrap();
+        assert_eq!(package.zip_bytes, bytes);
     }
 
     #[test]

@@ -162,14 +162,26 @@ fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn rejects_undecodable_utf8_zip_names_before_any_file_write() {
+async fn legacy_cp437_names_preserve_plugin_and_artifact_boundaries() {
     let root = tempfile::tempdir().unwrap();
-    let bytes = zip_with_invalid_utf8_name(build_zip(&[("bamboo", b"payload")]), "bamboo");
+    let bytes = zip_with_cp437_name(build_zip(&[("bamboo", b"payload")]), "bamboo");
     let plugin = root.path().join("plugin");
     std::fs::create_dir(&plugin).unwrap();
-    let error = extract_zip_sync(&bytes, &plugin, 1024).unwrap_err();
-    assert!(matches!(error, PluginError::InvalidManifest(_)));
-    assert!(std::fs::read_dir(&plugin).unwrap().next().is_none());
+    extract_zip_sync(&bytes, &plugin, 1024).unwrap();
+    assert_eq!(std::fs::read(plugin.join("éamboo")).unwrap(), b"payload");
+    assert!(!plugin.join("bamboo").exists());
+
+    let allowed = root.path().join("allowed-artifact");
+    extract_artifact_archive(
+        bytes.clone(),
+        ArchiveKind::Zip,
+        allowed.clone(),
+        "éamboo".into(),
+        1024,
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(allowed.join("éamboo")).unwrap(), b"payload");
 
     let artifact = root.path().join("artifact");
     let error = extract_artifact_archive(
