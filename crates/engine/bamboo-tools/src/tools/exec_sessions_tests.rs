@@ -87,6 +87,111 @@ async fn tiny_output_budget_preserves_running_session_metadata() {
     assert!(serde_json::to_string(&result).unwrap().len() > 4);
 }
 
+#[tokio::test(start_paused = true)]
+async fn quiet_poll_advisory_requires_sustained_silence_and_repeated_empty_readouts() {
+    let state = PolledShellState::new().unwrap();
+    tokio::time::advance(QUIET_POLL_ADVISORY_AFTER).await;
+    for count in 1..QUIET_POLL_ADVISORY_READOUTS {
+        let result = state.take("quiet-handle", None).await;
+        let progress = result.polling.unwrap();
+        assert_eq!(progress.consecutive_empty_readouts, count);
+        assert!(progress.advisory.is_none());
+    }
+    let result = state.take("quiet-handle", None).await;
+    assert_eq!(result.session_id.as_deref(), Some("quiet-handle"));
+    assert_eq!(result.status, "running");
+    assert!(result.exit_code.is_none());
+    let progress = result.polling.unwrap();
+    assert_eq!(progress.elapsed_ms, 90_000);
+    assert_eq!(progress.output_idle_ms, 90_000);
+    assert!(!progress.exit_observed);
+    assert_eq!(progress.advisory, Some(QUIET_POLL_ADVISORY));
+    assert!(!state.is_complete().await);
+
+    // A legitimate long command remains pending, even beyond the advisory.
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    let later = state.take("quiet-handle", None).await;
+    assert_eq!(later.status, "running");
+    assert!(later.exit_code.is_none());
+    assert!(later.polling.unwrap().advisory.is_some());
+    state.finish("completed", Some(7)).await;
+    let terminal = state.take("quiet-handle", None).await;
+    assert_eq!(terminal.status, "completed");
+    assert_eq!(terminal.exit_code, Some(7));
+    assert!(terminal.session_id.is_none());
+    assert!(terminal.polling.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn rapid_empty_polls_wait_for_the_silence_boundary_before_advising() {
+    let state = PolledShellState::new().unwrap();
+    for _ in 0..100 {
+        let result = state.take("short-polls", None).await;
+        assert!(result.polling.unwrap().advisory.is_none());
+    }
+    tokio::time::advance(QUIET_POLL_ADVISORY_AFTER - Duration::from_millis(1)).await;
+    let before = state.take("short-polls", None).await;
+    assert!(before.polling.unwrap().advisory.is_none());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let at_boundary = state.take("short-polls", None).await;
+    assert!(at_boundary.polling.unwrap().advisory.is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn captured_output_resets_quiet_polling_even_when_the_response_cap_omits_it() {
+    let state = PolledShellState::new().unwrap();
+    tokio::time::advance(QUIET_POLL_ADVISORY_AFTER).await;
+    for _ in 0..QUIET_POLL_ADVISORY_READOUTS {
+        state.take("output-resumes", None).await;
+    }
+    // One token cannot render either character, but capture made progress.
+    state.push("\0汉".as_bytes()).await;
+    let resumed = state.take("output-resumes", Some(1)).await;
+    assert!(resumed.output.is_empty());
+    assert_eq!(resumed.output_omitted_bytes, 4);
+    let progress = resumed.polling.unwrap();
+    assert_eq!(progress.elapsed_ms, 90_000);
+    assert_eq!(progress.output_idle_ms, 0);
+    assert_eq!(progress.consecutive_empty_readouts, 0);
+    assert!(progress.advisory.is_none());
+
+    tokio::time::advance(QUIET_POLL_ADVISORY_AFTER).await;
+    let first_empty = state.take("output-resumes", None).await;
+    assert!(first_empty.polling.unwrap().advisory.is_none());
+    state.push(b"").await;
+    let second_empty = state.take("output-resumes", None).await;
+    assert_eq!(second_empty.polling.unwrap().consecutive_empty_readouts, 2);
+    let third_empty = state.take("output-resumes", None).await;
+    assert!(third_empty.polling.unwrap().advisory.is_some());
+    state.reset_empty_readouts().await;
+    let after_input = state.take("output-resumes", None).await;
+    let progress = after_input.polling.unwrap();
+    assert_eq!(progress.consecutive_empty_readouts, 1);
+    assert!(progress.advisory.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn exit_observed_during_capture_is_not_a_terminal_result() {
+    let state = PolledShellState::new().unwrap();
+    let pending = serde_json::to_value(state.take("draining", None).await).unwrap();
+    assert_eq!(pending["polling"]["exit_observed"], false);
+    assert!(pending.get("exit_code").is_none());
+    state.mark_process_exited();
+    let draining = serde_json::to_value(state.take("draining", None).await).unwrap();
+    assert_eq!(draining["polling"]["exit_observed"], true);
+    assert_eq!(draining["status"], "running");
+    assert_eq!(draining["session_id"], "draining");
+    assert!(draining.get("exit_code").is_none());
+    state.push(b"tail").await;
+    state.finish("completed", Some(0)).await;
+    let terminal = serde_json::to_value(state.take("draining", None).await).unwrap();
+    assert_eq!(terminal["status"], "completed");
+    assert_eq!(terminal["output"], "tail");
+    assert_eq!(terminal["exit_code"], 0);
+    assert!(terminal.get("session_id").is_none());
+    assert!(terminal.get("polling").is_none());
+}
+
 #[test]
 fn workdir_accepts_workspace_and_nested_paths_but_rejects_other_directories() {
     let directory = tempfile::tempdir().unwrap();
@@ -693,6 +798,137 @@ mod process_tests {
         assert_eq!(
             result["output"].as_str().unwrap().trim(),
             nested.canonicalize().unwrap().to_str().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_command_advisory_keeps_the_real_process_and_final_handle() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("quiet-command-{}", uuid::Uuid::new_v4());
+        let release = directory.path().join("release");
+        let _cleanup = InitialProcessCleanup {
+            owner: &owner,
+            release: release.clone(),
+        };
+        workspace_state::publish_resolved_workspace(&owner, directory.path().to_path_buf());
+        let first = start(
+            "fixture_dir=$(pwd -P); remaining=3000; while [ -d \"$fixture_dir\" ] && [ ! -f release ] && [ \"$remaining\" -gt 0 ]; do remaining=$((remaining - 1)); sleep 0.01; done; printf tail; exit 7".into(),
+            &owner,
+            true,
+        ).await;
+        let id = first["session_id"].as_str().unwrap();
+        let shell = bash_runtime::get_shell(id).unwrap();
+        let state = shell.polled.as_ref().unwrap();
+        // Age only the advisory clock; the real gated process and its actual
+        // wait/capture owner remain unchanged and supply the terminal result.
+        {
+            let mut output = state.output.lock().await;
+            output.started_at = Instant::now() - QUIET_POLL_ADVISORY_AFTER;
+            output.last_output_at = output.started_at;
+        }
+        for _ in 0..QUIET_POLL_DIAGNOSIS_READOUTS {
+            let result = payload(
+                WriteStdinTool::new()
+                    .invoke(
+                        json!({"session_id":id,"chars":"","yield_time_ms":250}),
+                        context(&owner),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(result["status"], "running");
+            assert_eq!(result["session_id"], id);
+            assert_eq!(result["polling"]["exit_observed"], false);
+            assert!(result.get("exit_code").is_none());
+        }
+        assert!(!state.is_complete().await);
+        assert!(bash_runtime::get_shell(id).is_some());
+        let last_running = payload(poll_result(&shell, 0, None).await);
+        assert!(last_running["polling"]["advisory"].is_string());
+        assert_eq!(last_running["polling"]["state"], "needs_diagnosis");
+        assert_eq!(last_running["polling"]["terminal_result_ttl_ms"], 300_000);
+        // Successful input/EOF interrupts the empty-readout streak even when
+        // this command makes no stdout/stderr response to the input.
+        for request in [
+            json!({"session_id":id,"chars":"probe","yield_time_ms":250}),
+            json!({"session_id":id,"eof":true,"yield_time_ms":250}),
+        ] {
+            let after_input = payload(
+                WriteStdinTool::new()
+                    .invoke(request, context(&owner))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(after_input["status"], "running");
+            assert_eq!(after_input["polling"]["consecutive_empty_readouts"], 1);
+            assert!(after_input["polling"].get("advisory").is_none());
+        }
+        std::fs::write(release, b"release").unwrap();
+        let terminal = poll(id, &owner).await;
+        assert_eq!(terminal["status"], "completed");
+        assert_eq!(terminal["output"], "tail");
+        assert_eq!(terminal["exit_code"], 7);
+        assert!(terminal.get("session_id").is_none());
+        assert!(terminal.get("polling").is_none());
+        assert!(bash_runtime::get_shell(id).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_terminal_cache_expiry_releases_capture_without_inventing_an_outcome() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("quiet-cache-{}", uuid::Uuid::new_v4());
+        let release = directory.path().join("release");
+        let _cleanup = InitialProcessCleanup {
+            owner: &owner,
+            release: release.clone(),
+        };
+        workspace_state::publish_resolved_workspace(&owner, directory.path().to_path_buf());
+        let first = start(
+            "while [ ! -f release ]; do sleep 0.01; done; printf tail; exit 7".into(),
+            &owner,
+            false,
+        )
+        .await;
+        let id = first["session_id"].as_str().unwrap();
+        let shell = bash_runtime::get_shell(id).unwrap();
+        let capture = Arc::downgrade(shell.polled.as_ref().unwrap());
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(
+            bash_runtime::get_shell(id).is_some(),
+            "running handles do not use the terminal-cache TTL"
+        );
+        assert!(WriteStdinTool::new()
+            .invoke(json!({"session_id":id}), context("different-owner"))
+            .await
+            .is_err());
+        tokio::time::resume();
+        std::fs::write(release, b"release").unwrap();
+        shell.polled.as_ref().unwrap().wait(5_000).await;
+        assert!(shell.polled.as_ref().unwrap().is_complete().await);
+        assert!(
+            bash_runtime::get_shell(id).is_some(),
+            "terminal result is initially readable"
+        );
+        tokio::time::pause();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(
+            bash_runtime::COMPLETED_SESSION_TTL_SECS + 1,
+        ))
+        .await;
+        tokio::task::yield_now().await;
+        assert!(bash_runtime::get_shell(id).is_none());
+        let expired = WriteStdinTool::new()
+            .invoke(json!({"session_id":id}), context(&owner))
+            .await;
+        assert!(
+            matches!(expired, Err(ToolError::Execution(ref text)) if text.contains("expire") && text.contains("Host restart"))
+        );
+        drop(shell);
+        assert!(
+            capture.upgrade().is_none(),
+            "expired capture releases its retained-session permit"
         );
     }
 

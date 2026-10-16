@@ -224,6 +224,7 @@ pub(crate) struct ToolPolicyGuard {
     executed_calls: usize,
     consecutive_failures: HashMap<String, usize>,
     observation_progress: ObservationProgress,
+    pub(super) quiet_polls: super::quiet_poll::QuietPollGuard,
 }
 
 impl ToolPolicyGuard {
@@ -237,6 +238,7 @@ impl ToolPolicyGuard {
             executed_calls: 0,
             consecutive_failures: HashMap::new(),
             observation_progress: ObservationProgress::default(),
+            quiet_polls: super::quiet_poll::QuietPollGuard::default(),
         }
     }
 
@@ -289,6 +291,11 @@ impl ToolPolicyGuard {
 
     pub(crate) fn reset_observation_progress(&mut self) {
         self.observation_progress = ObservationProgress::default();
+        self.quiet_polls = super::quiet_poll::QuietPollGuard::default();
+    }
+
+    pub(crate) fn should_pause_for_quiet_polling(&self) -> bool {
+        self.quiet_polls.pending()
     }
 
     #[cfg(test)]

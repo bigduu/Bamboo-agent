@@ -3222,6 +3222,17 @@ async fn run_pipeline_inner(
         // round. Retries reuse this request-only hint. A pause creates no
         // phantom model round and leaves every completed tool pair intact.
         let observation_progress_hint = tool_policy_guard.observation_progress_hint();
+        if tool_policy_guard.should_pause_for_quiet_polling()
+            && crate::runtime::runner::tool_execution::pause_for_quiet_polling(
+                session,
+                &mut state.runtime_state,
+                event_tx,
+                config,
+            )
+            .await?
+        {
+            break;
+        }
         if tool_policy_guard.should_pause_for_observation_progress()
             && crate::runtime::runner::tool_execution::pause_for_no_progress(
                 session,
