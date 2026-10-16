@@ -1289,6 +1289,7 @@ pub fn check_permissions(
                 "reply" => {
                     "session_message reply: deliver a peer reply and request receiver activation"
                 }
+                "steer" => "session_message steer: admit peer input for an exact active run",
                 _ => {
                     return Err(PermissionError::CheckFailed(
                         "unsupported session_message action".into(),
@@ -3062,6 +3063,7 @@ mod tests {
         for (action, route_field, private_route) in [
             ("send", "target_session_id", "private-peer-target"),
             ("reply", "reply_to", "private-received-message-id"),
+            ("steer", "target_session_id", "private-peer-target"),
         ] {
             let mut args = json!({
                 "action": action,
@@ -3069,6 +3071,9 @@ mod tests {
                 "message": "private peer message body"
             });
             args[route_field] = json!(private_route);
+            if action == "steer" {
+                args["expected_run_id"] = json!("private-expected-run");
+            }
             let contexts = check_permissions("session_message", &args)
                 .unwrap()
                 .expect("peer delivery must enter the execution permission gate");
@@ -3080,7 +3085,8 @@ mod tests {
                 context.operation_description,
                 match action {
                     "send" => "session_message send: deliver a peer message and request receiver activation",
-                    _ => "session_message reply: deliver a peer reply and request receiver activation",
+                    "reply" => "session_message reply: deliver a peer reply and request receiver activation",
+                    _ => "session_message steer: admit peer input for an exact active run",
                 }
             );
             for private in [
@@ -3088,6 +3094,7 @@ mod tests {
                 "private-received-message-id",
                 "private-operation-id",
                 "private peer message body",
+                "private-expected-run",
             ] {
                 assert!(!context.resource.contains(private));
                 assert!(!context.operation_description.contains(private));

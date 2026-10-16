@@ -332,6 +332,126 @@ async fn unowned_actor_claim_seed_then_confirmation_preserves_cursor_and_ack_ord
         .await
         .is_err());
 }
+#[tokio::test]
+async fn unowned_actor_claim_context_keeps_expected_run_at_seed_and_confirmation() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+    let parent = Session::new("seed-parent", "model");
+    let mut child = Session::new_child_of("seed-child", &parent, "model", "task");
+    child.add_message(Message::user("original task"));
+    store.save_session(&parent).await.unwrap();
+    store.save_session(&child).await.unwrap();
+    store.ensure_actor(&child.id).await.unwrap();
+    let inbox = crate::FileSessionInbox::new(store.clone(), SessionInboxLimits::default());
+    let envelope = SessionMessageEnvelope::user_input(&child.id, "run-bound correction");
+    inbox
+        .deliver_with_activation_intent(
+            &envelope,
+            bamboo_domain::SessionActivationPolicy::RespectSpecificWait,
+            None,
+        )
+        .await
+        .unwrap();
+    let claim = inbox
+        .claim_for_turn(&child.id, 1, Some("warm-run"))
+        .await
+        .unwrap()
+        .remove(0);
+    let now = Utc::now();
+    let activation = store
+        .claim_activation(&ActorActivationClaim {
+            actor_id: child.id.clone(),
+            run_id: "warm-run".into(),
+            lease_owner: "remote-host".into(),
+            lease_expires_at: now + LeaseDuration::seconds(80),
+            inbox_generation: 0,
+            placement_ref: None,
+            now,
+        })
+        .await
+        .unwrap();
+    let fence = activation.fence();
+    store.start_activation(&fence, now).await.unwrap();
+    let request = |session: &Session| ActorClaimContextSeed {
+        fence: fence.clone(),
+        expected_created_at: session.created_at,
+        expected_messages: session.messages.clone(),
+        expected_provider_transcript: session.provider_transcript.clone(),
+        expected_admission: session.session_inbox_admission().cloned(),
+        claims: vec![claim.clone()],
+    };
+    let directory = home.path().join("sessions/seed-parent/children/seed-child");
+    let cur = directory.join("inbox/cur").join(&claim.claim_id);
+    let transport: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cur).unwrap()).unwrap();
+    let write_intent = |expected: &str| {
+        let mut value = transport.clone();
+        value["body"]["session_inbox_activation_intent"] = serde_json::to_value(
+            bamboo_domain::SessionInboxActivationIntent::for_expected_run(expected).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&cur, serde_json::to_vec(&value).unwrap()).unwrap();
+    };
+    // Keep real cur bytes and the current Actor fence; change only the
+    // immutable run intent to model an old host's stale forwarded claim.
+    write_intent("another-run");
+    let before = std::fs::read(directory.join("session.json")).unwrap();
+    let queued = std::fs::read(&cur).unwrap();
+    assert!(matches!(
+        store
+            .seed_actor_claim_context(inbox.clone(), request(&child))
+            .await
+            .unwrap_err(),
+        ActorInputCheckpointError::Inbox(bamboo_domain::SessionInboxError::InvalidClaim(_))
+    ));
+    assert_eq!(
+        std::fs::read(directory.join("session.json")).unwrap(),
+        before
+    );
+    assert_eq!(std::fs::read(&cur).unwrap(), queued);
+    assert!(!inbox.was_admitted(&child.id, &envelope.id).await.unwrap());
+    write_intent("warm-run");
+    let seeded = store
+        .seed_actor_claim_context(inbox.clone(), request(&child))
+        .await
+        .unwrap();
+    assert!(seeded
+        .messages
+        .iter()
+        .any(|message| bamboo_domain::is_matching_session_message(message, &envelope)));
+    write_intent("another-run");
+    let before = std::fs::read(directory.join("session.json")).unwrap();
+    let queued = std::fs::read(&cur).unwrap();
+    assert!(matches!(
+        store
+            .confirm_actor_claim_context(inbox.clone(), request(&seeded))
+            .await
+            .unwrap_err(),
+        ActorInputCheckpointError::Inbox(bamboo_domain::SessionInboxError::InvalidClaim(_))
+    ));
+    assert_eq!(
+        std::fs::read(directory.join("session.json")).unwrap(),
+        before
+    );
+    assert_eq!(std::fs::read(&cur).unwrap(), queued);
+    assert!(!inbox.was_admitted(&child.id, &envelope.id).await.unwrap());
+    write_intent("warm-run");
+    let confirmed = store
+        .confirm_actor_claim_context(inbox.clone(), request(&seeded))
+        .await
+        .unwrap();
+    assert!(confirmed
+        .session_inbox_admission()
+        .unwrap()
+        .contains(&envelope.id));
+    inbox.ack(&child.id, &claim).await.unwrap();
+    assert!(inbox.was_admitted(&child.id, &envelope.id).await.unwrap());
+    store
+        .finish_activation(&fence, Utc::now(), ActorActivationFinish::Succeeded)
+        .await
+        .unwrap();
+}
+
 fn held(f: &Fixture) {
     for path in lock_paths(f) {
         let file = std::fs::OpenOptions::new()
@@ -414,6 +534,61 @@ async fn actor_input_root_child_cold_new_already_and_complete_prefix() {
                     .next()
                     .is_none()
         );
+    }
+}
+
+#[tokio::test]
+async fn actor_input_expected_run_intent_checks_actual_actor_fence_before_checkpoint() {
+    for child in [false, true] {
+        for expected in ["first-run", "another-run"] {
+            let home = tempfile::tempdir().unwrap();
+            let f = fixture(home.path(), child, true).await;
+            let path = f
+                .directory
+                .join("inbox/cur")
+                .join(&f.request.claim.claim.claim_id);
+            // Keep the real Actor fence, lease and envelope. A stale host can
+            // supply this same claim even when the persisted input is bound
+            // to another run; the publication checkpoint must reject it too.
+            let mut transport: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            transport["body"]["session_inbox_activation_intent"] = serde_json::to_value(
+                bamboo_domain::SessionInboxActivationIntent::for_expected_run(expected).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(path, serde_json::to_vec(&transport).unwrap()).unwrap();
+            if expected != f.request.fence.run_id {
+                assert!(matches!(
+                    reject_unchanged(&f, f.request.clone()).await,
+                    ActorInputCheckpointError::Actor(
+                        bamboo_domain::ActorDirectoryError::StaleFence
+                    )
+                ));
+                continue;
+            }
+            let before = protected(&f);
+            let committed = f
+                .inbox
+                .checkpoint_actor_input(f.request.clone())
+                .await
+                .unwrap();
+            assert_eq!(committed.status, ActorInputCheckpointStatus::NewCheckpoint);
+            assert_eq!(protected(&f), before);
+            let cold = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+            let current = cold.load_session(ID).await.unwrap().unwrap();
+            let retry = crate::FileSessionInbox::new(cold, SessionInboxLimits::default())
+                .checkpoint_actor_input(f.request_from(&current))
+                .await
+                .unwrap();
+            assert_eq!(
+                retry.status,
+                ActorInputCheckpointStatus::AlreadyCheckpointed
+            );
+            assert_eq!(
+                retry.session.messages.len(),
+                committed.session.messages.len()
+            );
+        }
     }
 }
 

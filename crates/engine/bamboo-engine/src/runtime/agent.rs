@@ -421,6 +421,14 @@ impl Agent {
                 "direct execution lease is missing its router registration".to_string(),
             )
         })?;
+        if !router
+            .bind_run_lifetime(&registration.ownership(), session)
+            .await
+        {
+            return Err(bamboo_agent_core::AgentError::Tool(
+                "registered run Session lifetime differs".into(),
+            ));
+        }
         if let Some(counted) = req.counted_loop.as_mut() {
             counted.bind_owner(registration.ownership(), session);
         }
