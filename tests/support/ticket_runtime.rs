@@ -109,8 +109,13 @@ pub async fn ready(client: &reqwest::Client, base: &str, host: &mut Host, data: 
     .expect("actual Host startup");
 }
 
+pub type ControlledResponse = fn(&Value, &Probe) -> Option<(Value, &'static str)>;
+
 #[derive(Default)]
 pub struct Probe {
+    /// Optional deterministic scenario. It sees real provider requests only.
+    pub controlled_response: std::sync::Mutex<Option<ControlledResponse>>,
+    pub scenario: std::sync::Mutex<Value>,
     pub coding_path: std::sync::Mutex<Option<(String, String)>>,
     pub hold_code: std::sync::atomic::AtomicBool,
     pub ui_fixture: std::sync::atomic::AtomicBool,
@@ -161,6 +166,13 @@ pub fn question_call(messages: &Value, letter: &str, probe: &Probe) -> Value {
 }
 
 async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
+    let controlled = *probe.controlled_response.lock().unwrap();
+    if let Some((delta, finish)) = controlled.and_then(|respond| respond(&body, &probe)) {
+        let event = json!({"id":"ticket-controlled-scenario","object":"chat.completion.chunk","choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
+        return HttpResponse::Ok()
+            .content_type("text/event-stream")
+            .body(format!("data: {event}\n\ndata: [DONE]\n\n"));
+    }
     let task_only = body["tools"]
         .as_array()
         .is_some_and(|tools| tools.len() == 1 && tools[0]["function"]["name"] == "Task");
