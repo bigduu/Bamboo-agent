@@ -67,6 +67,15 @@ pub(crate) struct SupervisorFollowupGuard {
     sessions: Vec<SessionWriteGuard>,
     _task: RuntimeTaskTransactionReadGuard,
     _lifecycle: SessionLifecycleReadGuard,
+    // A private observation held stable by these same target Session locks.
+    // It closes only new Loop carriers, never reads or exact receipt retries.
+    scoped_loop_stopped: bool,
+}
+
+impl SupervisorFollowupGuard {
+    pub(crate) fn scoped_loop_stopped(&self) -> bool {
+        self.scoped_loop_stopped
+    }
 }
 
 /// Management publication owns the existing locks, not a new authority grant.
@@ -169,6 +178,7 @@ impl SessionStoreV2 {
             sessions,
             _task: task,
             _lifecycle: lifecycle,
+            scoped_loop_stopped: false,
         })
     }
 
@@ -179,7 +189,7 @@ impl SessionStoreV2 {
         binding: &bamboo_domain::ScopedLoopControlBinding,
     ) -> io::Result<SupervisorFollowupGuard> {
         binding.validate().map_err(invalid)?;
-        let guard = self
+        let mut guard = self
             .lock_supervisor_followup(&binding.supervisor, &binding.target_session_id)
             .await?;
         let source = self
@@ -234,6 +244,7 @@ impl SessionStoreV2 {
         {
             return Err(denied("Supervisor Loop canonical authority changed"));
         }
+        guard.scoped_loop_stopped = Self::scoped_loop_execution_stopped(&target, binding)?;
         Ok(guard)
     }
 

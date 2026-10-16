@@ -64,6 +64,12 @@ pub(super) struct StoredLease {
 }
 
 impl StoredLease {
+    /// Structural evidence only. Retirement does not mint or renew a lease.
+    pub(super) fn matches_transport_name(&self, generation: u64, name: &str) -> bool {
+        FileSessionInbox::owned_name(generation, &self.token) == name
+            && self.policy == SessionActivationPolicy::RespectSpecificWait
+    }
+
     fn reclaim_count(&self) -> u64 {
         self.reclaim_count.unwrap_or(self.token.epoch - 1)
     }
@@ -352,6 +358,33 @@ impl OwnedFilesystem {
         let to = cancelled.join(name);
         self.job("cancel", path, move |_, path| {
             std::fs::create_dir_all(cancelled)?;
+            std::fs::rename(path, to)
+        })
+        .await
+    }
+
+    /// Same cancelled tombstone, while preserving any existing evidence.
+    /// Caller and this job retain the original exclusive Inbox operation lock.
+    pub(super) async fn cancel_if_absent(
+        &self,
+        dir: &Path,
+        path: &Path,
+        name: &str,
+    ) -> std::io::Result<()> {
+        let cancelled = dir.join("cancelled");
+        let to = cancelled.join(name);
+        self.job("cancel", path, move |_, path| {
+            std::fs::create_dir_all(cancelled)?;
+            match std::fs::symlink_metadata(&to) {
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "scoped Loop cancellation tombstone already exists",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
             std::fs::rename(path, to)
         })
         .await

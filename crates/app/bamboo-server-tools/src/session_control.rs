@@ -209,6 +209,12 @@ impl Tool for SessionControlTool {
 /// The standalone self-tool schema and its public API remain unchanged.
 fn scoped_loop_command_schema() -> Value {
     let mut schema = bamboo_tools::tools::loop_control::LoopControlTool::new().parameters_schema();
+    // Match Rust str::trim/char::is_whitespace exactly. ECMAScript \s
+    // includes FEFF but excludes NEL, so its shorthand is not equivalent.
+    // This local wrapper leaves the shared self-tool schema and DTO unchanged.
+    schema["properties"]["objective"]["pattern"] = json!(
+        r"[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]"
+    );
     let patch_fields = [
         ("objective", "string"),
         ("max_iterations", "integer"),
@@ -219,6 +225,13 @@ fn scoped_loop_command_schema() -> Value {
     for (field, kind) in patch_fields {
         schema["properties"][field]["type"] = json!([kind, "null"]);
     }
+    schema["properties"]["objective"]["description"] = json!(
+        "Required for start; optional update patch. Non-whitespace text, at most 16384 UTF-8 bytes. \
+         Shared typed request validation enforces the byte limit before delivery. \
+         maxLength is only a character-count coarse filter: passing schema validation alone does not prove the UTF-8 byte limit. \
+         ASCII, CJK and mixed text retain the same full byte allowance. \
+         An edit applies no earlier than the next iteration admission; at most one objective edit may be pending."
+    );
     let variant = |action: &str, required: &[&str], optional: &[&str]| {
         let mut properties = serde_json::Map::new();
         properties.insert("action".into(), json!({"const": action}));

@@ -56,6 +56,9 @@ struct ExpectedRunAdmission {
     expected_run_id: String,
     activation: Arc<dyn bamboo_domain::SessionActivationPort>,
     scoped_loop: Option<bamboo_domain::ScopedLoopControlBinding>,
+    // Canonical Stop observed while the original Supervisor authority locks
+    // remain held through this delivery. Applies only to new carrier ids.
+    scoped_loop_stopped: bool,
 }
 
 impl ExpectedRunAdmission {
@@ -1412,6 +1415,14 @@ impl FileSessionInbox {
                 active_delivery_notified: false,
             });
         }
+        if expected
+            .as_ref()
+            .is_some_and(|expected| expected.scoped_loop_stopped)
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "scoped Loop execution stopped before new carrier admission".into(),
+            ));
+        }
         if let Some(expected) = &expected {
             let expected = expected.clone();
             filesystem
@@ -1888,6 +1899,192 @@ impl FileSessionInbox {
         self.ack_unlocked(dir, target, claim, AckAuthority::ScopedLegacy(&filesystem))
             .await
     }
+
+    /// Stop is already committed, and its exact claim has not been ACKed yet.
+    /// The supplied filesystem owns canonical, real writer, Inbox and exact
+    /// live-owner guards. Retiring a transport is not consumer admission.
+    pub(crate) async fn retire_scoped_loop_tail_with_filesystem(
+        &self,
+        dir: &Path,
+        binding: &bamboo_domain::ScopedLoopControlBinding,
+        stop: &bamboo_domain::ScopedLoopControlClaim,
+        committed: &bamboo_domain::Session,
+        filesystem: &OwnedFilesystem,
+    ) -> Result<(), SessionInboxError> {
+        let invalid = |reason: &str| SessionInboxError::InvalidClaim(reason.into());
+        let stop_input = bamboo_domain::scoped_loop_control_input(stop.envelope())
+            .map_err(SessionInboxError::InvalidClaim)?
+            .ok_or_else(|| invalid("scoped Stop input required for retirement"))?;
+        if stop_input.binding != *binding
+            || !matches!(
+                stop_input.command,
+                bamboo_domain::LoopControlRequest::Stop { .. }
+            )
+            || !SessionStoreV2::scoped_loop_execution_stopped(committed, binding)
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?
+            || !bamboo_domain::has_scoped_loop_consumption(committed, stop.envelope())
+            || !bamboo_domain::scoped_loop_consumptions(committed)
+                .map_err(SessionInboxError::InvalidClaim)?
+                .iter()
+                .any(|record| record.input_id == stop.envelope().id && record.configured)
+            || !committed.session_inbox_admission().is_some_and(|cursor| {
+                cursor.contains(&stop.envelope().id)
+                    && cursor.last_admitted_sequence >= stop.generation()
+            })
+        {
+            return Err(invalid("scoped Stop retirement proof changed"));
+        }
+        let mut entries = Vec::new();
+        for queue in ["new", "cur"] {
+            // Read-only selection: malformed names/non-regular entries remain
+            // the normal corruption handler's work, never this scope's proof.
+            let mut reader = match tokio::fs::read_dir(dir.join(queue)).await {
+                Ok(reader) => reader,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => return Err(SessionInboxError::Storage(error.to_string())),
+            };
+            while let Some(entry) = reader
+                .next_entry()
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?
+            {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.ends_with(".json") || name.starts_with('.') {
+                    continue;
+                }
+                let Ok(generation) = Self::claim_generation(&name) else {
+                    continue;
+                };
+                if !entry
+                    .file_type()
+                    .await
+                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?
+                    .is_file()
+                {
+                    continue;
+                }
+                entries.push((generation, name, entry.path()));
+            }
+        }
+        if entries.len() > self.limits.max_backlog {
+            return Err(invalid("scoped Stop backlog exceeds configured bound"));
+        }
+        entries.sort_by_key(|entry| entry.0);
+        let expected_intent = Some(SessionInboxActivationIntent::for_expected_run(
+            &binding.owner_run_id,
+        )?);
+        for (generation, name, path) in entries {
+            if generation <= stop.generation() {
+                continue;
+            }
+            let bytes = match Self::read_receipt_bytes(
+                &path,
+                ReceiptLookupMode::Observe {
+                    max_bytes: self.max_transport_bytes(),
+                },
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                // An overlarge unknown transport is not authority to delete it.
+                Err(error) if error.kind() == ErrorKind::InvalidData => continue,
+                Err(error) => return Err(SessionInboxError::Storage(error.to_string())),
+            };
+            let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            let Some(body) = raw.get("body") else {
+                continue;
+            };
+            if body.get("kind").and_then(serde_json::Value::as_str) != Some("runtime_instruction")
+                || body
+                    .pointer("/body/type")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("runtime_instruction")
+                || body
+                    .pointer("/source/type")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("runtime")
+                || body
+                    .pointer("/source/subsystem")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(bamboo_domain::SCOPED_LOOP_SUBSYSTEM)
+                || body
+                    .pointer("/body/instruction")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(bamboo_domain::SCOPED_LOOP_INSTRUCTION)
+            {
+                continue;
+            }
+            let Some(raw_binding) = body.pointer("/body/data/binding") else {
+                continue;
+            };
+            let Ok(candidate) = serde_json::from_value::<bamboo_domain::ScopedLoopControlBinding>(
+                raw_binding.clone(),
+            ) else {
+                continue;
+            };
+            if candidate != *binding {
+                continue;
+            }
+            // Only a fixed instruction with this exact full binding reaches
+            // strict decoding. A foreign/User corrupt body is not our input.
+            let (wrapper, lease) = Self::decode_owned_wrapper(&bytes)?;
+            if wrapper.kind != InboxKind::SessionEnvelope {
+                return Err(invalid("scoped Stop tail transport kind changed"));
+            }
+            if let Some(lease) = &lease {
+                if !Self::owned_enabled(dir).await?
+                    || !lease.matches_transport_name(generation, &name)
+                {
+                    return Err(invalid("scoped Stop tail lease transport changed"));
+                }
+            }
+            if !Self::read_activation_watermark(dir).await?.1 {
+                return Err(invalid("scoped Stop tail requires its v2 watermark"));
+            }
+            let intent = Self::activation_intent(&wrapper.body)?;
+            let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body)
+                .map_err(|error| SessionInboxError::InvalidClaim(error.to_string()))?;
+            envelope
+                .validate()
+                .map_err(|error| SessionInboxError::InvalidClaim(error.to_string()))?;
+            let Some(input) = bamboo_domain::scoped_loop_control_input(&envelope)
+                .map_err(SessionInboxError::InvalidClaim)?
+            else {
+                continue;
+            };
+            if input.binding != *binding {
+                continue;
+            }
+            if envelope.target_session_id != binding.target_session_id || intent != expected_intent
+            {
+                return Err(invalid("scoped Stop tail binding/intent changed"));
+            }
+            if committed
+                .session_inbox_admission()
+                .is_some_and(|cursor| cursor.contains(&envelope.id))
+                || bamboo_domain::has_scoped_loop_consumption(committed, &envelope)
+                || Self::admitted_receipt_in_mode(
+                    dir,
+                    &envelope,
+                    ReceiptLookupMode::Observe {
+                        max_bytes: self.max_transport_bytes(),
+                    },
+                )
+                .await?
+                .is_some()
+            {
+                // A durable application is not an unadmitted cancellation.
+                return Err(invalid("scoped Stop tail already has admission proof"));
+            }
+            filesystem
+                .cancel_if_absent(dir, &path, &name)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1915,6 +2112,7 @@ impl SessionInboxPort for FileSessionInbox {
             .lock_scoped_loop_authority(binding)
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        let scoped_loop_stopped = authority.scoped_loop_stopped();
         let state = self
             .deliver_with_lifecycle_held_run(
                 envelope,
@@ -1929,6 +2127,7 @@ impl SessionInboxPort for FileSessionInbox {
                     expected_run_id: binding.owner_run_id.clone(),
                     activation,
                     scoped_loop: Some(binding.clone()),
+                    scoped_loop_stopped,
                 }),
             )
             .await?;
@@ -2255,6 +2454,7 @@ impl SessionInboxPort for FileSessionInbox {
                     expected_run_id: expected_run_id.into(),
                     activation,
                     scoped_loop: None,
+                    scoped_loop_stopped: false,
                 }),
             )
             .await?;

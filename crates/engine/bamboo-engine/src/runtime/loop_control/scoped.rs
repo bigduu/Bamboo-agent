@@ -263,9 +263,10 @@ pub(crate) async fn drain(
         if policy.execution_cancel()?.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        // Host stop revokes the grant; model Stop cancels only the generation's
-        // child token. In both cases leave later QueueOnly input with this
-        // original owner. A logical Stop cannot consume or configure more work.
+        // Host stop revokes the grant; model Stop cancels only its generation.
+        // A configured remote Stop retires its later unconsumed carriers inside
+        // the guarded Storage checkpoint. This drain never applies more work
+        // after Stop; host/local terminal recovery is not granted here.
         let generation_stopped = counted_loop::read_loop_state(session)?.is_some_and(|state| {
             state.owner_execution_id == binding.execution_id
                 && state

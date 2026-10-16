@@ -95,6 +95,16 @@ Cross-action fields remain forbidden even when null. The common seven-property
 surface stays unchanged. These schema constraints do not replace runtime byte
 bounds, live owner CAS or any execution-authority check.
 
+Nested objective strings also require at least one character outside Rust's
+Unicode White_Space set. This preserves FEFF as content and rejects NEL-only
+text, rather than using a regex whitespace shorthand with different semantics.
+The existing 16384 UTF-8 byte limit is enforced by the shared typed request
+before Inbox delivery. JSON Schema `maxLength` counts characters and remains
+a coarse filter; schema acceptance alone does not prove the byte bound.
+All existing legal ASCII, CJK, emoji and mixed strings retain the complete
+byte allowance. This documents the schema/runtime boundary; it does not claim
+an exact portable schema assertion for encoded UTF-8 length.
+
 Canonical disabled-tool checks use Domain's authoritative reference resolver
 for the corresponding fixed core capability (`session_control` on the source,
 `loop_control` on the target). Storage does not possess the dynamic provider
@@ -201,6 +211,28 @@ execution, typed control draining ends and the next counted boundary records
 Stopped without admitting another goal or provider call. While that same owner
 and host grant are still live, authorized `status` and exact Stop retry may read
 the immutable checkpoint. They still require every fresh authority check.
+
+For an actually configured remote Stop, its canonical checkpoint and Main
+consumption publish before the same guarded Inbox operation retires matching
+later unconsumed carriers to the existing `cancelled` queue. The original Stop
+claim remains live until that bounded cleanup succeeds, then receives its ACK.
+Retired tails acquire no typed consumption, Main cursor, configuration receipt
+or task result. Their original transport bytes remain available for immutable
+exact retries. An enqueue replay is historical admission, not a pending-work
+promise. New carrier IDs are refused for this same stopped pipeline execution
+under the existing canonical/Inbox locks; exact retries still require the live
+grant and are checked before that closure.
+
+Cleanup uses the existing Inbox backlog bound, independently of the 64-entry
+typed consumption limit. Clearly unmatched malformed/User/foreign input remains
+unchanged for the normal corruption path. A selected invalid proof, actual I/O
+error, tombstone collision or revoked/expired authority fails closed: a real
+Stop publication is not rolled back or relabelled as a successful ACK. Existing
+tombstones are never overwritten. This path covers the normal later tail of a
+consumed remote Stop. Local self Stop without that claim, host cancellation,
+other terminal exits, earlier exceptional leased remnants and interrupted
+cleanup need a separate target-owned retirement/recovery contract; this slice
+does not restore their grants or claim automatic reclamation.
 
 Host stop, execution cancellation, or owner finalization/release/replacement
 ends this live-control capability. The Supervisor cannot use the retired grant

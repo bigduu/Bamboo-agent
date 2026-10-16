@@ -211,3 +211,5 @@ async fn scoped_native_root_revoke_before_stop_checkpoint_keeps_original_authori
     );
     close_native(&mut h, &mut binding).await;
 }
+
+mod selector_guard_tests;

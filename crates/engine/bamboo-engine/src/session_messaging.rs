@@ -918,7 +918,7 @@ impl SessionMessenger {
             "replayed":receipt.replayed, "active_delivery_notified":receipt.active_delivery_notified,
             "configured":false, "target_application_observed":false,
             "objective_applied_actual":false, "operation_receipt":null,
-            "note":"Only this expected live owner was notified. Application is not observed here; query status with receipt_operation_id. This input never starts a successor or answers a wait."
+            "note":"Transport admission is historical on replay; the input may no longer be pending. Target application remains unobserved here; query status with receipt_operation_id. This input never starts a successor or answers a wait."
         }))
     }
 

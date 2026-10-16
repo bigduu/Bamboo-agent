@@ -130,6 +130,34 @@ fn read_committed(directory: &Path) -> io::Result<Session> {
 }
 
 impl SessionStoreV2 {
+    /// A narrow projection of the existing canonical Loop state, not an
+    /// authority source or a persisted closed-run registry. Callers retain
+    /// their existing canonical and exact live-owner proofs separately.
+    pub(crate) fn scoped_loop_execution_stopped(
+        session: &Session,
+        binding: &ScopedLoopControlBinding,
+    ) -> io::Result<bool> {
+        let Some(raw) = session.metadata.get("runtime.counted_loop") else {
+            return Ok(false);
+        };
+        if raw.len() > 128 * 1024 {
+            return Err(conflict("scoped Loop state exceeds byte bound"));
+        }
+        let state: serde_json::Value = serde_json::from_str(raw).map_err(conflict)?;
+        let owner = state["owner_execution_id"]
+            .as_str()
+            .ok_or_else(|| conflict("scoped Loop execution identity is malformed"))?;
+        if owner != binding.execution_id.as_str() {
+            return Ok(false);
+        }
+        let Some(control) = state.get("control").filter(|control| !control.is_null()) else {
+            return Ok(false);
+        };
+        control["stop_requested"]
+            .as_bool()
+            .ok_or_else(|| conflict("scoped Loop stop proof is malformed"))
+    }
+
     pub(super) async fn load_scoped_loop_session_impl(
         &self,
         binding: &ScopedLoopControlBinding,
@@ -332,6 +360,34 @@ impl SessionStoreV2 {
             .await?;
             *request.session = committed;
             if let Some((inbox, directory, filesystem, claim)) = input_fs {
+                let input = bamboo_domain::scoped_loop_control_input(claim.envelope())
+                    .map_err(conflict)?
+                    .ok_or_else(|| conflict("scoped Loop input disappeared before ACK"))?;
+                let configured = bamboo_domain::scoped_loop_consumptions(request.session)
+                    .map_err(conflict)?
+                    .iter()
+                    .any(|record| record.input_id == claim.envelope().id && record.configured);
+                if matches!(
+                    input.command,
+                    bamboo_domain::LoopControlRequest::Stop { .. }
+                ) && configured
+                    && Self::scoped_loop_execution_stopped(request.session, binding)?
+                {
+                    // Main's typed Stop consumption is real; keep its original
+                    // cur/lease proof live until all non-admitted tail inputs
+                    // are tombstoned. Every rename still checks the same real
+                    // writer and owner; only then ACK the actual Stop input.
+                    inbox
+                        .retire_scoped_loop_tail_with_filesystem(
+                            &directory,
+                            binding,
+                            &claim,
+                            request.session,
+                            &filesystem,
+                        )
+                        .await
+                        .map_err(conflict)?;
+                }
                 match claim {
                     ScopedLoopControlClaim::Owned(claim) => inbox
                         .ack_owned_with_filesystem(
