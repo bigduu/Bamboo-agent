@@ -64,6 +64,12 @@ pub(super) struct StoredLease {
 }
 
 impl StoredLease {
+    /// Structural evidence only. Retirement does not mint or renew a lease.
+    pub(super) fn matches_transport_name(&self, generation: u64, name: &str) -> bool {
+        FileSessionInbox::owned_name(generation, &self.token) == name
+            && self.policy == SessionActivationPolicy::RespectSpecificWait
+    }
+
     fn reclaim_count(&self) -> u64 {
         self.reclaim_count.unwrap_or(self.token.epoch - 1)
     }
@@ -155,11 +161,15 @@ struct OwnedGuards {
 #[cfg(test)]
 pub(super) type FilesystemHook = Arc<dyn Fn(&str, &Path) -> std::io::Result<()> + Send + Sync>;
 
+type RuntimeRetainer =
+    Arc<dyn Fn() -> std::io::Result<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>> + Send + Sync>;
+
 /// Private mutation capability: constructed only from the actual acquired guards.
 #[derive(Clone)]
 pub(crate) struct OwnedFilesystem {
     guards: Arc<OwnedGuards>,
     check: Option<Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>>,
+    runtime: Option<(RuntimeRetainer, bamboo_domain::ScopedLoopControlBinding)>,
     #[cfg(test)]
     hook: Option<FilesystemHook>,
 }
@@ -171,10 +181,26 @@ impl OwnedFilesystem {
         path: &Path,
         job: impl FnOnce(&Self, &Path) -> std::io::Result<T> + Send + 'static,
     ) -> std::io::Result<T> {
-        let filesystem = self.clone();
+        let mut filesystem = self.clone();
         let path = path.to_owned();
         tokio::task::spawn_blocking(move || {
             // This capture outlives cancellation of the async transaction itself.
+            if let Some((retain, binding)) = filesystem.runtime.clone() {
+                let guard = retain()?;
+                filesystem = filesystem.with_check(Arc::new(move || {
+                    if guard.matches(
+                        &binding.target_session_id,
+                        binding.target_created_at,
+                        &binding.owner_run_id,
+                    ) {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::other(
+                            "scoped Loop owner stopped before Inbox publication",
+                        ))
+                    }
+                }));
+            }
             let _guards = &filesystem.guards;
             filesystem.observe(event, &path)?;
             filesystem.validate()?;
@@ -203,6 +229,15 @@ impl OwnedFilesystem {
             }
             check()
         }));
+        self
+    }
+
+    pub(crate) fn with_runtime_retainer(
+        mut self,
+        retain: RuntimeRetainer,
+        binding: bamboo_domain::ScopedLoopControlBinding,
+    ) -> Self {
+        self.runtime = Some((retain, binding));
         self
     }
 
@@ -280,6 +315,20 @@ impl OwnedFilesystem {
                                 }
                             }
                             filesystem.observe("expected_run_matched", path)?;
+                            if retained.borrow().as_ref().is_none_or(|guard| {
+                                !guard.matches(
+                                    &expected.target_session_id,
+                                    expected.target_created_at,
+                                    &expected.expected_run_id,
+                                )
+                            }) {
+                                *conflict.borrow_mut() = Some(SessionInboxError::InvalidClaim(
+                                    "Loop owner stopped before delivery publication".into(),
+                                ));
+                                return Err(std::io::Error::other(
+                                    "expected run publication stopped",
+                                ));
+                            }
                         }
                     }
                     Ok(())
@@ -309,6 +358,33 @@ impl OwnedFilesystem {
         let to = cancelled.join(name);
         self.job("cancel", path, move |_, path| {
             std::fs::create_dir_all(cancelled)?;
+            std::fs::rename(path, to)
+        })
+        .await
+    }
+
+    /// Same cancelled tombstone, while preserving any existing evidence.
+    /// Caller and this job retain the original exclusive Inbox operation lock.
+    pub(super) async fn cancel_if_absent(
+        &self,
+        dir: &Path,
+        path: &Path,
+        name: &str,
+    ) -> std::io::Result<()> {
+        let cancelled = dir.join("cancelled");
+        let to = cancelled.join(name);
+        self.job("cancel", path, move |_, path| {
+            std::fs::create_dir_all(cancelled)?;
+            match std::fs::symlink_metadata(&to) {
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "scoped Loop cancellation tombstone already exists",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
             std::fs::rename(path, to)
         })
         .await
@@ -378,6 +454,7 @@ fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
 /// The exact owned lease cannot be dispatched without its actual mutation scope.
 pub(super) enum AckAuthority<'a> {
     Legacy,
+    ScopedLegacy(&'a OwnedFilesystem),
     Owned {
         lease: &'a StoredLease,
         filesystem: &'a OwnedFilesystem,
@@ -386,26 +463,32 @@ pub(super) enum AckAuthority<'a> {
 impl AckAuthority<'_> {
     pub(super) fn lease(&self) -> Option<&StoredLease> {
         match self {
-            Self::Legacy => None,
+            Self::Legacy | Self::ScopedLegacy(_) => None,
             Self::Owned { lease, .. } => Some(lease),
         }
     }
     pub(super) async fn create_dir(&self, path: &Path) -> std::io::Result<()> {
         match self {
             Self::Legacy => tokio::fs::create_dir_all(path).await,
-            Self::Owned { filesystem, .. } => filesystem.create_dir(path).await,
+            Self::ScopedLegacy(filesystem) | Self::Owned { filesystem, .. } => {
+                filesystem.create_dir(path).await
+            }
         }
     }
     pub(super) async fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         match self {
             Self::Legacy => atomic_write(path, bytes).await,
-            Self::Owned { filesystem, .. } => filesystem.write(path, bytes).await,
+            Self::ScopedLegacy(filesystem) | Self::Owned { filesystem, .. } => {
+                filesystem.write(path, bytes).await
+            }
         }
     }
     pub(super) async fn remove(&self, path: &Path) -> std::io::Result<()> {
         match self {
             Self::Legacy => tokio::fs::remove_file(path).await,
-            Self::Owned { filesystem, .. } => filesystem.remove(path).await,
+            Self::ScopedLegacy(filesystem) | Self::Owned { filesystem, .. } => {
+                filesystem.remove(path).await
+            }
         }
     }
 }
@@ -566,6 +649,7 @@ impl FileSessionInbox {
             OwnedFilesystem {
                 guards,
                 check: None,
+                runtime: None,
                 #[cfg(test)]
                 hook: self.owned_fs_hook.clone(),
             },
@@ -992,6 +1076,7 @@ impl FileSessionInbox {
         run: Option<&str>,
         request: &SessionInboxLeaseRequest,
         receipt: Option<&SessionInboxReceipt>,
+        scoped_only: bool,
     ) -> Result<Vec<SessionInboxOwnedClaim>, SessionInboxError> {
         if receipt.is_some_and(|receipt| receipt.generation == 0) {
             return Err(invalid("Inbox receipt generation must be nonzero"));
@@ -1079,6 +1164,9 @@ impl FileSessionInbox {
                 return Err(invalid("Inbox target mismatch"));
             }
             if receipt.is_some_and(|receipt| receipt.id != envelope.id) {
+                continue;
+            }
+            if bamboo_domain::is_scoped_loop_control(&envelope) != scoped_only {
                 continue;
             }
             // Receipt publication is terminal even if a process stopped before
@@ -1401,6 +1489,9 @@ impl FileSessionInbox {
         claim: &SessionInboxOwnedClaim,
         now: DateTime<Utc>,
     ) -> Result<(), SessionInboxError> {
+        if bamboo_domain::is_scoped_loop_control(&claim.claim.envelope) {
+            return Err(invalid("Loop controls require checkpoint-before-ACK"));
+        }
         Self::validate_claim_name(&claim.claim.claim_id)?;
         if claim.claim.envelope.target_session_id != target {
             return Err(invalid("Inbox target mismatch"));

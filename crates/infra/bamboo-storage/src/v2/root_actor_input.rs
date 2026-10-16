@@ -135,10 +135,15 @@ impl SessionStoreV2 {
         let envelope = envelope.clone();
         Arc::new(move || {
             let durable = proof.validate()?;
-            if durable
-                .messages
-                .iter()
-                .any(|message| bamboo_domain::is_matching_session_message(message, &envelope))
+            if (bamboo_domain::is_scoped_loop_control(&envelope)
+                && bamboo_domain::has_scoped_loop_consumption(&durable, &envelope)
+                && durable
+                    .session_inbox_admission()
+                    .is_some_and(|cursor| cursor.contains(&envelope.id)))
+                || (!bamboo_domain::is_scoped_loop_control(&envelope)
+                    && durable.messages.iter().any(|message| {
+                        bamboo_domain::is_matching_session_message(message, &envelope)
+                    }))
             {
                 Ok(())
             } else {

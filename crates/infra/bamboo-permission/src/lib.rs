@@ -61,7 +61,10 @@ pub use policy::{
     PermissionOutcome, PermissionReasonCode, PermissionRequest, PermissionRuleEffect,
     PermissionRuleRef, PermissionRuleScope, PermissionRuleSource,
 };
-pub use replay::{current_permission_replay_generation, with_permission_replay_generation};
+pub use replay::{
+    current_permission_replay_generation, permission_replay_active,
+    with_permission_replay_generation,
+};
 pub use rule_parser::ParsedRule;
 pub use storage::{
     default_permission_document, PermissionSection, PermissionStorage, PermissionStorageError,

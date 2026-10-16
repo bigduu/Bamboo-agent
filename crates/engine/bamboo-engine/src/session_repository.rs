@@ -876,6 +876,83 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .await
     }
 
+    async fn claim_scoped_loop_controls(
+        &self,
+        session: &Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        active_run_id: &str,
+        limit: usize,
+    ) -> std::io::Result<Vec<bamboo_domain::ScopedLoopControlClaim>> {
+        use bamboo_domain::ScopedLoopControlClaim;
+        if let Some((directory, owner)) = self.root_actor_owner.as_ref() {
+            let inbox = self.storage.bind_root_actor_inbox(owner, inbox)?;
+            let consumer = bamboo_domain::SessionInboxConsumerId::new();
+            let request = root_inbox::lease_request(directory.as_ref(), owner, &consumer).await?;
+            return inbox
+                .claim_owned_scoped_loop_controls(&session.id, limit, Some(active_run_id), &request)
+                .await
+                .map(|claims| {
+                    claims
+                        .into_iter()
+                        .map(ScopedLoopControlClaim::Owned)
+                        .collect()
+                })
+                .map_err(std::io::Error::other);
+        }
+        inbox
+            .claim_scoped_loop_controls(&session.id, limit, Some(active_run_id))
+            .await
+            .map(|claims| {
+                claims
+                    .into_iter()
+                    .map(ScopedLoopControlClaim::Legacy)
+                    .collect()
+            })
+            .map_err(std::io::Error::other)
+    }
+
+    async fn checkpoint_scoped_loop_control(
+        &self,
+        session: &mut Session,
+        bindings: &[bamboo_domain::ScopedLoopControlBinding],
+        activation: Arc<dyn bamboo_domain::SessionActivationPort>,
+        input: Option<(
+            Arc<dyn bamboo_domain::SessionInboxPort>,
+            bamboo_domain::ScopedLoopControlClaim,
+        )>,
+    ) -> std::io::Result<()> {
+        let _guard = self.persistence.acquire_lock(&session.id).await;
+        let cache = self.cache.clone();
+        let publish: bamboo_domain::RootActorRuntimePublisher = Arc::new(move |saved| {
+            cache.insert(
+                saved.id.clone(),
+                Arc::new(crate::SessionSnapshot::new(saved.clone())),
+            );
+        });
+        self.storage
+            .checkpoint_scoped_loop(bamboo_domain::ScopedLoopControlCheckpoint {
+                session,
+                bindings,
+                activation,
+                owner: self
+                    .root_actor_owner
+                    .as_ref()
+                    .map(|(_, owner)| owner.as_ref()),
+                input,
+                publish,
+            })
+            .await
+    }
+
+    async fn load_loop_control_checkpoint(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        self.storage
+            .load_execution_admission_snapshot(session_id)
+            .await
+    }
+
     async fn admit_root_inbox(
         &self,
         session: &mut Session,

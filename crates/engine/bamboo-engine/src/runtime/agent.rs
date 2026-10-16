@@ -434,6 +434,12 @@ impl Agent {
         }
         if let Some(control) = req.loop_control.as_mut() {
             control.bind_owner(registration.ownership(), session);
+            control.bind_transport_cleanup(
+                &mut registration,
+                self.storage().clone(),
+                self.session_inbox().cloned(),
+                self.persistence().root_actor_writer(),
+            );
         }
         let result = if req.loop_control.is_some() {
             bamboo_agent_core::tools::observe_tool_suspension(false, async {
