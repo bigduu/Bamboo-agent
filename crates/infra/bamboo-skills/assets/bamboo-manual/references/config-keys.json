@@ -1,0 +1,20 @@
+{
+  "format_version": 1,
+  "coverage": "bounded_typed_catalog_not_full_schema",
+  "representation": "Config compatibility view; not section-file envelopes",
+  "unknown_key_meaning": "not covered here; inspect the installed version's typed DTO and validator",
+  "source": "crates/infra/bamboo-config/src/config.rs",
+  "entries": [
+    {"key":"server.port","section":"core","type":"u16","default":9562,"example":9652,"meaning":"HTTP listener port; a serve CLI override can change the runtime value."},
+    {"key":"server.workers","section":"core","type":"usize","default":10,"example":2,"meaning":"Actix HTTP worker count."},
+    {"key":"tools.disabled","section":"tools-skills","type":"array<string>","default":[],"example":["WebFetch"],"meaning":"Globally omitted tool names; does not grant other tool permissions."},
+    {"key":"skills.disabled","section":"tools-skills","type":"array<string>","default":[],"example":["bamboo-manual"],"meaning":"Globally unavailable skill IDs, including this manual if listed."},
+    {"key":"memory.auto_dream_enabled","section":"memory","type":"bool","default":true,"example":false,"meaning":"Enable automatic Dream ticks; configured models, eligible work and runtime gates still matter."},
+    {"key":"memory.project_prompt_injection","section":"memory","type":"bool","default":true,"example":false,"aliases":["memory.memory_project_prompt_injection"],"meaning":"Project durable-memory index injection in the main prompt."},
+    {"key":"memory.relevant_recall","section":"memory","type":"bool","default":true,"example":false,"aliases":["memory.memory_relevant_recall"],"meaning":"Automatic relevant durable-memory recall."},
+    {"key":"memory.relevant_recall_rerank","section":"memory","type":"bool","default":false,"example":true,"aliases":["memory.memory_relevant_recall_rerank"],"meaning":"Optional model reranking of lexical candidates; fallback remains lexical."},
+    {"key":"memory.ledger_agenda_injection","section":"memory","type":"bool","default":true,"example":false,"aliases":["memory.memory_ledger_agenda_injection"],"meaning":"Inject the applicable ledger agenda; an empty agenda contributes no section."},
+    {"key":"lifecycle_hooks.enabled","section":"hooks","type":"bool","default":false,"example":true,"meaning":"Native lifecycle-hook enablement; handler configuration and authorization remain separate."},
+    {"key":"context_management.strategy","section":"core","type":"enum","default":"summary","example":"retrieval_window","values":["summary","message_summary","retrieval_window"],"meaning":"Context strategy; retrieval-window validation and history-tool requirements still apply."}
+  ]
+}
