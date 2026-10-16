@@ -135,14 +135,14 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "write_stdin" => Some(guide(
             "write_stdin",
             ToolCategory::CommandExecution,
-            "Pull output and completion from an exec_command session owned by this conversation. Use chars=\"\" to wait/poll; yield_time_ms is bounded to 250–30000 ms (default 10000). Running results retain session_id; final results omit it and include exit_code when available. Output is incremental and bounded by max_output_tokens (default 2000, maximum 8192); output_omitted_bytes reports discarded bytes. For interactive=true sessions, nonempty chars writes exact bytes to the stdin pipe; include your own newline and use eof=true to close stdin. A lone Ctrl-C (\\u0003) stops the process.",
-            "Do not use a conversation ID or legacy Bash ID as session_id. Do not poll a finished session or wait for an automatic completion message. Input requires an interactive stdin pipe and does not provide PTY terminal behavior.",
+            "Pull output and completion from an exec_command session owned by this conversation. Use chars=\"\" to wait/poll; yield_time_ms is bounded to 250–30000 ms (default 10000). Running results retain session_id; final results omit it and include exit_code when available. Running polling metadata reports state, elapsed_ms, output_idle_ms, consecutive_empty_readouts and exit_observed. False exit_observed means no exit has been observed, not verified liveness; true still waits for terminal output capture. After repeated empty readouts and sustained silence, a polling advisory asks you to do useful work or inspect one command-owned progress signal before polling again. Continue waiting when appropriate, or report a concrete blocker, retaining the handle for final status. Repeatedly ignoring the quiet reminder can pause polling in a Human-controlled Root; the command remains pending. Handles are local to this Host; unread terminal results keep their existing five-minute expiry after completion, including during a diagnostic pause. Output is incremental and bounded by max_output_tokens (default 2000, maximum 8192); output_omitted_bytes reports discarded bytes. For interactive=true sessions, nonempty chars writes exact bytes to the stdin pipe; include your own newline and use eof=true to close stdin. A lone Ctrl-C (\\u0003) stops the process.",
+            "Do not use a conversation ID or legacy Bash ID as session_id. Do not blindly repeat identical empty polls, infer completion from silence or an existing report, or stop/restart a command only because it is quiet. Do not poll a finished session or wait for an automatic completion message. Input requires an interactive stdin pipe and does not provide PTY terminal behavior.",
             &["exec_command"],
             vec![
                 example(
                     "Pull a command's next output and exit status",
                     json!({"session_id":"<session_id-from-exec_command>","chars":"","yield_time_ms":1000}),
-                    "Repeat while status=running; a nonzero exit_code is a command outcome to inspect.",
+                    "While status=running, use polling progress and follow any advisory before another empty poll. Preserve the handle until final status; a nonzero exit_code is a command outcome to inspect.",
                 ),
                 example(
                     "Answer an interactive prompt and close input",
@@ -247,7 +247,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "ViewImage" => Some(guide(
             "ViewImage",
             ToolCategory::FileReading,
-            "Load a local raster image for visual inspection. With hooks.image_fallback enabled in vision mode, Bamboo replaces the image with the resolved vision model's description; otherwise the tool returns base64 multimodal image content.",
+            "Load a local raster image for visual inspection. Vision-capable main models receive multimodal image content. When the main model has Vision disabled, Bamboo uses the explicitly configured Vision model and returns a labeled description as untrusted tool data. This fallback applies only to this tool. Direct conversation image uploads to a main model without Vision remain rejected, even when a Vision model is configured. Missing or unsupported Vision configuration is an actionable tool error. The main model is unchanged.",
             "Do not use for text files, directories, SVG/vector files, or images larger than 10 MB; use Read for textual content.",
             &["Read", "GetFileInfo"],
             vec![example(
@@ -741,6 +741,11 @@ mod tests {
         let poll = builtin_guide_spec("write_stdin").unwrap();
         assert!(poll.when_to_use.contains("final results omit it"));
         assert!(poll.when_to_use.contains("include your own newline"));
+        assert!(poll.when_to_use.contains("polling advisory"));
+        assert!(poll.when_to_use.contains("not verified liveness"));
+        assert!(poll
+            .when_not_to_use
+            .contains("infer completion from silence"));
         assert_eq!(poll.examples[0].parameters["chars"], "");
         for legacy in ["Bash", "BashInput", "BashOutput", "KillShell"] {
             assert!(!BUILTIN_GUIDE_NAMES.contains(&legacy));

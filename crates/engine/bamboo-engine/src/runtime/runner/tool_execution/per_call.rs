@@ -305,14 +305,6 @@ pub(super) async fn execute_model_requested_tool_call_only(
         });
     };
 
-    if execution_name == "ViewImage" && !ctx.vision_support {
-        return Ok(ToolExecutionOutcome {
-            output_cap: None, permission_replay_origin: None,
-            result: Err("ViewImage is unavailable: the current model does not support Vision. Select a Vision-capable model or enable supports_vision for this model in provider settings. No image was read or sent.".into()),
-            needs_human: None, portable_tool: None, post_tool_hook_eligible: false, managed_running_violation: false,
-            tool_duration: std::time::Duration::ZERO,
-        });
-    }
     execute_tool_call_only_with_execution_name(&execution_name, ctx).await
 }
 
@@ -424,6 +416,26 @@ async fn execute_tool_call_only_with_execution_name_inner(
             tool_duration: std::time::Duration::ZERO,
         });
     }
+
+    let vision_target = if execution_name == "ViewImage" && !ctx.vision_support {
+        match crate::runtime::runner::image_fallback::resolve_vision_target(ctx.config).await {
+            Ok(target) => Some(target),
+            Err(error) => {
+                return Ok(ToolExecutionOutcome {
+                    output_cap: None,
+                    permission_replay_origin: None,
+                    result: Err(error.to_string()),
+                    needs_human: None,
+                    portable_tool: None,
+                    post_tool_hook_eligible: false,
+                    managed_running_violation: false,
+                    tool_duration: std::time::Duration::ZERO,
+                })
+            }
+        }
+    } else {
+        None
+    };
 
     let raw_arguments = ctx.tool_call.function.arguments.trim();
     let (args, parse_warning) = parse_tool_args_best_effort(&ctx.tool_call.function.arguments);
@@ -683,7 +695,7 @@ async fn execute_tool_call_only_with_execution_name_inner(
         output_cap,
         dispatch,
     );
-    let (needs_human, result, post_tool_hook_eligible) =
+    let (needs_human, mut result, post_tool_hook_eligible) =
         match bamboo_tools::with_hook_permission_override(
             permission_override,
             &ctx.tool_call.id,
@@ -697,6 +709,24 @@ async fn execute_tool_call_only_with_execution_name_inner(
             Ok(ToolOutcome::NeedsHuman { question, result }) => (Some(question), Ok(result), false),
             Err(error) => (None, Err(error), true),
         };
+
+    // Keep the auxiliary request inside the existing tool timeout/cancellation
+    // scope, after successful permission/file checks and before terminal events.
+    // Never spawn it into detached work or forward pixels to the main model.
+    if let Some(target) = vision_target {
+        if let Ok(tool_result) = result.as_mut() {
+            if tool_result.success && !tool_result.images.is_empty() {
+                if let Err(error) = crate::runtime::runner::image_fallback::describe_tool_images(
+                    &target,
+                    tool_result,
+                )
+                .await
+                {
+                    result = Err(bamboo_agent_core::ToolError::Execution(error.to_string()));
+                }
+            }
+        }
+    }
 
     let tool_duration = tool_timer.elapsed();
 

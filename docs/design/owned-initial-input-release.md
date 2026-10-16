@@ -6,7 +6,7 @@ After its real local transcript/cursor and permanent receipt, the worker request
 
 The worker queues its actual permission audit first. The broker flushes the preceding ordered event batches before the request. The Host requires matching posture confirmation, current policy/denies, current Actor fence and owner, complete current input checkpoint readback, and successful exact physical Inbox ACK. It rechecks authority before returning a deadline bounded by both leases. A worker-local receipt alone is insufficient.
 
-The same current owner may repeat the exact nonce/request after a lost reply. The Host rereads the durable admitted receipt and preserves the original deadline. Worker retries retain that nonce, time out after 60 seconds and observe cancellation/disconnection. Wrong, expired or unrelated releases fail the activation; they never become input. A release is an admission decision, not instantaneous revocation of an already entered provider call.
+The same current owner may repeat the exact nonce/request after a lost reply. The Host rereads the durable admitted receipt and preserves the original deadline. Worker retries retain that nonce, time out after 60 seconds and observe cancellation/disconnection. Exact unexpired copies of a release already accepted by this physical Run are ignored, including between batch items and after the final barrier. The remembered complete values include the nonce, birth, run, epoch, input/generation and original deadline, and are bounded by the existing Inbox max_claim_batch. They cannot satisfy a later barrier or extend a lease. Changed, expired or unrelated releases fail the activation; they never become input. A release is an admission decision, not instantaneous revocation of an already entered provider call.
 
 The existing Local placement reference records `owned-initial-release-v1:<physical mailbox>` only after the trusted capability probe and actual spawn. This is provenance for a future recovery consumer, not evidence that a process stopped. Absent/legacy placement cannot establish historical safety.
 
@@ -20,3 +20,28 @@ it reports unresolved admission to the checked runtime path. That path stops
 before prompt/provider execution and preserves the owned claim for its actual
 owner. This is a fail-closed compatibility boundary, not lease renewal or
 recovery of an expired Actor.
+
+
+## Completed plain Child with a bounded cold-input batch
+
+A successfully completed strict local zero-tool Child may select a bounded batch of
+new pending plain text inputs, using the existing Inbox max_claim_batch
+(default 128) when an actual wake-eligible input exists. This
+supports QueueOnly plus a later followup without promoting QueueOnly or staged
+Child/Bash outcomes. Fresh, Failed, expired-initial and pre-ACK recovery shapes
+retain their existing restrictions; an old physical claim is not a new batch.
+
+The Host validates and claims the complete bounded selection before any input
+checkpoint, checkpoints each under the unchanged Actor/physical fence, and sends
+the pre-input prefix plus ordered typed deliveries in one Run. The existing v1
+control runs separately for every input. The Host accepts only the next input or
+an exact retained release retransmission; wrong order, a changed nonce or an
+early Terminal fails closed. Two-input examples are acceptance samples, not an additional product limit.
+The worker waits for all releases and retains their
+earliest deadline before SDK/provider entry. No release extends a lease.
+
+Partial or uncertain publication/ACK never dispatches an unprepared prefix,
+ACKs a sibling, or establishes completion. Admitted prefixes and claims remain
+durable; this does not introduce multi-claim recovery or exactly-once provider
+effects. Older workers may reject the batch shape safely; no relaxed legacy
+fallback or new permission is available.

@@ -3753,9 +3753,9 @@ impl ExternalChildRunner for ActorChildRunner {
                 .await;
                 match started {
                     Ok((activation, prepared)) => {
-                        if let Some((prefix, delivery)) = prepared {
+                        if let Some((prefix, deliveries)) = prepared {
                             messages = prefix;
-                            initial_session_messages = vec![delivery];
+                            initial_session_messages = deliveries;
                         }
                         plain_activation = Some(activation);
                     }
@@ -3971,7 +3971,7 @@ impl ExternalChildRunner for ActorChildRunner {
             let dispatch = async {
                 if let Some(activation) = plain_activation
                     .as_ref()
-                    .filter(|activation| activation.initial_input.is_some())
+                    .filter(|activation| !activation.initial_inputs.is_empty())
                 {
                     activation.refresh_continuation_posture(
                         session,
@@ -4459,11 +4459,13 @@ struct PlainActorActivation {
     initial_release_required: bool,
     input_inbox: bamboo_storage::FileSessionInbox,
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
-    initial_input: Option<SessionInboxOwnedClaim>,
+    initial_inputs: Vec<SessionInboxOwnedClaim>,
+    initial_input_count: usize,
     recovering_pre_ack: bool,
     completion_router: std::sync::Mutex<Option<ActorEventRouter>>,
 }
 type PlainInitialDelivery = (Vec<serde_json::Value>, SessionMessageDelivery);
+type PlainInitialBatch = (Vec<serde_json::Value>, Vec<SessionMessageDelivery>);
 #[track_caller]
 fn plain_actor_unsupported() -> AgentError {
     let source = std::panic::Location::caller();
@@ -4474,7 +4476,7 @@ fn plain_actor_unsupported() -> AgentError {
         source_column = source.column(),
         "plain Actor continuation unsupported"
     );
-    AgentError::LLM("This Actor Child supports a fresh plain activation, a completed plain Child with one new input, two bounded corrections while Running, a Failed retry with one new input, an expired initial Local owner with one new input, or verified expired pre-ACK input recovery through run(reset_to_last_user=false). Other continuation is unsupported; durable history is preserved.".into())
+    AgentError::LLM("This Actor Child supports a fresh plain activation, a completed plain Child with a bounded batch of new inputs, two bounded corrections while Running, a Failed retry with one new input, an expired initial Local owner with one new input, or verified expired pre-ACK input recovery through run(reset_to_last_user=false). Other continuation is unsupported; durable history is preserved.".into())
 }
 fn plain_initial_history(session: &Session) -> bool {
     !session.messages.iter().any(|message| {
@@ -4654,15 +4656,27 @@ impl PlainActorActivation {
                         && backlog.generation > old.inbox_generation
                 })
                 && new_input;
+            // Only completed plain local history gains a bounded initial batch.
+            // Retry, expired owner and pre-ACK recovery retain their single-input
+            // contracts. QueueOnly alone still cannot authorize a cold start.
+            let new_batch = backlog.pending > 1
+                && backlog.pending <= bamboo_domain::SessionInboxLimits::default().max_claim_batch
+                && backlog.claimed == 0
+                && backlog
+                    .oldest_generation
+                    .is_some_and(|oldest| oldest < backlog.generation)
+                && backlog.activation_pending();
             let continuation = allow_failed_retry
                 && release_worker.is_some()
                 && entry.actor.state == ActorLogicalState::Cold
                 && entry.actor.current_attempt > 0
                 && entry.activation.as_ref().is_some_and(|old| {
                     old.status == bamboo_domain::ActorActivationStatus::Succeeded
-                        && backlog.generation > old.inbox_generation
+                        && backlog
+                            .oldest_generation
+                            .is_some_and(|oldest| oldest > old.inbox_generation)
                 })
-                && new_input
+                && (new_input || new_batch)
                 && plain_completed_history(session);
             let input_inbox = bamboo_storage::FileSessionInbox::new(
                 store.clone(),
@@ -4770,7 +4784,12 @@ impl PlainActorActivation {
                 initial_release_required: release_worker.is_some(),
                 input_inbox,
                 permission_config,
-                initial_input: recovered,
+                initial_inputs: recovered.into_iter().collect(),
+                initial_input_count: if continuation {
+                    backlog.pending
+                } else {
+                    usize::from(claimed.inbox_generation > 0)
+                },
                 recovering_pre_ack: recovery.is_some(),
                 completion_router: std::sync::Mutex::new(None),
             };
@@ -4795,9 +4814,8 @@ impl PlainActorActivation {
         release_worker: Option<&'a str>,
     ) -> std::pin::Pin<
         Box<
-            impl std::future::Future<
-                    Output = Result<(Self, Option<PlainInitialDelivery>), AgentError>,
-                > + Send
+            impl std::future::Future<Output = Result<(Self, Option<PlainInitialBatch>), AgentError>>
+                + Send
                 + 'a,
         >,
     > {
@@ -4825,26 +4843,46 @@ impl PlainActorActivation {
                 let expected = if activation.recovering_pre_ack {
                     (0, 1)
                 } else {
-                    (1, 0)
+                    (activation.initial_input_count, 0)
                 };
                 if (backlog.pending, backlog.claimed) != expected
                     || backlog.generation != activation.inbox_generation
                 {
                     return Err(plain_actor_unsupported());
                 }
-                let claim = match activation.initial_input.clone() {
-                    Some(claim) => claim,
-                    None => activation
-                        .claim_input(binding, session, run_id)
+                let claims = if activation.initial_inputs.is_empty() {
+                    // claim_owned is idempotent for this consumer. Repeating
+                    // limit=1 would return the same first claim, not the next.
+                    // Select once under the existing bounded queue transaction.
+                    activation
+                        .claim_inputs(binding, session, run_id, activation.initial_input_count)
                         .await?
-                        .ok_or_else(|| plain_actor_unsupported())?,
+                } else {
+                    activation.initial_inputs.clone()
                 };
-                if claim.claim.generation != activation.inbox_generation {
+                if claims.len() != activation.initial_input_count
+                    || claims.last().map(|claim| claim.claim.generation)
+                        != Some(activation.inbox_generation)
+                    || claims
+                        .windows(2)
+                        .any(|pair| pair[0].claim.generation >= pair[1].claim.generation)
+                {
                     return Err(plain_actor_unsupported());
                 }
-                let delivery = activation.checkpoint_input(session, run_id, &claim).await?;
-                activation.initial_input = Some(claim);
-                Ok(delivery)
+                // Validate/claim the entire bounded selection before publishing
+                // any input. Each checkpoint still uses its own physical lease,
+                // complete current prefix and actual Actor fence. A partial or
+                // uncertain checkpoint never dispatches a Run or ACKs a sibling.
+                let mut prefix = None;
+                let mut deliveries = Vec::with_capacity(claims.len());
+                for claim in &claims {
+                    let (messages, delivery) =
+                        activation.checkpoint_input(session, run_id, claim).await?;
+                    prefix.get_or_insert(messages);
+                    deliveries.push(delivery);
+                }
+                activation.initial_inputs = claims;
+                Ok((prefix.ok_or_else(|| plain_actor_unsupported())?, deliveries))
             }
             .await;
             match prepared {
@@ -4868,7 +4906,25 @@ impl PlainActorActivation {
                 + 'a,
         >,
     > {
+        Box::pin(async move { Ok(self.claim_inputs(binding, session, run_id, 1).await?.pop()) })
+    }
+    fn claim_inputs<'a>(
+        &'a self,
+        binding: &'a SessionInboxRuntimeBinding,
+        session: &'a Session,
+        run_id: &'a str,
+        limit: usize,
+    ) -> std::pin::Pin<
+        Box<
+            impl std::future::Future<Output = Result<Vec<SessionInboxOwnedClaim>, AgentError>>
+                + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
+            if limit == 0 || limit > bamboo_domain::SessionInboxLimits::default().max_claim_batch {
+                return Err(plain_actor_unsupported());
+            }
             if !self
                 .input_inbox
                 .inspect(&session.id)
@@ -4876,7 +4932,7 @@ impl PlainActorActivation {
                 .map_err(|_| plain_actor_unsupported())?
                 .activation_pending()
             {
-                return Ok(None);
+                return Ok(Vec::new());
             }
             if run_id != self.fence.run_id || !binding.router.owns_run(&session.id, run_id).await {
                 return Err(plain_actor_unsupported());
@@ -4890,19 +4946,17 @@ impl PlainActorActivation {
                 now,
                 duration: self.input_deadline - now,
             };
-            let claim = self
+            let claims = self
                 .input_inbox
-                .claim_owned(&session.id, 1, Some(run_id), &lease)
+                .claim_owned(&session.id, limit, Some(run_id), &lease)
                 .await
                 .map_err(|error| {
                     tracing::warn!(%error, "Actor correction claim unconfirmed");
                     AgentError::LLM(
                         "Actor correction claim unconfirmed; durable input is preserved".into(),
                     )
-                })?
-                .into_iter()
-                .next();
-            if let Some(claim) = &claim {
+                })?;
+            for claim in &claims {
                 if !matches!(&claim.claim.envelope.body, bamboo_domain::SessionMessageBody::Content(content)
                     if content.parts.is_empty() && !content.text.trim().is_empty() && content.text.len() <= 8192)
                 {
@@ -4925,7 +4979,7 @@ impl PlainActorActivation {
                     return Err(plain_actor_unsupported());
                 }
             }
-            Ok(claim)
+            Ok(claims)
         })
     }
     fn checkpoint_input<'a>(
@@ -7882,15 +7936,17 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     let mut got_first_frame = false;
     let mut first_frame_watch = first_frame_timeout.map(|d| Box::pin(tokio::time::sleep(d)));
     let mut inflight_claims = initial_inflight_claims;
-    let mut owned_input = plain_input.and_then(|activation| activation.initial_input.clone());
-    // Retry/recovery already consumes its one input; only a fresh activation
-    // can continue twice. Neither budget restarts the Actor lease or watchdog.
-    let continuation_limit = if owned_input.is_some() { 1 } else { 2 };
-    let mut continuations = usize::from(owned_input.is_some());
-    let mut released_input: Option<(
+    let mut owned_inputs = plain_input
+        .map(|activation| VecDeque::from(activation.initial_inputs.clone()))
+        .unwrap_or_default();
+    // A retry/recovery or completed initial batch consumes its cold allowance;
+    // only a fresh activation can continue twice. No lease/watchdog restarts.
+    let continuation_limit = if owned_inputs.is_empty() { 2 } else { 1 };
+    let mut continuations = usize::from(!owned_inputs.is_empty());
+    let mut released_inputs: Vec<(
         SessionInboxOwnedClaim,
         bamboo_subagent::proto::InitialInputRelease,
-    )> = None;
+    )> = Vec::new();
     let mut current_epoch = execution_epoch;
     let approval_epoch = Arc::new(AtomicU64::new(execution_epoch));
     let approval_cancel = cancel_token.child_token();
@@ -8019,15 +8075,25 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             let activation = plain_input.ok_or_else(|| plain_actor_unsupported())?;
                             let binding = session_inbox_runtime.ok_or_else(|| plain_actor_unsupported())?;
                             let (run, _) = plain_run.ok_or_else(|| plain_actor_unsupported())?;
-                            let claim = owned_input.as_ref().or_else(|| released_input.as_ref().map(|(claim, _)| claim))
-                                .ok_or_else(|| plain_actor_unsupported())?;
-                            let release = activation.release_initial_input(binding, logical_session, run, current_epoch, claim,
-                                &request, &mut expected_permission_posture, released_input.as_ref().map(|(_, release)| release)).await?;
+                            // Exact retransmission may refer to an earlier
+                            // release while the next input is still waiting.
+                            // Every new request must match the ordered front.
+                            let previous = released_inputs.iter()
+                                .find(|(_, release)| release.request == request);
+                            let (claim, previous) = match previous {
+                                Some((claim, release)) => (claim.clone(), Some(release.clone())),
+                                None => (owned_inputs.front().cloned()
+                                    .ok_or_else(|| plain_actor_unsupported())?, None),
+                            };
+                            let release = activation.release_initial_input(binding, logical_session, run, current_epoch, &claim,
+                                &request, &mut expected_permission_posture, previous.as_ref()).await?;
                             if cancel_token.is_cancelled() { return Err(AgentError::Cancelled); }
                             client.send(ParentFrame::InitialInputRelease { release: release.clone() }).await
                                 .map_err(|_| AgentError::LLM("Actor initial release unconfirmed; durable input is preserved".into()))?;
-                            released_input = Some((claim.clone(), release));
-                            owned_input = None;
+                            if previous.is_none() {
+                                let _ = owned_inputs.pop_front();
+                                released_inputs.push((claim, release));
+                            }
                             continue;
                         }
                         if expected_creation.is_some() {
@@ -8557,9 +8623,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             if activation.initial_release_required { return Err(plain_actor_unsupported()); }
                             let binding = session_inbox_runtime.ok_or_else(|| plain_actor_unsupported())?;
                             let run_id = activation_run_id.ok_or_else(|| plain_actor_unsupported())?;
-                            let claim = owned_input.as_ref().ok_or_else(|| plain_actor_unsupported())?;
+                            let claim = owned_inputs.front().ok_or_else(|| plain_actor_unsupported())?;
                             activation.confirm_input(binding, logical_session, run_id, claim, &confirmation).await?;
-                            owned_input = None;
+                            let _ = owned_inputs.pop_front();
                             continue;
                         }
                         let Some(binding) = session_inbox_runtime else {
@@ -8651,7 +8717,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 // persistence. Certify only an entirely validated
                                 // local Read/Glob prefix with no pending handoff.
                                 if permission_handshake.is_awaiting()
-                                    || owned_input.is_some()
+                                    || !owned_inputs.is_empty()
                                     || !inflight_claims.is_empty()
                                     || parent_question_checkpoint_id.is_some()
                                     || nested_wait_registered_this_run
@@ -8719,7 +8785,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                     .to_string(),
                             ));
                         }
-                        if owned_input.is_some() {
+                        if !owned_inputs.is_empty() {
                             return Err(AgentError::LLM("Actor terminated before confirming its durable correction; Inbox claim is retained".into()));
                         }
                         if let Some(claim) = inflight_claims.front() {
@@ -8759,8 +8825,8 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                         client, binding, logical_session, run_id, plain_run, &mut expected_permission_posture,
                                         result.clone().filter(|text| !text.is_empty()).ok_or_else(|| plain_actor_unsupported())?, event_tx,
                                     ).await? {
-                                        owned_input = Some(claim);
-                                        released_input = None;
+                                        owned_inputs = VecDeque::from([claim]);
+                                        released_inputs.clear();
                                         continuations += 1;
                                         current_epoch = epoch;
                                         approval_epoch.store(epoch, Ordering::Release);
@@ -9108,6 +9174,8 @@ mod tests {
 
     include!("expired_plain_owner_tests.rs");
 
+    include!("owned_cold_input_tests.rs");
+
     #[test]
     fn plain_rejection_logs_branch_and_run_without_changing_error() {
         // Keep shared callsites consulting the current subscriber during scoped capture.
@@ -9168,10 +9236,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_plain_continuation_requires_one_input_and_current_identity() {
+    async fn completed_plain_continuation_requires_bounded_inputs_and_current_identity() {
         for case in [
             "valid",
-            "two-inputs",
+            "over-batch-limit",
             "tool-history",
             "stale-lineage",
             "no-release",
@@ -9219,7 +9287,11 @@ mod tests {
                 store.clone(),
                 Default::default(),
             ));
-            for slot in 0..if case == "two-inputs" { 2 } else { 1 } {
+            for slot in 0..if case == "over-batch-limit" {
+                bamboo_domain::SessionInboxLimits::default().max_claim_batch + 1
+            } else {
+                1
+            } {
                 let envelope = bamboo_domain::SessionMessageEnvelope::user_input(
                     &child.id,
                     format!("new task {slot}"),
@@ -12949,7 +13021,9 @@ mod tests {
                 continue;
             }
             let (retry, prepared) = result.unwrap();
-            let (prefix, delivery) = prepared.unwrap();
+            let (prefix, mut deliveries) = prepared.unwrap();
+            assert_eq!(deliveries.len(), 1);
+            let delivery = deliveries.pop().unwrap();
             assert_eq!(
                 prefix,
                 serde_json::to_value(&before.messages)
@@ -12972,7 +13046,7 @@ mod tests {
                 bamboo_domain::ActorActivationStatus::Running
             );
             assert!(running.activation.unwrap().lease_epoch > first.fence.lease_epoch);
-            let claim = retry.initial_input.as_ref().unwrap();
+            let claim = retry.initial_inputs.first().unwrap();
             assert!(child
                 .session_inbox_admission()
                 .unwrap()
@@ -13291,8 +13365,10 @@ mod tests {
             }
             let (replacement, delivery) = prepared.unwrap();
             assert!(replacement.recovering_pre_ack);
-            let (messages, delivery) = delivery.unwrap();
-            let new_claim = replacement.initial_input.as_ref().unwrap();
+            let (messages, mut deliveries) = delivery.unwrap();
+            assert_eq!(deliveries.len(), 1);
+            let delivery = deliveries.pop().unwrap();
+            let new_claim = replacement.initial_inputs.first().unwrap();
             assert_eq!(new_claim.claim.envelope, claim.claim.envelope);
             assert_eq!(new_claim.claim.generation, claim.claim.generation);
             assert_eq!(

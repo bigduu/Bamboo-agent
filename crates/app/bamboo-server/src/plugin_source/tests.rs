@@ -17,6 +17,11 @@ use ed25519_dalek::{Signer, SigningKey};
 use super::*;
 use crate::app_state::AppState;
 
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/zip_test_fixture.rs"
+));
+
 fn hello_manifest_json(id: &str) -> String {
     serde_json::json!({
         "id": id,
@@ -146,7 +151,7 @@ fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut buffer = Vec::new();
     {
         let mut writer = zip::ZipWriter::new(Cursor::new(&mut buffer));
-        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        let options: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
         for (name, content) in entries {
             writer.start_file(*name, options).unwrap();
             writer.write_all(content).unwrap();
@@ -154,6 +159,42 @@ fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         writer.finish().unwrap();
     }
     buffer
+}
+
+#[tokio::test]
+async fn legacy_cp437_names_preserve_plugin_and_artifact_boundaries() {
+    let root = tempfile::tempdir().unwrap();
+    let bytes = zip_with_cp437_name(build_zip(&[("bamboo", b"payload")]), "bamboo");
+    let plugin = root.path().join("plugin");
+    std::fs::create_dir(&plugin).unwrap();
+    extract_zip_sync(&bytes, &plugin, 1024).unwrap();
+    assert_eq!(std::fs::read(plugin.join("éamboo")).unwrap(), b"payload");
+    assert!(!plugin.join("bamboo").exists());
+
+    let allowed = root.path().join("allowed-artifact");
+    extract_artifact_archive(
+        bytes.clone(),
+        ArchiveKind::Zip,
+        allowed.clone(),
+        "éamboo".into(),
+        1024,
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(allowed.join("éamboo")).unwrap(), b"payload");
+
+    let artifact = root.path().join("artifact");
+    let error = extract_artifact_archive(
+        bytes,
+        ArchiveKind::Zip,
+        artifact.clone(),
+        "bamboo".into(),
+        1024,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, PluginError::InvalidManifest(_)));
+    assert!(std::fs::read_dir(&artifact).unwrap().next().is_none());
 }
 
 #[tokio::test]
@@ -303,7 +344,7 @@ async fn zip_archive_with_traversal_entry_is_rejected() {
         // READ via `enclosed_name()` — which is exactly the guard under
         // test — so we can write a genuinely malicious raw entry name here.
         let mut writer = zip::ZipWriter::new(Cursor::new(&mut buffer));
-        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        let options: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
         writer.start_file("plugin.json", options).unwrap();
         writer
             .write_all(hello_manifest_json("hello-plugin").as_bytes())
@@ -332,6 +373,31 @@ async fn zip_archive_with_traversal_entry_is_rejected() {
         .map(|p| p.join("evil.txt"));
     if let Some(escaped) = escaped {
         assert!(!escaped.exists());
+    }
+}
+
+#[test]
+fn zip_archive_rejects_rooted_names_before_writing() {
+    for name in [
+        "/evil.txt",
+        r"\evil.txt",
+        r"C:\evil.txt",
+        r"C:evil.txt",
+        r"./C:\evil.txt",
+        r".\C:\evil.txt",
+        r"nested\C:\evil.txt",
+        r"\\host\share\evil.txt",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = build_zip(&[(name, b"payload")]);
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+        assert_eq!(archive.by_index(0).unwrap().name().unwrap().as_ref(), name);
+        let error = extract_zip_sync(&bytes, root.path(), 1024).unwrap_err();
+        assert!(
+            matches!(error, PluginError::InvalidManifest(_)),
+            "{name}: {error}"
+        );
+        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
     }
 }
 
@@ -516,13 +582,13 @@ async fn zip_symlink_mode_entry_lands_inert_as_a_regular_file() {
     let mut buffer = Vec::new();
     {
         let mut writer = zip::ZipWriter::new(Cursor::new(&mut buffer));
-        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        let options: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
         writer.start_file("plugin.json", options).unwrap();
         writer
             .write_all(hello_manifest_json("hello-plugin").as_bytes())
             .unwrap();
         // S_IFLNK (0o120000) | 0777 — a "symlink" mode, content = a target path.
-        let link_options: zip::write::FileOptions<'_, ()> =
+        let link_options: zip::write::SimpleFileOptions =
             zip::write::FileOptions::default().unix_permissions(0o120777);
         writer.start_file("notes.txt", link_options).unwrap();
         writer.write_all(b"/etc/passwd").unwrap();
@@ -1302,6 +1368,13 @@ async fn artifact_rejects_extra_nested_unsafe_and_duplicate_members() {
             &[("tool", b"binary"), ("directory/", b"")],
             &[("tool", b"binary"), ("../LICENSE", b"unsafe")],
             &[("tool", b"binary"), ("/LICENSE", b"unsafe")],
+            &[("tool", b"binary"), (r"\LICENSE", b"unsafe")],
+            &[("tool", b"binary"), (r"C:\LICENSE", b"unsafe")],
+            &[("tool", b"binary"), (r"C:LICENSE", b"unsafe")],
+            &[("tool", b"binary"), (r"./C:\LICENSE", b"unsafe")],
+            &[("tool", b"binary"), (r".\C:\LICENSE", b"unsafe")],
+            &[("tool", b"binary"), (r"\\host\share\LICENSE", b"unsafe")],
+            &[("tool", b"binary"), (r"nested\..\LICENSE", b"unsafe")],
             &[("tool", b"binary"), ("nested/../LICENSE", b"unsafe")],
             &[
                 ("tool", b"binary"),

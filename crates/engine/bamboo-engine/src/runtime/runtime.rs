@@ -914,6 +914,8 @@ impl AgentRuntime {
             provider_type,
             ..
         } = model_roster;
+        let active_provider =
+            provider_name.unwrap_or_else(|| config.effective_default_provider().to_string());
         let hook_runner = inputs
             .as_ref()
             .and_then(|inputs| inputs.sdk_hook_runner())
@@ -994,9 +996,7 @@ impl AgentRuntime {
                 .or_else(|| config.get_task_summary_model()),
             background_model_provider,
             summarization_model_provider,
-            provider_name: Some(
-                provider_name.unwrap_or_else(|| config.effective_default_provider().to_string()),
-            ),
+            provider_name: Some(active_provider.clone()),
             provider_type,
             reasoning_effort,
             auxiliary_model_resolver,
@@ -1009,6 +1009,13 @@ impl AgentRuntime {
                 merged
             },
             image_fallback,
+            vision_model_resolver: Some(
+                crate::runtime::runner::image_fallback::configured_vision_resolver(
+                    self.config.clone(),
+                    app_data_dir.clone(),
+                    active_provider,
+                ),
+            ),
             app_data_dir,
             memory_store: self.memory_store.clone(),
             prompt_memory_flags: config

@@ -164,7 +164,9 @@ mod expired_plain_owner_tests {
         let (replacement, delivery) =
             prepared.expect("expired initial owner accepts one new input");
         assert!(!replacement.recovering_pre_ack);
-        let (prefix, delivery) = delivery.expect("replacement checkpoints its new input");
+        let (prefix, mut deliveries) = delivery.expect("replacement checkpoints its new input");
+        assert_eq!(deliveries.len(), 1);
+        let delivery = deliveries.pop().unwrap();
         assert_eq!(prefix.len(), before.messages.len());
         assert_eq!(delivery.envelope, envelopes[0]);
         assert_eq!(delivery.activation_run_id, "replacement-run");
