@@ -22,6 +22,43 @@ const STOP_ID: &str = "3911b615-268b-4f85-a572-614963e3d033";
 const GOAL_A: &str = "First objective supplied by the authorized Supervisor.";
 const GOAL_B: &str = "Next objective supplied by the same authorized Supervisor.";
 
+// The engine intentionally consumes the existing redacted registry seam.
+// Keep its Project resolver and workspace validation real while supplying a
+// fixture-local authoritative descriptor; no registry persistence is cloned.
+struct FixtureProjectSource(crate::project_context::ProjectDescriptor);
+
+#[async_trait]
+impl crate::project_context::ProjectContextSource for FixtureProjectSource {
+    async fn find_project(
+        &self,
+        id: &bamboo_domain::ProjectId,
+    ) -> Result<
+        Option<crate::project_context::ProjectDescriptor>,
+        crate::project_context::ProjectContextError,
+    > {
+        Ok((&self.0.id == id).then(|| self.0.clone()))
+    }
+    async fn list_projects(
+        &self,
+    ) -> Result<
+        Vec<crate::project_context::ProjectDescriptor>,
+        crate::project_context::ProjectContextError,
+    > {
+        Ok(vec![self.0.clone()])
+    }
+    async fn find_workspace_owner(
+        &self,
+        workspace: &std::path::Path,
+    ) -> Result<Option<bamboo_domain::ProjectId>, crate::project_context::ProjectContextError> {
+        Ok(self
+            .0
+            .project_path
+            .as_ref()
+            .filter(|path| workspace.starts_with(path))
+            .map(|_| self.0.id.clone()))
+    }
+}
+
 #[derive(Default)]
 struct Stage {
     entered: Notify,
@@ -329,7 +366,38 @@ impl ScopedPublicFixture {
             inbox.clone(),
             activation.clone(),
         ));
+        let project_id: bamboo_domain::ProjectId = "project-a".parse().unwrap();
+        let project_home = dir.path().join("projects/project-a");
+        tokio::fs::create_dir_all(&project_home).await.unwrap();
+        let workspace_root = dir.path().join("workspaces");
+        tokio::fs::create_dir_all(&workspace_root).await.unwrap();
+        let resolver = Arc::new(
+            crate::project_context::ProjectContextResolver::new_with_workspace_resolver(
+                Arc::new(FixtureProjectSource(
+                    crate::project_context::ProjectDescriptor {
+                        id: project_id.clone(),
+                        name: "Scoped fixture Project".into(),
+                        project_path: Some(workspace.canonicalize().unwrap()),
+                        home: project_home,
+                        workspace_bindings: Vec::new(),
+                        resources: bamboo_domain::ProjectResourceSummary {
+                            project_id,
+                            resource_revision: 1,
+                            resources: Vec::new(),
+                        },
+                    },
+                )),
+                bamboo_agent_core::workspace_state::WorkspaceResolver::new(
+                    || None,
+                    move || bamboo_agent_core::workspace_state::WorkspaceRootConfig {
+                        root: workspace_root.clone(),
+                        confine: false,
+                    },
+                ),
+            ),
+        );
         let agent = crate::runtime::Agent::builder()
+            .project_context_resolver(resolver)
             .storage(storage.clone())
             .persistence(repository.clone())
             .session_inbox(inbox.clone())
