@@ -411,7 +411,6 @@ mod loop_adapter_tests {
         assert_eq!(command["properties"]["max_iterations"]["maximum"], 100);
         assert_eq!(command["properties"]["max_total_rounds"]["maximum"], 1000);
         // Advertised per-action acceptance is validated below, not inferred from shape.
-        assert!(command.get("oneOf").is_none());
         assert!(command["properties"].get("target_session_id").is_none());
         assert!(command["properties"].get("session_id").is_none());
         assert_eq!(schema["properties"]["expected_link_revision"]["minimum"], 1);
@@ -542,6 +541,257 @@ mod loop_adapter_tests {
                 f.tool.invoke(invalid, f.ctx.clone()).await,
                 Err(ToolError::InvalidArguments(_))
             ));
+        }
+        assert_eq!(f.inbox.inspect("a").await.unwrap().generation, 0);
+        assert!(f.activation.calls.lock().await.is_empty());
+    }
+
+    fn linked_command(command: Value) -> Value {
+        json!({
+            "action": "loop", "target_session_id": "a", "expected_link_revision": 2,
+            "command": command
+        })
+    }
+
+    fn command_validates(command: &Value) -> bool {
+        serde_json::from_value::<bamboo_domain::LoopControlRequest>(command.clone())
+            .is_ok_and(|request| request.validate().is_ok())
+    }
+
+    async fn assert_loop_schema_case(
+        f: &Fixture,
+        validator: &jsonschema::Validator,
+        arguments: Value,
+        valid: bool,
+    ) {
+        assert_eq!(f.tool.classify(&arguments), ToolClass::MUTATING_SERIAL);
+        if valid {
+            let request: bamboo_domain::LoopControlRequest =
+                serde_json::from_value(arguments["command"].clone()).unwrap();
+            request.validate().unwrap();
+            assert!(
+                validator.validate(&arguments).is_ok(),
+                "advertised schema rejected valid wire fields: {arguments}"
+            );
+            // Derived Serialize emits None as null; preserve that actual DTO
+            // roundtrip instead of narrowing nullable patches in the schema.
+            let mut roundtrip = arguments.clone();
+            roundtrip["command"] = serde_json::to_value(request).unwrap();
+            assert!(
+                validator.validate(&roundtrip).is_ok(),
+                "advertised schema rejected the typed roundtrip: {roundtrip}"
+            );
+            // This fixture has no live Loop host grant. A legal wire structure
+            // reaches that existing service gate; it does not gain authority.
+            assert!(matches!(
+                f.tool.invoke(arguments, f.ctx.clone()).await,
+                Err(ToolError::Execution(_))
+            ));
+        } else {
+            assert!(
+                validator.validate(&arguments).is_err(),
+                "advertised schema accepted invalid wire fields: {arguments}"
+            );
+            assert!(matches!(
+                f.tool.invoke(arguments, f.ctx.clone()).await,
+                Err(ToolError::InvalidArguments(_))
+            ));
+        }
+    }
+
+    async fn assert_nested_command_rejected(
+        f: &Fixture,
+        validator: &jsonschema::Validator,
+        command: Value,
+    ) {
+        assert!(
+            !command_validates(&command),
+            "DTO unexpectedly accepted {command}"
+        );
+        let arguments = linked_command(command);
+        assert_eq!(arguments["expected_link_revision"], 2);
+        assert_loop_schema_case(f, validator, arguments, false).await;
+    }
+
+    #[tokio::test]
+    async fn advertised_nested_loop_command_requires_every_action_field() {
+        let f = Fixture::new().await;
+        let validator = advertised_validator(&f);
+        // Keep the outer link valid so the real RED isolates missing nested
+        // Start fields, rather than an unrelated missing outer revision.
+        assert_nested_command_rejected(&f, &validator, json!({"action": "start"})).await;
+        for (arguments, required) in [
+            (status(), vec!["action"]),
+            (
+                start(),
+                vec![
+                    "action",
+                    "operation_id",
+                    "expected_revision",
+                    "objective",
+                    "max_iterations",
+                    "max_total_rounds",
+                ],
+            ),
+            (
+                update(),
+                vec!["action", "operation_id", "generation", "expected_revision"],
+            ),
+            (
+                stop(),
+                vec!["action", "operation_id", "generation", "expected_revision"],
+            ),
+        ] {
+            let command = arguments["command"].clone();
+            for field in required {
+                let mut missing = command.clone();
+                assert!(missing.as_object_mut().unwrap().remove(field).is_some());
+                assert_nested_command_rejected(&f, &validator, missing).await;
+            }
+            assert_loop_schema_case(&f, &validator, linked_command(command), true).await;
+        }
+        assert_eq!(f.inbox.inspect("a").await.unwrap().generation, 0);
+        assert!(f.activation.calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn advertised_nested_loop_command_rejects_other_action_fields_even_null() {
+        let f = Fixture::new().await;
+        let validator = advertised_validator(&f);
+        let fields = [
+            ("operation_id", json!(OPERATION)),
+            ("expected_generation", json!(GENERATION)),
+            ("generation", json!(GENERATION)),
+            ("expected_revision", json!(0)),
+            ("objective", json!("Future objective")),
+            ("max_iterations", json!(2)),
+            ("max_total_rounds", json!(6)),
+        ];
+        for (arguments, allowed) in [
+            (status(), vec![]),
+            (
+                start(),
+                vec![
+                    "operation_id",
+                    "expected_generation",
+                    "expected_revision",
+                    "objective",
+                    "max_iterations",
+                    "max_total_rounds",
+                ],
+            ),
+            (
+                update(),
+                vec![
+                    "operation_id",
+                    "generation",
+                    "expected_revision",
+                    "objective",
+                    "max_iterations",
+                    "max_total_rounds",
+                ],
+            ),
+            (
+                stop(),
+                vec!["operation_id", "generation", "expected_revision"],
+            ),
+        ] {
+            let command = arguments["command"].clone();
+            for (field, value) in &fields {
+                if allowed.contains(field) {
+                    continue;
+                }
+                for value in [value.clone(), Value::Null] {
+                    let mut extra = command.clone();
+                    extra[*field] = value;
+                    assert_nested_command_rejected(&f, &validator, extra).await;
+                }
+            }
+        }
+        assert_eq!(f.inbox.inspect("a").await.unwrap().generation, 0);
+        assert!(f.activation.calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn advertised_nested_loop_update_requires_a_real_patch_and_preserves_dto_roundtrips() {
+        let f = Fixture::new().await;
+        let validator = advertised_validator(&f);
+        let mut empty = update()["command"].clone();
+        empty.as_object_mut().unwrap().remove("max_total_rounds");
+        assert_nested_command_rejected(&f, &validator, empty.clone()).await;
+        let mut all_null = empty.clone();
+        for field in ["objective", "max_iterations", "max_total_rounds"] {
+            all_null[field] = Value::Null;
+        }
+        assert_nested_command_rejected(&f, &validator, all_null.clone()).await;
+        for (field, value) in [
+            ("objective", json!("  Revised objective  ")),
+            ("max_iterations", json!(2)),
+            ("max_total_rounds", json!(4)),
+        ] {
+            let mut patched = all_null.clone();
+            patched[field] = value;
+            // expected_revision is a stateless u64, including zero; actual
+            // generation/control CAS is still checked by the owning runner.
+            patched["expected_revision"] = json!(0);
+            assert_loop_schema_case(&f, &validator, linked_command(patched), true).await;
+        }
+        for expected_generation in [Value::Null, json!(GENERATION)] {
+            let mut command = start()["command"].clone();
+            command["expected_generation"] = expected_generation;
+            command["operation_id"] = json!("00000000-0000-1000-8000-000000000001");
+            assert_loop_schema_case(&f, &validator, linked_command(command), true).await;
+        }
+        for field in [
+            "operation_id",
+            "expected_revision",
+            "objective",
+            "max_iterations",
+            "max_total_rounds",
+        ] {
+            let mut command = start()["command"].clone();
+            command[field] = Value::Null;
+            assert_nested_command_rejected(&f, &validator, command).await;
+        }
+        assert_eq!(f.inbox.inspect("a").await.unwrap().generation, 0);
+        assert!(f.activation.calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn advertised_loop_outer_revision_and_receipt_conditions_match_nullable_dto_fields() {
+        let f = Fixture::new().await;
+        let validator = advertised_validator(&f);
+        for arguments in [start(), update(), stop()] {
+            assert!(command_validates(&arguments["command"]));
+            let mut missing_link = arguments.clone();
+            missing_link
+                .as_object_mut()
+                .unwrap()
+                .remove("expected_link_revision");
+            assert_loop_schema_case(&f, &validator, missing_link, false).await;
+            for revision in [Value::Null, json!(0)] {
+                let mut invalid_link = arguments.clone();
+                invalid_link["expected_link_revision"] = revision;
+                assert_loop_schema_case(&f, &validator, invalid_link, false).await;
+            }
+            let mut query_on_mutation = arguments.clone();
+            query_on_mutation["receipt_operation_id"] = json!(OPERATION);
+            assert_loop_schema_case(&f, &validator, query_on_mutation, false).await;
+            let mut no_query = arguments;
+            no_query["receipt_operation_id"] = Value::Null;
+            assert_loop_schema_case(&f, &validator, no_query, true).await;
+        }
+        for revision in [None, Some(Value::Null), Some(json!(2))] {
+            for receipt in [None, Some(Value::Null), Some(json!(OPERATION))] {
+                let mut arguments = status();
+                if let Some(revision) = revision.clone() {
+                    arguments["expected_link_revision"] = revision;
+                }
+                if let Some(receipt) = receipt {
+                    arguments["receipt_operation_id"] = receipt;
+                }
+                assert_loop_schema_case(&f, &validator, arguments, true).await;
+            }
         }
         assert_eq!(f.inbox.inspect("a").await.unwrap().generation, 0);
         assert!(f.activation.calls.lock().await.is_empty());
