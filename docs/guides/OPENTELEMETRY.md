@@ -85,8 +85,11 @@ explicit zero. Cached input and reasoning output subsets are not added again;
 local estimates are not labeled as provider usage. An interrupted stream can
 report usage already observed before the failure. Fixed error categories are
 used instead of error messages, stack traces or panic payloads. Dropped futures
-end spans as cancelled; unwinding ends them as panic. Abrupt process termination
-cannot guarantee span completion or export.
+end spans as cancelled; unwinding ends them as panic. Ordinary CLI error exits
+explicitly flush within the same shutdown budget; normal completion flushes
+before Tokio runtime teardown. The dedicated subagent worker's fatal hard-exit
+remains immediate to preserve its termination guarantee. That exit, signals and
+other abrupt termination cannot guarantee span completion or export.
 
 There is no prompt, response, thinking, memory, workflow content, tool schema,
 argument/result, private filesystem path, credential or arbitrary event capture
