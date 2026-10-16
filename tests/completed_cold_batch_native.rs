@@ -205,9 +205,9 @@ async fn cold_batch_wait_settled(
                 .unwrap()
                 .iter()
                 .any(|row| row["id"] == "plain-root" && row["is_running"] == false);
-            if parent_idle && tool.is_some() {
+            if let (true, Some(tool)) = (parent_idle, tool) {
                 let id = if phase == 0 {
-                    let receipt: Value = serde_json::from_str(&tool.unwrap().content).unwrap();
+                    let receipt: Value = serde_json::from_str(&tool.content).unwrap();
                     receipt["child_session_id"].as_str().map(str::to_owned)
                 } else {
                     probe.child_id.lock().unwrap().clone()
