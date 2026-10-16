@@ -797,6 +797,151 @@ mod loop_adapter_tests {
         assert!(f.activation.calls.lock().await.is_empty());
     }
 
+    // Use the registered tool's real full validator, and the shared DTO and
+    // adapter, rather than duplicating either validation implementation.
+    async fn assert_objective_schema_case(
+        f: &Fixture,
+        validator: &jsonschema::Validator,
+        label: &str,
+        objective: &str,
+        valid: bool,
+    ) {
+        for mut arguments in [start(), update()] {
+            arguments["command"]["objective"] = json!(objective);
+            assert_eq!(arguments["expected_link_revision"], 2);
+            assert_eq!(f.tool.classify(&arguments), ToolClass::MUTATING_SERIAL);
+            let request: bamboo_domain::LoopControlRequest =
+                serde_json::from_value(arguments["command"].clone()).unwrap();
+            let action = request.action();
+            let dimensions = (objective.len(), objective.chars().count());
+            assert_eq!(
+                request.validate().is_ok(),
+                valid,
+                "{label}/{action}: DTO acceptance differs, (bytes, chars)={dimensions:?}"
+            );
+            let outcome = f.tool.invoke(arguments.clone(), f.ctx.clone()).await;
+            if valid {
+                // The fixture has no live target host grant. Reaching the
+                // service gate proves legal wire admission, not application.
+                assert!(
+                    matches!(outcome, Err(ToolError::Execution(_))),
+                    "{label}/{action}: valid wire did not reach the existing service gate"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, Err(ToolError::InvalidArguments(_))),
+                    "{label}/{action}: invalid objective did not fail before delivery"
+                );
+            }
+            assert_eq!(
+                validator.validate(&arguments).is_ok(),
+                valid,
+                "{label}/{action}: advertised acceptance differs, (bytes, chars)={dimensions:?}"
+            );
+            if valid {
+                let mut roundtrip = arguments;
+                roundtrip["command"] = serde_json::to_value(request).unwrap();
+                assert_eq!(roundtrip["command"]["objective"].as_str(), Some(objective));
+                assert!(
+                    validator.validate(&roundtrip).is_ok(),
+                    "{label}/{action}: advertised schema rejected the typed roundtrip"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn advertised_nested_objective_matches_rust_whitespace() {
+        let f = Fixture::new().await;
+        let validator = advertised_validator(&f);
+        let whitespace = [
+            '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{0020}', '\u{0085}',
+            '\u{00a0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}',
+            '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}',
+            '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}',
+        ];
+        assert!(whitespace.iter().all(|character| character.is_whitespace()));
+        for character in whitespace {
+            let label = format!("whitespace U+{:04X}", character as u32);
+            assert_objective_schema_case(&f, &validator, &label, &character.to_string(), false)
+                .await;
+        }
+        let all_whitespace: String = whitespace.into_iter().collect();
+        assert_objective_schema_case(&f, &validator, "empty", "", false).await;
+        assert_objective_schema_case(&f, &validator, "all whitespace", &all_whitespace, false)
+            .await;
+        // Rust White_Space and ECMAScript \s differ at FEFF and NEL.
+        // A \S shorthand would reject FEFF, which this DTO preserves.
+        assert!(!'\u{feff}'.is_whitespace());
+        for (label, objective) in [
+            ("FEFF is content", "\u{feff}".to_string()),
+            ("NEL around FEFF", "\u{0085}\u{feff}\u{0085}".to_string()),
+            (
+                "surrounded content",
+                format!("{all_whitespace}x{all_whitespace}"),
+            ),
+        ] {
+            assert_objective_schema_case(&f, &validator, label, &objective, true).await;
+        }
+        assert_eq!(f.inbox.inspect("a").await.unwrap().generation, 0);
+        assert!(f.activation.calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn advertised_nested_objective_preserves_update_null() {
+        let f = Fixture::new().await;
+        let validator = advertised_validator(&f);
+        let mut bound_only = update();
+        bound_only["command"]["objective"] = Value::Null;
+        assert_loop_schema_case(&f, &validator, bound_only, true).await;
+        let mut no_patch = update()["command"].clone();
+        for field in ["objective", "max_iterations", "max_total_rounds"] {
+            no_patch[field] = Value::Null;
+        }
+        assert_nested_command_rejected(&f, &validator, no_patch).await;
+        let mut invalid_start = start()["command"].clone();
+        invalid_start["objective"] = Value::Null;
+        assert_nested_command_rejected(&f, &validator, invalid_start).await;
+        assert_eq!(f.inbox.inspect("a").await.unwrap().generation, 0);
+        assert!(f.activation.calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn advertised_nested_objective_preserves_full_utf8_byte_boundaries() {
+        let f = Fixture::new().await;
+        let validator = advertised_validator(&f);
+        let limit = bamboo_domain::session::loop_control_request::MAX_OBJECTIVE_BYTES;
+        assert_eq!(limit, 16_384);
+        for (label, objective, expected_bytes) in [
+            ("ASCII at limit", "x".repeat(16_384), 16_384),
+            ("5000 CJK", "界".repeat(5000), 15_000),
+            ("CJK below limit", "界".repeat(5461), 16_383),
+            (
+                "CJK plus ASCII at limit",
+                format!("{}a", "界".repeat(5461)),
+                16_384,
+            ),
+            ("two-byte at limit", "é".repeat(8192), 16_384),
+            ("four-byte at limit", "😀".repeat(4096), 16_384),
+            (
+                "mixed ASCII and CJK at limit",
+                format!("{}{}", "x".repeat(8191), "界".repeat(2731)),
+                16_384,
+            ),
+            (
+                "mixed all widths at limit",
+                format!("{}abcd", "aé界😀".repeat(1638)),
+                16_384,
+            ),
+        ] {
+            assert_eq!(objective.len(), expected_bytes, "{label}");
+            assert!(objective.len() <= limit, "{label}");
+            assert_objective_schema_case(&f, &validator, label, &objective, true).await;
+        }
+        assert_eq!(f.inbox.inspect("a").await.unwrap().generation, 0);
+        assert!(f.activation.calls.lock().await.is_empty());
+    }
+
     #[tokio::test]
     async fn loop_rejects_unknown_fields_invalid_links_and_nested_commands_before_delivery() {
         let f = Fixture::new().await;

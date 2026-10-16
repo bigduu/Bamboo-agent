@@ -116,6 +116,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new(granted: bool) -> Self {
+        Self::new_with_limits(granted, SessionInboxLimits::default()).await
+    }
+
+    async fn new_with_limits(granted: bool, limits: SessionInboxLimits) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let concrete = Arc::new(
             SessionStoreV2::new(dir.path().join("sessions"))
@@ -164,7 +168,7 @@ impl Fixture {
 
         let inbox = Arc::new(FileSessionInbox::new(
             concrete,
-            SessionInboxLimits::default(),
+            limits,
         ));
         let router = SessionActivationRouter::new();
         router.set_inbox(inbox.clone());
@@ -1020,3 +1024,5 @@ async fn scoped_host_stop_during_successful_claim_leaves_update_unconsumed_and_s
     );
     h.close().await;
 }
+
+mod stop_backlog_tests;
