@@ -927,4 +927,136 @@ mod tests {
         assert_eq!(list(&f.repo()).unwrap()[0].dirty, Some(true));
         assert!(!proof.exists());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn creation_suppresses_filters_selected_only_in_the_new_branch() {
+        let mut observations = Vec::new();
+        for kind in ["smudge", "process"] {
+            let f = Fixture::new();
+            fs::write(f.repo().join(".gitattributes"), "*.txt filter=context\n").unwrap();
+            fs::write(f.repo().join("tracked.txt"), "tracked\n").unwrap();
+            commit_fixture(&f.repo());
+            let (_, proof, callback) = callback_script(&f, "context-filter");
+            let config = f.0.join("context.config");
+            let key = format!("filter.context.{kind}");
+            git(
+                &f.repo(),
+                &[
+                    "config",
+                    "--file",
+                    config.to_str().unwrap(),
+                    &key,
+                    &callback,
+                ],
+            )
+            .unwrap();
+            git(
+                &f.repo(),
+                &[
+                    "config",
+                    "includeIf.onbranch:no/context.path",
+                    config.to_str().unwrap(),
+                ],
+            )
+            .unwrap();
+            let source_names = git(
+                &f.repo(),
+                &["config", "--includes", "--name-only", "--list"],
+            )
+            .unwrap();
+            assert!(!source_names.contains(&key));
+            let result = create(&f.repo(), &f.roots(), "context", "no/context");
+            observations.push((
+                kind,
+                proof.exists(),
+                result.is_err_and(|error| error.contains("filter")),
+                f.roots().join("context/.git").exists(),
+                git(
+                    &f.repo(),
+                    &["show-ref", "--verify", "refs/heads/no/context"],
+                )
+                .is_ok(),
+            ));
+        }
+        assert!(
+            observations
+                .iter()
+                .all(|(_, executed, explicit, metadata, branch)| !executed
+                    && *explicit
+                    && *metadata
+                    && *branch),
+            "New-context filters: {observations:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_checkout_preserves_collisions_and_staged_and_unstaged_content() {
+        let f = Fixture::new();
+        fs::write(f.repo().join("tracked.txt"), "tracked\n").unwrap();
+        commit_fixture(&f.repo());
+        let fresh = create(&f.repo(), &f.roots(), "fresh", "fresh").unwrap();
+        assert_eq!(
+            fs::read_to_string(fresh.join("tracked.txt")).unwrap(),
+            "tracked\n"
+        );
+        let empty = git(&f.repo(), &["mktree"]).unwrap();
+        for mode in ["collision", "staged"] {
+            let target = f.roots().join(mode);
+            git(
+                &f.repo(),
+                &[
+                    "worktree",
+                    "add",
+                    "--no-checkout",
+                    "-b",
+                    mode,
+                    "--",
+                    target.to_str().unwrap(),
+                    "HEAD",
+                ],
+            )
+            .unwrap();
+            if mode == "collision" {
+                fs::write(target.join("tracked.txt"), "preserve user collision\n").unwrap();
+            } else {
+                fs::write(target.join("user.txt"), "preserve staged content\n").unwrap();
+                git(&target, &["add", "user.txt"]).unwrap();
+                fs::write(target.join("user.txt"), "preserve unstaged content\n").unwrap();
+            }
+            let result = git(
+                &target,
+                &[
+                    "read-tree",
+                    "-m",
+                    "-u",
+                    "--no-sparse-checkout",
+                    empty.trim(),
+                    "HEAD",
+                ],
+            );
+            if mode == "collision" {
+                assert!(result.is_err());
+                assert_eq!(
+                    fs::read_to_string(target.join("tracked.txt")).unwrap(),
+                    "preserve user collision\n"
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    git(&target, &["show", ":user.txt"]).unwrap(),
+                    "preserve staged content\n"
+                );
+                assert_eq!(
+                    fs::read_to_string(target.join("user.txt")).unwrap(),
+                    "preserve unstaged content\n"
+                );
+                assert_eq!(
+                    fs::read_to_string(target.join("tracked.txt")).unwrap(),
+                    "tracked\n"
+                );
+            }
+        }
+    }
 }
