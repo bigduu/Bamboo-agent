@@ -1,8 +1,11 @@
 //! Lazy, process-local delivery of redacted canonical Actor change markers.
-//! Only actors with a live gateway subscriber have a sender or replay window.
+//! Windows are lazy: live observers, plus bounded opt-in reconnect retention.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use uuid::Uuid;
 
 use bamboo_engine::external_agents::actor_event_stream::{
     ActorEventObserver, ActorEventSourceOrder, PublicActorEvent, PublicActorEventClass,
@@ -14,6 +17,9 @@ const REPLAY_EVENTS: usize = 64;
 const REPLAY_BYTES: usize = 64 * 1024;
 const RING_EVENTS: usize = 64;
 const MAX_CHANNELS: usize = 256;
+// Opted-in observation windows survive a brief socket replacement only. This
+// never retains an execution, grants authority, or creates a durable journal.
+const RESUME_GRACE: Duration = Duration::from_secs(30);
 // The outer WS seq is a JavaScript-safe integer. Its high bits distinguish a
 // new channel after all observers leave within one process. The generation
 // restarts with the process and is not a cross-process resume credential.
@@ -56,6 +62,9 @@ pub(crate) enum ActorReplay {
 
 struct ChannelEntry {
     generation: u64,
+    epoch: Uuid,
+    retain_for_resume: bool,
+    expires_at: Option<Instant>,
     counter: u32,
     refs: usize,
     replay_floor: u64,
@@ -125,6 +134,15 @@ struct HubState {
     channels: HashMap<String, ChannelEntry>,
 }
 
+impl HubState {
+    fn prune_expired(&mut self) {
+        let now = Instant::now();
+        self.channels.retain(|_, entry| {
+            entry.refs > 0 || entry.expires_at.is_some_and(|deadline| deadline > now)
+        });
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ActorEventHub {
     state: Mutex<HubState>,
@@ -135,6 +153,14 @@ pub(crate) struct ActorSubscription {
     actor_id: String,
     pub receiver: broadcast::Receiver<ActorHubMessage>,
     pub initial: ActorReplay,
+    pub resume_proof: Option<ActorReplayProof>,
+}
+
+/// Observation continuity, not a capability to execute or renew an Actor.
+pub(crate) struct ActorReplayProof {
+    pub epoch: Uuid,
+    pub cursor: u64,
+    pub resumed_from: Option<u64>,
 }
 
 impl ActorSubscription {
@@ -157,7 +183,11 @@ impl Drop for ActorSubscription {
         if let Some(entry) = state.channels.get_mut(&self.actor_id) {
             entry.refs -= 1;
             if entry.refs == 0 {
-                state.channels.remove(&self.actor_id);
+                if entry.retain_for_resume {
+                    entry.expires_at = Some(Instant::now() + RESUME_GRACE);
+                } else {
+                    state.channels.remove(&self.actor_id);
+                }
             }
         }
     }
@@ -169,8 +199,41 @@ impl ActorEventHub {
         actor_id: &str,
         since: Option<u64>,
     ) -> Option<ActorSubscription> {
+        self.subscribe_inner(actor_id, since, false, None)
+    }
+
+    pub fn subscribe_resumable(
+        self: &Arc<Self>,
+        actor_id: &str,
+        since: Option<u64>,
+        epoch: Option<Uuid>,
+    ) -> Option<ActorSubscription> {
+        self.subscribe_inner(actor_id, since, true, epoch)
+    }
+
+    fn subscribe_inner(
+        self: &Arc<Self>,
+        actor_id: &str,
+        since: Option<u64>,
+        resumable: bool,
+        epoch: Option<Uuid>,
+    ) -> Option<ActorSubscription> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.prune_expired();
         if !state.channels.contains_key(actor_id) {
+            // Retention cannot block a new active observer. Evict only an idle
+            // cached window, never another subscription's sender or receiver.
+            if state.channels.len() >= MAX_CHANNELS {
+                let idle = state
+                    .channels
+                    .iter()
+                    .filter(|(_, entry)| entry.refs == 0)
+                    .min_by_key(|(_, entry)| entry.expires_at)
+                    .map(|(id, _)| id.clone());
+                if let Some(id) = idle {
+                    state.channels.remove(&id);
+                }
+            }
             if state.channels.len() >= MAX_CHANNELS || state.next_generation >= MAX_GENERATION {
                 return None;
             }
@@ -181,6 +244,9 @@ impl ActorEventHub {
                 actor_id.to_owned(),
                 ChannelEntry {
                     generation,
+                    epoch: Uuid::new_v4(),
+                    retain_for_resume: false,
+                    expires_at: None,
                     counter: 0,
                     refs: 0,
                     replay_floor: generation << COUNTER_BITS,
@@ -193,14 +259,18 @@ impl ActorEventHub {
         }
         let entry = state.channels.get_mut(actor_id)?;
         entry.refs += 1;
+        entry.expires_at = None;
+        entry.retain_for_resume |= resumable;
         // Receiver creation and replay planning are serialized with publish.
         let receiver = entry.sender.subscribe();
         // A numeric client cursor has no boot identity. Even if a replay window
         // is active, a previous process can have issued the same generation and
-        // counter. Never claim a reconnect is continuous from `since`; require
-        // an authorized snapshot. This subscription's own replay_after remains
-        // valid for live lag recovery because it cannot outlive this hub.
-        let initial = if since.is_some() {
+        // counter. Only an exact producer epoch plus retained coverage can
+        // prove resumption. Legacy numeric cursors still require a snapshot.
+        // This subscription's own replay_after is valid for live lag recovery
+        // because it cannot outlive this hub.
+        let verified_epoch = resumable && epoch == Some(entry.epoch);
+        let initial = if since.is_some() && !verified_epoch || epoch.is_some() && since.is_none() {
             ActorReplay::SnapshotRequired {
                 cursor: entry.cursor(),
                 reason: "gap",
@@ -208,11 +278,22 @@ impl ActorEventHub {
         } else {
             entry.replay_after(since)
         };
+        let resumed_from = if verified_epoch && matches!(&initial, ActorReplay::Events(_)) {
+            since
+        } else {
+            None
+        };
+        let resume_proof = resumable.then(|| ActorReplayProof {
+            epoch: entry.epoch,
+            cursor: entry.cursor(),
+            resumed_from,
+        });
         Some(ActorSubscription {
             hub: self.clone(),
             actor_id: actor_id.to_owned(),
             receiver,
             initial,
+            resume_proof,
         })
     }
 
@@ -236,6 +317,7 @@ impl ActorEventObserver for ActorEventHub {
             return;
         }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.prune_expired();
         let Some(entry) = state.channels.get(&event.actor_id) else {
             return;
         };
@@ -262,6 +344,7 @@ impl ActorEventObserver for ActorEventHub {
             let generation = state.next_generation;
             let entry = state.channels.get_mut(&event.actor_id).expect("present");
             entry.generation = generation;
+            entry.epoch = Uuid::new_v4();
             entry.counter = 0;
             entry.replay.clear();
             entry.replay_bytes = 0;
@@ -318,6 +401,134 @@ mod tests {
                 sequence: n as u64,
             },
         }
+    }
+
+    #[test]
+    fn proven_reconnect_replays_the_interval_after_the_last_observer_dropped() {
+        let hub = Arc::new(ActorEventHub::default());
+        let first = hub.subscribe_resumable("child", None, None).unwrap();
+        let proof = first.resume_proof.as_ref().unwrap();
+        let (epoch, base) = (proof.epoch, proof.cursor);
+        hub.publish(event("child", 1));
+        drop(first);
+        hub.publish(event("child", 2));
+        let next = hub
+            .subscribe_resumable("child", Some(base + 1), Some(epoch))
+            .unwrap();
+        let ActorReplay::Events(events) = &next.initial else {
+            panic!("retained interval must replay");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].change.event.event_id, event("child", 2).event_id);
+        let proof = next.resume_proof.as_ref().unwrap();
+        assert_eq!(proof.epoch, epoch);
+        assert_eq!(proof.resumed_from, Some(base + 1));
+        assert_eq!(proof.cursor, base + 2);
+    }
+
+    #[test]
+    fn reused_numeric_cursor_in_another_process_has_no_resume_proof() {
+        let old = Arc::new(ActorEventHub::default());
+        let first = old.subscribe_resumable("child", None, None).unwrap();
+        let epoch = first.resume_proof.as_ref().unwrap().epoch;
+        old.publish(event("child", 1));
+        let cursor = first.resume_proof.as_ref().unwrap().cursor + 1;
+        let restarted = Arc::new(ActorEventHub::default());
+        let peer = restarted.subscribe_resumable("child", None, None).unwrap();
+        restarted.publish(event("child", 2));
+        let next = restarted
+            .subscribe_resumable("child", Some(cursor), Some(epoch))
+            .unwrap();
+        assert!(
+            matches!(&next.initial, ActorReplay::SnapshotRequired { cursor: value, reason: "gap" } if *value == cursor)
+        );
+        assert_ne!(next.resume_proof.as_ref().unwrap().epoch, epoch);
+        assert_eq!(next.resume_proof.as_ref().unwrap().resumed_from, None);
+        drop(peer);
+    }
+
+    #[test]
+    fn expired_or_evicted_windows_cannot_be_proven_even_with_the_right_epoch() {
+        let hub = Arc::new(ActorEventHub::default());
+        let first = hub.subscribe_resumable("child", None, None).unwrap();
+        let proof = first.resume_proof.as_ref().unwrap();
+        let (epoch, base) = (proof.epoch, proof.cursor);
+        for n in 0..80 {
+            hub.publish(event("child", n));
+        }
+        let overflow = hub
+            .subscribe_resumable("child", Some(base), Some(epoch))
+            .unwrap();
+        assert!(matches!(
+            &overflow.initial,
+            ActorReplay::SnapshotRequired { reason: "gap", .. }
+        ));
+        assert_eq!(overflow.resume_proof.as_ref().unwrap().resumed_from, None);
+        drop(overflow);
+        drop(first);
+        hub.state
+            .lock()
+            .unwrap()
+            .channels
+            .get_mut("child")
+            .unwrap()
+            .expires_at = Some(Instant::now() - Duration::from_secs(1));
+        let expired = hub
+            .subscribe_resumable("child", Some(base + 80), Some(epoch))
+            .unwrap();
+        assert_ne!(expired.resume_proof.as_ref().unwrap().epoch, epoch);
+        assert!(matches!(
+            &expired.initial,
+            ActorReplay::SnapshotRequired { reason: "gap", .. }
+        ));
+    }
+
+    #[test]
+    fn resume_epoch_does_not_cross_actor_scope_or_relax_legacy_resubscription() {
+        let hub = Arc::new(ActorEventHub::default());
+        let first = hub.subscribe_resumable("one", None, None).unwrap();
+        let proof = first.resume_proof.as_ref().unwrap();
+        let foreign = hub
+            .subscribe_resumable("two", Some(proof.cursor), Some(proof.epoch))
+            .unwrap();
+        assert!(matches!(
+            &foreign.initial,
+            ActorReplay::SnapshotRequired { reason: "gap", .. }
+        ));
+        assert_eq!(foreign.resume_proof.as_ref().unwrap().resumed_from, None);
+        let legacy = hub.subscribe("one", Some(proof.cursor)).unwrap();
+        assert!(legacy.resume_proof.is_none());
+        assert!(matches!(
+            &legacy.initial,
+            ActorReplay::SnapshotRequired { reason: "gap", .. }
+        ));
+    }
+
+    #[test]
+    fn retained_windows_remain_bounded_and_never_evict_active_observers() {
+        let hub = Arc::new(ActorEventHub::default());
+        let mut active = Vec::new();
+        for n in 0..MAX_CHANNELS {
+            active.push(
+                hub.subscribe_resumable(&format!("actor-{n}"), None, None)
+                    .unwrap(),
+            );
+        }
+        assert!(hub.subscribe_resumable("overflow", None, None).is_none());
+        let old_epoch = active[0].resume_proof.as_ref().unwrap().epoch;
+        drop(active.remove(0));
+        let next = hub.subscribe_resumable("overflow", None, None).unwrap();
+        assert_eq!(hub.state.lock().unwrap().channels.len(), MAX_CHANNELS);
+        assert!(!hub.state.lock().unwrap().channels.contains_key("actor-0"));
+        drop(next);
+        let recreated = hub
+            .subscribe_resumable("actor-0", None, Some(old_epoch))
+            .unwrap();
+        assert_ne!(recreated.resume_proof.as_ref().unwrap().epoch, old_epoch);
+        assert!(matches!(
+            &recreated.initial,
+            ActorReplay::SnapshotRequired { reason: "gap", .. }
+        ));
     }
 
     #[test]
