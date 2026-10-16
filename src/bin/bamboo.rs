@@ -1263,6 +1263,12 @@ fn main() {
     // opens any application sockets/files). The adjustment is best-effort and
     // reports failures directly to stderr because logging is not initialized yet.
     nofile_limit::raise_nofile_limit_best_effort();
+    // Explicitly enabled export is independent of logging. Failure is fail-open
+    // and diagnostics never include the endpoint or exporter error payload.
+    let _telemetry = bamboo_infrastructure::telemetry::init_from_env().unwrap_or_else(|error| {
+        eprintln!("warning: telemetry disabled: {error}");
+        Default::default()
+    });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(thread_stack)
         .enable_all()

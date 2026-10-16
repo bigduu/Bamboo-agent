@@ -695,20 +695,33 @@ async fn execute_tool_call_only_with_execution_name_inner(
         output_cap,
         dispatch,
     );
-    let (needs_human, mut result, post_tool_hook_eligible) =
-        match bamboo_tools::with_hook_permission_override(
+    let observation = bamboo_infrastructure::telemetry::Observation::tool(
+        execution_name,
+        &ctx.tool_call.id,
+        ctx.session_id,
+        ctx.round_id,
+    );
+    let observed_dispatch = observation
+        .scope(bamboo_tools::with_hook_permission_override(
             permission_override,
             &ctx.tool_call.id,
             dispatch,
-        )
+        ))
         .await
-        .map(ToolOutcome::enforce_suspension_restriction)
-        {
-            Ok(ToolOutcome::Completed(result)) => (None, Ok(result), true),
-            Ok(ToolOutcome::Running(handle)) => (None, Ok(handle.ack), false),
-            Ok(ToolOutcome::NeedsHuman { question, result }) => (Some(question), Ok(result), false),
-            Err(error) => (None, Err(error), true),
-        };
+        .map(ToolOutcome::enforce_suspension_restriction);
+    use bamboo_infrastructure::telemetry::Outcome as TraceOutcome;
+    let trace_outcome = match &observed_dispatch {
+        Ok(ToolOutcome::Completed(result)) if !result.success => TraceOutcome::ToolError,
+        Err(_) => TraceOutcome::ToolError,
+        _ => TraceOutcome::Success,
+    };
+    observation.finish(trace_outcome);
+    let (needs_human, mut result, post_tool_hook_eligible) = match observed_dispatch {
+        Ok(ToolOutcome::Completed(result)) => (None, Ok(result), true),
+        Ok(ToolOutcome::Running(handle)) => (None, Ok(handle.ack), false),
+        Ok(ToolOutcome::NeedsHuman { question, result }) => (Some(question), Ok(result), false),
+        Err(error) => (None, Err(error), true),
+    };
 
     // Keep the auxiliary request inside the existing tool timeout/cancellation
     // scope, after successful permission/file checks and before terminal events.
@@ -3481,6 +3494,54 @@ mod hook_tests {
     }
 
     #[tokio::test]
+    async fn telemetry_records_actual_tool_errors_without_payloads() {
+        struct ErrorExecutor(bool);
+        #[async_trait]
+        impl ToolExecutor for ErrorExecutor {
+            async fn execute(&self, _: &ToolCall) -> Result<ToolResult, ToolError> {
+                if self.0 {
+                    Err(ToolError::Execution(
+                        "PRIVATE_EXECUTOR_ERROR /Users/private".into(),
+                    ))
+                } else {
+                    Ok(ToolResult::text(
+                        false,
+                        "PRIVATE_TOOL_OUTPUT /Users/private",
+                    ))
+                }
+            }
+            fn list_tools(&self) -> Vec<ToolSchema> {
+                vec![tool_schema("probe")]
+            }
+        }
+        for error_result in [false, true] {
+            let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+            let tools: Arc<dyn ToolExecutor> = Arc::new(ErrorExecutor(error_result));
+            let callable =
+                effective_callable_set(&["probe"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+            let (event_tx, _event_rx) = mpsc::channel(16);
+            let outcome = trace
+                .scope(execute_without_hooks(
+                    &callable,
+                    &tools,
+                    &probe_call("probe"),
+                    &event_tx,
+                ))
+                .await;
+            assert!(outcome.result.is_err() || !outcome.result.as_ref().unwrap().success);
+            let spans = trace.spans();
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].name, "execute_tool probe");
+            assert!(spans[0]
+                .attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == "error.type" && kv.value.to_string() == "tool_error"));
+            assert!(!format!("{spans:?}").contains("PRIVATE_"));
+            assert!(!format!("{spans:?}").contains("/Users/"));
+        }
+    }
+
+    #[tokio::test]
     async fn before_tool_hook_denies_without_dispatching_executor() {
         let mut runner = crate::runtime::hooks::HookRunner::new();
         runner.register(Arc::new(DenyToolHook));
@@ -3502,27 +3563,29 @@ mod hook_tests {
         let session_flags = ToolExecutionSessionFlags::from_session(&session);
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
-        let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
-            vision_support: true,
-            output_cap: None,
-            executing_supervisor: None,
-            tool_call: &tool_call,
-            event_tx: &event_tx,
-            metrics_collector: None,
-            session_id: "hook-deny-session",
-            root_orchestration_only: false,
-            root_session_id: "hook-deny-session",
-            round_id: "round-1",
-            round: 0,
-            tools: &(tools.clone() as Arc<dyn ToolExecutor>),
-            config: &config,
-            hook_session: Some(&mut session),
-            hook_runtime_state: Some(&mut runtime_state),
-            session_flags,
-            available_tool_schemas: &[],
-        })
-        .await
-        .expect("deny is a tool outcome, not a runner error");
+        let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+        let outcome = trace
+            .scope(execute_tool_call_only(ToolExecutionOnlyContext {
+                vision_support: true,
+                output_cap: None,
+                executing_supervisor: None,
+                tool_call: &tool_call,
+                event_tx: &event_tx,
+                metrics_collector: None,
+                session_id: "hook-deny-session",
+                root_orchestration_only: false,
+                root_session_id: "hook-deny-session",
+                round_id: "round-1",
+                round: 0,
+                tools: &(tools.clone() as Arc<dyn ToolExecutor>),
+                config: &config,
+                hook_session: Some(&mut session),
+                hook_runtime_state: Some(&mut runtime_state),
+                session_flags,
+                available_tool_schemas: &[],
+            }))
+            .await
+            .expect("deny is a tool outcome, not a runner error");
 
         assert!(matches!(outcome.result, Err(ref error) if error.contains("policy hook blocked")));
         assert!(!tools.0.load(Ordering::SeqCst));
@@ -3533,6 +3596,10 @@ mod hook_tests {
             AgentEvent::HookLifecycle { hook_name, decision: HookResult::Deny { .. }, .. }
                 if hook_name == "deny_probe"
         )));
+        assert!(
+            trace.spans().is_empty(),
+            "denied before dispatch must not fabricate tool spans"
+        );
     }
 
     #[tokio::test]
