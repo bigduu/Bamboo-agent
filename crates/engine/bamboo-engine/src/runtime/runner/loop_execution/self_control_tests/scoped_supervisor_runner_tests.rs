@@ -7,10 +7,10 @@ use crate::session_activation::{SessionActivationReserveOutcome, SessionActivati
 use crate::session_app::supervisor::SupervisorSessionService;
 use crate::{SessionMessenger, SessionRepository};
 use bamboo_domain::{
-    scoped_loop_consumptions, LoopControlAction, LoopControlRequest, ScopedLoopControlBinding,
-    ScopedLoopControlConsumption, SessionActivationDisposition, SessionActivationError,
-    SessionActivationPort, SessionInboxError, SessionInboxLimits, SessionInboxPort,
-    SessionRunConflict, SessionRunDeliveryGuard, SupervisorReference,
+    scoped_loop_consumptions, LoopControlAction, LoopControlRequest, RuntimeSessionPersistence,
+    ScopedLoopControlBinding, ScopedLoopControlConsumption, SessionActivationDisposition,
+    SessionActivationError, SessionActivationPort, SessionInboxError, SessionInboxLimits,
+    SessionInboxPort, SessionRunConflict, SessionRunDeliveryGuard, SupervisorReference,
 };
 use chrono::{DateTime, Utc};
 
@@ -258,6 +258,10 @@ struct ScopedPublicFixture {
 
 impl ScopedPublicFixture {
     async fn new() -> Self {
+        Self::new_with_root_actor_directory(false).await
+    }
+
+    async fn new_with_root_actor_directory(native_root: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         let config_dir = dir.path().join("config");
@@ -294,11 +298,16 @@ impl ScopedPublicFixture {
                 .unwrap(),
         );
         let storage: Arc<dyn Storage> = store.clone();
-        let repository = Arc::new(SessionRepository::new(
+        let repository = SessionRepository::new(
             Arc::new(Default::default()),
             storage.clone(),
             Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone())),
-        ));
+        );
+        let repository = Arc::new(if native_root {
+            repository.with_root_actor_directory(store.clone())
+        } else {
+            repository
+        });
         let supervisor_service = SupervisorSessionService::new(storage.clone());
         let supervisor: SupervisorReference = (&supervisor_service
             .get_or_create_default("synthetic-supervisor")
@@ -489,12 +498,68 @@ fn actual_receipt(
 
 #[tokio::test]
 async fn scoped_supervisor_public_direct_orders_start_update_stop_in_one_existing_owner() {
-    let mut f = ScopedPublicFixture::new().await;
+    assert_scoped_public_start_update_stop(false).await;
+}
+
+#[tokio::test]
+async fn scoped_supervisor_native_root_direct_consumes_real_goals_with_owned_control_claims() {
+    // The real repository-issued lease lasts 15 seconds. Keep the whole
+    // fixture-local scenario below that bound; no renewal scheduler is added.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        assert_scoped_public_start_update_stop(true),
+    )
+    .await
+    .expect("native Root control and exact owner finish stay within the real lease");
+}
+
+async fn assert_scoped_public_start_update_stop(native_root: bool) {
+    let mut f = ScopedPublicFixture::new_with_root_actor_directory(native_root).await;
     assert_ne!(f.supervisor.session_id, f.session.id);
     let birth = f.session.created_at;
     let (tx, mut rx) = mpsc::channel(1024);
     let request = f.request(tx);
-    let agent = f.agent.clone();
+    let (lease, mut root_binding) = if native_root {
+        let lease = f.agent.begin_direct_execution(TARGET_ID).await.unwrap();
+        let owner_run_id = f.router.current_run_id(TARGET_ID).await.unwrap();
+        let binding = f
+            .repository
+            .bind_root_actor_execution(&f.session, &owner_run_id)
+            .await
+            .unwrap()
+            .expect("real repository must issue the native Root capability");
+        assert_eq!(binding.owner.fence.actor_id, TARGET_ID);
+        assert_eq!(binding.owner.fence.run_id, owner_run_id);
+        assert_eq!(binding.owner.created_at, birth);
+        let writer = binding
+            .persistence
+            .root_actor_writer()
+            .expect("bound persistence retains the repository-issued writer");
+        assert_eq!(writer.fence, binding.owner.fence);
+        assert_eq!(writer.created_at, binding.owner.created_at);
+        let current = binding
+            .directory
+            .inspect_actor(TARGET_ID)
+            .await
+            .unwrap()
+            .activation
+            .unwrap();
+        assert_eq!(current.fence(), binding.owner.fence);
+        assert_eq!(
+            current.status,
+            bamboo_domain::ActorActivationStatus::Running
+        );
+        (Some(lease), Some(binding))
+    } else {
+        (None, None)
+    };
+    let agent = match root_binding.as_ref() {
+        Some(binding) => Arc::new(
+            f.agent
+                .with_execution_persistence(binding.persistence.clone()),
+        ),
+        None => f.agent.clone(),
+    };
     let provider = f.provider.clone();
     let messenger = f.messenger.clone();
     let storage = f.storage.clone();
@@ -511,7 +576,16 @@ async fn scoped_supervisor_public_direct_orders_start_update_stop_in_one_existin
     let mut start_proof = None;
     let mut update_proof = None;
     let (result, events) = {
-        let run = agent.execute_direct(&mut f.session, request);
+        let run = async {
+            match lease {
+                Some(lease) => {
+                    agent
+                        .execute_direct_registered(&mut f.session, request, lease)
+                        .await
+                }
+                None => agent.execute_direct(&mut f.session, request).await,
+            }
+        };
         tokio::pin!(run);
         let mut events = Vec::new();
         for stage in 0..3 {
@@ -725,6 +799,9 @@ async fn scoped_supervisor_public_direct_orders_start_update_stop_in_one_existin
     assert!(receipt.applied);
     assert_eq!(receipt.accepted_revision, 3);
     for record in &records {
+        if let Some(binding) = root_binding.as_ref() {
+            assert_eq!(record.binding.owner_run_id, binding.owner.fence.run_id);
+        }
         assert_eq!(record.binding.supervisor, f.supervisor);
         assert_eq!(record.binding.target_session_id, TARGET_ID);
         assert_eq!(record.binding.execution_id, state.owner_execution_id);
@@ -741,6 +818,15 @@ async fn scoped_supervisor_public_direct_orders_start_update_stop_in_one_existin
             record.receipt
         );
     }
+    assert_eq!(
+        durable
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .execution_id
+            .as_deref(),
+        Some(state.owner_execution_id.as_str())
+    );
     assert_eq!(durable.created_at, birth);
     assert_eq!(durable.model, TARGET_MODEL);
     assert_eq!(
@@ -767,6 +853,61 @@ async fn scoped_supervisor_public_direct_orders_start_update_stop_in_one_existin
     );
     assert_eq!(f.inbox.inspect(TARGET_ID).await.unwrap().pending, 0);
     assert!(f.router.current_run_id(TARGET_ID).await.is_none());
+    if let Some(binding) = root_binding.as_mut() {
+        // The direct adapter released its real router owner, while the
+        // independently issued physical Root lease stays ours until finish.
+        let current = binding
+            .directory
+            .inspect_actor(TARGET_ID)
+            .await
+            .unwrap()
+            .activation
+            .unwrap();
+        assert_eq!(current.fence(), binding.owner.fence);
+        assert_eq!(
+            current.status,
+            bamboo_domain::ActorActivationStatus::Running
+        );
+        assert_eq!(
+            serde_json::to_value(
+                binding
+                    .persistence
+                    .load_runtime_admission_snapshot(TARGET_ID)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .messages
+            )
+            .unwrap(),
+            serde_json::to_value(&durable.messages).unwrap()
+        );
+        binding
+            .directory
+            .finish_activation(
+                &binding.owner.fence,
+                Utc::now(),
+                bamboo_domain::ActorActivationFinish::Succeeded,
+            )
+            .await
+            .unwrap();
+        binding.disarm_abandonment();
+        assert!(binding
+            .persistence
+            .load_runtime_admission_snapshot(TARGET_ID)
+            .await
+            .is_err());
+    }
+    assert!(f
+        .messenger
+        .supervisor_loop_control(
+            &f.supervisor,
+            TARGET_ID,
+            None,
+            &LoopControlRequest::Status,
+            Some(STOP_ID),
+        )
+        .await
+        .is_err());
     f.assert_no_successor();
 }
 
