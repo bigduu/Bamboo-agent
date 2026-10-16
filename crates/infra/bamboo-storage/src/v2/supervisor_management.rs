@@ -70,14 +70,14 @@ pub(crate) struct SupervisorFollowupGuard {
     // A private observation held stable by these same target Session locks.
     // It closes only new Loop carriers, never reads or exact receipt retries.
     scoped_loop_stopped: bool,
-    scoped_native: Option<super::scoped_transport_expiry::ScopedTransportCensus>,
+    scoped_native: Option<Box<super::scoped_transport_expiry::ScopedTransportCensus>>,
 }
 
 impl SupervisorFollowupGuard {
     pub(crate) fn scoped_native(
         &self,
     ) -> Option<super::scoped_transport_expiry::ScopedTransportCensus> {
-        self.scoped_native.clone()
+        self.scoped_native.as_deref().cloned()
     }
 
     pub(crate) fn scoped_loop_stopped(&self) -> bool {
@@ -259,7 +259,7 @@ impl SessionStoreV2 {
         )?
         .ok_or_else(|| denied("Loop target canonical census missing"))?;
         census.require_live_binding(binding)?;
-        guard.scoped_native = Some(census);
+        guard.scoped_native = Some(Box::new(census));
         guard.scoped_loop_stopped = Self::scoped_loop_execution_stopped(&target, binding)?;
         Ok(guard)
     }
