@@ -54,6 +54,7 @@ fn assert_pending_rounds_receipt(
     assert_eq!(
         control.pending_objective,
         Some(PendingLoopObjective {
+            origin: None,
             objective: "B".into(),
             objective_revision: 2,
         })

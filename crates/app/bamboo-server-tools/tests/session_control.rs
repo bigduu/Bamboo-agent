@@ -152,7 +152,7 @@ async fn supervisor_followup_preserves_two_roots_and_rejects_unattached_c() {
     );
     let schema = f.tool.parameters_schema();
     assert_eq!(schema["additionalProperties"], false);
-    assert_eq!(schema["properties"].as_object().unwrap().len(), 4);
+    assert_eq!(schema["properties"].as_object().unwrap().len(), 7);
     assert!(bamboo_domain::ClassifiedToolIdentity::from_schema_name("session_control").is_some());
     for id in ["a", "b"] {
         let before =
@@ -355,4 +355,221 @@ async fn supervisor_followup_validates_target_operation_and_utf8_bounds() {
     };
     peer.kind = SessionMessageKind::PeerMessage;
     assert!(f.messenger.send(peer).await.is_err());
+}
+
+mod loop_adapter_tests {
+    use super::*;
+    use bamboo_agent_core::tools::ToolError;
+    use bamboo_tools::permission::{permission_replay_active, with_permission_replay_generation};
+
+    const OPERATION: &str = "a4b85b5b-ba44-488d-9900-20dd7e016e88";
+    const GENERATION: &str = "b23bc011-5424-4b5e-8fc9-3c861b89874b";
+
+    fn status() -> Value {
+        json!({"action":"loop","target_session_id":"a","command":{"action":"status"}})
+    }
+
+    fn start() -> Value {
+        json!({
+            "action":"loop", "target_session_id":"a", "expected_link_revision":2,
+            "command":{"action":"start", "operation_id":OPERATION,
+                "expected_revision":0, "objective":"  target objective  ",
+                "max_iterations":2, "max_total_rounds":6}
+        })
+    }
+
+    fn stop() -> Value {
+        json!({
+            "action":"loop", "target_session_id":"a", "expected_link_revision":2,
+            "command":{"action":"stop", "operation_id":OPERATION,
+                "generation":GENERATION, "expected_revision":1}
+        })
+    }
+
+    fn update() -> Value {
+        json!({
+            "action":"loop", "target_session_id":"a", "expected_link_revision":2,
+            "command":{"action":"update", "operation_id":OPERATION,
+                "generation":GENERATION, "expected_revision":1, "max_total_rounds":4}
+        })
+    }
+
+    #[tokio::test]
+    async fn loop_schema_reuses_strict_bounded_command_and_keeps_every_action_serial() {
+        let f = Fixture::new().await;
+        let schema = f.tool.parameters_schema();
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["action", "target_session_id"]));
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!(["followup", "loop"])
+        );
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 7);
+        let command = &schema["properties"]["command"];
+        assert_eq!(command["additionalProperties"], false);
+        assert_eq!(command["required"], json!(["action"]));
+        assert_eq!(command["properties"]["max_iterations"]["maximum"], 100);
+        assert_eq!(command["properties"]["max_total_rounds"]["maximum"], 1000);
+        assert!(schema.get("oneOf").is_none());
+        assert!(command.get("oneOf").is_none());
+        assert!(command["properties"].get("target_session_id").is_none());
+        assert!(command["properties"].get("session_id").is_none());
+        assert_eq!(schema["properties"]["expected_link_revision"]["minimum"], 1);
+        assert_eq!(schema["properties"]["message"]["maxLength"], 16384);
+        for arguments in [
+            status(),
+            start(),
+            update(),
+            stop(),
+            json!({"action":"loop"}),
+            args("a", "legacy-op", "Continue"),
+        ] {
+            assert_eq!(f.tool.classify(&arguments), ToolClass::MUTATING_SERIAL);
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_rejects_unknown_fields_invalid_links_and_nested_commands_before_delivery() {
+        let f = Fixture::new().await;
+        let mut invalid = Vec::new();
+        for field in [
+            "supervisor",
+            "source_session_id",
+            "incarnation_id",
+            "host_grant",
+            "project_id",
+            "operation_id",
+            "message",
+        ] {
+            let mut arguments = status();
+            arguments[field] = json!("untrusted");
+            invalid.push(arguments);
+        }
+        for field in ["target_session_id", "caller", "host_grant"] {
+            let mut arguments = status();
+            arguments["command"][field] = json!("untrusted");
+            invalid.push(arguments);
+        }
+        for target in ["", "../a", bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID] {
+            let mut arguments = status();
+            arguments["target_session_id"] = json!(target);
+            invalid.push(arguments);
+        }
+        for mut missing_link in [start(), update(), stop()] {
+            missing_link
+                .as_object_mut()
+                .unwrap()
+                .remove("expected_link_revision");
+            invalid.push(missing_link);
+        }
+        for mut arguments in [status(), start(), update(), stop()] {
+            arguments["expected_link_revision"] = json!(0);
+            invalid.push(arguments);
+        }
+        let mut invalid_uuid = start();
+        invalid_uuid["command"]["operation_id"] = json!("not-a-uuid");
+        invalid.push(invalid_uuid);
+        let mut invalid_bound = start();
+        invalid_bound["command"]["max_iterations"] = json!(101);
+        invalid.push(invalid_bound);
+        let mut invalid_objective = start();
+        invalid_objective["command"]["objective"] = json!("界".repeat(5500));
+        invalid.push(invalid_objective);
+        let mut receipt_on_mutation = stop();
+        receipt_on_mutation["receipt_operation_id"] = json!(OPERATION);
+        invalid.push(receipt_on_mutation);
+        let mut malformed_receipt = status();
+        malformed_receipt["receipt_operation_id"] = json!("not-a-uuid");
+        invalid.push(malformed_receipt);
+        let mut followup_with_loop_field = args("a", "legacy-op", "Continue");
+        followup_with_loop_field["command"] = json!({"action":"status"});
+        invalid.push(followup_with_loop_field);
+        for arguments in invalid {
+            assert!(
+                matches!(
+                    f.tool.invoke(arguments.clone(), f.ctx.clone()).await,
+                    Err(ToolError::InvalidArguments(_))
+                ),
+                "{arguments}"
+            );
+        }
+        assert_eq!(f.inbox.inspect("a").await.unwrap().generation, 0);
+        assert!(f.activation.calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn loop_original_identity_and_plan_denials_survive_bypass_and_auto() {
+        let f = Fixture::new().await;
+        let ordinary = Session::new("a", "model");
+        let child = Session::new_child("child-a", "a", "model", "child");
+        let impostor = Session::new(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        let mut ultra = Session::new("ordinary-ultra", "model");
+        ultra.set_root_orchestration_only(true).unwrap();
+        for session in [ordinary, child, impostor, ultra] {
+            let mut ctx = ToolCtx::none("loop-role-check");
+            ctx.session_id = Some(Arc::from(session.id.as_str()));
+            ctx.executing_supervisor =
+                ExecutingSupervisorObservation::capture_from_executing_session(&session);
+            ctx.bypass_permissions = true;
+            ctx.auto_approve_permissions = true;
+            assert!(matches!(f.tool.invoke(status(), ctx).await,
+                Err(ToolError::Execution(ref error)) if error.contains("original executing Supervisor")));
+        }
+        let mut wrong_caller = f.ctx.clone();
+        wrong_caller.session_id = Some(Arc::from("a"));
+        assert!(f.tool.invoke(status(), wrong_caller).await.is_err());
+        assert!(f
+            .tool
+            .invoke(status(), ToolCtx::none("missing"))
+            .await
+            .is_err());
+        for arguments in [status(), start(), update(), stop()] {
+            let mut ctx = f.ctx.clone();
+            ctx.plan_read_only = true;
+            ctx.bypass_permissions = true;
+            ctx.auto_approve_permissions = true;
+            assert!(matches!(f.tool.invoke(arguments, ctx).await,
+                Err(ToolError::Execution(ref error)) if error.contains("Plan mode")));
+        }
+        assert_eq!(f.inbox.inspect("a").await.unwrap().generation, 0);
+        assert!(f.activation.calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn loop_rejects_typed_and_legacy_replay_while_followup_keeps_its_existing_contract() {
+        let f = Fixture::new().await;
+        let caller = f.ctx.session_id().unwrap();
+        let call_id = &f.ctx.tool_call_id;
+        for (index, generation) in [Some("generation-1"), None].into_iter().enumerate() {
+            with_permission_replay_generation(caller, call_id, generation, async {
+                assert!(permission_replay_active(caller, call_id));
+                for arguments in [status(), start(), update(), stop()] {
+                    assert!(matches!(f.tool.invoke(arguments, f.ctx.clone()).await,
+                        Err(ToolError::Execution(ref error)) if error.contains("approval replay")));
+                }
+            })
+            .await;
+            assert!(!permission_replay_active(caller, call_id));
+            assert_eq!(f.inbox.inspect("a").await.unwrap().generation, index as u64);
+            let operation = format!("unchanged-followup-replay-{index}");
+            let response = with_permission_replay_generation(
+                caller,
+                call_id,
+                generation,
+                f.tool.invoke(
+                    args("a", &operation, "Continue your original task"),
+                    f.ctx.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+            let response = completed(response);
+            assert_eq!(response["action"], "followup");
+            assert_eq!(response["admitted"], true);
+            assert_eq!(response["operation_id"], operation);
+            assert!(response.get("applied").is_none());
+        }
+        assert_eq!(f.inbox.inspect("a").await.unwrap().generation, 2);
+        assert_eq!(f.activation.calls.lock().await.len(), 2);
+    }
 }

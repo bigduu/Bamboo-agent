@@ -185,6 +185,34 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Strict, uncached full observation under retained canonical Supervisor
+    /// authority and the exact live host grant. This read is not a write grant.
+    async fn load_scoped_loop_session(
+        &self,
+        binding: &crate::ScopedLoopControlBinding,
+        activation: std::sync::Arc<dyn crate::SessionActivationPort>,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (binding, activation);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support scoped Loop observations",
+        ))
+    }
+
+    /// Publish Loop state and typed consumption before ACK, retaining the same
+    /// canonical and exact owner guards. Err is not a rollback receipt: callers
+    /// must stop dispatch and must not save the proposed state generically.
+    async fn checkpoint_scoped_loop(
+        &self,
+        request: crate::ScopedLoopControlCheckpoint<'_>,
+    ) -> std::io::Result<()> {
+        let _ = request;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support scoped Loop checkpoints",
+        ))
+    }
+
     /// Probe before claiming an Actor; unsupported backends must not leave a
     /// claimed execution whose writes fall back to an ordinary snapshot save.
     fn supports_root_actor_runtime_write(&self) -> bool {

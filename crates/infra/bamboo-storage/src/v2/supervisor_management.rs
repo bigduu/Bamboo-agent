@@ -172,6 +172,68 @@ impl SessionStoreV2 {
         })
     }
 
+    /// The existing sorted authority lock set, retained through the caller's
+    /// physical read/write jobs. Do not call a public writer while holding it.
+    pub(crate) async fn lock_scoped_loop_authority(
+        &self,
+        binding: &bamboo_domain::ScopedLoopControlBinding,
+    ) -> io::Result<SupervisorFollowupGuard> {
+        binding.validate().map_err(invalid)?;
+        let guard = self
+            .lock_supervisor_followup(&binding.supervisor, &binding.target_session_id)
+            .await?;
+        let source = self
+            .load_execution_admission_unchecked(&binding.supervisor.session_id)
+            .await?
+            .ok_or_else(|| denied("Supervisor disappeared"))?;
+        let target = self
+            .load_execution_admission_unchecked(&binding.target_session_id)
+            .await?
+            .ok_or_else(|| denied("Loop target disappeared"))?;
+        let state = source
+            .supervisor_management
+            .as_ref()
+            .ok_or_else(|| denied("Supervisor scope missing"))?;
+        let link = state
+            .links
+            .get(&binding.target_session_id)
+            .ok_or_else(|| denied("Supervisor link missing"))?;
+        let blocked = |session: &Session, tool: &str| -> io::Result<bool> {
+            let disabled: BTreeSet<String> = match session.metadata.get("disabled_tools") {
+                Some(raw) => serde_json::from_str(raw)
+                    .map_err(|_| denied("invalid disabled tools authority"))?,
+                None => BTreeSet::new(),
+            };
+            Ok(disabled.contains(tool)
+                || session.agent_runtime_state.as_ref().is_some_and(|runtime| {
+                    runtime.read_only
+                        || runtime.plan_mode.is_some()
+                        || runtime.effective_permission_mode()
+                            == bamboo_domain::SessionPermissionMode::Plan
+                }))
+        };
+        if source.supervisor_incarnation_id() != Some(binding.supervisor.incarnation_id)
+            || source.root_tool_authority_revision != binding.supervisor_tool_authority_revision
+            || !source.allows_model_tool_execution("session_control")
+            || blocked(&source, "session_control")?
+            || blocked(&target, "loop_control")?
+            || target.root_orchestration_only_enabled()
+            || !link_authorizes_target(state, link, &target)
+            || link.revision != binding.link_revision
+            || target.created_at != binding.target_created_at
+            || target.metadata_version != binding.target_metadata_version
+            || target_project(&target)? != binding.target_project_id
+            || target
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|runtime| runtime.execution_id.as_deref())
+                != Some(binding.execution_id.as_str())
+        {
+            return Err(denied("Supervisor Loop canonical authority changed"));
+        }
+        Ok(guard)
+    }
+
     pub(super) async fn management_history(
         &self,
         reference: &SupervisorReference,

@@ -128,11 +128,8 @@ pub(crate) async fn run_agent_loop_with_config(
         )
         .await?;
 
-        if let Some(control) = config.loop_control.as_ref() {
-            control.bind_execution(&state.execution_id, cancel_token.clone())?;
-        }
         if config.effective_counted_loop().is_some() || config.loop_control.is_some() {
-            // Capture the initialized run before begin can fail. Its first
+            // Capture the initialized run before any owner checkpoint or binding can fail. Its first
             // checkpoint error must also terminalize this runtime snapshot for
             // the host's unconditional final error save.
             counted_runtime_identity = Some((
@@ -140,6 +137,52 @@ pub(crate) async fn run_agent_loop_with_config(
                 state.runtime_state.round.last_round_id.clone(),
                 state.runtime_state.execution_id.clone(),
             ));
+        }
+        if let Some(control) = config.loop_control.as_ref() {
+            control.bind_execution(&state.execution_id, cancel_token.clone())?;
+            if control.supervisor_grant_id().is_some() {
+                if cancel_token.is_cancelled() {
+                    return Err(bamboo_agent_core::AgentError::Cancelled);
+                }
+                config
+                    .persistence
+                    .as_ref()
+                    .ok_or_else(|| {
+                        bamboo_agent_core::AgentError::Budget(
+                            "Supervisor Loop requires a durable owner".into(),
+                        )
+                    })?
+                    .checkpoint_runtime_session(session)
+                    .await
+                    .map_err(|error| {
+                        if cancel_token.is_cancelled() {
+                            bamboo_agent_core::AgentError::Cancelled
+                        } else {
+                            bamboo_agent_core::AgentError::Budget(format!(
+                                "initial Supervisor Loop owner checkpoint failed: {error}"
+                            ))
+                        }
+                    })?;
+                if cancel_token.is_cancelled() {
+                    return Err(bamboo_agent_core::AgentError::Cancelled);
+                }
+            }
+            if let Some(storage) = config.storage.as_ref() {
+                control
+                    .register_supervisor_control(session, storage)
+                    .await
+                    .map_err(|error| {
+                        if cancel_token.is_cancelled() {
+                            bamboo_agent_core::AgentError::Cancelled
+                        } else {
+                            error
+                        }
+                    })?;
+            } else if control.supervisor_grant_id().is_some() {
+                return Err(bamboo_agent_core::AgentError::Budget(
+                    "Supervisor Loop requires canonical Storage".into(),
+                ));
+            }
         }
         counted_generation = crate::runtime::counted_loop::begin(
             session,

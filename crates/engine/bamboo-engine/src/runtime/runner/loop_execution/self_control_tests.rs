@@ -1478,3 +1478,5 @@ mod pending_rounds_runner_tests;
 
 mod managed_running_terminal_tests;
 mod running_timeout_observation_tests;
+
+mod scoped_supervisor_runner_tests;

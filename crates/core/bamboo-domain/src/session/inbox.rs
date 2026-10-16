@@ -777,6 +777,11 @@ impl SessionMessageEnvelope {
     /// message while retaining all correlation metadata.
     pub fn to_provider_message(&self) -> Result<Message, SessionMessageValidationError> {
         self.validate()?;
+        // Runtime control is consumed only by the registered owner. It must
+        // never become provider input or a genuine external User escape.
+        if crate::is_scoped_loop_control(self) {
+            return Err(SessionMessageValidationError::KindSourceBodyMismatch);
+        }
         let (text, parts, provider_metadata, never_compress) = match &self.body {
             SessionMessageBody::Content(content) => {
                 let (text, parts) = self
@@ -1511,6 +1516,44 @@ pub trait SessionInboxPort: Send + Sync {
         None
     }
 
+    /// Admit a typed Supervisor command to this exact live owner only. Never
+    /// request activation; an observation or serialized binding is not a grant.
+    async fn deliver_supervisor_loop_control(
+        &self,
+        _binding: &crate::ScopedLoopControlBinding,
+        _envelope: &SessionMessageEnvelope,
+        _activation: std::sync::Arc<dyn SessionActivationPort>,
+    ) -> Result<SessionInboxSteerReceipt, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "scoped Loop delivery unsupported".into(),
+        ))
+    }
+
+    /// The same Inbox claim protocol, selecting only typed Loop controls.
+    /// Ordinary claim and selected User input must exclude this carrier.
+    async fn claim_scoped_loop_controls(
+        &self,
+        _target_session_id: &str,
+        _limit: usize,
+        _active_run_id: Option<&str>,
+    ) -> Result<Vec<SessionInboxClaim>, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "scoped Loop claims unsupported".into(),
+        ))
+    }
+
+    async fn claim_owned_scoped_loop_controls(
+        &self,
+        _target_session_id: &str,
+        _limit: usize,
+        _active_run_id: Option<&str>,
+        _request: &SessionInboxLeaseRequest,
+    ) -> Result<Vec<SessionInboxOwnedClaim>, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "owned scoped Loop claims unsupported".into(),
+        ))
+    }
+
     /// Irreversibly opt this queue into owned claims. Legacy claim/ACK APIs
     /// must fail closed afterwards. This does not enable production expiry.
     async fn claim_owned(
@@ -1907,6 +1950,29 @@ pub trait SessionActivationPort: Send + Sync {
         expected_run_id: &str,
     ) -> Result<std::sync::Arc<dyn SessionRunDeliveryGuard>, SessionRunConflict> {
         Err(SessionRunConflict::unsupported(expected_run_id))
+    }
+
+    /// Observe the host-installed grant on a live owner. Canonical storage
+    /// independently revalidates caller/link/permissions before each use.
+    async fn observe_supervisor_loop(
+        &self,
+        _supervisor: &crate::SupervisorReference,
+        _target_session_id: &str,
+        _expected_link_revision: Option<u64>,
+        _action: crate::LoopControlAction,
+    ) -> Result<crate::ScopedLoopControlBinding, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "live Supervisor Loop observation unsupported".into(),
+        ))
+    }
+
+    /// Retain the exact owner AND the equal installed grant in a blocking job.
+    /// Like retain_expected_run_blocking, this must never cross an async wait.
+    fn retain_supervisor_loop_blocking(
+        &self,
+        binding: &crate::ScopedLoopControlBinding,
+    ) -> Result<std::sync::Arc<dyn SessionRunDeliveryGuard>, SessionRunConflict> {
+        Err(SessionRunConflict::unsupported(&binding.owner_run_id))
     }
 
     /// Signal only a currently running, non-finalizing owner. Never reserve a

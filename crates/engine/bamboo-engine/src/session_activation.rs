@@ -213,6 +213,33 @@ struct ActiveOwner {
     /// wake generation; that driver remains the single consumer of the
     /// canonical FileSessionInbox and forwards the claimed typed envelope.
     delivery_sink: Option<mpsc::UnboundedSender<u64>>,
+    scoped_loop: Option<SupervisorLoopGrant>,
+}
+
+#[derive(Debug, Clone)]
+struct SupervisorLoopGrant {
+    binding: bamboo_domain::ScopedLoopControlBinding,
+    execution_cancel: tokio_util::sync::CancellationToken,
+    host_stop: tokio_util::sync::CancellationToken,
+}
+impl SupervisorLoopGrant {
+    fn stopped(&self) -> bool {
+        self.execution_cancel.is_cancelled() || self.host_stop.is_cancelled()
+    }
+}
+
+struct SupervisorLoopDeliveryGuard {
+    inner: ExpectedRunDeliveryGuard,
+    grant: SupervisorLoopGrant,
+}
+impl bamboo_domain::SessionRunDeliveryGuard for SupervisorLoopDeliveryGuard {
+    fn matches(&self, target: &str, birth: DateTime<Utc>, run: &str) -> bool {
+        !self.grant.stopped()
+            && bamboo_domain::SessionRunDeliveryGuard::matches(&self.inner, target, birth, run)
+    }
+    fn notify_committed_delivery(&self, generation: u64) -> bool {
+        self.inner.notify_if(generation, || !self.grant.stopped())
+    }
 }
 
 #[derive(Debug)]
@@ -436,6 +463,12 @@ impl bamboo_domain::SessionRunDeliveryGuard for ExpectedRunDeliveryGuard {
     }
 
     fn notify_committed_delivery(&self, inbox_generation: u64) -> bool {
+        self.notify_if(inbox_generation, || true)
+    }
+}
+
+impl ExpectedRunDeliveryGuard {
+    fn notify_if(&self, inbox_generation: u64, allowed: impl FnOnce() -> bool) -> bool {
         // The blocking publication job already holds this target's fence.
         // Take the global map only for its short notification update.
         let mut states = self.states.blocking_lock();
@@ -447,6 +480,7 @@ impl bamboo_domain::SessionRunDeliveryGuard for ExpectedRunDeliveryGuard {
                 && owner.session_created_at == Some(self.session_created_at)
                 && !owner.finalizing
                 && owner.registrations > 0
+                && allowed()
         }) else {
             return false;
         };
@@ -516,6 +550,14 @@ pub(crate) struct SessionRunOwnership {
 }
 
 impl SessionRunOwnership {
+    pub(crate) fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub(crate) fn router(&self) -> &Arc<SessionActivationRouter> {
+        &self.router
+    }
+
     pub(crate) fn matches_router(&self, router: &Arc<SessionActivationRouter>) -> bool {
         Arc::ptr_eq(&self.router, router)
     }
@@ -1018,6 +1060,7 @@ impl SessionActivationRouter {
             registrations: 0,
             child_completions_need_successor: false,
             delivery_sink: None,
+            scoped_loop: None,
         });
     }
 
@@ -1071,6 +1114,98 @@ impl SessionActivationRouter {
         }
         owner.session_created_at = Some(session.created_at);
         true
+    }
+
+    /// Install only through the actual registered owner proof. Serialized
+    /// observations never enter this slot. A different grant requires host
+    /// revocation first; an equal retry is harmless.
+    pub(crate) async fn bind_supervisor_loop_control(
+        self: &Arc<Self>,
+        ownership: &SessionRunOwnership,
+        binding: bamboo_domain::ScopedLoopControlBinding,
+        execution_cancel: tokio_util::sync::CancellationToken,
+        host_stop: tokio_util::sync::CancellationToken,
+    ) -> Result<(), bamboo_domain::SessionInboxError> {
+        binding
+            .validate()
+            .map_err(bamboo_domain::SessionInboxError::InvalidClaim)?;
+        if execution_cancel.is_cancelled() || host_stop.is_cancelled() {
+            return Err(bamboo_domain::SessionInboxError::InvalidClaim(
+                "Loop owner is stopped".into(),
+            ));
+        }
+        if !ownership.matches_router(self)
+            || ownership.target_session_id != binding.target_session_id
+            || ownership.run_id != binding.owner_run_id
+        {
+            return Err(bamboo_domain::SessionInboxError::InvalidClaim(
+                "Loop owner proof mismatch".into(),
+            ));
+        }
+        let _publication = self.lock_publication(&binding.target_session_id).await;
+        let mut states = self.states.lock().await;
+        let owner = states
+            .get_mut(&binding.target_session_id)
+            .and_then(|state| state.owner.as_mut())
+            .filter(|owner| {
+                owner.run_id == ownership.run_id
+                    && !owner.finalizing
+                    && owner.registrations > 0
+                    && owner.session_created_at == Some(binding.target_created_at)
+            })
+            .ok_or_else(|| {
+                bamboo_domain::SessionInboxError::InvalidClaim(
+                    "Loop owner is no longer current".into(),
+                )
+            })?;
+        // Tokens can be cancelled while waiting for the publication fence.
+        if execution_cancel.is_cancelled() || host_stop.is_cancelled() {
+            return Err(bamboo_domain::SessionInboxError::InvalidClaim(
+                "Loop owner stopped during grant binding".into(),
+            ));
+        }
+        if let Some(old) = &owner.scoped_loop {
+            if old.binding != binding || old.stopped() {
+                return Err(bamboo_domain::SessionInboxError::InvalidClaim(
+                    "different or stopped Loop grant already bound".into(),
+                ));
+            }
+            // Idempotency must not replace the original stop/cancel tokens.
+            return Ok(());
+        }
+        owner.scoped_loop = Some(SupervisorLoopGrant {
+            binding,
+            execution_cancel,
+            host_stop,
+        });
+        Ok(())
+    }
+
+    /// Host revocation shares the target publication fence with physical
+    /// writes. It does not stop another run or retain a grant after owner exit.
+    pub async fn revoke_supervisor_loop_control(
+        &self,
+        target: &str,
+        grant_id: &uuid::Uuid,
+    ) -> bool {
+        let _publication = self.lock_publication(target).await;
+        let mut states = self.states.lock().await;
+        let Some(owner) = states
+            .get_mut(target)
+            .and_then(|state| state.owner.as_mut())
+        else {
+            return false;
+        };
+        if owner
+            .scoped_loop
+            .as_ref()
+            .is_some_and(|grant| grant.binding.grant_id == *grant_id)
+        {
+            owner.scoped_loop = None;
+            true
+        } else {
+            false
+        }
     }
 
     async fn register_run_with_birth(
@@ -1132,6 +1267,7 @@ impl SessionActivationRouter {
                             registrations: 1,
                             child_completions_need_successor: false,
                             delivery_sink: None,
+                            scoped_loop: None,
                         });
                         (Some(state.notify.subscribe()), None)
                     }
@@ -1227,6 +1363,7 @@ impl SessionActivationRouter {
                     registrations: 0,
                     child_completions_need_successor: false,
                     delivery_sink: None,
+                    scoped_loop: None,
                 });
             }
         }
@@ -1634,6 +1771,7 @@ impl SessionActivationRouter {
                         registrations: 0,
                         child_completions_need_successor: false,
                         delivery_sink: None,
+                        scoped_loop: None,
                     });
                     state.last_dispatched_generation =
                         state.last_dispatched_generation.max(generation);
@@ -1665,6 +1803,7 @@ impl SessionActivationRouter {
                     registrations: 0,
                     child_completions_need_successor: false,
                     delivery_sink: None,
+                    scoped_loop: None,
                 });
                 state.notify.send_replace(generation);
                 if let Some((candidate, now)) = recovery {
@@ -1766,6 +1905,100 @@ impl SessionActivationPort for SessionActivationRouter {
             run_id: expected_run_id.into(),
             states: self.states.clone(),
             _publication: publication,
+        }))
+    }
+
+    async fn observe_supervisor_loop(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target: &str,
+        expected_link_revision: Option<u64>,
+        action: bamboo_domain::LoopControlAction,
+    ) -> Result<bamboo_domain::ScopedLoopControlBinding, bamboo_domain::SessionInboxError> {
+        let _publication = self.lock_publication(target).await;
+        let states = self.states.lock().await;
+        let owner = states
+            .get(target)
+            .and_then(|state| state.owner.as_ref())
+            .filter(|owner| !owner.finalizing && owner.registrations > 0)
+            .ok_or_else(|| {
+                bamboo_domain::SessionInboxError::InvalidClaim("no live Loop owner".into())
+            })?;
+        let grant = owner
+            .scoped_loop
+            .as_ref()
+            .filter(|grant| !grant.stopped())
+            .ok_or_else(|| {
+                bamboo_domain::SessionInboxError::InvalidClaim(
+                    "host did not grant Supervisor Loop control".into(),
+                )
+            })?;
+        let binding = &grant.binding;
+        binding
+            .validate()
+            .map_err(bamboo_domain::SessionInboxError::InvalidClaim)?;
+        if binding.supervisor != *supervisor
+            || binding.target_session_id != target
+            || owner.run_id != binding.owner_run_id
+            || owner.session_created_at != Some(binding.target_created_at)
+            || !binding.allowed_actions.contains(&action)
+            || expected_link_revision.is_some_and(|revision| revision != binding.link_revision)
+            || (expected_link_revision.is_none()
+                && action != bamboo_domain::LoopControlAction::Status)
+        {
+            return Err(bamboo_domain::SessionInboxError::InvalidClaim(
+                "live Loop grant observation mismatch".into(),
+            ));
+        }
+        Ok(binding.clone())
+    }
+
+    fn retain_supervisor_loop_blocking(
+        &self,
+        binding: &bamboo_domain::ScopedLoopControlBinding,
+    ) -> Result<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>, bamboo_domain::SessionRunConflict>
+    {
+        use bamboo_domain::{SessionRunConflict, SessionRunConflictReason};
+        let publication = self
+            .publication_fence(&binding.target_session_id)
+            .blocking_lock_owned();
+        let states = self.states.blocking_lock();
+        let owner = states
+            .get(&binding.target_session_id)
+            .and_then(|state| state.owner.as_ref());
+        if binding.validate().is_err()
+            || owner.is_none_or(|owner| {
+                owner.finalizing
+                    || owner.registrations == 0
+                    || owner.run_id != binding.owner_run_id
+                    || owner.session_created_at != Some(binding.target_created_at)
+                    || owner
+                        .scoped_loop
+                        .as_ref()
+                        .is_none_or(|grant| grant.stopped() || grant.binding != *binding)
+            })
+        {
+            return Err(SessionRunConflict {
+                reason: SessionRunConflictReason::RunChanged,
+                expected_run_id: binding.owner_run_id.clone(),
+                observed_run_id: owner
+                    .filter(|owner| owner.session_created_at == Some(binding.target_created_at))
+                    .map(|owner| owner.run_id.clone()),
+            });
+        }
+        let grant = owner
+            .and_then(|owner| owner.scoped_loop.as_ref())
+            .expect("validated Loop grant")
+            .clone();
+        Ok(Arc::new(SupervisorLoopDeliveryGuard {
+            inner: ExpectedRunDeliveryGuard {
+                target_session_id: binding.target_session_id.clone(),
+                session_created_at: binding.target_created_at,
+                run_id: binding.owner_run_id.clone(),
+                states: self.states.clone(),
+                _publication: publication,
+            },
+            grant,
         }))
     }
 
@@ -4415,3 +4648,7 @@ mod tests {
 #[cfg(test)]
 #[path = "session_activation_child_completion_tests.rs"]
 mod child_completion_fence_tests;
+
+#[cfg(test)]
+#[path = "session_activation/scoped_loop_tests.rs"]
+mod scoped_loop_tests;

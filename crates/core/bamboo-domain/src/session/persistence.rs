@@ -448,6 +448,48 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         self.save_runtime_session(session).await
     }
 
+    /// Only the existing owner may claim structured Loop inputs. Unsupported
+    /// adapters do not fall back to ordinary provider-message admission.
+    async fn claim_scoped_loop_controls(
+        &self,
+        _session: &Session,
+        _inbox: Arc<dyn crate::SessionInboxPort>,
+        _active_run_id: &str,
+        _limit: usize,
+    ) -> io::Result<Vec<crate::ScopedLoopControlClaim>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "scoped Loop claims unsupported",
+        ))
+    }
+
+    /// State, immutable control outcome and typed consumption proof share the
+    /// actual target checkpoint; ACK is last. Err never means rollback.
+    async fn checkpoint_scoped_loop_control(
+        &self,
+        _session: &mut Session,
+        _bindings: &[crate::ScopedLoopControlBinding],
+        _activation: Arc<dyn crate::SessionActivationPort>,
+        _input: Option<(
+            Arc<dyn crate::SessionInboxPort>,
+            crate::ScopedLoopControlClaim,
+        )>,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "scoped Loop checkpoint unsupported",
+        ))
+    }
+
+    /// Canonical read after a failed/uncertain checkpoint. A cached Session or
+    /// the proposed caller snapshot is not confirmation of what was written.
+    async fn load_loop_control_checkpoint(&self, _session_id: &str) -> io::Result<Option<Session>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "strict Loop checkpoint reload unsupported",
+        ))
+    }
+
     async fn admit_root_inbox(
         &self,
         _session: &mut Session,
@@ -765,6 +807,37 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
 
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).checkpoint_runtime_session(session).await
+    }
+
+    async fn claim_scoped_loop_controls(
+        &self,
+        session: &Session,
+        inbox: Arc<dyn crate::SessionInboxPort>,
+        active_run_id: &str,
+        limit: usize,
+    ) -> io::Result<Vec<crate::ScopedLoopControlClaim>> {
+        (**self)
+            .claim_scoped_loop_controls(session, inbox, active_run_id, limit)
+            .await
+    }
+
+    async fn checkpoint_scoped_loop_control(
+        &self,
+        session: &mut Session,
+        bindings: &[crate::ScopedLoopControlBinding],
+        activation: Arc<dyn crate::SessionActivationPort>,
+        input: Option<(
+            Arc<dyn crate::SessionInboxPort>,
+            crate::ScopedLoopControlClaim,
+        )>,
+    ) -> io::Result<()> {
+        (**self)
+            .checkpoint_scoped_loop_control(session, bindings, activation, input)
+            .await
+    }
+
+    async fn load_loop_control_checkpoint(&self, session_id: &str) -> io::Result<Option<Session>> {
+        (**self).load_loop_control_checkpoint(session_id).await
     }
 
     async fn admit_root_inbox(

@@ -107,6 +107,9 @@ mod root_actor_input;
 #[cfg(test)]
 mod root_actor_input_tests;
 mod root_actor_runtime;
+mod scoped_loop_control;
+#[cfg(test)]
+mod scoped_loop_control_tests;
 mod title_observations;
 pub use host_registry::FileHostRegistry;
 #[cfg(test)]
@@ -6144,6 +6147,16 @@ impl SessionStoreV2 {
         publish: Option<bamboo_domain::RootActorRuntimePublisher>,
         inherited: Option<&bamboo_domain::InheritedChildWait>,
     ) -> io::Result<Option<Session>> {
+        if session
+            .metadata
+            .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "scoped Loop checkpoint outcome is uncertain; strict canonical reload required",
+            ));
+        }
+
         let reconciled = match inherited {
             Some(inherited) => Some(
                 self.reconcile_inherited_runtime_snapshot(session, inherited, true)
@@ -6331,6 +6344,16 @@ impl SessionStoreV2 {
         answer_permit: Option<&ParentQuestion>,
         manual_title: bool,
     ) -> io::Result<()> {
+        if session
+            .metadata
+            .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "scoped Loop checkpoint outcome is uncertain; strict canonical reload required",
+            ));
+        }
+
         let intended_rel = Self::default_writer_rel_path(session)?;
         self.check_default_or_root_actor_context(
             session,
@@ -6581,6 +6604,22 @@ impl Storage for SessionStoreV2 {
     ) -> io::Result<()> {
         self.save_root_actor_input_impl(owner, &mut session.clone(), inbox, claim, publish, None)
             .await
+    }
+
+    async fn load_scoped_loop_session(
+        &self,
+        binding: &bamboo_domain::ScopedLoopControlBinding,
+        activation: Arc<dyn bamboo_domain::SessionActivationPort>,
+    ) -> io::Result<Option<Session>> {
+        self.load_scoped_loop_session_impl(binding, activation)
+            .await
+    }
+
+    async fn checkpoint_scoped_loop(
+        &self,
+        request: bamboo_domain::ScopedLoopControlCheckpoint<'_>,
+    ) -> io::Result<()> {
+        self.checkpoint_scoped_loop_impl(request).await
     }
 
     fn supports_root_actor_runtime_write(&self) -> bool {

@@ -4,18 +4,26 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
-use bamboo_domain::SessionActivationDisposition;
+use bamboo_domain::{LoopControlRequest, SessionActivationDisposition, SupervisorReference};
 use bamboo_engine::{SessionMessenger, SessionMessengerError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum SessionControlArgs {
     Followup {
         target_session_id: String,
         operation_id: String,
         message: String,
+    },
+    Loop {
+        target_session_id: String,
+        #[serde(default)]
+        expected_link_revision: Option<u64>,
+        command: LoopControlRequest,
+        #[serde(default)]
+        receipt_operation_id: Option<String>,
     },
 }
 
@@ -36,21 +44,27 @@ impl Tool for SessionControlTool {
     }
 
     fn description(&self) -> &str {
-        "Supervisor-only followup to an already attached existing independent Root. The target continues with its original context. Use a stable operation_id per target; retry the same operation with exactly the same message to recover an uncertain result, never a new id. Returns durable admission and activation-request status, not task completion. Pending human questions remain unanswered. Use session_history action=read_messages for bounded result readback. This tool cannot create or attach sessions, answer approvals, or cancel work."
+        "Supervisor-only control of an already attached independent Root, preserving its original context and authority. followup: use a stable operation_id per target and exactly the same message on retry; returns durable admission/activation status, not task completion. loop: requires a separate explicit host grant for the target's current active execution and its existing finite loop opt-in. command is status/start/update/stop; only status may omit expected_link_revision or query receipt_operation_id. Mutations require the exact nonzero link revision and command generation/control CAS. A target-owner receipt distinguishes queued delivery, committed control and any objective still pending its next iteration. No new session, attachment, successor, cadence, approval answer or permission is created. Plan and approval replay cannot issue loop commands. Pending human questions remain unanswered; use session_history.read_messages for bounded history."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object", "additionalProperties": false,
             "properties": {
-                "action": {"type": "string", "enum": ["followup"]},
+                "action": {"type": "string", "enum": ["followup", "loop"],
+                    "description": "followup requires target_session_id, operation_id and message. loop requires target_session_id and command; mutations also require expected_link_revision. Only loop status may query receipt_operation_id or omit the link revision."},
                 "target_session_id": {"type": "string", "minLength": 1, "maxLength": 256},
                 "operation_id": {"type": "string", "minLength": 1, "maxLength": 256,
-                    "description": "Stable operation id for this target; no whitespace padding, slashes or '..'. Reuse it only with the same message."},
+                    "description": "followup only: stable operation id for this target; no whitespace padding, slashes or '..'. Reuse it only with the same message."},
                 "message": {"type": "string", "minLength": 1, "maxLength": 16384,
-                    "description": "One followup instruction, at most 16 KiB in UTF-8."}
+                    "description": "followup only: one instruction, at most 16 KiB in UTF-8."},
+                "expected_link_revision": {"type": "integer", "minimum": 1,
+                    "description": "loop only: exact current nonzero Supervisor link revision; required for start/update/stop. Status alone may omit it to bootstrap after full canonical authority and host-grant checks."},
+                "command": bamboo_tools::tools::loop_control::LoopControlTool::new().parameters_schema(),
+                "receipt_operation_id": {"type": "string", "format": "uuid",
+                    "description": "loop status only: exact operation UUID for bounded target-owner receipt lookup; never a grant or a new command."}
             },
-            "required": ["action", "target_session_id", "operation_id", "message"]
+            "required": ["action", "target_session_id"]
         })
     }
 
@@ -61,7 +75,7 @@ impl Tool for SessionControlTool {
     async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
         if ctx.plan_read_only {
             return Err(ToolError::Execution(
-                "session_control followup is unavailable in Plan mode".into(),
+                "session_control is unavailable in Plan mode".into(),
             ));
         }
         let caller = ctx.session_id().ok_or_else(|| {
@@ -75,13 +89,52 @@ impl Tool for SessionControlTool {
                 )
             })?
             .supervisor_reference();
-        let SessionControlArgs::Followup {
-            target_session_id,
-            operation_id,
-            message,
-        } = serde_json::from_value(args).map_err(|error| {
-            ToolError::InvalidArguments(format!("invalid session_control arguments: {error}"))
-        })?;
+        let (target_session_id, operation_id, message) = match serde_json::from_value(args)
+            .map_err(|error| {
+                ToolError::InvalidArguments(format!("invalid session_control arguments: {error}"))
+            })? {
+            SessionControlArgs::Followup {
+                target_session_id,
+                operation_id,
+                message,
+            } => (target_session_id, operation_id, message),
+            SessionControlArgs::Loop {
+                target_session_id,
+                expected_link_revision,
+                command,
+                receipt_operation_id,
+            } => {
+                validate_loop_arguments(
+                    &supervisor,
+                    &target_session_id,
+                    expected_link_revision,
+                    &command,
+                    receipt_operation_id.as_deref(),
+                )?;
+                if bamboo_tools::permission::permission_replay_active(caller, &ctx.tool_call_id) {
+                    return Err(ToolError::Execution(
+                        "session_control loop requires a fresh command, not approval replay".into(),
+                    ));
+                }
+                let receipt = self
+                    .messenger
+                    .supervisor_loop_control(
+                        &supervisor,
+                        &target_session_id,
+                        expected_link_revision,
+                        &command,
+                        receipt_operation_id.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| ToolError::Execution(error.to_string()))?;
+                // Preserve the host/target's actual queued or committed
+                // result. Delivery alone never manufactures applied=true.
+                return Ok(ToolOutcome::Completed(ToolResult::text(
+                    true,
+                    receipt.to_string(),
+                )));
+            }
+        };
         let result = self
             .messenger
             .supervisor_followup(&supervisor, &target_session_id, &operation_id, &message)
@@ -115,5 +168,83 @@ impl Tool for SessionControlTool {
             "activation": activation, "activation_error": detail,
             "note": "Admission is durable; this is not completion. A waiting target remains waiting. Retry with the same operation_id and message if activation needs recovery; read results with session_history.read_messages."
         }).to_string())))
+    }
+}
+
+fn validate_loop_arguments(
+    supervisor: &SupervisorReference,
+    target_session_id: &str,
+    expected_link_revision: Option<u64>,
+    command: &LoopControlRequest,
+    receipt_operation_id: Option<&str>,
+) -> Result<(), ToolError> {
+    bamboo_domain::validate_supervisor_target_id(target_session_id)
+        .map_err(|error| ToolError::InvalidArguments(error.into()))?;
+    if target_session_id == supervisor.session_id {
+        return Err(ToolError::InvalidArguments(
+            "Supervisor loop control cannot target itself".into(),
+        ));
+    }
+    command.validate().map_err(ToolError::InvalidArguments)?;
+    if expected_link_revision == Some(0)
+        || (!matches!(command, LoopControlRequest::Status) && expected_link_revision.is_none())
+    {
+        return Err(ToolError::InvalidArguments(
+            "loop expected_link_revision must be nonzero and is required for mutations".into(),
+        ));
+    }
+    if let Some(operation_id) = receipt_operation_id {
+        if !matches!(command, LoopControlRequest::Status) {
+            return Err(ToolError::InvalidArguments(
+                "receipt_operation_id is only valid for loop status".into(),
+            ));
+        }
+        uuid::Uuid::parse_str(operation_id).map_err(|_| {
+            ToolError::InvalidArguments("receipt_operation_id must be a valid UUID".into())
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_bootstrap_and_receipt_lookup_are_valid_structures_not_authority_grants() {
+        let supervisor = SupervisorReference {
+            session_id: bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID.into(),
+            incarnation_id: uuid::Uuid::from_u128(1),
+        };
+        for receipt in [None, Some("A4B85B5B-BA44-488D-9900-20DD7E016E88")] {
+            let mut arguments = json!({
+                "action":"loop", "target_session_id":"target-a", "command":{"action":"status"},
+            });
+            if let Some(operation_id) = receipt {
+                arguments["receipt_operation_id"] = json!(operation_id);
+            }
+            let SessionControlArgs::Loop {
+                target_session_id,
+                expected_link_revision,
+                command,
+                receipt_operation_id,
+            } = serde_json::from_value(arguments).unwrap()
+            else {
+                panic!("expected loop arguments");
+            };
+            assert_eq!(expected_link_revision, None);
+            assert_eq!(receipt_operation_id.as_deref(), receipt);
+            assert_eq!(command, LoopControlRequest::Status);
+            // This validates wire structure only. Live authority/host-grant
+            // checks remain mandatory in supervisor_loop_control.
+            validate_loop_arguments(
+                &supervisor,
+                &target_session_id,
+                expected_link_revision,
+                &command,
+                receipt_operation_id.as_deref(),
+            )
+            .unwrap();
+        }
     }
 }

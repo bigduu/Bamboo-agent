@@ -20,7 +20,9 @@ use super::counted_loop::{
 };
 
 pub(crate) mod output_limits;
+pub(crate) mod scoped;
 pub(crate) mod suspension;
+pub use scoped::SupervisorLoopControlGrant;
 
 const MAX_OPERATIONS: usize = 64;
 
@@ -36,6 +38,8 @@ pub struct LoopControlConfig {
     active: Arc<OnceLock<ManagedActivation>>,
     execution: Arc<OnceLock<ControlExecution>>,
     observed_running: Arc<AtomicBool>,
+    supervisor_grant: Option<SupervisorLoopControlGrant>,
+    live_supervisor_binding: Arc<OnceLock<bamboo_domain::ScopedLoopControlBinding>>,
 }
 
 struct ManagedActivation {
@@ -69,7 +73,26 @@ impl LoopControlConfig {
             active: Arc::new(OnceLock::new()),
             execution: Arc::new(OnceLock::new()),
             observed_running: Arc::new(AtomicBool::new(false)),
+            supervisor_grant: None,
+            live_supervisor_binding: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Separately opt this one activation into remote Supervisor management.
+    /// Attachment and the self-control opt-in alone never install this grant.
+    pub fn supervisor_control(
+        mut self,
+        grant: SupervisorLoopControlGrant,
+    ) -> Result<Self, AgentError> {
+        grant.validate(self.max_iterations, self.max_total_rounds)?;
+        self.supervisor_grant = Some(grant);
+        Ok(self)
+    }
+
+    pub fn supervisor_grant_id(&self) -> Option<uuid::Uuid> {
+        self.supervisor_grant
+            .as_ref()
+            .map(SupervisorLoopControlGrant::grant_id)
     }
 
     /// Revoke this host capability and stop any loop using its child token.
@@ -88,6 +111,7 @@ impl LoopControlConfig {
         self.active = Arc::new(OnceLock::new());
         self.execution = Arc::new(OnceLock::new());
         self.observed_running = Arc::new(AtomicBool::new(false));
+        self.live_supervisor_binding = Arc::new(OnceLock::new());
     }
 
     pub(crate) async fn validate_current_owner(&self, session: &Session) -> Result<(), AgentError> {
@@ -182,6 +206,8 @@ pub struct LoopControlReceipt {
 #[serde(deny_unknown_fields)]
 pub struct StoredLoopOperation {
     pub payload_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<bamboo_domain::ScopedLoopControlBinding>,
     pub receipt: LoopControlReceipt,
 }
 
@@ -189,6 +215,8 @@ pub struct StoredLoopOperation {
 #[serde(deny_unknown_fields)]
 pub struct PendingLoopObjective {
     pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<bamboo_domain::ScopedLoopControlBinding>,
     pub objective_revision: u64,
 }
 
@@ -198,6 +226,8 @@ pub struct PendingLoopObjective {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedLoopState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective_origin: Option<bamboo_domain::ScopedLoopControlBinding>,
     pub control_revision: u64,
     pub applied_revision: u64,
     pub iteration_objective_revision: u64,
@@ -229,6 +259,30 @@ impl ManagedLoopState {
             }
         } else if state.iterations_started > 0 && self.applied_revision != self.control_revision {
             return Err(fatal("inconsistent applied revision"));
+        }
+        for origin in self
+            .objective_origin
+            .iter()
+            .chain(
+                self.pending_objective
+                    .iter()
+                    .filter_map(|pending| pending.origin.as_ref()),
+            )
+            .chain(
+                self.operations
+                    .iter()
+                    .filter_map(|operation| operation.origin.as_ref()),
+            )
+        {
+            origin
+                .validate()
+                .map_err(|_| fatal("malformed remote objective origin"))?;
+            if origin.execution_id != state.owner_execution_id
+                || state.max_iterations > origin.max_iterations
+                || state.max_total_rounds > origin.max_total_rounds
+            {
+                return Err(fatal("remote objective lifetime or bounds changed"));
+            }
         }
         let mut seen = std::collections::BTreeSet::new();
         for operation in &self.operations {
@@ -429,7 +483,7 @@ pub(crate) async fn apply_current(
                     .is_none_or(|s| s.owner_execution_id != execution.id)
             {
                 rejected("generation_not_current_activation")
-            } else if prior.payload_sha256 == hash {
+            } else if prior.origin.is_none() && prior.payload_sha256 == hash {
                 receipt_result(&prior.receipt)
             } else {
                 rejected("operation_payload_conflict")
@@ -499,6 +553,41 @@ fn accept_command(
     round: usize,
     hash: String,
 ) -> Result<LoopState, &'static str> {
+    let spent = u32::try_from(round.saturating_add(1)).map_err(|_| "budget_exhausted")?;
+    accept_command_at_boundary(
+        policy,
+        config,
+        current,
+        command,
+        execution_id,
+        spent,
+        hash,
+        None,
+    )
+}
+
+/// One proposal algorithm for the self tool and the target's serial Inbox
+/// boundary. The caller supplies rounds already charged; remote admission
+/// before before_round must not charge a fictional tool/provider round.
+#[allow(clippy::too_many_arguments)]
+fn accept_command_at_boundary(
+    policy: &LoopControlConfig,
+    config: &AgentLoopConfig,
+    current: Option<LoopState>,
+    command: &LoopControlRequest,
+    execution_id: &str,
+    activation_rounds_spent: u32,
+    hash: String,
+    origin: Option<&bamboo_domain::ScopedLoopControlBinding>,
+) -> Result<LoopState, &'static str> {
+    if let Some(origin) = origin {
+        origin
+            .authorize(command)
+            .map_err(|_| "remote_host_grant_refused")?;
+        if origin.execution_id != execution_id {
+            return Err("remote_execution_changed");
+        }
+    }
     if !matches!(command, LoopControlRequest::Start { .. })
         && current
             .as_ref()
@@ -532,7 +621,7 @@ fn accept_command(
             }) {
                 return Err("prior_generation_not_retired");
             }
-            let spent = u32::try_from(round.saturating_add(1)).map_err(|_| "budget_exhausted")?;
+            let spent = activation_rounds_spent;
             let ceiling = policy
                 .max_total_rounds
                 .min(config.run_budget.max_rounds.unwrap_or(MAX_LOOP_ROUNDS));
@@ -558,6 +647,7 @@ fn accept_command(
                 rounds_started: spent,
                 status: LoopStatus::Running,
                 control: Some(ManagedLoopState {
+                    objective_origin: origin.cloned(),
                     control_revision: 1,
                     applied_revision: 0,
                     iteration_objective_revision: 0,
@@ -622,6 +712,7 @@ fn accept_command(
             if let Some(objective) = objective.as_ref().filter(|text| **text != state.objective) {
                 control.pending_objective = Some(PendingLoopObjective {
                     objective: objective.clone(),
+                    origin: origin.cloned().or_else(|| control.objective_origin.clone()),
                     objective_revision: state
                         .objective_revision
                         .checked_add(1)
@@ -658,6 +749,12 @@ fn accept_command(
         }
         LoopControlRequest::Status => unreachable!("status is not a mutation"),
     };
+    if origin.is_some_and(|origin| {
+        state.max_iterations > origin.max_iterations
+            || state.max_total_rounds > origin.max_total_rounds
+    }) {
+        return Err("effective_bounds_exceed_remote_host_grant");
+    }
     let control = state.control.as_mut().expect("managed state");
     if control.operations.len() >= MAX_OPERATIONS {
         return Err("operation_limit_exhausted");
@@ -666,6 +763,7 @@ fn accept_command(
     let applied = control.applied_revision == control.control_revision;
     control.operations.push(StoredLoopOperation {
         payload_sha256: hash,
+        origin: origin.cloned(),
         receipt: LoopControlReceipt {
             operation_id: operation_id(command).expect("mutation id").into(),
             generation: state.generation.clone(),
@@ -827,8 +925,7 @@ async fn persist_staged(
     policy: &LoopControlConfig,
     mut staged: Session,
 ) -> Result<(), AgentError> {
-    let checkpoint =
-        counted_loop::persist_checkpoint(&mut staged, config.persistence.as_deref()).await;
+    let checkpoint = scoped::persist_current_checkpoint(&mut staged, config).await;
     // An uncertain write reserves this operation/consumption conservatively.
     // The original error aborts the runner; its one known generation is Failed
     // (or Cancelled), never replayed or silently started a second time.
@@ -848,3 +945,6 @@ async fn persist_staged(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod scoped_tests;

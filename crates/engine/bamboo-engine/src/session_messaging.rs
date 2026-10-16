@@ -753,6 +753,175 @@ impl SessionMessenger {
         self.activate_prepared(&admission).await.map(Into::into)
     }
 
+    /// Original executing Supervisor control over one separately host-granted
+    /// live Root. Enqueue/notification is never a configuration application
+    /// receipt. Reads use a fresh canonical target snapshot under both fences.
+    pub async fn supervisor_loop_control(
+        &self,
+        supervisor: &SupervisorReference,
+        target_session_id: &str,
+        expected_link_revision: Option<u64>,
+        command: &bamboo_domain::LoopControlRequest,
+        receipt_operation_id: Option<&str>,
+    ) -> Result<serde_json::Value, SessionMessengerError> {
+        use bamboo_domain::{LoopControlAction, LoopControlRequest, ScopedLoopControlInput};
+        let invalid = |message: String| SessionMessengerError::InvalidEnvelope(message);
+        bamboo_domain::validate_supervisor_target_id(target_session_id)
+            .map_err(|error| invalid(error.into()))?;
+        command.validate().map_err(invalid)?;
+        let status = matches!(command, LoopControlRequest::Status);
+        if expected_link_revision == Some(0)
+            || (!status && expected_link_revision.is_none())
+            || (!status && receipt_operation_id.is_some())
+        {
+            return Err(invalid("loop mutations require the exact nonzero link revision; receipt lookup is status-only".into()));
+        }
+        if let Some(operation) = receipt_operation_id {
+            uuid::Uuid::parse_str(operation)
+                .map_err(|_| invalid("receipt operation must be a UUID".into()))?;
+        }
+        let binding = self
+            .activation
+            .observe_supervisor_loop(
+                supervisor,
+                target_session_id,
+                expected_link_revision,
+                LoopControlAction::of(command),
+            )
+            .await?;
+        binding.authorize(command).map_err(invalid)?;
+        let canonical = self
+            .sessions
+            .load_scoped_loop_session(&binding, self.activation.clone())
+            .await
+            .map_err(|error| SessionMessengerError::Storage(error.to_string()))?
+            .ok_or_else(|| SessionMessengerError::TargetNotFound(target_session_id.into()))?;
+        if status {
+            let mut snapshot = serde_json::to_value(
+                crate::runtime::loop_control::inspect_loop(&canonical)
+                    .map_err(|error| SessionMessengerError::Storage(error.to_string()))?,
+            )
+            .map_err(|error| SessionMessengerError::Storage(error.to_string()))?;
+            // Bounded readback belongs to the initiating Supervisor's output
+            // budget. The target's canonical objective bytes remain unchanged.
+            for field in ["objective", "pending_objective"] {
+                let text = snapshot[field].as_str().map(str::to_owned);
+                if let Some(text) = text {
+                    let mut end = text.len().min(1024);
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    snapshot[field] = serde_json::Value::String(text[..end].into());
+                    snapshot[format!("{field}_truncated")] =
+                        serde_json::Value::Bool(end < text.len());
+                }
+            }
+            let records = bamboo_domain::scoped_loop_consumptions(&canonical)
+                .map_err(SessionMessengerError::Storage)?;
+            let partial_checkpoint = records.iter().any(|record| {
+                record.binding == binding
+                    && receipt_operation_id.is_none_or(|id| id == record.operation_id)
+                    && !canonical
+                        .session_inbox_admission()
+                        .is_some_and(|cursor| cursor.contains(&record.input_id))
+            });
+            let record = records.into_iter().rev().find(|record| {
+                record.binding == binding
+                    && receipt_operation_id.is_none_or(|id| id == record.operation_id)
+                    && canonical
+                        .session_inbox_admission()
+                        .is_some_and(|cursor| cursor.contains(&record.input_id))
+            });
+            let state = crate::runtime::counted_loop::read_loop_state(&canonical)
+                .map_err(|error| SessionMessengerError::Storage(error.to_string()))?;
+            let objective_applied_actual = record
+                .as_ref()
+                .filter(|record| record.configured)
+                .and_then(|record| record.receipt.as_ref())
+                .zip(state.as_ref())
+                .is_some_and(|(receipt, state)| {
+                    receipt["generation"].as_str() == Some(state.generation.as_str())
+                        && canonical.messages.iter().any(|message| {
+                            message.role == bamboo_domain::Role::User
+                                && message.metadata.as_ref().is_some_and(|metadata| {
+                                    metadata["runtime_kind"].as_str()
+                                        == Some("counted_loop_iteration")
+                                        && metadata["loop_generation"] == receipt["generation"]
+                                        && metadata["objective_revision"]
+                                            == receipt["objective_revision"]
+                                })
+                        })
+                        && state.control.as_ref().is_some_and(|control| {
+                            receipt["accepted_revision"]
+                                .as_u64()
+                                .is_some_and(|revision| control.applied_revision >= revision)
+                                && receipt["objective_revision"]
+                                    .as_u64()
+                                    .is_some_and(|revision| {
+                                        revision > 0
+                                            && control.iteration_objective_revision >= revision
+                                    })
+                        })
+                });
+            return Ok(serde_json::json!({
+                "action":"loop", "command":"status", "target_session_id":target_session_id,
+                "link_revision":binding.link_revision, "owner_run_id":binding.owner_run_id,
+                "execution_id":binding.execution_id, "loop":snapshot,
+                "host_max_iterations":binding.max_iterations, "host_max_total_rounds":binding.max_total_rounds,
+                "configured":record.as_ref().is_some_and(|record|record.configured),
+                "checkpoint_observation":if partial_checkpoint { "partial_or_unknown" } else if record.is_some() { "confirmed" } else { "not_observed" },
+                "operation_receipt":record, "objective_applied_actual":objective_applied_actual,
+                "note":"Configuration receipts are immutable target checkpoints; objective_applied_actual additionally requires its real iteration-admission checkpoint. Neither is a task result."
+            }));
+        }
+        let input = ScopedLoopControlInput {
+            binding,
+            command: command.clone(),
+        };
+        let envelope = input.envelope().map_err(invalid)?;
+        if let Some(record) = bamboo_domain::scoped_loop_consumptions(&canonical)
+            .map_err(SessionMessengerError::Storage)?
+            .into_iter()
+            .find(|record| record.input_id == envelope.id)
+        {
+            if !bamboo_domain::has_scoped_loop_consumption(&canonical, &envelope) {
+                return Err(invalid(
+                    "operation payload conflicts with its immutable target receipt".into(),
+                ));
+            }
+            if canonical
+                .session_inbox_admission()
+                .is_some_and(|cursor| cursor.contains(&record.input_id))
+            {
+                return Ok(serde_json::json!({
+                    "action":"loop", "target_session_id":target_session_id,
+                    "operation_id":input.operation_id(), "receipt_id":envelope.id,
+                    "admitted":true, "replayed":true, "configured":record.configured,
+                    "operation_receipt":record, "objective_applied_actual":false,
+                    "note":"The original configuration receipt is replayed; use status for current objective application."
+                }));
+            }
+            // A runtime sidecar without Main's typed cursor is a partial
+            // publication, not a confirmed application. Exact delivery below
+            // recovers its original queued receipt without claiming success.
+        }
+        let started = Instant::now();
+        let receipt = self
+            .inbox
+            .deliver_supervisor_loop_control(&input.binding, &envelope, self.activation.clone())
+            .await?;
+        self.record_admission(envelope, receipt.delivery.clone(), started);
+        Ok(serde_json::json!({
+            "action":"loop", "target_session_id":target_session_id,
+            "operation_id":input.operation_id(), "receipt_id":receipt.delivery.id,
+            "generation":receipt.delivery.generation, "admitted":true,
+            "replayed":receipt.replayed, "active_delivery_notified":receipt.active_delivery_notified,
+            "configured":false, "target_application_observed":false,
+            "objective_applied_actual":false, "operation_receipt":null,
+            "note":"Only this expected live owner was notified. Application is not observed here; query status with receipt_operation_id. This input never starts a successor or answers a wait."
+        }))
+    }
+
     /// Follow an already-attached Ordinary Root from the original executing
     /// Supervisor. The concrete inbox revalidates and retains all authority
     /// locks through durable admission; a prior inspect_link is never a grant.

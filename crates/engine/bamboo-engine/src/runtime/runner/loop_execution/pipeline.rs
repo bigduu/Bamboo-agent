@@ -3072,6 +3072,7 @@ async fn run_pipeline_inner(
         {
             break;
         }
+        crate::runtime::loop_control::scoped::drain(session, config, turn_counter).await?;
         if !crate::runtime::counted_loop::before_round(session, config, &state.execution_id).await?
         {
             break;

@@ -66,6 +66,10 @@ impl CountedLoopConfig {
         });
     }
 
+    pub(crate) fn ownership(&self) -> Option<crate::session_activation::SessionRunOwnership> {
+        self.owner.as_ref().map(|owner| owner.run.clone())
+    }
+
     pub(crate) async fn owns_session(
         &self,
         router: Option<&std::sync::Arc<crate::session_activation::SessionActivationRouter>>,
@@ -207,7 +211,8 @@ async fn checkpoint(
     config: &AgentLoopConfig,
     state: LoopState,
 ) -> Result<(), AgentError> {
-    checkpoint_state(session, config.persistence.as_deref(), state).await
+    stage_state(session, state)?;
+    super::loop_control::scoped::persist_current_checkpoint(session, config).await
 }
 
 async fn checkpoint_state(
@@ -629,6 +634,7 @@ pub(crate) async fn before_round(
             if let Some(pending) = control.pending_objective.take() {
                 state.objective = pending.objective;
                 state.objective_revision = pending.objective_revision;
+                control.objective_origin = pending.origin;
             }
             control.applied_revision = control.control_revision;
             control.iteration_objective_revision = state.objective_revision;
@@ -653,10 +659,24 @@ pub(crate) async fn before_round(
         // conservative counters on an indeterminate write, without publishing
         // uncommitted input into the live execution or its later error save.
         let admitted_state = stage_state(&mut staged, state)?;
-        if let Err(error) = persist_checkpoint(&mut staged, config.persistence.as_deref()).await {
-            session
-                .metadata
-                .insert(LOOP_STATE_METADATA_KEY.into(), admitted_state);
+        if let Err(error) =
+            super::loop_control::scoped::persist_current_checkpoint(&mut staged, config).await
+        {
+            if bamboo_domain::scoped_loop_objective_origins(&staged)
+                .is_ok_and(|origins| !origins.is_empty())
+                || staged
+                    .metadata
+                    .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY)
+            {
+                // The remote checkpoint helper preserved a strict canonical
+                // snapshot or a no-save fence. Do not reinstall the rejected
+                // objective/counters through a later generic error save.
+                *session = staged;
+            } else {
+                session
+                    .metadata
+                    .insert(LOOP_STATE_METADATA_KEY.into(), admitted_state);
+            }
             return Err(error);
         }
         *session = staged;

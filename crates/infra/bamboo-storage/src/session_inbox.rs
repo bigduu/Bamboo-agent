@@ -55,17 +55,21 @@ struct ExpectedRunAdmission {
     target_created_at: chrono::DateTime<Utc>,
     expected_run_id: String,
     activation: Arc<dyn bamboo_domain::SessionActivationPort>,
+    scoped_loop: Option<bamboo_domain::ScopedLoopControlBinding>,
 }
 
 impl ExpectedRunAdmission {
     // Used only in an owned blocking job. The same check is repeated at the
     // actual Maildir rename; this early check is never publication authority.
     fn retain(&self) -> Result<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>, SessionInboxError> {
-        let guard = self.activation.retain_expected_run_blocking(
-            &self.target_session_id,
-            self.target_created_at,
-            &self.expected_run_id,
-        )?;
+        let guard = match &self.scoped_loop {
+            Some(binding) => self.activation.retain_supervisor_loop_blocking(binding)?,
+            None => self.activation.retain_expected_run_blocking(
+                &self.target_session_id,
+                self.target_created_at,
+                &self.expected_run_id,
+            )?,
+        };
         if !guard.matches(
             &self.target_session_id,
             self.target_created_at,
@@ -1321,6 +1325,16 @@ impl FileSessionInbox {
         intent: Option<SessionInboxActivationIntent>,
         expected: Option<ExpectedRunAdmission>,
     ) -> Result<StoredDeliveryState, SessionInboxError> {
+        if bamboo_domain::is_scoped_loop_control(envelope)
+            && expected
+                .as_ref()
+                .and_then(|expected| expected.scoped_loop.as_ref())
+                .is_none()
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "typed Loop control requires its dedicated admission port".into(),
+            ));
+        }
         if intent.as_ref().and_then(|intent| intent.expected_run_id())
             != expected
                 .as_ref()
@@ -1377,7 +1391,21 @@ impl FileSessionInbox {
                     ));
                 }
             }
-            // An exact accepted retry never rechecks/revives a newer run.
+            // Ordinary steer keeps its exact-retry contract. A Loop command
+            // retry still requires the current live host grant; it never
+            // borrows a historical owner or asks for a successor activation.
+            if let Some(expected) = expected
+                .as_ref()
+                .filter(|expected| expected.scoped_loop.is_some())
+            {
+                let expected = expected.clone();
+                filesystem
+                    .job("scoped_loop_retry", &dir, move |_, _| {
+                        expected.retain().map(|_| ()).map_err(std::io::Error::other)
+                    })
+                    .await
+                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            }
             return Ok(StoredDeliveryState {
                 receipt,
                 replayed: true,
@@ -1635,10 +1663,308 @@ impl FileSessionInbox {
     }
 }
 
+impl FileSessionInbox {
+    async fn claim_for_turn_selected(
+        &self,
+        target_session_id: &str,
+        limit: usize,
+        active_run_id: Option<&str>,
+        scoped_only: bool,
+    ) -> Result<Vec<SessionInboxClaim>, SessionInboxError> {
+        let _lifecycle = self.lock_lifecycle().await?;
+        let dir = self.inbox_dir(target_session_id).await?;
+        let _guard = self.lock_operation(&dir).await?;
+        if Self::owned_enabled(&dir).await? {
+            return Err(SessionInboxError::InvalidClaim(
+                "owned Inbox claim API required".into(),
+            ));
+        }
+        let mailbox = Mailbox::at(&dir);
+        mailbox
+            .ensure_dirs()
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        let (activation_generation, versioned) = Self::read_activation_watermark(&dir).await?;
+        let limit = limit.min(self.limits.max_claim_batch);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let interrupt_prefix = Self::read_interrupt_generation(&dir).await?;
+
+        // The coordinator grants a prefix; an immediate producer grants only
+        // its own message. Recovery cannot promote an earlier staged sibling.
+        let mut eligible = Vec::new();
+        for queue in ["cur", "new"] {
+            for (generation, name, path) in Self::valid_queue_entries(&dir, queue).await? {
+                let (intent, _) = self.queue_intent(&path, versioned, None).await?;
+                if intent
+                    .as_ref()
+                    .is_some_and(|intent| !intent.admits_run(active_run_id))
+                {
+                    continue;
+                }
+                if Self::eligible(generation, activation_generation, intent.clone()) {
+                    {
+                        let path = dir.join(queue).join(&name);
+                        let bytes = tokio::fs::read(&path)
+                            .await
+                            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+                        if let Ok(wrapper) = serde_json::from_slice::<InboxMessage>(&bytes) {
+                            if let Ok(envelope) =
+                                serde_json::from_value::<SessionMessageEnvelope>(wrapper.body)
+                            {
+                                if bamboo_domain::is_scoped_loop_control(&envelope) != scoped_only
+                                    || active_run_id.is_some_and(|run_id| {
+                                        envelope.waits_for_successor_of_run(run_id)
+                                    })
+                                {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    eligible.push((
+                        generation,
+                        name,
+                        queue == "cur",
+                        Self::effective_activation_policy(
+                            generation,
+                            activation_generation,
+                            interrupt_prefix,
+                            intent,
+                        )?,
+                    ));
+                }
+            }
+        }
+        eligible.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                // A recovered canonical claim wins over an impossible duplicate
+                // filename in `new/`.
+                .then_with(|| right.2.cmp(&left.2))
+        });
+
+        let mut claims = Vec::new();
+        for (_generation, claim_id, already_claimed, activation_policy) in eligible {
+            if claims.len() >= limit {
+                break;
+            }
+            let cur_path = dir.join("cur").join(&claim_id);
+            if !already_claimed {
+                let new_path = dir.join("new").join(&claim_id);
+                match tokio::fs::rename(&new_path, &cur_path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(SessionInboxError::Storage(format!(
+                            "claim SessionInbox message {}: {error}",
+                            new_path.display()
+                        )));
+                    }
+                }
+            }
+            let decoded = (|| {
+                let bytes = std::fs::read(&cur_path).map_err(|error| error.to_string())?;
+                let wrapper = serde_json::from_slice::<InboxMessage>(&bytes)
+                    .map_err(|error| error.to_string())?;
+                if wrapper.kind != InboxKind::SessionEnvelope {
+                    return Err(format!("unexpected inbox kind {:?}", wrapper.kind));
+                }
+                let generation =
+                    Self::claim_generation(&claim_id).map_err(|error| error.to_string())?;
+                let envelope = serde_json::from_value::<SessionMessageEnvelope>(wrapper.body)
+                    .map_err(|error| error.to_string())?;
+                envelope.validate().map_err(|error| error.to_string())?;
+                if envelope.target_session_id != target_session_id {
+                    return Err(format!(
+                        "claim target {} does not match inbox {target_session_id}",
+                        envelope.target_session_id
+                    ));
+                }
+                Ok(SessionInboxClaim {
+                    envelope,
+                    generation,
+                    activation_policy,
+                    claim_id,
+                })
+            })();
+            match decoded {
+                Ok(claim) => claims.push(claim),
+                Err(reason) => {
+                    Self::quarantine_claim(&dir, &cur_path, &reason).await?;
+                }
+            }
+        }
+        Ok(claims)
+    }
+}
+
+impl FileSessionInbox {
+    pub(crate) fn bind_scoped_checkpoint(
+        &self,
+        owner: Option<&bamboo_domain::RootActorRuntimeWrite>,
+        sessions_dir: &Path,
+    ) -> std::io::Result<Self> {
+        if self.sessions.root_sessions_directory() != sessions_dir || self.child_owner.is_some() {
+            return Err(std::io::Error::other(
+                "scoped Loop Inbox storage identity mismatch",
+            ));
+        }
+        match owner {
+            Some(owner) => self.bind_root_owner(owner, sessions_dir),
+            None if self.root_owner.is_none() => Ok(self.clone()),
+            None => Err(std::io::Error::other(
+                "scoped Loop requires the bound Root writer",
+            )),
+        }
+    }
+
+    /// Synchronous proof only while the original Inbox operation lock is held.
+    pub(crate) fn locked_scoped_legacy_claim(
+        &self,
+        dir: &Path,
+        claim: &SessionInboxClaim,
+        allow_terminal: bool,
+    ) -> Result<(), SessionInboxError> {
+        Self::validate_claim_name(&claim.claim_id)?;
+        use std::io::Read;
+        let path = dir.join("cur").join(&claim.claim_id);
+        if !std::fs::symlink_metadata(&path)
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?
+            .file_type()
+            .is_file()
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "Loop claim is not a regular file".into(),
+            ));
+        }
+        let file =
+            File::open(&path).map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        let mut bytes = Vec::new();
+        file.take(self.max_transport_bytes() as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        if bytes.len() > self.max_transport_bytes() {
+            return Err(SessionInboxError::InvalidClaim(
+                "claim exceeds transport limit".into(),
+            ));
+        }
+        let (wrapper, lease) = Self::decode_owned_wrapper(&bytes)?;
+        let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body)
+            .map_err(|error| SessionInboxError::InvalidClaim(error.to_string()))?;
+        if lease.is_some()
+            || wrapper.kind != InboxKind::SessionEnvelope
+            || Self::claim_generation(&claim.claim_id)? != claim.generation
+            || envelope != claim.envelope
+            || !bamboo_domain::is_scoped_loop_control(&envelope)
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "legacy Loop claim identity changed".into(),
+            ));
+        }
+        if !allow_terminal {
+            match std::fs::symlink_metadata(Self::admitted_path(dir, &envelope.id)) {
+                Ok(_) => {
+                    return Err(SessionInboxError::InvalidClaim(
+                        "Loop claim already terminal".into(),
+                    ))
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(SessionInboxError::Storage(error.to_string())),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn ack_scoped_legacy_with_filesystem(
+        &self,
+        dir: &Path,
+        target: &str,
+        claim: &SessionInboxClaim,
+        filesystem: OwnedFilesystem,
+    ) -> Result<(), SessionInboxError> {
+        self.ack_unlocked(dir, target, claim, AckAuthority::ScopedLegacy(&filesystem))
+            .await
+    }
+}
+
 #[async_trait]
 impl SessionInboxPort for FileSessionInbox {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
+    }
+
+    async fn deliver_supervisor_loop_control(
+        &self,
+        binding: &bamboo_domain::ScopedLoopControlBinding,
+        envelope: &SessionMessageEnvelope,
+        activation: Arc<dyn bamboo_domain::SessionActivationPort>,
+    ) -> Result<bamboo_domain::SessionInboxSteerReceipt, SessionInboxError> {
+        let input = bamboo_domain::scoped_loop_control_input(envelope)
+            .map_err(SessionInboxError::InvalidClaim)?
+            .ok_or_else(|| SessionInboxError::InvalidClaim("typed Loop input required".into()))?;
+        if input.binding != *binding {
+            return Err(SessionInboxError::InvalidClaim(
+                "Loop input binding mismatch".into(),
+            ));
+        }
+        let authority = self
+            .sessions
+            .lock_scoped_loop_authority(binding)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        let state = self
+            .deliver_with_lifecycle_held_run(
+                envelope,
+                InboxAuthority::Supervisor { _guard: authority },
+                None,
+                Some(SessionInboxActivationIntent::for_expected_run(
+                    &binding.owner_run_id,
+                )?),
+                Some(ExpectedRunAdmission {
+                    target_session_id: binding.target_session_id.clone(),
+                    target_created_at: binding.target_created_at,
+                    expected_run_id: binding.owner_run_id.clone(),
+                    activation,
+                    scoped_loop: Some(binding.clone()),
+                }),
+            )
+            .await?;
+        Ok(bamboo_domain::SessionInboxSteerReceipt {
+            delivery: state.receipt.delivery,
+            replayed: state.replayed,
+            active_delivery_notified: state.active_delivery_notified,
+        })
+    }
+
+    async fn claim_scoped_loop_controls(
+        &self,
+        target: &str,
+        limit: usize,
+        run: Option<&str>,
+    ) -> Result<Vec<SessionInboxClaim>, SessionInboxError> {
+        self.claim_for_turn_selected(target, limit, run, true).await
+    }
+
+    async fn claim_owned_scoped_loop_controls(
+        &self,
+        target: &str,
+        limit: usize,
+        run: Option<&str>,
+        request: &bamboo_domain::SessionInboxLeaseRequest,
+    ) -> Result<Vec<bamboo_domain::SessionInboxOwnedClaim>, SessionInboxError> {
+        let inbox = self.clone();
+        let target = target.to_owned();
+        let run = run.map(str::to_owned);
+        let request = request.clone();
+        owned::complete_owned(async move {
+            inbox
+                .claim_owned_impl(&target, limit, run.as_deref(), &request, None, true)
+                .await
+        })
+        .await
     }
 
     async fn claim_owned(
@@ -1654,7 +1980,7 @@ impl SessionInboxPort for FileSessionInbox {
         let request = request.clone();
         owned::complete_owned(async move {
             inbox
-                .claim_owned_impl(&target, limit, run.as_deref(), &request, None)
+                .claim_owned_impl(&target, limit, run.as_deref(), &request, None, false)
                 .await
         })
         .await
@@ -1674,7 +2000,7 @@ impl SessionInboxPort for FileSessionInbox {
         let request = request.clone();
         owned::complete_owned(async move {
             inbox
-                .claim_owned_impl(&target, 1, run.as_deref(), &request, Some(&receipt))
+                .claim_owned_impl(&target, 1, run.as_deref(), &request, Some(&receipt), false)
                 .await
                 .map(|mut claims| claims.pop())
         })
@@ -1928,6 +2254,7 @@ impl SessionInboxPort for FileSessionInbox {
                     target_created_at: target.session_created_at,
                     expected_run_id: expected_run_id.into(),
                     activation,
+                    scoped_loop: None,
                 }),
             )
             .await?;
@@ -2029,129 +2356,8 @@ impl SessionInboxPort for FileSessionInbox {
         limit: usize,
         active_run_id: Option<&str>,
     ) -> Result<Vec<SessionInboxClaim>, SessionInboxError> {
-        let _lifecycle = self.lock_lifecycle().await?;
-        let dir = self.inbox_dir(target_session_id).await?;
-        let _guard = self.lock_operation(&dir).await?;
-        if Self::owned_enabled(&dir).await? {
-            return Err(SessionInboxError::InvalidClaim(
-                "owned Inbox claim API required".into(),
-            ));
-        }
-        let mailbox = Mailbox::at(&dir);
-        mailbox
-            .ensure_dirs()
+        self.claim_for_turn_selected(target_session_id, limit, active_run_id, false)
             .await
-            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
-        let (activation_generation, versioned) = Self::read_activation_watermark(&dir).await?;
-        let limit = limit.min(self.limits.max_claim_batch);
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let interrupt_prefix = Self::read_interrupt_generation(&dir).await?;
-
-        // The coordinator grants a prefix; an immediate producer grants only
-        // its own message. Recovery cannot promote an earlier staged sibling.
-        let mut eligible = Vec::new();
-        for queue in ["cur", "new"] {
-            for (generation, name, path) in Self::valid_queue_entries(&dir, queue).await? {
-                let (intent, _) = self.queue_intent(&path, versioned, None).await?;
-                if intent
-                    .as_ref()
-                    .is_some_and(|intent| !intent.admits_run(active_run_id))
-                {
-                    continue;
-                }
-                if Self::eligible(generation, activation_generation, intent.clone()) {
-                    if let Some(run_id) = active_run_id {
-                        let path = dir.join(queue).join(&name);
-                        let bytes = tokio::fs::read(&path)
-                            .await
-                            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
-                        if let Ok(wrapper) = serde_json::from_slice::<InboxMessage>(&bytes) {
-                            if let Ok(envelope) =
-                                serde_json::from_value::<SessionMessageEnvelope>(wrapper.body)
-                            {
-                                if envelope.waits_for_successor_of_run(run_id) {
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                    eligible.push((
-                        generation,
-                        name,
-                        queue == "cur",
-                        Self::effective_activation_policy(
-                            generation,
-                            activation_generation,
-                            interrupt_prefix,
-                            intent,
-                        )?,
-                    ));
-                }
-            }
-        }
-        eligible.sort_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
-                // A recovered canonical claim wins over an impossible duplicate
-                // filename in `new/`.
-                .then_with(|| right.2.cmp(&left.2))
-        });
-
-        let mut claims = Vec::new();
-        for (_generation, claim_id, already_claimed, activation_policy) in eligible {
-            if claims.len() >= limit {
-                break;
-            }
-            let cur_path = dir.join("cur").join(&claim_id);
-            if !already_claimed {
-                let new_path = dir.join("new").join(&claim_id);
-                match tokio::fs::rename(&new_path, &cur_path).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == ErrorKind::NotFound => continue,
-                    Err(error) => {
-                        return Err(SessionInboxError::Storage(format!(
-                            "claim SessionInbox message {}: {error}",
-                            new_path.display()
-                        )));
-                    }
-                }
-            }
-            let decoded = (|| {
-                let bytes = std::fs::read(&cur_path).map_err(|error| error.to_string())?;
-                let wrapper = serde_json::from_slice::<InboxMessage>(&bytes)
-                    .map_err(|error| error.to_string())?;
-                if wrapper.kind != InboxKind::SessionEnvelope {
-                    return Err(format!("unexpected inbox kind {:?}", wrapper.kind));
-                }
-                let generation =
-                    Self::claim_generation(&claim_id).map_err(|error| error.to_string())?;
-                let envelope = serde_json::from_value::<SessionMessageEnvelope>(wrapper.body)
-                    .map_err(|error| error.to_string())?;
-                envelope.validate().map_err(|error| error.to_string())?;
-                if envelope.target_session_id != target_session_id {
-                    return Err(format!(
-                        "claim target {} does not match inbox {target_session_id}",
-                        envelope.target_session_id
-                    ));
-                }
-                Ok(SessionInboxClaim {
-                    envelope,
-                    generation,
-                    activation_policy,
-                    claim_id,
-                })
-            })();
-            match decoded {
-                Ok(claim) => claims.push(claim),
-                Err(reason) => {
-                    Self::quarantine_claim(&dir, &cur_path, &reason).await?;
-                }
-            }
-        }
-        Ok(claims)
     }
 
     async fn was_admitted(
@@ -2193,6 +2399,11 @@ impl SessionInboxPort for FileSessionInbox {
         target_session_id: &str,
         claim: &SessionInboxClaim,
     ) -> Result<(), SessionInboxError> {
+        if bamboo_domain::is_scoped_loop_control(&claim.envelope) {
+            return Err(SessionInboxError::InvalidClaim(
+                "Loop controls require checkpoint-before-ACK".into(),
+            ));
+        }
         Self::validate_claim_name(&claim.claim_id)?;
         if claim.envelope.target_session_id != target_session_id {
             return Err(SessionInboxError::InvalidClaim(
