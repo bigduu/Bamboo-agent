@@ -24,8 +24,9 @@ were received.
    bounded, typed-tested catalog, not a complete JSON Schema. An absent key is
    unverified here, not necessarily unsupported. Read the owning chapter.
 3. Cite the manifest's package version, source revision/status, content hash,
-   and chapter path. Development version `0.0.0`, unknown revision, modified
-   trees (including source archives marked dirty), or missing dependency-lock identity must remain explicit. Never label
+   and chapter path. Development version `0.0.0`, unknown revision,
+   `checkout_unverified` source, dirty source archives, or missing dependency-lock
+   identity must remain explicit. Never label
    this bundle the latest release or substitute online docs silently.
 4. Give the explanation or next safe check. Only make an instance-specific
    diagnosis from authorized, current evidence; state its observation time,

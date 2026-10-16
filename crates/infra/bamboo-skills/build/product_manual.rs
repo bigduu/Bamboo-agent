@@ -112,16 +112,10 @@ pub fn source_identity(manifest_dir: &Path) -> Value {
                     println!("cargo:rerun-if-changed={}", workspace.join(path).display());
                 }
             }
-            let status = git(
-                &workspace,
-                &["status", "--porcelain", "--untracked-files=normal"],
-            );
-            let state = match status.as_deref() {
-                Some("") => "clean",
-                Some(_) => "modified",
-                None => "unknown",
-            };
-            return json!({"revision": sha, "status": state, "identity_source": "git"});
+            // Cargo does not rerun this script for every unrelated worktree edit.
+            // HEAD is a baseline, not an attestation that the checkout is clean.
+            // Embedded manual bytes have their own independently verified hashes.
+            return json!({"revision": sha, "status": "checkout_unverified", "identity_source": "git"});
         }
     }
     json!({"revision": null, "status": "unknown", "identity_source": "unknown"})

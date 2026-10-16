@@ -24,6 +24,9 @@ fn embedded_manifest_binds_complete_exact_content() {
         manifest["configuration_coverage"],
         "bounded_catalog_not_full_schema"
     );
+    if manifest["source"]["identity_source"] == "git" {
+        assert_eq!(manifest["source"]["status"], "checkout_unverified");
+    }
     let resources = manifest["resources"].as_array().unwrap();
     assert_eq!(resources.len(), packaging::RESOURCES.len());
     let mut content = Vec::new();

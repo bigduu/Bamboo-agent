@@ -34,8 +34,9 @@ The normal workspace shares that version with Bamboo; custom mixed-version
 embedders must compare their own application version rather than infer it.
 
 Source archives use Cargo's recorded VCS identity when available. Otherwise
-source-checkout builds report Git revision and clean/modified state; unproven
-identities remain unknown. A modified tree is not an exact release snapshot.
+source-checkout builds report the baseline Git revision with status
+`checkout_unverified`. Cached build metadata cannot attest checkout cleanliness.
+Unproven identities remain unknown; a baseline is not an exact release snapshot.
 The dependency manifest hash identifies declared inputs; a lock hash identifies
 the lockfile available at build time. A null lock hash means exact dependency
 resolution is not attested. These are provenance labels, not signatures.
