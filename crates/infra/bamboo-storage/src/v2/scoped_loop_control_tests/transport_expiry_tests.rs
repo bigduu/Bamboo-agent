@@ -8,7 +8,15 @@ fn target_dir(f: &Fixture) -> PathBuf {
 fn queued_files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     let mut found = Vec::new();
     for queue in ["new", "cur"] {
-        for entry in std::fs::read_dir(dir.join("inbox").join(queue)).unwrap() {
+        let path = dir.join("inbox").join(queue);
+        let entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            // A producer creates new/; cur/ is created only when a consumer
+            // or a full Mailbox setup needs it. Missing empty cur is legal.
+            Err(error) if queue == "cur" && error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("read queue {}: {error}", path.display()),
+        };
+        for entry in entries {
             let path = entry.unwrap().path();
             if path
                 .extension()
@@ -191,6 +199,11 @@ async fn scoped_transport_unknown_legacy_and_live_or_broken_native_never_guess_d
         f.deliver(&envelope).await;
         let dir = target_dir(&f);
         let original_transport = queued_files(&dir);
+        assert_eq!(
+            original_transport.len(),
+            1,
+            "{fault}: the real scoped carrier must exist before the fault"
+        );
         let record = dir.join("actor-authority.json");
         match fault {
             "missing_marker" => {
@@ -322,10 +335,19 @@ async fn ordinary_root_and_child_without_scoped_carrier_do_not_require_runtime_o
             &session.id,
             "ordinary input without any scoped carrier",
         );
-        inbox.deliver(&envelope).await.unwrap();
+        let receipt = inbox.deliver(&envelope).await.unwrap();
         assert!(!directory.join("actor-authority.json").exists());
-        let claims = inbox.claim(&session.id, 1).await.unwrap();
-        assert_eq!(claims.len(), 1);
-        assert_eq!(claims[0].envelope, envelope);
+        let backlog = inbox.inspect(&session.id).await.unwrap();
+        assert_eq!((backlog.pending, backlog.claimed), (1, 0));
+        let queue = queued_files(&directory);
+        assert_eq!(queue.len(), 1);
+        let wrapper: serde_json::Value = serde_json::from_slice(&queue[0].1).unwrap();
+        let queued: SessionMessageEnvelope =
+            serde_json::from_value(wrapper["body"].clone()).unwrap();
+        assert_eq!(receipt.id, envelope.id);
+        assert_eq!(queued, envelope);
+        // Plain deliver stages work; it grants neither an activation prefix
+        // nor an immediate intent. Keep that gate instead of minting a wake.
+        assert!(inbox.claim(&session.id, 1).await.unwrap().is_empty());
     }
 }
