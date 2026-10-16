@@ -306,17 +306,28 @@ impl AgentStepPort for WorkflowAgentAdapter {
             .get()
             .ok_or("workflow Child adapter not bound")?
             .clone();
-        let parent = child
-            .storage
-            .load_session(session_id)
-            .await
-            .map_err(|_| "workflow Agent parent unavailable")?
-            .ok_or("workflow Agent parent missing")?;
-        let workspace = bamboo_agent_core::workspace_state::ensure_session_workspace(
-            session_id,
-            parent.workspace.as_ref().map(std::path::PathBuf::from),
-        )
-        .ok_or("workflow Agent session workspace unavailable")?;
+        let (parent, workspace) = {
+            let _guard = child.persistence.acquire_lock(session_id).await;
+            let parent = child
+                .storage
+                .load_session(session_id)
+                .await
+                .map_err(|_| "workflow Agent parent unavailable")?
+                .ok_or("workflow Agent parent missing")?;
+            let projects = child
+                .project_store
+                .as_deref()
+                .ok_or("workflow Agent Project authority unavailable")?;
+            let resolved = super::project_scope::resolve_durable_workflow_scope(
+                &parent,
+                projects,
+                &child.workspace_resolver,
+            )
+            .map_err(|_| "workflow Agent session workspace invalid")?;
+            // Child construction must never replace the parent's runtime path
+            // from Session.workspace or a stale registry entry.
+            (parent, resolved.execution_workspace)
+        };
         let child_id = uuid::Uuid::new_v4().to_string();
         let mut metadata = child.resolve_runtime_metadata(&spec.name).await;
         metadata.insert(WORKFLOW_USAGE_REQUESTED_KEY.to_string(), "true".into());
@@ -617,6 +628,150 @@ mod tests {
         assert_eq!(selected.profile.unwrap(), pinned);
         // Actual Child creation requires the native worker capability handshake
         // and is covered by the production serve/subagent-worker fixture.
+    }
+
+    #[tokio::test]
+    async fn workflow_agent_uses_durable_workspace_without_republishing_parent() {
+        let (_temp, state, mut parent) = fixture().await;
+        parent.id = format!("workflow-agent-durable-{}", uuid::Uuid::new_v4());
+        let old_workspace = std::path::PathBuf::from(parent.workspace.as_ref().unwrap());
+        let current_workspace = state.app_data_dir.join("current-workspace");
+        std::fs::create_dir(&current_workspace).unwrap();
+        let current_workspace = current_workspace.canonicalize().unwrap();
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Workflow workspace authority",
+                None,
+                current_workspace.to_string_lossy(),
+                vec![bamboo_domain::WorkspaceBinding {
+                    path: old_workspace.to_string_lossy().into_owned(),
+                    label: None,
+                    git_common_dir: None,
+                }],
+            )
+            .unwrap();
+        parent.set_project_id_meta(project.id.to_string());
+        parent.set_workspace_path_meta(current_workspace.to_string_lossy());
+        // A real workspace PATCH updates canonical metadata but can leave the
+        // child-compatibility field pointing at the previous workspace.
+        state.storage.save_session(&parent).await.unwrap();
+        state.workspace_resolver.publish_resolved_workspace(
+            &parent.id,
+            old_workspace.clone(),
+            "test_stale_same_project_registry",
+        );
+        let resolved = super::super::project_scope::resolve_durable_workflow_scope(
+            &parent,
+            &state.project_store,
+            &state.workspace_resolver,
+        )
+        .unwrap();
+        assert_eq!(resolved.execution_workspace, current_workspace);
+        assert_eq!(resolved.catalog_workspace, Some(current_workspace.clone()));
+        assert_eq!(
+            bamboo_agent_core::workspace_state::peek_workspace(&parent.id),
+            Some(old_workspace),
+            "resolving durable scope does not read or replace the runtime registry"
+        );
+
+        state.workspace_resolver.publish_resolved_workspace(
+            &parent.id,
+            current_workspace.clone(),
+            "test_validated_workflow_admission",
+        );
+        let adapter = &state.workflow_runs.agents;
+        let selected = adapter
+            .resolve("reviewer", &parent.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let run_id = format!("cancelled-workflow-{}", uuid::Uuid::new_v4());
+        assert!(adapter
+            .execute(
+                &selected,
+                json!("Read"),
+                None,
+                None,
+                &BTreeSet::from(["read".to_string()]),
+                &parent.id,
+                &run_id,
+                cancellation,
+            )
+            .await
+            .unwrap_err()
+            .contains("cancelled"));
+        let (_, drain_error) = adapter.drain_cancelled(&run_id).await;
+        assert!(drain_error.is_none());
+        assert!(adapter.attempts.is_empty());
+        assert!(adapter
+            .child
+            .get()
+            .unwrap()
+            .list_children(&parent.id)
+            .await
+            .is_empty());
+        assert_eq!(
+            bamboo_agent_core::workspace_state::peek_workspace(&parent.id),
+            Some(current_workspace),
+            "even a cancelled Agent must not republish the stale Session.workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_agent_rejects_durable_workspace_owned_by_another_project() {
+        let (_temp, state, mut parent) = fixture().await;
+        parent.id = format!("workflow-agent-conflict-{}", uuid::Uuid::new_v4());
+        let workspace = std::path::PathBuf::from(parent.workspace.as_ref().unwrap());
+        let project = state
+            .project_store
+            .create_with_project_path("Workflow owner", None, workspace.to_string_lossy(), vec![])
+            .unwrap();
+        parent.set_project_id_meta(project.id.to_string());
+        parent.set_workspace_path_meta(workspace.to_string_lossy());
+        state.storage.save_session(&parent).await.unwrap();
+        let adapter = &state.workflow_runs.agents;
+        let selected = adapter
+            .resolve("reviewer", &parent.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let foreign = state.app_data_dir.join("foreign-workspace");
+        std::fs::create_dir(&foreign).unwrap();
+        state
+            .project_store
+            .create_with_project_path("Foreign owner", None, foreign.to_string_lossy(), vec![])
+            .unwrap();
+        parent.set_workspace_path_meta(foreign.to_string_lossy());
+        state.storage.save_session(&parent).await.unwrap();
+        state.workspace_resolver.publish_resolved_workspace(
+            &parent.id,
+            workspace.clone(),
+            "test_previous_validated_workspace",
+        );
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(adapter
+            .execute(
+                &selected,
+                json!("Read"),
+                None,
+                None,
+                &BTreeSet::from(["read".to_string()]),
+                &parent.id,
+                "workflow-workspace-conflict",
+                cancellation,
+            )
+            .await
+            .unwrap_err()
+            .contains("workspace invalid"));
+        assert!(adapter.attempts.is_empty());
+        assert_eq!(
+            bamboo_agent_core::workspace_state::peek_workspace(&parent.id),
+            Some(workspace)
+        );
     }
 
     #[tokio::test]

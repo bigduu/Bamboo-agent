@@ -99,9 +99,12 @@ pub async fn list_workflow_catalog(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
+        let _session_guard = app_state.persistence.acquire_lock(session_id).await;
         let session = app_state
+            .persistence
+            .storage()
             .load_session(session_id)
-            .await
+            .await?
             .ok_or_else(|| AppError::NotFound(format!("Session '{session_id}'")))?;
         let project_id =
             match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
@@ -125,23 +128,45 @@ pub async fn list_workflow_catalog(
             .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
             .map(String::as_str)
             != Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str()))
-        .then(|| session.workspace_path_meta())
+        .then(|| {
+            session.workspace_path_meta().or_else(|| {
+                project_id
+                    .is_none()
+                    .then(|| session.workspace.clone())
+                    .flatten()
+            })
+        })
         .flatten();
-        let workspace = crate::project_context::validate_workspace_assignment_with_resolver(
-            &app_state.project_store,
-            project_id.as_ref(),
-            persisted_workspace.as_deref(),
-            &app_state.workspace_resolver,
-        )
-        .map_err(|error| match error {
-            crate::project_context::ProjectWorkspaceValidationError::Invalid { .. }
-            | crate::project_context::ProjectWorkspaceValidationError::Conflict { .. } => {
-                AppError::BadRequest(error.to_string())
-            }
-            crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
-                AppError::InternalError(anyhow::anyhow!(error))
-            }
-        })?;
+        let project = project_id
+            .as_ref()
+            .map(|id| app_state.project_store.get(id))
+            .transpose()
+            .map_err(|error| {
+                AppError::BadRequest(format!("Assigned Project is unavailable: {error}"))
+            })?;
+        let workspace = if persisted_workspace.is_none()
+            && project
+                .as_ref()
+                .is_some_and(|project| project.project_path.is_none())
+        {
+            None
+        } else {
+            crate::project_context::validate_workspace_assignment_with_resolver(
+                &app_state.project_store,
+                project_id.as_ref(),
+                persisted_workspace.as_deref(),
+                &app_state.workspace_resolver,
+            )
+            .map_err(|error| match error {
+                crate::project_context::ProjectWorkspaceValidationError::Invalid { .. }
+                | crate::project_context::ProjectWorkspaceValidationError::Conflict { .. } => {
+                    AppError::BadRequest(error.to_string())
+                }
+                crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
+                    AppError::InternalError(anyhow::anyhow!(error))
+                }
+            })?
+        };
         if let Some(project_id) = project_id {
             app_state.project_store.get(&project_id).map_err(|error| {
                 AppError::BadRequest(format!("Assigned Project is unavailable: {error}"))
@@ -185,11 +210,11 @@ pub async fn list_workflow_catalog(
         .json(snapshot))
 }
 
-struct CloneTargetScope {
-    trusted_root: PathBuf,
-    store: Arc<SkillStore>,
-    published_source: WorkflowSource,
-    session_guard: Option<bamboo_storage::session_merge::SessionLockGuard>,
+pub(super) struct CloneTargetScope {
+    pub(super) trusted_root: PathBuf,
+    pub(super) store: Arc<SkillStore>,
+    pub(super) published_source: WorkflowSource,
+    pub(super) session_guard: Option<bamboo_storage::session_merge::SessionLockGuard>,
 }
 
 fn fixed_clone_error(status: StatusCode, message: &'static str) -> HttpResponse {
@@ -224,7 +249,7 @@ fn session_project_scope_error(
     }
 }
 
-async fn clone_target_scope(
+pub(super) async fn clone_target_scope(
     app_state: &AppState,
     target: CloneWorkflowTarget,
     session_id: Option<&str>,
@@ -344,7 +369,7 @@ async fn clone_target_scope(
     }
 }
 
-async fn combined_catalog_snapshot(store: &SkillStore) -> WorkflowCatalogSnapshot {
+pub(super) async fn combined_catalog_snapshot(store: &SkillStore) -> WorkflowCatalogSnapshot {
     let (skill_catalog, workflow_catalog) = store.command_catalog_snapshots().await;
     let mut entries = skill_catalog.entries;
     entries.extend(workflow_catalog.entries);
@@ -354,7 +379,7 @@ async fn combined_catalog_snapshot(store: &SkillStore) -> WorkflowCatalogSnapsho
     }
 }
 
-fn unique_winner<'a>(
+pub(super) fn unique_winner<'a>(
     catalog: &'a WorkflowCatalogSnapshot,
     workflow_id: &str,
 ) -> Result<Option<&'a WorkflowCatalogEntry>, ()> {

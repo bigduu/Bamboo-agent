@@ -16,8 +16,8 @@ use cap_std::fs::{Dir as CapDir, File as CapFile, OpenOptions as CapOpenOptions}
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
-const CLONE_TRANSACTION_DIRECTORY: &str = ".workflow-clone-txn";
-const CLONE_TRANSACTION_LOCK: &str = ".publication.lock";
+pub(super) const CLONE_TRANSACTION_DIRECTORY: &str = ".workflow-clone-txn";
+pub(super) const CLONE_TRANSACTION_LOCK: &str = ".publication.lock";
 const CLONE_ROLLOVER_RESET: &str = "reset.json";
 const CLONE_ROLLOVER_RETIRED: &str = "retired.json";
 
@@ -39,9 +39,9 @@ pub(super) struct ClonePublicationReceipt {
     pub target_identity: CloneNodeIdentity,
 }
 
-struct ClonePublicationRoot {
-    trusted_root: CapDir,
-    skills_dir: CapDir,
+pub(super) struct ClonePublicationRoot {
+    pub(super) trusted_root: CapDir,
+    pub(super) skills_dir: CapDir,
 }
 
 struct OpenCloneMarker {
@@ -89,7 +89,7 @@ fn injected_failure() -> ClonePublicationError {
 }
 
 #[cfg(unix)]
-fn cap_node_identity(metadata: &cap_std::fs::Metadata) -> CloneNodeIdentity {
+pub(super) fn cap_node_identity(metadata: &cap_std::fs::Metadata) -> CloneNodeIdentity {
     use cap_std::fs::MetadataExt;
 
     CloneNodeIdentity {
@@ -99,7 +99,7 @@ fn cap_node_identity(metadata: &cap_std::fs::Metadata) -> CloneNodeIdentity {
 }
 
 #[cfg(windows)]
-fn cap_node_identity(metadata: &cap_std::fs::Metadata) -> CloneNodeIdentity {
+pub(super) fn cap_node_identity(metadata: &cap_std::fs::Metadata) -> CloneNodeIdentity {
     use cap_fs_ext::MetadataExt;
 
     CloneNodeIdentity {
@@ -109,7 +109,7 @@ fn cap_node_identity(metadata: &cap_std::fs::Metadata) -> CloneNodeIdentity {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn cap_node_identity(_metadata: &cap_std::fs::Metadata) -> CloneNodeIdentity {
+pub(super) fn cap_node_identity(_metadata: &cap_std::fs::Metadata) -> CloneNodeIdentity {
     CloneNodeIdentity {
         device: 0,
         inode: 0,
@@ -121,21 +121,21 @@ fn cap_entries_match(left: &cap_std::fs::Metadata, right: &cap_std::fs::Metadata
 }
 
 #[cfg(unix)]
-fn cap_regular_file_has_single_link(metadata: &cap_std::fs::Metadata) -> bool {
+pub(super) fn cap_regular_file_has_single_link(metadata: &cap_std::fs::Metadata) -> bool {
     use cap_std::fs::MetadataExt;
 
     metadata.nlink() == 1
 }
 
 #[cfg(windows)]
-fn cap_regular_file_has_single_link(metadata: &cap_std::fs::Metadata) -> bool {
+pub(super) fn cap_regular_file_has_single_link(metadata: &cap_std::fs::Metadata) -> bool {
     use cap_fs_ext::MetadataExt;
 
     metadata.nlink() == 1
 }
 
 #[cfg(not(any(unix, windows)))]
-fn cap_regular_file_has_single_link(_metadata: &cap_std::fs::Metadata) -> bool {
+pub(super) fn cap_regular_file_has_single_link(_metadata: &cap_std::fs::Metadata) -> bool {
     false
 }
 
@@ -165,7 +165,7 @@ fn set_cap_directory_mode(directory: &CapDir, mode: u32) -> Result<(), ClonePubl
     Ok(())
 }
 
-fn sync_cap_directory(directory: &CapDir) -> Result<(), ClonePublicationError> {
+pub(super) fn sync_cap_directory(directory: &CapDir) -> Result<(), ClonePublicationError> {
     #[cfg(unix)]
     open_io_cap_directory(directory)?.sync_all()?;
     #[cfg(not(unix))]
@@ -198,7 +198,10 @@ fn open_expected_real_child_dir(
     Ok(child)
 }
 
-fn open_real_child_dir(parent: &CapDir, name: &Path) -> Result<CapDir, ClonePublicationError> {
+pub(super) fn open_real_child_dir(
+    parent: &CapDir,
+    name: &Path,
+) -> Result<CapDir, ClonePublicationError> {
     let expected = parent.symlink_metadata(name)?;
     open_expected_real_child_dir(parent, name, &expected)
 }
@@ -230,7 +233,7 @@ fn ensure_real_child_dir(parent: &CapDir, name: &Path) -> Result<CapDir, ClonePu
     open_expected_real_child_dir(parent, name, &expected)
 }
 
-fn ensure_open_child_is_still_named(
+pub(super) fn ensure_open_child_is_still_named(
     parent: &CapDir,
     name: &Path,
     child: &CapDir,
@@ -245,7 +248,7 @@ fn ensure_open_child_is_still_named(
     Ok(())
 }
 
-fn ensure_cap_file_is_still_named(
+pub(super) fn ensure_cap_file_is_still_named(
     parent: &CapDir,
     name: &Path,
     opened: &cap_std::fs::Metadata,
@@ -260,7 +263,7 @@ fn ensure_cap_file_is_still_named(
 }
 
 #[cfg(windows)]
-fn open_windows_root_no_follow(root: &Path) -> std::io::Result<CapDir> {
+pub(super) fn open_windows_root_no_follow(root: &Path) -> std::io::Result<CapDir> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -283,7 +286,9 @@ fn open_windows_root_no_follow(root: &Path) -> std::io::Result<CapDir> {
     Ok(CapDir::from_std_file(file))
 }
 
-fn open_publication_root(root: &Path) -> Result<ClonePublicationRoot, ClonePublicationError> {
+pub(super) fn open_publication_root(
+    root: &Path,
+) -> Result<ClonePublicationRoot, ClonePublicationError> {
     let initial = std::fs::symlink_metadata(root)?;
     if initial.file_type().is_symlink() || !initial.is_dir() {
         return Err(ClonePublicationError::Conflict(
@@ -336,7 +341,9 @@ fn open_publication_root(root: &Path) -> Result<ClonePublicationRoot, ClonePubli
     })
 }
 
-fn open_transaction_parent(root: &ClonePublicationRoot) -> Result<CapDir, ClonePublicationError> {
+pub(super) fn open_transaction_parent(
+    root: &ClonePublicationRoot,
+) -> Result<CapDir, ClonePublicationError> {
     let transaction =
         ensure_real_child_dir(&root.trusted_root, Path::new(CLONE_TRANSACTION_DIRECTORY))?;
     #[cfg(unix)]
@@ -356,7 +363,7 @@ fn open_transaction_parent(root: &ClonePublicationRoot) -> Result<CapDir, CloneP
     Ok(transaction)
 }
 
-fn lock_clone_transactions(
+pub(super) fn lock_clone_transactions(
     transaction_parent: &CapDir,
 ) -> Result<std::fs::File, ClonePublicationError> {
     let name = Path::new(CLONE_TRANSACTION_LOCK);
@@ -1194,7 +1201,7 @@ fn rollover_terminal_marker(
     target_vendor = "apple",
     target_os = "redox"
 ))]
-fn rename_entry_noreplace(
+pub(super) fn rename_entry_noreplace(
     source_parent: &CapDir,
     source_name: &Path,
     destination_parent: &CapDir,
@@ -1226,7 +1233,7 @@ fn rename_entry_noreplace(
 }
 
 #[cfg(windows)]
-fn rename_entry_noreplace(
+pub(super) fn rename_entry_noreplace(
     source_parent: &CapDir,
     source_name: &Path,
     destination_parent: &CapDir,
@@ -1363,7 +1370,7 @@ fn rename_entry_noreplace(
     target_vendor = "apple",
     target_os = "redox"
 )))]
-fn rename_entry_noreplace(
+pub(super) fn rename_entry_noreplace(
     _source_parent: &CapDir,
     _source_name: &Path,
     _destination_parent: &CapDir,

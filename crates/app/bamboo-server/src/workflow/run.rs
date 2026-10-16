@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{
@@ -32,6 +32,8 @@ const MAX_WALL_TIME_MS: u64 = 60 * 60 * 1000;
 const MAX_TOKENS: u64 = 2_000_000;
 #[path = "agent_adapter.rs"]
 mod agent_adapter;
+#[path = "project_scope.rs"]
+mod project_scope;
 use agent_adapter::{WorkflowAgentAdapter, READ_ONLY_AGENTS};
 const MAX_PINNED_DEFINITIONS_PER_RUN: usize = 32;
 const MAX_PINNED_BUNDLE_BYTES_PER_RUN: usize = 512 * 1024;
@@ -60,6 +62,25 @@ pub struct WorkflowRunAccess {
     skills: Arc<SkillManager>,
     sessions: bamboo_engine::SessionRepository,
     agents: Arc<WorkflowAgentAdapter>,
+    project_scope: Option<project_scope::WorkflowProjectScope>,
+    scope_admissions: Arc<Mutex<BTreeMap<String, usize>>>,
+}
+
+struct WorkflowScopeAdmission {
+    admissions: Arc<Mutex<BTreeMap<String, usize>>>,
+    session_id: String,
+}
+
+impl Drop for WorkflowScopeAdmission {
+    fn drop(&mut self) {
+        let mut admissions = self.admissions.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = admissions.get_mut(&self.session_id) {
+            *count -= 1;
+            if *count == 0 {
+                admissions.remove(&self.session_id);
+            }
+        }
+    }
 }
 
 struct ServerWorkflowSessionPermissions {
@@ -149,7 +170,50 @@ impl WorkflowRunAccess {
             skills,
             sessions,
             agents,
+            project_scope: None,
+            scope_admissions: Arc::default(),
         })
+    }
+
+    /// Called under the Session persistence lock by Project/Workspace PATCH.
+    pub(crate) fn scope_change_is_blocked(&self, session_id: &str) -> bool {
+        self.scope_admissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(session_id)
+            || self.engine.is_session_active(session_id)
+    }
+
+    async fn with_scope_admission<F, Fut>(
+        &self,
+        session_id: &str,
+        operation: F,
+    ) -> Result<WorkflowRunSnapshot, WorkflowRunError>
+    where
+        F: FnOnce(Self) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<WorkflowRunSnapshot, WorkflowRunError>>
+            + Send
+            + 'static,
+    {
+        *self
+            .scope_admissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(session_id.to_string())
+            .or_default() += 1;
+        let admission = WorkflowScopeAdmission {
+            admissions: self.scope_admissions.clone(),
+            session_id: session_id.to_string(),
+        };
+        let access = self.clone();
+        // The engine may have spawned a worker before its durable-start reply.
+        // HTTP cancellation must not drop the scope fence during that window.
+        tokio::spawn(async move {
+            let _admission = admission;
+            operation(access).await
+        })
+        .await
+        .map_err(|_| WorkflowRunError::Storage("workflow admission task failed".into()))?
     }
 
     pub(crate) fn bind_child_adapter(
@@ -260,15 +324,36 @@ impl WorkflowRunAccess {
         budget: Option<WorkflowBudgets>,
         invoker: WorkflowInvoker,
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
+        let owned_session = session_id.to_string();
+        let workflow_id = workflow_id.to_string();
+        self.with_scope_admission(session_id, move |access| async move {
+            access
+                .start_admitted(
+                    &owned_session,
+                    &workflow_id,
+                    revision,
+                    args,
+                    budget,
+                    invoker,
+                )
+                .await
+        })
+        .await
+    }
+
+    async fn start_admitted(
+        &self,
+        session_id: &str,
+        workflow_id: &str,
+        revision: u64,
+        args: Value,
+        budget: Option<WorkflowBudgets>,
+        invoker: WorkflowInvoker,
+    ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
         self.ensure_run_index_capacity(session_id).await?;
-        let (workspace, workspace_trusted) = self.session_context(session_id).await?;
-        let store = self
-            .skills
-            .store_for_workspace(workspace.as_deref())
-            .await
-            .map_err(|_| {
-                WorkflowRunError::Preflight("workflow catalog is unavailable".to_string())
-            })?;
+        let context = self.definition_start_context(session_id).await?;
+        let store = context.store;
+        let workspace_trusted = context.workspace_trusted;
         let catalog = store.workflow_catalog_snapshot().await;
         let entry = catalog
             .entries
@@ -290,28 +375,13 @@ impl WorkflowRunAccess {
             ));
         }
         let automatic = invoker != WorkflowInvoker::Explicit;
-        if automatic {
-            let session = self
-                .sessions
-                .try_load(session_id)
-                .await
-                .map_err(|_| {
-                    WorkflowRunError::Preflight("session state is unavailable".to_string())
-                })?
-                .ok_or(WorkflowRunError::NotFound)?;
-            let opted_in = session
-                .metadata
-                .get(bamboo_skills::WORKFLOW_ORCHESTRATION_OPT_IN_METADATA_KEY)
-                .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-            if !opted_in {
-                return Err(WorkflowRunError::Preflight(
-                    "model-started orchestration requires explicit session opt-in".to_string(),
-                ));
-            }
+        if automatic && !context.automatic_opted_in {
+            return Err(WorkflowRunError::Preflight(
+                "model-started orchestration requires explicit session opt-in".to_string(),
+            ));
         }
-        let mut bundle = self
-            .skills
-            .pin_workflow_definition_bundle(workspace.as_deref(), workflow_id, revision)
+        let mut bundle = store
+            .pin_workflow_definition_bundle(workflow_id, revision)
             .await
             .map_err(|_| WorkflowRunError::Preflight("workflow catalog pin failed".to_string()))?;
         let policy = if automatic { "automatic" } else { "explicit" };
@@ -504,7 +574,7 @@ impl WorkflowRunAccess {
         &self,
         session_id: &str,
     ) -> Result<Vec<WorkflowRunSnapshot>, WorkflowRunError> {
-        self.session_context(session_id).await?;
+        // Listing must not publish a cache-derived execution workspace.
         let session = self
             .sessions
             .try_load(session_id)
@@ -585,15 +655,57 @@ impl WorkflowRunAccess {
         session_id: &str,
         run_id: &str,
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
+        self.restart_for_invoker(session_id, run_id, false).await
+    }
+
+    async fn restart_for_invoker(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        automatic: bool,
+    ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
+        let owned_session = session_id.to_string();
+        let run_id = run_id.to_string();
+        self.with_scope_admission(session_id, move |access| async move {
+            access
+                .restart_admitted(&owned_session, &run_id, automatic)
+                .await
+        })
+        .await
+    }
+
+    async fn restart_admitted(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        automatic: bool,
+    ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
         let progress = self
             .progress_for_session(session_id, run_id, u64::MAX)
             .await?;
         ensure_workflow_restart_as_new_run_allowed(&progress.snapshot)?;
         self.ensure_run_index_capacity(session_id).await?;
-        let (_, workspace_trusted) = self.session_context(session_id).await?;
+        let context = self.definition_start_context(session_id).await?;
+        if automatic {
+            if progress.snapshot.definition_bundle.root_invocation_policy["automatic"].as_bool()
+                != Some(true)
+            {
+                return Err(WorkflowRunError::Preflight(
+                    "pinned workflow invocation policy denies automatic restart".to_string(),
+                ));
+            }
+            if !context.automatic_opted_in {
+                return Err(WorkflowRunError::Preflight(
+                    "model-started orchestration restart requires explicit session opt-in"
+                        .to_string(),
+                ));
+            }
+        }
+        // Recovery retains its persisted bundle; this resolves only execution
+        // scope and current Session authority, never a new definition revision.
         let snapshot = self
             .engine
-            .restart(run_id, workspace_trusted, vec!["read".to_string()])
+            .restart(run_id, context.workspace_trusted, vec!["read".to_string()])
             .await?;
         self.index_started_run_or_compensate(session_id, snapshot)
             .await
@@ -604,13 +716,31 @@ impl WorkflowRunAccess {
         session_id: &str,
         run_id: &str,
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
+        let owned_session = session_id.to_string();
+        let run_id = run_id.to_string();
+        self.with_scope_admission(session_id, move |access| async move {
+            access.continue_admitted(&owned_session, &run_id).await
+        })
+        .await
+    }
+
+    async fn continue_admitted(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
         let progress = self
             .progress_for_session(session_id, run_id, u64::MAX)
             .await?;
         ensure_completed_prefix_allowed(&progress.snapshot)?;
-        let (_, workspace_trusted) = self.session_context(session_id).await?;
+        let context = self.definition_start_context(session_id).await?;
         self.engine
-            .continue_completed_prefix(run_id, session_id, workspace_trusted, vec!["read".into()])
+            .continue_completed_prefix(
+                run_id,
+                session_id,
+                context.workspace_trusted,
+                vec!["read".into()],
+            )
             .await
     }
 
@@ -619,32 +749,7 @@ impl WorkflowRunAccess {
         session_id: &str,
         run_id: &str,
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
-        let progress = self
-            .progress_for_session(session_id, run_id, u64::MAX)
-            .await?;
-        if progress.snapshot.definition_bundle.root_invocation_policy["automatic"].as_bool()
-            != Some(true)
-        {
-            return Err(WorkflowRunError::Preflight(
-                "pinned workflow invocation policy denies automatic restart".to_string(),
-            ));
-        }
-        let session = self
-            .sessions
-            .try_load(session_id)
-            .await
-            .map_err(|_| WorkflowRunError::Preflight("session state is unavailable".to_string()))?
-            .ok_or(WorkflowRunError::NotFound)?;
-        let opted_in = session
-            .metadata
-            .get(bamboo_skills::WORKFLOW_ORCHESTRATION_OPT_IN_METADATA_KEY)
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-        if !opted_in {
-            return Err(WorkflowRunError::Preflight(
-                "model-started orchestration restart requires explicit session opt-in".to_string(),
-            ));
-        }
-        self.restart_for_session(session_id, run_id).await
+        self.restart_for_invoker(session_id, run_id, true).await
     }
 }
 
@@ -1600,6 +1705,202 @@ mod tests {
         tempfile::TempDir,
     ) {
         workflow_test_access_with_tools(Arc::new(WorkflowReadTool)).await
+    }
+
+    #[tokio::test]
+    async fn workflow_scope_admission_survives_cancelled_request_and_releases_on_failure() {
+        let (access, _, _directory) = workflow_test_access().await;
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let worker_access = access.clone();
+        let worker_entered = entered.clone();
+        let worker_release = release.clone();
+        let request = tokio::spawn(async move {
+            worker_access
+                .with_scope_admission("scope-admission", move |_| async move {
+                    worker_entered.add_permits(1);
+                    let _permit = worker_release.acquire().await.unwrap();
+                    Err(WorkflowRunError::Preflight(
+                        "test rejected admission".into(),
+                    ))
+                })
+                .await
+        });
+        let _entered = entered.acquire().await.unwrap();
+        assert!(access.scope_change_is_blocked("scope-admission"));
+        assert!(!access.scope_change_is_blocked("unrelated-session"));
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(access.scope_change_is_blocked("scope-admission"));
+        release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while access.scope_change_is_blocked("scope-admission") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed admission releases the fence");
+    }
+
+    #[actix_web::test]
+    async fn workflow_active_run_rejects_project_and_workspace_patch_until_drained() {
+        use actix_web::{http::header, test, web, App};
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let bundle = directory.path().join("skills/scope-fence");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(
+            bundle.join("SKILL.md"),
+            "---\nname: scope-fence\ndescription: Scope fence fixture\n---\nRead only.\n",
+        )
+        .unwrap();
+        std::fs::write(bundle.join("workflow.yaml"), "workflow_schema: 1\nid: scope-fence\nrevision: 1\nsteps:\n  - id: inspect\n    type: tool\n    tool: Read\n    args: {}\n    capabilities: [read]\nplan: {type: step, step: inspect}\n").unwrap();
+        let mut state = crate::app_state::AppState::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let project_a = state
+            .project_store
+            .create_with_project_path(
+                "Scope A",
+                None,
+                workspace_a.path().to_string_lossy(),
+                vec![],
+            )
+            .unwrap();
+        let project_b = state
+            .project_store
+            .create_with_project_path(
+                "Scope B",
+                None,
+                workspace_b.path().to_string_lossy(),
+                vec![],
+            )
+            .unwrap();
+        let mut session = Session::new("workflow-scope-fence", "test-model");
+        session.set_project_id_meta(project_a.id.to_string());
+        session.set_workspace_path_meta(workspace_a.path().to_string_lossy());
+        state.storage.save_session(&session).await.unwrap();
+        let entered = Arc::new(Semaphore::new(0));
+        state.workflow_runs = WorkflowRunAccess::new(
+            directory.path(),
+            Arc::new(BlockingWorkflowReadTool {
+                entered: entered.clone(),
+            }),
+            state.skill_manager.clone(),
+            state.session_repo.clone(),
+        )
+        .await
+        .unwrap()
+        .with_project_scope(
+            state.project_store.clone(),
+            state.workspace_resolver.clone(),
+        );
+        let state = web::Data::new(state);
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let started = state
+            .workflow_runs
+            .start(&session.id, "scope-fence", 1, json!({}), None)
+            .await
+            .unwrap();
+        let _entered = tokio::time::timeout(std::time::Duration::from_secs(5), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.workflow_runs.scope_change_is_blocked(&session.id));
+        let before = state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        for body in [
+            json!({"project_id":project_b.id, "workspace_path":workspace_b.path()}),
+            json!({"workspace_path":workspace_b.path()}),
+        ] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/sessions/{}", session.id))
+                    .insert_header((header::IF_MATCH, format!("\"{}\"", before.metadata_version)))
+                    .set_json(body)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["error"]["code"], "session_project_running_conflict");
+        }
+        let unchanged = state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.project_id_meta(), before.project_id_meta());
+        assert_eq!(
+            unchanged.workspace_path_meta(),
+            before.workspace_path_meta()
+        );
+        assert_eq!(unchanged.metadata_version, before.metadata_version);
+        assert_eq!(
+            bamboo_agent_core::workspace_state::peek_workspace(&session.id),
+            Some(workspace_a.path().canonicalize().unwrap())
+        );
+        state
+            .workflow_runs
+            .cancel_for_session(&session.id, &started.run_id)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.workflow_runs.scope_change_is_blocked(&session.id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scope remains fenced until worker cleanup finishes");
+        let current = state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{}", session.id))
+                .insert_header((
+                    header::IF_MATCH,
+                    format!("\"{}\"", current.metadata_version),
+                ))
+                .set_json(json!({"project_id":project_b.id, "workspace_path":workspace_b.path()}))
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        let body = test::read_body(response).await;
+        assert_eq!(
+            status,
+            actix_web::http::StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let changed = state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            changed.project_id_meta().as_deref(),
+            Some(project_b.id.as_str())
+        );
     }
 
     async fn seed_durable_workflow_run(
