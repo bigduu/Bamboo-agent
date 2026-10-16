@@ -236,11 +236,6 @@ pub(crate) fn sys_keepalive_envelope() -> ServerEnvelope {
     ServerEnvelope::control("sys", 0, serde_json::json!({ "type": "keepalive" }))
 }
 
-/// A client→server frame, tagged by `type`.
-///
-/// Unknown / malformed frames deserialize to [`ClientFrame::Unknown`] (via the
-/// serde `other` fallback for the tag, or a parse error the driver catches) so a
-/// bad frame logs-and-continues instead of tearing down the connection.
 /// Opt-in observation continuity; never an execution capability.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -249,6 +244,11 @@ pub(crate) struct ActorResumeRequest {
     pub epoch: Option<String>,
 }
 
+/// A client→server frame, tagged by `type`.
+///
+/// Unknown / malformed frames deserialize to [`ClientFrame::Unknown`] (via the
+/// serde `other` fallback for the tag, or a parse error the driver catches) so a
+/// bad frame logs-and-continues instead of tearing down the connection.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ClientFrame {
