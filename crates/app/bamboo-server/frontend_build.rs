@@ -298,7 +298,10 @@ pub fn validate_frontend_package(frontend_root: &Path) -> io::Result<ValidatedFr
                 "cannot inspect frontend archive entry {index}: {error}"
             ))
         })?;
-        let raw_name = file.name().to_owned();
+        let raw_name = file
+            .name()
+            .map_err(|error| invalid_data(format!("invalid frontend zip entry name: {error}")))?
+            .into_owned();
         let path_to_validate = raw_name.strip_suffix('/').unwrap_or(&raw_name);
         let normalized = validate_archive_path(path_to_validate)?;
         let kind = if file.is_dir() {
@@ -366,6 +369,11 @@ mod tests {
     use tempfile::TempDir;
     use zip::write::SimpleFileOptions;
 
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/zip_test_fixture.rs"
+    ));
+
     fn package_fixture(files: &[(&str, &[u8])]) -> TempDir {
         let temp = tempfile::tempdir().expect("tempdir");
         let package_root = temp.path();
@@ -414,6 +422,16 @@ mod tests {
         let package = validate_frontend_package(fixture.path()).expect("valid package");
         assert!(!package.manifest_bytes.is_empty());
         assert!(!package.zip_bytes.is_empty());
+    }
+
+    #[test]
+    fn rejects_undecodable_utf8_zip_names() {
+        let fixture = package_fixture(&[("index.html", b"<html>ok</html>")]);
+        let path = fixture.path().join("lotus-frontend.zip");
+        let bytes = zip_with_invalid_utf8_name(fs::read(&path).unwrap(), "index.html");
+        fs::write(path, bytes).unwrap();
+        let error = validate_frontend_package(fixture.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

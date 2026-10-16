@@ -2357,13 +2357,21 @@ async fn extract_artifact_archive(
                     let mut file = archive.by_index(index).map_err(|error| {
                         PluginError::InvalidManifest(format!("invalid artifact zip entry: {error}"))
                     })?;
+                    let entry_name = file
+                        .name()
+                        .map_err(|error| {
+                            PluginError::InvalidManifest(format!(
+                                "invalid artifact zip entry name: {error}"
+                            ))
+                        })?
+                        .into_owned();
                     let regular_type = file
                         .unix_mode()
                         .is_none_or(|mode| matches!(mode & 0o170000, 0 | 0o100000));
                     if !file.is_file() || !regular_type {
                         return Err(PluginError::InvalidManifest(format!(
                             "artifact entry '{}' must be a regular file",
-                            file.name()
+                            entry_name
                         )));
                     }
                     let path = file.enclosed_name().ok_or_else(|| {
@@ -2371,7 +2379,7 @@ async fn extract_artifact_archive(
                     })?;
                     // Check the original spelling too: enclosed_name may simplify
                     // components, while artifact paths must be root-only.
-                    let original_path = PathBuf::from(file.name());
+                    let original_path = PathBuf::from(&entry_name);
                     if original_path
                         .components()
                         .any(|part| matches!(part, std::path::Component::ParentDir))
@@ -2579,13 +2587,19 @@ fn extract_zip_sync(
         let mut file = archive.by_index(index).map_err(|error| {
             PluginError::InvalidManifest(format!("invalid zip entry at index {index}: {error}"))
         })?;
+        let entry_name = file
+            .name()
+            .map_err(|error| {
+                PluginError::InvalidManifest(format!("invalid zip entry name: {error}"))
+            })?
+            .into_owned();
         // `enclosed_name()` is the zip crate's own traversal guard: it
         // returns `None` for any entry whose name contains `..`, is
         // absolute, or otherwise can't be safely joined under `dest_dir`.
         let Some(relative_path) = file.enclosed_name() else {
             return Err(PluginError::InvalidManifest(format!(
                 "zip entry '{}' has an unsafe path (traversal/absolute) — refusing to unpack",
-                file.name()
+                entry_name
             )));
         };
         let out_path = dest_dir.join(&relative_path);
