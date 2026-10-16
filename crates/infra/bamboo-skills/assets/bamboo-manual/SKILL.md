@@ -32,6 +32,9 @@ were received.
    diagnosis from authorized, current evidence; state its observation time,
    scope and coverage. Do not dump raw config, logs, memory, credentials or
    private paths into a model request to obtain that evidence.
+   If available, use `bamboo_diagnostics` with no arguments for the current
+   session's allowlisted local observations. Read troubleshooting.md for its
+   coverage and unknown/stale-state limits. Never infer active probe success.
 5. Reading this manual does not authorize writes, restarts, reloads, migration,
    repair, rebuilding memory, connecting services, model calls, enabling hooks,
    or hook dry-runs. Ask separately where the user's permissions require it.

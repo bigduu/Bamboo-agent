@@ -47,6 +47,7 @@ pub(super) fn build_base_tools(
     tool_event_publisher: Arc<dyn ToolEventPublisher>,
     memory_store: bamboo_memory::memory_store::MemoryStore,
     session_messenger: Arc<bamboo_engine::SessionMessenger>,
+    diagnostics: Arc<crate::tools::diagnostics::DiagnosticsSource>,
 ) -> (
     Arc<dyn ToolExecutor>,
     Arc<dyn bamboo_engine::external_agents::runtime::NativeToolCeilingSource>,
@@ -203,6 +204,12 @@ pub(super) fn build_base_tools(
     let base: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_legacy_history,
         current_history_tool,
+    ));
+    let base: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
+        base,
+        Arc::new(crate::tools::diagnostics::BambooDiagnosticsTool::new(
+            diagnostics,
+        )),
     ));
     let ceiling = Arc::new(HostNativeToolCeiling {
         builtin: builtin_executor,
