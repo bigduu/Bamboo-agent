@@ -568,9 +568,17 @@ async fn spawn_verified_cli(
     process: &mut tokio::process::Command,
     budget: Duration,
 ) -> Result<(tokio::process::Child, Duration), &'static str> {
+    spawn_verified_cli_with(budget, || process.spawn()).await
+}
+
+#[cfg(target_os = "linux")]
+async fn spawn_verified_cli_with(
+    budget: Duration,
+    mut spawn: impl FnMut() -> io::Result<tokio::process::Child>,
+) -> Result<(tokio::process::Child, Duration), &'static str> {
     let started = tokio::time::Instant::now();
     let error = loop {
-        match process.spawn() {
+        match spawn() {
             Ok(child) => return Ok((child, budget.saturating_sub(started.elapsed()))),
             Err(error) => {
                 // ETXTBSY refuses exec before the CLI can run. Retry only this
