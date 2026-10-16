@@ -354,12 +354,21 @@ impl SteerInbox {
     /// Create a sender + inbox pair (the transport holds the sender).
     pub fn channel() -> (mpsc::UnboundedSender<SteerMessage>, Self) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (tx, SteerInbox { rx, accepted_initial_releases: Vec::new() })
+        (
+            tx,
+            SteerInbox {
+                rx,
+                accepted_initial_releases: Vec::new(),
+            },
+        )
     }
     /// An already-closed inbox (for tests / executors that don't steer).
     pub fn disconnected() -> Self {
         let (_tx, rx) = mpsc::unbounded_channel();
-        SteerInbox { rx, accepted_initial_releases: Vec::new() }
+        SteerInbox {
+            rx,
+            accepted_initial_releases: Vec::new(),
+        }
     }
     /// Next steering message, or `None` once the run's sender is gone.
     pub async fn recv(&mut self) -> Option<String> {
@@ -577,25 +586,57 @@ mod tests {
         assert!(futures_util::poll!(waiting.as_mut()).is_pending());
         tokio::time::advance(std::time::Duration::from_secs(5)).await;
         assert!(futures_util::poll!(waiting.as_mut()).is_pending());
-        assert_eq!(controls.try_recv().unwrap(), ExecutorControl::InitialInputReleaseRequest(first.clone()));
-        sender.send(SteerMessage::InitialInputRelease(first_release.clone())).unwrap();
+        assert_eq!(
+            controls.try_recv().unwrap(),
+            ExecutorControl::InitialInputReleaseRequest(first.clone())
+        );
+        sender
+            .send(SteerMessage::InitialInputRelease(first_release.clone()))
+            .unwrap();
         assert_eq!(waiting.await.unwrap(), first_release.expires_at);
         // The Host may answer both the original request and its retry. A
         // preceding reply must not abort or satisfy the next item's barrier.
-        sender.send(SteerMessage::InitialInputRelease(first_release.clone())).unwrap();
-        sender.send(SteerMessage::InitialInputRelease(second_release.clone())).unwrap();
-        assert_eq!(inbox.wait_initial_release(&second, &cancel, &events).await.unwrap(), second_release.expires_at);
+        sender
+            .send(SteerMessage::InitialInputRelease(first_release.clone()))
+            .unwrap();
+        sender
+            .send(SteerMessage::InitialInputRelease(second_release.clone()))
+            .unwrap();
+        assert_eq!(
+            inbox
+                .wait_initial_release(&second, &cancel, &events)
+                .await
+                .unwrap(),
+            second_release.expires_at
+        );
         // Duplicates after the final barrier also cannot kill the typed steer
         // consumer or flatten a release into user text.
-        sender.send(SteerMessage::InitialInputRelease(first_release)).unwrap();
-        sender.send(SteerMessage::InitialInputRelease(second_release)).unwrap();
-        sender.send(SteerMessage::Text("next ordinary steer".into())).unwrap();
-        assert_eq!(inbox.recv_message().await, Some(SteerMessage::Text("next ordinary steer".into())));
+        sender
+            .send(SteerMessage::InitialInputRelease(first_release))
+            .unwrap();
+        sender
+            .send(SteerMessage::InitialInputRelease(second_release))
+            .unwrap();
+        sender
+            .send(SteerMessage::Text("next ordinary steer".into()))
+            .unwrap();
+        assert_eq!(
+            inbox.recv_message().await,
+            Some(SteerMessage::Text("next ordinary steer".into()))
+        );
     }
 
     #[tokio::test]
     async fn initial_release_changed_prior_reply_cannot_be_filtered_or_release_next_input() {
-        for changed in ["nonce", "epoch", "birth", "envelope", "generation", "deadline", "expired"] {
+        for changed in [
+            "nonce",
+            "epoch",
+            "birth",
+            "envelope",
+            "generation",
+            "deadline",
+            "expired",
+        ] {
             let first = duplicate_release_request(0);
             let second = duplicate_release_request(1);
             let original = crate::proto::InitialInputRelease {
@@ -605,8 +646,13 @@ mod tests {
             let (events, _events, _controls) = EventSink::channel_with_control();
             let (sender, mut inbox) = SteerInbox::channel();
             let cancel = CancellationToken::new();
-            sender.send(SteerMessage::InitialInputRelease(original.clone())).unwrap();
-            inbox.wait_initial_release(&first, &cancel, &events).await.unwrap();
+            sender
+                .send(SteerMessage::InitialInputRelease(original.clone()))
+                .unwrap();
+            inbox
+                .wait_initial_release(&first, &cancel, &events)
+                .await
+                .unwrap();
             let mut altered = original;
             match changed {
                 "nonce" => altered.request.nonce = uuid::Uuid::new_v4().to_string(),
@@ -618,8 +664,13 @@ mod tests {
                 "expired" => altered.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1),
                 _ => unreachable!(),
             }
-            sender.send(SteerMessage::InitialInputRelease(altered)).unwrap();
-            let error = inbox.wait_initial_release(&second, &cancel, &events).await.unwrap_err();
+            sender
+                .send(SteerMessage::InitialInputRelease(altered))
+                .unwrap();
+            let error = inbox
+                .wait_initial_release(&second, &cancel, &events)
+                .await
+                .unwrap_err();
             assert!(error.contains("mismatched"), "{changed}: {error}");
         }
     }
