@@ -166,10 +166,7 @@ impl Fixture {
             .unwrap()
             .unwrap();
 
-        let inbox = Arc::new(FileSessionInbox::new(
-            concrete,
-            limits,
-        ));
+        let inbox = Arc::new(FileSessionInbox::new(concrete, limits));
         let router = SessionActivationRouter::new();
         router.set_inbox(inbox.clone());
         let spawner = Arc::new(NoLaunch::default());
