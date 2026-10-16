@@ -112,6 +112,14 @@ Each repository includes `path`, `common_dir` when available, `error`, and
 `error`, and observed `sessions` (`id`, `title`, `active`). Occupancy is an
 observation of Bamboo Sessions/Git locks, not a cross-application lease.
 Unavailable paths are reported rather than dropped or pruned.
+Path-bearing Git output is parsed as raw OS bytes. `path_encoding` is `utf-8`
+for actionable paths. An existing Unix checkout with non-UTF-8 bytes is retained
+as an escaped display label with `path_encoding: "escaped"`, unknown dirty state
+and an explicit diagnostic; consumers must disable opening that label. Its
+native Git lock/prunable facts remain unchanged, and other checkouts remain
+available. Raw filenames inside a Unicode checkout do not prevent dirty/clean
+inspection. Creation/preferences require Unicode paths because their authority
+is JSON; no raw-byte path is silently replaced or migrated.
 
 Offline volumes, unwritable paths, existing destinations/branches, traversal,
 creation locks and boundary violations return explicit errors. There is no

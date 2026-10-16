@@ -101,7 +101,7 @@ fn command(repo: &Path, args: &[&str]) -> Result<Output, String> {
         .map_err(|e| format!("Git at {}: {e}", repo.display()))
 }
 
-fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
+fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let output = command(repo, args)?;
     if !output.status.success() {
         let diagnostic = String::from_utf8_lossy(&output.stderr);
@@ -118,21 +118,54 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
             diagnostic.trim()
         ));
     }
-    String::from_utf8(output.stdout).map_err(|_| "Git returned a non-UTF-8 path".into())
+    Ok(output.stdout)
+}
+
+fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
+    String::from_utf8(git_bytes(repo, args)?).map_err(|_| "Git returned non-UTF-8 text".into())
+}
+
+fn git_path(repo: &Path, args: &[&str]) -> Result<PathBuf, String> {
+    let mut bytes = git_bytes(repo, args)?;
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    path_from_bytes(&bytes)
+}
+
+fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(bytes)
+            .map(PathBuf::from)
+            .map_err(|_| "Git returned a path that cannot be represented on this platform".into())
+    }
+}
+
+/// JSON paths are Unicode. Preserve a raw path internally and expose an explicit
+/// escaped label for unsupported bytes, never a lossy path that could be opened.
+pub fn path_label(path: &Path) -> String {
+    path.to_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{:?}", path.as_os_str()))
 }
 
 pub fn repository(repo: &Path) -> Result<PathBuf, String> {
-    let value = git(
+    let value = git_path(
         repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
-    fs::canonicalize(value.strip_suffix('\n').unwrap_or(&value))
-        .map_err(|e| format!("Repository metadata is unavailable: {e}"))
+    fs::canonicalize(value).map_err(|e| format!("Repository metadata is unavailable: {e}"))
 }
 
 pub fn workspace_root(path: &Path) -> Result<PathBuf, String> {
-    let value = git(path, &["rev-parse", "--show-toplevel"])?;
-    fs::canonicalize(value.strip_suffix('\n').unwrap_or(&value)).map_err(|e| e.to_string())
+    let value = git_path(path, &["rev-parse", "--show-toplevel"])?;
+    fs::canonicalize(value).map_err(|e| e.to_string())
 }
 
 pub fn root(path: &Path) -> Result<PathBuf, String> {
@@ -199,29 +232,29 @@ pub fn root(path: &Path) -> Result<PathBuf, String> {
 
 pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
     let common = repository(repo)?;
-    let listing = git(repo, &["worktree", "list", "--porcelain", "-z"])?;
+    let listing = git_bytes(repo, &["worktree", "list", "--porcelain", "-z"])?;
     let mut result = Vec::new();
     let mut entry: Option<Worktree> = None;
-    for field in listing.split('\0') {
-        if let Some(path) = field.strip_prefix("worktree ") {
+    for field in listing.split(|byte| *byte == 0) {
+        if let Some(path) = field.strip_prefix(b"worktree ") {
             if let Some(previous) = entry.take() {
                 result.push(previous);
             }
             entry = Some(Worktree {
-                path: path.into(),
+                path: path_from_bytes(path)?,
                 ..Default::default()
             });
         } else if let Some(current) = entry.as_mut() {
-            if let Some(head) = field.strip_prefix("HEAD ") {
-                current.head = head.into();
+            if let Some(head) = field.strip_prefix(b"HEAD ") {
+                current.head = String::from_utf8_lossy(head).into_owned();
             }
-            if let Some(branch) = field.strip_prefix("branch refs/heads/") {
-                current.branch = Some(branch.into());
+            if let Some(branch) = field.strip_prefix(b"branch refs/heads/") {
+                current.branch = Some(String::from_utf8_lossy(branch).into_owned());
             }
-            if field == "locked" || field.starts_with("locked ") {
+            if field == b"locked" || field.starts_with(b"locked ") {
                 current.locked = true;
             }
-            if field == "prunable" || field.starts_with("prunable ") {
+            if field == b"prunable" || field.starts_with(b"prunable ") {
                 current.prunable = true;
             }
         }
@@ -230,15 +263,21 @@ pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
         result.push(previous);
     }
     for entry in &mut result {
+        if entry.path.to_str().is_none() {
+            entry.error = Some("Worktree path contains non-UTF-8 bytes and is displayed as an escaped label. This UI cannot open it; use a Git client. No files were changed.".into());
+            continue;
+        }
         let inspect = || -> Result<(PathBuf, bool), String> {
             let canonical = fs::canonicalize(&entry.path)
                 .map_err(|e| format!("{} is unavailable: {e}", entry.path.display()))?;
             if repository(&canonical)? != common || workspace_root(&canonical)? != canonical {
                 return Err("Worktree path now belongs to a different repository".into());
             }
-            let index = git(&canonical, &["ls-files", "--stage", "-z"])?;
-            let has_submodules = index.split('\0').any(|entry| entry.starts_with("160000 "));
-            let status = git(
+            let index = git_bytes(&canonical, &["ls-files", "--stage", "-z"])?;
+            let has_submodules = index
+                .split(|byte| *byte == 0)
+                .any(|entry| entry.starts_with(b"160000 "));
+            let status = git_bytes(
                 &canonical,
                 &[
                     "status",

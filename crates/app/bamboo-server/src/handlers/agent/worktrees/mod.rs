@@ -145,13 +145,13 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
                                 || matches!(session.last_run_status.as_deref(), Some("running" | "pending"))
                                 || session.has_pending_question})).collect();
                         let occupied = entry.locked || related.iter().any(|s| s["active"] == true);
-                        json!({"path": entry.path, "branch": entry.branch, "head": entry.head,
+                        json!({"path": git::path_label(&entry.path), "path_encoding": if entry.path.to_str().is_some() { "utf-8" } else { "escaped" }, "branch": entry.branch, "head": entry.head,
                             "locked": entry.locked, "prunable": entry.prunable, "dirty": entry.dirty,
                             "error": entry.error, "occupied": occupied, "sessions": related})
                     }).collect();
-                    repositories.push(json!({"path": source, "common_dir": common, "worktrees": worktrees, "error": null}));
+                    repositories.push(json!({"path": source, "common_dir": git::path_label(&common), "worktrees": worktrees, "error": null}));
                 }
-                Err(error) => repositories.push(json!({"path": source, "common_dir": common, "worktrees": [], "error": error})),
+                Err(error) => repositories.push(json!({"path": source, "common_dir": git::path_label(&common), "worktrees": [], "error": error})),
             }
         }
         Ok(repositories)
