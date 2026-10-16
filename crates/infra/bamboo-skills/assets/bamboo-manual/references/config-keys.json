@@ -1,6 +1,6 @@
 {
   "coverage": "bounded_typed_catalog_not_full_schema",
-  "default_scope": "typed DTO defaults, not effective instance values; server.tls children apply only when TLS is configured",
+  "default_scope": "typed input defaults, not effective instance values; required TLS children have no documented default",
   "dynamic_maps": [
     "server.<unknown>",
     "tools.<unknown>",
@@ -314,19 +314,19 @@
     },
     {
       "aliases": [],
-      "default": "",
       "example": "example-cert.pem",
       "key": "server.tls.cert_file",
       "meaning": "PEM certificate-chain file path, applicable only when server.tls is present.",
+      "required_when": "server.tls is present",
       "section": "core",
       "type": "path"
     },
     {
       "aliases": [],
-      "default": "",
       "example": "example-key.pem",
       "key": "server.tls.key_file",
       "meaning": "PEM private-key file path, applicable only when server.tls is present; never include key contents.",
+      "required_when": "server.tls is present",
       "section": "core",
       "type": "path"
     },

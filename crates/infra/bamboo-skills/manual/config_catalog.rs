@@ -13,6 +13,7 @@ pub struct Entry {
     pub meaning: &'static str,
     pub aliases: &'static [&'static str],
     pub read: fn(&Config) -> Value,
+    pub required_when: Option<&'static str>,
 }
 
 fn memory(c: &Config) -> MemoryConfig {
@@ -22,7 +23,10 @@ fn server(c: &Config) -> ServerConfig {
     c.server.clone()
 }
 fn tls(c: &Config) -> TlsConfig {
-    c.server.tls.clone().unwrap_or_default()
+    c.server
+        .tls
+        .clone()
+        .expect("TLS children require a configured TLS object")
 }
 fn timeouts(c: &Config) -> StreamTimeoutConfig {
     c.stream_timeout
@@ -43,11 +47,14 @@ macro_rules! group {
     ($out:ident, $ty:ident, $root:literal, $getter:ident,
      [$($field:ident => ($kind:literal, $example:expr, $meaning:literal, [$($alias:literal),*])),* $(,)?],
      [$($excluded:ident),*]) => {{
-        let $ty { $($field: _,)* $($excluded: _,)* } = $getter(&Config::default());
+        let _coverage_check = |value: $ty| {
+            let $ty { $($field: _,)* $($excluded: _,)* } = value;
+        };
         $($out.push(Entry {
             key: concat!($root, ".", stringify!($field)), kind: $kind,
             example: json!($example), meaning: $meaning, aliases: &[$($alias),*],
             read: |c| json!($getter(c).$field),
+            required_when: if $root == "server.tls" { Some("server.tls is present") } else { None },
         });)*
     }};
 }
@@ -109,10 +116,10 @@ pub fn entries() -> Vec<Entry> {
     ], []);
     entries.push(Entry { key: "lifecycle_hooks.enabled", kind: "bool", example: json!(true),
         meaning: "Native lifecycle-hook switch; handler configuration and authorization remain separate.",
-        aliases: &[], read: |c| json!(c.lifecycle_hooks.enabled) });
+        aliases: &[], read: |c| json!(c.lifecycle_hooks.enabled), required_when: None });
     entries.push(Entry { key: "context_management.strategy", kind: "enum", example: json!("retrieval_window"),
         meaning: "Context strategy; retrieval-window validation and history-tool requirements still apply.",
-        aliases: &[], read: |c| json!(c.context_management.strategy) });
+        aliases: &[], read: |c| json!(c.context_management.strategy), required_when: None });
     entries.sort_by_key(|entry| entry.key);
     entries
 }
@@ -146,7 +153,7 @@ pub fn catalog() -> Value {
         "format_version": 2,
         "coverage": "bounded_typed_catalog_not_full_schema",
         "representation": "Config compatibility view; not section-file envelopes",
-        "default_scope": "typed DTO defaults, not effective instance values; server.tls children apply only when TLS is configured",
+        "default_scope": "typed input defaults, not effective instance values; required TLS children have no documented default",
         "unknown_key_meaning": "not covered here; absence does not mean unsupported",
         "generator": "manual/config_catalog.rs; cargo run -p bamboo-skills --example generate_manual_catalog -- --check",
         "source": "crates/infra/bamboo-config/src/config.rs",
@@ -156,8 +163,13 @@ pub fn catalog() -> Value {
         "dynamic_maps": ["server.<unknown>", "tools.<unknown>", "skills.<unknown>", "worktrees.project_roots.<project>"],
         "entries": entries.iter().map(|entry| {
             let mut value = json!({"key":entry.key, "section":owner(entry.key).descriptor().name,
-                "type":entry.kind, "default":(entry.read)(&defaults), "example":entry.example,
+                "type":entry.kind, "example":entry.example,
                 "meaning":entry.meaning, "aliases":entry.aliases});
+            if let Some(condition) = entry.required_when {
+                value["required_when"] = json!(condition);
+            } else {
+                value["default"] = (entry.read)(&defaults);
+            }
             if entry.key == "context_management.strategy" {
                 value["values"] = json!(["summary", "message_summary", "retrieval_window"]);
             }

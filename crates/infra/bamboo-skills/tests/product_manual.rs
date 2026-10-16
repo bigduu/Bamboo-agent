@@ -204,11 +204,19 @@ fn catalog_defaults_examples_aliases_and_owners_match_real_typed_config() {
     for entry in entries {
         let key = entry["key"].as_str().unwrap();
         assert!(keys.insert(key));
-        assert_eq!(
-            typed_value(&Config::default(), key),
-            entry["default"],
-            "{key}"
-        );
+        if entry.get("required_when").is_some() {
+            assert!(key.starts_with("server.tls."));
+            assert!(
+                entry.get("default").is_none(),
+                "required TLS fields must not imply a fallback"
+            );
+        } else {
+            assert_eq!(
+                typed_value(&Config::default(), key),
+                entry["default"],
+                "{key}"
+            );
+        }
         assert_ne!(
             entry["default"], entry["example"],
             "must exercise a non-default value"
@@ -265,6 +273,18 @@ fn catalog_defaults_examples_aliases_and_owners_match_real_typed_config() {
                     .is_err()
             );
         }
+    }
+    for missing_child in [
+        json!({}),
+        json!({"cert_file":"example-cert.pem"}),
+        json!({"key_file":"example-key.pem"}),
+    ] {
+        assert!(serde_json::from_value::<Config>(json!({"server":{"tls":missing_child}})).is_err());
+    }
+    for key in ["server.tls.cert_file", "server.tls.key_file"] {
+        let entry = entries.iter().find(|entry| entry["key"] == key).unwrap();
+        assert_eq!(entry["required_when"], "server.tls is present");
+        assert!(entry.get("default").is_none());
     }
     // These are preserved dynamic values, never catalog entries or typed keys.
     let preserved: Config =

@@ -44,8 +44,9 @@ or runtime paths are read by generation. Static example paths are placeholders.
 The catalog exhaustively names the fields in MemoryConfig, ServerConfig/TLS,
 StreamTimeoutConfig, ToolsConfig, SkillsConfig and WorktreeSettings. A new field
 in one of those DTOs, even an omitted Option, makes the generator fail to compile
-until its documentation or explicit dynamic-map exclusion is updated. TLS child
-defaults describe its DTO only when TLS is configured; they do not enable TLS.
+until its documentation or explicit dynamic-map exclusion is updated. Both TLS child
+paths are required when `server.tls` is present and have no input defaults;
+omitting either fails deserialization. The optional parent defaults to absent.
 The deprecated `memory.dream_refine_mode` remains accepted but is ignored.
 
 `root_coverage` inventories ConfigValues ownership plus memory, reporting
