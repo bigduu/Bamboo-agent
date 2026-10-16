@@ -4850,15 +4850,16 @@ impl PlainActorActivation {
                 {
                     return Err(plain_actor_unsupported());
                 }
-                let mut claims = activation.initial_inputs.clone();
-                while claims.len() < activation.initial_input_count {
-                    claims.push(
-                        activation
-                            .claim_input(binding, session, run_id)
-                            .await?
-                            .ok_or_else(|| plain_actor_unsupported())?,
-                    );
-                }
+                let claims = if activation.initial_inputs.is_empty() {
+                    // claim_owned is idempotent for this consumer. Repeating
+                    // limit=1 would return the same first claim, not the next.
+                    // Select once under the existing bounded queue transaction.
+                    activation
+                        .claim_inputs(binding, session, run_id, activation.initial_input_count)
+                        .await?
+                } else {
+                    activation.initial_inputs.clone()
+                };
                 if claims.len() != activation.initial_input_count
                     || claims.last().map(|claim| claim.claim.generation)
                         != Some(activation.inbox_generation)
@@ -4905,7 +4906,25 @@ impl PlainActorActivation {
                 + 'a,
         >,
     > {
+        Box::pin(async move { Ok(self.claim_inputs(binding, session, run_id, 1).await?.pop()) })
+    }
+    fn claim_inputs<'a>(
+        &'a self,
+        binding: &'a SessionInboxRuntimeBinding,
+        session: &'a Session,
+        run_id: &'a str,
+        limit: usize,
+    ) -> std::pin::Pin<
+        Box<
+            impl std::future::Future<Output = Result<Vec<SessionInboxOwnedClaim>, AgentError>>
+                + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
+            if limit == 0 || limit > bamboo_domain::SessionInboxLimits::default().max_claim_batch {
+                return Err(plain_actor_unsupported());
+            }
             if !self
                 .input_inbox
                 .inspect(&session.id)
@@ -4913,7 +4932,7 @@ impl PlainActorActivation {
                 .map_err(|_| plain_actor_unsupported())?
                 .activation_pending()
             {
-                return Ok(None);
+                return Ok(Vec::new());
             }
             if run_id != self.fence.run_id || !binding.router.owns_run(&session.id, run_id).await {
                 return Err(plain_actor_unsupported());
@@ -4927,19 +4946,17 @@ impl PlainActorActivation {
                 now,
                 duration: self.input_deadline - now,
             };
-            let claim = self
+            let claims = self
                 .input_inbox
-                .claim_owned(&session.id, 1, Some(run_id), &lease)
+                .claim_owned(&session.id, limit, Some(run_id), &lease)
                 .await
                 .map_err(|error| {
                     tracing::warn!(%error, "Actor correction claim unconfirmed");
                     AgentError::LLM(
                         "Actor correction claim unconfirmed; durable input is preserved".into(),
                     )
-                })?
-                .into_iter()
-                .next();
-            if let Some(claim) = &claim {
+                })?;
+            for claim in &claims {
                 if !matches!(&claim.claim.envelope.body, bamboo_domain::SessionMessageBody::Content(content)
                     if content.parts.is_empty() && !content.text.trim().is_empty() && content.text.len() <= 8192)
                 {
@@ -4962,7 +4979,7 @@ impl PlainActorActivation {
                     return Err(plain_actor_unsupported());
                 }
             }
-            Ok(claim)
+            Ok(claims)
         })
     }
     fn checkpoint_input<'a>(

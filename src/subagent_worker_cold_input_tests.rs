@@ -122,8 +122,15 @@ async fn initial_release_batch_waits_for_every_owned_host_receipt() {
                 let control =
                     tokio::time::timeout(std::time::Duration::from_secs(5), controls.recv())
                         .await
-                        .unwrap()
-                        .expect("worker must request each initial release before provider entry");
+                        .unwrap();
+                let control = match control {
+                    Some(control) => control,
+                    None => {
+                        let outcome = worker.await.unwrap();
+                        panic!("worker exited before its exact initial release: status={:?}, error={:?}",
+                            outcome.status, outcome.error);
+                    }
+                };
                 let ExecutorControl::InitialInputReleaseRequest(request) = control else {
                     panic!("unexpected control")
                 };

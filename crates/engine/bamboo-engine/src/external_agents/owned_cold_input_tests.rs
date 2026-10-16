@@ -506,7 +506,7 @@ async fn completed_plain_batch_rejects_unsupported_member_before_any_checkpoint(
     );
 
     let backlog = binding.inbox.inspect(&child.id).await.unwrap();
-    assert_eq!((backlog.pending, backlog.claimed), (1, 2));
+    assert_eq!((backlog.pending, backlog.claimed), (0, 3));
     drop(_owner);
     let reopened = Arc::new(
         bamboo_storage::SessionStoreV2::new(_temp.path().into())
@@ -561,5 +561,5 @@ async fn completed_plain_batch_rejects_unsupported_member_before_any_checkpoint(
         before
     );
     let after_retry = retry_binding.inbox.inspect(&child.id).await.unwrap();
-    assert_eq!((after_retry.pending, after_retry.claimed), (1, 2));
+    assert_eq!((after_retry.pending, after_retry.claimed), (0, 3));
 }
