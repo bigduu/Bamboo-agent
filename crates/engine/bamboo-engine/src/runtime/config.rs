@@ -792,7 +792,7 @@ fn copy_checked_request(
 /// shift underneath it mid-execution. The deliberate exceptions are the
 /// late-bound handles that resolve LIVE each time they're
 /// used rather than being snapshotted — `auxiliary_model_resolver` (auxiliary
-/// model selection), `vision_model_resolver` (explicit global image target),
+/// model selection), `vision_model_resolver` (explicit ViewImage target),
 /// `model_limits_section` (validated model limits), and
 /// `guardian_spawner` (the reviewer child). If a frozen
 /// field ever needs to become live-per-round, follow that resolver pattern

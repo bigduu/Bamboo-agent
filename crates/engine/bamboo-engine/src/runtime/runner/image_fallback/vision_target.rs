@@ -17,7 +17,7 @@ fn configuration_error() -> AgentError {
 /// permission to send local image bytes to another model or provider account.
 fn configured_target(
     config: &Config,
-    _active_provider: &str,
+    active_provider: &str,
 ) -> Result<(ProviderModelRef, ProviderInstanceConfig), AgentError> {
     let legacy = bamboo_config::synthesize_legacy_instances(config);
     let find_instance = |provider: &str| {
@@ -40,7 +40,9 @@ fn configured_target(
     let target = if let Some(target) = configured_role {
         target
     } else {
-        let provider = config.effective_default_provider();
+        // The run may explicitly use another account than the process default.
+        // Only its own vision_model authorizes this no-global-role fallback.
+        let provider = active_provider;
         let instance = find_instance(provider).ok_or_else(configuration_error)?;
         let model = instance
             .vision_model

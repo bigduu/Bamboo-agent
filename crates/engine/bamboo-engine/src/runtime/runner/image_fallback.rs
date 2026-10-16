@@ -35,6 +35,8 @@ pub fn persistable_image_urls(parts: &[bamboo_domain::MessagePart]) -> Vec<Strin
     placeholder::persistable_image_urls(parts)
 }
 
+/// The independent legacy hook omits an image when its description request
+/// fails. It must not inherit the stricter tool-result error contract.
 pub async fn apply_image_fallback_to_llm_messages(
     messages: &mut [Message],
     fallback: ImageFallbackConfig,
@@ -43,13 +45,38 @@ pub async fn apply_image_fallback_to_llm_messages(
 ) -> std::result::Result<(), AgentError> {
     if fallback.mode == crate::runtime::config::ImageFallbackMode::Vision {
         bamboo_llm::validate_tool_image_budget(messages.iter()).map_err(AgentError::LLM)?;
-        tokio::time::timeout(VISION_TIMEOUT,
-            rewrite::apply_image_fallback_to_llm_messages(messages, fallback, attachment_reader, llm),
-        ).await.map_err(|_| AgentError::LLM("Vision description timed out; no image or partial description was sent to the main model.".into()))?
-    } else {
-        rewrite::apply_image_fallback_to_llm_messages(messages, fallback, attachment_reader, llm)
-            .await
     }
+    rewrite::apply_image_fallback_to_llm_messages(
+        messages,
+        fallback,
+        attachment_reader,
+        llm,
+        rewrite::VisionFailurePolicy::OmitImage,
+    )
+    .await
+}
+
+/// Fresh ViewImage results fail atomically; a partial description is never
+/// substituted for a successful tool result.
+async fn apply_strict_image_fallback_to_llm_messages(
+    messages: &mut [Message],
+    fallback: ImageFallbackConfig,
+    attachment_reader: Option<&dyn AttachmentReader>,
+    llm: Option<&Arc<dyn LLMProvider>>,
+) -> std::result::Result<(), AgentError> {
+    bamboo_llm::validate_tool_image_budget(messages.iter()).map_err(AgentError::LLM)?;
+    tokio::time::timeout(
+        VISION_TIMEOUT,
+        rewrite::apply_image_fallback_to_llm_messages(
+            messages,
+            fallback,
+            attachment_reader,
+            llm,
+            rewrite::VisionFailurePolicy::Error,
+        ),
+    )
+    .await
+    .map_err(|_| AgentError::LLM(VISION_TIMEOUT_MESSAGE.into()))?
 }
 
 #[cfg(test)]
@@ -64,6 +91,8 @@ pub(crate) type VisionModelResolver = Arc<
 >;
 
 pub(crate) const VISION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const VISION_TIMEOUT_MESSAGE: &str =
+    "Vision description timed out; no image or partial description was sent to the main model.";
 pub(crate) const VISION_CONFIGURATION_ERROR: &str = "ViewImage requires a configured Vision model for a main model without Vision. Configure defaults.vision (provider instance and model), or vision_model on the active provider. No image was sent.";
 
 pub(crate) async fn resolve_vision_target(
@@ -96,7 +125,7 @@ pub(crate) async fn describe_tool_images(
         true,
         result.images.clone(),
     )];
-    apply_image_fallback_to_llm_messages(
+    apply_strict_image_fallback_to_llm_messages(
         &mut messages,
         ImageFallbackConfig {
             mode: crate::runtime::config::ImageFallbackMode::Vision,

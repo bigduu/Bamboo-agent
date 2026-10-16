@@ -45,6 +45,18 @@ Missing/null capabilities retain default-on support and existing independent
 legacy hook compatibility; the new tool-only resolver does not participate in
 that legacy general-message transform.
 
+Without a global Vision role, the resolver captures the executing run's actual
+provider instance, including a session override. It never substitutes the
+process-wide default account for that instance's explicit `vision_model`.
+
+The strict atomic error contract belongs to fresh ViewImage results. The
+independent legacy hook retains per-image degradation: a request, stream or
+description failure produces a sanitized omitted-image placeholder and the
+remaining images continue. Each description has a bounded deadline; the tool
+path also bounds the complete rewrite. Configuration/capability checks still
+fail before dispatch, and omitted placeholders never echo source URLs, provider
+errors or partial descriptions.
+
 Images and returned descriptions are untrusted data. Description text has a
 clear Vision-model label and JSON quoting. Provider errors are sanitized;
 failed, empty, overlong or timed-out descriptions are explicit tool errors.
