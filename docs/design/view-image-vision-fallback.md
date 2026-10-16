@@ -53,7 +53,7 @@ transport EOF; an open connection after completion is not a timeout.
 The request/stream remain inside cancellation scopes, with bounded time/output
 and the existing cumulative encoded tool-image budget.
 
-## Prepared regression evidence
+## Offline regression coverage
 
 `vision_same_nonvision_main_rejects_uploads_but_describes_viewimage_output`
 uses the same main provider/effective model and valid Vision target for both
@@ -64,11 +64,13 @@ call resolves the target once, makes one mock Vision request, returns labeled
 text to the main model, and preserves its model identity. An enabled legacy
 Vision hook does not bypass the upload rejection.
 
-Other prepared mocks cover direct tool images, unconfigured/non-Vision targets,
+Other mocks cover direct tool images, unconfigured/non-Vision targets,
 exact instance isolation, native OpenAI/Anthropic/Gemini requests to local fake
 HTTP services, failure, empty/overlong output, timeout, tool cancellation and
 budget limits. Historical-image automatic fallback tests were removed because
 that behavior is outside the requested boundary.
 
-Only formatting and static source checks are permitted at present. These are
-test sources, not a claim that compilation or any Rust test passed.
+Run these tests with fake providers and loopback HTTP services only; never use
+configured paid model credentials. The PR must record the exact source,
+commands, executed case counts and results. Formatting and static checks alone
+do not establish compilation or test acceptance.
