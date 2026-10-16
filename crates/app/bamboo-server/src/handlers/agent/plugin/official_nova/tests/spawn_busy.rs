@@ -92,6 +92,44 @@ async fn persistent_busy_writer_stops_at_the_original_operation_budget() {
     assert!(!count.exists(), "a failed exec must not run the CLI");
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn persistent_busy_writer_bounds_real_process_creation_attempts() {
+    let (command, count) = counted_snapshot().await;
+    let writer = hold_owned_writer(&command);
+    let error = std::process::Command::new(&command.executable)
+        .output()
+        .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY));
+
+    let mut process = tokio::process::Command::new(&command.executable);
+    let mut attempts = 0;
+    let budget = INSTALL_TIMEOUT;
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(
+        budget + Duration::from_secs(1),
+        spawn_verified_cli_with(budget, || {
+            attempts += 1;
+            assert!(
+                attempts <= 200,
+                "persistent ETXTBSY must not create a process-attempt burst"
+            );
+            process.spawn()
+        }),
+    )
+    .await
+    .expect("busy recovery must retain the original deadline");
+    let elapsed = started.elapsed();
+    drop(writer);
+
+    assert_eq!(result.unwrap_err(), "status_failed");
+    assert!(elapsed >= budget && elapsed <= budget + Duration::from_millis(2));
+    assert!(
+        (2..=200).contains(&attempts),
+        "persistent ETXTBSY must back off real spawn attempts; observed {attempts}"
+    );
+    assert!(!count.exists(), "a failed exec must not run the CLI");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn permanent_spawn_error_fails_without_a_retry_yield_or_execution() {
     let (command, count) = counted_snapshot().await;
