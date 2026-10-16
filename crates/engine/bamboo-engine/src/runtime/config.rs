@@ -295,8 +295,8 @@ pub enum ImageFallbackMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageFallbackConfig {
     pub mode: ImageFallbackMode,
-    /// Vision model name for `Vision` mode. Falls back to the session's main model
-    /// when `None`.
+    /// Explicit Vision model name for the low-level fallback API. Missing
+    /// names are a configuration error; never guess a model or use the main model.
     pub vision_model: Option<String>,
 }
 
@@ -792,7 +792,8 @@ fn copy_checked_request(
 /// shift underneath it mid-execution. The deliberate exceptions are the
 /// late-bound handles that resolve LIVE each time they're
 /// used rather than being snapshotted — `auxiliary_model_resolver` (auxiliary
-/// model selection), `model_limits_section` (validated model limits), and
+/// model selection), `vision_model_resolver` (explicit ViewImage target),
+/// `model_limits_section` (validated model limits), and
 /// `guardian_spawner` (the reviewer child). If a frozen
 /// field ever needs to become live-per-round, follow that resolver pattern
 /// rather than widening the snapshot.
@@ -931,6 +932,10 @@ pub struct AgentLoopConfig {
     /// This is intended for text-only provider paths where image parts must be degraded
     /// (placeholder / OCR / error) without leaking into stored session history or UI.
     pub(crate) image_fallback: Option<ImageFallbackConfig>,
+    /// Host-owned resolver only for ViewImage tool-result fallback. Direct
+    /// conversation uploads/history never invoke it; their original Vision
+    /// capability rejection remains in place. It never changes the main model.
+    pub(crate) vision_model_resolver: Option<super::runner::image_fallback::VisionModelResolver>,
     /// Feature flags controlling prompt-time memory injection behavior.
     pub(crate) prompt_memory_flags: PromptMemoryFlags,
     /// Maximum tool calls allowed per round (default: 80).
@@ -1080,6 +1085,7 @@ impl Default for AgentLoopConfig {
             model_limits_section: None,
             legacy_model_limits: None,
             image_fallback: None,
+            vision_model_resolver: None,
             prompt_memory_flags: PromptMemoryFlags::default(),
             max_tool_calls_per_round: 80,
             max_consecutive_failures_per_tool: 3,
