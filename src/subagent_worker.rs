@@ -1420,8 +1420,13 @@ impl ChildExecutor for BambooRuntimeExecutor {
             }
         }
         let initial_deliveries = run.initial_session_messages.clone();
-        if self.initial_input_release_required && initial_deliveries.len() > 2 {
-            return ChildOutcome::error("initial release supports at most two exact typed inputs");
+        if self.initial_input_release_required
+            && initial_deliveries.len()
+                > bamboo_domain::SessionInboxLimits::default().max_claim_batch
+        {
+            return ChildOutcome::error(
+                "initial release exceeds the existing Inbox claim batch bound",
+            );
         }
         if !initial_deliveries.is_empty()
             && expected_activation_run_id

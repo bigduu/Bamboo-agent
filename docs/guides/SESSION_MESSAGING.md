@@ -92,9 +92,10 @@ same policy before and after ACK.
 TriggerTurn grants scheduling permission, subject to the existing receiver route;
 it does not certify that every Child can resume every backlog shape. The strict
 owned zero-tool Actor Child can cold-continue after a successful plain completion
-with one or two new bounded text inputs. QueueOnly followed by TriggerTurn can
+with a new bounded text batch, up to the owned Inbox's existing
+SessionInboxLimits::max_claim_batch (default 128). QueueOnly followed by TriggerTurn can
 therefore be admitted together in order. QueueOnly alone still cannot start the
-idle Child. More than two pending inputs, an outstanding claim, tools/native
+idle Child. A backlog exceeding that existing batch boundary, an outstanding claim, tools/native
 history, stale birth/lineage, or missing owned worker release remain unsupported.
 
 The Host claims and validates the bounded selection, then checkpoints every

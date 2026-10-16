@@ -22,10 +22,11 @@ owner. This is a fail-closed compatibility boundary, not lease renewal or
 recovery of an expired Actor.
 
 
-## Completed plain Child with two cold inputs
+## Completed plain Child with a bounded cold-input batch
 
-A successfully completed strict local zero-tool Child may select at most two
-new pending plain text inputs when an actual wake-eligible input exists. This
+A successfully completed strict local zero-tool Child may select a bounded batch of
+new pending plain text inputs, using the existing Inbox max_claim_batch
+(default 128) when an actual wake-eligible input exists. This
 supports QueueOnly plus a later followup without promoting QueueOnly or staged
 Child/Bash outcomes. Fresh, Failed, expired-initial and pre-ACK recovery shapes
 retain their existing restrictions; an old physical claim is not a new batch.
@@ -35,11 +36,12 @@ checkpoint, checkpoints each under the unchanged Actor/physical fence, and sends
 the pre-input prefix plus ordered typed deliveries in one Run. The existing v1
 control runs separately for every input. The Host accepts only the next input or
 an exact retained release retransmission; wrong order, a changed nonce or an
-early Terminal fails closed. The worker waits for all releases and retains their
+early Terminal fails closed. Two-input examples are acceptance samples, not an additional product limit.
+The worker waits for all releases and retains their
 earliest deadline before SDK/provider entry. No release extends a lease.
 
 Partial or uncertain publication/ACK never dispatches an unprepared prefix,
 ACKs a sibling, or establishes completion. Admitted prefixes and claims remain
 durable; this does not introduce multi-claim recovery or exactly-once provider
-effects. Older workers may reject the two-input shape safely; no relaxed legacy
+effects. Older workers may reject the batch shape safely; no relaxed legacy
 fallback or new permission is available.

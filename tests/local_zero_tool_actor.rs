@@ -3841,3 +3841,5 @@ async fn actual_message_only_tokio_actor_browser_fixture() {
     ))
     .await;
 }
+
+include!("completed_cold_batch_native.rs");

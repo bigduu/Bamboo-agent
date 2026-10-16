@@ -4476,7 +4476,7 @@ fn plain_actor_unsupported() -> AgentError {
         source_column = source.column(),
         "plain Actor continuation unsupported"
     );
-    AgentError::LLM("This Actor Child supports a fresh plain activation, a completed plain Child with up to two new inputs, two bounded corrections while Running, a Failed retry with one new input, an expired initial Local owner with one new input, or verified expired pre-ACK input recovery through run(reset_to_last_user=false). Other continuation is unsupported; durable history is preserved.".into())
+    AgentError::LLM("This Actor Child supports a fresh plain activation, a completed plain Child with a bounded batch of new inputs, two bounded corrections while Running, a Failed retry with one new input, an expired initial Local owner with one new input, or verified expired pre-ACK input recovery through run(reset_to_last_user=false). Other continuation is unsupported; durable history is preserved.".into())
 }
 fn plain_initial_history(session: &Session) -> bool {
     !session.messages.iter().any(|message| {
@@ -4659,7 +4659,8 @@ impl PlainActorActivation {
             // Only completed plain local history gains a bounded initial batch.
             // Retry, expired owner and pre-ACK recovery retain their single-input
             // contracts. QueueOnly alone still cannot authorize a cold start.
-            let new_pair = backlog.pending == 2
+            let new_batch = backlog.pending > 1
+                && backlog.pending <= bamboo_domain::SessionInboxLimits::default().max_claim_batch
                 && backlog.claimed == 0
                 && backlog
                     .oldest_generation
@@ -4675,7 +4676,7 @@ impl PlainActorActivation {
                             .oldest_generation
                             .is_some_and(|oldest| oldest > old.inbox_generation)
                 })
-                && (new_input || new_pair)
+                && (new_input || new_batch)
                 && plain_completed_history(session);
             let input_inbox = bamboo_storage::FileSessionInbox::new(
                 store.clone(),
@@ -9221,7 +9222,7 @@ mod tests {
     async fn completed_plain_continuation_requires_bounded_inputs_and_current_identity() {
         for case in [
             "valid",
-            "three-inputs",
+            "over-batch-limit",
             "tool-history",
             "stale-lineage",
             "no-release",
@@ -9269,7 +9270,11 @@ mod tests {
                 store.clone(),
                 Default::default(),
             ));
-            for slot in 0..if case == "three-inputs" { 3 } else { 1 } {
+            for slot in 0..if case == "over-batch-limit" {
+                bamboo_domain::SessionInboxLimits::default().max_claim_batch + 1
+            } else {
+                1
+            } {
                 let envelope = bamboo_domain::SessionMessageEnvelope::user_input(
                     &child.id,
                     format!("new task {slot}"),
