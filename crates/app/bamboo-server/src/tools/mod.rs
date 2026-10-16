@@ -20,6 +20,7 @@ pub use bamboo_server_tools::{
 pub mod browser;
 pub mod browser_eval;
 pub mod child_session_adapter;
+pub(crate) mod diagnostics;
 pub mod model_catalog;
 pub mod notify_dispatcher;
 pub mod ticket_dispatch_adapter;
