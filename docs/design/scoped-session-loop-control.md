@@ -12,7 +12,10 @@ This branch is the first bounded live implementation candidate. Its original
 implementation/validation base is protected dev
 `bf6b20bab2832b45d4b0927e971cea64866f2c77`. After local validation it was
 ordinarily merged with actual dev
-`0e32f537f66a76aba6108705acf733d6058d97c5`, including the accepted ZIP9 repair. The original pushed
+`0e32f537f66a76aba6108705acf733d6058d97c5`, including the accepted ZIP9 repair.
+The review regressions are then integrated with accepted P1 dev
+`b94ff17530c91bef3215bbc4cf8844aea8300548` before both their RED and GREEN;
+that merge changes the cold-Child adapter, without another dependency update. The original pushed
 design `305735f980e4b4316924216077930e644fb69bdc` and its 15 uncompiled synthetic
 contract tests were inspected and preserved separately. #1992 is now accepted
 in dev; its old test receipts are not acceptance evidence for this candidate.
@@ -34,11 +37,12 @@ successful model-facing `SessionControlTool` chain, the complete Server
 reservation path, or every SDK external preparation step. Tool adapter identity,
 validation, replay denials and existing Followup behavior have separate tests.
 
-The latest ZIP9 dependency/base integration has not yet received local
-combination/lint validation. The exclusive local Rust window was released to
-the next owner after the recorded commands ended naturally; further local
-builds require a separately coordinated window. Current-head/base remote
-review and required CI are also admission gates, not implicit successes.
+The ZIP9 dependency/base integration is a different validation context.
+Its focused combination and original-CI lint require their own exact-source
+receipts; the historical 666 passes do not establish them. Rust windows are
+separately coordinated, and every owner releases after its necessary local
+commands end naturally. Current-head/base remote review and required CI remain
+independent admission gates. The PR records the latest actual gate state.
 No real model or added-fee test was run. #1976 remains open, and frozen
 Nova/release sources remain independent.
 
@@ -77,6 +81,20 @@ legacy replay with no generation, cannot submit a fresh Loop command; old
 Followup replay behavior is preserved. Ordinary Roots, ordinary Ultra Roots,
 reserved-id impostors and children acquire no cross-Session capability.
 Thinking posture does not replace strict Supervisor identity.
+
+The outer advertised schema has action-specific `oneOf` branches: Followup
+requires its operation/message, and Loop requires its command. Boolean-false
+property schemas reject fields belonging to the other action. The common
+seven-property surface and nested finite Loop schema stay shared; neither
+wire acceptance nor registry projection supplies execution authority.
+
+Canonical disabled-tool checks use Domain's authoritative reference resolver
+for the corresponding fixed core capability (`session_control` on the source,
+`loop_control` on the target). Storage does not possess the dynamic provider
+catalog and does not invent foreign registrations from denial strings. An
+ambiguous qualified alias of that core capability is conservatively denied;
+encoded MCP names, different suffixes and the other core capability remain
+distinct. This is a deny-only check, never a new registered/callable identity.
 
 Attachment alone, the target's self-loop opt-in, schema registration and an
 orchestration whitelist entry are each insufficient. A separate host-only
@@ -274,10 +292,22 @@ Engine filter selected zero tests and was explicitly excluded from coverage.
 No ignored test, paid provider run or uncompiled prototype is counted as a pass.
 
 The later ordinary merge of dev `0e32f537` is a different dependency context.
-It leaves this slice's source paths unchanged, but changes Cargo manifests and
-lockfile; its required local combination/lint and current-head/base remote
-checks remain pending. Old-base receipts are not promoted to new-base green.
-Static review/formatting never replaces compilation or tests.
+It leaves the first implementation's paths unchanged, but changes Cargo
+manifests and lockfile. Validate that context separately; old-base receipts
+are never promoted to new-base green. Static review/formatting never replaces
+compilation or tests.
+
+Two later review regressions add five deterministic cases. The schema cases
+use the real ToolRegistry projection and the existing locked JSON Schema
+validator (a development dependency only, no new package/version). They check
+required action fields, legal structures and cross-action/unknown denials.
+The V2 cases check qualified/case denials, distinct-name checkpoint/ACKs, and
+policy withdrawal after delivery/claim with no publication or ACK. These are
+wire/storage tests, not a claim of full model-to-tool success or a provider
+catalog in Storage. Their exact RED/GREEN source and artifacts are recorded
+separately. The bounded combination is Engine public3, ServerTools11 and
+Storage scoped14, plus the original CI lint/format contract. Only the actual
+source-bound run receipts and current PR gates establish its result.
 
 ## Specific follow-up product slices (remain open)
 

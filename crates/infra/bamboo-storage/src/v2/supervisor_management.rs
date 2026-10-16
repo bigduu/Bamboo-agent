@@ -204,11 +204,16 @@ impl SessionStoreV2 {
                     .map_err(|_| denied("invalid disabled tools authority"))?,
                 None => BTreeSet::new(),
             };
-            Ok(disabled.contains(tool)
-                || session
-                    .agent_runtime_state
-                    .as_ref()
-                    .is_some_and(|runtime| runtime.read_only || runtime.plan_mode.is_some()))
+            // This checks one known core capability, not a provider catalog.
+            // Unknown qualified references keep the shared denial fallback.
+            Ok(disabled.iter().any(|reference| {
+                bamboo_domain::resolve_disabled_tool_reference_name(reference, |name| name == tool)
+                    .as_deref()
+                    == Some(tool)
+            }) || session
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|runtime| runtime.read_only || runtime.plan_mode.is_some()))
         };
         if source.supervisor_incarnation_id() != Some(binding.supervisor.incarnation_id)
             || source.root_tool_authority_revision != binding.supervisor_tool_authority_revision

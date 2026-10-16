@@ -64,7 +64,26 @@ impl Tool for SessionControlTool {
                 "receipt_operation_id": {"type": "string", "format": "uuid",
                     "description": "loop status only: exact operation UUID for bounded target-owner receipt lookup; never a grant or a new command."}
             },
-            "required": ["action", "target_session_id"]
+            "required": ["action", "target_session_id"],
+            "oneOf": [
+                {
+                    "properties": {
+                        "action": {"const": "followup"},
+                        "command": false,
+                        "expected_link_revision": false,
+                        "receipt_operation_id": false
+                    },
+                    "required": ["operation_id", "message"]
+                },
+                {
+                    "properties": {
+                        "action": {"const": "loop"},
+                        "operation_id": false,
+                        "message": false
+                    },
+                    "required": ["command"]
+                }
+            ]
         })
     }
 
