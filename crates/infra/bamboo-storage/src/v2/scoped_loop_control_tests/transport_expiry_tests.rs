@@ -42,7 +42,12 @@ async fn canonical(f: &Fixture) -> Session {
 async fn native_terminal_reclaims_pending_claimed_and_committed_cur_before_backlog_limit() {
     // The last row is a *rejected* command committed by the real writer, not
     // a fabricated successful operation. Its cur remnant must be ACKed.
-    for stage in ["pending", "claimed", "committed_cur"] {
+    // Expiry is injected into an actually issued native census entry. This
+    // does not model normal lease renewal or claim any physical work stopped.
+    for (evidence, stage) in ["expired", "terminal"]
+        .into_iter()
+        .flat_map(|evidence| ["pending", "claimed", "committed_cur"].map(|stage| (evidence, stage)))
+    {
         let mut f = Fixture::new(true).await;
         limit_one(&mut f);
         let envelope = f.envelope();
@@ -79,14 +84,43 @@ async fn native_terminal_reclaims_pending_claimed_and_committed_cur_before_backl
                 .is_some_and(|c| c.contains(&envelope.id)),
             stage == "committed_cur"
         );
-        f.store
-            .finish_activation(
-                &f.owner.as_ref().unwrap().fence,
-                Utc::now(),
-                bamboo_domain::ActorActivationFinish::Cancelled,
-            )
-            .await
-            .unwrap();
+        let dir = target_dir(&f);
+        let main_before = std::fs::read(dir.join("session.json")).unwrap();
+        let runtime_before = std::fs::read(dir.join(RUNTIME_SIDECAR_FILE)).unwrap();
+        if evidence == "terminal" {
+            f.store
+                .finish_activation(
+                    &f.owner.as_ref().unwrap().fence,
+                    Utc::now(),
+                    bamboo_domain::ActorActivationFinish::Cancelled,
+                )
+                .await
+                .unwrap();
+        } else {
+            let path = dir.join("actor-authority.json");
+            let mut entry: bamboo_domain::ActorDirectoryEntry =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let activation = entry.activation.as_mut().unwrap();
+            assert_eq!(
+                activation.status,
+                bamboo_domain::ActorActivationStatus::Running
+            );
+            activation.lease_expires_at = Utc::now() - chrono::Duration::seconds(1);
+            let expired_at = activation.lease_expires_at;
+            entry.validate().unwrap();
+            std::fs::write(&path, serde_json::to_vec(&entry).unwrap()).unwrap();
+            // The existing strict directory read accepts the valid expired
+            // entry; no renew/finish API or new runtime capability is invoked.
+            let observed = f.store.inspect_actor(&f.target.id).await.unwrap();
+            observed.validate().unwrap();
+            let observed = observed.activation.unwrap();
+            assert_eq!(
+                observed.status,
+                bamboo_domain::ActorActivationStatus::Running
+            );
+            assert_eq!(observed.lease_expires_at, expired_at);
+            assert!(observed.lease_expires_at <= Utc::now());
+        }
         let user = SessionMessageEnvelope::user_input(
             &f.target.id,
             "independent genuine User after terminal native run",
@@ -94,9 +128,17 @@ async fn native_terminal_reclaims_pending_claimed_and_committed_cur_before_backl
         let result = f.inbox.deliver(&user).await;
         assert!(
             result.is_ok(),
-            "{stage}: terminal transport must not cause BacklogFull: {result:?}"
+            "{evidence}/{stage}: inert transport must not cause BacklogFull: {result:?}"
         );
         let after = canonical(&f).await;
+        assert_eq!(
+            std::fs::read(dir.join("session.json")).unwrap(),
+            main_before
+        );
+        assert_eq!(
+            std::fs::read(dir.join(RUNTIME_SIDECAR_FILE)).unwrap(),
+            runtime_before
+        );
         assert_eq!(
             serde_json::to_value(after.session_inbox_admission()).unwrap(),
             cursor
@@ -115,7 +157,11 @@ async fn native_terminal_reclaims_pending_claimed_and_committed_cur_before_backl
             stage == "committed_cur"
         );
         let backlog = f.inbox.inspect(&f.target.id).await.unwrap();
-        assert_eq!((backlog.pending, backlog.claimed), (1, 0), "{stage}");
+        assert_eq!(
+            (backlog.pending, backlog.claimed),
+            (1, 0),
+            "{evidence}/{stage}"
+        );
         assert_eq!(f.activation.activations.load(Ordering::SeqCst), 0);
         // Owned mode is permanent once claimed. Observe the actual queued
         // User without calling the forbidden legacy claim API or minting a
