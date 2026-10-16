@@ -86,7 +86,9 @@ explicit zero. Cached input and reasoning output subsets are not added again;
 local estimates are not labeled as provider usage. An interrupted stream can
 report usage already observed before the failure. Fixed error categories are
 used instead of error messages, stack traces or panic payloads. Dropped futures
-end spans as cancelled; unwinding ends them as panic. Ordinary CLI error exits
+end spans as cancelled; an elapsed tool/batch deadline ends unfinished dispatch
+spans as timeout, while completed siblings keep their recorded outcome. Unwinding
+ends spans as panic. Ordinary CLI error exits
 explicitly flush within the same shutdown budget; normal completion flushes
 before Tokio runtime teardown. The dedicated subagent worker's fatal hard-exit
 remains immediate to preserve its termination guarantee. That exit, signals and

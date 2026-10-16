@@ -3493,6 +3493,36 @@ mod hook_tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_timeout_before_tool_start_has_no_dispatch_span() {
+        let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+        let executor = Arc::new(NameRecordingExecutor::new(&["probe"]));
+        let tools: Arc<dyn ToolExecutor> = executor.clone();
+        let callable =
+            effective_callable_set(&["probe"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        let call = probe_call("probe");
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .try_send(AgentEvent::Token {
+                content: "occupied".into(),
+            })
+            .unwrap();
+        let result = trace
+            .scope(bamboo_infrastructure::telemetry::with_timeout(
+                std::time::Duration::from_secs(1),
+                execute_without_hooks(&callable, &tools, &call, &event_tx),
+            ))
+            .await;
+        assert!(result.is_err());
+        assert!(executor.entered().is_empty());
+        assert!(trace.spans().is_empty());
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            AgentEvent::Token { .. }
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn telemetry_records_actual_tool_errors_without_payloads() {
         struct ErrorExecutor(bool);

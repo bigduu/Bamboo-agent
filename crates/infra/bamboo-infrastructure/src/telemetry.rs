@@ -13,9 +13,11 @@ use opentelemetry::{global, Context, InstrumentationScope, KeyValue};
 
 mod config;
 mod propagation;
+mod timeout;
 
 pub use config::{init, init_from_env, TelemetryConfig, TelemetryError, TelemetryGuard};
 pub use propagation::TraceContext;
+pub use timeout::with_timeout;
 
 /// GenAI conventions are Development. This source revision, not a floating
 /// schema URL, defines our deliberately small attribute mapping.
@@ -194,11 +196,20 @@ impl Drop for Observation {
             let span = self.context.span();
             let error_type = if std::thread::panicking() {
                 "panic"
+            } else if timeout::is_timeout_drop() {
+                "timeout"
             } else {
                 "cancelled"
             };
             span.set_attribute(KeyValue::new("error.type", error_type));
-            span.set_attribute(KeyValue::new("bamboo.outcome", error_type));
+            span.set_attribute(KeyValue::new(
+                "bamboo.outcome",
+                if error_type == "timeout" {
+                    "error"
+                } else {
+                    error_type
+                },
+            ));
             span.set_status(Status::error(error_type));
             span.end();
         }
