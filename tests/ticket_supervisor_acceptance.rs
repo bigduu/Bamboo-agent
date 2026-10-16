@@ -3,7 +3,7 @@
 #![cfg(unix)]
 #[path = "support/ticket_runtime.rs"]
 mod fixture;
-use bamboo_domain::{Storage, DEFAULT_SUPERVISOR_SESSION_ID};
+use bamboo_domain::{Role, Storage, DEFAULT_SUPERVISOR_SESSION_ID};
 use bamboo_engine::ticket_worker_plan::tickets::content_hash;
 use bamboo_storage::SessionStoreV2;
 use fixture::{get, post, Fixture, Probe};
@@ -190,6 +190,14 @@ fn controlled(body: &Value, probe: &Probe) -> Option<(Value, &'static str)> {
             let row = &view["data"][0];
             assert_eq!(row["ticket"]["state"], "submitted");
             assert_eq!(row["ticket"]["contract"]["user_acceptance_required"], true);
+            assert_eq!(
+                row["ticket"]["contract"]["acceptance"],
+                json!([format!(
+                    "Exact UTF-8 bytes {GOOD}; SHA256 {}",
+                    content_hash(GOOD.as_bytes())
+                )]),
+                "reinspection must use the unchanged assigned acceptance criterion"
+            );
             let submission = row["submissions"]
                 .as_array()
                 .unwrap()
@@ -290,9 +298,8 @@ fn controlled(body: &Value, probe: &Probe) -> Option<(Value, &'static str)> {
 
 async fn run_round(f: &Fixture, round: u64, message: String) -> (Value, Value) {
     f.probe.scenario.lock().unwrap()["round"] = json!(round);
-    let ultra = f.probe.scenario.lock().unwrap()["ultra"].as_bool().unwrap();
     let human = json!({"session_id":DEFAULT_SUPERVISOR_SESSION_ID,"message_id":format!("acceptance-human-{round}"),
-        "message":message,"model":"ticket-model","provider":"openai", "thinking_mode":if ultra {"ultra"} else {"standard"},
+        "message":message,"model":"ticket-model","provider":"openai",
         "model_ref":{"provider":"openai","model":"ticket-model"}});
     let admitted = post(&f.client, &f.base, "/chat", &human).await;
     post(
@@ -391,103 +398,188 @@ async fn submitted(f: &Fixture, generation: u64) -> Value {
     .expect("actual Worker publishes its stopped canonical result")
 }
 
+async fn select_mode(f: &Fixture, mode: &str) {
+    let detail = get(
+        &f.client,
+        &f.base,
+        &format!("/sessions/{DEFAULT_SUPERVISOR_SESSION_ID}"),
+    )
+    .await;
+    let epoch = detail["session"]["root_mode_transition_epoch"]
+        .as_u64()
+        .unwrap();
+    let operation_path = format!(
+        "/sessions/{DEFAULT_SUPERVISOR_SESSION_ID}/root-mode-operations/{epoch}:{}",
+        uuid::Uuid::new_v4()
+    );
+    let selection = json!({
+        "birth_token": detail["session"]["root_mode_birth_token"],
+        "expected_epoch": epoch,
+        "thinking_mode": mode
+    });
+    let selected = post(&f.client, &f.base, &operation_path, &selection).await;
+    assert_eq!(selected["status"], "committed");
+    assert_eq!(selected["thinking_mode_at_completion"], mode);
+}
+
 #[actix_web::test]
-async fn actual_supervisor_rejects_reworks_verifies_and_waits_for_exact_user_acceptance_in_both_modes(
-) {
-    for ultra in [false, true] {
-        let mut f = Fixture::new().await;
-        *f.probe.controlled_response.lock().unwrap() = Some(controlled);
-        *f.probe.scenario.lock().unwrap() = json!({"round":0,"ultra":ultra,"deliveries":0});
-        run_round(&f,0,format!("Create and start {TITLE}: return exactly {GOOD}; independently verify the exact bytes and reject a mismatching result for bounded rework. Wait for my final acceptance.")).await;
-        let bad = submitted(&f, 1).await;
-        let bad_submission = bad["data"][0]["ticket"]["current_submission"].clone();
-        let hash = bad["data"][0]["submissions"][0]["artifacts"][0]["sha256"]
-            .as_str()
-            .unwrap();
-        assert_eq!(
-            f.client
-                .get(format!("{}/tickets/artifacts/{hash}", f.base))
-                .send()
-                .await
-                .unwrap()
-                .text()
-                .await
-                .unwrap(),
-            BAD
-        );
-        run_round(&f,1,"Inspect the current artifact against the existing exact-byte criterion and arrange bounded rework if it fails; do not accept it for me.".into()).await;
-        let good = submitted(&f, 2).await;
-        let row = &good["data"][0];
-        assert_eq!(row["submissions"].as_array().unwrap().len(), 2);
-        assert_eq!(row["assignments"].as_array().unwrap().len(), 2);
-        assert_eq!(row["ticket"]["contract_revision"], 2);
-        assert_eq!(
-            row["ticket"]["contract"]["acceptance"],
-            bad["data"][0]["ticket"]["contract"]["acceptance"]
-        );
-        let good_submission = row["ticket"]["current_submission"].clone();
-        assert_ne!(good_submission, bad_submission);
-        let artifact = row["submissions"]
-            .as_array()
+async fn actual_supervisor_rejects_reworks_verifies_and_waits_for_exact_user_acceptance_in_ultra() {
+    let mut f = Fixture::new().await;
+    select_mode(&f, "ultra").await;
+    *f.probe.controlled_response.lock().unwrap() = Some(controlled);
+    *f.probe.scenario.lock().unwrap() = json!({"round":0,"ultra":true,"deliveries":0});
+    run_round(&f,0,format!("Create and start {TITLE}: return exactly {GOOD}; independently verify the exact bytes and reject a mismatching result for bounded rework. Wait for my final acceptance.")).await;
+    let bad = submitted(&f, 1).await;
+    let bad_submission = bad["data"][0]["ticket"]["current_submission"].clone();
+    let hash = bad["data"][0]["submissions"][0]["artifacts"][0]["sha256"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        f.client
+            .get(format!("{}/tickets/artifacts/{hash}", f.base))
+            .send()
+            .await
             .unwrap()
-            .iter()
-            .find(|s| s["id"] == good_submission)
-            .unwrap();
-        let hash = artifact["artifacts"][0]["sha256"].as_str().unwrap();
-        assert_eq!(
-            f.client
-                .get(format!("{}/tickets/artifacts/{hash}", f.base))
-                .send()
-                .await
-                .unwrap()
-                .text()
-                .await
-                .unwrap(),
-            GOOD
-        );
-        run_round(&f,2,"Verify the corrected result against every criterion and report the evidence; final acceptance is still pending my decision.".into()).await;
-        let work = row["ticket"]["id"].clone();
-        let inspect = json!({"ids":[work],"depth":0,"budget_bytes":65536,"fixed_commit":null});
-        assert_eq!(
-            post(&f.client, &f.base, "/tickets/inspect", &inspect).await["data"][0]["ticket"]
-                ["state"],
-            "submitted"
-        );
-        let (accepted_input, admitted) = run_round(
-            &f,
-            3,
-            format!(
-                "验收通过 {TITLE} submission {} 文件SHA256 {hash}",
-                good_submission.as_str().unwrap()
-            ),
+            .text()
+            .await
+            .unwrap(),
+        BAD
+    );
+    run_round(&f,1,"Inspect the current artifact against the existing exact-byte criterion and arrange bounded rework if it fails; do not accept it for me.".into()).await;
+    let good = submitted(&f, 2).await;
+    let row = &good["data"][0];
+    assert_eq!(row["submissions"].as_array().unwrap().len(), 2);
+    assert_eq!(row["assignments"].as_array().unwrap().len(), 2);
+    assert_eq!(row["ticket"]["contract_revision"], 2);
+    assert_eq!(
+        row["ticket"]["contract"]["acceptance"],
+        bad["data"][0]["ticket"]["contract"]["acceptance"]
+    );
+    let good_submission = row["ticket"]["current_submission"].clone();
+    assert_ne!(good_submission, bad_submission);
+    let artifact = row["submissions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == good_submission)
+        .unwrap();
+    let hash = artifact["artifacts"][0]["sha256"].as_str().unwrap();
+    assert_eq!(
+        f.client
+            .get(format!("{}/tickets/artifacts/{hash}", f.base))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        GOOD
+    );
+    run_round(&f,2,"Verify the corrected result against every criterion and report the evidence; final acceptance is still pending my decision.".into()).await;
+    let work = row["ticket"]["id"].clone();
+    let inspect = json!({"ids":[work],"depth":0,"budget_bytes":65536,"fixed_commit":null});
+    assert_eq!(
+        post(&f.client, &f.base, "/tickets/inspect", &inspect).await["data"][0]["ticket"]["state"],
+        "submitted"
+    );
+    let (accepted_input, admitted) = run_round(
+        &f,
+        3,
+        format!(
+            "验收通过 {TITLE} submission {} 文件SHA256 {hash}",
+            good_submission.as_str().unwrap()
+        ),
+    )
+    .await;
+    let accepted = post(&f.client, &f.base, "/tickets/inspect", &inspect).await;
+    assert_eq!(accepted["data"][0]["ticket"]["state"], "accepted");
+    assert_eq!(
+        accepted["data"][0]["ticket"]["accepted_submission"],
+        good_submission
+    );
+    assert_eq!(
+        f.probe.calls.load(Ordering::SeqCst),
+        4,
+        "two real Workers, private Task then output"
+    );
+    let root_calls = f.probe.root_calls.load(Ordering::SeqCst);
+    f.restart().await;
+    let replayed = post(&f.client, &f.base, "/chat", &accepted_input).await;
+    assert_eq!(replayed["ingress_seq"], admitted["ingress_seq"]);
+    let restored = post(&f.client, &f.base, "/tickets/inspect", &inspect).await;
+    assert_eq!(
+        restored["data"][0]["ticket"]["accepted_submission"],
+        good_submission
+    );
+    assert_eq!(
+        restored["data"][0]["submissions"],
+        accepted["data"][0]["submissions"]
+    );
+    assert_eq!(f.probe.calls.load(Ordering::SeqCst), 4);
+    assert_eq!(f.probe.root_calls.load(Ordering::SeqCst), root_calls);
+    f.finish().await;
+}
+
+// #1968 tracks the product mismatch: two-mode delegation policy/catalog does
+// not currently grant Standard mode a Host Ticket scope. Preserve that gate.
+#[actix_web::test]
+async fn standard_supervisor_ticket_gate_refuses_chat_without_publishing_work_or_human() {
+    let f = Fixture::new().await;
+    select_mode(&f, "standard").await;
+    let store = SessionStoreV2::new(f.data.clone()).await.unwrap();
+    let before = store
+        .load_session(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    let head = f
+        .data
+        .join("tickets")
+        .join(before.supervisor_incarnation_id().unwrap().to_string())
+        .join("HEAD");
+    let published_before = std::fs::read(&head).unwrap();
+    let scope = get(&f.client, &f.base, "/tickets/scope").await;
+    assert_eq!(scope["available"], false);
+    assert_eq!(
+        scope["availability"]["reason_code"],
+        "supervisor_mode_required"
+    );
+    let response = f
+        .client
+        .post(format!("{}/chat", f.base))
+        .json(&json!({
+            "session_id":DEFAULT_SUPERVISOR_SESSION_ID,"message_id":"standard-refused-human",
+            "message":format!("Create and start {TITLE}"),"model":"ticket-model","provider":"openai"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: Value = response.json().await.unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Supervisor orchestration authority required"));
+    let after = store
+        .load_session(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    // First chat may initialize the ordinary system prompt before admission.
+    // It must not publish the refused Human, assistant/tool work, or Ticket state.
+    let transcript = |session: &bamboo_domain::Session| {
+        serde_json::to_value(
+            session
+                .messages
+                .iter()
+                .filter(|message| message.role != Role::System)
+                .collect::<Vec<_>>(),
         )
-        .await;
-        let accepted = post(&f.client, &f.base, "/tickets/inspect", &inspect).await;
-        assert_eq!(accepted["data"][0]["ticket"]["state"], "accepted");
-        assert_eq!(
-            accepted["data"][0]["ticket"]["accepted_submission"],
-            good_submission
-        );
-        assert_eq!(
-            f.probe.calls.load(Ordering::SeqCst),
-            4,
-            "two real Workers, private Task then output"
-        );
-        let root_calls = f.probe.root_calls.load(Ordering::SeqCst);
-        f.restart().await;
-        let replayed = post(&f.client, &f.base, "/chat", &accepted_input).await;
-        assert_eq!(replayed["ingress_seq"], admitted["ingress_seq"]);
-        let restored = post(&f.client, &f.base, "/tickets/inspect", &inspect).await;
-        assert_eq!(
-            restored["data"][0]["ticket"]["accepted_submission"],
-            good_submission
-        );
-        assert_eq!(
-            restored["data"][0]["submissions"],
-            accepted["data"][0]["submissions"]
-        );
-        assert_eq!(f.probe.calls.load(Ordering::SeqCst), 4);
-        assert_eq!(f.probe.root_calls.load(Ordering::SeqCst), root_calls);
-        f.finish().await;
-    }
+        .unwrap()
+    };
+    assert_eq!(transcript(&after), transcript(&before));
+    assert_eq!(std::fs::read(&head).unwrap(), published_before);
+    assert_eq!(f.probe.root_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.probe.calls.load(Ordering::SeqCst), 0);
+    f.finish().await;
 }

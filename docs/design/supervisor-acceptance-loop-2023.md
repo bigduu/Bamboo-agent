@@ -19,7 +19,7 @@ not add a model quality classifier or broaden a capability.
 `tests/ticket_supervisor_acceptance.rs` starts a real isolated Bamboo HTTP Host
 and production native Workers using the existing Ticket fixture. All model
 responses come from a local scripted HTTP provider and use synthetic settings.
-It repeats the following scenario in Standard and Ultra:
+It runs the following scenario in the currently supported Ultra Ticket mode:
 
 1. The Supervisor resolves a canonical Human instruction, creates a Task-only
    Work with explicit exact-byte/SHA256 acceptance criteria, and dispatches it.
@@ -52,6 +52,24 @@ UI behavior, paid-provider behavior, or a release/platform certification.
 A scripted assistant's prose assertions are not a general runtime guarantee
 that a free-form model can never overstate completion.
 
+## Standard mode boundary remains open
+
+The actual Host currently refuses canonical Supervisor Ticket ingress in
+Standard mode with HTTP 403 (`Supervisor orchestration authority required`).
+The public scope endpoint reports `supervisor_mode_required`. This is an
+existing explicit gate in `verified_scope_binding` and the server scope
+initialization/status paths, not a failed artifact acceptance decision.
+The regression switches mode using the public recoverable mode-operation API
+and verifies that the refused chat publishes neither Human history nor a new
+Ticket HEAD and starts no Supervisor/Worker model calls.
+
+This differs from the identity-derived two-mode delegation prompt/catalog
+contract. The precise capability mismatch remains open in [#1968](https://github.com/bigduu/Bamboo-agent/issues/1968#issuecomment-6222324438);
+this change does not remove the gate or claim Standard Host Ticket completion.
+Existing `supervisor_delegation_first` engine tests retain Standard/Ultra prompt,
+catalog/discovery, final tool admission and real-runner controlled-provider
+coverage. They are separate from Host Ticket scope admission.
+
 ## Service boundaries
 
 `supervisor_rejection_rework_preserves_exact_evidence_and_user_acceptance` in
@@ -81,6 +99,7 @@ cargo +1.95.0 test --locked -p bamboo-tickets --test service_contract
 BAMBOO_FRONTEND_BUILD_MODE=api-only cargo +1.95.0 test --locked -p bamboo-agent \
   --test ticket_supervisor_acceptance --test ticket_supervisor_tools \
   --test ticket_runtime_mvp -- --test-threads=1
+cargo +1.95.0 test --locked -p bamboo-engine --lib supervisor_delegation_first
 cargo +1.95.0 fmt --all -- --check
 git diff --check
 ```
