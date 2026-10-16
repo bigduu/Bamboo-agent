@@ -53,6 +53,10 @@ pub(crate) async fn run_agent_loop_with_config(
     cancel_token: CancellationToken,
     config: AgentLoopConfig,
 ) -> super::Result<()> {
+    let scoped_transport = config
+        .loop_control
+        .as_ref()
+        .is_some_and(|control| control.supervisor_grant_id().is_some());
     let session_span = tracing::info_span!("agent_loop", session_id = %session.id);
     let mut counted_generation = None;
     let mut counted_usage = super::to_event_token_usage(0, 0);
@@ -128,11 +132,8 @@ pub(crate) async fn run_agent_loop_with_config(
         )
         .await?;
 
-        if let Some(control) = config.loop_control.as_ref() {
-            control.bind_execution(&state.execution_id, cancel_token.clone())?;
-        }
         if config.effective_counted_loop().is_some() || config.loop_control.is_some() {
-            // Capture the initialized run before begin can fail. Its first
+            // Capture the initialized run before any owner checkpoint or binding can fail. Its first
             // checkpoint error must also terminalize this runtime snapshot for
             // the host's unconditional final error save.
             counted_runtime_identity = Some((
@@ -140,6 +141,52 @@ pub(crate) async fn run_agent_loop_with_config(
                 state.runtime_state.round.last_round_id.clone(),
                 state.runtime_state.execution_id.clone(),
             ));
+        }
+        if let Some(control) = config.loop_control.as_ref() {
+            control.bind_execution(&state.execution_id, cancel_token.clone())?;
+            if control.supervisor_grant_id().is_some() {
+                if cancel_token.is_cancelled() {
+                    return Err(bamboo_agent_core::AgentError::Cancelled);
+                }
+                config
+                    .persistence
+                    .as_ref()
+                    .ok_or_else(|| {
+                        bamboo_agent_core::AgentError::Budget(
+                            "Supervisor Loop requires a durable owner".into(),
+                        )
+                    })?
+                    .checkpoint_runtime_session(session)
+                    .await
+                    .map_err(|error| {
+                        if cancel_token.is_cancelled() {
+                            bamboo_agent_core::AgentError::Cancelled
+                        } else {
+                            bamboo_agent_core::AgentError::Budget(format!(
+                                "initial Supervisor Loop owner checkpoint failed: {error}"
+                            ))
+                        }
+                    })?;
+                if cancel_token.is_cancelled() {
+                    return Err(bamboo_agent_core::AgentError::Cancelled);
+                }
+            }
+            if let Some(storage) = config.storage.as_ref() {
+                control
+                    .register_supervisor_control(session, storage)
+                    .await
+                    .map_err(|error| {
+                        if cancel_token.is_cancelled() {
+                            bamboo_agent_core::AgentError::Cancelled
+                        } else {
+                            error
+                        }
+                    })?;
+            } else if control.supervisor_grant_id().is_some() {
+                return Err(bamboo_agent_core::AgentError::Budget(
+                    "Supervisor Loop requires canonical Storage".into(),
+                ));
+            }
         }
         counted_generation = crate::runtime::counted_loop::begin(
             session,
@@ -183,7 +230,7 @@ pub(crate) async fn run_agent_loop_with_config(
                         &state.session_id,
                         &config,
                         state.metrics_collector.as_ref(),
-                        config.effective_counted_loop().is_some(),
+                        defers_terminal_complete(&config),
                         &mut state.runtime_state,
                     )
                     .await;
@@ -245,7 +292,7 @@ pub(crate) async fn run_agent_loop_with_config(
                     &state.session_id,
                     &config,
                     state.metrics_collector.as_ref(),
-                    config.effective_counted_loop().is_some(),
+                    defers_terminal_complete(&config),
                     &mut state.runtime_state,
                 )
                 .await;
@@ -287,7 +334,7 @@ pub(crate) async fn run_agent_loop_with_config(
             &state.session_id,
             &config,
             state.metrics_collector.as_ref(),
-            sent_complete || config.effective_counted_loop().is_some(),
+            sent_complete || defers_terminal_complete(&config),
             &mut state.runtime_state,
         )
         .await;
@@ -303,7 +350,27 @@ pub(crate) async fn run_agent_loop_with_config(
             .and_then(|c| c.generation())
             .map(str::to_owned);
     }
-    let result = if counted_generation.is_some() && result.is_ok() && cancel_token.is_cancelled() {
+    // This catches startup, hook, provider, cancellation and success exits.
+    // Closing owner transport is target housekeeping, independent of the
+    // original Supervisor's subsequently revoked permission.
+    let retirement = crate::runtime::loop_control::scoped::retire_terminal_transport(&config).await;
+    let result = match (result, retirement) {
+        (Err(error), Err(cleanup)) => {
+            tracing::warn!(%cleanup, "terminal transport cleanup failed");
+            Err(error)
+        }
+        (result @ Err(_), _) => result,
+        (Ok(()), Err(cleanup)) if cancel_token.is_cancelled() => {
+            tracing::warn!(%cleanup, "terminal transport cleanup failed during cancellation");
+            Err(bamboo_agent_core::AgentError::Cancelled)
+        }
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    };
+    let result = if (counted_generation.is_some() || scoped_transport)
+        && result.is_ok()
+        && cancel_token.is_cancelled()
+    {
         Err(bamboo_agent_core::AgentError::Cancelled)
     } else {
         result
@@ -329,12 +396,15 @@ pub(crate) async fn run_agent_loop_with_config(
             // Counted completion has one publication boundary, after every
             // fallible hook/finalizer and the original generation's checkpoint.
             let completion = match checkpoint {
-                Err(error) if cancel_token.is_cancelled() && counted_generation.is_some() => {
+                Err(error)
+                    if cancel_token.is_cancelled()
+                        && (counted_generation.is_some() || scoped_transport) =>
+                {
                     tracing::warn!(%error, "counted-loop checkpoint failed during cancellation");
                     Err(bamboo_agent_core::AgentError::Cancelled)
                 }
                 Err(error) => Err(error),
-                Ok(()) if counted_generation.is_some() => {
+                Ok(()) if counted_generation.is_some() || scoped_transport => {
                     tokio::select! {
                         biased;
                         _ = cancel_token.cancelled() => Err(bamboo_agent_core::AgentError::Cancelled),
@@ -365,6 +435,14 @@ pub(crate) async fn run_agent_loop_with_config(
             completion
         }
     }
+}
+
+fn defers_terminal_complete(config: &AgentLoopConfig) -> bool {
+    config.effective_counted_loop().is_some()
+        || config
+            .loop_control
+            .as_ref()
+            .is_some_and(|control| control.supervisor_grant_id().is_some())
 }
 
 fn fail_counted_runtime(

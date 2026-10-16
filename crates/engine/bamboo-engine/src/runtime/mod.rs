@@ -41,7 +41,7 @@ pub use hooks::{
     LifecycleHookTestOutput, LifecycleScriptRunner, ScriptHook, ShellCommandHook, ShellHookEvent,
     ShellHookTestOutput,
 };
-pub use loop_control::LoopControlConfig;
+pub use loop_control::{LoopControlConfig, SupervisorLoopControlGrant};
 pub use managers::{
     LifecycleManager, LlmManager, MemoryManager, MiniLoopExecutor, PromptManager, ToolManager,
 };

@@ -694,6 +694,7 @@ async fn self_control_malformed_schema_two_and_oversized_writes_fail_closed() {
             4 => {
                 bad.objective = "\0".repeat(MAX_LOOP_PROMPT_BYTES);
                 bad.control.as_mut().unwrap().pending_objective = Some(PendingLoopObjective {
+                    origin: None,
                     objective: "\0".repeat(MAX_LOOP_PROMPT_BYTES),
                     objective_revision: 2,
                 });
