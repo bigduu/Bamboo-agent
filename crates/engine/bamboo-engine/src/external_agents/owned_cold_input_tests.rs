@@ -220,3 +220,271 @@ async fn completed_plain_batch_keeps_unsupported_backlogs_and_identity_unchanged
         }
     }
 }
+
+#[tokio::test]
+async fn completed_plain_batch_release_preserves_order_exact_retry_and_partial_ack() {
+    use bamboo_subagent::proto::{InitialInputControl, InitialInputReleaseRequest};
+    for case in [
+        "accepted",
+        "early-terminal",
+        "wrong-order",
+        "changed-retry-nonce",
+    ] {
+        let (_temp, store, policy, binding, mut child, envelopes) =
+            completed_plain_inputs_fixture(2, false).await;
+        let _owner = binding
+            .router
+            .register_run(&child.id, "cold-input-new-run")
+            .await
+            .unwrap();
+        let (activation, prepared) = PlainActorActivation::start_and_prepare(
+            store.clone(),
+            &mut child,
+            &binding,
+            Some("cold-input-new-run"),
+            Some(policy.clone()),
+            true,
+            Some("cold-input-probed-worker"),
+        )
+        .await
+        .unwrap();
+        let (prefix, deliveries) = prepared.unwrap();
+        assert_eq!(deliveries.len(), 2);
+        let revision = policy.policy_revision();
+        let run = RunSpec {
+            assignment: "initial task".into(),
+            logical_session: Some(LogicalSessionIdentity {
+                session_id: child.id.clone(),
+                parent_session_id: child.parent_session_id.clone(),
+                root_session_id: child.root_session_id.clone(),
+                creation: Some(bamboo_subagent::proto::ChildCreationIdentity {
+                    created_at: child.created_at,
+                    spawn_depth: child.spawn_depth,
+                }),
+            }),
+            project_id: None,
+            reasoning_effort: None,
+            permission_policy: Some(bamboo_subagent::proto::PermissionPolicyContext {
+                revision,
+                requested_mode: "default".into(),
+                effective_mode: "default".into(),
+                bypass_permissions: false,
+                auto_approve_permissions: false,
+                session_id: child.id.clone(),
+                workspace_path: child.workspace.clone(),
+                environment_lease: None,
+                inherit_session_grants: false,
+                policy: serde_json::to_value(policy.to_serializable()).unwrap(),
+            }),
+            messages: prefix,
+            activation_run_id: Some("cold-input-new-run".into()),
+            execution_epoch: 7,
+            initial_session_messages: deliveries,
+            secrets: Default::default(),
+        };
+        let first = InitialInputReleaseRequest::from_run(
+            &run,
+            &run.initial_session_messages[0],
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+        let second = InitialInputReleaseRequest::from_run(
+            &run,
+            &run.initial_session_messages[1],
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+        let control = |request| ChildFrame::Event {
+            event: serde_json::to_value(InitialInputControl::Request { request }).unwrap(),
+        };
+        let mut frames = VecDeque::from([permission_posture_frame(&child.id, revision)]);
+        if case == "wrong-order" {
+            frames.push_back(control(second));
+        } else {
+            frames.push_back(control(first.clone()));
+            if case == "accepted" {
+                frames.push_back(control(first));
+                frames.push_back(control(second));
+            } else if case == "changed-retry-nonce" {
+                let mut wrong = first;
+                wrong.nonce = uuid::Uuid::new_v4().to_string();
+                frames.push_back(control(wrong));
+            }
+        }
+        frames.push_back(ChildFrame::Terminal {
+            status: TerminalStatus::Completed,
+            result: Some("batch result".into()),
+            error: None,
+            final_event_watermark: None,
+            transcript: Vec::new(),
+        });
+        let mut link = ConfirmationSequenceLink {
+            frames,
+            sent: Vec::new(),
+        };
+        let (events, _events_rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+        let (_live_tx, mut live_rx) = mpsc::unbounded_channel();
+        let (_delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
+        let epochs = AtomicU64::new(7);
+        let result = drive(ActorDriveContext {
+            client: &mut link,
+            parent_session_id: "cold-input-parent",
+            child_session_id: "cold-input-child",
+            child_attempt: 1,
+            approval_registry: None,
+            approval_decider: None,
+            approval_reviewer: None,
+            escalation_bridge: None,
+            event_tx: &events,
+            cancel_token: &cancel,
+            live_rx: &mut live_rx,
+            delivery_rx: &mut delivery_rx,
+            logical_session: &mut child,
+            expected_permission_posture: Some(expected_default_permission_posture(revision)),
+            expected_creation: None,
+            session_inbox_runtime: Some(&binding),
+            actor_directory_store: None,
+            canonical_subagent_tool: None,
+            ticket_service: None,
+            activation_run_id: Some("cold-input-new-run"),
+            execution_epoch: 7,
+            expected_source_actor_id: "cold-input-child",
+            initial_inflight_claims: VecDeque::new(),
+            first_frame_timeout: Some(Duration::from_secs(1)),
+            plain_actor: true,
+            remote_environment_lease: false,
+            readonly_output: None,
+            local_history_tools: None,
+            local_history_read_only: false,
+            strict_history_output: None,
+            plain_input: Some(&activation),
+            canonical_activation: None,
+            canonical_placement_ref: None,
+            actor_event_observer: None,
+            plain_run: Some((&run, &epochs)),
+        })
+        .await;
+        assert_eq!(result.is_ok(), case == "accepted", "{case}: {result:?}");
+        let releases = link
+            .sent
+            .iter()
+            .filter_map(|frame| match frame {
+                ParentFrame::InitialInputRelease { release } => Some(release),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if case == "accepted" {
+            assert_eq!(releases.len(), 3);
+            assert_eq!(
+                releases[0], releases[1],
+                "exact retry preserves nonce and deadline"
+            );
+            assert_eq!(releases[2].request.envelope_id, envelopes[1].id.as_str());
+        }
+        assert_eq!(
+            binding
+                .inbox
+                .was_admitted(&child.id, &envelopes[0].id)
+                .await
+                .unwrap(),
+            case != "wrong-order",
+            "{case}"
+        );
+        assert_eq!(
+            binding
+                .inbox
+                .was_admitted(&child.id, &envelopes[1].id)
+                .await
+                .unwrap(),
+            case == "accepted",
+            "{case}"
+        );
+        assert!(
+            !child
+                .messages
+                .iter()
+                .any(|message| message.content == "batch result"),
+            "worker terminal is not a Host transcript append"
+        );
+        activation
+            .finish(ActorActivationFinish::Failed)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn completed_plain_batch_rejects_unsupported_member_before_any_checkpoint() {
+    use bamboo_domain::{SessionMessageDeliveryIntent, SessionMessageKind, SessionMessageSource};
+    let (_temp, store, policy, binding, mut child, _) =
+        completed_plain_inputs_fixture(0, false).await;
+    let parent = store
+        .load_session("cold-input-parent")
+        .await
+        .unwrap()
+        .unwrap();
+    let source = bamboo_domain::ActorSession::from_session(&parent).unwrap();
+    let target = bamboo_domain::ActorSession::from_session(&child).unwrap();
+    let before = serde_json::to_value(&child.messages).unwrap();
+    let mut inputs = Vec::new();
+    for (slot, text) in ["valid input".to_string(), "x".repeat(8193)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut envelope = bamboo_domain::SessionMessageEnvelope::user_input(&child.id, text);
+        envelope.kind = SessionMessageKind::PeerMessage;
+        envelope.source = SessionMessageSource::Session {
+            session_id: parent.id.clone(),
+        };
+        envelope.thread_id = Some(format!("unsupported-batch-thread-{slot}"));
+        envelope.correlation_id = Some(format!("unsupported-batch-operation-{slot}"));
+        binding
+            .inbox
+            .deliver_peer_message_with_intent(
+                &envelope,
+                &source,
+                &target,
+                None,
+                if slot == 0 {
+                    SessionMessageDeliveryIntent::QueueOnly
+                } else {
+                    SessionMessageDeliveryIntent::TriggerTurn
+                },
+            )
+            .await
+            .unwrap();
+        inputs.push(envelope);
+    }
+    let _owner = binding
+        .router
+        .register_run(&child.id, "cold-input-new-run")
+        .await
+        .unwrap();
+    assert!(PlainActorActivation::start_and_prepare(
+        store.clone(),
+        &mut child,
+        &binding,
+        Some("cold-input-new-run"),
+        Some(policy),
+        true,
+        Some("cold-input-probed-worker"),
+    )
+    .await
+    .is_err());
+    let canonical = store.load_session(&child.id).await.unwrap().unwrap();
+    assert_eq!(serde_json::to_value(&canonical.messages).unwrap(), before);
+    for envelope in inputs {
+        assert!(!binding
+            .inbox
+            .was_admitted(&child.id, &envelope.id)
+            .await
+            .unwrap());
+    }
+    let entry = store.inspect_actor(&child.id).await.unwrap();
+    assert_eq!(entry.actor.current_attempt, 2);
+    assert_eq!(
+        entry.activation.unwrap().status,
+        bamboo_domain::ActorActivationStatus::Failed
+    );
+}

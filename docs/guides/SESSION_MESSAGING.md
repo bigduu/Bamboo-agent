@@ -58,7 +58,8 @@ transitions wait on that target's fence; unrelated Sessions keep progressing.
 The global Router state lock covers only memory checks/updates, never disk I/O.
 The existing generation reservation/format preparation may survive a rejected late
 publication, as with other cancelled admission; it is not a message receipt.
-The existing strict zero-tool Child cold-continuation boundary is unchanged.
+Steer does not broaden the strict zero-tool Child continuation boundary. A
+retired run's unconsumed steer cannot become a cold successor's input.
 
 ## Receipt boundaries
 
@@ -90,11 +91,25 @@ same policy before and after ACK.
 
 TriggerTurn grants scheduling permission, subject to the existing receiver route;
 it does not certify that every Child can resume every backlog shape. The strict
-owned zero-tool Actor Child continuation currently admits one fresh pending
-input. A queued input plus a later followup exceeds that existing cold-continuation
-shape. This slice does not widen its admission, lease or completion protocol;
-that route's multi-input continuation remains P1 follow-up acceptance in #2000.
-Other supported consumers can admit queued input at their existing safe points.
+owned zero-tool Actor Child can cold-continue after a successful plain completion
+with one or two new bounded text inputs. QueueOnly followed by TriggerTurn can
+therefore be admitted together in order. QueueOnly alone still cannot start the
+idle Child. More than two pending inputs, an outstanding claim, tools/native
+history, stale birth/lineage, or missing owned worker release remain unsupported.
+
+The Host claims and validates the bounded selection, then checkpoints every
+input under the existing current Actor fence before dispatching one worker Run.
+Each input retains its own physical claim, canonical identity and v1 release.
+The worker must obtain every exact Host ACK/release before entering its provider;
+one ACK is not a batch receipt. Exact release retransmission retains its nonce
+and deadline. A failed, partial or uncertain checkpoint/ACK/release cannot become
+successful execution, and durable input/history is preserved.
+
+Failed retry, expired initial-owner replacement and pre-ACK recovery retain their
+single-input contracts. The Actor lease, permission checks, wait coordinators,
+warm correction allowance and completion validation are unchanged. This bounded
+batch consumes the existing cold allowance; later input is not silently added
+to the worker Run. Other supported consumers retain their safe-point admission.
 
 ## Compatibility and later phases
 

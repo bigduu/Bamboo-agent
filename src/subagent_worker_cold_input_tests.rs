@@ -163,26 +163,27 @@ async fn initial_release_two_inputs_waits_for_every_owned_host_receipt() {
             .await
             .unwrap()
             .unwrap();
-        let calls = provider.calls.lock().unwrap();
-        if case == "accepted" {
-            assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
-            assert_eq!(calls.len(), 1);
-            let actual = calls[0]
-                .iter()
-                .filter(|message| {
-                    message.content == "BATCH_FIRST" || message.content == "BATCH_SECOND"
-                })
-                .map(|message| message.content.as_str())
-                .collect::<Vec<_>>();
-            assert_eq!(actual, ["BATCH_FIRST", "BATCH_SECOND"]);
-        } else {
-            assert_ne!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
-            assert!(
-                calls.is_empty(),
-                "{case}: partial release cannot enter provider"
-            );
+        {
+            let calls = provider.calls.lock().unwrap();
+            if case == "accepted" {
+                assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
+                assert_eq!(calls.len(), 1);
+                let actual = calls[0]
+                    .iter()
+                    .filter(|message| {
+                        message.content == "BATCH_FIRST" || message.content == "BATCH_SECOND"
+                    })
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, ["BATCH_FIRST", "BATCH_SECOND"]);
+            } else {
+                assert_ne!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
+                assert!(
+                    calls.is_empty(),
+                    "{case}: partial release cannot enter provider"
+                );
+            }
         }
-        drop(calls);
         assert!(inbox
             .was_admitted(&child.id, &envelopes[0].id)
             .await

@@ -1420,6 +1420,9 @@ impl ChildExecutor for BambooRuntimeExecutor {
             }
         }
         let initial_deliveries = run.initial_session_messages.clone();
+        if self.initial_input_release_required && initial_deliveries.len() > 2 {
+            return ChildOutcome::error("initial release supports at most two exact typed inputs");
+        }
         if !initial_deliveries.is_empty()
             && expected_activation_run_id
                 .as_deref()
@@ -1873,14 +1876,15 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 }
             }
         }
-        let initial_release_deadline =
-            if self.initial_input_release_required && !initial_deliveries.is_empty() {
-                if initial_deliveries.len() != 1 {
-                    return ChildOutcome::error("initial release requires one exact typed input");
-                }
+        let mut initial_release_deadline: Option<chrono::DateTime<chrono::Utc>> = None;
+        if self.initial_input_release_required {
+            // Keep the existing exact-input v1 control and nonce for each item.
+            // No SDK/provider entry until every ordered Host ACK is released;
+            // later replies cannot extend the earliest physical lease deadline.
+            for delivery in &initial_deliveries {
                 let request = match bamboo_subagent::proto::InitialInputReleaseRequest::from_run(
                     &run,
-                    &initial_deliveries[0],
+                    delivery,
                     uuid::Uuid::new_v4().to_string(),
                 ) {
                     Ok(request) => request,
@@ -1890,12 +1894,15 @@ impl ChildExecutor for BambooRuntimeExecutor {
                     return ChildOutcome::error(error);
                 }
                 match steer.wait_initial_release(&request, &cancel, &events).await {
-                    Ok(deadline) => Some(deadline),
+                    Ok(deadline) => {
+                        initial_release_deadline = Some(
+                            initial_release_deadline.map_or(deadline, |old| old.min(deadline)),
+                        );
+                    }
                     Err(error) => return ChildOutcome::error(error),
                 }
-            } else {
-                None
-            };
+            }
+        }
 
         // In-band steering: typed ParentFrame::SessionMessage values enter the
         // worker-local durable SessionInbox. The real engine safe-turn bridge
