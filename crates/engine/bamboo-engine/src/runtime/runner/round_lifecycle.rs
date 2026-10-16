@@ -249,15 +249,16 @@ pub(crate) async fn execute_llm_round(
     let request_tool_schemas =
         context_tool_schemas_for_session(session, llm, model_name, tool_schemas).await;
     let tool_schemas = request_tool_schemas.as_ref();
-    // Context preparation may describe historical images using the Vision
-    // role. Cancellation must also drop that request/stream before main dispatch.
-    let prepared = tokio::select! {
-        biased;
-        _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
-        result = context_preparation::prepare_round_context(
-            session, config, model_name, session_id, tool_schemas, llm, Some(event_tx),
-        ) => result?,
-    };
+    let prepared = context_preparation::prepare_round_context(
+        session,
+        config,
+        model_name,
+        session_id,
+        tool_schemas,
+        llm,
+        Some(event_tx),
+    )
+    .await?;
 
     // Use model from config (provided by execute request), not from session.
     let model = config

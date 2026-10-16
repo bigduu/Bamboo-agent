@@ -247,7 +247,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "ViewImage" => Some(guide(
             "ViewImage",
             ToolCategory::FileReading,
-            "Load a local raster image for visual inspection. Vision-capable main models receive multimodal image content. When the main model has Vision disabled, Bamboo uses the explicitly configured Vision model and returns a labeled description as untrusted tool data. Missing or unsupported Vision configuration is an actionable tool error. The main model is unchanged.",
+            "Load a local raster image for visual inspection. Vision-capable main models receive multimodal image content. When the main model has Vision disabled, Bamboo uses the explicitly configured Vision model and returns a labeled description as untrusted tool data. This fallback applies only to this tool. Direct conversation image uploads to a main model without Vision remain rejected, even when a Vision model is configured. Missing or unsupported Vision configuration is an actionable tool error. The main model is unchanged.",
             "Do not use for text files, directories, SVG/vector files, or images larger than 10 MB; use Read for textual content.",
             &["Read", "GetFileInfo"],
             vec![example(

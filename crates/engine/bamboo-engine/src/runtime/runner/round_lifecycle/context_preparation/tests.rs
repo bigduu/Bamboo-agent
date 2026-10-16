@@ -2141,12 +2141,6 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
     );
 
     let (llm, models) = recording_llm_with_response(vision_description);
-    let vision_provider = llm.clone();
-    let mut config = config;
-    config.vision_model_resolver = Some(Arc::new(move || {
-        let provider = vision_provider.clone();
-        Box::pin(async move { Ok(bamboo_llm::ResolvedModel::new(provider, "vision-test")) })
-    }));
     let prepared = prepare_round_context(
         &mut session,
         &config,

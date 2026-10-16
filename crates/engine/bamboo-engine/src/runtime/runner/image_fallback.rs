@@ -55,7 +55,8 @@ pub async fn apply_image_fallback_to_llm_messages(
 #[cfg(test)]
 mod tests;
 
-/// A host resolver, kept separate from model-supplied tool arguments.
+/// A host resolver exclusively for ViewImage tool results, kept separate
+/// from model arguments. Never apply it to conversation uploads or history.
 pub(crate) type VisionModelResolver = Arc<
     dyn Fn() -> futures::future::BoxFuture<'static, Result<ResolvedModel, AgentError>>
         + Send
