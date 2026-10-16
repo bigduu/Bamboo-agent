@@ -1,4 +1,6 @@
 mod clone_publication;
+mod definition_publication;
+mod definitions;
 mod handlers;
 #[cfg(test)]
 mod tests;
@@ -15,3 +17,8 @@ pub use types::{
 };
 
 pub(crate) use validation::is_safe_workflow_name;
+
+pub use definitions::{
+    create_workflow_definition, get_workflow_definition, update_workflow_definition,
+    validate_workflow_definition,
+};

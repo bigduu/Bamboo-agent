@@ -600,7 +600,8 @@ impl AppState {
             permission_checker.permission_config(),
         )
         .await
-        .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
+        .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?
+        .with_project_scope(project_store.clone(), workspace_resolver.clone());
 
         // Idle-evict completed runners together with their paired session event
         // senders (issue #346). Spawned here (not next to `agent_runners`) so it

@@ -183,6 +183,7 @@ pub struct WorkflowRunEngine {
 }
 
 struct ActiveRun {
+    session_id: String,
     cancellation: CancellationToken,
     snapshot: Arc<Mutex<WorkflowRunSnapshot>>,
     root_run_id: String,
@@ -588,6 +589,7 @@ impl WorkflowRunEngine {
         let ledger = Arc::new(Mutex::new(previous.usage.clone()));
         let drain_lock = Arc::new(Mutex::new(()));
         let active = Arc::new(ActiveRun {
+            session_id: session_id.to_string(),
             cancellation: cancellation.clone(),
             snapshot: snapshot.clone(),
             root_run_id: run_id.to_string(),
@@ -783,6 +785,7 @@ impl WorkflowRunEngine {
             updated_at: now,
         };
         let queued = event(&snapshot, None, WorkflowRunEventKind::RunQueued);
+        let session_id = snapshot.session_id.clone();
         self.repository
             .create(&snapshot, &queued)
             .await
@@ -795,6 +798,7 @@ impl WorkflowRunEngine {
         self.active.insert(
             run_id.clone(),
             Arc::new(ActiveRun {
+                session_id,
                 cancellation: cancellation.clone(),
                 snapshot: snapshot.clone(),
                 root_run_id: root_run_id.clone(),
@@ -997,6 +1001,12 @@ impl WorkflowRunEngine {
         self.active.contains_key(run_id)
     }
 
+    /// Includes workers whose terminal snapshot is visible but whose cleanup
+    /// has not drained. Adapters fence Session scope changes until this ends.
+    pub fn is_session_active(&self, session_id: &str) -> bool {
+        self.active.iter().any(|run| run.session_id == session_id)
+    }
+
     #[cfg(test)]
     pub(super) fn test_active_ledger(
         &self,
@@ -1029,6 +1039,7 @@ impl WorkflowRunEngine {
             Entry::Occupied(entry) => (entry.get().clone(), None),
             Entry::Vacant(entry) => {
                 let active = Arc::new(ActiveRun {
+                    session_id: snapshot.session_id.clone(),
                     cancellation: CancellationToken::new(),
                     snapshot: Arc::new(Mutex::new(snapshot)),
                     root_run_id: run_id.to_string(),

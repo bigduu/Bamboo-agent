@@ -35,6 +35,22 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
         )
         // Settings routes
         .route(
+            "/bamboo/workflow-definitions/validate",
+            web::post().to(settings::validate_workflow_definition),
+        )
+        .route(
+            "/bamboo/workflow-definitions",
+            web::post().to(settings::create_workflow_definition),
+        )
+        .route(
+            "/bamboo/workflow-definitions/{workflow_id}",
+            web::get().to(settings::get_workflow_definition),
+        )
+        .route(
+            "/bamboo/workflow-definitions/{workflow_id}",
+            web::put().to(settings::update_workflow_definition),
+        )
+        .route(
             "/bamboo/workflow-catalog",
             web::get().to(settings::list_workflow_catalog),
         )
