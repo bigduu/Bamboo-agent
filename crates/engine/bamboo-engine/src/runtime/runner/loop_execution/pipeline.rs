@@ -13855,6 +13855,8 @@ mod tests {
     struct VisionLoopProvider {
         support: Option<bool>,
         path: String,
+        expect_description: bool,
+        alias: &'static str,
         calls: AtomicUsize,
         received_images: std::sync::Mutex<Vec<bool>>,
     }
@@ -13877,7 +13879,7 @@ mod tests {
                 return Ok(Box::pin(stream::iter(vec![
                     Ok(LLMChunk::ToolCalls(vec![activation_call(
                         "vision-call",
-                        "default::ViewImage",
+                        self.alias,
                         &serde_json::json!({"path":self.path}).to_string(),
                     )])),
                     Ok(LLMChunk::Done),
@@ -13895,8 +13897,14 @@ mod tests {
             self.received_images.lock().unwrap().push(images);
             if self.support == Some(false) {
                 assert!(!images);
-                assert!(result.content.contains("does not support Vision"));
-                assert!(result.content.contains("No image was read or sent"));
+                if self.expect_description {
+                    assert!(result.content.contains("Vision model output"));
+                    assert!(result.content.contains("untrusted data"));
+                    assert!(result.content.contains("visual fixture"));
+                } else {
+                    assert!(result.content.contains("configured Vision model"));
+                    assert!(result.content.contains("No image was sent"));
+                }
             } else {
                 assert!(
                     images,
@@ -13910,7 +13918,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn vision_real_viewimage_loop_delivers_default_support_and_rejects_only_false() {
+    async fn vision_real_viewimage_loop_delivers_direct_images_or_configuration_feedback() {
         let image = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
         std::fs::write(image.path(), b"\x89PNG\r\n\x1a\nvision-test").unwrap();
         for support in [Some(true), Some(false), None] {
@@ -13921,6 +13929,8 @@ mod tests {
                 } else {
                     image.path().to_string_lossy().into_owned()
                 },
+                expect_description: false,
+                alias: "default::ViewImage",
                 calls: AtomicUsize::new(0),
                 received_images: Default::default(),
             });
@@ -13931,6 +13941,17 @@ mod tests {
             state.model_name = "actual-model".into();
             let config = AgentLoopConfig {
                 model_name: Some("actual-model".into()),
+                image_fallback: (support == Some(true)).then_some(crate::ImageFallbackConfig {
+                    mode: crate::ImageFallbackMode::Error,
+                    vision_model: None,
+                }),
+                vision_model_resolver: if support == Some(false) {
+                    None
+                } else {
+                    Some(Arc::new(|| {
+                        panic!("Vision-capable main must not invoke an auxiliary model")
+                    }))
+                },
                 ..delegation_loop_config()
             };
             let (tx, _rx) = tokio::sync::mpsc::channel(256);
@@ -13952,6 +13973,241 @@ mod tests {
                 vec![support != Some(false)]
             );
         }
+    }
+
+    struct AuxiliaryVisionMock(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl LLMProvider for AuxiliaryVisionMock {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[bamboo_domain::ToolSchema],
+            max: Option<u32>,
+            model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            assert_eq!(model, "configured-vision");
+            assert_eq!(max, Some(1024));
+            assert!(tools.is_empty());
+            assert!(messages[0].content.contains("untrusted"));
+            assert!(messages[1]
+                .content_parts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. })));
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("visual fixture".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_same_nonvision_main_rejects_uploads_but_describes_viewimage_output() {
+        let image = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+        std::fs::write(image.path(), b"\x89PNG\r\n\x1a\nvision-test").unwrap();
+        let provider = Arc::new(VisionLoopProvider {
+            support: Some(false),
+            path: image.path().to_string_lossy().into_owned(),
+            expect_description: true,
+            alias: "view_image",
+            calls: AtomicUsize::new(0),
+            received_images: Default::default(),
+        });
+        let vision_calls = Arc::new(AtomicUsize::new(0));
+        let vision: Arc<dyn LLMProvider> = Arc::new(AuxiliaryVisionMock(vision_calls.clone()));
+        let target_resolutions = Arc::new(AtomicUsize::new(0));
+        let resolver_count = target_resolutions.clone();
+        let mut session = Session::new("vision-loop-fallback", "stale-session-model");
+        session.add_message(Message::user("View the image"));
+        let mut state = e2e_loop_state(&session.id);
+        state.model_name = "actual-model".into();
+        let config = AgentLoopConfig {
+            model_name: Some("actual-model".into()),
+            // Even an enabled legacy Vision hook and a valid tool target must
+            // not forward a direct upload when the main model lacks Vision.
+            image_fallback: Some(crate::ImageFallbackConfig {
+                mode: crate::ImageFallbackMode::Vision,
+                vision_model: Some("configured-vision".into()),
+            }),
+            vision_model_resolver: Some(Arc::new(move || {
+                resolver_count.fetch_add(1, Ordering::SeqCst);
+                let provider = vision.clone();
+                Box::pin(async move {
+                    Ok(bamboo_llm::ResolvedModel::new(
+                        provider,
+                        "configured-vision",
+                    ))
+                })
+            })),
+            ..delegation_loop_config()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        // Same executing main provider, effective model, target and hook config
+        // as the successful ViewImage call below. Both upload transports reject
+        // before attachment resolution, either provider call, or target lookup.
+        for url in [
+            "data:image/png;base64,iVBORw0KGgo=",
+            "bamboo-attachment://upload-session/image1",
+        ] {
+            let mut upload = Session::new("vision-upload-rejected", "stale-session-model");
+            let message = Message::user_with_parts(
+                "uploaded image",
+                vec![bamboo_domain::MessagePart::ImageUrl {
+                    image_url: bamboo_domain::ImageUrlRef {
+                        url: url.into(),
+                        detail: None,
+                    },
+                }],
+            );
+            let image_id = message.id.clone();
+            let original_parts = message.content_parts.clone();
+            upload.add_message(message);
+            let entry_error = crate::session_app::execute::validate_image_fallback_for_session(
+                &upload,
+                config.image_fallback.as_ref(),
+                "actual-model",
+                Some(false),
+            )
+            .unwrap_err();
+            assert!(entry_error.contains("does not support Vision"));
+            let mut upload_state = e2e_loop_state(&upload.id);
+            upload_state.model_name = "actual-model".into();
+            let runtime_error = super::run_pipeline(
+                &mut upload,
+                &tx,
+                provider.clone(),
+                Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+                &tokio_util::sync::CancellationToken::new(),
+                &config,
+                &mut upload_state,
+            )
+            .await
+            .unwrap_err();
+            assert!(runtime_error
+                .to_string()
+                .contains("does not support Vision"));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(target_resolutions.load(Ordering::SeqCst), 0);
+            assert_eq!(vision_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(upload.model, "stale-session-model");
+            assert_eq!(
+                upload
+                    .messages
+                    .iter()
+                    .find(|message| message.id == image_id)
+                    .unwrap()
+                    .content_parts,
+                original_parts
+            );
+        }
+        assert!(super::run_pipeline(
+            &mut session,
+            &tx,
+            provider.clone(),
+            Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+            &tokio_util::sync::CancellationToken::new(),
+            &config,
+            &mut state
+        )
+        .await
+        .unwrap());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(vision_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(target_resolutions.load(Ordering::SeqCst), 1);
+        assert_eq!(*provider.received_images.lock().unwrap(), vec![false]);
+        assert_eq!(session.model, "stale-session-model");
+        assert_eq!(state.model_name, "actual-model");
+        let result = session
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("vision-call"))
+            .unwrap();
+        assert!(result.content_parts.is_none());
+        assert!(result.content.contains("Vision model output"));
+    }
+
+    struct WaitingVisionMock {
+        started: Arc<tokio::sync::Notify>,
+        dropped: Arc<AtomicBool>,
+    }
+    struct WaitingVisionDrop(Arc<AtomicBool>);
+    impl Drop for WaitingVisionDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    #[async_trait::async_trait]
+    impl LLMProvider for WaitingVisionMock {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_domain::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let guard = WaitingVisionDrop(self.dropped.clone());
+            self.started.notify_one();
+            futures::future::pending::<()>().await;
+            drop(guard);
+            unreachable!()
+        }
+    }
+    #[tokio::test]
+    async fn vision_pipeline_cancellation_drops_only_the_viewimage_fallback_request() {
+        let image = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+        std::fs::write(image.path(), b"\x89PNG\r\n\x1a\nvision-test").unwrap();
+        let main = Arc::new(VisionLoopProvider {
+            support: Some(false),
+            path: image.path().to_string_lossy().into_owned(),
+            expect_description: true,
+            alias: "viewImage",
+            calls: AtomicUsize::new(0),
+            received_images: Default::default(),
+        });
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let vision: Arc<dyn LLMProvider> = Arc::new(WaitingVisionMock {
+            started: started.clone(),
+            dropped: dropped.clone(),
+        });
+        let mut session = Session::new("cancel-viewimage-fallback", "actual-model");
+        session.add_message(Message::user("View the image"));
+        let mut state = e2e_loop_state(&session.id);
+        state.model_name = "actual-model".into();
+        let config = AgentLoopConfig {
+            model_name: Some("actual-model".into()),
+            vision_model_resolver: Some(Arc::new(move || {
+                let provider = vision.clone();
+                Box::pin(async move {
+                    Ok(bamboo_llm::ResolvedModel::new(
+                        provider,
+                        "configured-vision",
+                    ))
+                })
+            })),
+            ..delegation_loop_config()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let work = super::run_pipeline(
+            &mut session,
+            &tx,
+            main.clone(),
+            Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+            &cancel,
+            &config,
+            &mut state,
+        );
+        let (result, ()) = tokio::join!(work, async {
+            started.notified().await;
+            cancel.cancel();
+        });
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(main.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(session.model, "actual-model");
     }
 }
 
