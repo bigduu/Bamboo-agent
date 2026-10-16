@@ -282,6 +282,9 @@ pub(crate) async fn drain(
         if policy.execution_cancel()?.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
+        if policy.stop.is_cancelled() {
+            return Ok(());
+        }
         let Some(claim) = claims.into_iter().next() else {
             return Ok(());
         };
@@ -327,6 +330,11 @@ async fn apply_input(
         .await;
     if policy.execution_cancel()?.is_cancelled() {
         return Err(AgentError::Cancelled);
+    }
+    // No configuration proposal or checkpoint has started. A host stop that
+    // invalidated this read is an ordinary stop boundary, not a failed task.
+    if policy.stop.is_cancelled() {
+        return Ok(());
     }
     authority
         .map_err(|_| super::fatal("Supervisor Loop authority revoked before application"))?
@@ -398,6 +406,14 @@ async fn apply_input(
     if !bindings.contains(binding) {
         bindings.push(binding.clone());
     }
+    if policy.execution_cancel()?.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+    if policy.stop.is_cancelled() {
+        return Ok(());
+    }
+    // From this point onward every physical I/O/unknown result is preserved;
+    // a concurrent host stop cannot turn a checkpoint error into success.
     let checkpoint = checkpoint_scoped(&mut staged, config, &bindings, Some((inbox, claim))).await;
     // The helper has either a confirmed checkpoint, a strict canonical reload,
     // or an explicit volatile no-save fence. Never replace it with the proposal.
