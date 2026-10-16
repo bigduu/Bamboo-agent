@@ -366,6 +366,10 @@ async fn actual_completed_owned_child_cold_batch_requires_every_host_ack() {
             ActorActivationStatus::Succeeded
         );
         assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
+        eprintln!(
+            "cold-batch-stage {}",
+            json!({"stage":"initial_completed","count":count,"ack_fault":fail_ack,"attempt":old_actor.actor.current_attempt,"provider_calls":probe.child_calls.load(Ordering::SeqCst)})
+        );
         let store = std::sync::Arc::new(SessionStoreV2::new(data.clone()).await.unwrap());
         let parent = store.load_session("plain-root").await.unwrap().unwrap();
         let source = ActorSession::from_session(&parent).unwrap();
@@ -417,6 +421,10 @@ async fn actual_completed_owned_child_cold_batch_requires_every_host_ack() {
         probe.phase.store(1, Ordering::SeqCst);
         assert!(client.post(format!("{base}/chat")).json(&json!({"session_id":"plain-root","message":"Send the prepared followup now","provider":"openai","model":"cold-batch-root"})).send().await.unwrap().status().is_success());
         let (after, actor) = cold_batch_wait_settled(&probe, &mut host, &client, &base, 1).await;
+        eprintln!(
+            "cold-batch-stage {}",
+            json!({"stage":"cold_settled","count":count,"ack_fault":fail_ack,"attempt":actor.actor.current_attempt,"activation_status":format!("{:?}",actor.activation.as_ref().unwrap().status),"child_status":after.last_run_status(),"provider_calls":probe.child_calls.load(Ordering::SeqCst)})
+        );
         assert_eq!(
             actor.actor.current_attempt, 2,
             "cold batch must claim exactly one new Actor attempt"
