@@ -453,9 +453,12 @@ impl FileSessionInbox {
             if input.binding != candidate {
                 return Err(invalid("closed Loop binding changed"));
             }
-            let digest = hex::encode(Sha256::digest(bamboo_domain::canonical_json_bytes(
-                &envelope.idempotency_semantics(),
-            )));
+            let digest = format!(
+                "{:x}",
+                Sha256::digest(bamboo_domain::canonical_json_bytes(
+                    &envelope.idempotency_semantics(),
+                ))
+            );
             let record = records.iter().find(|record| record.input_id == envelope.id);
             if record.is_some_and(|record| {
                 record.input_sha256 != digest
@@ -503,6 +506,9 @@ impl FileSessionInbox {
                 let claim = SessionInboxClaim {
                     claim_id: name,
                     generation,
+                    // The exact v3 expected-run intent checked above is
+                    // QueueOnly and always preserves the specific wait.
+                    activation_policy: SessionActivationPolicy::RespectSpecificWait,
                     envelope,
                 };
                 // No lease is minted/renewed and no cursor is changed. The
