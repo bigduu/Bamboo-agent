@@ -16,8 +16,8 @@ shipping an empty manual or fetching latest.
 
 This first slice provides a bounded configuration-key catalog and explanations
 of configuration, memory, hooks, providers/MCP and safe troubleshooting. It does
-not implement a full configuration schema, a runtime diagnostic collector or
-website publication. No configuration/memory mutation, hook execution or model
+not implement a full configuration schema or website publication. The server
+now also offers the bounded read-only observation tool described below. No configuration/memory mutation, hook execution or model
 call is part of manual retrieval.
 
 ## Maintaining the typed key reference
@@ -36,5 +36,29 @@ compare the embedded artifact byte-for-byte with deterministic generation and
 exercise typed defaults, non-default examples, aliases and selected validators.
 The generator reads no live configuration or environment. Its no-argument mode
 prints JSON; `--check` is read-only and only explicit `--write` changes the asset.
-This improves bounded coverage; it does not create a complete JSON Schema,
-instance diagnostic tool or website.
+This improves bounded coverage; it does not create a complete JSON Schema or
+website.
+
+
+## Current-session instance observations
+
+The server registers `bamboo_diagnostics` on its existing permission-aware base
+surface. It accepts `{}` only and binds to the tool context's current session.
+It projects existing in-process provider/MCP health, recorded application
+revisions/error codes and cached prompt-memory counts/status. It does not read
+configuration/credential files, environment values, transcripts or memory bodies;
+it does not probe a provider, reload, repair, load persisted sessions or mutate
+state. No new persistence or background authority is introduced.
+
+Read [safe troubleshooting](../crates/infra/bamboo-skills/assets/bamboo-manual/references/troubleshooting.md)
+for the evidence limits. Receipt existence is not desired/applied equivalence;
+cached memory counts are not proof of model use and have unknown capture time.
+Missing/invalid observations remain unknown. The manual is offline product
+knowledge; tool output is separately scoped instance evidence. Ordinary tool
+results may be sent to the configured model, so only explicit fixed labels,
+counts, revisions and timestamps are projected.
+
+Run focused `bamboo-server` diagnostics/receipt tests and the `bamboo-skills`
+product-manual integration tests when changing this adapter. Canary tests cover
+private source paths/errors, project identifiers, arbitrary status strings and
+other-session observations, and compare sources before/after collection.

@@ -65,9 +65,43 @@ Default diagnostic advice should use allowlisted static labels, counts,
 booleans and non-secret revisions. Raw config, logs, memory bodies, private
 paths, endpoints and identifiers are not safe merely because obvious keys were
 masked. Any runtime adapter should remain an explicitly scoped read-only
-projection over existing observations; this manual introduces none.
+projection over existing observations.
 
 Source: `src/setup_cli.rs`, `src/bin/bamboo.rs`,
 `crates/app/bamboo-server/src/handlers/agent/health.rs`,
 `docs/guides/configuration-application-state.md`, `docs/plugin-command-hooks.md`,
 and the implementation paths cited by the other chapters.
+
+## Read-only instance observations
+
+When the server exposes `bamboo_diagnostics`, invoke it with an empty object.
+It is bound to the current tool session; it accepts no session selector. Use
+this bounded observation alongside this manual, not a raw config/live-health
+response or system-prompt dump. A binary-only installation needs no source
+checkout for either operation. If the tool is unavailable or denied, report
+that gap; do not bypass it through raw files or another session.
+
+The result identifies the embedded manual version, source status/revision and
+content hash. A development or unverified source remains explicitly unverified;
+a same-named user skill does not change that embedded identity.
+
+The result contains provider/MCP local configuration status and revision,
+already recorded application receipt revisions and static error codes, and
+current-session cached prompt-memory status/counts. `observed_at` is the read
+time; memory `captured_at` is unknown. Memory snapshots may be stale. A
+recorded receipt does not establish desired/applied equivalence: the tool
+explicitly does not evaluate that comparison. Configuration health is not a
+remote connection or completion test. Missing or malformed observations and
+new, unrecognized memory status strings are `unknown`.
+
+No config/credential file, environment variable, transcript, memory body,
+project identifier, path, endpoint, raw error or digest is returned. The tool
+only reads existing in-process metadata: no model/network probe, persistent
+session load, reload, repair, or state mutation. It does not establish whether
+the model received or used memory. Normal tool results can become model
+context, so even this projection is deliberately restricted to allowlisted
+labels, timestamps, revisions and counts.
+
+Source: `crates/app/bamboo-server/src/tools/diagnostics.rs`,
+`crates/app/bamboo-server/src/app_state/config_application.rs`, and
+`crates/engine/bamboo-engine/src/runtime/runner/prompt_context/external_memory.rs`.

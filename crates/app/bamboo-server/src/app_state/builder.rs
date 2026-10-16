@@ -568,6 +568,7 @@ impl AppState {
             ))
         })?;
 
+        let diagnostics = Arc::new(crate::tools::diagnostics::DiagnosticsSource::default());
         let (base_tools, native_tool_ceiling) = build_base_tools(
             config.clone(),
             permission_checker.clone(),
@@ -587,6 +588,7 @@ impl AppState {
             tool_event_publisher.clone(),
             memory_store.clone(),
             session_messenger.clone(),
+            diagnostics.clone(),
         );
 
         // The workflow engine executes against the base tool surface. The
@@ -1383,6 +1385,13 @@ impl AppState {
                 account_sink.clone(),
                 config_application.clone(),
             );
+        diagnostics.bind(crate::tools::diagnostics::ReadSources {
+            providers: config_live_health.clone(),
+            mcp: mcp_config_live_health.clone(),
+            application: config_application.clone(),
+            sessions: sessions.clone(),
+            config_io_lock: config_io_lock.clone(),
+        });
         Ok(Self {
             browser,
             app_data_dir: bamboo_home_dir,
