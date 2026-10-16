@@ -77,7 +77,8 @@ impl GuideBuildContext {
                 "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
                 "Use exec_command only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
                 "When multiple exec_command calls are independent, run them in parallel. For dependent commands, chain with &&.",
-                "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms to bound each wait; completion does not send an automatic user notification. Unread completed results expire after five minutes; poll required commands to a terminal result before finishing the task.",
+                "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms to bound each wait; completion does not send an automatic user notification. Unread completed results expire five minutes after completion, including during a diagnostic pause; handles do not survive Host restart. Poll required commands to a terminal result before finishing the task.",
+                "When polling reports sustained silence and repeated empty readouts, follow its advisory: do useful work or check one command-owned progress signal before polling again. Quiet output or an existing report does not prove completion; keep the handle, continue waiting when appropriate, and report a concrete blocker if progress cannot be established. A Human-controlled Root can pause polling after the reminder is repeatedly ignored, retaining the command handle for continuation. Do not stop/restart a command only because it is quiet.",
                 "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
                 "For commit requests: inspect git status, git diff, and recent git log first; commit only when explicitly requested; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
                 "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
@@ -94,7 +95,8 @@ impl GuideBuildContext {
                 "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
                 "Use exec_command only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
                 "When multiple exec_command calls are independent, run them in parallel. For dependent commands, chain with &&.",
-                "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms to bound each wait; completion does not send an automatic user notification. Unread completed results expire after five minutes; poll required commands to a terminal result before finishing the task.",
+                "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms to bound each wait; completion does not send an automatic user notification. Unread completed results expire five minutes after completion, including during a diagnostic pause; handles do not survive Host restart. Poll required commands to a terminal result before finishing the task.",
+                "When polling reports sustained silence and repeated empty readouts, follow its advisory: do useful work or check one command-owned progress signal before polling again. Quiet output or an existing report does not prove completion; keep the handle, continue waiting when appropriate, and report a concrete blocker if progress cannot be established. A Human-controlled Root can pause polling after the reminder is repeatedly ignored, retaining the command handle for continuation. Do not stop/restart a command only because it is quiet.",
                 "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
                 "For commit requests: inspect git status, git diff, and recent git log first; commit only when explicitly requested; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
                 "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
@@ -148,6 +150,8 @@ mod tests {
             assert!(guidance.contains("exec_command"));
             assert!(guidance.contains("write_stdin with empty chars"));
             assert!(guidance.contains("does not send an automatic user notification"));
+            assert!(guidance.contains("follow its advisory"));
+            assert!(guidance.contains("does not prove completion"));
             assert!(!guidance.contains("Bash"));
         }
     }

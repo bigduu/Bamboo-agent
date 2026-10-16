@@ -1,7 +1,7 @@
 # ViewImage Vision fallback boundary
 
-Tracking: Bamboo #2014. This design is a static candidate; its Rust tests and
-compilation have not run while #1976 owns the Rust window.
+Tracking: Bamboo #2014 / PR #2017. This document defines the behavior boundary;
+source-bound validation results and resource handoffs are recorded in the PR.
 
 ## Two different image inputs
 

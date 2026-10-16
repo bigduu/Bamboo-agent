@@ -411,6 +411,11 @@ pub(super) fn truncate_exec_session_output(
             kept = serde_json::to_string(object).expect("terminal result is serializable");
         }
     }
+    if counter.count_text(&kept) > max_tokens && object.remove("polling").is_some() {
+        // Progress/advisory data is optional. It cannot inherit the exception
+        // that protects a continuation handle or a real terminal status.
+        kept = serde_json::to_string(object).expect("terminal result is serializable");
+    }
     if counter.count_text(&kept) > max_tokens {
         // Even a tiny budget must retain fixed metadata, including an error or
         // session handle. The output itself is still reduced to zero bytes.
@@ -866,6 +871,43 @@ mod tests {
                 .result
                 .unwrap();
             assert!(result.result.contains("tool output truncated"));
+        }
+    }
+
+    #[test]
+    fn exec_session_caps_drop_optional_polling_before_required_metadata_exception() {
+        use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
+
+        let counter = TiktokenTokenCounter::default();
+        let output = "captured output 界🦀 ".repeat(500);
+        let polling = serde_json::json!({
+            "elapsed_ms":90_000, "output_idle_ms":90_000,
+            "consecutive_empty_readouts":3, "exit_observed":false,
+            "advisory":"No new output across repeated polls. Check a command-owned progress signal before polling again; silence does not prove completion.",
+        });
+        let payload = serde_json::json!({
+            "status":"running", "session_id":"retained-handle", "output":output,
+            "polling":polling,
+        });
+        for cap in [1, 32, 128, 512] {
+            let compressed =
+                truncate_exec_session_output(&payload.to_string(), cap, &counter).unwrap();
+            let received: serde_json::Value = serde_json::from_str(&compressed).unwrap();
+            assert_eq!(received["status"], "running");
+            assert_eq!(received["session_id"], "retained-handle");
+            let kept = received["output"].as_str().unwrap();
+            assert!(output.starts_with(kept));
+            assert_eq!(received["output_omitted_bytes"], output.len() - kept.len());
+            if counter.count_text(&compressed) > cap {
+                assert!(kept.is_empty());
+                assert!(received.get("polling").is_none());
+            }
+            if cap == 1 {
+                assert!(received.get("polling").is_none());
+            } else if cap == 512 {
+                assert_eq!(received["polling"], polling);
+                assert!(counter.count_text(&compressed) <= cap);
+            }
         }
     }
 

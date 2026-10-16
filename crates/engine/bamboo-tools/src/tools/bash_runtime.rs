@@ -28,7 +28,7 @@ use super::exec_command::{pump_polled_stream, PolledShellState};
 /// foreground promotion-seed buffers (`bash.rs`). Shared so a chatty command
 /// can't balloon memory before it promotes (issue #84, phase 2d).
 pub(crate) const MAX_OUTPUT_LINES: usize = 20_000;
-const COMPLETED_SESSION_TTL_SECS: u64 = 300;
+pub(crate) const COMPLETED_SESSION_TTL_SECS: u64 = 300;
 /// Trailing captured lines carried on a background-Bash completion push so the
 /// model sees the result without a mandatory `BashOutput` round-trip (issue #84
 /// Phase 2b follow-up). The full output is still available via `BashOutput`.
