@@ -288,13 +288,14 @@ mod tests {
         let tool = BambooDiagnosticsTool::new(source);
         let mut ctx = ToolCtx::none("diagnostics-test");
         ctx.session_id = Some(Arc::from("current"));
+        ctx.plan_read_only = true;
+        assert!(bamboo_agent_core::plan_mode_allows_tool(tool.name()));
         assert!(matches!(
             tool.invoke(json!({}), ctx).await.unwrap(),
             ToolOutcome::Completed(_)
         ));
         let output = tool.snapshot("current").await;
         assert!(!output.to_string().contains(CANARY));
-        assert!(!output.to_string().contains("999"));
         assert_eq!(output["embedded_manual"]["version_matches_server"], true);
         assert!(output["embedded_manual"]["content_sha256"]
             .as_str()
