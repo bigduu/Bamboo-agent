@@ -163,7 +163,27 @@ pub fn repository(repo: &Path) -> Result<PathBuf, String> {
     fs::canonicalize(value).map_err(|e| format!("Repository metadata is unavailable: {e}"))
 }
 
+// Observe actual resolver calls without changing process-global PATH. Each
+// HTTP regression uses unique fixture paths and never resets shared state.
+#[cfg(test)]
+static WORKSPACE_ROOT_QUERIES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(super) fn workspace_root_queries_for_test(path: &Path) -> usize {
+    WORKSPACE_ROOT_QUERIES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| p.as_path() == path)
+        .count()
+}
+
 pub fn workspace_root(path: &Path) -> Result<PathBuf, String> {
+    #[cfg(test)]
+    WORKSPACE_ROOT_QUERIES
+        .lock()
+        .unwrap()
+        .push(path.to_path_buf());
     let value = git_path(path, &["rev-parse", "--show-toplevel"])?;
     fs::canonicalize(value).map_err(|e| e.to_string())
 }
