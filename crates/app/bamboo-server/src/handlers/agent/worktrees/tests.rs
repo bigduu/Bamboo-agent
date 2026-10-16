@@ -401,6 +401,26 @@ async fn inventory_scopes_and_deduplicates_session_git_queries_without_losing_sh
         .project_store
         .create_with_project_path("Requested", None, binding.to_str().unwrap(), vec![])
         .unwrap();
+    #[cfg(unix)]
+    {
+        // Current writers canonicalize aliases. Seed an explicitly bound
+        // persisted alias to exercise legacy metadata, rather than assuming
+        // that creating a new Project preserved the spelling of its input.
+        assert_eq!(project.project_path.as_deref(), repo.to_str());
+        let path = state.project_store.paths().manifest_path(&project.id);
+        let mut stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        stored["project_path"] = json!(binding.to_str().unwrap());
+        fs::write(&path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+        assert_eq!(
+            state
+                .project_store
+                .get(&project.id)
+                .unwrap()
+                .project_path
+                .as_deref(),
+            binding.to_str()
+        );
+    }
     let other = state
         .project_store
         .create_with_project_path("Unrelated", None, unrelated.to_str().unwrap(), vec![])
