@@ -190,7 +190,7 @@ impl Fixture {
                 operation_id: Uuid::new_v4().to_string(),
                 expected_generation: None,
                 expected_revision: 0,
-                objective: "bounded target",
+                objective: "bounded target".into(),
                 max_iterations: 2,
                 max_total_rounds: 8,
             },
