@@ -205,12 +205,10 @@ impl SessionStoreV2 {
                 None => BTreeSet::new(),
             };
             Ok(disabled.contains(tool)
-                || session.agent_runtime_state.as_ref().is_some_and(|runtime| {
-                    runtime.read_only
-                        || runtime.plan_mode.is_some()
-                        || runtime.effective_permission_mode()
-                            == bamboo_domain::SessionPermissionMode::Plan
-                }))
+                || session
+                    .agent_runtime_state
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.read_only || runtime.plan_mode.is_some()))
         };
         if source.supervisor_incarnation_id() != Some(binding.supervisor.incarnation_id)
             || source.root_tool_authority_revision != binding.supervisor_tool_authority_revision

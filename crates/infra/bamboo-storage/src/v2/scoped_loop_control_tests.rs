@@ -477,7 +477,12 @@ async fn scoped_canonical_permissions_and_pipeline_identity_fail_closed() {
                 source
                     .agent_runtime_state
                     .get_or_insert_with(Default::default)
-                    .set_permission_mode(bamboo_domain::SessionPermissionMode::Plan);
+                    .plan_mode = Some(bamboo_domain::PlanModeState {
+                    entered_at: Utc::now(),
+                    pre_permission_mode: "default".into(),
+                    plan_file_path: None,
+                    status: Default::default(),
+                });
             }
             3 => {
                 target.set_root_orchestration_only(true).unwrap();
