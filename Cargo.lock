@@ -1525,6 +1525,7 @@ dependencies = [
  "dashmap",
  "futures",
  "hex",
+ "jsonschema",
  "parking_lot",
  "serde",
  "serde_json",

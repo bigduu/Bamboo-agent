@@ -410,7 +410,7 @@ mod loop_adapter_tests {
         assert_eq!(command["required"], json!(["action"]));
         assert_eq!(command["properties"]["max_iterations"]["maximum"], 100);
         assert_eq!(command["properties"]["max_total_rounds"]["maximum"], 1000);
-        assert!(schema.get("oneOf").is_none());
+        // Advertised per-action acceptance is validated below, not inferred from shape.
         assert!(command.get("oneOf").is_none());
         assert!(command["properties"].get("target_session_id").is_none());
         assert!(command["properties"].get("session_id").is_none());
@@ -426,6 +426,125 @@ mod loop_adapter_tests {
         ] {
             assert_eq!(f.tool.classify(&arguments), ToolClass::MUTATING_SERIAL);
         }
+    }
+
+    fn advertised_validator(fixture: &Fixture) -> jsonschema::Validator {
+        let registry = bamboo_agent_core::tools::registry::ToolRegistry::new();
+        registry
+            .register(SessionControlTool::new(fixture.messenger.clone()))
+            .unwrap();
+        let advertised = registry
+            .list_tools()
+            .into_iter()
+            .find(|schema| schema.function.name == "session_control")
+            .unwrap();
+        assert_eq!(
+            advertised.function.parameters,
+            fixture.tool.parameters_schema()
+        );
+        jsonschema::validator_for(&advertised.function.parameters).unwrap()
+    }
+
+    #[tokio::test]
+    async fn advertised_followup_schema_requires_its_fields_and_rejects_loop_fields() {
+        let f = Fixture::new().await;
+        let validator = advertised_validator(&f);
+        let valid = args("a", "schema-followup", "Continue your original task");
+        assert!(validator.validate(&valid).is_ok());
+        assert_eq!(f.tool.classify(&valid), ToolClass::MUTATING_SERIAL);
+
+        for field in ["action", "target_session_id", "operation_id", "message"] {
+            let mut invalid = valid.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(
+                validator.validate(&invalid).is_err(),
+                "advertised followup accepted missing {field}: {invalid}"
+            );
+            assert_eq!(f.tool.classify(&invalid), ToolClass::MUTATING_SERIAL);
+            assert!(matches!(
+                f.tool.invoke(invalid, f.ctx.clone()).await,
+                Err(ToolError::InvalidArguments(_))
+            ));
+        }
+        for (field, value) in [
+            ("command", json!({"action":"status"})),
+            ("expected_link_revision", json!(2)),
+            ("receipt_operation_id", json!(OPERATION)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(
+                validator.validate(&invalid).is_err(),
+                "advertised followup accepted loop-only {field}: {invalid}"
+            );
+            assert_eq!(f.tool.classify(&invalid), ToolClass::MUTATING_SERIAL);
+            assert!(matches!(
+                f.tool.invoke(invalid, f.ctx.clone()).await,
+                Err(ToolError::InvalidArguments(_))
+            ));
+        }
+        assert_eq!(f.inbox.inspect("a").await.unwrap().generation, 0);
+        assert!(f.activation.calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn advertised_loop_schema_requires_its_fields_and_rejects_followup_fields() {
+        let f = Fixture::new().await;
+        let validator = advertised_validator(&f);
+        let mut receipt_status = status();
+        receipt_status["expected_link_revision"] = json!(2);
+        receipt_status["receipt_operation_id"] = json!(OPERATION);
+        for valid in [status(), receipt_status, start(), update(), stop()] {
+            assert!(
+                validator.validate(&valid).is_ok(),
+                "advertised schema rejected legal loop structure: {valid}"
+            );
+            assert_eq!(f.tool.classify(&valid), ToolClass::MUTATING_SERIAL);
+        }
+
+        for field in ["action", "target_session_id", "command"] {
+            let mut invalid = status();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(
+                validator.validate(&invalid).is_err(),
+                "advertised loop accepted missing {field}: {invalid}"
+            );
+            assert_eq!(f.tool.classify(&invalid), ToolClass::MUTATING_SERIAL);
+            assert!(matches!(
+                f.tool.invoke(invalid, f.ctx.clone()).await,
+                Err(ToolError::InvalidArguments(_))
+            ));
+        }
+        for (field, value) in [
+            ("operation_id", json!("schema-followup")),
+            ("message", json!("Continue your original task")),
+        ] {
+            let mut invalid = status();
+            invalid[field] = value;
+            assert!(
+                validator.validate(&invalid).is_err(),
+                "advertised loop accepted followup-only {field}: {invalid}"
+            );
+            assert_eq!(f.tool.classify(&invalid), ToolClass::MUTATING_SERIAL);
+            assert!(matches!(
+                f.tool.invoke(invalid, f.ctx.clone()).await,
+                Err(ToolError::InvalidArguments(_))
+            ));
+        }
+
+        let mut unknown_outer = status();
+        unknown_outer["host_grant"] = json!("forged");
+        let mut unknown_nested = status();
+        unknown_nested["command"]["target_session_id"] = json!("a");
+        for invalid in [unknown_outer, unknown_nested] {
+            assert!(validator.validate(&invalid).is_err(), "{invalid}");
+            assert!(matches!(
+                f.tool.invoke(invalid, f.ctx.clone()).await,
+                Err(ToolError::InvalidArguments(_))
+            ));
+        }
+        assert_eq!(f.inbox.inspect("a").await.unwrap().generation, 0);
+        assert!(f.activation.calls.lock().await.is_empty());
     }
 
     #[tokio::test]

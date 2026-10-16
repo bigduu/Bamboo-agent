@@ -792,3 +792,262 @@ async fn scoped_terminal_remove_retry_preserves_the_canonical_consumption_and_ne
         .unwrap()
         .is_empty());
 }
+
+async fn write_scoped_disabled_references(
+    fixture: &mut Fixture,
+    source: bool,
+    references: &[String],
+) {
+    let id = if source {
+        &fixture.binding.supervisor.session_id
+    } else {
+        &fixture.target.id
+    };
+    let mut session = fixture
+        .store
+        .load_execution_admission_snapshot(id)
+        .await
+        .unwrap()
+        .unwrap();
+    session.metadata.insert(
+        "disabled_tools".into(),
+        serde_json::to_string(references).unwrap(),
+    );
+    fixture.store.save_session(&session).await.unwrap();
+    if !source {
+        fixture.target = session;
+    }
+}
+
+#[tokio::test]
+async fn scoped_disabled_core_references_reject_canonical_reads_and_delivery() {
+    for source in [false, true] {
+        let tool = if source {
+            "session_control"
+        } else {
+            "loop_control"
+        };
+        for reference in [
+            tool.to_owned(),
+            format!("default::{tool}"),
+            tool.to_ascii_uppercase(),
+            format!("  DeFaUlT::{}  ", tool.to_ascii_uppercase()),
+            // Storage has no dynamic catalog proving a foreign exact identity.
+            // The fixed core capability therefore keeps shared fallback denial.
+            format!("vendor::{tool}"),
+        ] {
+            let mut fixture = Fixture::new(false).await;
+            write_scoped_disabled_references(
+                &mut fixture,
+                source,
+                std::slice::from_ref(&reference),
+            )
+            .await;
+            let before = fixture
+                .store
+                .load_execution_admission_snapshot(&fixture.target.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let read = fixture
+                .store
+                .load_scoped_loop_session(&fixture.binding, fixture.activation.clone())
+                .await;
+            assert!(read.is_err(), "source={source}, disabled={reference:?}");
+            assert_eq!(
+                read.unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied,
+                "source={source}, disabled={reference:?}"
+            );
+            assert!(
+                fixture
+                    .inbox
+                    .deliver_supervisor_loop_control(
+                        &fixture.binding,
+                        &fixture.envelope(),
+                        fixture.activation.clone(),
+                    )
+                    .await
+                    .is_err(),
+                "source={source}, disabled={reference:?}"
+            );
+            let after = fixture
+                .store
+                .load_execution_admission_snapshot(&fixture.target.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&after).unwrap(),
+                serde_json::to_value(&before).unwrap(),
+                "denied control cannot mutate its target"
+            );
+            assert_eq!(
+                fixture
+                    .inbox
+                    .inspect(&fixture.target.id)
+                    .await
+                    .unwrap()
+                    .generation,
+                0
+            );
+            assert_eq!(fixture.activation.notifications.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.activation.activations.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn scoped_disabled_distinct_foreign_names_preserve_the_core_control_checkpoint() {
+    for source in [false, true] {
+        let tool = if source {
+            "session_control"
+        } else {
+            "loop_control"
+        };
+        let other_core = if source {
+            "loop_control"
+        } else {
+            "session_control"
+        };
+        let references = vec![
+            format!("mcp__vendor__{tool}"),
+            format!("default::mcp__vendor__{tool}"),
+            format!("vendor::{tool}_adapter"),
+            format!("default::{tool}_adapter"),
+            format!("wrapped_{tool}"),
+            format!("default::{other_core}"),
+        ];
+        let mut fixture = Fixture::new(false).await;
+        write_scoped_disabled_references(&mut fixture, source, &references).await;
+        let before = fixture
+            .store
+            .load_scoped_loop_session(&fixture.binding, fixture.activation.clone())
+            .await
+            .expect("distinct foreign names do not deny the fixed core capability")
+            .unwrap();
+        let envelope = fixture.envelope();
+        fixture.deliver(&envelope).await;
+        let (inbox, claim) = fixture.claim().await;
+        let mut candidate = fixture.candidate(&claim);
+        let publications = Arc::new(AtomicUsize::new(0));
+        let observed = publications.clone();
+        fixture
+            .checkpoint(
+                &mut candidate,
+                inbox,
+                claim,
+                Arc::new(move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(publications.load(Ordering::SeqCst), 1);
+        assert!(fixture
+            .inbox
+            .was_admitted(&fixture.target.id, &envelope.id)
+            .await
+            .unwrap());
+        let after = fixture
+            .store
+            .load_scoped_loop_session(&fixture.binding, fixture.activation.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(bamboo_domain::has_scoped_loop_consumption(
+            &after, &envelope
+        ));
+        assert_eq!(
+            serde_json::to_value(&after.messages).unwrap(),
+            serde_json::to_value(&before.messages).unwrap()
+        );
+        if !source {
+            assert_eq!(
+                after.metadata.get("disabled_tools"),
+                before.metadata.get("disabled_tools")
+            );
+        }
+        assert_eq!(fixture.activation.activations.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn scoped_disabled_reference_change_blocks_retry_and_checkpoint_without_ack() {
+    for source in [false, true] {
+        let tool = if source {
+            "session_control"
+        } else {
+            "loop_control"
+        };
+        for reference in [format!("default::{tool}"), tool.to_ascii_uppercase()] {
+            let mut fixture = Fixture::new(false).await;
+            let envelope = fixture.envelope();
+            fixture.deliver(&envelope).await;
+            let (inbox, claim) = fixture.claim().await;
+            let mut candidate = fixture.candidate(&claim);
+            write_scoped_disabled_references(
+                &mut fixture,
+                source,
+                std::slice::from_ref(&reference),
+            )
+            .await;
+            let before = fixture
+                .store
+                .load_execution_admission_snapshot(&fixture.target.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                fixture
+                    .inbox
+                    .deliver_supervisor_loop_control(
+                        &fixture.binding,
+                        &envelope,
+                        fixture.activation.clone(),
+                    )
+                    .await
+                    .is_err(),
+                "retry must recheck source={source}, disabled={reference:?}"
+            );
+            let publications = Arc::new(AtomicUsize::new(0));
+            let observed = publications.clone();
+            assert!(
+                fixture
+                    .checkpoint(
+                        &mut candidate,
+                        inbox,
+                        claim,
+                        Arc::new(move |_| {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                        }),
+                    )
+                    .await
+                    .is_err(),
+                "checkpoint must recheck source={source}, disabled={reference:?}"
+            );
+            assert_eq!(publications.load(Ordering::SeqCst), 0);
+            assert!(!fixture
+                .inbox
+                .was_admitted(&fixture.target.id, &envelope.id)
+                .await
+                .unwrap());
+            let after = fixture
+                .store
+                .load_execution_admission_snapshot(&fixture.target.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!bamboo_domain::has_scoped_loop_consumption(
+                &after, &envelope
+            ));
+            assert_eq!(
+                serde_json::to_value(&after).unwrap(),
+                serde_json::to_value(&before).unwrap(),
+                "rejected stale candidate cannot overwrite the changed policy"
+            );
+            assert_eq!(fixture.activation.notifications.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.activation.activations.load(Ordering::SeqCst), 0);
+        }
+    }
+}
