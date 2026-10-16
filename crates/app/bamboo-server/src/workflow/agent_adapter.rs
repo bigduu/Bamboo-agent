@@ -577,7 +577,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut parent = Session::new("workflow-agent-parent", "model");
+        let mut parent = Session::new(
+            format!("workflow-agent-parent-{}", uuid::Uuid::new_v4()),
+            "model",
+        );
         parent.workspace = Some(workspace.to_string_lossy().into_owned());
         state.storage.save_session(&parent).await.unwrap();
         (temp, state, parent)
@@ -633,7 +636,6 @@ mod tests {
     #[tokio::test]
     async fn workflow_agent_uses_durable_workspace_without_republishing_parent() {
         let (_temp, state, mut parent) = fixture().await;
-        parent.id = format!("workflow-agent-durable-{}", uuid::Uuid::new_v4());
         let old_workspace = std::path::PathBuf::from(parent.workspace.as_ref().unwrap());
         let current_workspace = state.app_data_dir.join("current-workspace");
         std::fs::create_dir(&current_workspace).unwrap();
@@ -723,7 +725,6 @@ mod tests {
     #[tokio::test]
     async fn workflow_agent_rejects_durable_workspace_owned_by_another_project() {
         let (_temp, state, mut parent) = fixture().await;
-        parent.id = format!("workflow-agent-conflict-{}", uuid::Uuid::new_v4());
         let workspace = std::path::PathBuf::from(parent.workspace.as_ref().unwrap());
         let project = state
             .project_store

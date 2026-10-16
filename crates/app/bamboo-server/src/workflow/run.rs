@@ -1631,6 +1631,7 @@ mod tests {
 
     struct BlockingWorkflowReadTool {
         entered: Arc<Semaphore>,
+        release: Option<Arc<Semaphore>>,
     }
 
     #[async_trait]
@@ -1640,7 +1641,13 @@ mod tests {
             _call: &ToolCall,
         ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
             self.entered.add_permits(1);
-            std::future::pending().await
+            match &self.release {
+                Some(release) => {
+                    let _permit = release.acquire().await.unwrap();
+                    Ok(ToolResult::text(true, r#"{"ok":true}"#))
+                }
+                None => std::future::pending().await,
+            }
         }
 
         fn list_tools(&self) -> Vec<ToolSchema> {
@@ -1783,10 +1790,12 @@ mod tests {
         session.set_workspace_path_meta(workspace_a.path().to_string_lossy());
         state.storage.save_session(&session).await.unwrap();
         let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
         state.workflow_runs = WorkflowRunAccess::new(
             directory.path(),
             Arc::new(BlockingWorkflowReadTool {
                 entered: entered.clone(),
+                release: Some(release.clone()),
             }),
             state.skill_manager.clone(),
             state.session_repo.clone(),
@@ -1858,6 +1867,25 @@ mod tests {
             .cancel_for_session(&session.id, &started.run_id)
             .await
             .unwrap();
+        // A terminal snapshot does not mean an in-flight Tool has returned.
+        // Keep scope fenced until the owned execution actually drains.
+        assert!(state.workflow_runs.scope_change_is_blocked(&session.id));
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{}", session.id))
+                .insert_header((
+                    header::IF_MATCH,
+                    format!("\"{}\"", unchanged.metadata_version),
+                ))
+                .set_json(json!({"project_id":project_b.id, "workspace_path":workspace_b.path()}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "session_project_running_conflict");
+        release.add_permits(1);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while state.workflow_runs.scope_change_is_blocked(&session.id) {
                 tokio::task::yield_now().await;
@@ -2716,6 +2744,7 @@ mod tests {
         let (access, repo, directory, storage) =
             workflow_test_access_with_tools_and_storage(Arc::new(BlockingWorkflowReadTool {
                 entered: Arc::new(Semaphore::new(0)),
+                release: None,
             }))
             .await;
         let workspace = directory.path().join("restart-failure-workspace");
@@ -3196,6 +3225,7 @@ mod tests {
         let (access, repo, directory) =
             workflow_test_access_with_tools(Arc::new(BlockingWorkflowReadTool {
                 entered: entered.clone(),
+                release: None,
             }))
             .await;
         let workspace = directory.path().join("workspace");
