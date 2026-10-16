@@ -2689,7 +2689,7 @@ mod execution_input_http {
     async fn vision_actual_execute_startup_uses_routed_model_before_legacy_error_fallback() {
         for (support, model, expected) in [
             (Some(true), "test-model", StatusCode::ACCEPTED),
-            (Some(false), "test-model", StatusCode::BAD_REQUEST),
+            (Some(false), "test-model", StatusCode::ACCEPTED),
             (None, "test-model", StatusCode::BAD_REQUEST),
             (Some(true), "other-model", StatusCode::BAD_REQUEST),
         ] {
@@ -2724,7 +2724,7 @@ mod execution_input_http {
             }
             let (status, body) = execute(&state, &id, None).await;
             assert_eq!(status, expected, "{support:?} {model}: {body}");
-            if expected == StatusCode::ACCEPTED {
+            if expected == StatusCode::ACCEPTED && support != Some(false) {
                 tokio::time::timeout(std::time::Duration::from_secs(20), async {
                     while !received.load(Ordering::SeqCst) {
                         tokio::task::yield_now().await;

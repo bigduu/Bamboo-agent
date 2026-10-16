@@ -26,7 +26,19 @@ pub(super) async fn apply_message_transforms(
                     .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. }))
             })
         }) {
-            return Err(AgentError::LLM(format!("Model '{model_name}' does not support Vision; image history was preserved but cannot be sent. Select a Vision-capable model or enable supports_vision for this model in provider settings.")));
+            let target =
+                crate::runtime::runner::image_fallback::resolve_vision_target(config).await?;
+            resolve_attachments(config, prepared_context).await?;
+            apply_image_fallback_to_llm_messages(
+                &mut prepared_context.messages,
+                crate::runtime::config::ImageFallbackConfig {
+                    mode: crate::runtime::config::ImageFallbackMode::Vision,
+                    vision_model: Some(target.model_name),
+                },
+                config.attachment_reader.as_deref(),
+                Some(&target.provider),
+            )
+            .await?;
         }
     } else if llm.vision_support_override(model_name).await != Some(true) {
         // Vision remains enabled by default. Preserve a legacy fallback only
@@ -132,12 +144,35 @@ async fn apply_image_fallback(
     // Apply image fallback (placeholder / OCR / error / vision) to the prepared
     // LLM context only. This must never mutate the persisted session messages
     // (UI should still show images).
-    if let Some(fallback) = config.image_fallback.clone() {
+    if !prepared_context.messages.iter().any(|message| {
+        message.content_parts.as_ref().is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. }))
+        })
+    }) {
+        return Ok(());
+    }
+    if let Some(mut fallback) = config.image_fallback.clone() {
+        let target = if fallback.mode == crate::runtime::config::ImageFallbackMode::Vision {
+            let target =
+                crate::runtime::runner::image_fallback::resolve_vision_target(config).await?;
+            fallback.vision_model = Some(target.model_name.clone());
+            resolve_attachments(config, prepared_context).await?;
+            Some(target)
+        } else {
+            None
+        };
         apply_image_fallback_to_llm_messages(
             &mut prepared_context.messages,
             fallback,
             config.attachment_reader.as_deref(),
-            Some(llm),
+            Some(
+                target
+                    .as_ref()
+                    .map(|target| &target.provider)
+                    .unwrap_or(llm),
+            ),
         )
         .await?;
     }
@@ -223,7 +258,7 @@ mod vision_tests {
         let error = apply_message_transforms(&config, &mut messages, &llm, "switch", "text")
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("does not support Vision"));
+        assert!(error.to_string().contains("configured Vision model"));
         assert!(
             messages.messages[0].content_parts.is_some(),
             "images are not silently removed"

@@ -53,7 +53,7 @@ impl Tool for ViewImageTool {
     }
 
     fn description(&self) -> &str {
-        "View a local PNG, JPEG, GIF, or WebP image. Returns base64 multimodal content for the current model. Models explicitly configured without Vision reject this tool. Models with inherited capability retain the configured hooks.image_fallback behavior."
+        "View a local PNG, JPEG, GIF, or WebP image. Vision-capable main models receive image content directly. For a main model without Vision, the configured Vision model returns a labeled, untrusted text description. A missing or unsupported Vision model returns a configuration error."
     }
 
     fn classify(&self, _args: &serde_json::Value) -> ToolClass {

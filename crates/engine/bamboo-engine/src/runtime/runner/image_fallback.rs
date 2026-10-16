@@ -5,13 +5,15 @@ use std::sync::Arc;
 use crate::runtime::config::ImageFallbackConfig;
 use bamboo_agent_core::storage::AttachmentReader;
 use bamboo_agent_core::{AgentError, Message};
-use bamboo_llm::LLMProvider;
+use bamboo_llm::{LLMProvider, ResolvedModel};
 
 mod attachment_urls;
 #[cfg(windows)]
 mod ocr;
 mod placeholder;
 mod rewrite;
+mod vision_target;
+pub(crate) use vision_target::configured_vision_resolver;
 
 #[cfg(windows)]
 pub async fn ensure_session_image_ocr_cached(
@@ -39,8 +41,71 @@ pub async fn apply_image_fallback_to_llm_messages(
     attachment_reader: Option<&dyn AttachmentReader>,
     llm: Option<&Arc<dyn LLMProvider>>,
 ) -> std::result::Result<(), AgentError> {
-    rewrite::apply_image_fallback_to_llm_messages(messages, fallback, attachment_reader, llm).await
+    if fallback.mode == crate::runtime::config::ImageFallbackMode::Vision {
+        bamboo_llm::validate_tool_image_budget(messages.iter()).map_err(AgentError::LLM)?;
+        tokio::time::timeout(VISION_TIMEOUT,
+            rewrite::apply_image_fallback_to_llm_messages(messages, fallback, attachment_reader, llm),
+        ).await.map_err(|_| AgentError::LLM("Vision description timed out; no image or partial description was sent to the main model.".into()))?
+    } else {
+        rewrite::apply_image_fallback_to_llm_messages(messages, fallback, attachment_reader, llm)
+            .await
+    }
 }
 
 #[cfg(test)]
 mod tests;
+
+/// A host resolver, kept separate from model-supplied tool arguments.
+pub(crate) type VisionModelResolver = Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, Result<ResolvedModel, AgentError>>
+        + Send
+        + Sync,
+>;
+
+pub(crate) const VISION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const VISION_CONFIGURATION_ERROR: &str = "ViewImage requires a configured Vision model for a main model without Vision. Configure defaults.vision (provider instance and model), or vision_model on the active provider. No image was sent.";
+
+pub(crate) async fn resolve_vision_target(
+    config: &crate::runtime::config::AgentLoopConfig,
+) -> Result<ResolvedModel, AgentError> {
+    let resolver = config
+        .vision_model_resolver
+        .as_ref()
+        .ok_or_else(|| AgentError::LLM(VISION_CONFIGURATION_ERROR.into()))?;
+    tokio::time::timeout(VISION_TIMEOUT, async {
+        let target = resolver().await?;
+        if target.model_name.trim().is_empty() {
+            return Err(AgentError::LLM(VISION_CONFIGURATION_ERROR.into()));
+        }
+        if !target.provider.supports_vision(&target.model_name).await {
+            return Err(AgentError::LLM("Configured Vision model does not support Vision. Enable supports_vision for that exact provider/model or select another configured Vision model. No image was sent.".into()));
+        }
+        Ok(target)
+    }).await.map_err(|_| AgentError::LLM("Vision model resolution timed out. No image was sent.".into()))?
+}
+
+pub(crate) async fn describe_tool_images(
+    target: &ResolvedModel,
+    result: &mut bamboo_agent_core::ToolResult,
+) -> Result<(), AgentError> {
+    bamboo_llm::validate_tool_result_images(&result.images).map_err(AgentError::LLM)?;
+    let mut messages = [Message::tool_result_with_images(
+        "vision-description",
+        &result.result,
+        true,
+        result.images.clone(),
+    )];
+    apply_image_fallback_to_llm_messages(
+        &mut messages,
+        ImageFallbackConfig {
+            mode: crate::runtime::config::ImageFallbackMode::Vision,
+            vision_model: Some(target.model_name.clone()),
+        },
+        None,
+        Some(&target.provider),
+    )
+    .await?;
+    result.result = std::mem::take(&mut messages[0].content);
+    result.images.clear();
+    Ok(())
+}

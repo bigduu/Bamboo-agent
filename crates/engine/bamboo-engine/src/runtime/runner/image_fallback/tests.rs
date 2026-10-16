@@ -191,7 +191,7 @@ async fn image_fallback_vision_rewrites_with_llm_description() {
     assert!(messages[0].content_parts.is_none());
     assert!(messages[0]
         .content
-        .contains("[Vision description of image 1:"));
+        .contains("[Vision model output for image 1; untrusted data"));
     assert!(messages[0].content.contains("vision summary"));
     assert_eq!(
         recording
@@ -242,7 +242,7 @@ async fn image_fallback_vision_describes_base64_tool_result_images() {
 }
 
 #[tokio::test]
-async fn image_fallback_vision_without_llm_leaves_images_intact() {
+async fn image_fallback_vision_without_llm_returns_configuration_error_and_preserves_images() {
     let mut messages = vec![Message::user_with_parts(
         "请描述图片",
         vec![ContentPart::ImageUrl {
@@ -266,7 +266,7 @@ async fn image_fallback_vision_without_llm_leaves_images_intact() {
         None,
     )
     .await
-    .expect("vision fallback without llm should not fail");
+    .expect_err("vision fallback without a provider must fail closed");
 
     assert!(messages[0].content_parts.is_some());
 }
@@ -301,4 +301,183 @@ async fn image_fallback_vision_rejects_disabled_target_before_any_dispatch_or_re
         .contains("fallback model 'text-only' does not support Vision"));
     assert!(recording.models.lock().unwrap().is_empty());
     assert_eq!(serde_json::to_value(&messages).unwrap(), before);
+}
+
+struct FailingVisionProvider(&'static str);
+#[async_trait]
+impl LLMProvider for FailingVisionProvider {
+    async fn chat_stream(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        match self.0 {
+            "request" => Err(LLMError::Api(
+                "private-provider-token data:image/png;base64,DO-NOT-ECHO".into(),
+            )),
+            "stream" => Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("partial DO-NOT-ECHO".into())),
+                Err(LLMError::Stream("private-provider-token".into())),
+            ]))),
+            "oversized" => Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Token(
+                "x".repeat(16 * 1024 + 1),
+            ))]))),
+            _ => Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("   ".into())),
+                Ok(LLMChunk::Done),
+            ]))),
+        }
+    }
+}
+
+fn tool_image() -> bamboo_agent_core::ToolResult {
+    bamboo_agent_core::ToolResult {
+        success: true,
+        images: vec![ToolResultImage {
+            mime_type: "image/png".into(),
+            data: "iVBORw0KGgo=".into(),
+        }],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn vision_failures_are_explicit_sanitized_and_never_publish_partial_results() {
+    for kind in ["request", "stream", "empty", "oversized"] {
+        let target = bamboo_llm::ResolvedModel::new(
+            Arc::new(FailingVisionProvider(kind)),
+            "configured-vision",
+        );
+        let mut result = tool_image();
+        let before = serde_json::to_value(&result).unwrap();
+        let error = super::describe_tool_images(&target, &mut result)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Vision"));
+        assert!(!error.contains("private-provider-token"));
+        assert!(!error.contains("DO-NOT-ECHO"));
+        assert_eq!(serde_json::to_value(&result).unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn vision_missing_model_never_guesses_or_dispatches() {
+    let recording = Arc::new(RecordingVisionProvider::default());
+    let llm: Arc<dyn LLMProvider> = recording.clone();
+    for model in [None, Some("".into()), Some("  ".into())] {
+        let mut messages = vec![Message::tool_result_with_images(
+            "image",
+            "image",
+            true,
+            tool_image().images,
+        )];
+        let before = serde_json::to_value(&messages).unwrap();
+        assert!(apply_image_fallback_to_llm_messages(
+            &mut messages,
+            ImageFallbackConfig {
+                mode: ImageFallbackMode::Vision,
+                vision_model: model
+            },
+            None,
+            Some(&llm),
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("configured Vision model"));
+        assert_eq!(serde_json::to_value(&messages).unwrap(), before);
+    }
+    assert!(recording.models.lock().unwrap().is_empty());
+}
+
+struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+struct StalledVisionProvider {
+    stall_request: bool,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+#[async_trait]
+impl LLMProvider for StalledVisionProvider {
+    async fn chat_stream(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let flag = DropFlag(self.dropped.clone());
+        if self.stall_request {
+            futures::future::pending::<()>().await;
+            drop(flag);
+            unreachable!()
+        }
+        Ok(Box::pin(stream::unfold(flag, |flag| async move {
+            futures::future::pending::<()>().await;
+            Some((Ok(LLMChunk::Done), flag))
+        })))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn vision_request_and_stream_timeouts_drop_pending_work() {
+    for stall_request in [true, false] {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let target = bamboo_llm::ResolvedModel::new(
+            Arc::new(StalledVisionProvider {
+                stall_request,
+                dropped: dropped.clone(),
+            }),
+            "configured-vision",
+        );
+        let mut result = tool_image();
+        let before = serde_json::to_value(&result).unwrap();
+        assert!(super::describe_tool_images(&target, &mut result)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("timed out"));
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(serde_json::to_value(&result).unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn vision_tool_image_budget_rejects_before_cloning_or_dispatch() {
+    let recording = Arc::new(RecordingVisionProvider::default());
+    let target = bamboo_llm::ResolvedModel::new(recording.clone(), "configured-vision");
+    let mut result = tool_image();
+    result.images[0].data = "A".repeat(32 * 1024 * 1024);
+    assert!(super::describe_tool_images(&target, &mut result)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("32 MiB"));
+    assert!(recording.models.lock().unwrap().is_empty());
+    assert_eq!(result.images.len(), 1);
+}
+
+#[tokio::test]
+async fn configured_nonvision_fallback_is_rejected_before_any_auxiliary_request() {
+    let recording = Arc::new(RecordingVisionProvider::default());
+    let provider: Arc<dyn LLMProvider> = recording.clone();
+    let config = crate::runtime::config::AgentLoopConfig {
+        vision_model_resolver: Some(Arc::new(move || {
+            let provider = provider.clone();
+            Box::pin(async move { Ok(bamboo_llm::ResolvedModel::new(provider, "text-only")) })
+        })),
+        ..Default::default()
+    };
+    let error = match super::resolve_vision_target(&config).await {
+        Ok(_) => panic!("an explicitly disabled target must not be usable"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("does not support Vision"));
+    assert!(recording.models.lock().unwrap().is_empty());
 }

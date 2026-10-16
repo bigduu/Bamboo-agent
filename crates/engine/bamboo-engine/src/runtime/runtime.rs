@@ -1009,6 +1009,12 @@ impl AgentRuntime {
                 merged
             },
             image_fallback,
+            vision_model_resolver: Some(
+                crate::runtime::runner::image_fallback::configured_vision_resolver(
+                    self.config.clone(),
+                    app_data_dir.clone(),
+                ),
+            ),
             app_data_dir,
             memory_store: self.memory_store.clone(),
             prompt_memory_flags: config
