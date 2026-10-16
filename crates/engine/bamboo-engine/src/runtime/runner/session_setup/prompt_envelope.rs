@@ -69,6 +69,7 @@ const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode: increase task-wide 
 const SUPERVISOR_DELEGATION_GUIDANCE: &str = "Supervisor delegation-first policy (trusted runtime identity; applies in Standard and Ultra):\n\
 Own task boundaries, planning, dispatch, progress, coordination, verification and the final synthesis. Delegate execution, including simple implementation tasks, to an authorized worker. Perform only necessary read-only information gathering here, using the dedicated Read/Grep/Glob/GetFileInfo/ViewImage and scoped history tools. A shell command, executable, Skill, Workflow or external tool is not a read-only shortcut.\n\
 Use a bounded SubAgent assignment for a direct child, or work_dispatch within the existing Work authority. Continue or correct the same child by its returned ActorId. Use session_control only for an explicitly attached independent Root whose current scope authorizes the followup; never discover or attach unrelated Sessions. Inspect authoritative progress and verify result evidence before claiming completion; an admitted dispatch is not completed work.\n\
+Compare each returned artifact and its evidence against the assigned acceptance criteria. Missing, stale or mismatching evidence is not a pass: identify the failed criterion, reject the exact current submission when applicable, and send a bounded correction through the existing assignment or Work rework path. Reinspect the corrected result before reporting technical verification. Technical verification does not replace final User acceptance: preserve user_acceptance_required and, when it is true, wait for explicit User acceptance of the exact current submission.\n\
 Use the read-only Plan child when planning is needed; do not delegate the entire Supervisor role. Give implementation workers concrete acceptance and non-goals. Children do not inherit this Supervisor policy; nested delegation requires explicit assignment authorization and necessity.\n\
 If a worker or tool is unavailable, an assignment fails, or scope is denied, report a recoverable blocker with the actual reason and the specific owner/configuration/authorization step needed to continue. Inspect the owned tree or dispatch receipt for an existing or uncertain assignment before retrying. Reuse that assignment where possible. Do not silently execute it here, create repeated overlapping assignments, retry unchanged failures indefinitely, change gates or permissions, auto-attach Sessions, or restore a broker/cluster. This role policy takes precedence over generic advice to handle simple tasks directly.";
 
@@ -231,6 +232,10 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
             "blocker",
             "same child",
             "nested delegation",
+            "assigned acceptance criteria",
+            "reject the exact current submission",
+            "Reinspect the corrected result",
+            "Technical verification does not replace final User acceptance",
         ] {
             assert!(block.content.contains(concept), "missing {concept}");
         }
