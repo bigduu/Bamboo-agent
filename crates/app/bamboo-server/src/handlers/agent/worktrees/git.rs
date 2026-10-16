@@ -1107,4 +1107,91 @@ mod tests {
             }
         }
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_cli_worktree_does_not_hide_other_inventory() {
+        use std::os::unix::ffi::OsStringExt;
+        let f = Fixture::new();
+        let valid = create(&f.repo(), &f.roots(), "valid", "valid").unwrap();
+        let raw = f
+            .roots()
+            .join(std::ffi::OsString::from_vec(b"invalid-\xff".to_vec()));
+        let output = git_command(&f.repo())
+            .args(["worktree", "add", "-b", "bytes", "--"])
+            .arg(&raw)
+            .arg("HEAD")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let entries =
+            list(&f.repo()).expect("A valid raw-byte checkout must not hide the repository");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries.iter().find(|e| e.path == f.repo()).unwrap().dirty,
+            Some(false)
+        );
+        assert_eq!(
+            entries.iter().find(|e| e.path == valid).unwrap().dirty,
+            Some(false)
+        );
+        let unavailable = entries.iter().find(|e| e.path == raw).unwrap();
+        assert_eq!(unavailable.branch.as_deref(), Some("bytes"));
+        assert_eq!(unavailable.dirty, None);
+        assert!(
+            !unavailable.prunable,
+            "Unsupported encoding must not falsify Git's prunable fact"
+        );
+        assert!(unavailable.error.as_deref().unwrap().contains("non-UTF-8"));
+        assert!(raw.join(".git").is_file());
+        assert_eq!(workspace_root(&raw).unwrap(), raw);
+        assert_eq!(repository(&raw).unwrap(), repository(&f.repo()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_filename_bytes_do_not_make_known_dirty_or_clean_status_unknown() {
+        use std::os::unix::ffi::OsStringExt;
+        let f = Fixture::new();
+        let file = f
+            .repo()
+            .join(std::ffi::OsString::from_vec(b"tracked-\xff".to_vec()));
+        fs::write(&file, "keep raw filename content\n").unwrap();
+        let entries = list(&f.repo()).unwrap();
+        assert_eq!(
+            entries[0].dirty,
+            Some(true),
+            "Untracked raw bytes are still known dirty"
+        );
+        git(&f.repo(), &["add", "."]).unwrap();
+        git(
+            &f.repo(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "raw filename",
+            ],
+        )
+        .unwrap();
+        let entries = list(&f.repo()).unwrap();
+        assert_eq!(
+            entries[0].dirty,
+            Some(false),
+            "Raw index names do not prevent clean inspection"
+        );
+        fs::write(&file, "changed raw filename content\n").unwrap();
+        assert_eq!(list(&f.repo()).unwrap()[0].dirty, Some(true));
+        assert_eq!(
+            fs::read_to_string(file).unwrap(),
+            "changed raw filename content\n"
+        );
+    }
 }

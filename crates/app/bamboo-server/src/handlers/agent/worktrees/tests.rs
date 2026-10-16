@@ -123,6 +123,53 @@ async fn directory_preferences_native_create_discovery_and_session_association_r
         global.to_str()
     );
     assert!(state.config.read().await.worktrees.project_roots.is_empty());
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = global.join(std::ffi::OsString::from_vec(b"invalid-\xff".to_vec()));
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "worktree",
+                "add",
+                "-b",
+                "bytes",
+                "--",
+            ])
+            .arg(&raw)
+            .arg("HEAD")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+        assert!(response.status().is_success());
+        let body: Value = test::read_body_json(response).await;
+        assert!(body["repositories"][0]["error"].is_null());
+        let entries = body["repositories"][0]["worktrees"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            3,
+            "Unsupported raw paths must not drop valid inventory"
+        );
+        assert!(entries
+            .iter()
+            .any(|e| e["path"] == checkout.to_str().unwrap() && e["dirty"] == true));
+        let unsupported = entries.iter().find(|e| e["branch"] == "bytes").unwrap();
+        assert_eq!(unsupported["path"], format!("{:?}", raw.as_os_str()));
+        assert_eq!(unsupported["prunable"], false);
+        assert_eq!(unsupported["path_encoding"], "escaped");
+        assert!(unsupported["dirty"].is_null());
+        assert!(unsupported["error"].as_str().unwrap().contains("non-UTF-8"));
+        assert!(raw.join(".git").is_file());
+    }
 }
 
 #[actix_web::test]
