@@ -634,12 +634,26 @@ async fn scoped_stop_preserves_context_and_admits_no_pending_goal_or_successor()
                 LoopControlRequest::Update { operation_id, .. } => operation_id.as_str(),
                 _ => unreachable!(),
             }));
-    assert!(
-        h.status(None).await.is_err(),
-        "Stop revokes the live read grant too"
+    let operation = operation_id(&command).unwrap();
+    let status = h.status(Some(operation)).await.unwrap();
+    assert_eq!(status["configured"], true);
+    assert_eq!(status["loop"]["stop_requested"], true);
+    assert_eq!(
+        status["operation_receipt"],
+        serde_json::to_value(consumption(&h.durable().await, &command)).unwrap()
+    );
+    let generation = h.inbox.inspect(TARGET).await.unwrap().generation;
+    let retry = h.send(&command).await.unwrap();
+    assert_eq!(retry["configured"], true);
+    assert_eq!(
+        h.inbox.inspect(TARGET).await.unwrap().generation,
+        generation
     );
     assert!(!h.admit().await);
     assert_eq!(h.state().status, LoopStatus::Stopped);
+    let stopped = h.status(Some(operation)).await.unwrap();
+    assert_eq!(stopped["loop"]["status"], "stopped");
+    assert_eq!(stopped["operation_receipt"], status["operation_receipt"]);
     assert_eq!(
         serde_json::to_value(&h.durable().await.messages).unwrap(),
         before_messages

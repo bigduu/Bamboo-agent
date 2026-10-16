@@ -263,10 +263,17 @@ pub(crate) async fn drain(
         if policy.execution_cancel()?.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        // A committed Stop has revoked this grant's physical writer. Leave any
-        // remaining QueueOnly input with its original owner instead of turning
-        // the successful stop into an authority error on the next claim.
-        if policy.stop.is_cancelled() {
+        // Host stop revokes the grant; model Stop cancels only the generation's
+        // child token. In both cases leave later QueueOnly input with this
+        // original owner. A logical Stop cannot consume or configure more work.
+        let generation_stopped = counted_loop::read_loop_state(session)?.is_some_and(|state| {
+            state.owner_execution_id == binding.execution_id
+                && state
+                    .control
+                    .as_ref()
+                    .is_some_and(|control| control.stop_requested)
+        });
+        if policy.stop.is_cancelled() || generation_stopped {
             return Ok(());
         }
         policy
