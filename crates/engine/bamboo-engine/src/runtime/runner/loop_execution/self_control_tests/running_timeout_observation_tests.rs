@@ -272,12 +272,53 @@ async fn self_control_pre_start_running_observation_survives_tool_and_batch_time
             active: Arc::new(AtomicUsize::new(0)),
             peak: AtomicUsize::new(0),
         });
+        let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
         let (result, events) = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_timeout_observation_fixture(&mut fixture, provider.clone(), Arc::new(tools)),
+            trace.scope(run_timeout_observation_fixture(
+                &mut fixture,
+                provider.clone(),
+                Arc::new(tools),
+            )),
         )
         .await
         .expect("existing one-second tool/batch timeout must bound the pending plugin");
+        let spans = trace.spans();
+        let pending_spans = spans
+            .iter()
+            .filter(|span| {
+                span.attributes.iter().any(|kv| {
+                    kv.key.as_str() == "gen_ai.tool.call.id" && kv.value.to_string() == PENDING_CALL
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pending_spans.len(), 1);
+        for (key, value) in [("error.type", "timeout"), ("bamboo.outcome", "error")] {
+            assert!(pending_spans[0]
+                .attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == key && kv.value.to_string() == value));
+        }
+        let control_spans = spans
+            .iter()
+            .filter(|span| {
+                span.attributes.iter().any(|kv| {
+                    kv.key.as_str() == "gen_ai.tool.call.id" && kv.value.to_string() == CONTROL_CALL
+                })
+            })
+            .collect::<Vec<_>>();
+        // A completed dispatch stays successful even when the runtime's existing
+        // batch handler later synthesizes timeout replies for the whole batch.
+        assert_eq!(control_spans.len(), 1);
+        assert!(control_spans[0]
+            .attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == "bamboo.outcome" && kv.value.to_string() == "success"));
+        assert!(!control_spans[0]
+            .attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == "error.type"));
+
         result.unwrap();
         // The helper is below public Agent's ordinary terminal save. Persist
         // only the runner's actual returned snapshot, never fabricated state.

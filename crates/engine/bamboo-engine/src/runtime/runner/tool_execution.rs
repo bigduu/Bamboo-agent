@@ -304,7 +304,7 @@ async fn execute_and_apply_single_tool_call(
                         .per_tool_timeout_secs
                         .min(config.parallel_batch_timeout_secs),
                 );
-                match tokio::time::timeout(timeout, dispatch).await {
+                match bamboo_infrastructure::telemetry::with_timeout(timeout, dispatch).await {
                     Ok(result) => result?,
                     Err(_) => {
                         let violation = bamboo_agent_core::tools::suspension_running_violated();
@@ -813,12 +813,12 @@ async fn execute_round_tool_calls_inner(
             let output_cap = session
                 .effective_token_budget()
                 .map(|budget| budget.max_tool_output_tokens);
-            let outcomes = tokio::time::timeout(
+            let outcomes = bamboo_infrastructure::telemetry::with_timeout(
                 batch_timeout,
                 join_all(batch.iter().map(|tool_call| {
                     let timeout = per_tool_timeout;
                     async move {
-                        tokio::time::timeout(
+                        bamboo_infrastructure::telemetry::with_timeout(
                             timeout,
                             per_call::execute_model_requested_tool_call_only(
                                 effective_callable_set,
@@ -3001,13 +3001,34 @@ mod tests {
                 parallel_batch_timeout_secs: if batch_timeout { 1 } else { 10 },
                 ..Default::default()
             };
-            cap_fixture_round(&mut session, executor.clone(), config).await;
+            let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+            trace
+                .scope(cap_fixture_round(&mut session, executor.clone(), config))
+                .await;
+            let spans = trace.spans();
+            assert_eq!(spans.len(), 2);
             assert_eq!(
                 executor.seen.lock().unwrap().len(),
                 2,
                 "both actual dispatch scopes started"
             );
             for id in ["cap-a", "cap-b"] {
+                let matching = spans
+                    .iter()
+                    .filter(|span| {
+                        span.attributes.iter().any(|kv| {
+                            kv.key.as_str() == "gen_ai.tool.call.id" && kv.value.to_string() == id
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(matching.len(), 1);
+                assert_eq!(matching[0].name, "execute_tool cap_probe");
+                for (key, value) in [("error.type", "timeout"), ("bamboo.outcome", "error")] {
+                    assert!(matching[0]
+                        .attributes
+                        .iter()
+                        .any(|kv| kv.key.as_str() == key && kv.value.to_string() == value));
+                }
                 let replies: Vec<_> = session
                     .messages
                     .iter()
@@ -3037,6 +3058,33 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|(_, cap)| *cap == Some(0)));
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_cancelled_tool_dispatches_are_not_timeouts() {
+        for parallel in [false, true] {
+            let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+            let mut session = Session::new("cap-cancelled", "model");
+            let executor = cap_executor(parallel, true);
+            let mut run = Box::pin(trace.scope(cap_fixture_round(
+                &mut session,
+                executor.clone(),
+                Default::default(),
+            )));
+            assert!(futures::poll!(run.as_mut()).is_pending());
+            let expected = if parallel { 2 } else { 1 };
+            assert_eq!(executor.seen.lock().unwrap().len(), expected);
+            drop(run);
+            let spans = trace.spans();
+            assert_eq!(spans.len(), expected);
+            for span in spans {
+                for key in ["error.type", "bamboo.outcome"] {
+                    assert!(span
+                        .attributes
+                        .iter()
+                        .any(|kv| kv.key.as_str() == key && kv.value.to_string() == "cancelled"));
+                }
+            }
         }
     }
 }

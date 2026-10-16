@@ -1542,27 +1542,44 @@ pub(super) async fn execute_llm_stream(
             ));
         }
     }
-    let stream = crate::runtime::stream::handler::await_stream_bootstrap(
-        llm.chat_stream_ir(
-            &prepared_envelope.ir,
-            tool_schemas,
-            Some(max_output_tokens),
-            model,
-            Some(&planned.request_options),
-        ),
-        cancel_token,
-        session_id,
-        &timeout_context,
-    )
-    .await?
-    .map_err(|error| {
-        let message = format_provider_error(error);
-        if is_llm_overflow_error(&message) {
-            AgentError::LLMOverflow(message)
-        } else {
-            AgentError::LLM(message)
+    if cancel_token.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+    // Start only at the actual dispatch boundary: failed prompt preflight is
+    // not an LLM request. The same span remains alive through stream consumption.
+    let observation =
+        bamboo_infrastructure::telemetry::Observation::llm(provider_type, model, session_id);
+    let stream = observation
+        .scope(crate::runtime::stream::handler::await_stream_bootstrap(
+            llm.chat_stream_ir(
+                &prepared_envelope.ir,
+                tool_schemas,
+                Some(max_output_tokens),
+                model,
+                Some(&planned.request_options),
+            ),
+            cancel_token,
+            session_id,
+            &timeout_context,
+        ))
+        .await
+        .and_then(|result| {
+            result.map_err(|error| {
+                let message = format_provider_error(error);
+                if is_llm_overflow_error(&message) {
+                    AgentError::LLMOverflow(message)
+                } else {
+                    AgentError::LLM(message)
+                }
+            })
+        });
+    let stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            observation.finish(crate::runtime::runner::telemetry_error_outcome(&error));
+            return Err(error);
         }
-    })?;
+    };
 
     // A successful stream bootstrap is the first point at which the final
     // provider-visible PromptIR is known to have been accepted. Capture the
@@ -1638,27 +1655,37 @@ pub(super) async fn execute_llm_stream(
         );
     // The opt-in evidence check must publish only the final, checked answer.
     // Buffer this response until tool calls tell us whether it is a candidate.
-    let stream_output_result = if activation_pending || config.features_final_evidence_check {
-        crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
-            stream,
-            cancel_token,
-            session_id,
-            &timeout_context,
-        )
-        .await
-    } else {
-        crate::runtime::stream::handler::consume_llm_stream_with_context_and_partial(
-            stream,
-            event_tx,
-            cancel_token,
-            session_id,
-            &timeout_context,
-        )
-        .await
-    };
+    let stream_output_result = observation
+        .scope(async {
+            if activation_pending || config.features_final_evidence_check {
+                crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
+                    stream,
+                    cancel_token,
+                    session_id,
+                    &timeout_context,
+                )
+                .await
+            } else {
+                crate::runtime::stream::handler::consume_llm_stream_with_context_and_partial(
+                    stream,
+                    event_tx,
+                    cancel_token,
+                    session_id,
+                    &timeout_context,
+                )
+                .await
+            }
+        })
+        .await;
     let mut stream_output = match stream_output_result {
         Ok(output) => output,
         Err(failure) => {
+            if let Some(usage) = failure.partial_output.provider_usage {
+                observation.usage(usage.input_tokens, usage.output_tokens);
+            }
+            observation.finish(crate::runtime::runner::telemetry_error_outcome(
+                &failure.error,
+            ));
             let appended = append_interrupted_assistant_output(
                 session,
                 *failure.partial_output,
@@ -1673,6 +1700,11 @@ pub(super) async fn execute_llm_stream(
             return Err(failure.error);
         }
     };
+
+    if let Some(usage) = stream_output.provider_usage {
+        observation.usage(usage.input_tokens, usage.output_tokens);
+    }
+    observation.finish(bamboo_infrastructure::telemetry::Outcome::Success);
 
     if config.features_final_evidence_check
         && !activation_pending

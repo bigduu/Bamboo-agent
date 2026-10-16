@@ -44,6 +44,9 @@ use std::path::PathBuf;
 
 pub mod error;
 
+/// Explicit, content-free OpenTelemetry initialization and W3C propagation.
+pub use bamboo_infrastructure::telemetry;
+
 pub mod commands;
 
 #[doc(hidden)]
