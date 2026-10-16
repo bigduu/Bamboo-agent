@@ -1510,6 +1510,16 @@ pub enum SessionInboxError {
 /// but every address is a stable logical session id.
 #[async_trait]
 pub trait SessionInboxPort: Send + Sync {
+    /// Host wiring only; one live runtime may own a concrete Inbox adapter.
+    /// A weak observer never keeps a grant/runtime alive and None is no proof.
+    fn bind_scoped_transport_runtime(
+        &self,
+        _runtime: std::sync::Weak<dyn SessionActivationPort>,
+        _instance: std::sync::Arc<()>,
+    ) -> bool {
+        false
+    }
+
     /// Host-only access to the concrete durable Inbox when an Actor-fenced
     /// transcript seed must hold the same process lock as claim and ACK.
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -1937,6 +1947,21 @@ pub enum SessionActivationError {
 /// loop directly; it notifies the owner or reserves one successor activation.
 #[async_trait]
 pub trait SessionActivationPort: Send + Sync {
+    /// Opaque in-process runtime identity, never serialized or a model grant.
+    fn scoped_transport_runtime_instance(&self) -> Option<std::sync::Arc<()>> {
+        None
+    }
+
+    /// Disposal only: a real closed owner in this exact runtime. An absent
+    /// owner, a fresh router, contention or a failed retain is NOT a dead-run
+    /// proof. This guard must never notify, admit, resume or publish runtime.
+    fn retain_closed_scoped_transport_blocking(
+        &self,
+        binding: &crate::ScopedLoopControlBinding,
+    ) -> Result<std::sync::Arc<dyn SessionRunDeliveryGuard>, SessionRunConflict> {
+        Err(SessionRunConflict::unsupported(&binding.owner_run_id))
+    }
+
     /// Called only from an already-owned blocking filesystem job. Retain the
     /// exact registered non-finalizing owner across the synchronous publication
     /// boundary. Implementations must not emulate this with a read-then-act.

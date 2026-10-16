@@ -2605,7 +2605,7 @@ async fn handle_no_tool_calls_with_native(
     );
     // Counted publication belongs to the outer runner, after AfterRound,
     // normal finalization and the terminal LoopState checkpoint all succeed.
-    if config.effective_counted_loop().is_none() {
+    if !super::defers_terminal_complete(config) {
         let _ = event_tx.send(AgentEvent::Complete { usage }).await;
     }
     record_no_tool_calls_round_completed(
@@ -2617,7 +2617,7 @@ async fn handle_no_tool_calls_with_native(
     );
     Ok(TurnOutcome {
         should_break: true,
-        sent_complete: config.effective_counted_loop().is_none(),
+        sent_complete: !super::defers_terminal_complete(config),
     })
 }
 
@@ -2851,7 +2851,7 @@ async fn handle_tool_calls_path(
                 "runtime.completion_reason".into(),
                 "ticket_question_yield".into(),
             );
-            if frame.config.effective_counted_loop().is_none() {
+            if !super::defers_terminal_complete(frame.config) {
                 let _ = frame
                     .event_tx
                     .send(AgentEvent::Complete {
@@ -2865,7 +2865,7 @@ async fn handle_tool_calls_path(
         }
         return Ok(TurnOutcome {
             should_break: true,
-            sent_complete: ticket_question_yield && frame.config.effective_counted_loop().is_none(),
+            sent_complete: ticket_question_yield && !super::defers_terminal_complete(frame.config),
         });
     }
 

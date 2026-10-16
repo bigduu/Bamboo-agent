@@ -98,12 +98,36 @@ bounds, live owner CAS or any execution-authority check.
 Nested objective strings also require at least one character outside Rust's
 Unicode White_Space set. This preserves FEFF as content and rejects NEL-only
 text, rather than using a regex whitespace shorthand with different semantics.
-The existing 16384 UTF-8 byte limit is enforced by the shared typed request
-before Inbox delivery. JSON Schema `maxLength` counts characters and remains
-a coarse filter; schema acceptance alone does not prove the byte bound.
-All existing legal ASCII, CJK, emoji and mixed strings retain the complete
-byte allowance. This documents the schema/runtime boundary; it does not claim
-an exact portable schema assertion for encoded UTF-8 length.
+This unpublished remote command contract accepts at most **4096 Unicode scalar
+values**, counting the original objective including surrounding whitespace.
+The existing **16384 UTF-8 byte** limit and non-whitespace requirement still apply.
+Standard JSON Schema `maxLength: 4096` and the Domain scoped-command validator
+enforce the same scalar limit: a scalar occupies at most four UTF-8 bytes, so
+every schema-accepted string also fits the byte ceiling. The same Domain guard
+runs before Tool and direct Messenger delivery and when validating typed Inbox
+carriers. No trimming, normalization, authority or application is implied.
+Update's null objective remains an omitted patch; another actual patch is required.
+
+This is an explicit narrowing of the earlier **unreleased remote candidate**,
+not an exact schema encoding of the original full 16 KiB language. Standalone
+self `loop_control`, its shared request DTO and its 16 KiB contract are unchanged.
+For example:
+
+| Objective | Scalars | UTF-8 bytes | Self | Remote |
+|---|---:|---:|---|---|
+| ASCII repeated 4096 | 4096 | 4096 | accepts | accepts |
+| CJK repeated 4096 | 4096 | 12288 | accepts | accepts |
+| Emoji repeated 4096 | 4096 | 16384 | accepts | accepts |
+| `aé界😀` repeated 1024 | 4096 | 10240 | accepts | accepts |
+| ASCII repeated 16384 | 16384 | 16384 | accepts | rejects |
+| CJK repeated 5000 | 5000 | 15000 | accepts | rejects |
+| `aé界😀` repeated 1638, then `abcd` | 6556 | 16384 | accepts | rejects |
+| CJK repeated 5500 | 5500 | 16500 | rejects | rejects |
+
+The remote limit is independent of live grants, finite bounds, CAS and target
+consumption checks; passing text validation supplies none of that authority.
+The historical full-byte-schema mismatch evidence remains evidence of the old
+candidate, rather than being relabelled as parity under this narrower contract.
 
 Canonical disabled-tool checks use Domain's authoritative reference resolver
 for the corresponding fixed core capability (`session_control` on the source,
@@ -228,11 +252,62 @@ typed consumption limit. Clearly unmatched malformed/User/foreign input remains
 unchanged for the normal corruption path. A selected invalid proof, actual I/O
 error, tombstone collision or revoked/expired authority fails closed: a real
 Stop publication is not rolled back or relabelled as a successful ACK. Existing
-tombstones are never overwritten. This path covers the normal later tail of a
-consumed remote Stop. Local self Stop without that claim, host cancellation,
-other terminal exits, earlier exceptional leased remnants and interrupted
-cleanup need a separate target-owned retirement/recovery contract; this slice
-does not restore their grants or claim automatic reclamation.
+tombstones are never overwritten. This original remote-Stop path covers its
+normal later tail. The target-owned terminal boundary also disposes exact-run
+transports when a local Stop, ordinary completion, budget, host stop,
+cancellation, provider failure or dropped execution ends the owning pipeline,
+including an installed host grant before any Loop generation was started.
+
+The host binds a private reusable transport callback to the actual direct-run
+registration before polling the runner. A per-registration in-process instance
+prevents a stale callback from closing a replacement merely sharing a run id.
+The target closes intake under the existing publication fence, releases that
+fence before awaiting Storage, then retains the real canonical and Inbox guards
+and the closed owner across each physical disposal job. It neither consults nor
+recreates a revoked initiating Supervisor grant. Unsupported Storage refuses the
+host opt-in before publication. This port is transport disposal, not a new
+Session writer, model capability, scheduler or recovery authority.
+
+For the scoped opt-in, every inner success publication is deferred until target
+transport cleanup and the original terminal checkpoint succeed. No-Start exits
+are included. The shared successful-cleanup bit is set only after all physical
+ACK/cancel jobs finish; registration finish, abandon and Drop use the same
+callback before releasing ownership or considering a successor. An I/O or proof
+failure retains the closed owner, leaves cleanup unsuccessful and publishes no
+Complete. It does not silently grant a new owner or automatic recovery. An
+original provider/runtime error remains the result; for an otherwise successful
+run, cancellation before Complete wins over a concurrent cleanup error, while
+that cleanup error remains recorded.
+
+A full old queue cannot defer reclamation until after a successor is acquired:
+ordinary User delivery checks eligible scoped transports before backlog capacity.
+Disposal requires either the actual same-runtime already-closed owner or strict
+current native census evidence. Native evidence reads regular full Main and
+Runtime plus both current Actor record/initialization witnesses, validates their
+birth, Root lineage, Project and overlay identity, then proves current terminal
+status, current lease expiry, a different actual owner run, or a different valid
+canonical pipeline. Each started filesystem job re-reads that proof with a fresh
+clock. Delivery and scoped checkpoints likewise recheck current native liveness
+at their final retained publication boundary, so a logical slot cannot extend a
+native lease. No old physical epoch is reconstructed from the epoch-less binding.
+
+A missing/dead router, a missing or corrupt witness, a never-claimed Cold actor,
+or a legacy post-crash Running snapshot is not evidence of expiry. Same run and
+execution with only an epoch change remains unknown. These cases fail closed
+instead of restoring grants or making a persistence/restart policy decision.
+Ordinary delivery with no scoped carrier follows its existing path without a
+new Runtime sidecar or native-census requirement; Child delivery receives no
+Root-only proof requirement.
+
+A sweep only selects the fixed scoped carrier and exact target birth/run/execution.
+It validates original transport identity, intent, digest and any existing lease.
+An exact immutable consumption plus Main cursor receives its original ACK,
+including a consumed rejection. A conflicting digest or half-checkpoint is an
+error. An existing permanent admission receipt is preserved. Otherwise only the
+now-inert transport is cancelled: absent or evicted history is not relabelled as
+proof that it never executed, and no Applied result, cursor or consumption is
+invented. Parsing transport identity does not reapply a newly tightened objective
+acceptance policy to historical bytes. No goal is rewritten to satisfy a limit.
 
 Host stop, execution cancellation, or owner finalization/release/replacement
 ends this live-control capability. The Supervisor cannot use the retired grant
@@ -284,6 +359,19 @@ Stop is sticky and never restarts a generation or answers a human wait.
 - A fake-provider public runner combination with controlled barriers, proving
   the Supervisor commands another live Root and observes its real target-side
   goal admission while provider concurrency remains one.
+- Remote scalar/byte and whitespace boundaries through the registered schema,
+  typed carrier, direct Messenger and actual counted iteration; unchanged self
+  acceptance and an explicit disclosure of the narrower remote contract.
+- Public direct-owner No-Start/active exits and real Root-terminal-before-Drop;
+  actual native pending/claimed/committed-cur reclamation before backlog capacity;
+  final-publication expiry, unknown/corrupt/live refusal, ordinary no-scope
+  controls, and cleanup-error/cancellation with no Complete or successor.
+
+The following receipts belong to the earlier implementation at the explicitly
+listed heads. They do not validate the new remote scalar contract or terminal
+retirement boundary. Those changes require their own tests-only behavioral RED,
+actual candidate GREEN and current-head review before admission. Static patch
+application or rustfmt parsing is not runtime acceptance.
 
 Recorded local acceptance uses this common test prefix:
 

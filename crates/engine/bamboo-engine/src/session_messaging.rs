@@ -768,7 +768,7 @@ impl SessionMessenger {
         let invalid = |message: String| SessionMessengerError::InvalidEnvelope(message);
         bamboo_domain::validate_supervisor_target_id(target_session_id)
             .map_err(|error| invalid(error.into()))?;
-        command.validate().map_err(invalid)?;
+        bamboo_domain::validate_scoped_loop_control_command(command).map_err(invalid)?;
         let status = matches!(command, LoopControlRequest::Status);
         if expected_link_revision == Some(0)
             || (!status && expected_link_revision.is_none())

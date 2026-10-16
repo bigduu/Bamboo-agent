@@ -2,6 +2,8 @@
 //! Public runner/provider wiring is covered separately by the owner.
 
 use super::*;
+
+mod terminal_owner_mechanism_tests;
 use crate::runtime::config::PromptMemoryFlags;
 use crate::session_activation::{
     SessionActivationReserveOutcome, SessionActivationRouter, SessionActivationSpawner,
@@ -54,6 +56,10 @@ struct RecordingActivation {
 
 #[async_trait]
 impl SessionActivationPort for RecordingActivation {
+    fn scoped_transport_runtime_instance(&self) -> Option<Arc<()>> {
+        self.router.scoped_transport_runtime_instance()
+    }
+
     fn retain_expected_run_blocking(
         &self,
         target: &str,

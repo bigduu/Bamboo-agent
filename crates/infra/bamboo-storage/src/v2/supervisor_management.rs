@@ -70,9 +70,16 @@ pub(crate) struct SupervisorFollowupGuard {
     // A private observation held stable by these same target Session locks.
     // It closes only new Loop carriers, never reads or exact receipt retries.
     scoped_loop_stopped: bool,
+    scoped_native: Option<super::scoped_transport_expiry::ScopedTransportCensus>,
 }
 
 impl SupervisorFollowupGuard {
+    pub(crate) fn scoped_native(
+        &self,
+    ) -> Option<super::scoped_transport_expiry::ScopedTransportCensus> {
+        self.scoped_native.clone()
+    }
+
     pub(crate) fn scoped_loop_stopped(&self) -> bool {
         self.scoped_loop_stopped
     }
@@ -179,6 +186,7 @@ impl SessionStoreV2 {
             _task: task,
             _lifecycle: lifecycle,
             scoped_loop_stopped: false,
+            scoped_native: None,
         })
     }
 
@@ -244,6 +252,14 @@ impl SessionStoreV2 {
         {
             return Err(denied("Supervisor Loop canonical authority changed"));
         }
+        // Read-only native physical authority: a logical slot cannot keep
+        // admitting carriers after its Actor lease expires or is superseded.
+        let census = super::scoped_transport_expiry::ScopedTransportCensus::read(
+            &self.sessions_dir.join(&target.id),
+        )?
+        .ok_or_else(|| denied("Loop target canonical census missing"))?;
+        census.require_live_binding(binding)?;
+        guard.scoped_native = Some(census);
         guard.scoped_loop_stopped = Self::scoped_loop_execution_stopped(&target, binding)?;
         Ok(guard)
     }

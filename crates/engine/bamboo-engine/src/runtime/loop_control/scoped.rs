@@ -79,11 +79,16 @@ impl LoopControlConfig {
     pub(crate) async fn register_supervisor_control(
         &self,
         session: &Session,
-        _storage: &Arc<dyn Storage>,
+        storage: &Arc<dyn Storage>,
     ) -> Result<(), AgentError> {
         let Some(grant) = &self.supervisor_grant else {
             return Ok(());
         };
+        if !storage.supports_scoped_loop_transport_retirement() {
+            return Err(super::fatal(
+                "Supervisor Loop transport retirement unsupported",
+            ));
+        }
         self.validate_current_owner(session).await?;
         grant.validate(self.max_iterations, self.max_total_rounds)?;
         let ownership = self
@@ -515,4 +520,98 @@ async fn propose(
         hash,
         Some(&input.binding),
     ))
+}
+
+impl LoopControlConfig {
+    /// Installed before polling the runtime. The clone shares the actual live
+    /// binding and successful-cleanup bit, never recreating authority from disk.
+    pub(crate) fn bind_transport_cleanup(
+        &self,
+        registration: &mut crate::session_activation::SessionRunRegistration,
+        storage: Arc<dyn Storage>,
+        inbox: Option<Arc<dyn SessionInboxPort>>,
+        owner: Option<bamboo_domain::storage::RootActorRuntimeWrite>,
+    ) {
+        if self.supervisor_grant.is_none() {
+            return;
+        }
+        let policy = self.clone();
+        registration.set_scoped_transport_cleanup(move || {
+            let policy = policy.clone();
+            let storage = storage.clone();
+            let inbox = inbox.clone();
+            let owner = owner.clone();
+            async move {
+                policy
+                    .retire_transport(&storage, inbox, owner.as_ref())
+                    .await
+            }
+        });
+    }
+
+    async fn retire_transport(
+        &self,
+        storage: &Arc<dyn Storage>,
+        inbox: Option<Arc<dyn SessionInboxPort>>,
+        owner: Option<&bamboo_domain::storage::RootActorRuntimeWrite>,
+    ) -> std::io::Result<()> {
+        if self
+            .transport_retired
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let Some(binding) = self.live_supervisor_binding.get() else {
+            return Ok(());
+        };
+        let ownership = self
+            .owner
+            .ownership()
+            .ok_or_else(|| std::io::Error::other("target retirement owner missing"))?;
+        ownership.close_scoped_transport(binding).await?;
+        let inbox =
+            inbox.ok_or_else(|| std::io::Error::other("target retirement Inbox missing"))?;
+        let retained_binding = binding.clone();
+        storage
+            .retire_scoped_loop_transport(bamboo_domain::storage::ScopedLoopTransportRetirement {
+                binding,
+                inbox,
+                owner,
+                retain: Arc::new(move || {
+                    ownership.retain_closed_scoped_transport(&retained_binding)
+                }),
+            })
+            .await?;
+        // Only the complete physical sweep, including ACK/cancel jobs, proves
+        // success. Subsequent registration finish adds no fallible post-Complete work.
+        self.transport_retired
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+}
+
+pub(crate) async fn retire_terminal_transport(config: &AgentLoopConfig) -> Result<(), AgentError> {
+    let Some(policy) = config
+        .loop_control
+        .as_ref()
+        .filter(|policy| policy.supervisor_grant_id().is_some())
+    else {
+        return Ok(());
+    };
+    let storage = config
+        .storage
+        .as_ref()
+        .ok_or_else(|| super::fatal("target retirement storage missing"))?;
+    policy
+        .retire_transport(
+            storage,
+            config.session_inbox.clone(),
+            config
+                .persistence
+                .as_ref()
+                .and_then(|persistence| persistence.root_actor_writer())
+                .as_ref(),
+        )
+        .await
+        .map_err(|error| super::fatal(&format!("target transport retirement failed: {error}")))
 }

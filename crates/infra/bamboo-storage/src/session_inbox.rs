@@ -59,6 +59,7 @@ struct ExpectedRunAdmission {
     // Canonical Stop observed while the original Supervisor authority locks
     // remain held through this delivery. Applies only to new carrier ids.
     scoped_loop_stopped: bool,
+    native_census: Option<crate::v2::scoped_transport_expiry::ScopedTransportCensus>,
 }
 
 impl ExpectedRunAdmission {
@@ -72,6 +73,12 @@ impl ExpectedRunAdmission {
                 self.target_created_at,
                 &self.expected_run_id,
             )?,
+        };
+        let guard = match (&self.native_census, &self.scoped_loop) {
+            (Some(census), Some(binding)) => census
+                .wrap_live_guard(binding, guard)
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?,
+            _ => guard,
         };
         if !guard.matches(
             &self.target_session_id,
@@ -214,6 +221,7 @@ pub struct FileSessionInbox {
     /// Runtime-owned path registry. Clones of this adapter share it, while
     /// independent AppState/SDK runtimes remain fully isolated.
     operation_locks: Arc<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>>,
+    scoped_runtime: Arc<Mutex<Option<(Weak<dyn bamboo_domain::SessionActivationPort>, Arc<()>)>>>,
     #[cfg(test)]
     followup_authority_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     #[cfg(test)]
@@ -238,6 +246,9 @@ pub struct FileSessionInbox {
     owned_scope_drop: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
+#[path = "session_inbox_scoped_retirement.rs"]
+mod scoped_retirement;
+
 impl FileSessionInbox {
     pub fn new(sessions: Arc<SessionStoreV2>, limits: SessionInboxLimits) -> Self {
         Self {
@@ -246,6 +257,7 @@ impl FileSessionInbox {
             child_owner: None,
             limits,
             operation_locks: Arc::new(Mutex::new(HashMap::new())),
+            scoped_runtime: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             followup_authority_pause: None,
             #[cfg(test)]
@@ -1365,7 +1377,7 @@ impl FileSessionInbox {
         }
 
         let (dir, filesystem) = self
-            .filesystem_with_authority(&envelope.target_session_id, authority)
+            .delivery_filesystem_with_transport_expiry(&envelope.target_session_id, authority)
             .await?;
         // Enqueue idempotency is independent from consumer admission dedupe.
         // This closes the legacy-migration crash window (deliver succeeded,
@@ -2089,6 +2101,26 @@ impl FileSessionInbox {
 
 #[async_trait]
 impl SessionInboxPort for FileSessionInbox {
+    fn bind_scoped_transport_runtime(
+        &self,
+        runtime: Weak<dyn bamboo_domain::SessionActivationPort>,
+        instance: Arc<()>,
+    ) -> bool {
+        let mut slot = self
+            .scoped_runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match slot.as_ref() {
+            Some((previous, identity)) if previous.upgrade().is_some() => {
+                Arc::ptr_eq(identity, &instance)
+            }
+            _ => {
+                *slot = Some((runtime, instance));
+                true
+            }
+        }
+    }
+
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
@@ -2099,6 +2131,21 @@ impl SessionInboxPort for FileSessionInbox {
         envelope: &SessionMessageEnvelope,
         activation: Arc<dyn bamboo_domain::SessionActivationPort>,
     ) -> Result<bamboo_domain::SessionInboxSteerReceipt, SessionInboxError> {
+        if let Some((_, expected)) = self
+            .scoped_runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            if !activation
+                .scoped_transport_runtime_instance()
+                .is_some_and(|actual| Arc::ptr_eq(&actual, expected))
+            {
+                return Err(SessionInboxError::InvalidClaim(
+                    "scoped Loop delivery belongs to another runtime".into(),
+                ));
+            }
+        }
         let input = bamboo_domain::scoped_loop_control_input(envelope)
             .map_err(SessionInboxError::InvalidClaim)?
             .ok_or_else(|| SessionInboxError::InvalidClaim("typed Loop input required".into()))?;
@@ -2113,6 +2160,7 @@ impl SessionInboxPort for FileSessionInbox {
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
         let scoped_loop_stopped = authority.scoped_loop_stopped();
+        let native_census = authority.scoped_native();
         let state = self
             .deliver_with_lifecycle_held_run(
                 envelope,
@@ -2128,6 +2176,7 @@ impl SessionInboxPort for FileSessionInbox {
                     activation,
                     scoped_loop: Some(binding.clone()),
                     scoped_loop_stopped,
+                    native_census,
                 }),
             )
             .await?;
@@ -2455,6 +2504,7 @@ impl SessionInboxPort for FileSessionInbox {
                     activation,
                     scoped_loop: None,
                     scoped_loop_stopped: false,
+                    native_census: None,
                 }),
             )
             .await?;

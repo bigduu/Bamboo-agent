@@ -195,6 +195,10 @@ struct RecordedActivation {
 
 #[async_trait]
 impl SessionActivationPort for RecordedActivation {
+    fn scoped_transport_runtime_instance(&self) -> Option<Arc<()>> {
+        self.router.scoped_transport_runtime_instance()
+    }
+
     fn retain_expected_run_blocking(
         &self,
         target: &str,
@@ -262,6 +266,13 @@ impl ScopedPublicFixture {
     }
 
     async fn new_with_root_actor_directory(native_root: bool) -> Self {
+        Self::new_with_storage_transform(native_root, |store| store).await
+    }
+
+    async fn new_with_storage_transform<F>(native_root: bool, transform: F) -> Self
+    where
+        F: FnOnce(Arc<bamboo_storage::SessionStoreV2>) -> Arc<dyn Storage>,
+    {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         let config_dir = dir.path().join("config");
@@ -297,7 +308,7 @@ impl ScopedPublicFixture {
                 .await
                 .unwrap(),
         );
-        let storage: Arc<dyn Storage> = store.clone();
+        let storage: Arc<dyn Storage> = transform(store.clone());
         let repository = SessionRepository::new(
             Arc::new(Default::default()),
             storage.clone(),

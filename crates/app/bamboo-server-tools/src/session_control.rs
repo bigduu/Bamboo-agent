@@ -215,6 +215,8 @@ fn scoped_loop_command_schema() -> Value {
     schema["properties"]["objective"]["pattern"] = json!(
         r"[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]"
     );
+    schema["properties"]["objective"]["maxLength"] =
+        json!(bamboo_domain::MAX_SCOPED_LOOP_OBJECTIVE_CHARS);
     let patch_fields = [
         ("objective", "string"),
         ("max_iterations", "integer"),
@@ -226,10 +228,10 @@ fn scoped_loop_command_schema() -> Value {
         schema["properties"][field]["type"] = json!([kind, "null"]);
     }
     schema["properties"]["objective"]["description"] = json!(
-        "Required for start; optional update patch. Non-whitespace text, at most 16384 UTF-8 bytes. \
-         Shared typed request validation enforces the byte limit before delivery. \
-         maxLength is only a character-count coarse filter: passing schema validation alone does not prove the UTF-8 byte limit. \
-         ASCII, CJK and mixed text retain the same full byte allowance. \
+        "Required for start; optional update patch. Non-whitespace text, at most 4096 Unicode scalar values, \
+         counting the original text including surrounding whitespace, and at most 16384 UTF-8 bytes. \
+         This remote command contract is narrower than standalone self loop_control; no trimming or normalization occurs. \
+         The same limit applies to start and objective updates. \
          An edit applies no earlier than the next iteration admission; at most one objective edit may be pending."
     );
     let variant = |action: &str, required: &[&str], optional: &[&str]| {
@@ -294,7 +296,8 @@ fn validate_loop_arguments(
             "Supervisor loop control cannot target itself".into(),
         ));
     }
-    command.validate().map_err(ToolError::InvalidArguments)?;
+    bamboo_domain::validate_scoped_loop_control_command(command)
+        .map_err(ToolError::InvalidArguments)?;
     if expected_link_revision == Some(0)
         || (!matches!(command, LoopControlRequest::Status) && expected_link_revision.is_none())
     {

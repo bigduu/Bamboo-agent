@@ -53,6 +53,10 @@ pub(crate) async fn run_agent_loop_with_config(
     cancel_token: CancellationToken,
     config: AgentLoopConfig,
 ) -> super::Result<()> {
+    let scoped_transport = config
+        .loop_control
+        .as_ref()
+        .is_some_and(|control| control.supervisor_grant_id().is_some());
     let session_span = tracing::info_span!("agent_loop", session_id = %session.id);
     let mut counted_generation = None;
     let mut counted_usage = super::to_event_token_usage(0, 0);
@@ -226,7 +230,7 @@ pub(crate) async fn run_agent_loop_with_config(
                         &state.session_id,
                         &config,
                         state.metrics_collector.as_ref(),
-                        config.effective_counted_loop().is_some(),
+                        defers_terminal_complete(&config),
                         &mut state.runtime_state,
                     )
                     .await;
@@ -288,7 +292,7 @@ pub(crate) async fn run_agent_loop_with_config(
                     &state.session_id,
                     &config,
                     state.metrics_collector.as_ref(),
-                    config.effective_counted_loop().is_some(),
+                    defers_terminal_complete(&config),
                     &mut state.runtime_state,
                 )
                 .await;
@@ -330,7 +334,7 @@ pub(crate) async fn run_agent_loop_with_config(
             &state.session_id,
             &config,
             state.metrics_collector.as_ref(),
-            sent_complete || config.effective_counted_loop().is_some(),
+            sent_complete || defers_terminal_complete(&config),
             &mut state.runtime_state,
         )
         .await;
@@ -346,7 +350,27 @@ pub(crate) async fn run_agent_loop_with_config(
             .and_then(|c| c.generation())
             .map(str::to_owned);
     }
-    let result = if counted_generation.is_some() && result.is_ok() && cancel_token.is_cancelled() {
+    // This catches startup, hook, provider, cancellation and success exits.
+    // Closing owner transport is target housekeeping, independent of the
+    // original Supervisor's subsequently revoked permission.
+    let retirement = crate::runtime::loop_control::scoped::retire_terminal_transport(&config).await;
+    let result = match (result, retirement) {
+        (Err(error), Err(cleanup)) => {
+            tracing::warn!(%cleanup, "terminal transport cleanup failed");
+            Err(error)
+        }
+        (result @ Err(_), _) => result,
+        (Ok(()), Err(cleanup)) if cancel_token.is_cancelled() => {
+            tracing::warn!(%cleanup, "terminal transport cleanup failed during cancellation");
+            Err(bamboo_agent_core::AgentError::Cancelled)
+        }
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    };
+    let result = if (counted_generation.is_some() || scoped_transport)
+        && result.is_ok()
+        && cancel_token.is_cancelled()
+    {
         Err(bamboo_agent_core::AgentError::Cancelled)
     } else {
         result
@@ -372,12 +396,15 @@ pub(crate) async fn run_agent_loop_with_config(
             // Counted completion has one publication boundary, after every
             // fallible hook/finalizer and the original generation's checkpoint.
             let completion = match checkpoint {
-                Err(error) if cancel_token.is_cancelled() && counted_generation.is_some() => {
+                Err(error)
+                    if cancel_token.is_cancelled()
+                        && (counted_generation.is_some() || scoped_transport) =>
+                {
                     tracing::warn!(%error, "counted-loop checkpoint failed during cancellation");
                     Err(bamboo_agent_core::AgentError::Cancelled)
                 }
                 Err(error) => Err(error),
-                Ok(()) if counted_generation.is_some() => {
+                Ok(()) if counted_generation.is_some() || scoped_transport => {
                     tokio::select! {
                         biased;
                         _ = cancel_token.cancelled() => Err(bamboo_agent_core::AgentError::Cancelled),
@@ -408,6 +435,14 @@ pub(crate) async fn run_agent_loop_with_config(
             completion
         }
     }
+}
+
+fn defers_terminal_complete(config: &AgentLoopConfig) -> bool {
+    config.effective_counted_loop().is_some()
+        || config
+            .loop_control
+            .as_ref()
+            .is_some_and(|control| control.supervisor_grant_id().is_some())
 }
 
 fn fail_counted_runtime(

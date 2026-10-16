@@ -24,6 +24,33 @@ pub const SCOPED_LOOP_UNCERTAIN_KEY: &str = "runtime.scoped_loop_checkpoint_unce
 pub const SCOPED_LOOP_CONSUMPTION_KEY: &str = "runtime.scoped_loop_consumption_v1";
 pub const MAX_SCOPED_LOOP_CONSUMPTIONS: usize = 64;
 
+/// The unpublished cross-Session command contract counts raw Unicode scalar
+/// values, including surrounding whitespace. Four UTF-8 bytes per scalar keep
+/// every accepted remote objective within the unchanged 16 KiB self limit.
+pub const MAX_SCOPED_LOOP_OBJECTIVE_CHARS: usize = 4096;
+
+// Keep schema's scalar ceiling sufficient for the independent byte ceiling.
+const _: () = assert!(
+    MAX_SCOPED_LOOP_OBJECTIVE_CHARS * 4 <= super::loop_control_request::MAX_OBJECTIVE_BYTES
+);
+
+/// Stateless remote wire validation, never an execution-authority grant.
+/// The shared self request retains its existing byte and whitespace checks.
+pub fn validate_scoped_loop_control_command(command: &LoopControlRequest) -> Result<(), String> {
+    command.validate()?;
+    let objective = match command {
+        LoopControlRequest::Start { objective, .. } => Some(objective.as_str()),
+        LoopControlRequest::Update { objective, .. } => objective.as_deref(),
+        LoopControlRequest::Status | LoopControlRequest::Stop { .. } => None,
+    };
+    if objective.is_some_and(|text| text.chars().count() > MAX_SCOPED_LOOP_OBJECTIVE_CHARS) {
+        return Err(format!(
+            "Supervisor Loop objective must be at most {MAX_SCOPED_LOOP_OBJECTIVE_CHARS} Unicode scalar values"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopControlAction {
@@ -84,7 +111,7 @@ impl ScopedLoopControlBinding {
 
     pub fn authorize(&self, command: &LoopControlRequest) -> Result<(), String> {
         self.validate()?;
-        command.validate()?;
+        validate_scoped_loop_control_command(command)?;
         if !self
             .allowed_actions
             .contains(&LoopControlAction::of(command))

@@ -201,6 +201,7 @@ pub trait SessionActivationSpawner: Send + Sync {
 
 #[derive(Debug, Clone)]
 struct ActiveOwner {
+    instance: Arc<()>,
     run_id: String,
     /// Set only by a real registration at its Session-bound execution entry.
     session_created_at: Option<DateTime<Utc>>,
@@ -501,6 +502,7 @@ impl ExpectedRunDeliveryGuard {
 /// One router per owning runtime/AppState. All keys are logical Session ids.
 #[derive(Clone, Default)]
 pub struct SessionActivationRouter {
+    runtime_instance: Arc<()>,
     states: Arc<Mutex<HashMap<String, TargetActivationState>>>,
     /// Live operations for one logical target share a fence. Weak entries are
     /// pruned on access; idle/deleted targets retain no separate lock state.
@@ -519,6 +521,19 @@ type TerminalInspectionPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notif
 type AbortCleanup =
     Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + 'static>;
 
+type ScopedTransportCleanup =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> + Send + Sync>;
+
+struct ClosedLoopTransportGuard(ExpectedRunDeliveryGuard);
+impl bamboo_domain::SessionRunDeliveryGuard for ClosedLoopTransportGuard {
+    fn matches(&self, target: &str, birth: DateTime<Utc>, run: &str) -> bool {
+        bamboo_domain::SessionRunDeliveryGuard::matches(&self.0, target, birth, run)
+    }
+    fn notify_committed_delivery(&self, _generation: u64) -> bool {
+        false
+    }
+}
+
 /// Exact-run ownership lease returned by
 /// [`SessionActivationRouter::register_run`].
 ///
@@ -527,11 +542,13 @@ type AbortCleanup =
 /// durable activation watermark, and gives the router one chance to launch a
 /// successor. A stale lease can never clear a newer owner.
 pub struct SessionRunRegistration {
+    instance: Arc<()>,
     router: Arc<SessionActivationRouter>,
     target_session_id: String,
     run_id: String,
     notifications: Option<watch::Receiver<u64>>,
     abort_cleanup: Option<AbortCleanup>,
+    scoped_transport_cleanup: Option<ScopedTransportCleanup>,
     quarantine_on_drop: bool,
     // The host binds the actual opaque scope before polling direct execution.
     // It is not a Session/model field and cannot grant or weaken authority.
@@ -544,12 +561,90 @@ pub struct SessionRunRegistration {
 /// metadata or the presence of another caller's active run.
 #[derive(Clone)]
 pub(crate) struct SessionRunOwnership {
+    instance: Arc<()>,
     router: Arc<SessionActivationRouter>,
     target_session_id: String,
     run_id: String,
 }
 
 impl SessionRunOwnership {
+    /// Target authority only. Close under the producer's original publication
+    /// fence, without recreating a missing owner or consulting a revoked grant.
+    pub(crate) async fn close_scoped_transport(
+        &self,
+        binding: &bamboo_domain::ScopedLoopControlBinding,
+    ) -> std::io::Result<()> {
+        if binding.target_session_id != self.target_session_id
+            || binding.owner_run_id != self.run_id
+        {
+            return Err(std::io::Error::other(
+                "target transport proof identity differs",
+            ));
+        }
+        let _publication = self.router.lock_publication(&self.target_session_id).await;
+        let mut states = self.router.states.lock().await;
+        let owner = states
+            .get_mut(&self.target_session_id)
+            .and_then(|state| state.owner.as_mut())
+            .filter(|owner| {
+                Arc::ptr_eq(&owner.instance, &self.instance)
+                    && owner.run_id == self.run_id
+                    && owner.session_created_at == Some(binding.target_created_at)
+                    && owner.registrations > 0
+            })
+            .ok_or_else(|| {
+                std::io::Error::other("target transport owner is no longer registered")
+            })?;
+        if owner
+            .scoped_loop
+            .as_ref()
+            .is_some_and(|grant| grant.binding.execution_id != binding.execution_id)
+        {
+            return Err(std::io::Error::other("target transport execution differs"));
+        }
+        owner.finalizing = true;
+        Ok(())
+    }
+
+    pub(crate) fn retain_closed_scoped_transport(
+        &self,
+        binding: &bamboo_domain::ScopedLoopControlBinding,
+    ) -> std::io::Result<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>> {
+        if binding.target_session_id != self.target_session_id
+            || binding.owner_run_id != self.run_id
+        {
+            return Err(std::io::Error::other("closed transport identity differs"));
+        }
+        let publication = self
+            .router
+            .publication_fence(&self.target_session_id)
+            .blocking_lock_owned();
+        let states = self.router.states.blocking_lock();
+        if !states
+            .get(&self.target_session_id)
+            .and_then(|state| state.owner.as_ref())
+            .is_some_and(|owner| {
+                Arc::ptr_eq(&owner.instance, &self.instance)
+                    && owner.run_id == self.run_id
+                    && owner.session_created_at == Some(binding.target_created_at)
+                    && owner.finalizing
+                    && owner.registrations > 0
+            })
+        {
+            return Err(std::io::Error::other("closed transport owner changed"));
+        }
+        drop(states);
+        Ok(Arc::new(ClosedLoopTransportGuard(
+            ExpectedRunDeliveryGuard {
+                target_session_id: self.target_session_id.clone(),
+                session_created_at: binding.target_created_at,
+                run_id: self.run_id.clone(),
+                states: self.router.states.clone(),
+                _publication: publication,
+            },
+        )))
+    }
+
     pub(crate) fn run_id(&self) -> &str {
         &self.run_id
     }
@@ -568,6 +663,14 @@ impl SessionRunOwnership {
 }
 
 impl SessionRunRegistration {
+    pub(crate) fn set_scoped_transport_cleanup<F, Fut>(&mut self, cleanup: F)
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::io::Result<()>> + Send + 'static,
+    {
+        self.scoped_transport_cleanup = Some(Arc::new(move || Box::pin(cleanup())));
+    }
+
     pub(crate) fn bind_tool_suspension_observation(
         &mut self,
         token: bamboo_agent_core::tools::SuspensionRestriction,
@@ -583,6 +686,7 @@ impl SessionRunRegistration {
 
     pub(crate) fn ownership(&self) -> SessionRunOwnership {
         SessionRunOwnership {
+            instance: self.instance.clone(),
             router: self.router.clone(),
             target_session_id: self.target_session_id.clone(),
             run_id: self.run_id.clone(),
@@ -641,6 +745,13 @@ impl SessionRunRegistration {
         self.router
             .begin_finalization(&self.target_session_id, &self.run_id)
             .await;
+        if let Some(cleanup) = self.scoped_transport_cleanup.take() {
+            let task = tokio::spawn(async move { cleanup().await });
+            match task.await {
+                Ok(Ok(())) => {}
+                result => tracing::warn!(?result, "quarantined Loop transport cleanup incomplete"),
+            }
+        }
         self.notifications.take();
     }
 
@@ -657,6 +768,7 @@ impl SessionRunRegistration {
         if self.selected_input_wakes.is_some() {
             drop(self.notifications.take());
         }
+        let scoped_transport_cleanup = self.scoped_transport_cleanup.clone();
         let abort_cleanup = self.abort_cleanup.take();
         let router = self.router.clone();
         let target_session_id = self.target_session_id.clone();
@@ -665,6 +777,12 @@ impl SessionRunRegistration {
         let cleanup_run_id = run_id.clone();
         let selected_input_wakes = self.selected_input_wakes.take();
         let cleanup = tokio::spawn(async move {
+            if let Some(cleanup) = scoped_transport_cleanup {
+                if let Err(error) = cleanup().await {
+                    tracing::warn!(%error, "closed Loop transport cleanup failed; retaining abandoned owner");
+                    return;
+                }
+            }
             if let Some(cleanup) = abort_cleanup {
                 cleanup().await;
             }
@@ -692,6 +810,11 @@ impl SessionRunRegistration {
         mut self,
         admitted_generation: u64,
     ) -> Result<Option<SessionActivationDisposition>, SessionActivationError> {
+        if let Some(cleanup) = &self.scoped_transport_cleanup {
+            cleanup()
+                .await
+                .map_err(|error| SessionActivationError::Internal(error.to_string()))?;
+        }
         // The router compacts caught-up routing state only after the last
         // safe-point receiver is gone.
         drop(self.notifications.take());
@@ -726,6 +849,7 @@ impl Drop for SessionRunRegistration {
         let router = self.router.clone();
         let target_session_id = self.target_session_id.clone();
         let run_id = self.run_id.clone();
+        let scoped_transport_cleanup = self.scoped_transport_cleanup.clone();
         let abort_cleanup = self.abort_cleanup.take();
         let quarantine = self.quarantine_on_drop || self.observed_forbidden_running();
         if self.selected_input_wakes.is_some() {
@@ -734,6 +858,12 @@ impl Drop for SessionRunRegistration {
         let selected_input_wakes = self.selected_input_wakes.take();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
+                if let Some(cleanup) = scoped_transport_cleanup {
+                    if let Err(error) = cleanup().await {
+                        tracing::warn!(%error, "closed Loop transport cleanup failed; retaining dropped owner");
+                        return;
+                    }
+                }
                 if quarantine {
                     router.begin_finalization(&target_session_id, &run_id).await;
                     return;
@@ -1054,6 +1184,7 @@ impl SessionActivationRouter {
             .entry(target_session_id.to_string())
             .or_default()
             .owner = Some(ActiveOwner {
+            instance: Arc::new(()),
             run_id: run_id.to_string(),
             session_created_at: None,
             finalizing: false,
@@ -1126,6 +1257,14 @@ impl SessionActivationRouter {
         execution_cancel: tokio_util::sync::CancellationToken,
         host_stop: tokio_util::sync::CancellationToken,
     ) -> Result<(), bamboo_domain::SessionInboxError> {
+        let inbox = self
+            .inbox
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                bamboo_domain::SessionInboxError::InvalidClaim("scoped Loop Inbox missing".into())
+            })?;
         binding
             .validate()
             .map_err(bamboo_domain::SessionInboxError::InvalidClaim)?;
@@ -1148,7 +1287,8 @@ impl SessionActivationRouter {
             .get_mut(&binding.target_session_id)
             .and_then(|state| state.owner.as_mut())
             .filter(|owner| {
-                owner.run_id == ownership.run_id
+                Arc::ptr_eq(&owner.instance, &ownership.instance)
+                    && owner.run_id == ownership.run_id
                     && !owner.finalizing
                     && owner.registrations > 0
                     && owner.session_created_at == Some(binding.target_created_at)
@@ -1172,6 +1312,14 @@ impl SessionActivationRouter {
             }
             // Idempotency must not replace the original stop/cancel tokens.
             return Ok(());
+        }
+        let runtime: Arc<dyn SessionActivationPort> = self.clone();
+        if !inbox
+            .bind_scoped_transport_runtime(Arc::downgrade(&runtime), self.runtime_instance.clone())
+        {
+            return Err(bamboo_domain::SessionInboxError::InvalidClaim(
+                "scoped Inbox belongs to another live runtime or is unsupported".into(),
+            ));
         }
         owner.scoped_loop = Some(SupervisorLoopGrant {
             binding,
@@ -1242,7 +1390,18 @@ impl SessionActivationRouter {
                             owner.session_created_at = birth;
                         }
                         owner.registrations = 1;
-                        (Some(state.notify.subscribe()), None)
+                        (
+                            Some((
+                                state.notify.subscribe(),
+                                state
+                                    .owner
+                                    .as_ref()
+                                    .expect("registered owner")
+                                    .instance
+                                    .clone(),
+                            )),
+                            None,
+                        )
                     }
                     Some(owner) => {
                         return Err(SessionRunRegistrationError::OwnerCollision {
@@ -1261,6 +1420,7 @@ impl SessionActivationRouter {
                     }
                     None => {
                         state.owner = Some(ActiveOwner {
+                            instance: Arc::new(()),
                             run_id: run_id.to_string(),
                             session_created_at: birth,
                             finalizing: false,
@@ -1269,7 +1429,18 @@ impl SessionActivationRouter {
                             delivery_sink: None,
                             scoped_loop: None,
                         });
-                        (Some(state.notify.subscribe()), None)
+                        (
+                            Some((
+                                state.notify.subscribe(),
+                                state
+                                    .owner
+                                    .as_ref()
+                                    .expect("registered owner")
+                                    .instance
+                                    .clone(),
+                            )),
+                            None,
+                        )
                     }
                 }
             };
@@ -1278,12 +1449,16 @@ impl SessionActivationRouter {
                 let _ = reservation_wait.changed().await;
                 continue;
             }
+            let (notifications, instance) =
+                notifications.expect("registered owner has a receiver and instance");
             return Ok(SessionRunRegistration {
+                instance,
                 router: self.clone(),
                 target_session_id: target_session_id.to_string(),
                 run_id: run_id.to_string(),
-                notifications,
+                notifications: Some(notifications),
                 abort_cleanup: None,
+                scoped_transport_cleanup: None,
                 quarantine_on_drop: false,
                 tool_suspension_observation: None,
                 selected_input_wakes: None,
@@ -1357,6 +1532,7 @@ impl SessionActivationRouter {
             Some(_) => {}
             None => {
                 state.owner = Some(ActiveOwner {
+                    instance: Arc::new(()),
                     run_id: run_id.to_string(),
                     session_created_at: None,
                     finalizing: true,
@@ -1765,6 +1941,7 @@ impl SessionActivationRouter {
                         };
                     }
                     state.owner = Some(ActiveOwner {
+                        instance: Arc::new(()),
                         run_id,
                         session_created_at: None,
                         finalizing: false,
@@ -1797,6 +1974,7 @@ impl SessionActivationRouter {
                     return Ok(SessionActivationDisposition::ActiveNotified);
                 }
                 state.owner = Some(ActiveOwner {
+                    instance: Arc::new(()),
                     run_id,
                     session_created_at: None,
                     finalizing: false,
@@ -1852,6 +2030,49 @@ impl SessionActivationRouter {
 
 #[async_trait]
 impl SessionActivationPort for SessionActivationRouter {
+    fn scoped_transport_runtime_instance(&self) -> Option<Arc<()>> {
+        Some(self.runtime_instance.clone())
+    }
+
+    fn retain_closed_scoped_transport_blocking(
+        &self,
+        binding: &bamboo_domain::ScopedLoopControlBinding,
+    ) -> Result<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>, bamboo_domain::SessionRunConflict>
+    {
+        let publication = self
+            .publication_fence(&binding.target_session_id)
+            .blocking_lock_owned();
+        let states = self.states.blocking_lock();
+        let matches = states
+            .get(&binding.target_session_id)
+            .and_then(|state| state.owner.as_ref())
+            .is_some_and(|owner| {
+                owner.finalizing
+                    && owner.registrations > 0
+                    && owner.run_id == binding.owner_run_id
+                    && owner.session_created_at == Some(binding.target_created_at)
+                    && owner
+                        .scoped_loop
+                        .as_ref()
+                        .is_none_or(|grant| grant.binding.execution_id == binding.execution_id)
+            });
+        if !matches {
+            return Err(bamboo_domain::SessionRunConflict::unsupported(
+                &binding.owner_run_id,
+            ));
+        }
+        drop(states);
+        Ok(Arc::new(ClosedLoopTransportGuard(
+            ExpectedRunDeliveryGuard {
+                target_session_id: binding.target_session_id.clone(),
+                session_created_at: binding.target_created_at,
+                run_id: binding.owner_run_id.clone(),
+                states: self.states.clone(),
+                _publication: publication,
+            },
+        )))
+    }
+
     fn retain_expected_run_blocking(
         &self,
         target_session_id: &str,

@@ -110,6 +110,7 @@ mod root_actor_runtime;
 mod scoped_loop_control;
 #[cfg(test)]
 mod scoped_loop_control_tests;
+pub(crate) mod scoped_transport_expiry;
 mod title_observations;
 pub use host_registry::FileHostRegistry;
 #[cfg(test)]
@@ -6613,6 +6614,17 @@ impl Storage for SessionStoreV2 {
     ) -> io::Result<Option<Session>> {
         self.load_scoped_loop_session_impl(binding, activation)
             .await
+    }
+
+    fn supports_scoped_loop_transport_retirement(&self) -> bool {
+        true
+    }
+
+    async fn retire_scoped_loop_transport(
+        &self,
+        request: bamboo_domain::storage::ScopedLoopTransportRetirement<'_>,
+    ) -> io::Result<()> {
+        self.retire_scoped_loop_transport_impl(request).await
     }
 
     async fn checkpoint_scoped_loop(

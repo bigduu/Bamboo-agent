@@ -457,3 +457,5 @@ async fn run_drop(native: bool, terminal_first: bool) {
         binding.disarm_abandonment();
     }
 }
+
+mod cleanup_failure_tests;

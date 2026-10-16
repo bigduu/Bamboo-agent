@@ -38,6 +38,7 @@ pub struct LoopControlConfig {
     active: Arc<OnceLock<ManagedActivation>>,
     execution: Arc<OnceLock<ControlExecution>>,
     observed_running: Arc<AtomicBool>,
+    transport_retired: Arc<AtomicBool>,
     supervisor_grant: Option<SupervisorLoopControlGrant>,
     live_supervisor_binding: Arc<OnceLock<bamboo_domain::ScopedLoopControlBinding>>,
 }
@@ -73,6 +74,7 @@ impl LoopControlConfig {
             active: Arc::new(OnceLock::new()),
             execution: Arc::new(OnceLock::new()),
             observed_running: Arc::new(AtomicBool::new(false)),
+            transport_retired: Arc::new(AtomicBool::new(false)),
             supervisor_grant: None,
             live_supervisor_binding: Arc::new(OnceLock::new()),
         }
@@ -111,6 +113,7 @@ impl LoopControlConfig {
         self.active = Arc::new(OnceLock::new());
         self.execution = Arc::new(OnceLock::new());
         self.observed_running = Arc::new(AtomicBool::new(false));
+        self.transport_retired = Arc::new(AtomicBool::new(false));
         self.live_supervisor_binding = Arc::new(OnceLock::new());
     }
 

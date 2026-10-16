@@ -12,17 +12,23 @@ use bamboo_domain::{
 pub(super) struct ScopedLoopWriteProof {
     binding: ScopedLoopControlBinding,
     activation: Arc<dyn SessionActivationPort>,
+    native_census: Option<super::scoped_transport_expiry::ScopedTransportCensus>,
 }
 impl ScopedLoopWriteProof {
     pub(super) fn validate_retained(
         &self,
         guard: &Arc<dyn bamboo_domain::SessionRunDeliveryGuard>,
     ) -> io::Result<()> {
-        if guard.matches(
-            &self.binding.target_session_id,
-            self.binding.target_created_at,
-            &self.binding.owner_run_id,
-        ) {
+        if self
+            .native_census
+            .as_ref()
+            .is_none_or(|census| census.check_current_live(&self.binding).is_ok())
+            && guard.matches(
+                &self.binding.target_session_id,
+                self.binding.target_created_at,
+                &self.binding.owner_run_id,
+            )
+        {
             Ok(())
         } else {
             Err(conflict("scoped Loop owner stopped before publication"))
@@ -34,6 +40,10 @@ impl ScopedLoopWriteProof {
             .activation
             .retain_supervisor_loop_blocking(&self.binding)
             .map_err(conflict)?;
+        let guard = match self.native_census.as_ref() {
+            Some(census) => census.wrap_live_guard(&self.binding, guard)?,
+            None => guard,
+        };
         if !guard.matches(
             &self.binding.target_session_id,
             self.binding.target_created_at,
@@ -170,6 +180,7 @@ impl SessionStoreV2 {
         let proof = ScopedLoopWriteProof {
             binding: binding.clone(),
             activation,
+            native_census: authority.scoped_native(),
         };
         // Final owner/grant observation is linearized in an owned blocking job.
         // Even caller cancellation cannot release canonical locks mid-check.
@@ -226,6 +237,7 @@ impl SessionStoreV2 {
         let proof = ScopedLoopWriteProof {
             binding: binding.clone(),
             activation: request.activation,
+            native_census: authority.scoped_native(),
         };
         let mut guards = DefaultWriterGuards::scoped_loop(authority, root.clone(), proof.clone());
         let input_fs: Option<(
@@ -424,5 +436,94 @@ impl SessionStoreV2 {
             }
         }
         result
+    }
+}
+
+impl SessionStoreV2 {
+    /// Canonical target locks precede Inbox; the exact closed-run guard is
+    /// acquired only in physical jobs, after Inbox. Never re-enter a writer.
+    pub(super) async fn retire_scoped_loop_transport_impl(
+        &self,
+        request: bamboo_domain::storage::ScopedLoopTransportRetirement<'_>,
+    ) -> io::Result<()> {
+        let binding = request.binding;
+        validate_session_id(&binding.target_session_id)?;
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let session = self
+            .acquire_session_write_lock(&binding.target_session_id, SaveKind::Runtime)
+            .await?;
+        let directory = self.sessions_dir.join(&binding.target_session_id);
+        let root = request
+            .owner
+            .map(|owner| RootActorWriteProof::new(directory.clone(), owner.clone()));
+        if request.owner.is_some_and(|owner| {
+            owner.fence.actor_id != binding.target_session_id
+                || owner.created_at != binding.target_created_at
+                || owner.fence.run_id != binding.owner_run_id
+        }) {
+            return Err(conflict("target retirement Root identity changed"));
+        }
+        let guards =
+            DefaultWriterGuards::shared_with_root_actor(lifecycle, task, session, root.clone());
+        let census = super::scoped_transport_expiry::ScopedTransportCensus::read(&directory)?
+            .ok_or_else(|| conflict("target retirement canonical census missing"))?;
+        let committed = census.session.clone();
+        let native_inert = census.native_inert(binding)?;
+        if committed.id != binding.target_session_id
+            || committed.created_at != binding.target_created_at
+        {
+            return Err(conflict("target retirement canonical lifetime changed"));
+        }
+        if !native_inert {
+            if committed
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.execution_id.as_deref())
+                != Some(binding.execution_id.as_str())
+            {
+                return Err(conflict("target retirement canonical execution changed"));
+            }
+            if let Some(root) = &root {
+                root.validate()?;
+            } else {
+                self.check_default_actor_clear(&directory).await?;
+            }
+        }
+        let inbox = request
+            .inbox
+            .as_any()
+            .and_then(|value| value.downcast_ref::<FileSessionInbox>())
+            .ok_or_else(|| conflict("target retirement requires its concrete Inbox"))?;
+        let inbox = inbox.bind_scoped_checkpoint(request.owner, &self.sessions_dir)?;
+        let (dir, filesystem) = inbox
+            .filesystem_with_authority(
+                &binding.target_session_id,
+                InboxAuthority::Root {
+                    _guard: guards.physical.clone(),
+                },
+            )
+            .await
+            .map_err(conflict)?;
+        let filesystem = filesystem.with_runtime_retainer(request.retain, binding.clone());
+        let filesystem = if native_inert {
+            let binding = binding.clone();
+            filesystem.with_check(Arc::new(move || {
+                let current = census.require_same_snapshot()?;
+                if current.native_inert(&binding)? {
+                    Ok(())
+                } else {
+                    Err(conflict("target transport expiry no longer proved"))
+                }
+            }))
+        } else if let Some(root) = root {
+            filesystem.with_check(Arc::new(move || root.validate().map(|_| ())))
+        } else {
+            filesystem
+        };
+        inbox
+            .retire_closed_loop_with_filesystem(&dir, binding, &committed, &filesystem)
+            .await
+            .map_err(conflict)
     }
 }
