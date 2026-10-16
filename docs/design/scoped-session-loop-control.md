@@ -8,8 +8,11 @@ results, and decide which authorized work to schedule next. Executing the
 task itself or enabling an Ordinary Root's self-loop is not completion of
 that product goal.
 
-This branch is the first **static implementation candidate**, based on actual
-protected dev `bf6b20bab2832b45d4b0927e971cea64866f2c77`. The original pushed
+This branch is the first bounded live implementation candidate. Its original
+implementation/validation base is protected dev
+`bf6b20bab2832b45d4b0927e971cea64866f2c77`. After local validation it was
+ordinarily merged with actual dev
+`0e32f537f66a76aba6108705acf733d6058d97c5`, including the accepted ZIP9 repair. The original pushed
 design `305735f980e4b4316924216077930e644fb69bdc` and its 15 uncompiled synthetic
 contract tests were inspected and preserved separately. #1992 is now accepted
 in dev; its old test receipts are not acceptance evidence for this candidate.
@@ -17,11 +20,27 @@ in dev; its old test receipts are not acceptance evidence for this candidate.
 The current slice connects a strict executing Supervisor to finite
 `start/status/update/stop` on **one already attached and separately host-granted,
 currently running Standard Ordinary Root**. It is not the whole #1976 feature.
-No Cargo, Rust compiler, Clippy, runtime test, real provider, or paid model call
-has been run for this new candidate. Nova owns the sole Rust validation window.
-Standalone formatting and static source review are not type checking or
-runtime acceptance. #1976 remains open; current frozen Nova/release sources
-remain independent.
+Actual compilation and focused deterministic validation now record **666 distinct
+passed tests, 0 failed, 0 ignored** on their exact recorded heads, culminating
+in `6d2e0126c31b70ac7d14c6b386477910fc09cb28` on the original base. Original-CI
+Clippy, workspace formatting and diff checks also passed there. These are
+new-slice receipts; #1992's older green receipts were not reused as acceptance.
+
+Three public target-runner cases use the real Agent/Repository/Inbox/router,
+including a Repository-issued native Root writer and owned control claims.
+They exercise real canonical/provider goal consumption with a controlled
+provider. They call the Supervisor service directly; they do not prove a
+successful model-facing `SessionControlTool` chain, the complete Server
+reservation path, or every SDK external preparation step. Tool adapter identity,
+validation, replay denials and existing Followup behavior have separate tests.
+
+The latest ZIP9 dependency/base integration has not yet received local
+combination/lint validation. The exclusive local Rust window was released to
+the next owner after the recorded commands ended naturally; further local
+builds require a separately coordinated window. Current-head/base remote
+review and required CI are also admission gates, not implicit successes.
+No real model or added-fee test was run. #1976 remains open, and frozen
+Nova/release sources remain independent.
 
 ## Reused interface and authority
 
@@ -150,12 +169,19 @@ runtime publication or the old iteration's terminal answer cannot claim this
 proof. Long objective previews are explicitly truncated; canonical goal bytes
 and the initiating Supervisor's normal output cap are preserved.
 
-Stop cancels this live grant, including its read retainer. The first slice can
-therefore prove a stopped checkpoint from strict host/canonical evidence, but
-the initiating Supervisor cannot use live status to query that Stop receipt
-afterwards. Owner finalization has the same read limit. Terminal readback needs
-a separately designed read capability; this branch does not weaken the shared
-write/admission retainer to provide it.
+A Loop `stop` command stops the current generation through its child token;
+it does not cancel the separate host-parent stop token or revoke that live
+grant. Once its durable `stop_requested` is observed for the same pipeline
+execution, typed control draining ends and the next counted boundary records
+Stopped without admitting another goal or provider call. While that same owner
+and host grant are still live, authorized `status` and exact Stop retry may read
+the immutable checkpoint. They still require every fresh authority check.
+
+Host stop, execution cancellation, or owner finalization/release/replacement
+ends this live-control capability. The Supervisor cannot use the retired grant
+to query terminal state after owner exit. Post-run readback needs a separately
+designed read capability; this branch does not weaken the shared write/admission
+retainer to provide it. Generation Stop is sticky and cannot authorize restart.
 
 The target retains its provider/model, permissions, workspace, transcript,
 context, usage and sole execution owner. A control application receipt is not
@@ -202,9 +228,56 @@ Stop is sticky and never restarts a generation or answers a human wait.
   the Supervisor commands another live Root and observes its real target-side
   goal admission while provider concurrency remains one.
 
-All new runtime acceptance above is currently **UNRUN**. Existing #898/#1992
-green receipts do not satisfy these new gates. Exact source-bound focused
-commands and original-CI lint flags accompany the static candidate handoff.
+Recorded local acceptance uses this common test prefix:
+
+```sh
+cargo test --locked --offline --all-features -p <package> <target> <filter> -- --test-threads=1
+```
+
+| Package / target / filter | Receipt head | Passed |
+| --- | --- | ---: |
+| Engine `--lib runtime::loop_control::` | `85fee287` | 36 |
+| Engine `--lib runtime::runner::loop_execution::counted_tests::` | `85fee287` | 39 |
+| Engine `--lib runtime::runner::loop_execution::self_control_tests::` with `--skip scoped_supervisor_runner_tests::` | `85fee287` | 37 |
+| Engine `--lib session_activation::` | `85fee287` | 50 |
+| Engine `--lib scoped_supervisor_runner_tests::` | `6d2e0126` | 3 |
+| Storage `--lib v2::scoped_loop_control_tests::` | `4f8fa3fa` | 11 |
+| Storage `--lib session_merge::tests::scoped_unknown_checkpoint_cannot_enter_generic_merge_or_publish_callbacks --exact` | `4f8fa3fa` | 1 |
+| Storage `--lib session_inbox::` | `4f8fa3fa` | 96 |
+| Storage `--lib v2::root_actor_input_tests::` | `4f8fa3fa` | 8 |
+| Storage `--lib v2::supervisor_` | `4f8fa3fa` | 40 |
+| Permission `--lib replay::` | `4f8fa3fa` | 2 |
+| Tools `--lib tools::loop_control::` | `4f8fa3fa` | 13 |
+| Domain `--lib` (no filter) | `4f8fa3fa` | 321 |
+| Server Tools `--test session_control` (no filter) | `4f8fa3fa` | 9 |
+
+The package names are `bamboo-engine`, `bamboo-storage`, `bamboo-permission`,
+`bamboo-tools`, `bamboo-domain` and `bamboo-server-tools`. The exact-merge test's
+`--exact` is a test-harness argument after `--`. Every receipt records unchanged
+source, the exact command, source/tree and raw log hash. A case-name inventory
+establishes 666 distinct tests; repeated earlier public tests are not counted
+twice. The native case uses the same opaque direct lease and router run id to
+obtain the real physical writer, consumes both objectives at the provider,
+confirms three typed receipts and ACKs, observes no overlap/fourth provider or
+successor, and finishes its exact physical fence.
+
+The original CI default-member/all-features Clippy allowlist, `cargo fmt --all
+-- --check` and diff checks passed at `6d2e0126`. No `--workspace` or extra
+all-test lint suite was substituted. Since `85fee287`, the only Rust changes
+before that final validation were the owned-String Storage test fixture and
+the native public test extension; production Rust remained byte-identical.
+
+All historical failures remain evidence: the real host-stop claim race was
+RED then GREEN; the logical Stop drain regression was fixed and revalidated;
+the Storage fixture first failed compilation before executing tests. A mistaken
+Engine filter selected zero tests and was explicitly excluded from coverage.
+No ignored test, paid provider run or uncompiled prototype is counted as a pass.
+
+The later ordinary merge of dev `0e32f537` is a different dependency context.
+It leaves this slice's source paths unchanged, but changes Cargo manifests and
+lockfile; its required local combination/lint and current-head/base remote
+checks remain pending. Old-base receipts are not promoted to new-base green.
+Static review/formatting never replaces compilation or tests.
 
 ## Specific follow-up product slices (remain open)
 
