@@ -8,11 +8,11 @@ import re
 import subprocess
 import time
 
-RED = 'b9d72ba72cffb7e6fa550881647599c7a95e841c'
-GREEN = 'fda0f5f2459b3d52c7be5997d9b5655d6b811aa3'
+RED = '280c60553586511ea7a46f5615b2516108d79b62'
+GREEN = '302051abce7af32a1126c16d19553a920dc964b4'
 BASELINE = '6963521d987a71a09ef6ccf69927521e594c65d3'
-TREES = {RED: '85e0623d08e06c40d2fa7530af35fa24bcfa8e45',
-         GREEN: 'e0f4c5f87dac5716ce206086ea88bfdb85ba3eb6'}
+TREES = {RED: '9fe8a9bee9cd282230104efeeb01ce7f7951512b',
+         GREEN: '885888534ae7995a78227a099398d4316ab8235b'}
 PREFIX = 'handlers::agent::plugin::official_nova::'
 BUSY = PREFIX + 'tests::spawn_busy::'
 CASES = {BUSY + suffix for suffix in [
@@ -109,12 +109,19 @@ def run_cases(binary, stage, prefix):
 
 try:
     assert git('rev-parse', 'HEAD') == CONTROLLER
-    assert git('rev-parse', 'HEAD^') == GREEN
+    subprocess.run(['git', 'merge-base', '--is-ancestor', GREEN, CONTROLLER], check=True)
     assert not git('status', '--porcelain', '--untracked-files=all')
     assert sorted(git('diff', '--name-only', GREEN, CONTROLLER).splitlines()) == sorted([
         '.github/workflows/nova-spawn-regression.yml', 'scripts/nova-spawn-regression.py'])
-    assert git('rev-parse', GREEN + '^') == RED
-    assert git('rev-parse', RED + '^') == BASELINE
+    common = 'b9d72ba72cffb7e6fa550881647599c7a95e841c'
+    assert git('merge-base', RED, GREEN) == common
+    assert git('rev-parse', RED + '^') == common
+    assert git('rev-parse', GREEN + '^') == 'fda0f5f2459b3d52c7be5997d9b5655d6b811aa3'
+    assert git('rev-parse', GREEN + '^^') == common
+    assert git('rev-parse', common + '^') == BASELINE
+    tests = 'crates/app/bamboo-server/src/handlers/agent/plugin/official_nova/tests/spawn_busy.rs'
+    assert git('rev-parse', RED + ':' + tests) == git('rev-parse', GREEN + ':' + tests)
+    assert git('diff', '--name-only', RED, GREEN) == 'crates/app/bamboo-server/src/handlers/agent/plugin/official_nova.rs'
     compiler = subprocess.check_output(['rustc', '-Vv'], text=True)
     assert compiler.startswith('rustc 1.99.1 (58cf8f9c3 2026-10-13)\n')
     assert os.environ['RUST_MIN_STACK'] == '8388608'
