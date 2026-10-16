@@ -125,29 +125,31 @@ async fn directory_preferences_native_create_discovery_and_session_association_r
     assert!(state.config.read().await.worktrees.project_roots.is_empty());
     #[cfg(unix)]
     {
-        use std::os::unix::ffi::OsStringExt;
-        let raw = global.join(std::ffi::OsString::from_vec(b"invalid-\xff".to_vec()));
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args([
-                "-c",
-                "core.hooksPath=/dev/null",
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let registered = global.join("registered");
+        run_git(
+            &repo,
+            &[
                 "worktree",
                 "add",
                 "-b",
                 "bytes",
-                "--",
-            ])
-            .arg(&raw)
-            .arg("HEAD")
+                registered.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let metadata = Command::new("git")
+            .arg("-C")
+            .arg(&registered)
+            .args(["rev-parse", "--absolute-git-dir"])
             .output()
             .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert!(metadata.status.success());
+        let metadata = String::from_utf8(metadata.stdout).unwrap();
+        let raw = global.join(std::ffi::OsString::from_vec(b"invalid-\xff".to_vec()));
+        let gitdir = [raw.as_os_str().as_bytes(), b"/.git\n"].concat();
+        let record = Path::new(metadata.trim()).join("gitdir");
+        fs::write(&record, &gitdir).unwrap();
         let response =
             test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
         assert!(response.status().is_success());
@@ -164,11 +166,12 @@ async fn directory_preferences_native_create_discovery_and_session_association_r
             .any(|e| e["path"] == checkout.to_str().unwrap() && e["dirty"] == true));
         let unsupported = entries.iter().find(|e| e["branch"] == "bytes").unwrap();
         assert_eq!(unsupported["path"], format!("{:?}", raw.as_os_str()));
-        assert_eq!(unsupported["prunable"], false);
+        assert_eq!(unsupported["prunable"], true);
         assert_eq!(unsupported["path_encoding"], "escaped");
         assert!(unsupported["dirty"].is_null());
         assert!(unsupported["error"].as_str().unwrap().contains("non-UTF-8"));
-        assert!(raw.join(".git").is_file());
+        assert_eq!(fs::read(record).unwrap(), gitdir);
+        assert!(registered.join(".git").is_file());
     }
 }
 

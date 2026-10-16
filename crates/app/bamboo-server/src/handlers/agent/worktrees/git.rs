@@ -1111,25 +1111,39 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn non_utf8_cli_worktree_does_not_hide_other_inventory() {
-        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
         let f = Fixture::new();
         let valid = create(&f.repo(), &f.roots(), "valid", "valid").unwrap();
+        let registered = f.roots().join("registered");
+        git(
+            &f.repo(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "bytes",
+                registered.to_str().unwrap(),
+                "HEAD",
+            ],
+        )
+        .unwrap();
+        let metadata = git(&registered, &["rev-parse", "--absolute-git-dir"]).unwrap();
         let raw = f
             .roots()
             .join(std::ffi::OsString::from_vec(b"invalid-\xff".to_vec()));
-        let output = git_command(&f.repo())
-            .args(["worktree", "add", "-b", "bytes", "--"])
-            .arg(&raw)
-            .arg("HEAD")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        // APFS rejects raw-byte filenames. A Git registration imported from a
+        // Unix filesystem can still contain them; Git itself emits this entry.
+        let gitdir = [raw.as_os_str().as_bytes(), b"/.git\n"].concat();
+        let record = Path::new(metadata.trim()).join("gitdir");
+        fs::write(&record, &gitdir).unwrap();
+        let native = command(&f.repo(), &["worktree", "list", "--porcelain", "-z"]).unwrap();
+        assert!(native.status.success());
+        assert!(native
+            .stdout
+            .windows(b"invalid-\xff".len())
+            .any(|v| v == b"invalid-\xff"));
         let entries =
-            list(&f.repo()).expect("A valid raw-byte checkout must not hide the repository");
+            list(&f.repo()).expect("A raw-byte Git registration must not hide other checkouts");
         assert_eq!(entries.len(), 3);
         assert_eq!(
             entries.iter().find(|e| e.path == f.repo()).unwrap().dirty,
@@ -1143,55 +1157,62 @@ mod tests {
         assert_eq!(unavailable.branch.as_deref(), Some("bytes"));
         assert_eq!(unavailable.dirty, None);
         assert!(
-            !unavailable.prunable,
-            "Unsupported encoding must not falsify Git's prunable fact"
+            unavailable.prunable,
+            "Preserve Git's actual missing-path fact"
         );
         assert!(unavailable.error.as_deref().unwrap().contains("non-UTF-8"));
-        assert!(raw.join(".git").is_file());
-        assert_eq!(workspace_root(&raw).unwrap(), raw);
-        assert_eq!(repository(&raw).unwrap(), repository(&f.repo()).unwrap());
+        assert_eq!(fs::read(record).unwrap(), gitdir);
+        assert!(registered.join(".git").is_file());
     }
 
     #[cfg(unix)]
     #[test]
-    fn raw_filename_bytes_do_not_make_known_dirty_or_clean_status_unknown() {
-        use std::os::unix::ffi::OsStringExt;
+    fn raw_index_filename_bytes_preserve_known_dirty_state() {
+        use std::io::Write;
+        use std::process::Stdio;
         let f = Fixture::new();
-        let file = f
-            .repo()
-            .join(std::ffi::OsString::from_vec(b"tracked-\xff".to_vec()));
-        fs::write(&file, "keep raw filename content\n").unwrap();
+        let mut blob = git_command(&f.repo())
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        blob.stdin
+            .take()
+            .unwrap()
+            .write_all(b"owned raw index fixture\n")
+            .unwrap();
+        let output = blob.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let oid = String::from_utf8(output.stdout).unwrap();
+        let record = [
+            format!("100644 {}\t", oid.trim()).as_bytes(),
+            b"tracked-\xff\0",
+        ]
+        .concat();
+        let mut index = git_command(&f.repo())
+            .args(["update-index", "-z", "--index-info"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        index.stdin.take().unwrap().write_all(&record).unwrap();
+        assert!(index.wait().unwrap().success());
+        let native = command(
+            &f.repo(),
+            &["status", "--porcelain", "-z", "--ignore-submodules=dirty"],
+        )
+        .unwrap();
+        assert!(native.status.success());
+        assert!(native.stdout.contains(&0xff));
         let entries = list(&f.repo()).unwrap();
         assert_eq!(
             entries[0].dirty,
             Some(true),
-            "Untracked raw bytes are still known dirty"
+            "Native Git reports a known staged/missing file, not unknown"
         );
-        git(&f.repo(), &["add", "."]).unwrap();
-        git(
-            &f.repo(),
-            &[
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@example.invalid",
-                "commit",
-                "-m",
-                "raw filename",
-            ],
-        )
-        .unwrap();
-        let entries = list(&f.repo()).unwrap();
-        assert_eq!(
-            entries[0].dirty,
-            Some(false),
-            "Raw index names do not prevent clean inspection"
-        );
-        fs::write(&file, "changed raw filename content\n").unwrap();
-        assert_eq!(list(&f.repo()).unwrap()[0].dirty, Some(true));
-        assert_eq!(
-            fs::read_to_string(file).unwrap(),
-            "changed raw filename content\n"
-        );
+        assert!(entries[0].error.is_none());
+        let after = command(&f.repo(), &["ls-files", "--stage", "-z"]).unwrap();
+        assert!(after.status.success());
+        assert!(after.stdout.contains(&0xff));
     }
 }
