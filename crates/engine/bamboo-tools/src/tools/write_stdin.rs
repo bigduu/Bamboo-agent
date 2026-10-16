@@ -38,7 +38,7 @@ impl Tool for WriteStdinTool {
     }
 
     fn description(&self) -> &str {
-        "Continue an exec_command session owned by this conversation. Empty chars waits/polls for incremental output and final exit status. Nonempty chars writes exact bytes to an interactive stdin pipe; use eof=true to close it. A lone Ctrl-C (\\u0003) stops the process. Finished results omit session_id; nonzero exit codes are command outcomes."
+        "Continue an exec_command session owned by this conversation. Empty chars waits/polls for incremental output and final exit status. Running results include polling elapsed/idle times, empty-readout count and exit_observed (false does not prove liveness). Follow a polling advisory by checking progress or doing useful work before polling again; silence does not prove completion. Nonempty chars writes exact bytes to an interactive stdin pipe; use eof=true to close it. A lone Ctrl-C (\\u0003) stops the process. Finished results omit session_id; nonzero exit codes are command outcomes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -63,7 +63,7 @@ impl Tool for WriteStdinTool {
         let shell = bash_runtime::get_shell(&parsed.session_id)
             .filter(|shell| shell.polled.is_some() && shell.session_id.as_deref() == Some(owner))
             .ok_or_else(|| {
-                ToolError::Execution("Exec session not found or not owned by this session".into())
+                ToolError::Execution("Exec session not found or not owned by this session (unread completed results expire after five minutes; handles do not survive Host restart)".into())
             })?;
         if parsed.chars.len() > MAX_INPUT_BYTES {
             return Err(ToolError::InvalidArguments(
@@ -87,10 +87,13 @@ impl Tool for WriteStdinTool {
                     return Err(ToolError::Execution(error));
                 }
                 wait_ms = 0;
+            } else {
+                state.reset_empty_readouts().await;
             }
         }
         if parsed.eof {
             shell.close_stdin().await;
+            state.reset_empty_readouts().await;
         }
         Ok(poll_result(&shell, wait_ms, parsed.max_output_tokens).await)
     }
