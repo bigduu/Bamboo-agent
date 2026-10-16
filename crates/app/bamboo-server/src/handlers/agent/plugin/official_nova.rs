@@ -574,7 +574,7 @@ async fn spawn_verified_cli(
 #[cfg(target_os = "linux")]
 async fn spawn_verified_cli_with(
     budget: Duration,
-    mut spawn: impl FnMut() -> io::Result<tokio::process::Child>,
+    mut spawn: impl FnMut() -> std::io::Result<tokio::process::Child>,
 ) -> Result<(tokio::process::Child, Duration), &'static str> {
     let started = tokio::time::Instant::now();
     let mut retry_delay = Duration::from_millis(1);
