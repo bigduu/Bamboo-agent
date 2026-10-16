@@ -58,10 +58,10 @@ impl Tool for SessionControlTool {
                     "description": "followup only: stable operation id for this target; no whitespace padding, slashes or '..'. Reuse it only with the same message."},
                 "message": {"type": "string", "minLength": 1, "maxLength": 16384,
                     "description": "followup only: one instruction, at most 16 KiB in UTF-8."},
-                "expected_link_revision": {"type": "integer", "minimum": 1,
+                "expected_link_revision": {"type": ["integer", "null"], "minimum": 1,
                     "description": "loop only: exact current nonzero Supervisor link revision; required for start/update/stop. Status alone may omit it to bootstrap after full canonical authority and host-grant checks."},
-                "command": bamboo_tools::tools::loop_control::LoopControlTool::new().parameters_schema(),
-                "receipt_operation_id": {"type": "string", "format": "uuid",
+                "command": scoped_loop_command_schema(),
+                "receipt_operation_id": {"type": ["string", "null"], "format": "uuid",
                     "description": "loop status only: exact operation UUID for bounded target-owner receipt lookup; never a grant or a new command."}
             },
             "required": ["action", "target_session_id"],
@@ -81,7 +81,22 @@ impl Tool for SessionControlTool {
                         "operation_id": false,
                         "message": false
                     },
-                    "required": ["command"]
+                    "required": ["command"],
+                    "oneOf": [
+                        {
+                            "properties": {
+                                "command": {"properties": {"action": {"const": "status"}}}
+                            }
+                        },
+                        {
+                            "properties": {
+                                "command": {"properties": {"action": {"enum": ["start", "update", "stop"]}}},
+                                "expected_link_revision": {"type": "integer"},
+                                "receipt_operation_id": {"type": "null"}
+                            },
+                            "required": ["expected_link_revision"]
+                        }
+                    ]
                 }
             ]
         })
@@ -188,6 +203,68 @@ impl Tool for SessionControlTool {
             "note": "Admission is durable; this is not completion. A waiting target remains waiting. Retry with the same operation_id and message if activation needs recovery; read results with session_history.read_messages."
         }).to_string())))
     }
+}
+
+/// Project the shared bounded fields into the remote adapter's strict actions.
+/// The standalone self-tool schema and its public API remain unchanged.
+fn scoped_loop_command_schema() -> Value {
+    let mut schema = bamboo_tools::tools::loop_control::LoopControlTool::new().parameters_schema();
+    let patch_fields = [
+        ("objective", "string"),
+        ("max_iterations", "integer"),
+        ("max_total_rounds", "integer"),
+    ];
+    // Serde Option patches accept null as omission. Start requires actual values
+    // below; Update must still carry at least one non-null patch.
+    for (field, kind) in patch_fields {
+        schema["properties"][field]["type"] = json!([kind, "null"]);
+    }
+    let variant = |action: &str, required: &[&str], optional: &[&str]| {
+        let mut properties = serde_json::Map::new();
+        properties.insert("action".into(), json!({"const": action}));
+        for field in schema["properties"].as_object().unwrap().keys() {
+            if field != "action"
+                && !required.contains(&field.as_str())
+                && !optional.contains(&field.as_str())
+            {
+                properties.insert(field.clone(), Value::Bool(false));
+            }
+        }
+        json!({"properties": properties, "required": required})
+    };
+    let status = variant("status", &["action"], &[]);
+    let mut start = variant(
+        "start",
+        &[
+            "action",
+            "operation_id",
+            "expected_revision",
+            "objective",
+            "max_iterations",
+            "max_total_rounds",
+        ],
+        &["expected_generation"],
+    );
+    let mut update = variant(
+        "update",
+        &["action", "operation_id", "generation", "expected_revision"],
+        &["objective", "max_iterations", "max_total_rounds"],
+    );
+    let stop = variant(
+        "stop",
+        &["action", "operation_id", "generation", "expected_revision"],
+        &[],
+    );
+    for (field, kind) in patch_fields {
+        start["properties"][field] = json!({"type": kind});
+    }
+    update["anyOf"] = json!([
+        {"required": ["objective"], "properties": {"objective": {"type": "string"}}},
+        {"required": ["max_iterations"], "properties": {"max_iterations": {"type": "integer"}}},
+        {"required": ["max_total_rounds"], "properties": {"max_total_rounds": {"type": "integer"}}}
+    ]);
+    schema["oneOf"] = json!([status, start, update, stop]);
+    schema
 }
 
 fn validate_loop_arguments(

@@ -84,9 +84,16 @@ Thinking posture does not replace strict Supervisor identity.
 
 The outer advertised schema has action-specific `oneOf` branches: Followup
 requires its operation/message, and Loop requires its command. Boolean-false
-property schemas reject fields belonging to the other action. The common
-seven-property surface and nested finite Loop schema stay shared; neither
-wire acceptance nor registry projection supplies execution authority.
+property schemas reject fields belonging to the other action. Within Loop,
+mutations require a positive link revision and reserve non-null receipt queries
+for Status. The nested command projects the shared bounded fields into strict
+Status/Start/Update/Stop branches without changing the standalone self-tool API.
+Start requires its real objective/bounds; Update requires at least one non-null
+patch. Nullable optional fields preserve the existing typed DTO round-trip:
+unused Update patches and Start's expected generation may serialize as null.
+Cross-action fields remain forbidden even when null. The common seven-property
+surface stays unchanged. These schema constraints do not replace runtime byte
+bounds, live owner CAS or any execution-authority check.
 
 Canonical disabled-tool checks use Domain's authoritative reference resolver
 for the corresponding fixed core capability (`session_control` on the source,
