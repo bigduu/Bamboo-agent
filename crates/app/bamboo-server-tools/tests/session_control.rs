@@ -942,6 +942,74 @@ mod loop_adapter_tests {
         assert!(f.activation.calls.lock().await.is_empty());
     }
 
+    // The advertised schema is a character filter; shared typed validation
+    // enforces UTF-8 bytes before delivery. This does not assert byte parity.
+    #[tokio::test]
+    async fn nested_objective_byte_guard_rejects_oversize_despite_schema_character_filter() {
+        let f = Fixture::new().await;
+        let validator = advertised_validator(&f);
+        let limit = bamboo_domain::session::loop_control_request::MAX_OBJECTIVE_BYTES;
+        let before = f.inbox.inspect("a").await.unwrap();
+        assert_eq!(
+            (before.generation, before.pending, before.claimed),
+            (0, 0, 0)
+        );
+        for (label, objective, advertised_accepts) in [
+            ("reported 5500 CJK", "界".repeat(5500), true),
+            ("CJK beyond byte limit", "界".repeat(5462), true),
+            ("two-byte beyond limit", "é".repeat(8193), true),
+            ("four-byte beyond limit", "😀".repeat(4097), true),
+            (
+                "mixed beyond byte limit",
+                format!("{}{}x", "x".repeat(8191), "界".repeat(2731)),
+                true,
+            ),
+            (
+                "exact character cap but one extra byte",
+                format!("{}é", "x".repeat(16_383)),
+                true,
+            ),
+            (
+                "ASCII beyond both limits control",
+                "x".repeat(16_385),
+                false,
+            ),
+        ] {
+            assert!(!objective.trim().is_empty(), "{label}");
+            assert!(objective.len() > limit, "{label}");
+            for mut arguments in [start(), update()] {
+                arguments["command"]["objective"] = json!(&objective);
+                assert_eq!(arguments["expected_link_revision"], 2);
+                assert_eq!(f.tool.classify(&arguments), ToolClass::MUTATING_SERIAL);
+                let request: bamboo_domain::LoopControlRequest =
+                    serde_json::from_value(arguments["command"].clone()).unwrap();
+                let action = request.action();
+                // This remains the existing registered full validator. The
+                // advertised character bound cannot assert a UTF-8 byte bound.
+                assert_eq!(
+                    validator.validate(&arguments).is_ok(),
+                    advertised_accepts,
+                    "{label}/{action}: unexpected advertised acceptance"
+                );
+                assert!(
+                    request.validate().is_err(),
+                    "{label}/{action}: the shared DTO must enforce its byte bound"
+                );
+                assert!(matches!(
+                    f.tool.invoke(arguments, f.ctx.clone()).await,
+                    Err(ToolError::InvalidArguments(_))
+                ));
+                let after = f.inbox.inspect("a").await.unwrap();
+                assert_eq!(
+                    (after.generation, after.pending, after.claimed),
+                    (before.generation, before.pending, before.claimed),
+                    "{label}/{action}: rejected objective changed Inbox admission"
+                );
+                assert!(f.activation.calls.lock().await.is_empty());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn loop_rejects_unknown_fields_invalid_links_and_nested_commands_before_delivery() {
         let f = Fixture::new().await;
