@@ -376,6 +376,31 @@ async fn zip_archive_with_traversal_entry_is_rejected() {
     }
 }
 
+#[test]
+fn zip_archive_rejects_rooted_names_before_writing() {
+    for name in [
+        "/evil.txt",
+        r"\evil.txt",
+        r"C:\evil.txt",
+        r"C:evil.txt",
+        r"./C:\evil.txt",
+        r".\C:\evil.txt",
+        r"nested\C:\evil.txt",
+        r"\\host\share\evil.txt",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = build_zip(&[(name, b"payload")]);
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+        assert_eq!(archive.by_index(0).unwrap().name().unwrap().as_ref(), name);
+        let error = extract_zip_sync(&bytes, root.path(), 1024).unwrap_err();
+        assert!(
+            matches!(error, PluginError::InvalidManifest(_)),
+            "{name}: {error}"
+        );
+        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+    }
+}
+
 // ---------------------------------------------------------------------
 // Symlink / hardlink escape (BLOCKER) — a tar link entry's target is
 // attacker-controlled; extraction must reject any link entry outright.
@@ -1343,6 +1368,13 @@ async fn artifact_rejects_extra_nested_unsafe_and_duplicate_members() {
             &[("tool", b"binary"), ("directory/", b"")],
             &[("tool", b"binary"), ("../LICENSE", b"unsafe")],
             &[("tool", b"binary"), ("/LICENSE", b"unsafe")],
+            &[("tool", b"binary"), (r"\LICENSE", b"unsafe")],
+            &[("tool", b"binary"), (r"C:\LICENSE", b"unsafe")],
+            &[("tool", b"binary"), (r"C:LICENSE", b"unsafe")],
+            &[("tool", b"binary"), (r"./C:\LICENSE", b"unsafe")],
+            &[("tool", b"binary"), (r".\C:\LICENSE", b"unsafe")],
+            &[("tool", b"binary"), (r"\\host\share\LICENSE", b"unsafe")],
+            &[("tool", b"binary"), (r"nested\..\LICENSE", b"unsafe")],
             &[("tool", b"binary"), ("nested/../LICENSE", b"unsafe")],
             &[
                 ("tool", b"binary"),
