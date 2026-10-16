@@ -237,11 +237,44 @@ pub(crate) fn sys_keepalive_envelope() -> ServerEnvelope {
 }
 
 /// Opt-in observation continuity; never an execution capability.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ActorResumeRequest {
-    #[serde(default)]
     pub epoch: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ActorResumeRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ResumeVisitor;
+        impl<'de> serde::de::Visitor<'de> for ResumeVisitor {
+            type Value = ActorResumeRequest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an Actor resume object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut epoch = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key != "epoch" {
+                        return Err(serde::de::Error::unknown_field(&key, &["epoch"]));
+                    }
+                    if epoch.is_some() {
+                        return Err(serde::de::Error::duplicate_field("epoch"));
+                    }
+                    epoch = Some(map.next_value::<Option<String>>()?);
+                }
+                Ok(ActorResumeRequest {
+                    epoch: epoch.flatten(),
+                })
+            }
+        }
+        // Derived struct deserialization also accepts positional arrays. This
+        // opt-in protocol requires an object in JSON and MessagePack alike.
+        deserializer.deserialize_map(ResumeVisitor)
+    }
 }
 
 /// A client→server frame, tagged by `type`.
@@ -486,6 +519,7 @@ mod tests {
             json!({"epoch":12}),
             json!({"epoch":null,"worker_token":"private"}),
             json!([]),
+            json!([null]),
         ] {
             let value = json!({"type":"subscribe","ch":"actor.child","actor_resume":resume});
             assert!(
@@ -497,6 +531,9 @@ mod tests {
             )
             .is_err());
         }
+        assert!(decode_client_frame(Encoding::Json,
+            br#"{"type":"subscribe","ch":"actor.child","actor_resume":{"epoch":null,"epoch":null}}"#
+        ).is_err());
     }
 
     #[test]
