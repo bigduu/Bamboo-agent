@@ -1,4 +1,4 @@
-use actix_web::{web, HttpResponse, Responder};
+use actix_web::{web, HttpRequest, HttpResponse, Responder, ResponseError};
 
 use super::types::StopResponse;
 use crate::app_state::{AgentStatus, AppState};
@@ -22,6 +22,63 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> imp
             message: "No active agent execution found".to_string(),
         })
     }
+}
+
+/// Additive HTTP wrapper: a delayed selected-execution cancel must not look
+/// up a newer owner or fall through to the legacy token table.
+pub async fn handler_with_run(
+    state: web::Data<AppState>,
+    http: HttpRequest,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let Some(header) = http.headers().get("Bamboo-Run-Id") else {
+        return handler(state, path)
+            .await
+            .respond_to(&http)
+            .map_into_boxed_body();
+    };
+    let run_id = match header
+        .to_str()
+        .ok()
+        .filter(|s| !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_graphic()))
+    {
+        Some(value) if http.headers().get_all("Bamboo-Run-Id").count() == 1 => value,
+        _ => {
+            return crate::error::json_error(
+                actix_web::http::StatusCode::BAD_REQUEST,
+                "Invalid Bamboo-Run-Id",
+            )
+        }
+    };
+    let id = path.into_inner();
+    if let Err(error) =
+        crate::handlers::agent::tickets::require_supervisor_owner(&state, &http, &id).await
+    {
+        return crate::handlers::agent::tickets::TicketHttpError::from(error).error_response();
+    }
+    if cancel_exact_run(&state, &id, run_id).await {
+        HttpResponse::Ok().json(serde_json::json!({"success":true,"session_id":id,"run_id":run_id}))
+    } else {
+        crate::error::json_error(
+            actix_web::http::StatusCode::CONFLICT,
+            "Requested run is not the current cancellable owner",
+        )
+    }
+}
+
+pub(crate) async fn cancel_exact_run(state: &web::Data<AppState>, id: &str, run_id: &str) -> bool {
+    let runners = state.agent_runners.read().await;
+    let Some(runner) = runners.get(id).filter(|r| r.run_id == run_id) else {
+        return false;
+    };
+    match runner.status {
+        AgentStatus::Pending | AgentStatus::Running => runner.cancel_token.cancel(),
+        AgentStatus::Cancelled => return true,
+        _ => return false,
+    }
+    drop(runners);
+    mark_runner_cancelled(state, id, Some(run_id)).await;
+    true
 }
 
 /// Cancel a running agent session through the shared v1 HTTP / v2 WebSocket

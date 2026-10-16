@@ -11,7 +11,8 @@ use bamboo_domain::{
     StartWorkflowRun, WorkflowBudgetUsage, WorkflowBudgets, WorkflowDefinitionBundle,
     WorkflowFailure, WorkflowFailureCode, WorkflowPlan, WorkflowProgress, WorkflowRunDefinition,
     WorkflowRunEvent, WorkflowRunEventKind, WorkflowRunSnapshot, WorkflowRunStatus,
-    WorkflowStepKind, WorkflowStepSnapshot, WorkflowStepStatus, WorkflowSuspensionContext,
+    WorkflowStepKind, WorkflowStepSnapshot, WorkflowStepStatus, WorkflowStepTopology,
+    WorkflowSuspensionContext,
 };
 use bamboo_engine::{
     FileWorkflowRunRepository, PermissionDecision, WorkflowDefinitionPort, WorkflowPolicyPort,
@@ -842,6 +843,8 @@ pub(crate) struct PublicWorkflowRunSnapshot {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct PublicWorkflowStepSnapshot {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<WorkflowStepTopology>,
     pub status: WorkflowStepStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<PublicWorkflowFailure>,
@@ -869,6 +872,7 @@ pub(crate) enum PublicWorkflowPlannedStepKind {
 pub(crate) enum PublicWorkflowPlan {
     Step {
         step: String,
+        node_path: Vec<usize>,
     },
     Sequence {
         nodes: Vec<PublicWorkflowPlan>,
@@ -938,32 +942,51 @@ pub(crate) enum PublicWorkflowRunEventKind {
 }
 
 fn public_workflow_plan(plan: &WorkflowPlan) -> PublicWorkflowPlan {
-    match plan {
-        WorkflowPlan::Step { step } => PublicWorkflowPlan::Step { step: step.clone() },
-        WorkflowPlan::Sequence { nodes } => PublicWorkflowPlan::Sequence {
-            nodes: nodes.iter().map(public_workflow_plan).collect(),
-        },
-        WorkflowPlan::Parallel { nodes } => PublicWorkflowPlan::Parallel {
-            nodes: nodes.iter().map(public_workflow_plan).collect(),
-        },
-        WorkflowPlan::Choice {
-            then_branch,
-            else_branch,
-            ..
-        } => PublicWorkflowPlan::Choice {
-            then_branch: Box::new(public_workflow_plan(then_branch)),
-            else_branch: Box::new(public_workflow_plan(else_branch)),
-        },
-        WorkflowPlan::Map { body, .. } => PublicWorkflowPlan::Map {
-            body: Box::new(public_workflow_plan(body)),
-        },
-        WorkflowPlan::Retry {
-            node, max_attempts, ..
-        } => PublicWorkflowPlan::Retry {
-            node: Box::new(public_workflow_plan(node)),
-            max_attempts: *max_attempts,
-        },
+    fn project(plan: &WorkflowPlan, node_path: Vec<usize>) -> PublicWorkflowPlan {
+        let child = |node: &WorkflowPlan, index| {
+            let mut path = node_path.clone();
+            path.push(index);
+            project(node, path)
+        };
+        match plan {
+            WorkflowPlan::Step { step } => PublicWorkflowPlan::Step {
+                step: step.clone(),
+                node_path,
+            },
+            WorkflowPlan::Sequence { nodes } => PublicWorkflowPlan::Sequence {
+                nodes: nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, node)| child(node, i))
+                    .collect(),
+            },
+            WorkflowPlan::Parallel { nodes } => PublicWorkflowPlan::Parallel {
+                nodes: nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, node)| child(node, i))
+                    .collect(),
+            },
+            WorkflowPlan::Choice {
+                then_branch,
+                else_branch,
+                ..
+            } => PublicWorkflowPlan::Choice {
+                then_branch: Box::new(child(then_branch, 0)),
+                else_branch: Box::new(child(else_branch, 1)),
+            },
+            WorkflowPlan::Map { body, .. } => PublicWorkflowPlan::Map {
+                body: Box::new(child(body, 0)),
+            },
+            WorkflowPlan::Retry {
+                node, max_attempts, ..
+            } => PublicWorkflowPlan::Retry {
+                node: Box::new(child(node, 0)),
+                max_attempts: *max_attempts,
+            },
+        }
     }
+    project(plan, Vec::new())
 }
 
 fn public_planned_steps(
@@ -1013,9 +1036,52 @@ fn public_workflow_failure(failure: WorkflowFailure) -> PublicWorkflowFailure {
     }
 }
 
-fn public_workflow_step(step: WorkflowStepSnapshot) -> PublicWorkflowStepSnapshot {
+// Called only after the unique leaf/address check. This counts static Map
+// ancestors, without consulting item values or parsing an opaque runtime ID.
+fn workflow_step_map_depth(plan: &WorkflowPlan, step_id: &str) -> Option<usize> {
+    match plan {
+        WorkflowPlan::Step { step } => (step == step_id).then_some(0),
+        WorkflowPlan::Sequence { nodes } | WorkflowPlan::Parallel { nodes } => nodes
+            .iter()
+            .find_map(|node| workflow_step_map_depth(node, step_id)),
+        WorkflowPlan::Choice {
+            then_branch,
+            else_branch,
+            ..
+        } => workflow_step_map_depth(then_branch, step_id)
+            .or_else(|| workflow_step_map_depth(else_branch, step_id)),
+        WorkflowPlan::Map { body, .. } => {
+            workflow_step_map_depth(body, step_id).map(|depth| depth + 1)
+        }
+        WorkflowPlan::Retry { node, .. } => workflow_step_map_depth(node, step_id),
+    }
+}
+
+fn public_workflow_step(
+    step: WorkflowStepSnapshot,
+    plan: &WorkflowPlan,
+) -> PublicWorkflowStepSnapshot {
     PublicWorkflowStepSnapshot {
         id: step.id,
+        topology: step.topology.filter(|topology| {
+            if plan
+                .step_topology(&topology.planned_step_id, topology.map_index_path.clone())
+                .as_ref()
+                != Some(topology)
+            {
+                return false;
+            }
+            let complete = workflow_step_map_depth(plan, &topology.planned_step_id)
+                == Some(topology.map_index_path.len());
+            let unexpanded_placeholder = step.attempts == 0
+                && matches!(
+                    step.status,
+                    WorkflowStepStatus::Skipped | WorkflowStepStatus::Failed
+                )
+                && step.input_hash.is_empty()
+                && step.output.is_none();
+            complete || unexpanded_placeholder
+        }),
         status: step.status,
         failure: step.failure.map(public_workflow_failure),
         attempts: step.attempts,
@@ -1069,7 +1135,7 @@ pub(crate) fn public_workflow_snapshot(snapshot: WorkflowRunSnapshot) -> PublicW
         steps: snapshot
             .steps
             .into_iter()
-            .map(|(id, step)| (id, public_workflow_step(step)))
+            .map(|(id, step)| (id, public_workflow_step(step, &snapshot.definition.plan)))
             .collect(),
         budget: snapshot.definition.budgets,
         usage: snapshot.usage,
@@ -1582,6 +1648,7 @@ mod tests {
                     (
                         step.id.clone(),
                         WorkflowStepSnapshot {
+                            topology: None,
                             id: step.id.clone(),
                             status: step_status,
                             input_hash: "seeded-input-hash".to_string(),
@@ -1743,6 +1810,7 @@ mod tests {
             steps: BTreeMap::from([(
                 "inspect".to_string(),
                 WorkflowStepSnapshot {
+                    topology: None,
                     id: "inspect".to_string(),
                     status: WorkflowStepStatus::Failed,
                     input_hash: "PRIVATE-INPUT-HASH-SENTINEL".to_string(),
@@ -1799,8 +1867,8 @@ mod tests {
                 public["plan"],
                 json!({
                     "type":"choice",
-                    "then_branch":{"type":"step","step":"inspect"},
-                    "else_branch":{"type":"sequence","nodes":[{"type":"step","step":"explain"}]}
+                    "then_branch":{"type":"step","step":"inspect","node_path":[0]},
+                    "else_branch":{"type":"sequence","nodes":[{"type":"step","step":"explain","node_path":[1,0]}]}
                 })
             );
             let text = public.to_string();
@@ -1826,6 +1894,136 @@ mod tests {
         assert_eq!(public["step_id"], "unchosen");
         assert!(public.get("reason").is_none());
         assert!(!public.to_string().contains("PRIVATE-"));
+    }
+
+    #[test]
+    fn public_workflow_topology_matches_plan_leaf_and_redacts_private_map_data() {
+        let mut snapshot = private_workflow_snapshot(WorkflowRunStatus::Succeeded);
+        snapshot.steps.get_mut("inspect").unwrap().topology =
+            snapshot.definition.plan.step_topology("inspect", vec![2]);
+        let public = serde_json::to_value(public_workflow_snapshot(snapshot.clone())).unwrap();
+        assert_eq!(public["plan"]["node"]["body"]["node_path"], json!([0, 0]));
+        assert_eq!(
+            public["steps"]["inspect"]["topology"],
+            json!({"planned_step_id":"inspect","plan_node_path":[0,0],"map_index_path":[2]})
+        );
+        assert!(!public.to_string().contains("PRIVATE-"));
+        let historical: WorkflowRunSnapshot = serde_json::from_value({
+            let mut json = serde_json::to_value(&snapshot).unwrap();
+            json["steps"]["inspect"]
+                .as_object_mut()
+                .unwrap()
+                .remove("topology");
+            json
+        })
+        .unwrap();
+        assert!(
+            serde_json::to_value(public_workflow_snapshot(historical)).unwrap()["steps"]["inspect"]
+                .get("topology")
+                .is_none()
+        );
+        for topology in [
+            WorkflowStepTopology {
+                planned_step_id: "/PRIVATE-PATH".into(),
+                plan_node_path: vec![0, 0],
+                map_index_path: vec![2],
+            },
+            WorkflowStepTopology {
+                planned_step_id: "inspect".into(),
+                plan_node_path: vec![9],
+                map_index_path: vec![2],
+            },
+            WorkflowStepTopology {
+                planned_step_id: "inspect".into(),
+                plan_node_path: vec![0, 0],
+                map_index_path: vec![2, 3],
+            },
+        ] {
+            snapshot.steps.get_mut("inspect").unwrap().topology = Some(topology);
+            let public = serde_json::to_value(public_workflow_snapshot(snapshot.clone())).unwrap();
+            assert!(public["steps"]["inspect"].get("topology").is_none());
+            assert!(!public.to_string().contains("PRIVATE-"));
+        }
+        snapshot.definition.plan = WorkflowPlan::Sequence {
+            nodes: vec![
+                WorkflowPlan::Step {
+                    step: "inspect".into(),
+                },
+                WorkflowPlan::Step {
+                    step: "inspect".into(),
+                },
+            ],
+        };
+        snapshot.steps.get_mut("inspect").unwrap().topology = Some(WorkflowStepTopology {
+            planned_step_id: "inspect".into(),
+            plan_node_path: vec![0],
+            map_index_path: vec![],
+        });
+        let public = serde_json::to_value(public_workflow_snapshot(snapshot)).unwrap();
+        assert_eq!(public["plan"]["nodes"][0]["node_path"], json!([0]));
+        assert_eq!(public["plan"]["nodes"][1]["node_path"], json!([1]));
+        assert!(public["steps"]["inspect"].get("topology").is_none());
+    }
+
+    #[test]
+    fn public_workflow_topology_rejects_truncated_materialized_indices() {
+        let mut snapshot = private_workflow_snapshot(WorkflowRunStatus::Succeeded);
+        let prefix = snapshot
+            .definition
+            .plan
+            .step_topology("inspect", vec![])
+            .unwrap();
+        let complete = snapshot
+            .definition
+            .plan
+            .step_topology("inspect", vec![2])
+            .unwrap();
+        for status in [
+            WorkflowStepStatus::Queued,
+            WorkflowStepStatus::Running,
+            WorkflowStepStatus::Suspended,
+            WorkflowStepStatus::Succeeded,
+            WorkflowStepStatus::Failed,
+            WorkflowStepStatus::Cancelled,
+            WorkflowStepStatus::Skipped,
+        ] {
+            for attempts in [0, 1] {
+                let step = snapshot.steps.get_mut("inspect").unwrap();
+                step.status = status;
+                step.attempts = attempts;
+                step.input_hash.clear();
+                step.output = None;
+                step.topology = Some(prefix.clone());
+                let public = public_workflow_snapshot(snapshot.clone());
+                assert_eq!(
+                    public.steps["inspect"].topology.is_some(),
+                    attempts == 0
+                        && matches!(
+                            status,
+                            WorkflowStepStatus::Skipped | WorkflowStepStatus::Failed
+                        ),
+                    "invalid partial mapping for {status:?}, attempts={attempts}"
+                );
+                snapshot.steps.get_mut("inspect").unwrap().topology = Some(complete.clone());
+                assert!(public_workflow_snapshot(snapshot.clone()).steps["inspect"]
+                    .topology
+                    .is_some());
+            }
+        }
+        let step = snapshot.steps.get_mut("inspect").unwrap();
+        step.status = WorkflowStepStatus::Skipped;
+        step.attempts = 0;
+        step.topology = Some(prefix);
+        step.input_hash = "PRIVATE-INPUT-HASH".into();
+        assert!(public_workflow_snapshot(snapshot.clone()).steps["inspect"]
+            .topology
+            .is_none());
+        let step = snapshot.steps.get_mut("inspect").unwrap();
+        step.input_hash.clear();
+        step.output = Some(json!({"private":"PRIVATE-OUTPUT"}));
+        assert!(public_workflow_snapshot(snapshot).steps["inspect"]
+            .topology
+            .is_none());
     }
 
     #[test]

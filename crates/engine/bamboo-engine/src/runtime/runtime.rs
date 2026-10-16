@@ -363,6 +363,9 @@ pub struct ExecuteRequest {
     /// the config default (which may itself be unlimited). See
     /// [`bamboo_config::RunBudgetConfig::merged_with_override`].
     pub run_budget: Option<bamboo_config::RunBudgetConfig>,
+    /// Opt-in live counted repetition under the caller's existing execution owner.
+    /// Requires the shared activation router and an already registered run.
+    pub counted_loop: Option<super::counted_loop::CountedLoopConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +418,7 @@ pub struct ExecuteRequestBuilder {
     bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
     app_data_dir: Option<std::path::PathBuf>,
     run_budget: Option<bamboo_config::RunBudgetConfig>,
+    counted_loop: Option<super::counted_loop::CountedLoopConfig>,
 }
 
 impl ExecuteRequestBuilder {
@@ -456,6 +460,7 @@ impl ExecuteRequestBuilder {
             bash_completion_sink: None,
             app_data_dir: None,
             run_budget: None,
+            counted_loop: None,
         }
     }
 
@@ -657,6 +662,13 @@ impl ExecuteRequestBuilder {
         self
     }
 
+    /// Repeat the submitted prompt with explicit iteration and total-round bounds.
+    /// This is live-only; lifecycle/model management is a separate application seam.
+    pub fn counted_loop(mut self, config: super::counted_loop::CountedLoopConfig) -> Self {
+        self.counted_loop = Some(config);
+        self
+    }
+
     /// Materialize the underlying [`ExecuteRequest`].
     ///
     /// `gold_config` is an internal feature flag with only a crate-visible
@@ -699,6 +711,7 @@ impl ExecuteRequestBuilder {
             bash_completion_sink: self.bash_completion_sink,
             app_data_dir: self.app_data_dir,
             run_budget: self.run_budget,
+            counted_loop: self.counted_loop,
         }
     }
 }
@@ -754,6 +767,9 @@ impl AgentRuntime {
         req: ExecuteRequest,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     ) -> crate::runtime::runner::Result<()> {
+        // Refusals are not executions: never reach SessionEnd or the generic
+        // final checkpoint, and never mutate another counted owner's clone.
+        super::counted_loop::reject_ambiguous_reentry(session, self.persistence.as_ref()).await?;
         struct SdkFinish {
             host: Option<Arc<dyn crate::runtime::config::SdkSkillExecutionHost>>,
             session_id: String,
@@ -815,6 +831,16 @@ impl AgentRuntime {
             Some(router) => router.current_run_id(&session.id).await,
             None => None,
         };
+        if let Some(counted) = req.counted_loop.as_ref() {
+            if !counted
+                .owns_session(self.activation_router.as_ref(), session)
+                .await
+            {
+                return Err(bamboo_agent_core::AgentError::Budget(
+                    "counted loop requires the caller's exact Session activation owner".into(),
+                ));
+            }
+        }
         let system_prompt = extract_system_prompt(session);
         let config = self.config.read().await;
         let ExecuteRequest {
@@ -840,6 +866,7 @@ impl AgentRuntime {
             bash_completion_sink,
             app_data_dir,
             run_budget,
+            counted_loop,
         } = req;
         let tools = tools.unwrap_or_else(|| self.default_tools.clone());
         let llm = provider_override.unwrap_or_else(|| self.provider.clone());
@@ -984,6 +1011,7 @@ impl AgentRuntime {
             // the HTTP layer) means every caller — HTTP, schedules, connect,
             // the in-proc SDK — gets the same clamped fallback for free.
             run_budget: config.run_budget.merged_with_override(run_budget.as_ref()),
+            counted_loop,
             stream_timeout: config.stream_timeout,
             ..Default::default()
         };

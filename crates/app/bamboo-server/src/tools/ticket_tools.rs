@@ -36,9 +36,9 @@ pub fn overlay(
     mut base: Arc<dyn ToolExecutor>,
     app: Arc<TicketApplication>,
 ) -> Arc<dyn ToolExecutor> {
-    if app.service().is_err() {
-        return base;
-    }
+    // Install the guarded definitions before explicit initialization so an
+    // already-built runtime can use the scope as soon as the owner creates it.
+    // Every invocation still validates the original Supervisor and live binding.
     for name in NAMES {
         base = Arc::new(super::OverlayToolExecutor::new(
             base,

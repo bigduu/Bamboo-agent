@@ -74,6 +74,7 @@ pub use runtime::config::{
     ChildApprovalRequest, DisabledFilterResolver, DisabledFilterSets, GuardianConfig,
     GuardianSpawner, ImageFallbackConfig, ImageFallbackMode,
 };
+pub use runtime::counted_loop::CountedLoopConfig;
 pub use runtime::execution::runner_state::{AgentRunner, AgentStatus};
 pub use runtime::execution::{
     VisibleAssistantMessage, VisibleMessageEvent, VisibleMessageEventKind, VisibleMessageSnapshot,

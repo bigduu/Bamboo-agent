@@ -55,7 +55,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 tokio-stream = "0.1"
 url = "2"
 toml = "1.1"
-dirs = "6"
+dirs = "7"
 libc = "0.2"
 rand = "0.10"
 sysinfo = "0.39"

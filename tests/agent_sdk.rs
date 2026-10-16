@@ -8,7 +8,8 @@
 use std::sync::Arc;
 
 use bamboo_agent::agent::{
-    builtin_tool_names, Agent, AgentBuilder, BuiltinTool, ExecuteRequestBuilder, ToolSpec,
+    builtin_tool_names, Agent, AgentBuilder, BuiltinTool, CountedLoopConfig, ExecuteRequestBuilder,
+    ToolSpec,
 };
 
 use bamboo_agent_core::tools::{SharedTool, Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
@@ -94,15 +95,20 @@ fn s_t4_2_execute_request_builder_round_trip() {
     assert!(req.selected_skill_mode.is_none());
     assert!(req.image_fallback.is_none());
     assert!(req.gold_config.is_none());
+    assert!(req.counted_loop.is_none());
     assert!(req.app_data_dir.is_none());
 
     // Setters round-trip.
     let (tx2, _rx2) = mpsc::channel::<AgentEvent>(8);
+    let counted: CountedLoopConfig = bamboo_agent::CountedLoopConfig::new(2, 4);
     let req2 = ExecuteRequestBuilder::new("go", tx2, CancellationToken::new())
+        .counted_loop(counted)
         .model("claude-x")
         .provider_name("anthropic")
         .build();
     assert_eq!(req2.model_roster.model.as_deref(), Some("claude-x"));
+    let counted = req2.counted_loop.as_ref().unwrap();
+    assert_eq!((counted.max_iterations, counted.max_total_rounds), (2, 4));
     assert_eq!(
         req2.model_roster.provider_name.as_deref(),
         Some("anthropic")

@@ -36,6 +36,8 @@ members = [
     "crates/app/bamboo-broker",
     "examples/tool-event-recorder",
 ]
+# Patched dependency belongs only to the dev-only Analytics graph.
+exclude = ["third_party/libduckdb-sys"]
 # Bare `cargo build`/`test`/`check` (no `-p`/`--workspace`) operate on these.
 # `bamboo-analytics` is intentionally omitted: it is a dev-only analysis tool
 # that links the heavy bundled DuckDB engine, so it stays out of default builds
@@ -180,7 +182,7 @@ anyhow = "1"
 thiserror = "2"
 
 # Utilities
-dirs = "6"
+dirs = "7"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
@@ -191,7 +193,7 @@ glob = "0.3"
 globset = "0.4"
 walkdir = "2"
 url = "2"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
 
 # Async utilities
 futures = "0.3"
@@ -200,7 +202,8 @@ async-stream = "0.3"
 tokio-stream = "0.1"
 tokio-util = "0.7"
 eventsource-stream = "0.2"
-eventsource-client = "0.18"
+# Keep the Rust 1.95 contract; eventsource-client 0.18.1 requires Rust 1.97.
+eventsource-client = "=0.18.0"
 bytes = "1"
 
 # Concurrency utilities
@@ -266,3 +269,9 @@ bamboo-projects = { path = "crates/infra/bamboo-projects" }
 [profile.release]
 opt-level = 3
 lto = true
+
+# Analytics is outside bamboo-agent's published closure. This source-audited
+# sys patch actually upgrades ZIP6 to ZIP9; it never renames/ignores old ZIP.
+# Preserve normal full audit and verify the published29 do not depend on it.
+[patch.crates-io]
+libduckdb-sys = { path = "third_party/libduckdb-sys" }

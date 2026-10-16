@@ -71,19 +71,9 @@ impl ExecutingSupervisorObservation {
     /// context is queued or transferred. Never call this on a replacement
     /// Session loaded to resolve configuration or replay an old operation.
     pub fn capture_from_executing_session(session: &Session) -> Option<Self> {
-        let SessionAuthorityIdentity::Supervisor { incarnation_id } = &session.authority_identity
-        else {
-            return None;
-        };
-        (session.id == DEFAULT_SUPERVISOR_SESSION_ID
-            && session.kind == SessionKind::Root
-            && session.root_session_id == session.id
-            && session.parent_session_id.is_none()
-            && session.spawn_depth == 0
-            && !incarnation_id.is_nil())
-        .then_some(Self {
-            incarnation_id: *incarnation_id,
-        })
+        session
+            .supervisor_incarnation_id()
+            .map(|incarnation_id| Self { incarnation_id })
     }
 
     /// Original identity for the canonical service to revalidate. Possession

@@ -296,6 +296,9 @@ async fn root_catalog_keeps_only_current_history_in_the_core_functions() {
         .await
         .expect("app state should initialize");
 
+    // Definitions stay resident so this executor can use a scope initialized
+    // later. Their presence does not initialize or authorize a Work service.
+    assert!(state.tickets.service().is_err());
     let full = state.get_all_tool_schemas();
     let core_names = full
         .iter()
@@ -316,6 +319,12 @@ async fn root_catalog_keeps_only_current_history_in_the_core_functions() {
             "Read".to_string(),
             "Write".to_string(),
             "session_history_current".to_string(),
+            "work_overview".to_string(),
+            "work_search".to_string(),
+            "work_inspect".to_string(),
+            "work_changes".to_string(),
+            "work_update".to_string(),
+            "work_dispatch".to_string(),
         ])
     );
     let broad_history = bamboo_domain::ClassifiedToolIdentity::from_schema_name("session_history")

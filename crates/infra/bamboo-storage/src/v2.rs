@@ -6750,6 +6750,16 @@ impl Storage for SessionStoreV2 {
         self.bootstrap_default_supervisor(initial_model).await
     }
 
+    async fn with_supervisor_orchestration_authority(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        expected_revision: u64,
+        operation: Box<dyn FnOnce() -> io::Result<()> + Send>,
+    ) -> io::Result<()> {
+        self.supervisor_orchestration_job(supervisor, expected_revision, operation)
+            .await
+    }
+
     async fn load_root_authority(&self, session_id: &str) -> io::Result<Option<Session>> {
         let _lifecycle = self.lock_session_lifecycle_shared().await?;
         let _task = self.lock_runtime_task_sidecar_shared().await?;
@@ -6777,6 +6787,14 @@ impl Storage for SessionStoreV2 {
         target_session_id: &str,
     ) -> io::Result<bamboo_domain::SupervisorLinkObservation> {
         self.management_link(supervisor, target_session_id).await
+    }
+
+    async fn load_supervisor_managed_session(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target_session_id: &str,
+    ) -> io::Result<Option<Session>> {
+        self.management_history(supervisor, target_session_id).await
     }
 
     async fn save_session(&self, session: &Session) -> io::Result<()> {
@@ -6920,6 +6938,17 @@ impl Storage for SessionStoreV2 {
     async fn load_session(&self, session_id: &str) -> io::Result<Option<Session>> {
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         self.load_session_unlocked(session_id).await
+    }
+
+    async fn load_execution_admission_snapshot(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Session>> {
+        validate_session_id(session_id)?;
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let _session = self.acquire_session_maintenance_lock(session_id).await?;
+        self.load_execution_admission_unchecked(session_id).await
     }
 
     async fn delete_session(&self, session_id: &str) -> io::Result<bool> {

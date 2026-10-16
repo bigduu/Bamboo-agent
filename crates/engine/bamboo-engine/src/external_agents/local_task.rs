@@ -35,8 +35,14 @@ pub struct LocalTaskRuntime {
     pub sessions_cache: crate::SessionCache,
 }
 
+mod local_skill_binding;
+pub use local_skill_binding::{
+    LocalChildSkillAuthority, LocalChildSkillBinding, LocalChildSkillFactory,
+};
+
 #[derive(Default)]
 struct Bindings {
+    skills: Option<Arc<dyn LocalChildSkillFactory>>,
     runtime: Option<LocalTaskRuntime>,
     inbox: Option<SessionInboxRuntimeBinding>,
     store: Option<Arc<bamboo_storage::SessionStoreV2>>,
@@ -397,6 +403,9 @@ impl LocalTaskChildRunner {
 
 #[async_trait]
 impl ExternalChildRunner for LocalTaskChildRunner {
+    fn set_local_child_skill_factory(&self, factory: Option<Arc<dyn LocalChildSkillFactory>>) {
+        lock(&self.bindings).skills = factory;
+    }
     fn set_local_task_runtime(&self, runtime: Option<LocalTaskRuntime>) {
         lock(&self.bindings).runtime = runtime;
     }
@@ -677,10 +686,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         if let (Some(policy), Some(workspace)) = (&self.permission, &session.workspace) {
             policy.register_session_workspace(session.id.clone(), workspace);
         }
-        let required =
-            bamboo_domain::ChildContextBinding::from_session(session).map_err(failure)?;
-        let strict = required.is_some() || crate::session_app::child_session::named_profile::has_named_profile(session)
-            || session.metadata.contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY);
+        let strict = skill_host::strict_child(session)?;
         let names = if strict { match &self.ceiling {
             Some(source) => Some(source.observe(session).await.map_err(failure)?),
             None => return Err(failure("strict native tool ceiling unavailable")),
@@ -696,14 +702,25 @@ impl ExternalChildRunner for LocalTaskChildRunner {
             ticket_plan = Some(plan);
         }
         let mut tools: Arc<dyn ToolExecutor> = runtime.tools.clone();
-        let names = names.unwrap_or_else(||tools.list_tools().into_iter().map(|s|s.function.name).collect());
         let store = lock(&self.bindings).store.clone().ok_or_else(||failure("local store unavailable"))?;
-        tools = Arc::new(tool_policy::LocalChildTools::new(tools, names.clone(), session, store, execution.owner.clone(), job.disabled_tools.as_deref())?.with_canonical_subagent(lock(&self.bindings).subagent.clone()));
+        let factory = if strict { None } else { lock(&self.bindings).skills.clone() };
+        let mut child_skill_host = None;
+        let mut child_skill_authority = None;
+        if let Some(factory) = factory {
+            let authority = LocalChildSkillAuthority::bind(store.clone(), &execution);
+            let binding = factory.bind(authority.clone(), session, tools).await?;
+            child_skill_authority = Some(authority);
+            tools = binding.tools;
+            child_skill_host = Some(binding.host);
+        }
+        let names = names.unwrap_or_else(||tools.list_tools().into_iter().map(|s|s.function.name).collect());
+        tools = Arc::new(tool_policy::LocalChildTools::new(tools, names.clone(), session, store.clone(), execution.owner.clone(), job.disabled_tools.as_deref())?.with_canonical_subagent(lock(&self.bindings).subagent.clone()));
         if session.metadata.contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY) {
             tools = Arc::new(crate::ticket_worker_plan::files::LocalFileExecutor::new(
                 tools, tickets.clone().ok_or_else(||failure("Ticket authority unavailable"))?, session.clone(), run_id.clone(), &names
             ).map_err(failure)?);
         }
+        if let Some(authority) = child_skill_authority { authority.finalize_tools(tools.as_ref()); }
         let (local_event_tx, local_event_rx) = mpsc::channel(256);
         let mut request = ExecuteRequestBuilder::new("", local_event_tx.clone(), cancel_token.clone())
             .tools(tools)
@@ -747,9 +764,14 @@ impl ExternalChildRunner for LocalTaskChildRunner {
             .checkpoint_runtime_session(&mut owned_session)
             .await
             .map_err(failure)?;
-        let agent = runtime
+        let mut agent = runtime
             .agent
             .with_execution_persistence(execution.persistence.clone());
+        if strict {
+            agent = agent.with_skill_execution_host(skill_host::StrictChildSkills::bind(store, &execution));
+        } else if let Some(host) = child_skill_host {
+            agent = agent.with_skill_execution_host(host);
+        }
         let resources = execution.resources.clone();
         let task_cancel = cancel_token.clone();
         let mut handle = execution.task.lock().await;
@@ -1192,6 +1214,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
 
 mod approval;
 mod events;
+mod skill_host;
 mod tool_policy;
 
 #[cfg(test)]

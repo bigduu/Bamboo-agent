@@ -753,6 +753,9 @@ async fn migrate_legacy_pending_messages(
     inbox: &Arc<dyn SessionInboxPort>,
     persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
 ) -> LegacyPendingMigration {
+    if persistence.is_some_and(|p| p.root_inbox_receipt().is_some()) {
+        return LegacyPendingMigration::default();
+    }
     if messages.is_empty() {
         return LegacyPendingMigration {
             source_cleared: true,

@@ -2339,6 +2339,20 @@ impl RuntimeSessionPersistence for LockedSessionStore {
         Ok(session)
     }
 
+    async fn load_runtime_admission_snapshot(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        self.validate_child_runtime_read(session_id).await?;
+        let session = self
+            .storage
+            .load_execution_admission_snapshot(session_id)
+            .await?;
+        self.validate_child_runtime_readback(session_id, session.as_ref())
+            .await?;
+        Ok(session)
+    }
+
     async fn clear_legacy_pending_messages(
         &self,
         session_id: &str,

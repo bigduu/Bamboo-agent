@@ -959,7 +959,7 @@ async fn handle_chat(
         None
     };
 
-    let native_skills = crate::skill_runtime::ordinary_main(&session)
+    let native_skills = crate::skill_runtime::registered_main(&session)
         && [
             &req.message_id,
             &req.thread_id,
@@ -1209,7 +1209,7 @@ async fn handle_chat(
             // consumer publishes prompt + typed turn + cursor together.
             session.messages = original.clone();
         }
-        if let Err(response) = legacy_selection::commit_selected_input(
+        match legacy_selection::commit_selected_input(
             state.clone(),
             session,
             session_id.clone(),
@@ -1222,7 +1222,11 @@ async fn handle_chat(
         )
         .await
         {
-            return *response;
+            Ok(Some(receipt)) => ingress_receipt = Some(receipt),
+            // Referenced ingress may already own its receipt; metadata-only
+            // commits must preserve it rather than fabricate or erase one.
+            Ok(None) => {}
+            Err(response) => return *response,
         }
     } else {
         // Re-save to persist image attachments (if any).

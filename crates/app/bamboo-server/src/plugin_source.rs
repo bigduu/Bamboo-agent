@@ -100,8 +100,8 @@
 //!
 //! All three paths run the SAME safety checks: [`PluginManifest::validate`]
 //! before anything is committed to `plugins_dir()`, and path-traversal-safe
-//! archive extraction (a zip entry's [`zip::read::ZipFile::enclosed_name`]
-//! rejects `..`/absolute entries outright; a tar entry's path is checked for
+//! archive extraction (raw ZIP roots/prefixes are rejected before the relative
+//! containment check; a tar entry's path is checked for
 //! `ParentDir`/root/prefix components before extraction) — a malicious
 //! archive must not be able to write outside its own staging directory.
 //!
@@ -2357,24 +2357,30 @@ async fn extract_artifact_archive(
                     let mut file = archive.by_index(index).map_err(|error| {
                         PluginError::InvalidManifest(format!("invalid artifact zip entry: {error}"))
                     })?;
+                    let entry_name = file
+                        .name()
+                        .map_err(|error| {
+                            PluginError::InvalidManifest(format!(
+                                "invalid artifact zip entry name: {error}"
+                            ))
+                        })?
+                        .into_owned();
                     let regular_type = file
                         .unix_mode()
                         .is_none_or(|mode| matches!(mode & 0o170000, 0 | 0o100000));
                     if !file.is_file() || !regular_type {
                         return Err(PluginError::InvalidManifest(format!(
                             "artifact entry '{}' must be a regular file",
-                            file.name()
+                            entry_name
                         )));
                     }
                     let path = file.enclosed_name().ok_or_else(|| {
                         PluginError::InvalidManifest("artifact zip entry has an unsafe path".into())
                     })?;
-                    // Check the original spelling too: enclosed_name may simplify
-                    // components, while artifact paths must be root-only.
-                    let original_path = PathBuf::from(file.name());
-                    if original_path
-                        .components()
-                        .any(|part| matches!(part, std::path::Component::ParentDir))
+                    // ZIP9 may remove root/drive prefixes and simplify parents.
+                    // Artifact members must retain their original root-only spelling.
+                    if zip_entry_has_rooted_path(&entry_name)
+                        || entry_name.split(['/', '\\']).any(|part| part == "..")
                     {
                         return Err(PluginError::InvalidManifest(
                             "artifact zip entry has an unsafe path".into(),
@@ -2562,6 +2568,13 @@ fn copy_capped(
     }
 }
 
+fn zip_entry_has_rooted_path(name: &str) -> bool {
+    name.starts_with(['/', '\\'])
+        || name
+            .split(['/', '\\'])
+            .any(|part| part.as_bytes().get(1) == Some(&b':'))
+}
+
 fn extract_zip_sync(
     bytes: &[u8],
     dest_dir: &Path,
@@ -2579,13 +2592,21 @@ fn extract_zip_sync(
         let mut file = archive.by_index(index).map_err(|error| {
             PluginError::InvalidManifest(format!("invalid zip entry at index {index}: {error}"))
         })?;
-        // `enclosed_name()` is the zip crate's own traversal guard: it
-        // returns `None` for any entry whose name contains `..`, is
-        // absolute, or otherwise can't be safely joined under `dest_dir`.
-        let Some(relative_path) = file.enclosed_name() else {
+        let entry_name = file
+            .name()
+            .map_err(|error| {
+                PluginError::InvalidManifest(format!("invalid zip entry name: {error}"))
+            })?
+            .into_owned();
+        // ZIP9 can discard absolute prefixes; reject those in the original name
+        // before relying on its containment check for relative traversal.
+        let Some(relative_path) = file
+            .enclosed_name()
+            .filter(|_| !zip_entry_has_rooted_path(&entry_name))
+        else {
             return Err(PluginError::InvalidManifest(format!(
                 "zip entry '{}' has an unsafe path (traversal/absolute) — refusing to unpack",
-                file.name()
+                entry_name
             )));
         };
         let out_path = dest_dir.join(&relative_path);

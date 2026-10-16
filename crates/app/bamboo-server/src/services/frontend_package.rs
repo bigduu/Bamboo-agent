@@ -368,12 +368,15 @@ fn validate_external_frontend_archive(
         } else {
             ExternalArchiveEntryKind::File
         };
-        let raw_name = entry.name().to_string();
+        let raw_name = entry
+            .name()
+            .map_err(FrontendPackageError::Zip)?
+            .into_owned();
         let normalized = validate_external_archive_path(&raw_name, kind)?;
         let enclosed = entry
             .enclosed_name()
             .map(|path| path.to_path_buf())
-            .ok_or_else(|| FrontendPackageError::InvalidArchivePath(entry.name().to_string()))?;
+            .ok_or_else(|| FrontendPackageError::InvalidArchivePath(raw_name.clone()))?;
         let enclosed_portable = enclosed
             .iter()
             .map(|component| component.to_string_lossy())
@@ -583,10 +586,20 @@ fn extract_archive_entries<R: io::Read + io::Seek>(
 ) -> Result<(), FrontendPackageError> {
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(FrontendPackageError::Zip)?;
+        let raw_name = entry
+            .name()
+            .map_err(FrontendPackageError::Zip)?
+            .into_owned();
         let enclosed = entry
             .enclosed_name()
+            .filter(|_| {
+                !raw_name.starts_with(['/', '\\'])
+                    && !raw_name
+                        .split(['/', '\\'])
+                        .any(|part| part.as_bytes().get(1) == Some(&b':'))
+            })
             .map(|path| path.to_path_buf())
-            .ok_or_else(|| FrontendPackageError::InvalidArchivePath(entry.name().to_string()))?;
+            .ok_or_else(|| FrontendPackageError::InvalidArchivePath(raw_name.clone()))?;
         let out_path = target_dir.join(enclosed);
 
         if entry.is_dir() {
@@ -675,6 +688,11 @@ mod tests {
     static FRONTEND_PACKAGE_ENV_LOCK: Mutex<()> = Mutex::new(());
     const TEST_INDEX_HTML: &[u8] = b"<html><body>ok</body></html>";
 
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/zip_test_fixture.rs"
+    ));
+
     struct ScopedFrontendPackageEnv {
         previous: Option<OsString>,
     }
@@ -744,6 +762,49 @@ mod tests {
     }
 
     #[test]
+    fn extracts_legacy_cp437_zip_names() {
+        let fixture = tempdir().unwrap();
+        let path = fixture.path().join("frontend.zip");
+        write_test_zip(&path, &manifest_fixture());
+        let bytes = zip_with_cp437_name(std::fs::read(path).unwrap(), "index.html");
+        let target = tempdir().unwrap();
+        extract_frontend_zip_bytes(&bytes, target.path()).unwrap();
+        assert_eq!(
+            std::fs::read(target.path().join("éndex.html")).unwrap(),
+            TEST_INDEX_HTML
+        );
+        assert!(!target.path().join("index.html").exists());
+    }
+
+    #[test]
+    fn rejects_rooted_zip_names_before_extraction() {
+        for name in [
+            "/evil.txt",
+            r"\evil.txt",
+            r"C:\evil.txt",
+            r"C:evil.txt",
+            r"./C:\evil.txt",
+            r".\C:\evil.txt",
+            r"nested\C:\evil.txt",
+            r"\\host\share\evil.txt",
+        ] {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"payload").unwrap();
+            let bytes = writer.finish().unwrap().into_inner();
+            let target = tempdir().unwrap();
+            let error = extract_frontend_zip_bytes(&bytes, target.path()).unwrap_err();
+            assert!(
+                matches!(error, FrontendPackageError::InvalidArchivePath(_)),
+                "{name}: {error}"
+            );
+            assert!(std::fs::read_dir(target.path()).unwrap().next().is_none());
+        }
+    }
+
+    #[test]
     fn compiled_default_is_the_locked_clean_lotus_next_artifact() {
         if !has_embedded_frontend_package() {
             // The explicit API-only build contract intentionally omits these bytes.
@@ -751,7 +812,7 @@ mod tests {
         }
         let manifest = read_bundled_manifest(None).expect("embedded manifest should be valid");
         assert_eq!(manifest.frontend_name, "lotus-next");
-        assert_eq!(manifest.frontend_version, "2026.10.12");
+        assert_eq!(manifest.frontend_version, "2026.10.15");
 
         let package_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("frontend_package/lotus-frontend.zip");
@@ -769,12 +830,12 @@ mod tests {
         .expect("universal manifest should parse");
         assert_eq!(
             universal["sourceRevision"],
-            "d8b0eb6cad98ec53afe8dc4f6aeaa35ef050ec9f"
+            "58920d5b58b98847ef10f70e60b8f8c23afb9df4"
         );
         assert_eq!(universal["sourceDirty"], false);
         assert_eq!(
             universal["resourcesSha256"],
-            "60ef877ef46416a049a79085e1306351b4e1f7ba96ba39a32c9a4c24104a8c5d"
+            "7b34ed5b086a6c6ceab8ad804134c4d363996ba673635a3f4c5213a890f73163"
         );
         assert_eq!(universal["resources"].as_array().unwrap().len(), 710);
     }

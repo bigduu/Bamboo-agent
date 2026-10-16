@@ -13,12 +13,12 @@ use bamboo_domain::{
     LegacyProjectAssignment, LegacyProjectDryRunReport, LegacyProjectMatchBasis,
     LegacyProjectSuggestion, LegacyProjectUnassigned, LegacySessionProjectInput, ProjectId,
     ProjectIndex, ProjectIndexEntry, ProjectManifest, ProjectPathStatus, ProjectResourceEntry,
-    ProjectResourceKind, ProjectResourceSummary, ProjectStatus, WorkspaceBinding,
+    ProjectResourceKind, ProjectResourceSummary, ProjectSidebar, ProjectStatus, WorkspaceBinding,
     PROJECT_INDEX_SCHEMA_VERSION, PROJECT_MANIFEST_SCHEMA_VERSION,
 };
 use chrono::Utc;
 use fs2::FileExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -33,6 +33,13 @@ pub enum ProjectStoreError {
     Io(#[from] std::io::Error),
     #[error("project document is invalid")]
     Json(#[from] serde_json::Error),
+    #[error("unsupported project manifest schema {found}; this reader supports up to {supported}")]
+    UnsupportedManifestSchema { found: u64, supported: u32 },
+    #[error("project {project_id} schema-{schema_version} manifest differs from its saved migration snapshot; preserve both copies and resolve the conflict before retrying")]
+    LegacyMigrationConflict {
+        project_id: ProjectId,
+        schema_version: u32,
+    },
     #[error("project {0} was not found")]
     NotFound(ProjectId),
     #[error("project {0} already exists")]
@@ -332,6 +339,8 @@ impl ProjectStore {
     /// Open the registry and rebuild its derived index. Corrupt individual
     /// manifests are recovered from their last-known-good backup when possible;
     /// otherwise they are quarantined and skipped rather than blocking startup.
+    /// Readable future-schema manifests are skipped without recovery or changes
+    /// to their canonical primary, backup or revision floor.
     pub fn open(data_dir: impl Into<PathBuf>) -> ProjectStoreResult<Self> {
         let data_dir = prepare_data_dir(data_dir.into())?;
         let paths = ProjectPaths::new(data_dir);
@@ -1005,10 +1014,16 @@ impl ProjectStore {
             Err(error) => return Err(error),
         };
         match decode_manifest(&primary, project_id) {
-            Ok(decoded) if decoded.migrated_from_v1 => {
-                self.persist_migrated_manifest_locked(project_id, &primary, decoded.manifest)
-            }
-            Ok(decoded) => self.normalize_manifest_revision_locked(decoded.manifest),
+            Ok(decoded) => match decoded.migrated_from {
+                Some(schema_version) => self.persist_migrated_manifest_locked(
+                    project_id,
+                    schema_version,
+                    &primary,
+                    decoded.manifest,
+                ),
+                None => self.normalize_manifest_revision_locked(decoded.manifest),
+            },
+            Err(error @ ProjectStoreError::UnsupportedManifestSchema { .. }) => Err(error),
             Err(primary_error) => {
                 let quarantine =
                     path.with_file_name(format!("project.json.corrupt.{}", Uuid::new_v4()));
@@ -1054,7 +1069,8 @@ impl ProjectStore {
     fn persist_migrated_manifest_locked(
         &self,
         project_id: &ProjectId,
-        v1_bytes: &[u8],
+        legacy_schema_version: u32,
+        legacy_bytes: &[u8],
         manifest: ProjectManifest,
     ) -> ProjectStoreResult<ProjectManifest> {
         let revision_floor = self.read_manifest_revision_floor(project_id)?;
@@ -1067,7 +1083,24 @@ impl ProjectStore {
         candidate.updated_at = Utc::now();
 
         let home = self.validate_project_home(project_id)?;
-        write_bytes_atomic(&home.join(PROJECT_MANIFEST_BACKUP_FILE), v1_bytes)?;
+        // Old binaries try their recovery backup after rejecting a newer
+        // primary schema. Keep the exact legacy bytes for inspection outside
+        // that recovery path, and fence both writable copies with v3.
+        // An old reader may have rewritten the still-legacy primary after
+        // interruption. Never replace the only raw snapshot with those bytes;
+        // divergent copies require explicit reconciliation.
+        let snapshot = home.join(format!("project.json.migrated-v{legacy_schema_version}"));
+        if validate_regular_file_if_exists(&snapshot, "project migration snapshot")? {
+            if read_regular_file(&snapshot, "project migration snapshot")? != legacy_bytes {
+                return Err(ProjectStoreError::LegacyMigrationConflict {
+                    project_id: project_id.clone(),
+                    schema_version: legacy_schema_version,
+                });
+            }
+        } else {
+            write_bytes_atomic(&snapshot, legacy_bytes)?;
+        }
+        write_json_atomic(&home.join(PROJECT_MANIFEST_BACKUP_FILE), &candidate)?;
         self.write_manifest_revision_floor(project_id, candidate.revision)?;
         write_json_atomic(&self.paths.manifest_path(project_id), &candidate)?;
         Ok(candidate)
@@ -1171,7 +1204,7 @@ impl ProjectStore {
         match serde_json::from_slice::<ProjectIndex>(&bytes)
             .map_err(ProjectStoreError::from)
             .and_then(|index| match index.schema_version {
-                1 => Ok(index),
+                1 | 2 => Ok(index),
                 PROJECT_INDEX_SCHEMA_VERSION => {
                     validate_index(&index)?;
                     Ok(index)
@@ -1216,12 +1249,27 @@ impl ProjectStore {
 
 struct DecodedManifest {
     manifest: ProjectManifest,
-    migrated_from_v1: bool,
+    migrated_from: Option<u32>,
 }
 
 fn decode_manifest(bytes: &[u8], expected_id: &ProjectId) -> ProjectStoreResult<DecodedManifest> {
+    // A future format may also change fields this reader knows. Check only
+    // its version before decoding the current DTO, so an incompatible field
+    // cannot send a readable newer manifest through corruption recovery.
+    #[derive(Deserialize)]
+    struct ManifestSchema {
+        schema_version: u64,
+    }
+    let schema: ManifestSchema = serde_json::from_slice(bytes)?;
+    if schema.schema_version > u64::from(PROJECT_MANIFEST_SCHEMA_VERSION) {
+        return Err(ProjectStoreError::UnsupportedManifestSchema {
+            found: schema.schema_version,
+            supported: PROJECT_MANIFEST_SCHEMA_VERSION,
+        });
+    }
+
     let mut manifest: ProjectManifest = serde_json::from_slice(bytes)?;
-    let migrated_from_v1 = match manifest.schema_version {
+    let migrated_from = match manifest.schema_version {
         1 => {
             // A sole v1 binding is the only deterministic primary-folder
             // signal. Zero or multiple bindings deliberately remain
@@ -1235,16 +1283,19 @@ fn decode_manifest(bytes: &[u8], expected_id: &ProjectId) -> ProjectStoreResult<
             } else {
                 manifest.project_path_status = ProjectPathStatus::NeedsSelection;
             }
-            manifest.schema_version = PROJECT_MANIFEST_SCHEMA_VERSION;
-            true
+            Some(1)
         }
-        PROJECT_MANIFEST_SCHEMA_VERSION => false,
+        // v2 already has explicit primary-path semantics. Only the format
+        // fence changes; retain paths, bindings and any saved sidebar exactly.
+        2 => Some(2),
+        PROJECT_MANIFEST_SCHEMA_VERSION => None,
         schema_version => {
             return Err(ProjectStoreError::Validation(format!(
                 "unsupported project manifest schema {schema_version}"
             )));
         }
     };
+    manifest.schema_version = PROJECT_MANIFEST_SCHEMA_VERSION;
     validate_manifest(&manifest)?;
     if &manifest.id != expected_id {
         return Err(ProjectStoreError::Validation(format!(
@@ -1254,7 +1305,7 @@ fn decode_manifest(bytes: &[u8], expected_id: &ProjectId) -> ProjectStoreResult<
     }
     Ok(DecodedManifest {
         manifest,
-        migrated_from_v1,
+        migrated_from,
     })
 }
 
@@ -1505,6 +1556,9 @@ fn validate_manifest(manifest: &ProjectManifest) -> ProjectStoreResult<()> {
                 .to_string(),
         ));
     }
+    if let Some(sidebar) = manifest.sidebar.as_ref() {
+        validate_project_sidebar(sidebar, manifest.section.as_deref())?;
+    }
     if manifest.revision == 0 || manifest.resource_revision == 0 {
         return Err(ProjectStoreError::Validation(
             "project revisions must be positive".to_string(),
@@ -1557,6 +1611,64 @@ fn validate_manifest(manifest: &ProjectManifest) -> ProjectStoreResult<()> {
         }
         if let Some(git_common_dir) = &binding.git_common_dir {
             validate_absolute_path(git_common_dir, "git common dir")?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate the self-contained sidebar shape. Session ownership is checked by
+/// the server against durable session control planes before accepting new or
+/// changed assignments; it must never be inferred from these presentation IDs.
+pub fn validate_project_sidebar(
+    sidebar: &ProjectSidebar,
+    legacy_section: Option<&str>,
+) -> ProjectStoreResult<()> {
+    let mut ids = HashSet::new();
+    // Preserve the existing sidebar naming rule: distinct Unicode lowercase
+    // forms keep distinct buckets, including legacy Straße/STRASSE imports.
+    let mut names = HashSet::new();
+    for section in &sidebar.sections {
+        let valid_id = section
+            .id
+            .strip_prefix("section:")
+            .and_then(|value| Uuid::parse_str(value).ok().map(|id| (value, id)))
+            .is_some_and(|(value, id)| value == id.to_string());
+        if !valid_id || !ids.insert(section.id.as_str()) {
+            return Err(ProjectStoreError::Validation(
+                "sidebar section ids must be unique section:<canonical UUID> values".into(),
+            ));
+        }
+        if section.name.trim() != section.name
+            || section.name.is_empty()
+            || section.name.chars().count() > 80
+            || section.name.chars().any(char::is_control)
+            || !names.insert(section.name.to_lowercase())
+        {
+            return Err(ProjectStoreError::Validation(
+                "sidebar section names must be unique, trimmed 1..=80 characters without controls"
+                    .into(),
+            ));
+        }
+    }
+    for (session_id, target) in &sidebar.session_sections {
+        if session_id.is_empty()
+            || session_id.contains('/')
+            || session_id.contains('\\')
+            || session_id.contains("..")
+            || session_id.chars().any(char::is_control)
+        {
+            return Err(ProjectStoreError::Validation(
+                "invalid sidebar session id".into(),
+            ));
+        }
+        if let Some(target) = target {
+            if !ids.contains(target.as_str())
+                && !(target == "legacy" && legacy_section.is_some() && !sidebar.hidden_legacy)
+            {
+                return Err(ProjectStoreError::Validation(
+                    "sidebar assignment references an unavailable section".into(),
+                ));
+            }
         }
     }
     Ok(())
@@ -1996,13 +2108,133 @@ fn suggest_groups<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_domain::WorkspaceBinding;
+    use bamboo_domain::{ProjectSidebarSection, WorkspaceBinding};
     use tempfile::TempDir;
 
     fn store() -> (TempDir, ProjectStore) {
         let temp = tempfile::tempdir().unwrap();
         let store = ProjectStore::open(temp.path()).unwrap();
         (temp, store)
+    }
+
+    fn sidebar() -> ProjectSidebar {
+        ProjectSidebar {
+            sections: vec![ProjectSidebarSection {
+                id: "section:2d567c47-a081-4a8d-9c9e-246bce470c9f".into(),
+                name: "Support".into(),
+            }],
+            session_sections: BTreeMap::from([("root".into(), None)]),
+            hidden_legacy: false,
+        }
+    }
+
+    #[test]
+    fn project_sidebar_survives_restart_and_derived_index_rebuild() {
+        let (temp, store) = store();
+        let project = store.create("Zenith", None).unwrap();
+        let updated = store
+            .update(&project.id, 1, |project| {
+                project.sidebar = Some(sidebar());
+                Ok(())
+            })
+            .unwrap();
+        let home = store.paths().project_home(&project.id);
+        drop(store);
+        let reopened = ProjectStore::open(temp.path()).unwrap();
+        assert_eq!(reopened.get(&project.id).unwrap(), updated);
+        assert_eq!(reopened.list().unwrap(), vec![updated.clone()]);
+        assert_eq!(
+            reopened.index().unwrap().projects[&project.id].sidebar,
+            updated.sidebar
+        );
+        assert_eq!(reopened.paths().project_home(&project.id), home);
+        let empty = reopened
+            .update(&project.id, 2, |project| {
+                project.sidebar = Some(ProjectSidebar::default());
+                Ok(())
+            })
+            .unwrap();
+        drop(reopened);
+        let reopened = ProjectStore::open(temp.path()).unwrap();
+        assert_eq!(reopened.get(&project.id).unwrap().sidebar, empty.sidebar);
+        assert_eq!(empty.sidebar, Some(ProjectSidebar::default()));
+    }
+
+    #[test]
+    fn sidebar_validation_rejects_bad_ids_names_and_targets_without_writes() {
+        let (_temp, store) = store();
+        let project = store.create("Zenith", None).unwrap();
+        let manifest_path = store.paths().manifest_path(&project.id);
+        let original = std::fs::read(&manifest_path).unwrap();
+        let mut invalid = Vec::new();
+        for name in [
+            "".into(),
+            " leading".into(),
+            "line\nbreak".into(),
+            "界".repeat(81),
+        ] {
+            let mut candidate = sidebar();
+            candidate.sections[0].name = name;
+            invalid.push(candidate);
+        }
+        for id in [
+            "legacy",
+            "section:invalid",
+            "section:2D567C47-A081-4A8D-9C9E-246BCE470C9F",
+        ] {
+            let mut candidate = sidebar();
+            candidate.sections[0].id = id.into();
+            invalid.push(candidate);
+        }
+        let mut duplicate = sidebar();
+        duplicate.sections.push(duplicate.sections[0].clone());
+        invalid.push(duplicate);
+        for (first, second) in [
+            ("Support", "support"),
+            ("Ärger", "ärger"),
+            ("Straße", "STRAẞE"),
+        ] {
+            let mut duplicate_name = sidebar();
+            duplicate_name.sections[0].name = first.into();
+            duplicate_name.sections.push(ProjectSidebarSection {
+                id: "section:28f595c0-21dc-4a86-8b83-5f8b258386fa".into(),
+                name: second.into(),
+            });
+            invalid.push(duplicate_name);
+        }
+        for (session_id, target) in [
+            ("root", "missing"),
+            ("root", "legacy"),
+            ("../root", "legacy"),
+        ] {
+            let mut candidate = sidebar();
+            candidate.session_sections = BTreeMap::from([(session_id.into(), Some(target.into()))]);
+            invalid.push(candidate);
+        }
+        for candidate in invalid {
+            assert!(matches!(
+                store.update(&project.id, 1, |project| {
+                    project.sidebar = Some(candidate);
+                    Ok(())
+                }),
+                Err(ProjectStoreError::Validation(_))
+            ));
+            assert_eq!(std::fs::read(&manifest_path).unwrap(), original);
+            assert_eq!(store.index().unwrap().projects[&project.id].revision, 1);
+        }
+        let mut unicode = sidebar();
+        unicode.sections[0].name = "界".repeat(80);
+        validate_project_sidebar(&unicode, None).unwrap();
+        let mut legacy = sidebar();
+        legacy
+            .session_sections
+            .insert("root".into(), Some("legacy".into()));
+        validate_project_sidebar(&legacy, Some("Development")).unwrap();
+        // Legacy Project.section has an independent rename lifecycle. Its
+        // display name may collide without invalidating stored bucket IDs.
+        validate_project_sidebar(&legacy, Some("support")).unwrap();
+        legacy.hidden_legacy = true;
+        assert!(validate_project_sidebar(&legacy, Some("Development")).is_err());
     }
 
     fn binding(path: &Path) -> WorkspaceBinding {
@@ -2311,8 +2543,19 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(backup["schema_version"], 1);
-        assert!(backup.get(retired_memory_key_field().as_str()).is_some());
+        assert_eq!(backup["schema_version"], PROJECT_MANIFEST_SCHEMA_VERSION);
+        let legacy: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                store
+                    .paths()
+                    .project_home(&one.id)
+                    .join("project.json.migrated-v1"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(legacy["schema_version"], 1);
+        assert!(legacy.get(retired_memory_key_field().as_str()).is_some());
 
         let zero = store.create("zero", None).unwrap();
         rewrite_as_v1(&store, &zero);
@@ -2339,6 +2582,131 @@ mod tests {
             ProjectPathStatus::NeedsSelection
         );
         assert_eq!(migrated.workspace_bindings.len(), 2);
+    }
+
+    #[test]
+    fn v2_migration_fences_both_copies_preserves_sidebar_and_rebuilds_old_index() {
+        for sidebar in [None, Some(sidebar()), Some(ProjectSidebar::default())] {
+            let (temp, store) = store();
+            let primary = temp.path().join("primary");
+            let additional = temp.path().join("additional");
+            std::fs::create_dir_all(&primary).unwrap();
+            std::fs::create_dir_all(&additional).unwrap();
+            let project = store
+                .create_with_project_path(
+                    "v2 Project",
+                    Some("retained description".into()),
+                    primary.to_string_lossy().into_owned(),
+                    vec![binding(&additional)],
+                )
+                .unwrap();
+            let mut legacy = project.clone();
+            legacy.schema_version = 2;
+            legacy.section = Some("Development".into());
+            legacy.sidebar = sidebar.clone();
+            legacy.status = ProjectStatus::Archived;
+            legacy.revision = 7;
+            legacy.resource_revision = 4;
+            let mut value = serde_json::to_value(&legacy).unwrap();
+            if sidebar.is_none() {
+                value.as_object_mut().unwrap().remove("sidebar");
+            }
+            let legacy_bytes = serde_json::to_vec_pretty(&value).unwrap();
+            let manifest_path = store.paths().manifest_path(&project.id);
+            std::fs::write(&manifest_path, &legacy_bytes).unwrap();
+            store
+                .write_manifest_revision_floor(&project.id, 11)
+                .unwrap();
+            drop(store);
+
+            let reopened = ProjectStore::open(temp.path()).unwrap();
+            let migrated = reopened.get(&project.id).unwrap();
+            let mut expected = legacy;
+            expected.schema_version = PROJECT_MANIFEST_SCHEMA_VERSION;
+            expected.revision = 12;
+            expected.updated_at = migrated.updated_at;
+            assert_eq!(migrated, expected);
+            let migrated_bytes = std::fs::read(&manifest_path).unwrap();
+            let home = reopened.paths().project_home(&project.id);
+            assert_eq!(
+                std::fs::read(home.join(PROJECT_MANIFEST_BACKUP_FILE)).unwrap(),
+                migrated_bytes,
+                "old v2 readers must reject the recovery copy as well as the primary"
+            );
+            assert_eq!(
+                std::fs::read(home.join("project.json.migrated-v2")).unwrap(),
+                legacy_bytes
+            );
+            assert!(matches!(
+                reopened.update(&project.id, 7, |_| Ok(())),
+                Err(ProjectStoreError::Conflict { actual: 12, .. })
+            ));
+            assert_eq!(std::fs::read(&manifest_path).unwrap(), migrated_bytes);
+
+            // A downgraded binary may replace the derived index while refusing
+            // the v3 manifests. A new open must recover it from those manifests.
+            let mut old_index = serde_json::to_value(reopened.index().unwrap()).unwrap();
+            old_index["schema_version"] = serde_json::json!(2);
+            old_index["projects"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+                .for_each(|entry| {
+                    entry.as_object_mut().unwrap().remove("sidebar");
+                });
+            std::fs::write(
+                reopened.paths().index_path(),
+                serde_json::to_vec_pretty(&old_index).unwrap(),
+            )
+            .unwrap();
+            drop(reopened);
+
+            let reopened = ProjectStore::open(temp.path()).unwrap();
+            assert_eq!(reopened.get(&project.id).unwrap(), migrated);
+            assert_eq!(reopened.list().unwrap(), vec![migrated.clone()]);
+            let index = reopened.index().unwrap();
+            assert_eq!(index.schema_version, PROJECT_INDEX_SCHEMA_VERSION);
+            assert_eq!(index.projects[&project.id].sidebar, sidebar);
+            assert_eq!(std::fs::read(&manifest_path).unwrap(), migrated_bytes);
+            let updated = reopened
+                .update(&project.id, migrated.revision, |project| {
+                    project.name = "renamed without sidebar loss".into();
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(updated.sidebar, sidebar);
+            let backup: ProjectManifest = serde_json::from_slice(
+                &std::fs::read(home.join(PROJECT_MANIFEST_BACKUP_FILE)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(backup, migrated);
+        }
+    }
+
+    #[test]
+    fn corrupt_primary_recovery_upgrades_v2_backup_and_preserves_sidebar() {
+        let (_temp, store) = store();
+        let project = store.create("recovery", None).unwrap();
+        let mut legacy = project.clone();
+        legacy.schema_version = 2;
+        legacy.sidebar = Some(sidebar());
+        let home = store.paths().project_home(&project.id);
+        std::fs::write(
+            home.join(PROJECT_MANIFEST_BACKUP_FILE),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(store.paths().manifest_path(&project.id), b"{broken").unwrap();
+        let recovered = store.get(&project.id).unwrap();
+        assert_eq!(recovered.schema_version, PROJECT_MANIFEST_SCHEMA_VERSION);
+        assert_eq!(recovered.sidebar, legacy.sidebar);
+        assert!(recovered.revision > legacy.revision);
+        let backup: ProjectManifest = serde_json::from_slice(
+            &std::fs::read(home.join(PROJECT_MANIFEST_BACKUP_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(backup.schema_version, PROJECT_MANIFEST_SCHEMA_VERSION);
+        assert_eq!(backup.sidebar, legacy.sidebar);
     }
 
     #[test]
@@ -3114,6 +3482,315 @@ mod tests {
         assert!(store.index().unwrap().projects[&project.id]
             .section
             .is_none());
+    }
+
+    #[test]
+    fn changed_legacy_manifest_cannot_overwrite_saved_migration_snapshot() {
+        for version in [1, 2] {
+            let (temp, store) = store();
+            let project = store.create("original metadata", None).unwrap();
+            let healthy = store.create("healthy", None).unwrap();
+            let home = store.paths().project_home(&project.id);
+            let primary = store.paths().manifest_path(&project.id);
+            let backup = home.join(PROJECT_MANIFEST_BACKUP_FILE);
+            let floor = store.paths().manifest_revision_path(&project.id);
+            let snapshot = home.join(format!("project.json.migrated-v{version}"));
+            let mut original = serde_json::to_value(&project).unwrap();
+            original["schema_version"] = serde_json::json!(version);
+            original["sidebar"] = serde_json::to_value(sidebar()).unwrap();
+            original["unknown_legacy_field"] = serde_json::json!({"retained": [1, 2, 3]});
+            let original_bytes = serde_json::to_vec_pretty(&original).unwrap();
+            std::fs::write(&snapshot, &original_bytes).unwrap();
+
+            // A cooperating old writer can change a still-readable primary
+            // after an interrupted migration. Its fields must not replace the
+            // first snapshot, nor may recovery silently discard its edits.
+            let mut changed = original;
+            changed.as_object_mut().unwrap().remove("sidebar");
+            changed
+                .as_object_mut()
+                .unwrap()
+                .remove("unknown_legacy_field");
+            changed["name"] = serde_json::json!("metadata edited by old writer");
+            changed["revision"] = serde_json::json!(3);
+            let changed_bytes = serde_json::to_vec_pretty(&changed).unwrap();
+            std::fs::write(&primary, &changed_bytes).unwrap();
+            std::fs::write(&backup, &changed_bytes).unwrap();
+            store.write_manifest_revision_floor(&project.id, 3).unwrap();
+            let files = [primary, backup, floor, snapshot];
+            let before = files.each_ref().map(|path| std::fs::read(path).unwrap());
+            assert!(matches!(
+                store.get(&project.id),
+                Err(ProjectStoreError::LegacyMigrationConflict { project_id, schema_version })
+                    if project_id == project.id && schema_version == version
+            ));
+            let mut mutated = false;
+            assert!(matches!(
+                store.update(&project.id, 3, |_| {
+                    mutated = true;
+                    Ok(())
+                }),
+                Err(ProjectStoreError::LegacyMigrationConflict { .. })
+            ));
+            assert!(!mutated);
+            assert_eq!(
+                files.each_ref().map(|path| std::fs::read(path).unwrap()),
+                before
+            );
+
+            drop(store);
+            let reopened = ProjectStore::open(temp.path()).unwrap();
+            assert!(!reopened.index().unwrap().projects.contains_key(&project.id));
+            assert!(reopened.index().unwrap().projects.contains_key(&healthy.id));
+            assert_eq!(
+                files.each_ref().map(|path| std::fs::read(path).unwrap()),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn identical_legacy_snapshot_resumes_each_interrupted_migration_prefix() {
+        for version in [1, 2] {
+            for stage in ["snapshot", "backup", "floor"] {
+                let (_temp, store) = store();
+                let project = store.create("resume original", None).unwrap();
+                let home = store.paths().project_home(&project.id);
+                let mut legacy = project.clone();
+                legacy.schema_version = version;
+                legacy.sidebar = Some(sidebar());
+                let original = serde_json::to_vec_pretty(&legacy).unwrap();
+                std::fs::write(store.paths().manifest_path(&project.id), &original).unwrap();
+                let snapshot = home.join(format!("project.json.migrated-v{version}"));
+                std::fs::write(&snapshot, &original).unwrap();
+                let mut candidate = legacy.clone();
+                candidate.schema_version = PROJECT_MANIFEST_SCHEMA_VERSION;
+                candidate.revision = 2;
+                let backup = home.join(PROJECT_MANIFEST_BACKUP_FILE);
+                if stage == "snapshot" {
+                    std::fs::write(&backup, &original).unwrap();
+                } else {
+                    write_json_atomic(&backup, &candidate).unwrap();
+                }
+                if stage == "floor" {
+                    store.write_manifest_revision_floor(&project.id, 2).unwrap();
+                }
+                let migrated = store.get(&project.id).unwrap();
+                assert_eq!(migrated.sidebar, legacy.sidebar);
+                assert_eq!(migrated.schema_version, PROJECT_MANIFEST_SCHEMA_VERSION);
+                assert_eq!(migrated.revision, if stage == "floor" { 3 } else { 2 });
+                assert_eq!(std::fs::read(&snapshot).unwrap(), original);
+                let saved_backup: ProjectManifest =
+                    serde_json::from_slice(&std::fs::read(&backup).unwrap()).unwrap();
+                assert_eq!(saved_backup, migrated);
+                assert_eq!(store.get(&project.id).unwrap(), migrated);
+                let updated = store
+                    .update(&project.id, migrated.revision, |manifest| {
+                        manifest.description =
+                            Some("current-schema update remains available".into());
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(updated.sidebar, migrated.sidebar);
+                assert_eq!(std::fs::read(&snapshot).unwrap(), original);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_snapshot_symlink_is_rejected_without_canonical_writes() {
+        use std::os::unix::fs::symlink;
+
+        let (_temp, store) = store();
+        let project = store.create("snapshot confinement", None).unwrap();
+        let home = store.paths().project_home(&project.id);
+        let primary = store.paths().manifest_path(&project.id);
+        let mut legacy = project.clone();
+        legacy.schema_version = 2;
+        let original = serde_json::to_vec_pretty(&legacy).unwrap();
+        std::fs::write(&primary, &original).unwrap();
+        let backup = home.join(PROJECT_MANIFEST_BACKUP_FILE);
+        std::fs::write(&backup, &original).unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), &original).unwrap();
+        let snapshot = home.join("project.json.migrated-v2");
+        symlink(outside.path(), &snapshot).unwrap();
+        assert!(matches!(
+            store.get(&project.id),
+            Err(ProjectStoreError::Validation(_))
+        ));
+        assert!(std::fs::symlink_metadata(&snapshot)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(outside.path()).unwrap(), original);
+        assert_eq!(std::fs::read(primary).unwrap(), original);
+        assert_eq!(std::fs::read(backup).unwrap(), original);
+        assert_eq!(store.read_manifest_revision_floor(&project.id).unwrap(), 1);
+    }
+
+    #[test]
+    fn future_manifest_rejects_get_and_update_without_recovery() {
+        for version in [
+            u64::from(PROJECT_MANIFEST_SCHEMA_VERSION) + 1,
+            u64::from(u32::MAX) + 1,
+            u64::MAX,
+        ] {
+            for changed_shape in [false, true] {
+                let (_temp, store) = store();
+                let created = store.create("Future Project", None).unwrap();
+                let current = store
+                    .update(&created.id, created.revision, |manifest| {
+                        manifest.sidebar = Some(sidebar());
+                        Ok(())
+                    })
+                    .unwrap();
+                let mut future = serde_json::to_value(&current).unwrap();
+                future["schema_version"] = serde_json::json!(version);
+                future["revision"] = serde_json::json!(9);
+                future["future_fields"] = serde_json::json!({"preserve": ["unknown", 42]});
+                if changed_shape {
+                    future["status"] = serde_json::json!({"new_state": true});
+                    future.as_object_mut().unwrap().remove("name");
+                }
+                let home = store.paths().project_home(&current.id);
+                let primary = store.paths().manifest_path(&current.id);
+                std::fs::write(&primary, serde_json::to_vec_pretty(&future).unwrap()).unwrap();
+                store
+                    .write_manifest_revision_floor(&current.id, 17)
+                    .unwrap();
+                let snapshot = || {
+                    std::fs::read_dir(&home)
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .filter(|entry| entry.file_type().unwrap().is_file())
+                        .map(|entry| (entry.file_name(), std::fs::read(entry.path()).unwrap()))
+                        .collect::<BTreeMap<_, _>>()
+                };
+                let before = snapshot();
+
+                assert!(matches!(
+                    store.get(&current.id),
+                    Err(ProjectStoreError::UnsupportedManifestSchema { found, supported })
+                        if found == version && supported == PROJECT_MANIFEST_SCHEMA_VERSION
+                ));
+                assert_eq!(snapshot(), before);
+
+                let mut mutated = false;
+                assert!(matches!(
+                    store.update(&current.id, current.revision, |_| {
+                        mutated = true;
+                        Ok(())
+                    }),
+                    Err(ProjectStoreError::UnsupportedManifestSchema { found, .. })
+                        if found == version
+                ));
+                assert!(
+                    !mutated,
+                    "unsupported data must never reach the mutation callback"
+                );
+                assert_eq!(
+                    snapshot(),
+                    before,
+                    "no recovery, migration or floor write is allowed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn startup_skips_future_manifest_without_rewriting_canonical_files() {
+        let (temp, store) = store();
+        let future = store.create("Future Project", None).unwrap();
+        let current = store
+            .update(&future.id, future.revision, |manifest| {
+                manifest.sidebar = Some(sidebar());
+                Ok(())
+            })
+            .unwrap();
+        let healthy = store.create("Supported Project", None).unwrap();
+        let mut value = serde_json::to_value(&current).unwrap();
+        value["schema_version"] = serde_json::json!(PROJECT_MANIFEST_SCHEMA_VERSION + 1);
+        value["future_fields"] = serde_json::json!({"retained": true});
+        let primary = store.paths().manifest_path(&current.id);
+        let backup = store
+            .paths()
+            .project_home(&current.id)
+            .join(PROJECT_MANIFEST_BACKUP_FILE);
+        let floor = store.paths().manifest_revision_path(&current.id);
+        std::fs::write(&primary, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        store
+            .write_manifest_revision_floor(&current.id, 17)
+            .unwrap();
+        let canonical = [primary, backup, floor];
+        let before = canonical
+            .each_ref()
+            .map(|path| std::fs::read(path).unwrap());
+        drop(store);
+
+        let reopened = ProjectStore::open(temp.path()).unwrap();
+        let index = reopened.index().unwrap();
+        assert!(!index.projects.contains_key(&current.id));
+        assert!(index.projects.contains_key(&healthy.id));
+        assert_eq!(reopened.list().unwrap(), vec![healthy]);
+        assert!(matches!(
+            reopened.get(&current.id),
+            Err(ProjectStoreError::UnsupportedManifestSchema { .. })
+        ));
+        assert_eq!(
+            canonical
+                .each_ref()
+                .map(|path| std::fs::read(path).unwrap()),
+            before
+        );
+        assert!(
+            std::fs::read_dir(reopened.paths().project_home(&current.id))
+                .unwrap()
+                .map(Result::unwrap)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("project.json.corrupt."))
+        );
+    }
+
+    #[test]
+    fn supported_manifest_decode_and_validation_errors_still_recover() {
+        for invalid_type in [false, true] {
+            let (_temp, store) = store();
+            let created = store.create("Supported recovery", None).unwrap();
+            let updated = store
+                .update(&created.id, created.revision, |manifest| {
+                    manifest.description = Some("latest".into());
+                    Ok(())
+                })
+                .unwrap();
+            let mut corrupt = serde_json::to_value(&updated).unwrap();
+            corrupt["name"] = if invalid_type {
+                serde_json::json!({"invalid": "name"})
+            } else {
+                serde_json::json!("")
+            };
+            let primary = store.paths().manifest_path(&created.id);
+            std::fs::write(&primary, serde_json::to_vec_pretty(&corrupt).unwrap()).unwrap();
+            store
+                .write_manifest_revision_floor(&created.id, 17)
+                .unwrap();
+
+            let recovered = store.get(&created.id).unwrap();
+            assert_eq!(recovered.name, created.name);
+            assert_eq!(recovered.description, created.description);
+            assert_eq!(recovered.schema_version, PROJECT_MANIFEST_SCHEMA_VERSION);
+            assert_eq!(recovered.revision, 18);
+            assert!(matches!(
+                store.update(&created.id, 17, |_| Ok(())),
+                Err(ProjectStoreError::Conflict {
+                    expected: 17,
+                    actual: 18
+                })
+            ));
+        }
     }
 
     #[test]

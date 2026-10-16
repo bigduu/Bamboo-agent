@@ -2303,7 +2303,7 @@ async fn handle_no_tool_calls_with_native(
     // Stop path does NOT persist a message the resumed turn re-emits — preserving
     // the exact pre-#343 no-goal guardian behavior (the guardian ran before the
     // assistant message was appended).
-    let add_message_before_gold = config.goal_loop_active();
+    let add_message_before_gold = config.goal_loop_active() || config.counted_loop.is_some();
     let mut deferred_assistant_message = Some(assistant_with_visible_identity(
         Message::assistant_with_reasoning(content, None, reasoning)
             .with_reasoning_signature(reasoning_signature),
@@ -2320,6 +2320,51 @@ async fn handle_no_tool_calls_with_native(
         if let Some(message) = deferred_assistant_message.take() {
             commit_assistant_message(session, message, &mut native_items)?;
         }
+    }
+
+    // Counted repetition is a peer terminal gate inside this same owner. Gold
+    // combinations are rejected at startup; no judge is added by this gate.
+    if config.counted_loop.is_some() && cancel_token.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+    let counted_decision = crate::runtime::counted_loop::terminal(session, config).await?;
+    if config.counted_loop.is_some() && cancel_token.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+    match counted_decision {
+        crate::runtime::counted_loop::TerminalDecision::Continue => {
+            if let Some(message) = buffered_candidate.as_ref() {
+                publish_buffered_message(event_tx, message).await;
+            }
+            record_no_tool_calls_round_completed(
+                metrics_collector,
+                round_id,
+                session_id,
+                session,
+                round_usage,
+            );
+            return Ok(TurnOutcome {
+                should_break: false,
+                sent_complete: false,
+            });
+        }
+        crate::runtime::counted_loop::TerminalDecision::Stop => {
+            if let Some(message) = buffered_candidate.as_ref() {
+                publish_buffered_message(event_tx, message).await;
+            }
+            record_no_tool_calls_round_completed(
+                metrics_collector,
+                round_id,
+                session_id,
+                session,
+                round_usage,
+            );
+            return Ok(TurnOutcome {
+                should_break: true,
+                sent_complete: false,
+            });
+        }
+        crate::runtime::counted_loop::TerminalDecision::Finalize => {}
     }
 
     // Terminal goal gate FIRST (issue #343): when an autonomous goal is active,
@@ -2544,14 +2589,15 @@ async fn handle_no_tool_calls_with_native(
     if let Some(message) = deferred_assistant_message.take() {
         commit_assistant_message(session, message, &mut native_items)?;
     }
-    let _ = event_tx
-        .send(AgentEvent::Complete {
-            usage: to_event_token_usage(
-                complete_usage.prompt_tokens,
-                complete_usage.completion_tokens,
-            ),
-        })
-        .await;
+    let usage = to_event_token_usage(
+        complete_usage.prompt_tokens,
+        complete_usage.completion_tokens,
+    );
+    // Counted publication belongs to the outer runner, after AfterRound,
+    // normal finalization and the terminal LoopState checkpoint all succeed.
+    if config.counted_loop.is_none() {
+        let _ = event_tx.send(AgentEvent::Complete { usage }).await;
+    }
     record_no_tool_calls_round_completed(
         metrics_collector,
         round_id,
@@ -2561,7 +2607,7 @@ async fn handle_no_tool_calls_with_native(
     );
     Ok(TurnOutcome {
         should_break: true,
-        sent_complete: true,
+        sent_complete: config.counted_loop.is_none(),
     })
 }
 
@@ -2795,19 +2841,21 @@ async fn handle_tool_calls_path(
                 "runtime.completion_reason".into(),
                 "ticket_question_yield".into(),
             );
-            let _ = frame
-                .event_tx
-                .send(AgentEvent::Complete {
-                    usage: to_event_token_usage(
-                        round_usage.prompt_tokens,
-                        round_usage.completion_tokens,
-                    ),
-                })
-                .await;
+            if frame.config.counted_loop.is_none() {
+                let _ = frame
+                    .event_tx
+                    .send(AgentEvent::Complete {
+                        usage: to_event_token_usage(
+                            round_usage.prompt_tokens,
+                            round_usage.completion_tokens,
+                        ),
+                    })
+                    .await;
+            }
         }
         return Ok(TurnOutcome {
             should_break: true,
-            sent_complete: ticket_question_yield,
+            sent_complete: ticket_question_yield && frame.config.counted_loop.is_none(),
         });
     }
 
@@ -2908,6 +2956,16 @@ pub(super) async fn run_pipeline(
 ) -> super::super::Result<bool> {
     let result =
         boxed_pipeline_inner(session, event_tx, llm, tools, cancel_token, config, state).await;
+    // Stop/budget checkpoint awaits can race Session cancellation. Until a
+    // Complete was actually published, cancellation retains its error path.
+    let result = if config.counted_loop.is_some()
+        && cancel_token.is_cancelled()
+        && matches!(result, Ok(false))
+    {
+        Err(AgentError::Cancelled)
+    } else {
+        result
+    };
 
     // This outer lifecycle fence deliberately catches every return from the
     // implementation below, including `?` from prompt refresh and hook paths.
@@ -2988,6 +3046,9 @@ async fn run_pipeline_inner(
     );
 
     loop {
+        if config.counted_loop.is_some() && cancel_token.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
         // Startup has already admitted this run's input. A runtime-only wakeup
         // cannot spend model calls while the Human progress question is pending,
         // including auxiliary evaluations and prompt-memory work below.
@@ -2998,6 +3059,10 @@ async fn run_pipeline_inner(
             tool_policy_guard.reset_observation_progress();
         }
         if crate::session_app::no_progress::retain_pending_pause(session, &mut state.runtime_state)
+        {
+            break;
+        }
+        if !crate::runtime::counted_loop::before_round(session, config, &state.execution_id).await?
         {
             break;
         }
@@ -3063,6 +3128,12 @@ async fn run_pipeline_inner(
             turn_counter as usize,
         );
         state.runtime_state.round.last_round_id = Some(round_id.clone());
+        if config.counted_loop.is_some() {
+            // A prelude may fail before normal round finalization mirrors this
+            // snapshot. Keep the Session on this owned round so the outer
+            // failure correction retains its exact run/round fence.
+            state_bridge::write_runtime_state(session, &state.runtime_state);
+        }
 
         if config
             .hook_runner
@@ -4119,6 +4190,15 @@ async fn run_pipeline_inner(
 
         turn_counter += 1;
 
+        // Counted loops have a hard total-round cap, including finalizer work.
+        // Do not grant an additional model summary beyond either host bound.
+        if config.counted_loop.is_some()
+            && check_run_budget_exceeded(&state.runtime_state.round, &config.run_budget).is_some()
+        {
+            crate::runtime::counted_loop::exhaust_budget(session, config).await?;
+            break;
+        }
+
         // --- Guard against the per-run resource budget (issue #221) ---
         //
         // Checked BEFORE max_rounds so a budget trip is reported with its own
@@ -4201,6 +4281,10 @@ async fn run_pipeline_inner(
         // the instruction and emitting more tool calls). It can therefore never
         // recurse or extend the loop indefinitely.
         if let Some(max_rounds) = config.run_budget.max_rounds {
+            if config.counted_loop.is_some() && turn_counter >= max_rounds {
+                crate::runtime::counted_loop::exhaust_budget(session, config).await?;
+                break;
+            }
             if turn_counter >= max_rounds {
                 if !max_rounds_summary_used {
                     tracing::warn!(

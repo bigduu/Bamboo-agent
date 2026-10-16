@@ -1290,8 +1290,29 @@ impl SessionInboxPort for FileSessionInbox {
         let request = request.clone();
         owned::complete_owned(async move {
             inbox
-                .claim_owned_impl(&target, limit, run.as_deref(), &request)
+                .claim_owned_impl(&target, limit, run.as_deref(), &request, None)
                 .await
+        })
+        .await
+    }
+
+    async fn claim_owned_receipt(
+        &self,
+        target: &str,
+        receipt: &SessionInboxReceipt,
+        run: Option<&str>,
+        request: &bamboo_domain::SessionInboxLeaseRequest,
+    ) -> Result<Option<bamboo_domain::SessionInboxOwnedClaim>, SessionInboxError> {
+        let inbox = self.clone();
+        let target = target.to_owned();
+        let receipt = receipt.clone();
+        let run = run.map(str::to_owned);
+        let request = request.clone();
+        owned::complete_owned(async move {
+            inbox
+                .claim_owned_impl(&target, 1, run.as_deref(), &request, Some(&receipt))
+                .await
+                .map(|mut claims| claims.pop())
         })
         .await
     }
@@ -1923,6 +1944,10 @@ mod activation_intent_tests;
 #[cfg(test)]
 #[path = "session_inbox_owned_tests.rs"]
 mod owned_tests;
+
+#[cfg(test)]
+#[path = "session_inbox_receipt_tests.rs"]
+mod receipt_tests;
 
 #[cfg(test)]
 mod tests {

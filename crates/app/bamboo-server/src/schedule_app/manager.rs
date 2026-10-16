@@ -92,26 +92,130 @@ enum ScheduleRunLifecycleResult {
 #[derive(Clone)]
 pub struct ScheduleManager {
     tx: mpsc::Sender<ScheduleRunJob>,
+    #[cfg(test)]
+    guard_progress: ScheduleGuardObservers,
+}
+
+// Only explicitly observed fixture runs are retained. Observations never read
+// storage, introduce a suspension point, or participate in scheduling decisions.
+#[cfg(test)]
+type ScheduleGuardObservers = Arc<std::sync::Mutex<HashMap<String, Arc<ScheduleGuardProgress>>>>;
+
+#[cfg(test)]
+#[derive(Default)]
+struct ScheduleGuardProgress {
+    boundaries: std::sync::Mutex<[(Option<&'static str>, Option<std::time::Instant>); 2]>,
+    enqueued: std::sync::atomic::AtomicUsize,
+    received: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl ScheduleGuardProgress {
+    fn at(&self, boundary: &'static str) {
+        self.boundaries.lock().unwrap()[0] = (Some(boundary), Some(std::time::Instant::now()));
+    }
+
+    fn watch(&self, boundary: &'static str) {
+        self.boundaries.lock().unwrap()[1] = (Some(boundary), Some(std::time::Instant::now()));
+    }
+
+    fn metadata(&self) -> String {
+        use std::sync::atomic::Ordering;
+        let [(worker, worker_since), (watcher, watcher_since)] = *self.boundaries.lock().unwrap();
+        format!(
+            "worker_boundary={} worker_elapsed_ms={:?} watcher_boundary={} watcher_elapsed_ms={:?} enqueued={} worker_received={}",
+            worker.unwrap_or("unobserved"),
+            worker_since.map(|instant| instant.elapsed().as_millis()),
+            watcher.unwrap_or("unobserved"),
+            watcher_since.map(|instant| instant.elapsed().as_millis()),
+            self.enqueued.load(Ordering::Relaxed),
+            self.received.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[cfg(test)]
+trait ObserveScheduleGuard {
+    fn at(&self, boundary: &'static str);
+    fn watch(&self, boundary: &'static str);
+}
+
+#[cfg(test)]
+impl ObserveScheduleGuard for Option<Arc<ScheduleGuardProgress>> {
+    fn at(&self, boundary: &'static str) {
+        if let Some(progress) = self {
+            progress.at(boundary);
+        }
+    }
+
+    fn watch(&self, boundary: &'static str) {
+        if let Some(progress) = self {
+            progress.watch(boundary);
+        }
+    }
+}
+
+#[cfg(test)]
+fn guard_progress_for_job(
+    observers: &ScheduleGuardObservers,
+    job: &ScheduleRunJob,
+) -> Option<Arc<ScheduleGuardProgress>> {
+    job.run_config.workflow_target.as_ref()?;
+    observers.lock().unwrap().get(&job.run_id).cloned()
+}
+
+#[cfg(test)]
+fn guard_progress_for_received_job(
+    observers: &ScheduleGuardObservers,
+    job: &ScheduleRunJob,
+) -> Option<Arc<ScheduleGuardProgress>> {
+    // A duplicate still contributes to the receive count, but it must not
+    // replace the original attempt's worker or watcher boundaries.
+    guard_progress_for_job(observers, job).filter(|progress| {
+        progress
+            .received
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            == 0
+    })
 }
 
 impl ScheduleManager {
     pub fn new(ctx: ScheduleContext) -> Self {
         let (tx, mut rx) = mpsc::channel::<ScheduleRunJob>(128);
+        #[cfg(test)]
+        let guard_progress = ScheduleGuardObservers::default();
 
         // Worker: executes jobs sequentially (simple + predictable).
         tokio::spawn({
             let ctx = ctx.clone();
+            #[cfg(test)]
+            let guard_progress = guard_progress.clone();
             async move {
                 while let Some(job) = rx.recv().await {
+                    #[cfg(test)]
+                    let progress = {
+                        let progress = guard_progress_for_received_job(&guard_progress, &job);
+                        progress.at("occurrence_claim_pending");
+                        progress
+                    };
                     if job.run_config.workflow_target.is_some() {
                         match ctx
                             .schedule_store
                             .start_workflow_occurrence(&job.schedule_id, &job.run_id)
                             .await
                         {
-                            Ok(true) => {}
-                            Ok(false) => continue,
+                            Ok(true) => {
+                                #[cfg(test)]
+                                progress.at("occurrence_claimed");
+                            }
+                            Ok(false) => {
+                                #[cfg(test)]
+                                progress.at("occurrence_claim_skipped");
+                                continue;
+                            }
                             Err(error) => {
+                                #[cfg(test)]
+                                progress.at("occurrence_claim_failed");
                                 tracing::warn!(%error, run_id = %job.run_id, "scheduled Workflow claim could not be persisted; no dispatch");
                                 continue;
                             }
@@ -130,24 +234,40 @@ impl ScheduleManager {
                     }
                     let schedule_id = job.schedule_id.clone();
                     let run_id = job.run_id.clone();
-                    match run_schedule_job(ctx.clone(), job).await {
+                    match run_schedule_job(
+                        ctx.clone(),
+                        job,
+                        #[cfg(test)]
+                        progress.clone(),
+                    )
+                    .await
+                    {
                         Ok(ScheduleRunLifecycleResult::Terminal(status)) => {
+                            #[cfg(test)]
+                            progress.at("worker_terminal_publish_pending");
                             if let Err(error) = ctx
                                 .schedule_store
                                 .mark_run_terminal(&schedule_id, &run_id, status, None)
                                 .await
                             {
+                                #[cfg(test)]
+                                progress.at("worker_terminal_publish_failed");
                                 tracing::warn!(
                                     "failed to mark schedule run terminal state for {} / {}: {}",
                                     schedule_id,
                                     run_id,
                                     error
                                 );
+                            } else {
+                                #[cfg(test)]
+                                progress.at("worker_terminal_published");
                             }
                         }
                         Ok(ScheduleRunLifecycleResult::BackgroundExecutionInProgress) => {}
                         Err(e) => {
                             tracing::warn!("schedule job failed: {e}");
+                            #[cfg(test)]
+                            progress.at("worker_failure_publish_pending");
                             if let Err(error) = ctx
                                 .schedule_store
                                 .mark_run_terminal(
@@ -158,12 +278,17 @@ impl ScheduleManager {
                                 )
                                 .await
                             {
+                                #[cfg(test)]
+                                progress.at("worker_failure_publish_failed");
                                 tracing::warn!(
                                     "failed to mark schedule run failed state for {} / {}: {}",
                                     schedule_id,
                                     run_id,
                                     error
                                 );
+                            } else {
+                                #[cfg(test)]
+                                progress.at("worker_failure_published");
                             }
                         }
                     }
@@ -220,14 +345,28 @@ impl ScheduleManager {
             }
         });
 
-        Self { tx }
+        Self {
+            tx,
+            #[cfg(test)]
+            guard_progress,
+        }
     }
 
     pub async fn enqueue_run_now(&self, job: ScheduleRunJob) -> Result<(), String> {
-        self.tx
+        #[cfg(test)]
+        let progress = guard_progress_for_job(&self.guard_progress, &job);
+        let result = self
+            .tx
             .send(job)
             .await
-            .map_err(|_| "schedule manager is not running".to_string())
+            .map_err(|_| "schedule manager is not running".to_string());
+        #[cfg(test)]
+        if let Some(progress) = progress.filter(|_| result.is_ok()) {
+            progress
+                .enqueued
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 }
 
@@ -326,7 +465,10 @@ async fn notify_schedule_run_outcome(
 async fn run_schedule_job(
     ctx: ScheduleContext,
     job: ScheduleRunJob,
+    #[cfg(test)] progress: Option<Arc<ScheduleGuardProgress>>,
 ) -> Result<ScheduleRunLifecycleResult, String> {
+    #[cfg(test)]
+    progress.at("session_preparation_pending");
     validate_schedule_project_at_fire(&ctx.project_store, &job.run_config)?;
     if job.run_config.workflow_target.is_some() {
         let schedule = ctx
@@ -456,10 +598,14 @@ async fn run_schedule_job(
     }
 
     // Persist session and index entry.
+    #[cfg(test)]
+    progress.at("session_save_pending");
     ctx.persistence
         .save_runtime_authoritative_flags(&mut session)
         .await
         .map_err(|e| format!("failed to save scheduled session: {e}"))?;
+    #[cfg(test)]
+    progress.at("session_bind_pending");
     if let Err(error) = ctx
         .schedule_store
         .bind_run_session(&job.schedule_id, &job.run_id, &session_id)
@@ -482,6 +628,8 @@ async fn run_schedule_job(
         session_id.clone(),
         Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
     );
+    #[cfg(test)]
+    progress.at("session_bound");
 
     if let Some(reason) = prompt_hook_block {
         return Err(format!(
@@ -490,7 +638,14 @@ async fn run_schedule_job(
     }
 
     if job.run_config.workflow_target.is_some() {
-        return dispatch_scheduled_workflow(ctx, job, session_id).await;
+        return dispatch_scheduled_workflow(
+            ctx,
+            job,
+            session_id,
+            #[cfg(test)]
+            progress,
+        )
+        .await;
     }
 
     // If no task message (or not configured to execute), we're done.
@@ -792,6 +947,7 @@ async fn dispatch_scheduled_workflow(
     ctx: ScheduleContext,
     job: ScheduleRunJob,
     session_id: String,
+    #[cfg(test)] progress: Option<Arc<ScheduleGuardProgress>>,
 ) -> Result<ScheduleRunLifecycleResult, String> {
     let access = ctx
         .workflow_runs
@@ -802,6 +958,8 @@ async fn dispatch_scheduled_workflow(
         .workflow_target
         .as_ref()
         .expect("Workflow branch checked");
+    #[cfg(test)]
+    progress.at("workflow_admission_pending");
     let snapshot = match access
         .start_from_schedule(
             &session_id,
@@ -813,6 +971,8 @@ async fn dispatch_scheduled_workflow(
     {
         Ok(snapshot) => snapshot,
         Err(bamboo_engine::WorkflowRunError::Storage(error)) => {
+            #[cfg(test)]
+            progress.at("workflow_admission_unknown");
             // Session indexing can fail after engine admission. The existing
             // admission boundary attempts cancellation, but an error cannot
             // certify that no Workflow remains active.
@@ -822,15 +982,21 @@ async fn dispatch_scheduled_workflow(
             return Ok(ScheduleRunLifecycleResult::BackgroundExecutionInProgress);
         }
         Err(error) => {
+            #[cfg(test)]
+            progress.at("workflow_admission_rejected");
             tracing::warn!(%error, run_id = %job.run_id, "scheduled Workflow admission failed");
             return Err("scheduled Workflow admission failed".to_string());
         }
     };
+    #[cfg(test)]
+    progress.at("workflow_correlation_pending");
     if let Err(error) = ctx
         .schedule_store
         .bind_run_workflow(&job.schedule_id, &job.run_id, &snapshot.run_id)
         .await
     {
+        #[cfg(test)]
+        progress.at("workflow_correlation_failed");
         tracing::warn!(%error, workflow_run_id = %snapshot.run_id, "scheduled Workflow correlation failed after admission");
         // Reuse the existing cancel/readback path. A terminal readback is evidence
         // that no active Workflow is left; failure to confirm keeps this run Running.
@@ -861,15 +1027,21 @@ async fn dispatch_scheduled_workflow(
             .await;
         return Ok(ScheduleRunLifecycleResult::BackgroundExecutionInProgress);
     }
+    #[cfg(test)]
+    progress.at("workflow_correlated");
     tokio::spawn(async move {
         loop {
-            let progress = match access
+            #[cfg(test)]
+            progress.watch("workflow_terminal_read_pending");
+            let workflow_progress = match access
                 .progress_for_session(&session_id, &snapshot.run_id, u64::MAX)
                 .await
             {
                 Ok(progress) => progress,
                 Err(error) => {
                     tracing::warn!(%error, workflow_run_id = %snapshot.run_id, "scheduled Workflow terminal state is unknown");
+                    #[cfg(test)]
+                    progress.watch("workflow_read_failed_note_pending");
                     let _ = ctx
                         .schedule_store
                         .note_workflow_unknown(
@@ -879,10 +1051,14 @@ async fn dispatch_scheduled_workflow(
                                 .to_string(),
                         )
                         .await;
+                    #[cfg(test)]
+                    progress.watch("workflow_read_failed_note_returned");
                     break;
                 }
             };
-            let status = match progress.snapshot.status {
+            #[cfg(test)]
+            progress.watch("workflow_progress_read_returned");
+            let status = match workflow_progress.snapshot.status {
                 bamboo_domain::WorkflowRunStatus::Succeeded => Some(ScheduleRunStatus::Success),
                 bamboo_domain::WorkflowRunStatus::Failed => Some(ScheduleRunStatus::Failed),
                 bamboo_domain::WorkflowRunStatus::Cancelled => Some(ScheduleRunStatus::Cancelled),
@@ -893,17 +1069,26 @@ async fn dispatch_scheduled_workflow(
                 // return. Preserve overlap accounting until the existing engine
                 // reports that this run has actually left the active set.
                 if access.is_run_active(&snapshot.run_id) {
+                    #[cfg(test)]
+                    progress.watch("workflow_terminal_waiting_for_exit");
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     continue;
                 }
                 let reason = (status != ScheduleRunStatus::Success)
                     .then(|| format!("Workflow ended with {status:?}"));
+                #[cfg(test)]
+                progress.watch("workflow_terminal_publish_pending");
                 if let Err(error) = ctx
                     .schedule_store
                     .mark_run_terminal(&job.schedule_id, &job.run_id, status, reason)
                     .await
                 {
+                    #[cfg(test)]
+                    progress.watch("workflow_terminal_publish_failed");
                     tracing::warn!(%error, run_id = %job.run_id, "scheduled Workflow terminal outcome could not be persisted");
+                } else {
+                    #[cfg(test)]
+                    progress.watch("workflow_terminal_published");
                 }
                 notify_schedule_run_outcome(
                     &ctx.notification_relay,
@@ -1631,18 +1816,225 @@ budgets:
             was_catch_up: claim.was_catch_up,
         }
     }
-    async fn terminal(store: &ScheduleStore, run_id: &str) -> bamboo_domain::ScheduleRunRecord {
-        tokio::time::timeout(Duration::from_secs(30), async {
+    #[derive(Clone, Copy)]
+    struct GuardRecord {
+        status: ScheduleRunStatus,
+        session_present: bool,
+        workflow_present: bool,
+    }
+
+    impl From<&bamboo_domain::ScheduleRunRecord> for GuardRecord {
+        fn from(record: &bamboo_domain::ScheduleRunRecord) -> Self {
+            Self {
+                status: record.status,
+                session_present: record.session_id.is_some(),
+                workflow_present: record.workflow_run_id.is_some(),
+            }
+        }
+    }
+
+    fn guard_metadata(
+        progress: &ScheduleGuardProgress,
+        case: usize,
+        tool_calls: usize,
+        provider_calls: usize,
+        last_record: Option<GuardRecord>,
+        poll_pending: Option<bool>,
+    ) -> String {
+        format!(
+            "case={case} {} fixture_tool_calls={tool_calls} fixture_provider_calls={provider_calls} last_status={:?} session_present={:?} workflow_present={:?} terminal_poll_pending={poll_pending:?}",
+            progress.metadata(),
+            last_record.map(|record| record.status),
+            last_record.map(|record| record.session_present),
+            last_record.map(|record| record.workflow_present),
+        )
+    }
+
+    struct WorkflowGuard {
+        progress: Arc<ScheduleGuardProgress>,
+        provider: Arc<NoWorkflowProvider>,
+        tools: Arc<GatedReadonlyTools>,
+        case: usize,
+    }
+
+    impl WorkflowGuard {
+        fn new(
+            manager: &ScheduleManager,
+            run_id: &str,
+            provider: &Arc<NoWorkflowProvider>,
+            tools: &Arc<GatedReadonlyTools>,
+            case: usize,
+        ) -> Self {
+            let progress = Arc::new(ScheduleGuardProgress::default());
+            manager
+                .guard_progress
+                .lock()
+                .unwrap()
+                .insert(run_id.to_owned(), progress.clone());
+            Self {
+                progress,
+                provider: provider.clone(),
+                tools: tools.clone(),
+                case,
+            }
+        }
+
+        fn failed(
+            &self,
+            guard: &'static str,
+            last_record: Option<GuardRecord>,
+            poll_pending: Option<bool>,
+        ) -> ! {
+            // Fixed vocabulary, existing counters, and presence booleans only.
+            // No IDs, paths, arguments, errors, or record/user content.
+            panic!(
+                "scheduled Workflow guard={guard} {}",
+                guard_metadata(
+                    &self.progress,
+                    self.case,
+                    self.tools.calls.load(Ordering::SeqCst),
+                    self.provider.calls.load(Ordering::SeqCst),
+                    last_record,
+                    poll_pending,
+                ),
+            );
+        }
+    }
+
+    async fn terminal(
+        store: &ScheduleStore,
+        run_id: &str,
+        guard: &WorkflowGuard,
+    ) -> bamboo_domain::ScheduleRunRecord {
+        let mut last_record = None;
+        let mut poll_pending = false;
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
+                poll_pending = true;
                 let record = store.get_run_record(run_id).await.unwrap();
+                poll_pending = false;
+                last_record = Some(GuardRecord::from(&record));
                 if record.status.is_terminal() {
                     break record;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("scheduled Workflow terminal outcome")
+        .await;
+        result.unwrap_or_else(|_| guard.failed("terminal", last_record, Some(poll_pending)))
+    }
+
+    mod guard_metadata_tests {
+        use super::{
+            guard_metadata, guard_progress_for_job, guard_progress_for_received_job,
+            ObserveScheduleGuard, ScheduleGuardObservers, ScheduleGuardProgress, ScheduleRunJob,
+        };
+        use chrono::Utc;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        #[test]
+        fn non_workflow_jobs_do_not_read_the_observer_map() {
+            let observers = ScheduleGuardObservers::default();
+            let progress = Arc::new(ScheduleGuardProgress::default());
+            let at = Utc::now();
+            let mut job = ScheduleRunJob {
+                run_id: "observed-run".into(),
+                schedule_id: "fixture-schedule".into(),
+                schedule_name: "fixture".into(),
+                run_config: serde_json::from_value(json!({"auto_execute": true})).unwrap(),
+                scheduled_for: at,
+                claimed_at: at,
+                was_catch_up: false,
+            };
+            observers
+                .lock()
+                .unwrap()
+                .insert(job.run_id.clone(), progress.clone());
+            assert!(guard_progress_for_job(&observers, &job).is_none());
+            job.run_config = serde_json::from_value(json!({
+                "auto_execute": true,
+                "workflow_target": {"workflow_id": "fixture", "revision": 1, "args": {}}
+            }))
+            .unwrap();
+            assert!(Arc::ptr_eq(
+                &guard_progress_for_job(&observers, &job).unwrap(),
+                &progress
+            ));
+
+            // A poisoned map would panic if this Agent job inspected it. This
+            // proves the fast path without a wait or a competing test thread.
+            let poison = std::panic::catch_unwind(|| {
+                let _mapping = observers.lock().unwrap();
+                panic!("poison fixture observer map");
+            });
+            assert!(poison.is_err());
+            job.run_config.workflow_target = None;
+            assert!(guard_progress_for_job(&observers, &job).is_none());
+        }
+
+        #[test]
+        fn duplicate_receives_preserve_the_first_attempt_boundaries() {
+            let observers = ScheduleGuardObservers::default();
+            let progress = Arc::new(ScheduleGuardProgress::default());
+            let at = Utc::now();
+            let job = ScheduleRunJob {
+                run_id: "observed-run".into(),
+                schedule_id: "fixture-schedule".into(),
+                schedule_name: "fixture".into(),
+                run_config: serde_json::from_value(json!({
+                    "auto_execute": true,
+                    "workflow_target": {"workflow_id": "fixture", "revision": 1, "args": {}}
+                }))
+                .unwrap(),
+                scheduled_for: at,
+                claimed_at: at,
+                was_catch_up: false,
+            };
+            observers
+                .lock()
+                .unwrap()
+                .insert(job.run_id.clone(), progress.clone());
+            let first = guard_progress_for_received_job(&observers, &job).unwrap();
+            assert!(Arc::ptr_eq(&first, &progress));
+            first.at("workflow_correlated");
+            first.watch("workflow_terminal_read_pending");
+            let original_boundaries = *progress.boundaries.lock().unwrap();
+
+            let duplicate = guard_progress_for_received_job(&observers, &job);
+            duplicate.at("occurrence_claim_pending");
+            duplicate.at("occurrence_claim_skipped");
+            assert!(duplicate.is_none());
+            assert_eq!(*progress.boundaries.lock().unwrap(), original_boundaries);
+            assert_eq!(progress.received.load(super::Ordering::Relaxed), 2);
+            assert!(Arc::ptr_eq(
+                &guard_progress_for_job(&observers, &job).unwrap(),
+                &first
+            ));
+        }
+
+        #[test]
+        fn guard_metadata_preserves_unobserved_boundaries_and_excludes_record_content() {
+            let progress = ScheduleGuardProgress::default();
+            let unobserved = guard_metadata(&progress, 0, 0, 0, None, None);
+            assert!(unobserved.contains("worker_boundary=unobserved"));
+            assert!(unobserved.contains("watcher_boundary=unobserved"));
+            assert!(unobserved.contains("last_status=None session_present=None workflow_present=None terminal_poll_pending=None"));
+            let record: bamboo_domain::ScheduleRunRecord = serde_json::from_value(json!({
+                "run_id":"private-run", "schedule_id":"private-schedule",
+                "scheduled_for":Utc::now(), "claimed_at":Utc::now(), "status":"running",
+                "session_id":"private-session", "workflow_run_id":"private-workflow",
+                "outcome_reason":"private error /private/path args and user content"
+            }))
+            .unwrap();
+            progress.at("session_save_pending");
+            progress.watch("workflow_terminal_read_pending");
+            let observed = guard_metadata(&progress, 3, 1, 0, Some((&record).into()), Some(true));
+            assert!(observed.contains("case=3 worker_boundary=session_save_pending"));
+            assert!(observed.contains("watcher_boundary=workflow_terminal_read_pending"));
+            assert!(observed.contains("fixture_tool_calls=1 fixture_provider_calls=0 last_status=Some(Running) session_present=Some(true) workflow_present=Some(true) terminal_poll_pending=Some(true)"));
+            assert!(!observed.contains("private"));
+        }
     }
 
     #[actix_web::test]
@@ -1740,10 +2132,11 @@ budgets:
                 .revision,
             7
         );
+        let guard = WorkflowGuard::new(&manager, &claims[0].run_id, &provider, &tools, 0);
         manager.enqueue_run_now(job(&claims[0])).await.unwrap();
         tokio::time::timeout(Duration::from_secs(30), tools.entered.acquire())
             .await
-            .unwrap()
+            .unwrap_or_else(|_| guard.failed("readonly_tool_entry", None, None))
             .unwrap()
             .forget();
         // Admission and dispatch are not terminal success; overlap accounting stays Running.
@@ -1760,7 +2153,7 @@ budgets:
         );
         manager.enqueue_run_now(job(&claims[0])).await.unwrap();
         tools.release.add_permits(1);
-        let completed = terminal(&store, &claims[0].run_id).await;
+        let completed = terminal(&store, &claims[0].run_id, &guard).await;
         assert_eq!(completed.status, ScheduleRunStatus::Success);
         assert_eq!(tools.calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
@@ -1827,7 +2220,7 @@ budgets:
             .project_store
             .archive(&project.id, project.revision)
             .unwrap();
-        for (name, id, revision, args, project_id) in [
+        for (case, (name, id, revision, args, project_id)) in [
             (
                 "missing",
                 "missing-workflow",
@@ -1865,7 +2258,10 @@ budgets:
                 json!({"file_path":"unused"}),
                 Some(project.id.clone()),
             ),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let config: ScheduleRunConfig = serde_json::from_value(json!({
                 "auto_execute":true,"model":"bookkeeping-model","project_id":project_id,
                 "workflow_target":{"workflow_id":id,"revision":revision,"args":args}
@@ -1889,8 +2285,9 @@ budgets:
                 .await
                 .unwrap()
                 .unwrap();
+            let guard = WorkflowGuard::new(&manager, &claim.run_id, &provider, &tools, case);
             manager.enqueue_run_now(job(&claim)).await.unwrap();
-            let record = terminal(&state.schedule_store, &claim.run_id).await;
+            let record = terminal(&state.schedule_store, &claim.run_id, &guard).await;
             assert_eq!(record.status, ScheduleRunStatus::Failed, "{name}");
             assert!(record.workflow_run_id.is_none(), "{name}");
             if let Some(session_id) = record.session_id.as_deref() {
@@ -1915,7 +2312,7 @@ budgets:
         let ctx = context(&state, state.schedule_store.clone(), tools.clone()).await;
         let access = ctx.workflow_runs.clone().unwrap();
         let manager = ScheduleManager::new(ctx);
-        for cancel in [true, false] {
+        for (case, cancel) in [true, false].into_iter().enumerate() {
             let config: ScheduleRunConfig = serde_json::from_value(json!({
                 "auto_execute":true,"model":"bookkeeping-model",
                 "workflow_target":{"workflow_id":"read-once","revision":7,"args":{"file_path":dir.path().join("missing-file")}}
@@ -1938,10 +2335,11 @@ budgets:
                 .await
                 .unwrap()
                 .unwrap();
+            let guard = WorkflowGuard::new(&manager, &claim.run_id, &provider, &tools, case);
             manager.enqueue_run_now(job(&claim)).await.unwrap();
             tokio::time::timeout(Duration::from_secs(30), tools.entered.acquire())
                 .await
-                .unwrap()
+                .unwrap_or_else(|_| guard.failed("readonly_tool_entry", None, None))
                 .unwrap()
                 .forget();
             let record = tokio::time::timeout(Duration::from_secs(30), async {
@@ -1958,7 +2356,7 @@ budgets:
                 }
             })
             .await
-            .unwrap();
+            .unwrap_or_else(|_| guard.failed("workflow_correlation", None, None));
             assert_eq!(record.status, ScheduleRunStatus::Running);
             if cancel {
                 access
@@ -1981,7 +2379,7 @@ budgets:
             } else {
                 tools.release.add_permits(1);
             }
-            let record = terminal(&state.schedule_store, &claim.run_id).await;
+            let record = terminal(&state.schedule_store, &claim.run_id, &guard).await;
             assert_eq!(
                 record.status,
                 if cancel {
@@ -2053,7 +2451,7 @@ budgets:
         let bytes = tokio::fs::read(path).await.unwrap();
         tokio::fs::remove_file(path).await.unwrap();
         tokio::fs::create_dir(path).await.unwrap();
-        let result = dispatch_scheduled_workflow(ctx, job, session.id.clone()).await;
+        let result = dispatch_scheduled_workflow(ctx, job, session.id.clone(), None).await;
         let runs = access.list_for_session(&session.id).await.unwrap();
         assert_eq!(runs.len(), 1);
         match result {
