@@ -318,6 +318,9 @@ impl ChildOutcome {
 /// (the engine's round boundary); others may simply ignore the inbox.
 pub struct SteerInbox {
     rx: mpsc::UnboundedReceiver<SteerMessage>,
+    // One physical Run owns this inbox. Retain only replies actually accepted
+    // by its initial-input barriers; public input or a new request is no proof.
+    accepted_initial_releases: Vec<crate::proto::InitialInputRelease>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -351,23 +354,24 @@ impl SteerInbox {
     /// Create a sender + inbox pair (the transport holds the sender).
     pub fn channel() -> (mpsc::UnboundedSender<SteerMessage>, Self) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (tx, SteerInbox { rx })
+        (tx, SteerInbox { rx, accepted_initial_releases: Vec::new() })
     }
     /// An already-closed inbox (for tests / executors that don't steer).
     pub fn disconnected() -> Self {
         let (_tx, rx) = mpsc::unbounded_channel();
-        SteerInbox { rx }
+        SteerInbox { rx, accepted_initial_releases: Vec::new() }
     }
     /// Next steering message, or `None` once the run's sender is gone.
     pub async fn recv(&mut self) -> Option<String> {
-        match self.rx.recv().await? {
+        match self.recv_message().await? {
             SteerMessage::Text(text) => Some(text),
             SteerMessage::DurableText { text, .. } => Some(text),
             SteerMessage::SessionMessage(delivery) => serde_json::to_string(&delivery).ok(),
             SteerMessage::InitialInputRelease(_) => None, // Never flatten authority into text.
         }
     }
-    /// Wait before SDK admission. Any unrelated/late control is a failed barrier.
+    /// Wait before SDK admission. Exact unexpired replies from this inbox's
+    /// completed barriers are duplicates; every other mismatched control fails.
     pub async fn wait_initial_release(
         &mut self,
         request: &crate::proto::InitialInputReleaseRequest,
@@ -399,7 +403,17 @@ impl SteerInbox {
                 _ = cancel.cancelled() => return Err("initial release cancelled".into()),
                 _ = &mut timeout => return Err("initial release timed out".into()),
                 message = self.recv_message() => return match message {
-                    Some(SteerMessage::InitialInputRelease(release)) if release.permits(request, chrono::Utc::now()) => Ok(release.expires_at),
+                    Some(SteerMessage::InitialInputRelease(release)) if release.permits(request, chrono::Utc::now()) => {
+                        if self.accepted_initial_releases.iter().any(|accepted| accepted.request == release.request) {
+                            return Err("initial release missing, expired or mismatched".into());
+                        }
+                        if self.accepted_initial_releases.len() >= bamboo_domain::SessionInboxLimits::default().max_claim_batch {
+                            return Err("initial release completed batch limit exceeded".into());
+                        }
+                        let deadline = release.expires_at;
+                        self.accepted_initial_releases.push(release);
+                        Ok(deadline)
+                    },
                     _ => Err("initial release missing, expired or mismatched".into()),
                 },
                 _ = retry.tick() => events.request_initial_release(request.clone()).await?,
@@ -409,7 +423,19 @@ impl SteerInbox {
     /// Receive the typed steering value. Runtime-backed workers use this path
     /// so SessionInbox envelopes never collapse into ad-hoc text.
     pub async fn recv_message(&mut self) -> Option<SteerMessage> {
-        self.rx.recv().await
+        loop {
+            let message = self.rx.recv().await?;
+            if let SteerMessage::InitialInputRelease(release) = &message {
+                // A retransmission cannot satisfy a later barrier, extend the
+                // accepted deadline, become text or terminate live steering.
+                if chrono::Utc::now() < release.expires_at
+                    && self.accepted_initial_releases.contains(release)
+                {
+                    continue;
+                }
+            }
+            return Some(message);
+        }
     }
 }
 
