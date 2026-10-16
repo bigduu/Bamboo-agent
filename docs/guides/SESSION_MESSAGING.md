@@ -35,6 +35,31 @@ A trigger authorizes its own delivery, not earlier staged child/Bash outcomes.
 An unrelated coordinator prefix or steering grant cannot upgrade an explicit
 peer delivery's wait policy or turn QueueOnly into a scheduling trigger.
 
+## Active-run steer
+
+`action: "steer"` requires `target_session_id`, `expected_run_id`, `operation_id`
+and `message`. It is an active-run-only QueueOnly delivery. A new operation
+must match the current registered, non-finalizing owner at the actual durable
+publication boundary, including the canonical Session birth. Missing, replaced,
+finalizing, lifetime-unbound or unsupported owners return a structured conflict
+with `accepted: false`. It never cancels or starts a run.
+
+The expected run is retained in versioned v3 intent and its semantic digest.
+Reuse the exact operation and arguments after an uncertain result. An authorized
+existing receipt replays without signalling any owner, including after ACK or
+run replacement; changing the expected run under the same operation conflicts.
+Accepted does not prove context consumption or run completion. Unconsumed input
+remains durable and restricted to that run; restart or a successor cannot
+silently retarget it. It cannot schedule a successor by itself.
+
+The actual started filesystem job retains the original peer authority and exact
+run through publication and notification even after caller cancellation. Owner
+transitions wait on that target's fence; unrelated Sessions keep progressing.
+The global Router state lock covers only memory checks/updates, never disk I/O.
+The existing generation reservation/format preparation may survive a rejected late
+publication, as with other cancelled admission; it is not a message receipt.
+The existing strict zero-tool Child cold-continuation boundary is unchanged.
+
 ## Receipt boundaries
 
 The tool retains `admitted`, `message_id`, `inbox_generation`, `activation` and
@@ -77,8 +102,8 @@ Other supported consumers can admit queued input at their existing safe points.
 `auto_run=false` still writes a Child draft. A draft is not QueueOnly. Existing
 legacy tools and callers keep their old behavior when the new field is absent.
 
-This slice provides no `expected_run_id` compare-and-steer or cancellation API.
+Steer adds no cancellation API.
 Cancel accepted never means stopped: exact-run stop and Bamboo's durable terminal
 validation keep their existing contracts. Supervisor SSE/output remains session
-scoped; no input-exclusive output attribution is inferred. These are the later
-P2 and P3 acceptance phases in #2000.
+scoped; no input-exclusive output attribution is inferred. Input/output attribution remains the later
+P3 acceptance phase in #2000; P2 acceptance also requires its documented regressions.

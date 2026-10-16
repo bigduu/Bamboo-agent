@@ -370,6 +370,58 @@ impl SessionMessenger {
         .await
     }
 
+    /// Active-run-only peer input. The Inbox owns exact retry recovery and
+    /// retains its original authority through the runtime's publication CAS.
+    /// This never cancels a run, requests activation or reconstructs an owner.
+    pub async fn steer_peer(
+        &self,
+        caller_session_id: &str,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        expected_run_id: &str,
+    ) -> Result<bamboo_domain::SessionInboxSteerReceipt, SessionMessengerError> {
+        Self::validate_peer_input(operation_id, message)?;
+        if !bamboo_domain::valid_session_run_id(expected_run_id) {
+            return Err(SessionMessengerError::InvalidEnvelope(
+                "invalid expected run id".into(),
+            ));
+        }
+        let (caller, target) = self.peer_pair(caller_session_id, target_session_id).await?;
+        let id = Self::peer_message_id(&caller, &target, operation_id);
+        let envelope = Self::peer_envelope(
+            &caller,
+            &target,
+            operation_id,
+            message,
+            id.clone(),
+            id.to_string(),
+            None,
+        );
+        let source = ActorSession::from_session(&caller)
+            .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
+        let target = ActorSession::from_session(&target)
+            .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
+        let started = Instant::now();
+        let receipt = self
+            .inbox
+            .deliver_peer_steer(
+                &envelope,
+                &source,
+                &target,
+                expected_run_id,
+                self.activation.clone(),
+            )
+            .await
+            .map_err(|error| {
+                let error = SessionMessengerError::Inbox(error);
+                self.record_rejection(&error);
+                error
+            })?;
+        self.record_admission(envelope, receipt.delivery.clone(), started);
+        Ok(receipt)
+    }
+
     async fn send_peer_delivery(
         &self,
         caller_session_id: &str,
@@ -825,7 +877,8 @@ impl SessionMessenger {
             | SessionMessengerError::TargetNotFound(_) => {
                 self.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
             }
-            SessionMessengerError::Inbox(SessionInboxError::AdmissionCancelled) => {}
+            SessionMessengerError::Inbox(SessionInboxError::AdmissionCancelled)
+            | SessionMessengerError::Inbox(SessionInboxError::ExpectedRunConflict(_)) => {}
             SessionMessengerError::Inbox(SessionInboxError::PayloadTooLarge { .. }) => {
                 self.metrics
                     .payload_too_large

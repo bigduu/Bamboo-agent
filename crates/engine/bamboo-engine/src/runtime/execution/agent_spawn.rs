@@ -1014,6 +1014,18 @@ pub fn spawn_session_execution_with_inputs(
             let admission_persistence = execution_reservation
                 .execution_persistence()
                 .unwrap_or_else(|| agent.persistence().clone());
+            if let (Some(router), Some(ownership)) = (agent.activation_router(), ownership.as_ref())
+            {
+                if !router.bind_run_lifetime(ownership, &session).await {
+                    let _ = mpsc_tx
+                        .send(AgentEvent::Error {
+                            message: "registered run Session lifetime differs".into(),
+                        })
+                        .await;
+                    execution_reservation.abandon().await;
+                    return;
+                }
+            }
             if let Err(error) = crate::runtime::counted_loop::admit_registered(
                 &mut session,
                 ownership.as_ref(),
