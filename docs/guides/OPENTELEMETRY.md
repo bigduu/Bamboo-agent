@@ -23,8 +23,9 @@ running at the chosen endpoint; Bamboo does not install or launch a collector.
 No tests call a paid model or an external telemetry service.
 
 - `BAMBOO_OTEL_ENABLED`: `true`/`1` enables; absent, `false` or `0` disables.
-- `BAMBOO_OTEL_ENDPOINT`: complete trace URL, including `/v1/traces`. Required
-  when enabled. HTTPS is required except for loopback HTTP. User information,
+- `BAMBOO_OTEL_ENDPOINT`: complete trace URL ending in `/v1/traces`, optionally
+  after a reverse-proxy prefix. Required when enabled; a collector base URL alone
+  is rejected. HTTPS is required except for loopback HTTP. User information,
   passwords, query strings and fragments are rejected. Maximum 2,048 bytes.
 - `BAMBOO_OTEL_SAMPLE_RATIO`: finite number from 0 to 1, default 1. This applies
   to new roots. A valid remote parent's sampling decision is honored.

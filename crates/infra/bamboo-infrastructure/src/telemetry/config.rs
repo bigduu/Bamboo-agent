@@ -110,6 +110,7 @@ impl TelemetryConfig {
         };
         if !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
             || url.host().is_none()
+            || !url.path().ends_with("/v1/traces")
             || !url.username().is_empty()
             || url.password().is_some()
             || url.query().is_some()
@@ -305,6 +306,39 @@ mod tests {
                 config.sample_ratio = ratio;
                 assert!(config.validate().is_err());
             }
+        }
+    }
+
+    #[test]
+    fn endpoint_requires_trace_path_and_allows_reverse_proxy_prefix() {
+        for endpoint in [
+            "https://collector.example",
+            "https://collector.example/",
+            "http://127.0.0.1:4318",
+            "https://collector.example/v1/metrics",
+            "https://collector.example/v1/traces/",
+            "https://collector.example/v1/traces/extra",
+            "https://collector.example/prefixv1/traces",
+            "https://collector.example/v1%2Ftraces",
+        ] {
+            let config = TelemetryConfig {
+                enabled: true,
+                endpoint: Some(endpoint.into()),
+                ..Default::default()
+            };
+            assert_eq!(config.validate(), Err(TelemetryError::InvalidConfiguration));
+        }
+        for endpoint in [
+            "https://collector.example/v1/traces",
+            "https://collector.example/otel/tenant/v1/traces",
+            "http://127.0.0.1:4318/otel/v1/traces",
+        ] {
+            let config = TelemetryConfig {
+                enabled: true,
+                endpoint: Some(endpoint.into()),
+                ..Default::default()
+            };
+            assert_eq!(config.validate(), Ok(()));
         }
     }
 
