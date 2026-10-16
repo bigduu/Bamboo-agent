@@ -36,12 +36,31 @@ configuration example or tell a user they have been persisted.
 
 ## Bounded key catalog
 
-`config-keys.json` documents selected serialized paths, section ownership,
-defaults and non-default example values. Tests construct the actual typed DTOs,
-compare defaults, deserialize the examples and compare their typed fields.
-This avoids treating unknown keys retained in a flattened map as recognized
-typed settings. It does not cover all validators, dynamic provider maps,
-credential operations, optional fields or feature-specific settings.
+`config-keys.json` is generated from typed accessors and curated explanations.
+Defaults come from the actual DTOs; examples and aliases must deserialize into
+the matching typed field. No user configuration, environment values, credentials
+or runtime paths are read by generation. Static example paths are placeholders.
+
+The catalog exhaustively names the fields in MemoryConfig, ServerConfig/TLS,
+StreamTimeoutConfig, ToolsConfig, SkillsConfig and WorktreeSettings. A new field
+in one of those DTOs, even an omitted Option, makes the generator fail to compile
+until its documentation or explicit dynamic-map exclusion is updated. Both TLS child
+paths are required when `server.tls` is present and have no input defaults;
+omitting either fails deserialization. The optional parent defaults to absent.
+The deprecated `memory.dream_refine_mode` remains accepted but is ignored.
+
+`root_coverage` inventories ConfigValues ownership plus memory, reporting
+uncovered roots explicitly. It is not an exhaustive list of sidecars,
+environment variables or storage sections. `exhaustive_typed_groups` identifies
+selected complete DTO surfaces; other roots may have only selected entries.
+Flattened unknown fields and dynamic project/provider names are not typed keys.
+A checked-in artifact mismatch fails the normal integration test. Generation
+requires review of its diff, not automatic acceptance of a new default or key.
+
+It is still not a full schema: validators, nested types outside the covered
+groups, dynamic provider maps, credentials and feature-specific inputs may be
+uncovered. The catalog describes supported input spelling and product defaults,
+not what a running process actually persisted or applied.
 
 `Config::default()` serialized to JSON is not a schema. Optional and omitted
 values, aliases, enum variants, flattened maps and validation constraints need

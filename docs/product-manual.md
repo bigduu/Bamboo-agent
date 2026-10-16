@@ -19,3 +19,22 @@ of configuration, memory, hooks, providers/MCP and safe troubleshooting. It does
 not implement a full configuration schema, a runtime diagnostic collector or
 website publication. No configuration/memory mutation, hook execution or model
 call is part of manual retrieval.
+
+## Maintaining the typed key reference
+
+The public JSON is generated from `crates/infra/bamboo-skills/manual/config_catalog.rs`.
+Each curated declaration includes a real typed field accessor, default, example,
+alias list and explanation. Selected DTOs are exhaustively destructured, so new
+fields (including skipped optional fields) require deliberate coverage updates.
+Root ownership is generated from `CONFIG_VALUE_FIELD_OWNERS`; unknown roots are
+visible as undocumented rather than silently considered invalid.
+
+Run `cargo run -p bamboo-skills --example generate_manual_catalog -- --write`,
+review the asset diff, then run the same command with `--check` and
+`cargo test -p bamboo-skills --test product_manual --locked`. The normal tests
+compare the embedded artifact byte-for-byte with deterministic generation and
+exercise typed defaults, non-default examples, aliases and selected validators.
+The generator reads no live configuration or environment. Its no-argument mode
+prints JSON; `--check` is read-only and only explicit `--write` changes the asset.
+This improves bounded coverage; it does not create a complete JSON Schema,
+instance diagnostic tool or website.
