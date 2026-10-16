@@ -35,4 +35,5 @@ pub mod subagent_snapshot;
 pub mod supervisor;
 pub mod task;
 pub mod tickets;
+pub mod worktrees;
 pub mod ws_v2;

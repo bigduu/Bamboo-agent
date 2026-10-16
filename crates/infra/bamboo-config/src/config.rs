@@ -218,6 +218,21 @@ pub struct DefaultWorkAreaConfig {
     pub path: Option<String>,
 }
 
+/// User-selected locations for new user worktrees. Git remains the registry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_root: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_roots: BTreeMap<String, String>,
+}
+
+impl WorktreeSettings {
+    pub fn is_empty(&self) -> bool {
+        self.default_root.is_none() && self.project_roots.is_empty()
+    }
+}
+
 /// Access control configuration for password-based UI/API gating.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccessControlConfig {
@@ -1815,6 +1830,9 @@ pub struct ConfigValues {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_work_area: Option<DefaultWorkAreaConfig>,
 
+    #[serde(default, skip_serializing_if = "WorktreeSettings::is_empty")]
+    pub worktrees: WorktreeSettings,
+
     /// Access control / password gate configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_control: Option<AccessControlConfig>,
@@ -1909,6 +1927,7 @@ impl Default for ConfigValues {
             skills: SkillsConfig::default(),
             env_vars: Vec::new(),
             default_work_area: None,
+            worktrees: WorktreeSettings::default(),
             access_control: None,
             features: FeatureFlags::default(),
             defaults: None,
@@ -1994,6 +2013,8 @@ struct WorkspaceConfigSection {
     env_vars: Vec<EnvVarEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     default_work_area: Option<DefaultWorkAreaConfig>,
+    #[serde(default, skip_serializing_if = "WorktreeSettings::is_empty")]
+    worktrees: WorktreeSettings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     access_control: Option<AccessControlConfig>,
 }
@@ -2116,6 +2137,7 @@ impl From<ConfigValues> for ConfigRoot {
             skills,
             env_vars,
             default_work_area,
+            worktrees,
             access_control,
             features,
             run_budget,
@@ -2156,6 +2178,7 @@ impl From<ConfigValues> for ConfigRoot {
             workspace: WorkspaceConfigSection {
                 env_vars,
                 default_work_area,
+                worktrees,
                 access_control,
             },
             execution: ExecutionConfigSection {
@@ -2216,6 +2239,7 @@ impl From<ConfigRoot> for ConfigValues {
         let WorkspaceConfigSection {
             env_vars,
             default_work_area,
+            worktrees,
             access_control,
         } = workspace;
         let ExecutionConfigSection {
@@ -2252,6 +2276,7 @@ impl From<ConfigRoot> for ConfigValues {
             skills,
             env_vars,
             default_work_area,
+            worktrees,
             access_control,
             features,
             run_budget,
@@ -4789,6 +4814,7 @@ impl Config {
                 skills: SkillsConfig::default(),
                 env_vars: Vec::new(),
                 default_work_area: None,
+                worktrees: WorktreeSettings::default(),
                 access_control: None,
                 features: FeatureFlags::default(),
                 defaults: None,
