@@ -124,7 +124,11 @@ Manager Git calls disable fsmonitor, hooks, recursive submodule inspection,
 automatic maintenance and lazy fetching. Configured clean/smudge/process filters
 are suppressed per command without changing repository configuration. When
 conversion is needed, the operation fails explicitly instead of materializing
-raw content or silently bypassing a required filter. Existing CLI-created
+raw content or silently bypassing a required filter. Registration uses `--no-checkout`;
+initial materialization re-reads configuration in the new branch/gitdir context
+and uses Git's protected two-tree merge from an empty tree. It refuses untracked
+collisions, carries forward staged/unstaged content, and never uses reset/force
+cleanup. Filter errors explain the boundary and suggest a trusted Git client. Existing CLI-created
 checkouts remain discoverable/openable. Submodule working-copy changes are not
 inspected: known parent/Gitlink changes remain dirty, otherwise a checkout with
 Gitlinks reports unknown dirty state and an explicit diagnostic.

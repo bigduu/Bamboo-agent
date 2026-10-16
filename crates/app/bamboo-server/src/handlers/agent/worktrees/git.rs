@@ -36,6 +36,9 @@ fn git_command(repo: &Path) -> Command {
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_QUARANTINE_PATH")
         .env_remove("GIT_CEILING_DIRECTORIES")
         .env_remove("GIT_CONFIG")
         .env_remove("GIT_CONFIG_PARAMETERS")
@@ -50,7 +53,9 @@ fn git_command(repo: &Path) -> Command {
 
 fn command(repo: &Path, args: &[&str]) -> Result<Output, String> {
     let mut command = git_command(repo);
-    if args.first() == Some(&"status") || args.starts_with(&["worktree", "add"]) {
+    if matches!(args.first(), Some(&"status" | &"read-tree"))
+        || args.starts_with(&["worktree", "add"])
+    {
         // Reading configuration names does not execute filters. Include every
         // scope and include file, but never read/log their potentially secret values.
         let configured = git_command(repo)
@@ -99,10 +104,18 @@ fn command(repo: &Path, args: &[&str]) -> Result<Output, String> {
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     let output = command(repo, args)?;
     if !output.status.success() {
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        let guidance = if diagnostic.contains(": smudge filter ")
+            || diagnostic.contains(": clean filter ")
+        {
+            "External Git content filters are disabled in Worktree manager. Use a trusted Git client to prepare checkouts that need conversion, then open them here. "
+        } else {
+            ""
+        };
         return Err(format!(
-            "Git at {}: {}",
+            "Git at {}: {guidance}{}",
             repo.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            diagnostic.trim()
         ));
     }
     String::from_utf8(output.stdout).map_err(|_| "Git returned a non-UTF-8 path".into())
@@ -381,9 +394,44 @@ pub fn create(
             return Err("Repository or destination changed during worktree creation".into());
         }
         let target_arg = target.to_str().ok_or("Destination must be UTF-8")?;
+        // Register first, then read configuration in the actual new branch /
+        // gitdir context. Conditional includes can differ from the source.
         git(
             repo,
-            &["worktree", "add", "-b", branch, "--", target_arg, "HEAD"],
+            &[
+                "worktree",
+                "add",
+                "--no-checkout",
+                "-b",
+                branch,
+                "--",
+                target_arg,
+                "HEAD",
+            ],
+        )?;
+        if repository(&target)? != common
+            || workspace_root(&target)? != target
+            || !retains_identity(&root, &root_identity)
+            || !retains_identity(&target, &target_identity)
+            || !retains_identity(&common, &repo_identity)
+            || !lock.is_current()
+        {
+            return Err("Repository or destination changed before checkout".into());
+        }
+        let empty = git(&target, &["mktree"])?;
+        // A native two-tree merge from the initially empty checkout preserves
+        // concurrent staged/unstaged content and rejects untracked collisions.
+        // Never reset, force-checkout, prune, or delete a branch on failure.
+        git(
+            &target,
+            &[
+                "read-tree",
+                "-m",
+                "-u",
+                "--no-sparse-checkout",
+                empty.trim(),
+                "HEAD",
+            ],
         )?;
         Ok(())
     };
