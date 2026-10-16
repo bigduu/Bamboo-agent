@@ -592,6 +592,12 @@ fn extract_archive_entries<R: io::Read + io::Seek>(
             .into_owned();
         let enclosed = entry
             .enclosed_name()
+            .filter(|_| {
+                !raw_name.starts_with(['/', '\\'])
+                    && !raw_name
+                        .split(['/', '\\'])
+                        .any(|part| part.as_bytes().get(1) == Some(&b':'))
+            })
             .map(|path| path.to_path_buf())
             .ok_or_else(|| FrontendPackageError::InvalidArchivePath(raw_name.clone()))?;
         let out_path = target_dir.join(enclosed);
@@ -768,6 +774,34 @@ mod tests {
             TEST_INDEX_HTML
         );
         assert!(!target.path().join("index.html").exists());
+    }
+
+    #[test]
+    fn rejects_rooted_zip_names_before_extraction() {
+        for name in [
+            "/evil.txt",
+            r"\evil.txt",
+            r"C:\evil.txt",
+            r"C:evil.txt",
+            r"./C:\evil.txt",
+            r".\C:\evil.txt",
+            r"nested\C:\evil.txt",
+            r"\\host\share\evil.txt",
+        ] {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"payload").unwrap();
+            let bytes = writer.finish().unwrap().into_inner();
+            let target = tempdir().unwrap();
+            let error = extract_frontend_zip_bytes(&bytes, target.path()).unwrap_err();
+            assert!(
+                matches!(error, FrontendPackageError::InvalidArchivePath(_)),
+                "{name}: {error}"
+            );
+            assert!(std::fs::read_dir(target.path()).unwrap().next().is_none());
+        }
     }
 
     #[test]
