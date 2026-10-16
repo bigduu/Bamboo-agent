@@ -146,7 +146,7 @@ fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut buffer = Vec::new();
     {
         let mut writer = zip::ZipWriter::new(Cursor::new(&mut buffer));
-        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        let options: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
         for (name, content) in entries {
             writer.start_file(*name, options).unwrap();
             writer.write_all(content).unwrap();
@@ -303,7 +303,7 @@ async fn zip_archive_with_traversal_entry_is_rejected() {
         // READ via `enclosed_name()` — which is exactly the guard under
         // test — so we can write a genuinely malicious raw entry name here.
         let mut writer = zip::ZipWriter::new(Cursor::new(&mut buffer));
-        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        let options: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
         writer.start_file("plugin.json", options).unwrap();
         writer
             .write_all(hello_manifest_json("hello-plugin").as_bytes())
@@ -516,13 +516,13 @@ async fn zip_symlink_mode_entry_lands_inert_as_a_regular_file() {
     let mut buffer = Vec::new();
     {
         let mut writer = zip::ZipWriter::new(Cursor::new(&mut buffer));
-        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        let options: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
         writer.start_file("plugin.json", options).unwrap();
         writer
             .write_all(hello_manifest_json("hello-plugin").as_bytes())
             .unwrap();
         // S_IFLNK (0o120000) | 0777 — a "symlink" mode, content = a target path.
-        let link_options: zip::write::FileOptions<'_, ()> =
+        let link_options: zip::write::SimpleFileOptions =
             zip::write::FileOptions::default().unix_permissions(0o120777);
         writer.start_file("notes.txt", link_options).unwrap();
         writer.write_all(b"/etc/passwd").unwrap();

@@ -1,0 +1,135 @@
+{
+  "preparedAt": "2026-10-16T04:19:11.017140+00:00",
+  "upstreamPackage": "libduckdb-sys",
+  "version": "1.10506.0",
+  "upstreamDownload": "https://crates.io/api/v1/crates/libduckdb-sys/1.10506.0/download",
+  "upstreamArchiveSha256": "0aac3459f2f7f0221d5be9114fa77ff5877040c8de456d3b986a680579fe202b",
+  "upstreamVcsInfo": {
+    "git": {
+      "sha1": "0fec186cdd4ada2f7703a2df5ee18f9f78d95f8e"
+    },
+    "path_in_vcs": "crates/libduckdb-sys"
+  },
+  "upstreamFileCount": 21,
+  "functionalChanges": [
+    "Cargo.toml build-dependency zip6 -> zip9.0.3",
+    "Cargo.toml publish=false (local dev-only patch)"
+  ],
+  "packageIdentityRenamed": false,
+  "engineAndBindingsModified": false,
+  "removedInactiveOriginalFiles": {
+    "Cargo.lock": {
+      "reason": "Inactive dependency-crate lockfile is not used by root resolution; preserve upstream archive checksum/source receipt instead of shipping a stale alternative lock. The active root lock must be resolved and audited normally.",
+      "upstreamSha256": "e36f14ee913f939ec83c996458c609552f0465cef5762faf8662d5bd75638122"
+    }
+  },
+  "files": {
+    ".cargo_vcs_info.json": {
+      "upstreamSha256": "52cf93188e68266626b0a22c019591afc2483d32406a36afab900a9a7dda5ad0",
+      "bytes": 114,
+      "preparedSha256": "52cf93188e68266626b0a22c019591afc2483d32406a36afab900a9a7dda5ad0"
+    },
+    "Cargo.lock": {
+      "upstreamSha256": "e36f14ee913f939ec83c996458c609552f0465cef5762faf8662d5bd75638122",
+      "bytes": 36269
+    },
+    "Cargo.toml": {
+      "upstreamSha256": "13a8439d3c948b5d597151254c481bbe904f9f03b750a2645398dea2bae6d1dc",
+      "bytes": 2788,
+      "preparedSha256": "a9b9c512dd1fc828dd5293ac0ddae43ba006b207599ee42e26a04fcd0e648389"
+    },
+    "Cargo.toml.orig": {
+      "upstreamSha256": "5b67aed9083bcc573b363d5192acc7904843e555561f4e9f4252a87a8fb588ac",
+      "bytes": 2178,
+      "preparedSha256": "5b67aed9083bcc573b363d5192acc7904843e555561f4e9f4252a87a8fb588ac"
+    },
+    "LICENSE": {
+      "upstreamSha256": "e00a318e49c9ff90254194864b2b695efc04c0384a8682c93ef51518e77ff5ea",
+      "bytes": 1072,
+      "preparedSha256": "e00a318e49c9ff90254194864b2b695efc04c0384a8682c93ef51518e77ff5ea"
+    },
+    "README.md": {
+      "upstreamSha256": "1b4c41f7ecb33bc9f0c2098adf30082c2a8c239c53c39d804865efdf42850b8c",
+      "bytes": 18574,
+      "preparedSha256": "1b4c41f7ecb33bc9f0c2098adf30082c2a8c239c53c39d804865efdf42850b8c"
+    },
+    "build.rs": {
+      "upstreamSha256": "1c535e02a32f55b9f370beb1d37e7113e51bb2953722680b2aa1616cdd97f2cb",
+      "bytes": 24034,
+      "preparedSha256": "1c535e02a32f55b9f370beb1d37e7113e51bb2953722680b2aa1616cdd97f2cb"
+    },
+    "build_bundled_cc.rs": {
+      "upstreamSha256": "8e72e723f754dd0b06f6cabb0052f9a1ac045edf0e5f2f13a0037e0483ac7fce",
+      "bytes": 5141,
+      "preparedSha256": "8e72e723f754dd0b06f6cabb0052f9a1ac045edf0e5f2f13a0037e0483ac7fce"
+    },
+    "build_bundled_cmake.rs": {
+      "upstreamSha256": "1291d3446f99e7d57af7e83150c26c4f786bd00c3d4d7841584181a74d18d810",
+      "bytes": 19408,
+      "preparedSha256": "1291d3446f99e7d57af7e83150c26c4f786bd00c3d4d7841584181a74d18d810"
+    },
+    "duckdb.tar.gz": {
+      "upstreamSha256": "05c43055c3c76c630957e787b160925f9212f33265f4e7dbbc413bdf655b5ddf",
+      "bytes": 6138230,
+      "preparedSha256": "05c43055c3c76c630957e787b160925f9212f33265f4e7dbbc413bdf655b5ddf"
+    },
+    "src/arrow_c_data.rs": {
+      "upstreamSha256": "2999895413e7d978d3b264d45ac07532382c6f243fcd57eac9e54b3ce9354d91",
+      "bytes": 3653,
+      "preparedSha256": "2999895413e7d978d3b264d45ac07532382c6f243fcd57eac9e54b3ce9354d91"
+    },
+    "src/bindgen_bundled_version.rs": {
+      "upstreamSha256": "ad05f0ab08acbb4f504b9c4cce125dff5a88b327feb0f1a03aab0aae220bf104",
+      "bytes": 270451,
+      "preparedSha256": "ad05f0ab08acbb4f504b9c4cce125dff5a88b327feb0f1a03aab0aae220bf104"
+    },
+    "src/bindgen_bundled_version_loadable.rs": {
+      "upstreamSha256": "f74d1c4f173f882cc44e8149927878b7c88ddd5941c66d891905cad57da912dc",
+      "bytes": 602019,
+      "preparedSha256": "f74d1c4f173f882cc44e8149927878b7c88ddd5941c66d891905cad57da912dc"
+    },
+    "src/build_paths.rs": {
+      "upstreamSha256": "12012d2dc06a01cac0627c041f19379f067866faf2c79ac1d65109a2ab63da6a",
+      "bytes": 3495,
+      "preparedSha256": "12012d2dc06a01cac0627c041f19379f067866faf2c79ac1d65109a2ab63da6a"
+    },
+    "src/error.rs": {
+      "upstreamSha256": "3a14a0aa103450068f4b230b0ff7b5c6a5d809335a32ab889c87e5f1aaeedc77",
+      "bytes": 2370,
+      "preparedSha256": "3a14a0aa103450068f4b230b0ff7b5c6a5d809335a32ab889c87e5f1aaeedc77"
+    },
+    "src/lib.rs": {
+      "upstreamSha256": "69355fc4d4db20521b0b64883cd4abcbed4ae183947050f053da4e6b1fade17a",
+      "bytes": 15532,
+      "preparedSha256": "69355fc4d4db20521b0b64883cd4abcbed4ae183947050f053da4e6b1fade17a"
+    },
+    "src/string.rs": {
+      "upstreamSha256": "dc38e02b8c7bc2c34a384ff944c3e491de486952f5d2e0a224429bb19ba6527d",
+      "bytes": 3171,
+      "preparedSha256": "dc38e02b8c7bc2c34a384ff944c3e491de486952f5d2e0a224429bb19ba6527d"
+    },
+    "update_sources.py": {
+      "upstreamSha256": "17e7873db697d1150ecb985011442dfb522a64fcaf7859669b4308aeaee3ca7d",
+      "bytes": 6108,
+      "preparedSha256": "17e7873db697d1150ecb985011442dfb522a64fcaf7859669b4308aeaee3ca7d"
+    },
+    "upgrade.sh": {
+      "upstreamSha256": "c8b9299165bf133ffa3f182be137731561a88bf9c9316a843ba36a27dfae7acf",
+      "bytes": 3084,
+      "preparedSha256": "c8b9299165bf133ffa3f182be137731561a88bf9c9316a843ba36a27dfae7acf"
+    },
+    "wrapper.h": {
+      "upstreamSha256": "c9722869a8a5660ad284e05972b61e94e8e53236c1ce1010f519fcd3cb7abae0",
+      "bytes": 26,
+      "preparedSha256": "c9722869a8a5660ad284e05972b61e94e8e53236c1ce1010f519fcd3cb7abae0"
+    },
+    "wrapper_ext.h": {
+      "upstreamSha256": "4f3d94aba09168b7e8fe13a1face4e0f28d646792ba601015e0508c0a9f8cb72",
+      "bytes": 305,
+      "preparedSha256": "4f3d94aba09168b7e8fe13a1face4e0f28d646792ba601015e0508c0a9f8cb72"
+    }
+  },
+  "scope": "Only dev-only bamboo-analytics uses DuckDB. Normal published29 full locked graph has no duckdb/sys; actual package and clean registry consumer checks remain mandatory.",
+  "rootLockResolved": false,
+  "cargoOrRustcRun": false
+}

@@ -298,7 +298,10 @@ pub fn validate_frontend_package(frontend_root: &Path) -> io::Result<ValidatedFr
                 "cannot inspect frontend archive entry {index}: {error}"
             ))
         })?;
-        let raw_name = file.name().to_owned();
+        let raw_name = file
+            .name()
+            .map_err(|error| invalid_data(format!("invalid frontend zip entry name: {error}")))?
+            .into_owned();
         let path_to_validate = raw_name.strip_suffix('/').unwrap_or(&raw_name);
         let normalized = validate_archive_path(path_to_validate)?;
         let kind = if file.is_dir() {

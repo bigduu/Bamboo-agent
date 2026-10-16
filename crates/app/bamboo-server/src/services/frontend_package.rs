@@ -368,12 +368,15 @@ fn validate_external_frontend_archive(
         } else {
             ExternalArchiveEntryKind::File
         };
-        let raw_name = entry.name().to_string();
+        let raw_name = entry
+            .name()
+            .map_err(FrontendPackageError::Zip)?
+            .into_owned();
         let normalized = validate_external_archive_path(&raw_name, kind)?;
         let enclosed = entry
             .enclosed_name()
             .map(|path| path.to_path_buf())
-            .ok_or_else(|| FrontendPackageError::InvalidArchivePath(entry.name().to_string()))?;
+            .ok_or_else(|| FrontendPackageError::InvalidArchivePath(raw_name.clone()))?;
         let enclosed_portable = enclosed
             .iter()
             .map(|component| component.to_string_lossy())
@@ -583,10 +586,14 @@ fn extract_archive_entries<R: io::Read + io::Seek>(
 ) -> Result<(), FrontendPackageError> {
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(FrontendPackageError::Zip)?;
+        let raw_name = entry
+            .name()
+            .map_err(FrontendPackageError::Zip)?
+            .into_owned();
         let enclosed = entry
             .enclosed_name()
             .map(|path| path.to_path_buf())
-            .ok_or_else(|| FrontendPackageError::InvalidArchivePath(entry.name().to_string()))?;
+            .ok_or_else(|| FrontendPackageError::InvalidArchivePath(raw_name.clone()))?;
         let out_path = target_dir.join(enclosed);
 
         if entry.is_dir() {
