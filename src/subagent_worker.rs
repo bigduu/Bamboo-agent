@@ -2515,6 +2515,8 @@ mod tests {
     use bamboo_subagent::provision::{ChildIdentity, ModelRefSpec, ScopedCredential};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    include!("subagent_worker_cold_input_tests.rs");
+
     #[test]
     fn local_completion_preserves_message_data_and_refuses_provider_state() {
         let mut session = Session::new("local-completion", "model");

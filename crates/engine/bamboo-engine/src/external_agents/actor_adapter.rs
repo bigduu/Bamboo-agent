@@ -9108,6 +9108,8 @@ mod tests {
 
     include!("expired_plain_owner_tests.rs");
 
+    include!("owned_cold_input_tests.rs");
+
     #[test]
     fn plain_rejection_logs_branch_and_run_without_changing_error() {
         // Keep shared callsites consulting the current subscriber during scoped capture.
