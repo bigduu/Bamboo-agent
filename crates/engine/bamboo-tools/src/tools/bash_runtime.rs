@@ -638,7 +638,7 @@ fn spawn_completion_poll(
                 // as a delivered result, retaining only its display/result key.
                 tokio::spawn(async move {
                     sleep(Duration::from_secs(COMPLETED_SESSION_TTL_SECS)).await;
-                    let _ = remove_shell(&session_id_for_gc);
+                    remove_expired_polled_shell(&session_id_for_gc);
                 });
             }
         } else if owned {
@@ -836,10 +836,40 @@ pub fn remove_shell(id: &str) -> Option<Arc<ShellSession>> {
     sessions().remove(id).map(|(_, value)| value)
 }
 
+// A held diagnostic result is removed by the normal terminal read or explicit
+// owner cleanup, never by the display-cache TTL while Human polling is paused.
+pub(super) fn remove_expired_polled_shell(id: &str) {
+    let _ = sessions().remove_if(id, |_, shell| {
+        !shell
+            .polled
+            .as_ref()
+            .is_some_and(|state| state.retain_for_diagnosis())
+    });
+}
+
+/// Retain one existing, owner-scoped polled result while a Human-controlled
+/// runner pauses for diagnosis. This reads no output and grants no execution
+/// capability. The existing session permit keeps retained capture bounded.
+pub fn retain_polled_result_for_diagnosis(owner: &str, id: &str) -> bool {
+    let Some(shell) = sessions().get(id) else {
+        return false;
+    };
+    if shell.session_id.as_deref() != Some(owner) {
+        return false;
+    }
+    let Some(state) = shell.polled.as_ref() else {
+        return false;
+    };
+    // Hold the registry shard while publishing the hold, so cache expiry
+    // cannot remove the entry between the owner check and the atomic store.
+    state.hold_for_diagnosis();
+    true
+}
+
 /// Current pull-session handles whose terminal result has not been consumed.
 ///
 /// Include exited sessions: only a terminal `poll_result` removes their handle
-/// (apart from the existing cache TTL). The exec-session capacity bounds this
+/// (apart from the cache TTL for results not held for diagnosis). The capacity bounds this
 /// snapshot; do not truncate it or infer process state from registry presence.
 /// This observes the existing registry without reading output or advancing a
 /// cursor, and intentionally excludes legacy Bash sessions.

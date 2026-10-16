@@ -20,6 +20,7 @@ const MAX_COMMAND_BYTES: usize = 64 * 1024;
 // Advisory only: silence never changes process lifetime or terminal status.
 const QUIET_POLL_ADVISORY_AFTER: Duration = Duration::from_secs(90);
 const QUIET_POLL_ADVISORY_READOUTS: usize = 3;
+const QUIET_POLL_DIAGNOSIS_READOUTS: usize = 6;
 const QUIET_POLL_ADVISORY: &str = "No new output across repeated polls. Do other useful work or check a command-owned progress signal before polling again. Quiet output or an existing report does not prove completion. Continue waiting when appropriate, or report the concrete blocker; retain this handle for the final status.";
 
 #[derive(Debug)]
@@ -57,6 +58,9 @@ pub(crate) struct PolledShellState {
     // A reaped parent may still have descendants holding its output pipes.
     // This observation does not publish a terminal capture result.
     process_exited: AtomicBool,
+    // A diagnostic pause must not expire the unread terminal result before
+    // the caller resumes. Retention remains bounded by the 64-session permit.
+    retain_for_diagnosis: AtomicBool,
     #[cfg(test)]
     fail_cleanup_after_reap: AtomicBool,
     capture_stop: watch::Sender<bool>,
@@ -76,6 +80,7 @@ impl PolledShellState {
             output: Mutex::new(CapturedOutput::default()),
             completed: Notify::new(),
             process_exited: AtomicBool::new(false),
+            retain_for_diagnosis: AtomicBool::new(false),
             #[cfg(test)]
             fail_cleanup_after_reap: AtomicBool::new(false),
             capture_stop: watch::channel(false).0,
@@ -175,6 +180,14 @@ impl PolledShellState {
         )
     }
 
+    pub(crate) fn hold_for_diagnosis(&self) {
+        self.retain_for_diagnosis.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn retain_for_diagnosis(&self) -> bool {
+        self.retain_for_diagnosis.load(Ordering::Acquire)
+    }
+
     fn take_locked(
         output: &mut CapturedOutput,
         shell_id: &str,
@@ -193,6 +206,13 @@ impl PolledShellState {
             let now = Instant::now();
             let idle = now.duration_since(output.last_output_at);
             ExecSessionProgress {
+                state: if idle >= QUIET_POLL_ADVISORY_AFTER
+                    && output.consecutive_empty_readouts >= QUIET_POLL_DIAGNOSIS_READOUTS
+                {
+                    "needs_diagnosis"
+                } else {
+                    "waiting"
+                },
                 elapsed_ms: duration_ms(now.duration_since(output.started_at)),
                 output_idle_ms: duration_ms(idle),
                 consecutive_empty_readouts: output.consecutive_empty_readouts,
@@ -335,6 +355,7 @@ struct ExecSessionResult {
 /// Capture observations, never a liveness probe or evidence of a hung process.
 #[derive(Debug, Serialize)]
 struct ExecSessionProgress {
+    state: &'static str,
     elapsed_ms: u64,
     output_idle_ms: u64,
     consecutive_empty_readouts: usize,

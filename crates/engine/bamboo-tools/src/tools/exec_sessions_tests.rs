@@ -827,7 +827,7 @@ mod process_tests {
             output.started_at = Instant::now() - QUIET_POLL_ADVISORY_AFTER;
             output.last_output_at = output.started_at;
         }
-        for _ in 0..QUIET_POLL_ADVISORY_READOUTS {
+        for _ in 0..QUIET_POLL_DIAGNOSIS_READOUTS {
             let result = payload(
                 WriteStdinTool::new()
                     .invoke(
@@ -846,6 +846,17 @@ mod process_tests {
         assert!(bash_runtime::get_shell(id).is_some());
         let last_running = payload(poll_result(&shell, 0, None).await);
         assert!(last_running["polling"]["advisory"].is_string());
+        assert_eq!(last_running["polling"]["state"], "needs_diagnosis");
+        assert!(
+            !state.retain_for_diagnosis(),
+            "diagnostics alone do not extend ordinary cache lifetime"
+        );
+        assert!(!bash_runtime::retain_polled_result_for_diagnosis(
+            "other-owner",
+            id
+        ));
+        assert!(bash_runtime::retain_polled_result_for_diagnosis(&owner, id));
+        assert!(state.retain_for_diagnosis());
         // Successful input/EOF interrupts the empty-readout streak even when
         // this command makes no stdout/stderr response to the input.
         for request in [
@@ -863,6 +874,12 @@ mod process_tests {
             assert!(after_input["polling"].get("advisory").is_none());
         }
         std::fs::write(release, b"release").unwrap();
+        state.wait(5_000).await;
+        bash_runtime::remove_expired_polled_shell(id);
+        assert!(
+            bash_runtime::get_shell(id).is_some(),
+            "diagnostic pause retains an unread terminal result past cache expiry"
+        );
         let terminal = poll(id, &owner).await;
         assert_eq!(terminal["status"], "completed");
         assert_eq!(terminal["output"], "tail");

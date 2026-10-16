@@ -28,6 +28,196 @@ fn gated_command(gate: &Path) -> String {
     )
 }
 
+struct IgnoredQuietReminder {
+    command: String,
+    calls: AtomicUsize,
+    handle: Mutex<Option<String>>,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for IgnoredQuietReminder {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let calls = match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => vec![tool_call(
+                "quiet-start",
+                "exec_command",
+                json!({"cmd":self.command,"yield_time_ms":250}),
+            )],
+            1 => {
+                let started = result_for(messages, "quiet-start");
+                assert_eq!(started["status"], "running");
+                let handle = started["session_id"].as_str().unwrap().to_owned();
+                *self.handle.lock().unwrap() = Some(handle.clone());
+                // Virtual time advances only the real capture/poll clocks, not
+                // the gated OS child or its actual wait/exit status.
+                tokio::time::advance(Duration::from_secs(90)).await;
+                (0..8)
+                    .map(|index| {
+                        tool_call(
+                            &format!("ignored-poll-{index}"),
+                            "write_stdin",
+                            json!({"session_id":handle,"chars":"","yield_time_ms":250+index,
+                        "max_output_tokens":100+index}),
+                        )
+                    })
+                    .collect()
+            }
+            round => panic!("quiet polling must pause before another provider request: {round}"),
+        };
+        Ok(Box::pin(stream::iter([
+            Ok(LLMChunk::ToolCalls(calls)),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+struct ReadQuietCompletion {
+    handle: String,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for ReadQuietCompletion {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let chunks = match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => vec![
+                Ok(LLMChunk::ToolCalls(vec![tool_call(
+                    "quiet-final",
+                    "write_stdin",
+                    json!({"session_id":self.handle,"yield_time_ms":30_000}),
+                )])),
+                Ok(LLMChunk::Done),
+            ],
+            1 => {
+                let result = result_for(messages, "quiet-final");
+                assert_eq!(result["status"], "completed");
+                assert_eq!(result["exit_code"], 7);
+                assert!(result.get("session_id").is_none());
+                vec![
+                    Ok(LLMChunk::Token("Observed command exit 7.".into())),
+                    Ok(LLMChunk::Done),
+                ]
+            }
+            round => panic!("unexpected continuation request {round}"),
+        };
+        Ok(Box::pin(stream::iter(chunks)))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ignored_quiet_polling_pauses_without_killing_and_resumes_the_same_real_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("release");
+    let _release = ReleaseGate(gate.clone());
+    let quoted_gate = gate.to_string_lossy().replace('\'', "'\\''");
+    let provider = Arc::new(IgnoredQuietReminder {
+        command: format!(
+            "while [ ! -f '{quoted_gate}' ]; do sleep 0.01; done; printf quiet-finished; exit 7"
+        ),
+        calls: AtomicUsize::new(0),
+        handle: Mutex::new(None),
+    });
+    let (mut session, config, mut state) = fixture("ignored-quiet-polling");
+    let executor = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let (tx, mut rx) = mpsc::channel(256);
+    run_pipeline(
+        &mut session,
+        &tx,
+        provider.clone(),
+        executor.clone(),
+        &CancellationToken::new(),
+        &config,
+        &mut state,
+    )
+    .await
+    .unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        state.runtime_state.status,
+        bamboo_domain::AgentStatusState::Suspended
+    );
+    let pending = session
+        .pending_question
+        .as_ref()
+        .expect("deterministic diagnostic pause");
+    assert!(crate::session_app::no_progress::is_no_progress_question(
+        &session, pending
+    ));
+    assert!(pending.question.contains("command remains pending"));
+    let handle = provider.handle.lock().unwrap().clone().unwrap();
+    let shell = bamboo_tools::tools::bash_runtime::get_shell(&handle).unwrap();
+    assert_eq!(shell.status(), "running");
+    let mut suppressed = 0;
+    for index in 0..8 {
+        let result = result_for(&session.messages, &format!("ignored-poll-{index}"));
+        assert_eq!(result["status"], "running");
+        assert_eq!(result["session_id"], handle);
+        assert!(result.get("exit_code").is_none());
+        suppressed += usize::from(result["polling"]["poll_suppressed"] == true);
+    }
+    assert!(
+        suppressed > 0,
+        "same-batch redundant waits are suppressed and every call stays paired"
+    );
+    let mut questions = 0;
+    let mut dispatched_polls = 0;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(&event, bamboo_agent_core::AgentEvent::ToolStart { tool_name, .. } if tool_name == "write_stdin")
+        {
+            dispatched_polls += 1;
+        }
+        if matches!(
+            event,
+            bamboo_agent_core::AgentEvent::NeedClarification { .. }
+        ) {
+            questions += 1;
+        }
+    }
+    assert_eq!(questions, 1);
+    assert_eq!(
+        dispatched_polls + suppressed,
+        8,
+        "suppressed polls never enter the executor"
+    );
+    // No synthetic completion or process control is needed to resume. Restore
+    // real time before letting the real OS child produce its ordinary exit.
+    tokio::time::resume();
+    std::fs::write(&gate, b"release").unwrap();
+    session.add_message(Message::user(
+        "Continue waiting and read the command result.",
+    ));
+    let resumed = Arc::new(ReadQuietCompletion {
+        handle: handle.clone(),
+        calls: AtomicUsize::new(0),
+    });
+    run_pipeline(
+        &mut session,
+        &tx,
+        resumed.clone(),
+        executor,
+        &CancellationToken::new(),
+        &config,
+        &mut state,
+    )
+    .await
+    .unwrap();
+    assert!(session.pending_question.is_none());
+    assert_eq!(resumed.calls.load(Ordering::SeqCst), 2);
+    assert!(bamboo_tools::tools::bash_runtime::get_shell(&handle).is_none());
+}
+
 fn tool_call(id: &str, name: &str, args: Value) -> ToolCall {
     ToolCall {
         id: id.into(),

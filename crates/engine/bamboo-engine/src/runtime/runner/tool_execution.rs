@@ -18,7 +18,7 @@ use bamboo_domain::{
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 
-pub(crate) use no_progress::pause_for_no_progress;
+pub(crate) use no_progress::{pause_for_no_progress, pause_for_quiet_polling};
 pub(crate) use policy::ToolPolicyGuard;
 
 fn build_context_pressure(session: &Session) -> Option<output_compressor::ContextPressure> {
@@ -64,6 +64,7 @@ mod per_call;
 mod policy;
 #[cfg(test)]
 mod progress_hint_tests;
+mod quiet_poll;
 #[cfg(test)]
 mod supervisor_dispatch_tests;
 mod task;
@@ -234,12 +235,33 @@ async fn execute_and_apply_single_tool_call(
         }
     }
 
+    let quiet_guard_active = no_progress::quiet_poll_guard_active(session, runtime_state, config);
+    let suppressed = quiet_guard_active
+        .then(|| {
+            policy_guard
+                .quiet_polls
+                .suppress(tool_call, admitted_execution_name.as_deref())
+        })
+        .flatten();
     let mut stop_round = false;
     let outcome = match policy_guard.check_before_execution_for_name(
         tool_call,
         reserved_calls,
         admitted_execution_name.as_deref(),
     ) {
+        Ok(()) if suppressed.is_some() => per_call::ToolExecutionOutcome {
+            output_cap: None,
+            permission_replay_origin: None,
+            needs_human: None,
+            portable_tool: per_call::portable_tool_for_admitted_call(
+                effective_callable_set,
+                tool_call,
+            ),
+            post_tool_hook_eligible: false,
+            managed_running_violation: false,
+            result: Ok(suppressed.expect("checked suppression")),
+            tool_duration: std::time::Duration::ZERO,
+        },
         Ok(()) => {
             let managed_parallel_call = crate::runtime::loop_control::suspension::active(config)
                 && scheduling_mode_for_tool_call(tool_call, tools)
@@ -340,6 +362,20 @@ async fn execute_and_apply_single_tool_call(
 
     // Compare raw output: changing evidence hidden by compression is still progress.
     policy_guard.observe_raw_observation(tool_call, &outcome.result);
+    if quiet_guard_active {
+        policy_guard
+            .quiet_polls
+            .observe(tool_call, &outcome, admitted_execution_name.as_deref());
+        if let Some(handle) = policy_guard.quiet_polls.pending_handle() {
+            if !bamboo_tools::tools::bash_runtime::retain_polled_result_for_diagnosis(
+                session_id, handle,
+            ) {
+                // Foreign host implementations under the reserved spelling
+                // cannot pin an absent handle or another owner's command.
+                policy_guard.quiet_polls = Default::default();
+            }
+        }
+    }
     // Use exactly the scalar observed by this dispatch, including unknown/zero.
     // Pre-dispatch failures retain the original local projection.
     let max_tool_tokens = outcome
@@ -608,7 +644,18 @@ async fn execute_round_tool_calls_inner(
     } else {
         tool_calls
             .iter()
-            .map(|tc| scheduling_mode_for_tool_call(tc, tools))
+            .map(|tc| {
+                if no_progress::quiet_poll_guard_active(session, runtime_state, config)
+                    && effective_callable_set
+                        .resolve_callable_reference(&tc.function.name)
+                        .as_deref()
+                        == Some("write_stdin")
+                {
+                    ToolSchedulingMode::Sequential
+                } else {
+                    scheduling_mode_for_tool_call(tc, tools)
+                }
+            })
             .collect()
     };
 

@@ -11,6 +11,7 @@ pub const CONTINUE_OPTION: &str = "Continue";
 pub const STOP_OPTION: &str = "Stop";
 const QUESTION_KIND: &str = "observation_progress_pause";
 pub(crate) const QUESTION_TEXT: &str = "The same successful file observations stayed unchanged for six consecutive rounds, including three rounds after the progress reminder. The run is paused. Continue, stop, or provide a different approach.";
+pub(crate) const QUIET_POLL_QUESTION_TEXT: &str = "Repeated command polls produced no new output after the quiet-command reminder. Polling is paused for diagnosis; the command remains pending and its handle is retained. Silence does not prove completion or failure. Continue waiting, stop this run, or provide a different approach.";
 
 /// Match our own persisted runtime question, not another tool with a similar name.
 pub fn is_no_progress_question(session: &Session, pending: &PendingQuestion) -> bool {
@@ -29,14 +30,22 @@ pub fn is_no_progress_question(session: &Session, pending: &PendingQuestion) -> 
 }
 
 pub(crate) fn create_question(session: &mut Session, runtime_state: &mut AgentRuntimeState) {
-    let mut message = Message::assistant(QUESTION_TEXT, None);
+    create_question_with_text(session, runtime_state, QUESTION_TEXT);
+}
+
+pub(crate) fn create_question_with_text(
+    session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
+    text: &str,
+) {
+    let mut message = Message::assistant(text, None);
     message.metadata = Some(serde_json::json!({"runtime_kind": QUESTION_KIND}));
     let question_id = message.id.clone();
     session.add_message(message);
     session.set_pending_question_with_source(
         question_id,
         QUESTION_TOOL_NAME.into(),
-        QUESTION_TEXT.into(),
+        text.into(),
         vec![CONTINUE_OPTION.into(), STOP_OPTION.into()],
         true,
         PendingQuestionSource::AgenticClarification,
