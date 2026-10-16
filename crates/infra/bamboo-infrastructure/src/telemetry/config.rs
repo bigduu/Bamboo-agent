@@ -307,6 +307,39 @@ mod tests {
             }
         }
     }
+
+    #[cfg(feature = "otel-otlp")]
+    #[test]
+    fn explicit_guard_shutdown_is_bounded_and_idempotent() {
+        use opentelemetry::trace::{Span, Tracer, TracerProvider};
+
+        // Keep the collector socket open without responding. Exercise the
+        // exact guard API used before CLI process::exit, without installing a
+        // process-global provider in this parallel test suite.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let provider = build_provider(&TelemetryConfig {
+            enabled: true,
+            endpoint: Some(format!(
+                "http://{}/v1/traces",
+                listener.local_addr().unwrap()
+            )),
+            sample_ratio: 1.0,
+        })
+        .unwrap();
+        provider.tracer("guard-test").start("invoke_agent").end();
+        let mut guard = TelemetryGuard {
+            provider: Some(provider),
+        };
+        assert!(guard.enabled());
+        let started = std::time::Instant::now();
+        let _ = guard.shutdown();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!guard.enabled());
+        // Drop after explicit shutdown must not wait on the exporter again.
+        guard.shutdown().unwrap();
+        drop(guard);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
 }
 
 /// The upstream exporter merges OTEL_* headers even after programmatic config.
