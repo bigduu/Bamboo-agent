@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, Instant};
 
 use super::{bash_runtime, workspace_state};
 
@@ -17,13 +17,35 @@ const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_OUTPUT_TOKENS: usize = 8192;
 const DEFAULT_OUTPUT_TOKENS: usize = 2000;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
+// Advisory only: silence never changes process lifetime or terminal status.
+const QUIET_POLL_ADVISORY_AFTER: Duration = Duration::from_secs(90);
+const QUIET_POLL_ADVISORY_READOUTS: usize = 3;
+const QUIET_POLL_ADVISORY: &str = "No new output across repeated polls. Do other useful work or check a command-owned progress signal before polling again. Quiet output or an existing report does not prove completion. Continue waiting when appropriate, or report the concrete blocker; retain this handle for the final status.";
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CapturedOutput {
     bytes: Vec<u8>,
     omitted_bytes: usize,
     completion: Option<(&'static str, Option<i32>)>,
     error: Option<String>,
+    started_at: Instant,
+    last_output_at: Instant,
+    consecutive_empty_readouts: usize,
+}
+
+impl Default for CapturedOutput {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            bytes: Vec::new(),
+            omitted_bytes: 0,
+            completion: None,
+            error: None,
+            started_at: now,
+            last_output_at: now,
+            consecutive_empty_readouts: 0,
+        }
+    }
 }
 
 /// Per-handle pull cursor and bounded capture. Process ownership remains in
@@ -63,7 +85,12 @@ impl PolledShellState {
     }
 
     async fn push(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
         let mut output = self.output.lock().await;
+        output.last_output_at = Instant::now();
+        output.consecutive_empty_readouts = 0;
         output.bytes.extend_from_slice(bytes);
         let mut excess = output.bytes.len().saturating_sub(MAX_CAPTURE_BYTES);
         if excess > 0 {
@@ -134,16 +161,47 @@ impl PolledShellState {
         self.output.lock().await.completion.is_some()
     }
 
+    pub(super) async fn reset_empty_readouts(&self) {
+        self.output.lock().await.consecutive_empty_readouts = 0;
+    }
+
     async fn take(&self, shell_id: &str, max_output_tokens: Option<usize>) -> ExecSessionResult {
         let mut output = self.output.lock().await;
-        Self::take_locked(&mut output, shell_id, max_output_tokens)
+        Self::take_locked(
+            &mut output,
+            shell_id,
+            max_output_tokens,
+            self.process_exited(),
+        )
     }
 
     fn take_locked(
         output: &mut CapturedOutput,
         shell_id: &str,
         max_output_tokens: Option<usize>,
+        exit_observed: bool,
     ) -> ExecSessionResult {
+        // Count captured bytes, including bytes omitted by either cap, rather
+        // than the rendered string. A tiny response cap can hide real output.
+        let had_output = !output.bytes.is_empty() || output.omitted_bytes > 0;
+        let polling = output.completion.is_none().then(|| {
+            output.consecutive_empty_readouts = if had_output {
+                0
+            } else {
+                output.consecutive_empty_readouts.saturating_add(1)
+            };
+            let now = Instant::now();
+            let idle = now.duration_since(output.last_output_at);
+            ExecSessionProgress {
+                elapsed_ms: duration_ms(now.duration_since(output.started_at)),
+                output_idle_ms: duration_ms(idle),
+                consecutive_empty_readouts: output.consecutive_empty_readouts,
+                exit_observed,
+                advisory: (idle >= QUIET_POLL_ADVISORY_AFTER
+                    && output.consecutive_empty_readouts >= QUIET_POLL_ADVISORY_READOUTS)
+                    .then_some(QUIET_POLL_ADVISORY),
+            }
+        });
         let bytes = std::mem::take(&mut output.bytes);
         let decoded = String::from_utf8_lossy(&bytes);
         let budget = max_output_tokens
@@ -161,6 +219,7 @@ impl PolledShellState {
             exit_code,
             output_omitted_bytes: omitted,
             error: output.error.clone(),
+            polling,
         }
     }
 }
@@ -269,6 +328,24 @@ struct ExecSessionResult {
     output_omitted_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    polling: Option<ExecSessionProgress>,
+}
+
+/// Capture observations, never a liveness probe or evidence of a hung process.
+#[derive(Debug, Serialize)]
+struct ExecSessionProgress {
+    elapsed_ms: u64,
+    output_idle_ms: u64,
+    consecutive_empty_readouts: usize,
+    // False means no exit has been observed, not that liveness was verified.
+    exit_observed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    advisory: Option<&'static str>,
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -365,9 +442,15 @@ async fn take_initial_result(
     before_commit();
     // Delivery errors must leave the output cursor untouched for cleanup.
     let terminal = shell.deliver_initial().map_err(ToolError::Execution)?;
-    let mut result = PolledShellState::take_locked(&mut output, &shell.id, max_output_tokens);
+    let mut result = PolledShellState::take_locked(
+        &mut output,
+        &shell.id,
+        max_output_tokens,
+        state.process_exited(),
+    );
     if let Some(status) = terminal {
         result.session_id = None;
+        result.polling = None;
         result.exit_code = status.code();
         result.status = if result.error.is_some() {
             "error"
@@ -452,7 +535,7 @@ impl Tool for ExecCommandTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and wait up to yield_time_ms. A running command returns a session_id; continue other work, then call write_stdin with that ID and empty chars to retrieve incremental output and its final exit code. Completion is delivered through these tool results. interactive=true keeps a stdin pipe open for later input; this is a pipe, not a terminal/PTY. Output is bounded and reports omitted bytes."
+        "Execute a shell command and wait up to yield_time_ms. A running command returns a session_id and polling progress; continue other work, then call write_stdin with that ID and empty chars to retrieve incremental output and its final exit code. Follow a quiet polling advisory before repeating empty polls; silence does not prove completion. Completion is delivered through these tool results. interactive=true keeps a stdin pipe open for later input; this is a pipe, not a terminal/PTY. Output is bounded and reports omitted bytes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

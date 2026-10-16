@@ -135,14 +135,14 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "write_stdin" => Some(guide(
             "write_stdin",
             ToolCategory::CommandExecution,
-            "Pull output and completion from an exec_command session owned by this conversation. Use chars=\"\" to wait/poll; yield_time_ms is bounded to 250–30000 ms (default 10000). Running results retain session_id; final results omit it and include exit_code when available. Output is incremental and bounded by max_output_tokens (default 2000, maximum 8192); output_omitted_bytes reports discarded bytes. For interactive=true sessions, nonempty chars writes exact bytes to the stdin pipe; include your own newline and use eof=true to close stdin. A lone Ctrl-C (\\u0003) stops the process.",
-            "Do not use a conversation ID or legacy Bash ID as session_id. Do not poll a finished session or wait for an automatic completion message. Input requires an interactive stdin pipe and does not provide PTY terminal behavior.",
+            "Pull output and completion from an exec_command session owned by this conversation. Use chars=\"\" to wait/poll; yield_time_ms is bounded to 250–30000 ms (default 10000). Running results retain session_id; final results omit it and include exit_code when available. Running polling metadata reports elapsed_ms, output_idle_ms, consecutive_empty_readouts and exit_observed. False exit_observed means no exit has been observed, not verified liveness; true still waits for terminal output capture. After repeated empty readouts and sustained silence, a polling advisory asks you to do useful work or inspect one command-owned progress signal before polling again. Continue waiting when appropriate, or report a concrete blocker, retaining the handle for final status. Output is incremental and bounded by max_output_tokens (default 2000, maximum 8192); output_omitted_bytes reports discarded bytes. For interactive=true sessions, nonempty chars writes exact bytes to the stdin pipe; include your own newline and use eof=true to close stdin. A lone Ctrl-C (\\u0003) stops the process.",
+            "Do not use a conversation ID or legacy Bash ID as session_id. Do not blindly repeat identical empty polls, infer completion from silence or an existing report, or stop/restart a command only because it is quiet. Do not poll a finished session or wait for an automatic completion message. Input requires an interactive stdin pipe and does not provide PTY terminal behavior.",
             &["exec_command"],
             vec![
                 example(
                     "Pull a command's next output and exit status",
                     json!({"session_id":"<session_id-from-exec_command>","chars":"","yield_time_ms":1000}),
-                    "Repeat while status=running; a nonzero exit_code is a command outcome to inspect.",
+                    "While status=running, use polling progress and follow any advisory before another empty poll. Preserve the handle until final status; a nonzero exit_code is a command outcome to inspect.",
                 ),
                 example(
                     "Answer an interactive prompt and close input",
@@ -741,6 +741,11 @@ mod tests {
         let poll = builtin_guide_spec("write_stdin").unwrap();
         assert!(poll.when_to_use.contains("final results omit it"));
         assert!(poll.when_to_use.contains("include your own newline"));
+        assert!(poll.when_to_use.contains("polling advisory"));
+        assert!(poll.when_to_use.contains("not verified liveness"));
+        assert!(poll
+            .when_not_to_use
+            .contains("infer completion from silence"));
         assert_eq!(poll.examples[0].parameters["chars"], "");
         for legacy in ["Bash", "BashInput", "BashOutput", "KillShell"] {
             assert!(!BUILTIN_GUIDE_NAMES.contains(&legacy));
