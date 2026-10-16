@@ -243,6 +243,7 @@ name = "bamboo"
 path = "src/bin/bamboo.rs"
 
 [features]
+otel-otlp = ["bamboo-infrastructure/otel-otlp"]
 ticket-runtime-fixtures = ["bamboo-server/ticket-runtime-fixtures"]
 
 [dev-dependencies]
