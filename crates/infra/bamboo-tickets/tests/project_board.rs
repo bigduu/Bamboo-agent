@@ -70,7 +70,13 @@ impl Fixture {
             project_revision: 1,
             resource_revision: 1,
             workspace_binding: WorkspaceBinding {
-                path: self.workspace.path().to_string_lossy().into(),
+                path: self
+                    .workspace
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into(),
                 label: None,
                 git_common_dir: None,
             },
