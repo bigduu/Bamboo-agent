@@ -1089,6 +1089,14 @@ test("native Windows runs source-bound immutable artifacts and preserves process
   assert.ok(invoke.indexOf("Assert-ActorNativeArtifact") < invoke.indexOf("& $Invoker"))
   assert.match(invoke, /& \$Executable @NativeArguments/u)
   assert.match(invoke, /\$code = \$LASTEXITCODE/u)
+  assert.match(invoke, /\[IO\.File\]::AppendAllText\(\$OutputPath,/u)
+  assert.match(invoke, /\[IO\.FileMode\]::CreateNew/u)
+  assert.doesNotMatch(invoke, /\$output = @\(& \$Executable/u)
+  assert.ok(invoke.indexOf("AppendAllText($OutputPath") < invoke.indexOf("$code = $LASTEXITCODE"),
+    "native output must be written while the executable runs")
+  assert.ok(invoke.indexOf("AppendAllText($logPath") < invoke.indexOf("if ($result.ExitCode"),
+    "injected failure output must be retained before rejecting its exit code")
+  assert.match(invoke, /return @\(Get-Content -LiteralPath \$logPath\)/u)
   assert.match(invoke, /\$result\.ExitCode -isnot \[int\] -or \$result\.ExitCode -ne 0/u)
   assert.match(invoke, /Push-Location -LiteralPath \$Record\.workingDirectory/u)
   assert.match(invoke, /\$env:CARGO_MANIFEST_DIR = \$Record\.workingDirectory/u)
@@ -1106,5 +1114,11 @@ test("native Windows runs source-bound immutable artifacts and preserves process
     "selection differs", "Selected tests differ", "executable is missing, replaced or changed",
     "outside its owned directory", "source changed", "all five scopes and all 41 tests"]) {
     assert.ok(actorWindowsControllerTests.includes(`'${failure}'`), `missing controller failure fixture: ${failure}`)
+  }
+  for (const witness of ["Native failure output must be preserved before a nonzero exit is propagated",
+    "partial output while still running", "Real native failure output lost stdout or stderr",
+    "Timed-out native output must be retained before termination",
+    "A timed-out controller was incorrectly reported as successful"]) {
+    assert.ok(actorWindowsControllerTests.includes(witness), `missing output-retention regression: ${witness}`)
   }
 })
