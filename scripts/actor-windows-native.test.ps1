@@ -53,8 +53,17 @@ try {
       ($script:observedInvocations[1].arguments -join '|') -cne 'fixture::|--nocapture|--test-threads=1') {
     throw 'Execution did not use exactly the compiled native binary and original selection'
   }
-  $nonzero = { return @{ ExitCode = 23; Output = @('test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s') } }
+  $nonzero = { return @{ ExitCode = 23; Output = @('native stdout before exit 23', 'native stderr before exit 23', 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s') } }
   Expect-ActorHarnessFailure { Assert-ActorNativeRun $context 'bamboo-storage' 'fixture::' 1 'nonzero.log' $nonzero } 'nonzero.*23'
+  $failureLog = Join-Path $evidenceFixture 'nonzero.log'
+  if (-not (Test-Path -LiteralPath $failureLog -PathType Leaf)) {
+    throw 'Native failure output must be preserved before a nonzero exit is propagated'
+  }
+  $failureOutput = Get-Content -LiteralPath $failureLog -Raw
+  if (-not $failureOutput.Contains('native stdout before exit 23') -or
+      -not $failureOutput.Contains('native stderr before exit 23')) {
+    throw 'Native failure output lost stdout or stderr'
+  }
   $ignored = { return @{ ExitCode = 0; Output = @('test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s') } }
   Expect-ActorHarnessFailure { Assert-ActorNativeRun $context 'bamboo-storage' 'fixture::' 1 'ignored.log' $ignored } 'counts did not prove'
   $missing = { return @{ ExitCode = 0; Output = @() } }
