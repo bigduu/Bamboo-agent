@@ -60,15 +60,25 @@ function Assert-ActorNativeArtifact($Context, $Record) {
   }
 }
 
-function Invoke-ActorNativeProcess($Context, $Record, [string[]]$Arguments, [scriptblock]$Invoker = $null) {
+function Invoke-ActorNativeProcess($Context, $Record, [string[]]$Arguments, [scriptblock]$Invoker = $null, [string]$LogName = 'native-process.log') {
   Assert-ActorNativeArtifact $Context $Record
-  if ($null -eq $Invoker) {
+  $logPath = Get-ActorNativePath (Join-Path $Context.evidence $LogName) $Context.evidence
+  # Create the log before launching, and never replace earlier evidence.
+  [IO.File]::Open($logPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read).Dispose()
+  $nativeInvoker = $null -eq $Invoker
+  if ($nativeInvoker) {
     $Invoker = {
-      param($Executable, [string[]]$NativeArguments)
+      param($Executable, [string[]]$NativeArguments, $OutputPath)
       $PSNativeCommandUseErrorActionPreference = $false
-      $output = @(& $Executable @NativeArguments 2>&1 | ForEach-Object { $_.ToString() })
+      & $Executable @NativeArguments 2>&1 | ForEach-Object {
+        $line = $_.ToString()
+        # Each append opens and closes its writer immediately. A timeout or
+        # nonzero exit must retain all output already received from the process.
+        [IO.File]::AppendAllText($OutputPath, $line + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+        Write-Host $line
+      }
       $code = $LASTEXITCODE
-      return @{ ExitCode = $code; Output = $output }
+      return @{ ExitCode = $code }
     }
   }
   $previousPath = $env:PATH
@@ -79,12 +89,21 @@ function Invoke-ActorNativeProcess($Context, $Record, [string[]]$Arguments, [scr
     # Cargo's package working directory and manifest-directory environment.
     $env:PATH = (Split-Path -Parent $Record.snapshot) + [IO.Path]::PathSeparator + $previousPath
     $env:CARGO_MANIFEST_DIR = $Record.workingDirectory
-    $result = & $Invoker $Record.snapshot $Arguments
+    $result = & $Invoker $Record.snapshot $Arguments $logPath
     if ($null -eq $result) { throw 'Native process has no exit-code result' }
+    if (-not $nativeInvoker) {
+      # Injected controller fixtures keep their structured result contract;
+      # record that output before checking the simulated process exit too.
+      foreach ($item in @($result.Output)) {
+        $line = $item.ToString()
+        [IO.File]::AppendAllText($logPath, $line + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+        Write-Host $line
+      }
+    }
     if ($result.ExitCode -isnot [int] -or $result.ExitCode -ne 0) {
       throw "Native process returned a nonzero or missing exit code: $($result.ExitCode)"
     }
-    return @($result.Output | ForEach-Object { $_.ToString() })
+    return @(Get-Content -LiteralPath $logPath)
   } finally {
     Pop-Location
     $env:PATH = $previousPath
@@ -139,8 +158,7 @@ function Get-ActorNativeBinary($Context, $Package) {
 
 function Assert-ActorNativeList($Context, $Package, $Filter, $ExpectedNames, $LogName, [scriptblock]$Invoker = $null) {
   $record = Get-ActorNativeBinary $Context $Package
-  $output = @(Invoke-ActorNativeProcess $Context $record @($Filter, '--list') $Invoker)
-  $output | Set-Content (Join-Path $Context.evidence $LogName)
+  $output = @(Invoke-ActorNativeProcess $Context $record @($Filter, '--list') $Invoker $LogName)
   $names = @($output | ForEach-Object { if ($_ -match '^(.+): test$') { $Matches[1] } })
   $expected = @($ExpectedNames | ForEach-Object { "$Filter$_" })
   $noun = if ($expected.Count -eq 1) { 'test' } else { 'tests' }
@@ -190,8 +208,7 @@ function Assert-ActorNativeRun($Context, $Package, $Filter, $ExpectedCount, $Log
     throw 'Runtime selection differs from the compiled and enumerated native test set'
   }
   # Runtime must never call Cargo: use exactly the frozen, enumerated bytes.
-  $output = @(Invoke-ActorNativeProcess $Context $Context.packages[$Package] @($Filter, '--nocapture', '--test-threads=1') $Invoker)
-  $output | Tee-Object -FilePath (Join-Path $Context.evidence $LogName)
+  $output = @(Invoke-ActorNativeProcess $Context $Context.packages[$Package] @($Filter, '--nocapture', '--test-threads=1') $Invoker $LogName)
   $summaries = @($output | Where-Object { $_ -match '^test result:' })
   $passed = "^test result: ok\. $ExpectedCount passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$"
   if ($summaries.Count -ne 1 -or $summaries[0] -notmatch $passed) {

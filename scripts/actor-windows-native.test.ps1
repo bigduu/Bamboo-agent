@@ -64,6 +64,23 @@ try {
       -not $failureOutput.Contains('native stderr before exit 23')) {
     throw 'Native failure output lost stdout or stderr'
   }
+  $partialOutput = {
+    param($NativeExecutable, [string[]]$NativeArguments, $OutputPath)
+    if (-not (Test-Path -LiteralPath $OutputPath -PathType Leaf)) {
+      throw 'The output log was not created before process invocation'
+    }
+    [IO.File]::AppendAllText($OutputPath, 'partial output while still running' + [Environment]::NewLine)
+    if (-not (Get-Content -LiteralPath $OutputPath -Raw).Contains('partial output while still running')) {
+      throw 'Partial process output was not readable before the exit result'
+    }
+    return @{ ExitCode = 23; Output = @() }
+  }
+  Expect-ActorHarnessFailure {
+    Assert-ActorNativeRun $context 'bamboo-storage' 'fixture::' 1 'partial.log' $partialOutput
+  } 'nonzero.*23'
+  if (-not (Get-Content -LiteralPath (Join-Path $evidenceFixture 'partial.log') -Raw).Contains('partial output while still running')) {
+    throw 'Partial process output was lost when exit checking failed'
+  }
   $ignored = { return @{ ExitCode = 0; Output = @('test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s') } }
   Expect-ActorHarnessFailure { Assert-ActorNativeRun $context 'bamboo-storage' 'fixture::' 1 'ignored.log' $ignored } 'counts did not prove'
   $missing = { return @{ ExitCode = 0; Output = @() } }
@@ -92,13 +109,92 @@ try {
   $commandRecord.snapshot = Join-Path $targetFixture 'command.exe'
   [IO.File]::Copy($env:ComSpec, $commandRecord.snapshot, $false)
   $commandRecord.sha256 = (Get-FileHash -LiteralPath $commandRecord.snapshot -Algorithm SHA256).Hash
-  $nativeOutput = @(Invoke-ActorNativeProcess $context $commandRecord @('/d', '/c', 'echo native-controller-ok'))
+  $nativeOutput = @(Invoke-ActorNativeProcess $context $commandRecord @('/d', '/c', 'echo native-controller-ok') $null 'real-success.log')
   if ($nativeOutput.Count -ne 1 -or $nativeOutput[0] -cne 'native-controller-ok') {
     throw 'Real native process output or successful exit was lost'
   }
   Expect-ActorHarnessFailure {
-    Invoke-ActorNativeProcess $context $commandRecord @('/d', '/c', 'exit 23')
+    Invoke-ActorNativeProcess $context $commandRecord @('/d', '/c', 'echo native stdout before exit 23 & echo native stderr before exit 23 1>&2 & exit 23') $null 'real-nonzero.log'
   } 'nonzero.*23'
+  $nativeFailureOutput = Get-Content -LiteralPath (Join-Path $evidenceFixture 'real-nonzero.log') -Raw
+  if (-not $nativeFailureOutput.Contains('native stdout before exit 23') -or
+      -not $nativeFailureOutput.Contains('native stderr before exit 23')) {
+    throw 'Real native failure output lost stdout or stderr'
+  }
+
+  # Reproduce a runner-style timeout in an owned child controller. Kill only
+  # this fixture's process tree after its bounded deadline, then inspect bytes
+  # that had to be persisted while the native command was still running.
+  $timeoutPayload = Join-Path $targetFixture 'timeout-context.json'
+  @{ Context = $context; Record = $commandRecord } |
+    ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $timeoutPayload
+  $timeoutScriptPath = Join-Path $targetFixture 'timeout-controller.ps1'
+  $timeoutScript = @'
+param($HelperPath, $PayloadPath)
+$ErrorActionPreference = 'Stop'
+. $HelperPath
+$payload = Get-Content -LiteralPath $PayloadPath -Raw | ConvertFrom-Json -AsHashtable
+Invoke-ActorNativeProcess $payload.Context $payload.Record @('/d', '/c', 'echo native timeout stdout & echo native timeout stderr 1>&2 & ping -n 60 127.0.0.1 >nul') $null 'timeout.log'
+throw 'The hanging fixture returned before its timeout deadline'
+'@
+  $timeoutScript | Set-Content -LiteralPath $timeoutScriptPath
+  $startInfo = [Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = (Get-Process -Id $PID).Path
+  $startInfo.UseShellExecute = $false
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+  foreach ($argument in @('-NoProfile', '-NonInteractive', '-File', $timeoutScriptPath,
+      (Join-Path $PSScriptRoot 'actor-windows-native.ps1'), $timeoutPayload)) {
+    $startInfo.ArgumentList.Add($argument)
+  }
+  $controller = [Diagnostics.Process]::new()
+  $controller.StartInfo = $startInfo
+  $started = $false
+  $stdout = $null
+  $stderr = $null
+  try {
+    $started = $controller.Start()
+    if (-not $started) { throw 'Cannot start the isolated timeout controller' }
+    $stdout = $controller.StandardOutput.ReadToEndAsync()
+    $stderr = $controller.StandardError.ReadToEndAsync()
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
+    $retainedWhileRunning = $false
+    $timeoutLog = Join-Path $evidenceFixture 'timeout.log'
+    while ([DateTimeOffset]::UtcNow -lt $deadline) {
+      if ($controller.HasExited) { throw 'The timeout fixture exited before its deadline' }
+      if (Test-Path -LiteralPath $timeoutLog -PathType Leaf) {
+        $partial = Get-Content -LiteralPath $timeoutLog -Raw
+        if ($null -ne $partial -and $partial.Contains('native timeout stdout') -and $partial.Contains('native timeout stderr')) {
+          $retainedWhileRunning = $true
+        }
+      }
+      Start-Sleep -Milliseconds 50
+    }
+    $controller.Kill($true)
+    if (-not $controller.WaitForExit(5000)) { throw 'The owned timeout process tree did not exit' }
+    if ($controller.ExitCode -eq 0) { throw 'A timed-out controller was incorrectly reported as successful' }
+    if (-not $retainedWhileRunning) { throw 'Timed-out native output must be retained before termination' }
+    $retainedAfterTimeout = Get-Content -LiteralPath $timeoutLog -Raw
+    if (-not $retainedAfterTimeout.Contains('native timeout stdout') -or
+        -not $retainedAfterTimeout.Contains('native timeout stderr')) {
+      throw 'Timed-out native stdout or stderr was lost after termination'
+    }
+    Write-Host "Owned timeout fixture retained both streams before/after termination; exit=$($controller.ExitCode)"
+  } finally {
+    if ($started -and -not $controller.HasExited) {
+      $controller.Kill($true)
+      if (-not $controller.WaitForExit(5000)) { throw 'Cannot clean the owned timeout fixture' }
+    }
+    if ($null -ne $stdout) {
+      $captured = $stdout.GetAwaiter().GetResult()
+      if ($captured) { Write-Host $captured.TrimEnd() }
+    }
+    if ($null -ne $stderr) {
+      $captured = $stderr.GetAwaiter().GetResult()
+      if ($captured) { Write-Host $captured.TrimEnd() }
+    }
+    $controller.Dispose()
+  }
 
   # A complete synthetic manifest must survive the real JSON handoff. Its
   # fixtures still do not execute or claim any of the 41 native Rust cases.
