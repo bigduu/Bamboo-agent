@@ -1,9 +1,11 @@
 const assert = require("node:assert/strict")
+const { createHash } = require("node:crypto")
 const { mkdtempSync, readFileSync, rmSync, writeFileSync } = require("node:fs")
 const { spawnSync } = require("node:child_process")
 const os = require("node:os")
 const path = require("node:path")
 const { test } = require("node:test")
+const { runInNewContext } = require("node:vm")
 
 const workflow = readFileSync(".github/workflows/ci.yml", "utf8")
 const cacheCleanupWorkflow = readFileSync(
@@ -12,6 +14,20 @@ const cacheCleanupWorkflow = readFileSync(
 )
 const codeqlWorkflow = readFileSync(".github/workflows/codeql.yml", "utf8")
 const contributing = readFileSync("CONTRIBUTING.md", "utf8")
+const frozenCacheWriteHeader = [
+  "  BAMBOO_RELEASE_CACHE_WRITE_ALLOWED: >-",
+  "    ${{ !(",
+  "      startsWith(github.ref, 'refs/heads/bamboo/release/da348-') ||",
+  "      github.ref == 'refs/heads/release/da348a63f1d019a22df547c78575c500b6b1294e' ||",
+  "      startsWith(github.head_ref, 'bamboo/release/da348-') ||",
+  "      github.head_ref == 'release/da348a63f1d019a22df547c78575c500b6b1294e' ||",
+  "      (github.event_name == 'push' && github.ref == 'refs/heads/main' &&",
+  "       (github.event.before == 'dbafb74522794012fc8f0a61e761817b3913989a' ||",
+  "        contains(github.event.head_commit.message, 'release/da348a63f1d019a22df547c78575c500b6b1294e')))",
+  "    ) }}",
+]
+const cacheSaveIf = (predicate) =>
+  `save-if: \${{ (${predicate}) && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}`
 
 const job = (id) => {
   const marker = `\n  ${id}:\n`
@@ -243,11 +259,10 @@ test("all-feature E2E tests retain the workspace test thread stack contract", ()
   assert.doesNotMatch(step, /^        (?:if|continue-on-error):/mu)
 })
 
-test("PR caches are reusable while open and scoped cleanup runs on close", () => {
-  assert.match(
-    job("test"),
-    /save-if: \$\{\{ github\.event_name == 'push' \|\| \(github\.event_name == 'pull_request' && github\.base_ref == 'dev'\) \}\}/u,
-  )
+test("ordinary PR caches remain reusable and frozen validation restores without saving", () => {
+  assert.ok(job("test").includes(cacheSaveIf(
+    "github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'dev')",
+  )))
   for (const id of [
     "msrv",
     "tls-fixture-test",
@@ -257,9 +272,8 @@ test("PR caches are reusable while open and scoped cleanup runs on close", () =>
     "docs",
     "security",
   ]) {
-    assert.match(
-      job(id),
-      /save-if: \$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' \}\}/u,
+    assert.ok(
+      job(id).includes(cacheSaveIf("github.event_name == 'push' && github.ref == 'refs/heads/main'")),
       `${id} must restore but not write PR-scoped caches`,
     )
   }
@@ -606,6 +620,64 @@ assert counts == fixture.get("counts", {"release": 2, "dev": 2, "compare": 2}), 
 const frontendWorkflow = readFileSync(
   ".github/workflows/frontend-acceptance.yml", "utf8",
 )
+test("this frozen batch cannot save cache on source, integration, promotion or main push", () => {
+  const actor = readFileSync(".github/workflows/actor-snapshot-windows.yml", "utf8")
+  const docs = readFileSync(".github/workflows/docs.yml", "utf8")
+  const sources = [workflow, frontendWorkflow, actor, docs]
+  const header = frozenCacheWriteHeader.join("\n")
+  const expression = frozenCacheWriteHeader.slice(1).join("\n").trim().slice(3, -2)
+  const cutRef = "release/da348a63f1d019a22df547c78575c500b6b1294e"
+  const anchor = "dbafb74522794012fc8f0a61e761817b3913989a"
+  const context = ({ event = "workflow_dispatch", ref = "", head = "", base = "", before = "", message = "" }) => ({
+    event_name: event, ref, head_ref: head, base_ref: base,
+    event: { before, head_commit: { message } },
+  })
+  const cases = [
+    ["original source", context({ ref: "refs/heads/bamboo/release/da348-cache-readonly" }), false],
+    ["fixed release source", context({ ref: `refs/heads/${cutRef}` }), false],
+    ["dev integration", context({ event: "pull_request", ref: "refs/pull/2037/merge", head: "bamboo/release/da348-main-ancestry", base: "dev" }), false],
+    ["main promotion", context({ event: "pull_request", ref: "refs/pull/2036/merge", head: cutRef, base: "main" }), false],
+    ["first promotion push", context({ event: "push", ref: "refs/heads/main", before: anchor }), false],
+    ["identified later promotion push", context({ event: "push", ref: "refs/heads/main", before: "changed-base", message: `Merge pull request #2036 from bigduu/${cutRef}` }), false],
+    ["batch backmerge", context({ event: "pull_request", head: "bamboo/release/da348-main-backmerge", base: "dev" }), false],
+    ["case-insensitive branch function", context({ ref: "refs/heads/BAMBOO/RELEASE/DA348-SOURCE" }), false],
+    ["other source", context({ ref: "refs/heads/bamboo/release/other-source" }), true],
+    ["similar unrelated prefix", context({ ref: "refs/heads/bamboo/release/da348x-source" }), true],
+    ["ordinary dev PR", context({ event: "pull_request", head: "feature/example", base: "dev" }), true],
+    ["other release PR", context({ event: "pull_request", head: "release/another-cut", base: "main" }), true],
+    ["later unrelated main push", context({ event: "push", ref: "refs/heads/main", before: "other-base", message: "ordinary merge" }), true],
+  ]
+  const evaluate = (value, github, allowed) => runInNewContext(value, {
+    github, env: { BAMBOO_RELEASE_CACHE_WRITE_ALLOWED: String(allowed) },
+    startsWith: (text, prefix) => String(text).toLowerCase().startsWith(prefix.toLowerCase()),
+    contains: (text, part) => String(text).toLowerCase().includes(part.toLowerCase()),
+  }, { timeout: 1000 })
+  let caches = 0
+  for (const source of sources) {
+    const actualHeader = source.match(/^  BAMBOO_RELEASE_CACHE_WRITE_ALLOWED: >-\n((?:    .*\n)+)/mu)
+    const actualExpression = actualHeader ? actualHeader[1].trim().slice(3, -2) : "true"
+    const steps = source.split(/\n      - /u).filter((step) => step.includes("uses: swatinem/rust-cache@v2"))
+    for (const step of steps) {
+      const conditions = [...step.matchAll(/^          save-if: \$\{\{ (.*) \}\}$/gmu)]
+      assert.ok(conditions.length <= 1, "a cache action cannot have conflicting save predicates")
+      const saveExpression = conditions.length ? conditions[0][1] : "true"
+      caches += 1
+      for (const [name, github, expected] of cases) {
+        const allowed = evaluate(actualExpression, github, true)
+        if (!expected) assert.equal(evaluate(saveExpression, github, allowed), false, `${name} must not save cache`)
+      }
+      assert.equal(conditions.length, 1, "each cache action must have an explicit save predicate")
+      assert.ok(saveExpression.includes("env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true'"))
+    }
+    assert.equal(source.split(header).length, 2, "one shared batch predicate must govern each workflow")
+    for (const [name, github, expected] of cases) assert.equal(evaluate(expression, github, true), expected, name)
+  }
+  assert.equal(caches, 12, "all planned source/dev/main cache actions remain covered")
+  assert.ok(actor.includes(cacheSaveIf("github.event_name == 'pull_request' && github.base_ref == 'dev'")))
+  assert.match(docs, /cache-on-failure: true\n          save-if: \$\{\{ env\.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' \}\}/u)
+  const publisher = readFileSync(".github/workflows/publish-crate.yml", "utf8")
+  assert.doesNotMatch(publisher, /(?:swatinem\/rust-cache|actions\/cache)@|\bcache-to:/u)
+})
 const frontendHead = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
 const frontendJobs = (source) => {
   const parts = source.replace(/\r\n/gu, "\n").split("\njobs:\n")
@@ -630,7 +702,7 @@ const frontendScript = (step) => {
 }
 function assertFrontendPolicy(source) {
   source = source.replace(/\r\n/gu, "\n")
-  const header = source.slice(0, source.indexOf("\njobs:\n")).split("\n").filter((line) => line.trim() && !line.startsWith("#"))
+  const header = source.slice(0, source.indexOf("\njobs:\n")).split("\n").filter((line) => line.trim() && !line.trimStart().startsWith("#"))
   assert.deepEqual(header, [
     "name: Frontend consumer acceptance",
     "on:",
@@ -646,6 +718,7 @@ function assertFrontendPolicy(source) {
     "  contents: read",
     "env:",
     "  PYTHONDONTWRITEBYTECODE: \"1\"",
+    ...frozenCacheWriteHeader,
   ], "main and manual snapshot routing binds the actual source without Cargo environment overrides")
   const lint = source.split("\n  lint:\n")[1].split("\n  build:\n")[0].replace(/^  #.*(?:\n|$)/gmu, "").trimEnd()
   assert.equal(lint, [
@@ -689,7 +762,7 @@ function assertFrontendPolicy(source) {
     "        uses: swatinem/rust-cache@v2",
     "        with:",
     "          shared-key: bamboo-ci-lint-${{ runner.os }}",
-    "          save-if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'dev') }}",
+    "          " + cacheSaveIf("github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'dev')"),
     "",
     "      - name: Check formatting",
     "        run: cargo fmt --all -- --check",
@@ -709,7 +782,7 @@ function assertFrontendPolicy(source) {
     "",
     "      - name: Require source files to remain unchanged",
     "        run: git diff --exit-code",
-  ].join("\n"), "the current lint job, snapshot guard, Clippy arguments and cache policy remain unchanged")
+  ].join("\n"), "the lint source guards and Clippy arguments remain exact; frozen validation only changes cache saving")
   const jobs = frontendJobs(source)
   source = "  build:\n" + source.split("  build:\n")[1]
   const withoutFinalConditions = source.replaceAll(
@@ -1002,5 +1075,122 @@ test("frontend acceptance final guards inspect actual HEAD, index and untracked 
   } finally {
     rmSync(directory, { recursive: true, force: true })
     rmSync(statusTools, { recursive: true, force: true })
+  }
+})
+
+const actorWindowsWorkflow = readFileSync(".github/workflows/actor-snapshot-windows.yml", "utf8")
+const actorWindowsController = readFileSync("scripts/actor-windows-native.ps1", "utf8")
+const actorWindowsControllerTests = readFileSync("scripts/actor-windows-native.test.ps1", "utf8")
+const actorWindowsStep = (source, name) => {
+  const marker = `      - name: ${name}\n`
+  const start = source.indexOf(marker)
+  assert.notEqual(start, -1, `missing native Windows step: ${name}`)
+  const end = source.indexOf("\n      - ", start + marker.length)
+  return source.slice(start, end === -1 ? undefined : end)
+}
+const actorWindowsCompileName = "Compile and verify all 41 selected native tests"
+const actorWindowsRunName = "Execute 9 snapshot, 3 gateway, 19 directory, 5 scoped and 5 initial process tests"
+
+const assertActorWindowsAcceptance = (source) => {
+  const compile = actorWindowsStep(source, actorWindowsCompileName)
+  const runtime = actorWindowsStep(source, actorWindowsRunName)
+  const groups = [...compile.matchAll(/Assert-TestList '([^']+)' '([^']+)' @\(([\s\S]*?)\n\s*\) '([^']+)'/gu)]
+    .map(([, packageName, filter, body, log]) => ({
+      package: packageName, filter,
+      names: [...body.matchAll(/^\s*'([^']+)'\s*$/gmu)].map(([, name]) => name), log,
+    }))
+  // The exact original EF29 selection, including every name and its scope.
+  assert.equal(createHash("sha256").update(JSON.stringify(groups)).digest("hex"),
+    "b825cd60aa10b69ce33bcb0d92fff7e9c37878d3375f8008834b7e496c90fd52")
+  assert.deepEqual(groups.map(({ names }) => names.length), [9, 3, 19, 5, 5])
+  const runs = [...runtime.matchAll(/Assert-TestRun '([^']+)' '([^']+)' ([0-9]+) '([^']+)'/gu)]
+    .map(([, packageName, filter, count]) => ({ package: packageName, filter, count: Number(count) }))
+  assert.deepEqual(runs, groups.map(({ package: packageName, filter, names }) => ({
+    package: packageName, filter, count: names.length,
+  })))
+  assert.match(compile, /timeout-minutes: 20\n/u)
+  assert.match(runtime, /timeout-minutes: 5\n/u)
+  assert.doesNotMatch(runtime, /(?:&\s*|run:\s*)cargo\b/iu)
+  assert.match(compile, /Save-ActorNativeManifest \$nativeContext/u)
+  assert.match(runtime, /Read-ActorNativeManifest \$evidence/u)
+  assert.match(runtime, /Assert-ActorNativeRun \$nativeContext \$package \$filter \$expectedCount \$logName/u)
+}
+
+test("native Windows retains the exact 41-case selection and original runtime budget", () => {
+  assertActorWindowsAcceptance(actorWindowsWorkflow)
+  assert.match(actorWindowsWorkflow, /runs-on: windows-2025\n    timeout-minutes: 30\n/u)
+  assert.match(actorWindowsWorkflow, /contents: read/u)
+  assert.match(actorWindowsWorkflow, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
+  assert.match(actorWindowsWorkflow, /RUST_MIN_STACK: '8388608'/u)
+  assert.match(actorWindowsWorkflow, /toolchain: 1\.99\.0-x86_64-pc-windows-msvc/u)
+  assert.match(actorWindowsWorkflow, /RUNNER_OS -ne 'Windows'.*RUNNER_ARCH -ne 'X64'/u)
+  assert.match(actorWindowsWorkflow, /mklink \/J/u)
+  assert.match(actorWindowsWorkflow, /\$junction\.LinkType -ne 'Junction'/u)
+  assert.match(actorWindowsWorkflow, /fsutil reparsepoint query/u)
+  assert.match(actorWindowsWorkflow, /'host: x86_64-pc-windows-msvc'/u)
+  assert.match(actorWindowsWorkflow, /'release: 1\.99\.0'/u)
+  assert.match(actorWindowsWorkflow, /Retain native Windows evidence even on failure\n        if: always\(\)/u)
+  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
+    "'background_scope_drain'", "'missing_original_case'")), "dropping or replacing a case must fail")
+  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
+    "timeout-minutes: 5\n", "timeout-minutes: 15\n")), "the runtime budget must not expand")
+  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
+    "$nativeContext = Read-ActorNativeManifest $evidence",
+    "$nativeContext = Read-ActorNativeManifest $evidence\n          & cargo test --locked")),
+  "runtime must not re-enter Cargo")
+})
+
+test("native Windows runs source-bound immutable artifacts and preserves process failures", () => {
+  const functionBody = (name) => {
+    const marker = `function ${name}(`
+    const start = actorWindowsController.indexOf(marker)
+    assert.notEqual(start, -1)
+    const end = actorWindowsController.indexOf("\nfunction ", start + marker.length)
+    return actorWindowsController.slice(start, end === -1 ? undefined : end)
+  }
+  const build = functionBody("Get-ActorNativeBinary")
+  assert.match(build, /cargo test --locked -p \$Package --lib --no-run --message-format=json-render-diagnostics/u)
+  assert.match(build, /\$Context\.packages\.ContainsKey\(\$Package\)/u)
+  assert.match(build, /'build-finished'/u)
+  assert.match(build, /\$units\.Count -ne 1/u)
+  assert.match(build, /\[IO\.File\]::Copy\(\$executable, \$snapshot, \$false\)/u)
+  for (const name of ["Invoke-ActorNativeProcess", "Assert-ActorNativeRun"]) {
+    assert.doesNotMatch(functionBody(name), /&\s*cargo\b|cargo\s+test/iu)
+  }
+  const invoke = functionBody("Invoke-ActorNativeProcess")
+  assert.ok(invoke.indexOf("Assert-ActorNativeArtifact") < invoke.indexOf("& $Invoker"))
+  assert.match(invoke, /& \$Executable @NativeArguments/u)
+  assert.match(invoke, /\$code = \$LASTEXITCODE/u)
+  assert.match(invoke, /\[IO\.File\]::AppendAllText\(\$OutputPath,/u)
+  assert.match(invoke, /\[IO\.FileMode\]::CreateNew/u)
+  assert.doesNotMatch(invoke, /\$output = @\(& \$Executable/u)
+  assert.ok(invoke.indexOf("AppendAllText($OutputPath") < invoke.indexOf("$code = $LASTEXITCODE"),
+    "native output must be written while the executable runs")
+  assert.ok(invoke.indexOf("AppendAllText($logPath") < invoke.indexOf("if ($result.ExitCode"),
+    "injected failure output must be retained before rejecting its exit code")
+  assert.match(invoke, /return @\(Get-Content -LiteralPath \$logPath\)/u)
+  assert.match(invoke, /\$result\.ExitCode -isnot \[int\] -or \$result\.ExitCode -ne 0/u)
+  assert.match(invoke, /Push-Location -LiteralPath \$Record\.workingDirectory/u)
+  assert.match(invoke, /\$env:CARGO_MANIFEST_DIR = \$Record\.workingDirectory/u)
+  assert.match(invoke, /finally \{\s*Pop-Location/u)
+  const artifact = functionBody("Assert-ActorNativeArtifact")
+  assert.match(artifact, /\$identity\.revision -cne \$Context\.revision/u)
+  assert.match(artifact, /\$identity\.tree -cne \$Context\.tree/u)
+  assert.match(artifact, /Get-FileHash -LiteralPath \$snapshot -Algorithm SHA256/u)
+  assert.match(artifact, /FileAttributes\]::ReparsePoint/u)
+  assert.match(functionBody("Get-ActorNativeIdentity"), /status --porcelain --untracked-files=all/u)
+  assert.match(functionBody("Assert-ActorNativeRun"), /0 failed; 0 ignored/u)
+  const fixture = actorWindowsStep(actorWindowsWorkflow, "Test native executable controller guards")
+  assert.match(fixture, /run: \.\/scripts\/actor-windows-native\.test\.ps1/u)
+  for (const failure of ["nonzero.*23", "counts did not prove", "no exit-code result",
+    "selection differs", "Selected tests differ", "executable is missing, replaced or changed",
+    "outside its owned directory", "source changed", "all five scopes and all 41 tests"]) {
+    assert.ok(actorWindowsControllerTests.includes(`'${failure}'`), `missing controller failure fixture: ${failure}`)
+  }
+  for (const witness of ["Native failure output must be preserved before a nonzero exit is propagated",
+    "partial output while still running", "Real native failure output lost stdout or stderr",
+    "Timed-out native output must be retained before termination",
+    "A timed-out controller was incorrectly reported as successful"]) {
+    assert.ok(actorWindowsControllerTests.includes(witness), `missing output-retention regression: ${witness}`)
   }
 })
