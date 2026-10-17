@@ -7,6 +7,7 @@ description = "File-authoritative Supervisor work contracts and assignment servi
 license = "MIT"
 
 [dependencies]
+bamboo-domain = { path = "../../core/bamboo-domain" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

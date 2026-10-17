@@ -271,6 +271,8 @@ pub struct DispatchIntent {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_context_hash: Option<String>,
     pub binding: ScopeBinding,
     pub work_id: String,
     pub assignment_id: String,
@@ -347,6 +349,9 @@ pub struct ImportSource {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub schema: u32,
+    /// Explicit project membership and immutable adopted context; absent in legacy scopes.
+    #[serde(default, skip_serializing_if = "crate::ProjectTicketState::is_empty")]
+    pub project: crate::ProjectTicketState,
     pub binding: ScopeBinding,
     pub seq: u64,
     pub graph_revision: u64,
@@ -368,6 +373,7 @@ impl Snapshot {
     pub fn empty(binding: ScopeBinding) -> Self {
         Self {
             schema: 1,
+            project: Default::default(),
             binding,
             seq: 0,
             graph_revision: 0,
@@ -406,6 +412,14 @@ pub enum CommandSource {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Operation {
+    AssociateProject {
+        ticket_id: String,
+        project_id: bamboo_domain::ProjectId,
+    },
+    SetProjectContext {
+        work_id: String,
+        context: crate::ProjectContextSnapshot,
+    },
     Create {
         temp_id: String,
         kind: TicketKind,

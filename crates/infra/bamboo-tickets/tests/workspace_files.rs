@@ -211,7 +211,44 @@ fn actual_file_write_receipt_replay_changed_payload_and_full_manifest_backup() {
 
 #[test]
 fn schema_four_file_evidence_survives_stopped_offline_transfer_without_downgrade() {
+    file_evidence_transfer_preserves_schema(false);
+}
+
+#[test]
+fn schema_five_project_and_file_evidence_survive_stopped_transfer_without_downgrade() {
+    file_evidence_transfer_preserves_schema(true);
+}
+
+fn file_evidence_transfer_preserves_schema(with_project: bool) {
     let f = fixture();
+    if with_project {
+        let snapshot = f.service.published().unwrap().1;
+        let host = Authority::from_verified_host(
+            snapshot.binding.clone(),
+            Principal::User {
+                user_id: "owner".into(),
+            },
+        );
+        execute(
+            &f.service,
+            &host,
+            "linked-work",
+            vec![
+                Operation::Create {
+                    temp_id: "project-work".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    depends_on: BTreeSet::new(),
+                    contract: snapshot.tickets.values().next().unwrap().contract.clone(),
+                },
+                Operation::AssociateProject {
+                    ticket_id: "project-work".into(),
+                    project_id: bamboo_domain::ProjectId::parse("durable-project").unwrap(),
+                },
+            ],
+        )
+        .unwrap();
+    }
     let path = Path::new(&f.workspace.worktree).join("code.rs");
     let artifact = f
         .service
@@ -269,7 +306,9 @@ fn schema_four_file_evidence_survives_stopped_offline_transfer_without_downgrade
     destination
         .activate_migrated_copy(&source, &user, &request, &proof)
         .unwrap();
-    assert_eq!(destination.published().unwrap().1.schema, 4);
+    let migrated = destination.published().unwrap().1;
+    assert_eq!(migrated.schema, if with_project { 5 } else { 4 });
+    assert_eq!(migrated.project.links.len(), usize::from(with_project));
     assert_eq!(
         destination
             .read_artifact(&user, &artifact, FILE_BYTES_LIMIT)

@@ -90,6 +90,19 @@ pub async fn overview(
     Ok(HttpResponse::Ok().json(service.work_overview(&authority)?))
 }
 
+pub async fn project_board(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    body: web::Json<ProjectBoardRequest>,
+) -> std::result::Result<HttpResponse, TicketHttpError> {
+    let (service, authority) = state.tickets.authority(user(&state, &req).await?).await?;
+    state
+        .project_store
+        .get(&body.project_id)
+        .map_err(|e| Error::InvalidTransition(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(service.project_board(&authority, &body)?))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchRequest {

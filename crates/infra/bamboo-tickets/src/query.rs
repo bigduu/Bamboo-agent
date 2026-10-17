@@ -133,6 +133,8 @@ pub struct AnsweredInput {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkContextPacket {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_context: Option<crate::ProjectContextSnapshot>,
     pub contract_ref: String,
     pub contract_revision: u64,
     pub generation: u64,
@@ -156,7 +158,7 @@ pub struct WorkChange {
     pub id: String,
 }
 
-fn visible(authority: &Authority, snapshot: &Snapshot) -> Result<BTreeSet<String>> {
+pub(crate) fn visible(authority: &Authority, snapshot: &Snapshot) -> Result<BTreeSet<String>> {
     validate_authority(authority, snapshot)?;
     if let Principal::Worker { assignment_id, .. } = &authority.principal {
         let assignment = &snapshot.assignments[assignment_id];
@@ -191,7 +193,7 @@ fn can_read_work_private(authority: &Authority, snapshot: &Snapshot, work_id: &s
     }
 }
 
-fn envelope<T>(
+pub(crate) fn envelope<T>(
     commit: String,
     snapshot: &Snapshot,
     authority: &Authority,
@@ -302,7 +304,7 @@ impl TicketService {
         )
     }
 
-    fn query_snapshot(
+    pub(crate) fn query_snapshot(
         &self,
         authority: &Authority,
         query_hash: &str,
@@ -577,7 +579,7 @@ impl TicketService {
     }
 }
 
-fn page<T: Clone>(
+pub(crate) fn page<T: Clone>(
     commit: String,
     snapshot: &Snapshot,
     authority: &Authority,
@@ -670,7 +672,7 @@ pub(crate) fn build_context_packet(
             });
         }
     }
-    let packet=WorkContextPacket { contract_ref:work.id.clone(),contract_revision:work.contract_revision,generation:assignment.generation,
+    let packet=WorkContextPacket { project_context: snapshot.project.assignment_contexts.get(assignment_id).and_then(|hash| snapshot.project.contexts.get(hash)).cloned(), contract_ref:work.id.clone(),contract_revision:work.contract_revision,generation:assignment.generation,
         assignment_id:assignment_id.into(),binding:snapshot.binding.clone(),contract:work.contract.clone(),inputs:assignment.dependency_inputs.clone(),
         input_artifacts, workspace:assignment.workspace.clone(),
         answers:snapshot.requests.values().filter(|r| r.work_id == work.id && r.contract_revision == assignment.contract_revision

@@ -55,7 +55,7 @@ impl Authority {
             } => format!("worker:{assignment_id}:{generation}:{run_id}:{session_id}"),
         }
     }
-    fn supervisor(&self) -> Result<()> {
+    pub(crate) fn supervisor(&self) -> Result<()> {
         match &self.principal {
             Principal::Supervisor { session_id }
                 if session_id == &self.binding.supervisor_session_id =>
@@ -732,6 +732,17 @@ fn apply(
     use Operation::*;
     let seq = snapshot.seq;
     match operation {
+        AssociateProject {
+            ticket_id,
+            project_id,
+        } => {
+            authority.supervisor()?;
+            crate::project::associate(snapshot, &resolve(ticket_id, ids), project_id)?;
+        }
+        SetProjectContext { work_id, context } => {
+            authority.supervisor()?;
+            crate::project::set_context(snapshot, &resolve(work_id, ids), context)?;
+        }
         Create {
             temp_id,
             kind,
@@ -768,6 +779,15 @@ fn apply(
                     import_source: None,
                 },
             );
+            let created = ids[temp_id].clone();
+            if let Some(project_id) = snapshot.tickets[&created]
+                .parent
+                .as_ref()
+                .and_then(|parent| snapshot.project.links.get(parent))
+                .cloned()
+            {
+                snapshot.project.links.insert(created, project_id);
+            }
             snapshot.graph_revision += 1;
         }
         Ready { work_id } => {
@@ -916,11 +936,14 @@ fn apply(
                     ));
                 }
             }
+            let context_ref =
+                crate::project::context_for_start(snapshot, &work, workspace.as_ref())?;
             let inputs = dependencies(snapshot, &work)?;
             let id = allocate(temp_id, ids)?;
             let generation = work.generation + 1;
             let dispatch_key = format!("{}/{}/{generation}", snapshot.binding.scope_id, id);
             let spec = DispatchSpec {
+                project_context_hash: context_ref.clone(),
                 binding: snapshot.binding.clone(),
                 work_id: work_id.clone(),
                 assignment_id: id.clone(),
@@ -957,6 +980,12 @@ fn apply(
                     updated_seq: seq,
                 },
             );
+            if let Some(context_ref) = context_ref {
+                snapshot
+                    .project
+                    .assignment_contexts
+                    .insert(id.clone(), context_ref);
+            }
             snapshot.intents.insert(
                 dispatch_key.clone(),
                 DispatchIntent {
@@ -2100,6 +2129,7 @@ fn valid_effect_transition(from: EffectState, to: EffectState) -> bool {
 }
 
 pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
+    crate::project::validate(snapshot)?;
     crate::migration::validate_migration(snapshot)?;
     crate::file_reconciliation::validate_file_intents(snapshot)?;
     crate::resolution::validate_history(snapshot)?;
