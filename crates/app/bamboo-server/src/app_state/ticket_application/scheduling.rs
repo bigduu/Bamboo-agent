@@ -19,7 +19,7 @@ impl TicketApplication {
         self.ready_scheduler.reconcile(self).await
     }
 
-    pub(super) fn spawn_ready_worker(
+    pub(in crate::app_state) fn spawn_ready_worker(
         self: &Arc<Self>,
         shutdown: tokio_util::sync::CancellationToken,
     ) {
@@ -27,7 +27,7 @@ impl TicketApplication {
         self.ready_scheduler.spawn(Arc::downgrade(&host), shutdown);
     }
 
-    pub(super) async fn shutdown_ready_worker(&self) {
+    pub(in crate::app_state) async fn shutdown_ready_worker(&self) {
         self.ready_scheduler.shutdown().await;
     }
 }
