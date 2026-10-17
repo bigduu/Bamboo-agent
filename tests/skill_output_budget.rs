@@ -268,6 +268,7 @@ struct Observation {
     actual_cap: Option<u32>,
     resolved_cap: Option<u32>,
     previous_cap: Option<u32>,
+    runtime_blocker: Option<String>,
 }
 async fn public_reader_round(
     response_bytes: usize,
@@ -450,6 +451,7 @@ async fn reader_round_with(
             actual_cap: None,
             resolved_cap: None,
             previous_cap: None,
+            runtime_blocker: None,
         };
     }
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -477,8 +479,11 @@ async fn reader_round_with(
         .default_tools(overlay)
         .build()
         .unwrap();
-    run_reader_runtime(&runtime, &mut session, dir.path()).await;
+    run_reader_runtime(&runtime, &mut session, dir.path())
+        .await
+        .expect("authorized Reader baseline must execute");
     let mut previous_cap = None;
+    let mut runtime_blocker = None;
     if let Some((change, cold)) = repeat.filter(|(change, _)| *change != "shadow") {
         assert!(errors.lock().unwrap().is_empty());
         let (id, raw) = pages.lock().unwrap()[0].clone();
@@ -556,7 +561,34 @@ async fn reader_round_with(
         pages.lock().unwrap().clear();
         errors.lock().unwrap().clear();
         caps.lock().unwrap().clear();
-        run_reader_runtime(&runtime, &mut session, dir.path()).await;
+        let pinned_before = session
+            .metadata
+            .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY)
+            .cloned();
+        let result = run_reader_runtime(&runtime, &mut session, dir.path()).await;
+        if change == "session" {
+            runtime_blocker = Some(result.expect_err(
+                "Root tightening with a persisted activation must reject before the provider",
+            ));
+            let pinned_before =
+                pinned_before.expect("the authorized baseline pinned its activation");
+            assert_eq!(
+                session
+                    .metadata
+                    .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY),
+                Some(&pinned_before),
+                "Root rejection must retain the activation evidence for an explicit host correction"
+            );
+            let stored = storage.load_session(&session.id).await.unwrap().unwrap();
+            assert_eq!(
+                stored
+                    .metadata
+                    .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY),
+                Some(&pinned_before)
+            );
+        } else {
+            result.expect("Reader-level revocation must retain its genuine failed ToolResult");
+        }
     }
     let requests = requests.lock().unwrap().clone();
     let pages = pages.lock().unwrap().clone();
@@ -573,6 +605,7 @@ async fn reader_round_with(
             .effective_token_budget()
             .map(|b| b.max_tool_output_tokens),
         previous_cap,
+        runtime_blocker,
         resolved_cap: session
             .resolved_token_budget
             .as_ref()
@@ -584,7 +617,7 @@ async fn run_reader_runtime(
     runtime: &bamboo_engine::AgentRuntime,
     session: &mut Session,
     data_dir: &std::path::Path,
-) {
+) -> Result<(), String> {
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(128);
     let events = tokio::spawn(async move {
         let mut events = Vec::new();
@@ -593,7 +626,7 @@ async fn run_reader_runtime(
         }
         events
     });
-    tokio::time::timeout(
+    let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         runtime.execute(
             session,
@@ -605,9 +638,12 @@ async fn run_reader_runtime(
         ),
     )
     .await
-    .unwrap()
-    .unwrap();
-    events.await.unwrap();
+    .expect("Reader Runtime must finish within the fixture deadline");
+    tokio::time::timeout(std::time::Duration::from_secs(30), events)
+        .await
+        .expect("Reader Runtime must close its fixture event channel")
+        .unwrap();
+    result.map(|_| ()).map_err(|error| error.to_string())
 }
 
 fn exact_reply<'a>(messages: &'a [Message], id: &str) -> &'a Message {
@@ -1047,15 +1083,21 @@ async fn skill_output_scoped_runtime_warm_and_cold_revocation_remains_mandatory(
             .await;
             assert!(observed.pages.is_empty(), "{change}, cold={cold}");
             if change == "session" {
-                // Root tightening is enforced even earlier than Reader freshness:
-                // no executor dispatch or cap observation may occur at all.
+                // Root tightening rejects the persisted activation before the
+                // provider can request a Reader call; no synthetic ToolResult.
+                let blocker = observed.runtime_blocker.as_deref().unwrap();
+                assert!(blocker.contains("Root orchestration blocker"));
+                assert!(blocker.contains("persisted Skill or Workflow activation"));
+                assert!(observed.requests.is_empty());
                 assert!(observed.errors.is_empty());
                 assert!(observed.caps.is_empty());
-                let reply = exact_reply(&observed.requests[1], "actual-reader-call-r1-0");
-                assert_eq!(reply.tool_success, Some(false));
-                assert_provider_pages(&observed.requests[1], reply, None);
+                assert!(observed.persisted.root_orchestration_only_enabled());
+                assert!(observed.persisted.messages.iter().all(|message| {
+                    message.tool_call_id.as_deref() != Some("actual-reader-call-r1-0")
+                }));
                 continue;
             }
+            assert!(observed.runtime_blocker.is_none());
             assert_eq!(observed.errors.len(), 1, "{change}, cold={cold}");
             if cold {
                 assert!(reader_arguments(&observed, "actual-reader-call-r1-0")

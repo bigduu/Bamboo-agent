@@ -1,9 +1,27 @@
 use super::*;
 use bamboo_domain::{
-    LoopControlAction, ScopedLoopControlBinding, Session, SessionActivationPort,
+    LoopControlAction, ScopedLoopControlBinding, Session, SessionActivationPort, Storage,
     SupervisorReference,
 };
 use std::collections::BTreeSet;
+
+async fn install_inbox(
+    router: &Arc<SessionActivationRouter>,
+    target: &Session,
+) -> tempfile::TempDir {
+    let directory = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(
+        bamboo_storage::SessionStoreV2::new(directory.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    store.save_session(target).await.unwrap();
+    router.set_inbox(Arc::new(bamboo_storage::FileSessionInbox::new(
+        store,
+        Default::default(),
+    )));
+    directory
+}
 
 fn binding(session: &Session, run: &str) -> ScopedLoopControlBinding {
     ScopedLoopControlBinding {
@@ -41,24 +59,44 @@ async fn scoped_grant_requires_the_same_real_router_owner_and_bound_lifetime() {
         .await
         .unwrap();
     let grant = binding(&target, "run-a");
-    assert!(router
+    assert!(matches!(
+        router
+            .bind_supervisor_loop_control(
+                &registration.ownership(),
+                grant.clone(),
+                tokio_util::sync::CancellationToken::new(),
+                tokio_util::sync::CancellationToken::new()
+            )
+            .await,
+        Err(bamboo_domain::SessionInboxError::InvalidClaim(reason))
+            if reason == "scoped Loop Inbox missing"
+    ));
+    // Configure the real Inbox before checking owner and lifetime errors.
+    let _inbox_directory = install_inbox(&router, &target).await;
+    assert!(matches!(
+        router
         .bind_supervisor_loop_control(
             &other.ownership(),
             grant.clone(),
             tokio_util::sync::CancellationToken::new(),
             tokio_util::sync::CancellationToken::new()
         )
-        .await
-        .is_err());
-    assert!(router
+        .await,
+        Err(bamboo_domain::SessionInboxError::InvalidClaim(reason))
+            if reason == "Loop owner proof mismatch"
+    ));
+    assert!(matches!(
+        router
         .bind_supervisor_loop_control(
             &registration.ownership(),
             grant.clone(),
             tokio_util::sync::CancellationToken::new(),
             tokio_util::sync::CancellationToken::new()
         )
-        .await
-        .is_err());
+        .await,
+        Err(bamboo_domain::SessionInboxError::InvalidClaim(reason))
+            if reason == "Loop owner is no longer current"
+    ));
     assert!(
         router
             .bind_run_lifetime(&registration.ownership(), &target)
@@ -103,6 +141,7 @@ async fn scoped_grant_requires_the_same_real_router_owner_and_bound_lifetime() {
 async fn scoped_observation_bootstraps_status_only_and_never_survives_owner_exit() {
     let router = SessionActivationRouter::new();
     let target = Session::new("scoped-observe", "model");
+    let _inbox_directory = install_inbox(&router, &target).await;
     let registration = router.register_session_run(&target, "run-a").await.unwrap();
     let grant = binding(&target, "run-a");
     assert!(router
@@ -206,6 +245,7 @@ async fn scoped_observation_bootstraps_status_only_and_never_survives_owner_exit
 async fn scoped_revoke_waits_for_the_actual_target_publication_guard() {
     let router = SessionActivationRouter::new();
     let target = Session::new("scoped-retain", "model");
+    let _inbox_directory = install_inbox(&router, &target).await;
     let registration = router.register_session_run(&target, "run-a").await.unwrap();
     let grant = binding(&target, "run-a");
     router
@@ -271,6 +311,7 @@ async fn scoped_real_cancel_and_host_stop_invalidate_even_a_retained_guard() {
     for user_cancel in [true, false] {
         let router = SessionActivationRouter::new();
         let target = Session::new("scoped-stop", "model");
+        let _inbox_directory = install_inbox(&router, &target).await;
         let registration = router.register_session_run(&target, "run-a").await.unwrap();
         let grant = binding(&target, "run-a");
         let cancel = tokio_util::sync::CancellationToken::new();
