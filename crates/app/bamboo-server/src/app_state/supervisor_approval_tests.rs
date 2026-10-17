@@ -295,7 +295,12 @@ impl Fixture {
             .find(|m| m.tool_call_id.as_deref() == Some(CALL))
             .unwrap();
         if self.ordinary_root {
-            assert!(result.metadata.as_ref().unwrap().get(AUTHORITY).is_none());
+            assert!(result
+                .metadata
+                .as_ref()
+                .is_none_or(|metadata| metadata.get(AUTHORITY).is_none()));
+            let payload: Value = serde_json::from_str(&result.content).unwrap();
+            assert!(payload.get(AUTHORITY).is_none());
         } else {
             let authority = &result.metadata.as_ref().unwrap()[AUTHORITY];
             assert_eq!(
@@ -455,9 +460,25 @@ impl Fixture {
             .rev()
             .find(|m| m.tool_call_id.as_deref() == Some(CALL))
             .unwrap();
-        let request: PermissionRequest =
-            serde_json::from_value(result.metadata.as_ref().unwrap()["permission_request"].clone())
-                .unwrap();
+        // Match the native HTTP persisted_permission_request reader. The real
+        // Root Actor persists the waiting payload in content; a later typed
+        // response retains it in metadata before replacing that content.
+        let request = result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("permission_request"))
+            .cloned()
+            .or_else(|| {
+                serde_json::from_str::<Value>(&result.content)
+                    .ok()?
+                    .get("permission_request")
+                    .cloned()
+            })
+            .expect("the real parked call must retain its native permission request");
+        let request: PermissionRequest = serde_json::from_value(request).unwrap();
+        assert_eq!(request.session_id, self.session_id);
+        assert_eq!(request.request_id, CALL);
+        assert!(!request.request_generation.trim().is_empty());
         PermissionDecision {
             request_id: CALL.into(),
             request_generation: request.request_generation,
