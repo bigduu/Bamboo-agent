@@ -1458,6 +1458,18 @@ fn apply(
                     "acceptance requires current exact submission and evidence",
                 ));
             }
+            let source_assignment =
+                crate::controls::matching_submission_assignment(snapshot, &work, submission)
+                    .ok_or_else(|| {
+                        Error::ScopeDenied(
+                            "acceptance Assignment differs from the exact Submission".into(),
+                        )
+                    })?;
+            if !source_assignment.process_stopped {
+                return Err(Error::ResourceBlocked(
+                    "acceptance awaits host-confirmed process stop for the exact Assignment".into(),
+                ));
+            }
             let work = snapshot.tickets.get_mut(work_id).expect("work");
             work.state = WorkState::Accepted;
             work.accepted_submission = Some(submission_id.clone());

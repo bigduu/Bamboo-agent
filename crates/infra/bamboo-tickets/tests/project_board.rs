@@ -47,6 +47,24 @@ impl Fixture {
             .execute(&self.authority, &self.command(id, ops))
             .unwrap()
     }
+    fn confirm_submission_stopped(&self, submission: &str) {
+        let snapshot = self.service.published().unwrap().1;
+        let assignment = &snapshot.assignments[&snapshot.submissions[submission].assignment_id];
+        let runtime = Authority::from_verified_host(snapshot.binding.clone(), Principal::Runtime);
+        self.service
+            .execute(
+                &runtime,
+                &self.command(
+                    &format!("fixture-stop-{submission}"),
+                    vec![Operation::RuntimeStopped {
+                        assignment_id: assignment.id.clone(),
+                        receipt: assignment.runtime.clone().unwrap(),
+                        completed: true,
+                    }],
+                ),
+            )
+            .unwrap();
+    }
     fn create(&self, title: &str, linked: bool) -> String {
         let mut ops = vec![Operation::Create {
             temp_id: "w".into(),
@@ -638,6 +656,7 @@ fn submitted_stays_testing_until_exact_evidenced_user_acceptance() {
         .service
         .execute(&supervisor, &f.command("not-user", vec![accept.clone()]))
         .is_err());
+    f.confirm_submission_stopped(&submitted.ids["s"]);
     f.exec("accept", vec![accept]);
     let board = f.board(10, None);
     assert_eq!(board.data.counts.done, 1);
@@ -929,6 +948,7 @@ fn metadata_only_pending_does_not_stale_historical_submission_or_user_acceptance
         snapshot.submissions[&receipt.ids["result"]].assignment_id,
         assignment
     );
+    f.confirm_submission_stopped(&receipt.ids["result"]);
     f.exec(
         "accept-metadata",
         vec![Operation::Accept {

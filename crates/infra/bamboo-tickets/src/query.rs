@@ -84,6 +84,9 @@ pub struct TicketView {
     pub assignments: Vec<Assignment>,
     pub requests: Vec<PendingRequest>,
     pub submissions: Vec<Submission>,
+    /// Opt-in owner control facts; absence on an older producer is unsupported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controls: Option<WorkControlFacts>,
     #[serde(default = "all_inspect_sections")]
     pub sections: BTreeSet<InspectSection>,
 }
@@ -94,8 +97,10 @@ pub enum InspectSection {
     Assignments,
     Requests,
     Submissions,
+    Controls,
 }
 
+/// Legacy default history sections. Owner control facts require explicit opt-in.
 pub fn all_inspect_sections() -> BTreeSet<InspectSection> {
     BTreeSet::from([
         InspectSection::Assignments,
@@ -370,6 +375,9 @@ impl TicketService {
                 "inspect <=32 IDs, depth<=4, budget 128..65536".into(),
             ));
         }
+        if options.sections.contains(&InspectSection::Controls) {
+            authority.user()?;
+        }
         let (commit, snapshot) = self.query_snapshot(authority, "inspect", None, fixed_commit)?;
         let refs = visible(authority, &snapshot)?;
         let mut selected: BTreeSet<_> = ids.iter().cloned().collect();
@@ -428,11 +436,15 @@ impl TicketService {
                 ticket.current_submission = ticket.accepted_submission.clone();
                 ticket.import_source = None;
             }
+            let controls = (ticket.kind == TicketKind::Work
+                && options.sections.contains(&InspectSection::Controls))
+            .then(|| crate::controls::facts(&snapshot, &ticket));
             data.push(TicketView {
                 ticket,
                 assignments,
                 requests,
                 submissions,
+                controls,
                 sections: options.sections.clone(),
             });
         }
