@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub(crate) const CALL: &str = "transport-call";
 const TARGET: &str = "transport-target";
@@ -135,6 +135,8 @@ pub(crate) struct Fixture {
     pub(crate) original: bamboo_domain::SupervisorReference,
     session_id: String,
     ordinary_root: bool,
+    replay_generation: Mutex<Option<String>>,
+    corrupted_authority: Mutex<Option<Value>>,
     probe: Arc<Probe>,
 }
 
@@ -219,6 +221,8 @@ impl Fixture {
             original,
             session_id,
             ordinary_root,
+            replay_generation: Mutex::new(None),
+            corrupted_authority: Mutex::new(None),
             probe,
         }
     }
@@ -310,6 +314,9 @@ impl Fixture {
         let workspace = self.directory.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         session.set_workspace_path_meta(workspace.to_string_lossy());
+        if self.ordinary_root {
+            return self.run_root_call(session).await;
+        }
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         let drain = tokio::spawn(async move {
             let mut parked = false;
@@ -335,6 +342,100 @@ impl Fixture {
             .await
             .unwrap();
         drain.await.unwrap()
+    }
+
+    async fn run_root_call(&self, mut session: Session) -> bool {
+        use crate::handlers::agent::execute::runtime::{
+            spawn_agent_execution, spawn_event_forwarder_with_root_actor, SpawnAgentExecution,
+        };
+        use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
+
+        // Use the existing hosted Root path: the real reservation, Actor
+        // writer and history handoff must all exist before the provider runs.
+        session.add_message(Message::user("execute the permitted command"));
+        self.state
+            .agent
+            .prepare_external_session_for_execution(&mut session)
+            .await
+            .unwrap();
+        self.state.storage.save_session(&session).await.unwrap();
+        let sender = self.state.get_session_event_sender(&self.session_id).await;
+        let mut events = sender.subscribe();
+        let mut reservation = match reserve_session_execution(
+            &self.state.agent,
+            &self.state.agent_runners,
+            &self.state.session_event_senders,
+            &self.session_id,
+            &sender,
+        )
+        .await
+        {
+            SessionExecutionReserveOutcome::Reserved(reservation) => reservation,
+            SessionExecutionReserveOutcome::AlreadyRunning { run_id } => {
+                panic!("fresh ordinary Root already has a run: {run_id}")
+            }
+        };
+        reservation
+            .bind_root_actor(&self.state.agent, &session)
+            .await
+            .unwrap();
+        let writer = reservation
+            .root_actor_writer()
+            .expect("ordinary Root requires its real Actor writer");
+        assert!(reservation.execution_persistence().is_some());
+        let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel(100);
+        let history_commit_barrier = spawn_event_forwarder_with_root_actor(
+            self.state.clone(),
+            self.session_id.clone(),
+            reservation.run_id().to_string(),
+            mpsc_rx,
+            sender,
+            None,
+            Some(writer),
+        );
+        spawn_agent_execution(SpawnAgentExecution {
+            state: self.state.clone(),
+            session_id: self.session_id.clone(),
+            session,
+            execution_reservation: reservation,
+            is_child_session: false,
+            provider_name: "test-provider".into(),
+            provider_override: Some(self.probe.clone()),
+            model_roster: bamboo_engine::ModelRoster {
+                model: Some("test-model".into()),
+                ..Default::default()
+            },
+            reasoning_effort: None,
+            reasoning_effort_source: "test".into(),
+            disabled_tools: Default::default(),
+            disabled_skill_ids: Default::default(),
+            mpsc_tx,
+            history_commit_barrier,
+            image_fallback: None,
+            gold_config: None,
+            app_data_dir: Some(self.state.app_data_dir.clone()),
+            run_budget: None,
+        });
+        let parked = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut parked = false;
+            loop {
+                match events.recv().await.unwrap() {
+                    AgentEvent::NeedClarification { .. } => parked = true,
+                    AgentEvent::SessionHistoryCommitted { session_id } => {
+                        assert_eq!(session_id, self.session_id);
+                        break parked;
+                    }
+                    AgentEvent::Error { message } => {
+                        panic!("hosted Root fixture failed: {message}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("hosted Root must commit its pending approval history");
+        self.wait_for_idle().await;
+        parked
     }
 
     pub(crate) async fn reload(&self) -> Session {
@@ -376,11 +477,14 @@ impl Fixture {
             .find(|m| m.tool_call_id.as_deref() == Some(CALL))
             .unwrap();
         result.metadata.as_mut().unwrap()[AUTHORITY]["version"] = json!(99);
+        *self.corrupted_authority.lock().unwrap() =
+            Some(result.metadata.as_ref().unwrap()[AUTHORITY].clone());
         self.state.session_repo.save(&mut session).await.unwrap();
     }
 
     pub(crate) async fn formal_approve(&self) {
         let decision = self.decision().await;
+        *self.replay_generation.lock().unwrap() = Some(decision.request_generation.clone());
         let guard =
             bamboo_engine::session_app::respond::acquire_pending_response_guard(&self.session_id)
                 .await;
@@ -406,7 +510,7 @@ impl Fixture {
         .unwrap();
     }
 
-    pub(crate) async fn settled(&self, writes: usize, replay_retained: bool) {
+    async fn wait_for_idle(&self) {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let active = self
@@ -437,6 +541,10 @@ impl Fixture {
         })
         .await
         .expect("adapter must finish or retire its reserved execution");
+    }
+
+    pub(crate) async fn settled(&self, writes: usize, replay_retained: bool) {
+        self.wait_for_idle().await;
         self.state.shutdown().await;
         assert_eq!(self.probe.actions.load(Ordering::SeqCst), writes);
         assert_eq!(self.probe.shell_entries.load(Ordering::SeqCst), 0);
@@ -459,10 +567,33 @@ impl Fixture {
             replay_retained
         );
         assert!(session.pending_question.is_none());
-        if !replay_retained {
+        if replay_retained {
+            assert_eq!(
+                session
+                    .metadata
+                    .get(PERMISSION_REEXECUTE_METADATA_KEY)
+                    .map(String::as_str),
+                Some(CALL)
+            );
+            assert_eq!(session.metadata.get(
+                bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_GENERATION_METADATA_KEY,
+            ), self.replay_generation.lock().unwrap().as_ref());
+        } else {
             assert!(!session.metadata.contains_key(
                 bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_GENERATION_METADATA_KEY,
             ));
+        }
+        if let Some(expected) = self.corrupted_authority.lock().unwrap().as_ref() {
+            let result = session
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+                .unwrap();
+            assert_eq!(
+                result.metadata.as_ref().unwrap().get(AUTHORITY),
+                Some(expected)
+            );
         }
         if self.ordinary_root {
             assert!(session.supervisor_incarnation_id().is_none());
@@ -608,6 +739,7 @@ async fn server_native_typed_supervisor_approval_fixture_replay_body() {
         assert_eq!(refreshed.request_generation, decision.request_generation);
         assert_eq!(fixture.decision().await.expected_policy_revision, Some(0));
         decision.expected_policy_revision = Some(refreshed.policy_revision);
+        *fixture.replay_generation.lock().unwrap() = Some(decision.request_generation.clone());
         let response = test::call_service(
             &app,
             test::TestRequest::post()
