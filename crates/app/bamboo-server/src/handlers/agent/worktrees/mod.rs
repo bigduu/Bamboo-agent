@@ -5,7 +5,7 @@ use crate::app_state::{AppState, ConfigUpdateEffects};
 use crate::error::AppError;
 use actix_web::{web, HttpResponse};
 use bamboo_domain::{ProjectId, ProjectManifest, ProjectStatus};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -97,6 +97,32 @@ pub async fn set_preferences(
     Ok(HttpResponse::Ok().json(config.worktrees.clone()))
 }
 
+// Inventory diagnostics are data in a successful response, not native HTTP
+// errors. Keep their existing string/null wire contract explicit and separate
+// from the AppError envelope used when the request itself fails.
+#[derive(Serialize)]
+struct RepositoryInventory {
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    common_dir: Option<String>,
+    worktrees: Vec<WorktreeInventory>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WorktreeInventory {
+    path: String,
+    path_encoding: &'static str,
+    branch: Option<String>,
+    head: String,
+    locked: bool,
+    prunable: bool,
+    dirty: Option<bool>,
+    error: Option<String>,
+    occupied: bool,
+    sessions: Vec<Value>,
+}
+
 pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response {
     let project = project(&state, &id)?;
     let sessions = state.session_store.list_index_entries().await;
@@ -121,14 +147,17 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
         // offline and must not trigger filesystem/Git work for this request.
         let bound_sources: Vec<_> = project.workspace_roots().map(PathBuf::from).collect();
         let mut session_checkouts = HashMap::<PathBuf, Option<PathBuf>>::new();
-        let mut repositories = Vec::<Value>::new();
+        let mut repositories = Vec::new();
         let mut seen = HashSet::new();
         for source in project.workspace_roots() {
             let path = PathBuf::from(source);
             let common = match git::repository(&path) {
                 Ok(common) => common,
                 Err(error) => {
-                    repositories.push(json!({"path": source, "worktrees": [], "error": error}));
+                    repositories.push(RepositoryInventory {
+                        path: source.to_owned(), common_dir: None,
+                        worktrees: Vec::new(), error: Some(error),
+                    });
                     continue;
                 }
             };
@@ -169,13 +198,23 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
                                 || matches!(session.last_run_status.as_deref(), Some("running" | "pending"))
                                 || session.has_pending_question})).collect();
                         let occupied = entry.locked || related.iter().any(|s| s["active"] == true);
-                        json!({"path": git::path_label(&entry.path), "path_encoding": if entry.path.to_str().is_some() { "utf-8" } else { "escaped" }, "branch": entry.branch, "head": entry.head,
-                            "locked": entry.locked, "prunable": entry.prunable, "dirty": entry.dirty,
-                            "error": entry.error, "occupied": occupied, "sessions": related})
+                        WorktreeInventory {
+                            path: git::path_label(&entry.path),
+                            path_encoding: if entry.path.to_str().is_some() { "utf-8" } else { "escaped" },
+                            branch: entry.branch, head: entry.head, locked: entry.locked,
+                            prunable: entry.prunable, dirty: entry.dirty, error: entry.error,
+                            occupied, sessions: related,
+                        }
                     }).collect();
-                    repositories.push(json!({"path": source, "common_dir": git::path_label(&common), "worktrees": worktrees, "error": null}));
+                    repositories.push(RepositoryInventory {
+                        path: source.to_owned(), common_dir: Some(git::path_label(&common)),
+                        worktrees, error: None,
+                    });
                 }
-                Err(error) => repositories.push(json!({"path": source, "common_dir": git::path_label(&common), "worktrees": [], "error": error})),
+                Err(error) => repositories.push(RepositoryInventory {
+                    path: source.to_owned(), common_dir: Some(git::path_label(&common)),
+                    worktrees: Vec::new(), error: Some(error),
+                }),
             }
         }
         Ok(repositories)
