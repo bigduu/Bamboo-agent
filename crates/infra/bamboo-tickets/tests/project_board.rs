@@ -96,6 +96,64 @@ impl Fixture {
             claims: BTreeSet::from([format!("worktree:{path}")]),
         }
     }
+    fn running(&self, work: &str) -> (String, Authority, Authority) {
+        self.exec(
+            "setup-running",
+            vec![
+                Operation::SetProjectContext {
+                    work_id: work.into(),
+                    context: self.context(work),
+                },
+                Operation::Ready {
+                    work_id: work.into(),
+                },
+            ],
+        );
+        let receipt = self.exec(
+            "start-running",
+            vec![Operation::Start {
+                work_id: work.into(),
+                temp_id: "assignment".into(),
+                workspace: Some(self.execution()),
+            }],
+        );
+        let id = receipt.ids["assignment"].clone();
+        let snapshot = self.service.published().unwrap().1;
+        let a = &snapshot.assignments[&id];
+        let runtime = Authority::from_verified_host(snapshot.binding.clone(), Principal::Runtime);
+        let worker = Authority::from_verified_host(
+            snapshot.binding,
+            Principal::Worker {
+                assignment_id: id.clone(),
+                generation: a.generation,
+                run_id: "run".into(),
+                session_id: "worker".into(),
+            },
+        );
+        self.service
+            .execute(
+                &runtime,
+                &self.command(
+                    "admit-running",
+                    vec![
+                        Operation::Admitted {
+                            assignment_id: id.clone(),
+                            receipt: RuntimeReceipt {
+                                dispatch_key: a.dispatch_key.clone(),
+                                spec_hash: snapshot.intents[&a.dispatch_key].spec_hash.clone(),
+                                run_id: "run".into(),
+                                session_id: "worker".into(),
+                            },
+                        },
+                        Operation::Running {
+                            assignment_id: id.clone(),
+                        },
+                    ],
+                ),
+            )
+            .unwrap();
+        (id, runtime, worker)
+    }
     fn board(&self, limit: usize, cursor: Option<ReadCursor>) -> ReadEnvelope<ProjectBoard> {
         self.service
             .project_board(
@@ -293,7 +351,13 @@ fn context_is_bounded_required_and_does_not_grant_or_switch_workspace() {
                 "midrun",
                 vec![Operation::SetProjectContext {
                     work_id: w.clone(),
-                    context: f.context(&w)
+                    context: {
+                        let mut context = f.context(&w);
+                        context
+                            .sources
+                            .insert("requirements".into(), "revision-2".into());
+                        context
+                    }
                 }]
             )
         )
@@ -573,4 +637,302 @@ fn submitted_stays_testing_until_exact_evidenced_user_acceptance() {
     assert_eq!(board.data.counts.done, 1);
     assert_eq!(board.data.counts.testing, 0);
     assert_eq!(board.data.rows[0].adopted_context, Some(f.context(&w)));
+}
+
+#[test]
+fn running_metadata_is_pending_with_cas_and_no_permission_or_input_changes() {
+    let f = Fixture::new();
+    let work = f.create("metadata", true);
+    let (assignment, runtime, worker) = f.running(&work);
+    let before = f.service.published().unwrap().1;
+    let adopted = f.context(&work);
+    let mut pending = adopted.clone();
+    pending.project_revision += 1;
+    pending.resource_revision += 1;
+    let command = f.command(
+        "metadata-pending",
+        vec![Operation::SetProjectContext {
+            work_id: work.clone(),
+            context: pending.clone(),
+        }],
+    );
+    let receipt = f.service.execute(&f.authority, &command).unwrap();
+    assert_eq!(f.service.execute(&f.authority, &command).unwrap(), receipt);
+    let mut conflict = command.clone();
+    conflict.operation_id = "stale-metadata".into();
+    assert!(matches!(
+        f.service.execute(&f.authority, &conflict),
+        Err(Error::RevisionConflict)
+    ));
+    let after = f.service.published().unwrap().1;
+    assert_eq!(
+        canonical_bytes(&after.assignments).unwrap(),
+        canonical_bytes(&before.assignments).unwrap()
+    );
+    assert_eq!(
+        canonical_bytes(&after.intents).unwrap(),
+        canonical_bytes(&before.intents).unwrap()
+    );
+    assert_eq!(
+        after.project.assignment_contexts,
+        before.project.assignment_contexts
+    );
+    assert_eq!(after.schema, 5);
+    let packet = f
+        .service
+        .child_context_packet(&worker, &assignment, 65536)
+        .unwrap();
+    assert_eq!(packet.project_context, Some(adopted.clone()));
+    let row = &f.board(10, None).data.rows[0];
+    assert_eq!(row.context, Some(pending.clone()));
+    assert_eq!(row.pending_context, Some(pending.clone()));
+    assert_eq!(row.adopted_context, Some(adopted));
+    assert_eq!(row.stage, Some(ProjectBoardStage::Doing));
+    for (name, context) in [
+        ("source", {
+            let mut c = pending.clone();
+            c.sources.insert("requirements".into(), "revision-2".into());
+            c
+        }),
+        ("binding", {
+            let mut c = pending.clone();
+            c.workspace_binding.path.push_str("/other");
+            c
+        }),
+        ("tool", {
+            let mut c = pending.clone();
+            c.contract.allowed_tools.insert("Bash".into());
+            c
+        }),
+        ("contract", {
+            let mut c = pending.clone();
+            c.contract_revision += 1;
+            c
+        }),
+    ] {
+        let old_commit = f.service.published().unwrap().0;
+        assert!(
+            f.service
+                .execute(
+                    &f.authority,
+                    &f.command(
+                        name,
+                        vec![Operation::SetProjectContext {
+                            work_id: work.clone(),
+                            context,
+                        }]
+                    )
+                )
+                .is_err(),
+            "{name}"
+        );
+        assert_eq!(f.service.published().unwrap().0, old_commit);
+    }
+    for authority in [&worker, &runtime] {
+        let old_commit = f.service.published().unwrap().0;
+        assert!(matches!(
+            f.service.execute(
+                authority,
+                &f.command(
+                    "no-worker-adoption",
+                    vec![Operation::SetProjectContext {
+                        work_id: work.clone(),
+                        context: pending.clone()
+                    }]
+                )
+            ),
+            Err(Error::ScopeDenied(_))
+        ));
+        assert_eq!(f.service.published().unwrap().0, old_commit);
+    }
+    assert!(matches!(
+        f.service.execute(
+            &f.authority,
+            &f.command(
+                "no-regression",
+                vec![Operation::SetProjectContext {
+                    work_id: work.clone(),
+                    context: f.context(&work)
+                }]
+            )
+        ),
+        Err(Error::RevisionConflict)
+    ));
+}
+
+#[test]
+fn pending_context_survives_stop_and_restart_and_next_start_adopts_once() {
+    let f = Fixture::new();
+    let work = f.create("restart", true);
+    let (assignment, runtime, _) = f.running(&work);
+    let adopted = f.context(&work);
+    let mut pending = adopted.clone();
+    pending.project_revision += 1;
+    pending.resource_revision += 1;
+    f.exec(
+        "queue",
+        vec![Operation::SetProjectContext {
+            work_id: work.clone(),
+            context: pending.clone(),
+        }],
+    );
+    f.exec(
+        "pause-running",
+        vec![Operation::Pause {
+            work_id: work.clone(),
+            reason: "safe metadata boundary".into(),
+        }],
+    );
+    assert!(f
+        .service
+        .execute(
+            &f.authority,
+            &f.command(
+                "premature-start",
+                vec![Operation::Start {
+                    work_id: work.clone(),
+                    temp_id: "early".into(),
+                    workspace: Some(f.execution()),
+                }]
+            )
+        )
+        .is_err());
+    f.service
+        .execute(
+            &runtime,
+            &f.command(
+                "stopped",
+                vec![Operation::ConfirmStopped {
+                    assignment_id: assignment.clone(),
+                    effects_reconciled: true,
+                }],
+            ),
+        )
+        .unwrap();
+    let row = &f.board(10, None).data.rows[0];
+    assert!(row.ticket.paused);
+    assert!(row.ticket.active_assignment.is_none());
+    assert_eq!(row.adopted_context, Some(adopted.clone()));
+    assert_eq!(row.pending_context, Some(pending.clone()));
+    let workspace = f.execution();
+    let snapshot = f.service.published().unwrap().1;
+    let adopted_hash = snapshot.project.assignment_contexts[&assignment].clone();
+    drop(f.service);
+    let service = TicketService::open(f.root.path(), snapshot.binding).unwrap();
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(snapshot.project.contexts.len(), 2);
+    assert_eq!(
+        snapshot.project.assignment_contexts[&assignment],
+        adopted_hash
+    );
+    assert!(snapshot.assignments[&assignment].process_stopped);
+    let authority = Authority::from_verified_host(
+        snapshot.binding.clone(),
+        Principal::User {
+            user_id: "owner".into(),
+        },
+    );
+    let request = ProjectBoardRequest {
+        project_id: project(),
+        include_cancelled: false,
+        include_archived: false,
+        limit: 10,
+        cursor: None,
+        fixed_commit: None,
+    };
+    let row = &service
+        .project_board(&authority, &request)
+        .unwrap()
+        .data
+        .rows[0];
+    assert_eq!(row.adopted_context, Some(adopted));
+    assert_eq!(row.pending_context, Some(pending.clone()));
+    let command = service
+        .prepare_command(
+            &authority,
+            "next-start",
+            vec![
+                Operation::Ready {
+                    work_id: work.clone(),
+                },
+                Operation::Start {
+                    work_id: work.clone(),
+                    temp_id: "next".into(),
+                    workspace: Some(workspace),
+                },
+            ],
+        )
+        .unwrap();
+    let receipt = service.execute(&authority, &command).unwrap();
+    assert_eq!(service.execute(&authority, &command).unwrap(), receipt);
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(snapshot.assignments.len(), 2);
+    assert_eq!(
+        snapshot.project.assignment_contexts[&assignment],
+        adopted_hash
+    );
+    assert_eq!(
+        snapshot.project.contexts[&snapshot.project.assignment_contexts[&receipt.ids["next"]]],
+        pending
+    );
+    let row = &service
+        .project_board(&authority, &request)
+        .unwrap()
+        .data
+        .rows[0];
+    assert!(row.pending_context.is_none());
+    assert_eq!(row.adopted_context, Some(pending));
+}
+
+#[test]
+fn metadata_only_pending_does_not_stale_historical_submission_or_user_acceptance() {
+    let f = Fixture::new();
+    let work = f.create("submission", true);
+    let (assignment, _, worker) = f.running(&work);
+    let adopted = f.context(&work);
+    let mut pending = adopted.clone();
+    pending.project_revision += 1;
+    f.exec(
+        "rename-pending",
+        vec![Operation::SetProjectContext {
+            work_id: work.clone(),
+            context: pending.clone(),
+        }],
+    );
+    let receipt = f
+        .service
+        .execute(
+            &worker,
+            &f.command(
+                "submit-metadata",
+                vec![Operation::Submit {
+                    assignment_id: assignment.clone(),
+                    temp_id: "result".into(),
+                    artifacts: vec![Artifact {
+                        uri: "artifact://proof/result".into(),
+                        sha256: "a".repeat(64),
+                    }],
+                    evidence: vec!["tested adopted inputs".into()],
+                }],
+            ),
+        )
+        .unwrap();
+    let snapshot = f.service.published().unwrap().1;
+    assert!(!snapshot.submissions[&receipt.ids["result"]].stale);
+    assert_eq!(
+        snapshot.submissions[&receipt.ids["result"]].assignment_id,
+        assignment
+    );
+    f.exec(
+        "accept-metadata",
+        vec![Operation::Accept {
+            work_id: work,
+            submission_id: receipt.ids["result"].clone(),
+            evidence: vec!["owner verified".into()],
+        }],
+    );
+    let row = &f.board(10, None).data.rows[0];
+    assert_eq!(row.stage, Some(ProjectBoardStage::Done));
+    assert_eq!(row.adopted_context, Some(adopted));
+    assert_eq!(row.pending_context, Some(pending));
 }
