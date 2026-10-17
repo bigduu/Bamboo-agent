@@ -618,7 +618,12 @@ impl Fixture {
         }
         if self.ordinary_root {
             assert!(session.supervisor_incarnation_id().is_none());
-            let decision = self.decision().await;
+            let original_generation = self
+                .replay_generation
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("ordinary Root approval must capture its original generation");
             assert!(!self
                 .state
                 .permission_checker
@@ -627,7 +632,7 @@ impl Fixture {
                 .consume_once_for_generation(
                     &self.session_id,
                     CALL,
-                    &decision.request_generation,
+                    &original_generation,
                     bamboo_tools::permission::PermissionType::ExecuteCommand,
                     "current-command"
                 ));
