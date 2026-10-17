@@ -7,6 +7,7 @@ mod project;
 mod query;
 mod resolution;
 mod service;
+mod sprint;
 pub mod store;
 mod workspace_files;
 
@@ -17,6 +18,7 @@ pub use project::*;
 pub use query::*;
 pub use resolution::*;
 pub use service::{validate_native_tool_ceiling, Authority, Principal, TicketService};
+pub use sprint::*;
 pub use store::{FaultPoint, Health, PublicationFault};
 pub use workspace_files::{FileOperation, FileReply, FILE_BYTES_LIMIT};
 
