@@ -504,13 +504,27 @@ impl Fixture {
     }
 
     pub(crate) async fn formal_approve(&self) {
+        assert!(
+            !self.ordinary_root,
+            "ordinary Root needs its response writer handoff"
+        );
         let decision = self.decision().await;
-        *self.replay_generation.lock().unwrap() = Some(decision.request_generation.clone());
         let guard =
             bamboo_engine::session_app::respond::acquire_pending_response_guard(&self.session_id)
                 .await;
+        self.persist_approval(&self.state.session_repo, decision, &guard)
+            .await;
+    }
+
+    async fn persist_approval(
+        &self,
+        access: &dyn bamboo_engine::session_app::repository::SessionAccess,
+        decision: PermissionDecision,
+        guard: &bamboo_engine::session_app::respond::PendingResponseGuard,
+    ) -> Session {
+        *self.replay_generation.lock().unwrap() = Some(decision.request_generation.clone());
         bamboo_engine::session_app::respond::submit_pending_permission_response_checked_guarded(
-            &self.state.session_repo,
+            access,
             bamboo_engine::session_app::types::RespondInput {
                 session_id: self.session_id.clone(),
                 user_response: "Approve".into(),
@@ -525,10 +539,160 @@ impl Fixture {
                 decision,
                 decided_at: std::time::SystemTime::now().into(),
             },
-            &guard,
+            guard,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0
+    }
+
+    pub(crate) async fn ordinary_root_approval_handoff(
+        &self,
+    ) -> bamboo_engine::session_app::resume::ResponseResumeHandoff {
+        use bamboo_engine::session_app::repository::SessionAccess;
+        assert!(self.ordinary_root);
+        let decision = self.decision().await;
+        let guard =
+            bamboo_engine::session_app::respond::acquire_pending_response_guard(&self.session_id)
+                .await;
+        // Same guarded successor/writer as the production typed response path.
+        // Retain it across the policy CAS: never dispatch the model or reserve
+        // a second owner between approval and the intended denied replay.
+        let handoff = bamboo_engine::session_app::resume::reserve_response_resume_handoff(
+            &AppStateResumeRef(self.state.clone()),
+            &self.session_id,
+            std::time::Duration::from_secs(15),
+        )
+        .await
+        .expect("ordinary Root response must own its real successor");
+        assert!(handoff.root_actor_writer().is_some());
+        let access =
+            SessionAccess::bind_response_writer(self.state.as_ref(), handoff.root_actor_writer())
+                .unwrap()
+                .expect("ordinary Root approval needs its fenced response access");
+        let approved = self
+            .persist_approval(access.as_ref(), decision, &guard)
+            .await;
+        assert!(approved.pending_question.is_none());
+        assert!(approved.supervisor_incarnation_id().is_none());
+        assert_eq!(
+            approved
+                .metadata
+                .get("clarification_resume_pending")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            approved
+                .metadata
+                .get(PERMISSION_REEXECUTE_METADATA_KEY)
+                .map(String::as_str),
+            Some(CALL)
+        );
+        assert_eq!(
+            approved.metadata.get(
+                bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_GENERATION_METADATA_KEY,
+            ),
+            self.replay_generation.lock().unwrap().as_ref()
+        );
+        assert_eq!(self.probe.provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(self.probe.shell_entries.load(Ordering::SeqCst), 0);
+        assert_eq!(self.probe.actions.load(Ordering::SeqCst), 0);
+        handoff
+    }
+
+    pub(crate) async fn tighten_ordinary_root(&self) -> Session {
+        assert!(self.ordinary_root);
+        let before = self.reload().await;
+        assert!(before.supervisor_incarnation_id().is_none());
+        assert!(!before.root_orchestration_only_enabled());
+        assert_eq!(
+            before
+                .metadata
+                .get("clarification_resume_pending")
+                .map(String::as_str),
+            Some("true")
+        );
+        let receipt = before
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()["permission_decision_receipt"]
+            .clone();
+        assert!(receipt.is_object());
+        let operation_id = format!(
+            "{}:{}",
+            before.root_mode_transition_epoch,
+            uuid::Uuid::new_v4()
+        );
+        let uri = format!(
+            "/sessions/{}/root-mode-operations/{operation_id}",
+            self.session_id
+        );
+        let app = test::init_service(App::new().app_data(self.state.clone()).route(
+            "/sessions/{session_id}/root-mode-operations/{operation_id}",
+            web::post().to(crate::handlers::agent::sessions::select_root_mode),
+        ))
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&uri)
+                .set_json(json!({"birth_token":before.root_mode_birth_token(),
+                "expected_epoch":before.root_mode_transition_epoch, "thinking_mode":"ultra"}))
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(status, actix_web::http::StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "committed");
+        let after = self.reload().await;
+        assert!(after.root_orchestration_only_enabled());
+        assert_eq!(
+            after.root_mode_transition_epoch,
+            before.root_mode_transition_epoch + 1
+        );
+        assert!(after.root_tool_authority_revision > before.root_tool_authority_revision);
+        assert_eq!(
+            after.root_mode_birth_token(),
+            before.root_mode_birth_token()
+        );
+        assert_eq!(
+            after
+                .metadata
+                .get("clarification_resume_pending")
+                .map(String::as_str),
+            Some("true")
+        );
+        for key in [
+            PERMISSION_REEXECUTE_METADATA_KEY,
+            bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_GENERATION_METADATA_KEY,
+        ] {
+            assert_eq!(after.metadata.get(key), before.metadata.get(key));
+        }
+        let result = after
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+            .unwrap();
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("permission_decision_receipt"),
+            Some(&receipt)
+        );
+        assert_eq!(self.probe.shell_entries.load(Ordering::SeqCst), 0);
+        assert_eq!(self.probe.actions.load(Ordering::SeqCst), 0);
+        assert_eq!(self.probe.provider_calls.load(Ordering::SeqCst), 1);
+        after
     }
 
     async fn wait_for_idle(&self) {
@@ -820,23 +984,23 @@ async fn server_resume_consumes_approved_call_after_root_tool_tightening() {
             actix_web::rt::System::new().block_on(async {
                 let fixture = Box::pin(Fixture::ordinary_root_pending()).await;
                 fixture.prepare_workspace_catalog().await;
-                fixture.formal_approve().await;
-                let mut selected = fixture.reload().await;
-                selected.set_root_orchestration_only(true).unwrap();
-                fixture.state.storage.save_session(&selected).await.unwrap();
-                let session = fixture.reload().await;
+                let handoff = fixture.ordinary_root_approval_handoff().await;
+                let session = fixture.tighten_ordinary_root().await;
                 let config = bamboo_engine::session_app::resolution::resolve_resume_config_snapshot(
                     &*fixture.state.config.read().await,
                     &fixture.state.provider_registry,
                     &session,
                     None,
                 );
-                let outcome = bamboo_engine::session_app::resume::resume_session_execution(
-                    &AppStateResumeRef(fixture.state.clone()),
-                    &session.id,
-                    config,
-                )
-                .await;
+                let outcome =
+                    bamboo_engine::session_app::resume::resume_session_execution_with_handoff(
+                        &AppStateResumeRef(fixture.state.clone()),
+                        &session.id,
+                        session.clone(),
+                        config,
+                        handoff,
+                    )
+                    .await;
                 assert!(matches!(
                     outcome,
                     bamboo_engine::session_app::types::ResumeOutcome::Started { .. }
