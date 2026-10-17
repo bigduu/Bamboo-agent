@@ -131,6 +131,12 @@ pub struct SessionInboxRuntimeBinding {
 /// and respecting the `cancel_token`.
 #[async_trait::async_trait]
 pub trait ExternalChildRunner: Send + Sync {
+    /// Capability of the actually assembled backend, independent of hot config.
+    /// Only the in-process backend consumes canonical Ticket request ceilings.
+    fn supports_native_ticket_budget(&self) -> bool {
+        false
+    }
+
     /// App catalog/read services for the owned local backend only.
     /// Process and remote adapters deliberately retain the default no-op.
     fn set_local_child_skill_factory(
@@ -332,6 +338,12 @@ pub struct SpawnScheduler {
 }
 
 impl SpawnScheduler {
+    pub fn supports_native_ticket_budget(&self) -> bool {
+        self.ctx
+            .external_child_runner
+            .supports_native_ticket_budget()
+    }
+
     pub fn set_ticket_service(&self, service: Option<Arc<bamboo_tickets::TicketService>>) {
         self.ctx.external_child_runner.set_ticket_service(service);
     }

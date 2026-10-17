@@ -1,0 +1,18 @@
+[package]
+name = "bamboo-orchestration"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "Bounded host-authorized Ready Work orchestration over the canonical Ticket ledger"
+license = "MIT"
+
+[dependencies]
+bamboo-domain = { path = "../../core/bamboo-domain" }
+bamboo-tickets = { path = "../../infra/bamboo-tickets" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
