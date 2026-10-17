@@ -163,7 +163,6 @@ tar = "0.4"
 # already depends on the same "0.10" line for its own WS message-rate
 # limiting, so this adds no new crate to the dependency tree.
 governor = "0.10"
-notify-rust = "4.18"
 notify = "8"
 # Feishu/Lark connect adapter (`src/connect/platforms/feishu/`): the
 # `pbbp2.Frame`/`Header` wire types are hand-derived `prost::Message` impls
@@ -181,6 +180,22 @@ ticket-runtime-fixtures = ["bamboo-tickets/test-utils"]
 # Test-only scoped access to bamboo-config's process-global env-cache fixtures.
 # Kept out of defaults so production builds retain the ordinary global path.
 test-utils = ["bamboo-config/test-utils"]
+
+# macOS and Windows keep notify-rust's existing native notification APIs.
+# Disable its default Unix zbus 5 backend, whose standalone wire/name crates
+# are retired (RUSTSEC-2026-0370/0371/0372).
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+notify-rust = { version = "4.18", default-features = false }
+
+# Unix notifications use maintained pure-Rust D-Bus, without a new system
+# libdbus dependency or a bundled native library.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus = { version = "6", default-features = false, features = ["default-rt"] }
+
+# Exercise the same XDG wire contract on macOS without creating a D-Bus
+# connection or changing its production notification implementation.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+zbus = { version = "6", default-features = false }
 
 [dev-dependencies]
 bamboo-server-tools = { path = "../bamboo-server-tools", features = ["test-utils"] }
