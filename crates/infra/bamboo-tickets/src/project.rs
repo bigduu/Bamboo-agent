@@ -309,6 +309,8 @@ pub struct ProjectBoardRequest {
     pub include_cancelled: bool,
     #[serde(default)]
     pub include_archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprint_filter: Option<SprintBoardFilter>,
     pub limit: usize,
     pub cursor: Option<ReadCursor>,
     pub fixed_commit: Option<String>,
@@ -326,12 +328,7 @@ impl TicketService {
         if !(1..=100).contains(&request.limit) {
             return Err(invalid("board limit 1..100"));
         }
-        let hash = content_hash(&canonical_bytes(&(
-            "project-board-v1",
-            &request.project_id,
-            request.include_cancelled,
-            request.include_archived,
-        ))?);
+        let hash = crate::sprint_query::board_query_hash(request)?;
         let (commit, snapshot) = self.query_snapshot(
             authority,
             &hash,
@@ -339,6 +336,11 @@ impl TicketService {
             request.fixed_commit.as_deref(),
         )?;
         let visible = crate::query::visible(authority, &snapshot)?;
+        let sprint_members = crate::sprint_query::board_members(
+            &snapshot,
+            &request.project_id,
+            request.sprint_filter.as_ref(),
+        )?;
         let mut counts = ProjectBoardCounts::default();
         let mut rows = Vec::new();
         for ticket in snapshot.tickets.values().filter(|t| {
@@ -346,6 +348,9 @@ impl TicketService {
                 && visible.contains(&t.id)
                 && snapshot.project.links.get(&t.id) == Some(&request.project_id)
                 && (request.include_archived || !t.archived)
+                && sprint_members
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&t.id))
         }) {
             counts.total += 1;
             if ticket.state == WorkState::Cancelled {

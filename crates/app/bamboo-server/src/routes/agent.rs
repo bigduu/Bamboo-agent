@@ -110,6 +110,7 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         )
         .service(
             web::scope("/tickets")
+                .configure(agent::tickets::sprints::configure)
                 .route("/scope", web::get().to(agent::tickets::scope))
                 .route("/initialize", web::post().to(agent::tickets::initialize))
                 .route("/overview", web::get().to(agent::tickets::overview))

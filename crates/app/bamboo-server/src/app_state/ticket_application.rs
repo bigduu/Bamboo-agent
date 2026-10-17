@@ -31,6 +31,7 @@ pub struct TicketApplication {
 mod initialization;
 pub use initialization::{ScopeInitialization, ScopeInitializationError};
 mod resolution;
+mod sprints;
 #[cfg(test)]
 mod tests;
 
