@@ -28,11 +28,11 @@ pub(crate) fn effective_guide_activation(
     } else {
         activated_discoverable_tools(session)
     };
-    // Ultra Roots rely on delegation for execution, so the compact contract
+    // Ultra Roots and trusted Supervisors rely on delegation, so its contract
     // must be visible even if guide exposure froze before the mode was selected.
     // This derived presentation policy neither persists user activation nor
     // changes the live catalog or execution authority.
-    if session.root_orchestration_only_enabled() {
+    if session.model_orchestration_only_enabled() {
         activated.insert("SubAgent".to_string());
     }
     activated
@@ -170,6 +170,12 @@ fn resolve_catalog_with_activation(
     // round, because this list is rebuilt unfiltered every round; with no resolver
     // (SDK/tests) this is the frozen per-run snapshot (#44), unchanged.
     let (disabled_tools, _disabled_skill_ids) = config.resolve_disabled_filters();
+    // Self control is host-opt-in and uses ordinary authority filtering below.
+    if config.loop_control.is_none() {
+        tool_schemas.retain(|schema| {
+            schema.function.name != bamboo_tools::tools::loop_control::LOOP_CONTROL_TOOL_NAME
+        });
+    }
     // The `update_goal` self-report tool is only meaningful while the autonomous
     // goal loop is active; hide it from every ordinary session so it never
     // tempts the model when no goal is set.
@@ -199,6 +205,15 @@ fn resolve_catalog_with_activation(
     }
 
     if session.supervisor_incarnation_id().is_some() {
+        for schema in tool_schemas
+            .iter_mut()
+            .filter(|schema| schema.function.name == "SubAgent")
+        {
+            schema.function.description = format!(
+                "Supervisor: delegate execution, including simple implementation tasks; retain only necessary dedicated read-only acquisition and orchestration here. If no suitable authorized worker is available, report the actual recoverable blocker instead of self-executing or repeatedly creating children. {}",
+                schema.function.description,
+            );
+        }
         for schema in tool_schemas
             .iter_mut()
             .filter(|schema| schema.function.name == "session_history")

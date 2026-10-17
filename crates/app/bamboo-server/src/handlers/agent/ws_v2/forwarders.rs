@@ -266,8 +266,8 @@ async fn send_actor_plan(
     true
 }
 
-/// One lazy canonical Actor channel. The subscription lease drops on abort,
-/// closing the source sender and replay window after the final observer leaves.
+/// One lazy canonical Actor channel. Abort releases its observer reference;
+/// opted-in bounded replay windows briefly outlive the final socket observer.
 pub(crate) fn spawn_actor_forwarder(
     out: OutboundTx,
     encoding: Encoding,
@@ -278,8 +278,32 @@ pub(crate) fn spawn_actor_forwarder(
     tokio::spawn(async move {
         let mut last = since.unwrap_or(0);
         let initial = std::mem::replace(&mut subscription.initial, ActorReplay::Events(Vec::new()));
+        let proof = subscription.resume_proof.take();
         if !send_actor_plan(&out, encoding, &ch, initial, &mut last).await {
             return;
+        }
+        if let Some(proof) = proof {
+            // The acknowledgment follows the complete retained prefix on the
+            // same bounded queue, before its live receiver is drained.
+            if proof.cursor != last
+                || !send_env(
+                    &out,
+                    encoding,
+                    ServerEnvelope::control(
+                        &ch,
+                        last,
+                        serde_json::json!({
+                            "type": "actor_replay_complete",
+                            "epoch": proof.epoch.to_string(),
+                            "cursor": last,
+                            "resumed_from": proof.resumed_from,
+                        }),
+                    ),
+                )
+                .await
+            {
+                return;
+            }
         }
         loop {
             match subscription.receiver.recv().await {
@@ -1270,6 +1294,115 @@ mod tests {
     use crate::app_state::{AgentRunner, AgentStatus};
     use crate::handlers::agent::events::terminal_event_if_ready;
     use std::collections::VecDeque;
+
+    fn public_actor_marker(
+        sequence: u64,
+    ) -> bamboo_engine::external_agents::actor_event_stream::PublicActorEvent {
+        use bamboo_engine::external_agents::actor_event_stream::{
+            ActorEventSourceOrder, PublicActorEvent, PublicActorEventClass,
+        };
+        PublicActorEvent {
+            actor_id: "child".into(),
+            root_actor_id: "root".into(),
+            parent_actor_id: Some("root".into()),
+            activation_id: "123e4567-e89b-42d3-a456-426614174000".into(),
+            attempt: 1,
+            event_id: format!("ae1-{sequence:064x}"),
+            class: PublicActorEventClass::Semantic,
+            source_order: ActorEventSourceOrder {
+                lease_epoch: 1,
+                execution_epoch: 1,
+                sequence,
+            },
+        }
+    }
+
+    async fn next_actor_frame(rx: &mut mpsc::Receiver<OutFrame>) -> serde_json::Value {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            OutFrame::Text(text) => serde_json::from_str(&text).unwrap(),
+            OutFrame::Binary(bytes) => rmp_serde::from_slice(&bytes).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_resume_proof_follows_replay_prefix_and_precedes_live_in_both_encodings() {
+        use bamboo_engine::external_agents::actor_event_stream::ActorEventObserver;
+        for encoding in [Encoding::Json, Encoding::Msgpack] {
+            let hub = Arc::new(crate::app_state::actor_events::ActorEventHub::default());
+            let first = hub.subscribe_resumable("child", None, None).unwrap();
+            let proof = first.resume_proof.as_ref().unwrap();
+            let (epoch, base) = (proof.epoch, proof.cursor);
+            hub.publish(public_actor_marker(1));
+            drop(first);
+            hub.publish(public_actor_marker(2));
+            let resumed = hub
+                .subscribe_resumable("child", Some(base + 1), Some(epoch))
+                .unwrap();
+            // Publish after the initial plan is captured, before its bounded
+            // queue is drained: this marker must follow the replay proof.
+            hub.publish(public_actor_marker(3));
+            let (out, mut rx) = mpsc::channel(1);
+            let handle =
+                spawn_actor_forwarder(out, encoding, "actor.child".into(), resumed, Some(base + 1));
+            let replay = next_actor_frame(&mut rx).await;
+            assert_eq!(replay["seq"], base + 2);
+            assert_eq!(replay["event"]["event_id"], public_actor_marker(2).event_id);
+            assert_eq!(replay["event"].as_object().unwrap().len(), 8);
+            let proof = next_actor_frame(&mut rx).await;
+            assert_eq!(
+                proof,
+                serde_json::json!({
+                    "ch":"actor.child", "seq":base + 2,
+                    "control":{"type":"actor_replay_complete","epoch":epoch.to_string(),"cursor":base + 2,"resumed_from":base + 1}
+                })
+            );
+            let live = next_actor_frame(&mut rx).await;
+            assert_eq!(live["seq"], base + 3);
+            assert_eq!(live["event"]["event_id"], public_actor_marker(3).event_id);
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_resume_baselines_never_claim_the_missing_prefix() {
+        for epoch in [None, Some(uuid::Uuid::new_v4())] {
+            let hub = Arc::new(crate::app_state::actor_events::ActorEventHub::default());
+            let subscription = hub
+                .subscribe_resumable("child", epoch.map(|_| 5), epoch)
+                .unwrap();
+            let expected = subscription.resume_proof.as_ref().unwrap();
+            let (new_epoch, cursor) = (expected.epoch, expected.cursor);
+            let (out, mut rx) = mpsc::channel(1);
+            let handle = spawn_actor_forwarder(
+                out,
+                Encoding::Json,
+                "actor.child".into(),
+                subscription,
+                epoch.map(|_| 5),
+            );
+            let reset = next_actor_frame(&mut rx).await;
+            assert_eq!(reset["control"]["type"], "actor_snapshot_required");
+            assert_eq!(
+                reset["control"]["reason"],
+                if epoch.is_some() { "gap" } else { "initial" }
+            );
+            let proof = next_actor_frame(&mut rx).await;
+            assert_eq!(
+                proof,
+                serde_json::json!({
+                    "ch":"actor.child", "seq":cursor,
+                    "control":{"type":"actor_replay_complete","epoch":new_epoch.to_string(),"cursor":cursor,"resumed_from":null}
+                })
+            );
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
 
     #[tokio::test]
     async fn actor_tree_retries_pending_transaction_then_sends_recovered_cursor() {

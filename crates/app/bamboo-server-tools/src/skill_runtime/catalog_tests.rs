@@ -66,6 +66,10 @@ struct Fixture {
 impl Fixture {
     async fn new(count: usize) -> Self {
         let directory = tempfile::tempdir().unwrap();
+        Self::new_in(count, directory).await
+    }
+
+    async fn new_in(count: usize, directory: tempfile::TempDir) -> Self {
         let skills = directory.path().join("skills");
         for index in 0..count {
             let id = format!("catalog-{index}");
@@ -1969,7 +1973,28 @@ impl Fixture {
 #[tokio::test]
 async fn skill_factory_unappended_user_preserves_message_and_existing_reader_predicate() {
     use bamboo_domain::{ImageUrlRef, MessagePart};
-    let fixture = Fixture::new(2).await;
+    let directory = tempfile::Builder::new()
+        .prefix("authorized-aux-path-")
+        .tempdir()
+        .unwrap();
+    let fixture = Fixture::new_in(2, directory).await;
+    let auxiliary_canaries = [
+        "BAMBOO_PREAPPEND_RAW_CANARY_CATALOG_0_98C2E1",
+        "BAMBOO_PREAPPEND_RAW_CANARY_CATALOG_1_98C2E1",
+    ];
+    let mut auxiliary_raw = Vec::new();
+    for (index, canary) in auxiliary_canaries.iter().enumerate() {
+        let path = fixture
+            ._directory
+            .path()
+            .join("skills")
+            .join(format!("catalog-{index}"))
+            .join("references/raw.txt");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{canary}\n{raw}")).unwrap();
+        auxiliary_raw.push(raw);
+    }
+    fixture.manager.store().reload().await.unwrap();
     let (mut user, selections) = fixture.fresh_input(&["catalog-0", "catalog-1"]).await;
     user.content_parts = Some(vec![
         MessagePart::Text {
@@ -2007,8 +2032,30 @@ async fn skill_factory_unappended_user_preserves_message_and_existing_reader_pre
     assert!(prepared.message.content.starts_with(&user.content));
     assert!(prepared.message.content.contains("PRIVATE BODY catalog-0"));
     assert!(prepared.message.content.contains("PRIVATE BODY catalog-1"));
-    assert!(!prepared.message.content.contains("aux"));
+    assert!(prepared.message.content.contains("authorized-aux-path-"));
+    // An authorized source path may contain "aux"; reject actual resource content.
+    let assert_auxiliary_absent = |text: &str| {
+        assert!(
+            !text.contains("界🦀\r\n\0\"\\aux"),
+            "raw auxiliary block was preappended"
+        );
+        for canary in &auxiliary_canaries {
+            assert!(!text.contains(*canary), "auxiliary canary was preappended");
+        }
+        for raw in &auxiliary_raw {
+            assert!(
+                !text.contains(raw.as_str()),
+                "raw auxiliary content was preappended"
+            );
+        }
+    };
+    assert_auxiliary_absent(&prepared.message.content);
     let parts = prepared.message.content_parts.as_ref().unwrap();
+    for part in parts {
+        if let MessagePart::Text { text } = part {
+            assert_auxiliary_absent(text);
+        }
+    }
     assert!(matches!(&parts[0], MessagePart::Text { text } if text == &prepared.message.content));
     assert_eq!(&parts[1..], &user.content_parts.as_ref().unwrap()[1..]);
     assert_eq!(serde_json::to_value(&user).unwrap(), original);
@@ -4046,4 +4093,115 @@ async fn skill_factory_self_owned_waits_for_owner_without_retaining_config_read_
             .unwrap()
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn supervisor_delegation_first_catalog_and_factory_keep_skill_authority_denied_in_both_modes()
+{
+    for ultra in [false, true] {
+        let mut fixture = Fixture::new(2).await;
+        let storage = Arc::new(
+            bamboo_storage::SessionStoreV2::new(fixture._directory.path().join("supervisor-data"))
+                .await
+                .unwrap(),
+        );
+        fixture.repo = bamboo_engine::SessionRepository::new(
+            bamboo_engine::SessionCache::default(),
+            storage.clone(),
+            Arc::new(bamboo_storage::LockedSessionStore::new(storage)),
+        );
+        fixture.tool = SkillsListTool::new(
+            fixture.manager.clone(),
+            fixture.config.clone(),
+            fixture.repo.clone(),
+            fixture.resolver.clone(),
+        );
+        let bootstrap = bamboo_engine::session_app::supervisor::SupervisorSessionService::new(
+            fixture.repo.storage().clone(),
+        )
+        .get_or_create_default("model")
+        .await
+        .unwrap();
+        let mut session = fixture
+            .repo
+            .storage()
+            .load_session(&bootstrap.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        session.set_root_orchestration_only(ultra).unwrap();
+        fixture.repo.save(&mut session).await.unwrap();
+        let (user, selections) = fixture.fresh_input(&["catalog-0"]).await;
+        fixture.ctx.session_id = Some(session.id.clone().into());
+        fixture
+            .resolver
+            .0
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .session_id = session.id.clone();
+        let before = serde_json::to_value(&session).unwrap();
+        let prepared = fixture
+            .input_factory()
+            .prepare_input(
+                &fixture.ctx,
+                &user,
+                SkillInputSession::Existing,
+                &selections,
+            )
+            .await;
+        assert!(
+            prepared.is_err(),
+            "Supervisor Ultra={ultra}: factory prepared an execution Skill"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                fixture
+                    .repo
+                    .storage()
+                    .load_session(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            before
+        );
+
+        session.add_message(user);
+        fixture.repo.save(&mut session).await.unwrap();
+        let before = serde_json::to_value(&session).unwrap();
+        assert_eq!(
+            fixture
+                .tool
+                .render_catalog(&fixture.ctx)
+                .await
+                .unwrap()
+                .included_count,
+            0
+        );
+        assert!(fixture.page(None, 20).await.unwrap().1["skills"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(fixture
+            .tool
+            .selected_source(&fixture.ctx, "catalog-0", "SKILL.md")
+            .await
+            .is_err());
+        assert_eq!(
+            serde_json::to_value(
+                fixture
+                    .repo
+                    .storage()
+                    .load_session(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            before
+        );
+    }
 }

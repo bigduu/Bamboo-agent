@@ -1006,6 +1006,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervisor_delegation_first_blocks_implementation_approval_replay_in_both_modes() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for ultra in [false, true] {
+            let mut owned =
+                session_with_mode(DEFAULT_SUPERVISOR_SESSION_ID, SessionPermissionMode::Auto);
+            owned.authority_identity = SessionAuthorityIdentity::Supervisor {
+                incarnation_id: uuid::Uuid::new_v4(),
+            };
+            owned.set_root_orchestration_only(ultra).unwrap();
+            let storage = ReplayStorage {
+                session: RwLock::new(Some(owned.clone())),
+                fail_load: false,
+            };
+            for name in ["Write", "Edit", "exec_command", "load_skill"] {
+                assert_eq!(
+                    refresh_approval_replay_posture(
+                        &storage,
+                        &mut owned,
+                        PermissionMode::Default,
+                        Some(name)
+                    )
+                    .await
+                    .unwrap(),
+                    ApprovalReplayDecision::BlockedByRootToolAuthority,
+                    "{ultra}: {name}"
+                );
+            }
+            for name in ["Read", "SubAgent", "session_control"] {
+                assert!(
+                    matches!(
+                        refresh_approval_replay_posture(
+                            &storage,
+                            &mut owned,
+                            PermissionMode::Default,
+                            Some(name)
+                        )
+                        .await
+                        .unwrap(),
+                        ApprovalReplayDecision::Execute(_)
+                    ),
+                    "{ultra}: {name}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn durable_root_tool_authority_blocks_denied_replay_owner() {
         let mut owned = session_with_mode("root-replay", SessionPermissionMode::Auto);
         let mut latest = owned.clone();

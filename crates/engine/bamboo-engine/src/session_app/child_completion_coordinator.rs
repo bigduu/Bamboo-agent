@@ -1418,12 +1418,19 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                     child_final_response.clone(),
                     &resume_message,
                 );
-                if let Some(run_id) = self
-                    .agent
-                    .activation_router()
-                    .map(|router| router.current_run_id(&completion.parent_session_id))
-                {
-                    if let Some(run_id) = run_id.await {
+                if let Some(router) = self.agent.activation_router() {
+                    let previous_fenced_run = previous_delivery
+                        .as_ref()
+                        .and_then(|(envelope, _)| envelope.correlation_id.as_deref())
+                        .and_then(|value| value.strip_prefix("child_completion_after_run:"));
+                    if let Some(run_id) = router
+                        .child_completion_successor_run(
+                            &completion.parent_session_id,
+                            active_wait.is_some() || guardian_control_changed,
+                            previous_fenced_run,
+                        )
+                        .await
+                    {
                         envelope.correlation_id =
                             Some(format!("child_completion_after_run:{run_id}"));
                     }
@@ -1520,7 +1527,13 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             if should_resume {
                 if let (Some(wait), Some(messenger)) = (active_wait.as_ref(), messenger.as_ref()) {
                     let parent_run_id = if let Some(router) = self.agent.activation_router() {
-                        router.current_run_id(&completion.parent_session_id).await
+                        router
+                            .child_completion_successor_run(
+                                &completion.parent_session_id,
+                                true,
+                                None,
+                            )
+                            .await
                     } else {
                         None
                     };
@@ -3836,6 +3849,7 @@ impl ChildCompletionCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("child_completion_background_tests.rs");
     use bamboo_domain::session::runtime_state::SuspensionState;
 
     #[test]

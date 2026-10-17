@@ -2,8 +2,8 @@
 
 Bamboo provides a trusted host/SDK service for one stable Supervisor Root in
 each local data domain. It establishes identity and manages explicitly scoped
-links to independent Ordinary Roots. Commands such as followup and cancellation
-remain separate capabilities tracked by #1051–#1058.
+links to independent Ordinary Roots. Each management command retains its own
+trusted admission checks; identity and a visible tool definition are not a grant.
 
 ```rust,no_run
 use bamboo_sdk::Agent;
@@ -75,6 +75,51 @@ bootstrap wins a concurrent first save, that stale save fails without publishing
 its rejected identity to a cache. Unrelated I/O failures keep their existing
 runtime publication behavior. Task writes, migration, clear, copy and recovery
 must respect the same authority integrity boundary.
+
+## Model role and thinking mode
+
+Supervisor identity and [Ultra thinking mode](design/ultra-root-thinking-mode-v1.md)
+are independent. A trusted Supervisor delegates execution in both Standard and
+Ultra. Switching to Standard does not turn it into an implementation worker;
+selecting Ultra on an Ordinary Root does not make it a Supervisor.
+
+| Executing Session | Model posture | Management authority |
+| --- | --- | --- |
+| Ordinary Root, Standard | Existing configured execution tools and permissions | Existing ordinary checks; no Supervisor exception |
+| Ordinary Root, Ultra | Bounded planning, delegation, read-only acquisition and verification | No Supervisor-only exception |
+| Trusted Supervisor, Standard or Ultra | Bounded orchestration and necessary dedicated read-only acquisition | Only current, explicitly authorized scope |
+| Child | Its own profile, tools and permissions | Does not inherit Supervisor identity or management scope |
+
+The Supervisor owns task boundaries, planning, dispatch, progress, coordination,
+evidence verification and synthesis. It delegates implementation, including
+simple changes. Necessary reads use dedicated `Read`, `Grep`, `Glob`,
+`GetFileInfo`, `ViewImage` and scoped history tools. Shell commands, editing,
+Skill/Workflow execution and external tools cannot become read-only shortcuts.
+Catalog projection, final dispatch, approval replay and queued tool actions
+apply the same exact execution-name boundary.
+
+Use `SubAgent` for a bounded child assignment and `Plan` for a read-only planning
+child. `work_dispatch` uses the existing Work authority. `session_control`
+continues an independent Ordinary Root only after explicit attach and current
+Project, lifetime and Supervisor checks. `session_history` allows only
+`read_messages` and `get_meta` in that scope; it is not a global Session directory.
+`session_message` retains its same-task-tree restriction and cannot replace an
+independent-Root followup.
+
+Providers may defer delegation tool definitions. The trusted Supervisor can use
+the existing read-only discovery protocol to load its approved orchestration
+catalog. Discovery does not open Skill/Workflow catalogs, broaden target scope,
+force a named tool call, or make an unavailable worker ready. A saved discovery
+receipt cannot restore a tool that is no longer in the current catalog.
+
+If delegation fails or no authorized worker is available, report the actual
+recoverable blocker and the owner action needed to proceed. Inspect an existing
+assignment or receipt before retrying an uncertain dispatch. Do not self-execute,
+create overlapping assignments, retry unchanged failures indefinitely, change
+permissions, attach unrelated Sessions, or restore a broker automatically.
+Opening a Supervisor or selecting Ultra does not enable Work feature flags or
+initialize its Work scope. Tool exposure is distinct from worker readiness and
+target authorization.
 
 ## Trusted Project scope and links
 
@@ -165,9 +210,9 @@ Task callbacks continue to patch only Task fields.
 Receipts and observations contain bounded identity/revision/link fields, never
 a history-free Session to install in a full conversation cache. `inspect_link`
 proves authorization only while its locks are held. The returned boolean is an
-observation, not a retained grant for a later command. Future #1051 command
-admission must retain a final relationship/target authorization fence through
-durable inbox acceptance; this link API does not solve that later race.
+observation, not a retained grant for a later command. Command admission must
+retain a final relationship/target authorization fence through durable Inbox
+acceptance; inspecting a link alone does not authorize a later followup.
 
 Followups, cancellation, Tracker subscriptions and Plan delegation still need
 their own trusted admission checks. Like the existing Session store, this is not

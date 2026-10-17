@@ -626,30 +626,51 @@ async fn prompt_exposure_starts_only_after_successful_provider_bootstrap() {
         let provider: Arc<dyn LLMProvider> = Arc::new(BoundaryProvider(case));
         let mut session = Session::new(&session_id, "test-model");
 
-        let result = execute_llm_stream(
-            &mut session,
-            &config,
-            &provider,
-            &prepared_context,
-            &[],
-            &LlmStreamFrame {
-                event_tx: &event_tx,
-                cancel_token: &cancel,
-                session_id: &session_id,
-                model: "test-model",
-                provider_name: None,
-                provider_type: None,
-                reasoning_effort: None,
-                max_context_tokens: 400_000,
-                max_output_tokens: 128,
-                observation_progress_hint: None,
-                prompt_memory_exposure: Some(PromptMemoryExposureFrame {
-                    round_id: &round_id,
-                    provenance: &provenance,
-                }),
-            },
-        )
-        .await;
+        let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+        let result = trace
+            .scope(execute_llm_stream(
+                &mut session,
+                &config,
+                &provider,
+                &prepared_context,
+                &[],
+                &LlmStreamFrame {
+                    event_tx: &event_tx,
+                    cancel_token: &cancel,
+                    session_id: &session_id,
+                    model: "test-model",
+                    provider_name: None,
+                    provider_type: None,
+                    reasoning_effort: None,
+                    max_context_tokens: 400_000,
+                    max_output_tokens: 128,
+                    observation_progress_hint: None,
+                    prompt_memory_exposure: Some(PromptMemoryExposureFrame {
+                        round_id: &round_id,
+                        provenance: &provenance,
+                    }),
+                },
+            ))
+            .await;
+        let spans = trace.spans();
+        if case == BoundaryCase::PreCancelled {
+            assert!(
+                spans.is_empty(),
+                "cancelled before dispatch must not fabricate an LLM request"
+            );
+        } else {
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].name, "chat test-model");
+            assert!(spans[0]
+                .attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == "error.type"
+                    && kv.value.to_string() == "provider_error"));
+            assert!(
+                !format!("{spans:?}").contains("injected"),
+                "raw provider errors must not be exported"
+            );
+        }
         assert!(result.is_err(), "{case:?} must fail the stream execution");
 
         if case == BoundaryCase::StreamError {
@@ -1882,30 +1903,36 @@ async fn final_ir_guard_rejects_unbudgeted_large_ledger_before_provider_dispatch
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
     let llm = mock_llm(vec![LLMChunk::Done]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
-    let result = execute_llm_stream(
-        &mut session,
-        &config,
-        &llm_dyn,
-        &prepared_context,
-        &[],
-        &LlmStreamFrame {
-            event_tx: &event_tx,
-            cancel_token: &CancellationToken::new(),
-            session_id,
-            model: "test-model",
-            provider_name: Some("openai"),
-            provider_type: Some("openai"),
-            reasoning_effort: None,
-            max_context_tokens: 2_000,
-            max_output_tokens: 200,
-            observation_progress_hint: None,
-            prompt_memory_exposure: Some(PromptMemoryExposureFrame {
-                round_id,
-                provenance: &provenance,
-            }),
-        },
-    )
-    .await;
+    let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+    let result = trace
+        .scope(execute_llm_stream(
+            &mut session,
+            &config,
+            &llm_dyn,
+            &prepared_context,
+            &[],
+            &LlmStreamFrame {
+                event_tx: &event_tx,
+                cancel_token: &CancellationToken::new(),
+                session_id,
+                model: "test-model",
+                provider_name: Some("openai"),
+                provider_type: Some("openai"),
+                reasoning_effort: None,
+                max_context_tokens: 2_000,
+                max_output_tokens: 200,
+                observation_progress_hint: None,
+                prompt_memory_exposure: Some(PromptMemoryExposureFrame {
+                    round_id,
+                    provenance: &provenance,
+                }),
+            },
+        ))
+        .await;
+    assert!(
+        trace.spans().is_empty(),
+        "failed prompt preflight must not fabricate provider spans"
+    );
 
     assert!(matches!(result, Err(AgentError::Budget(_))));
     assert!(llm

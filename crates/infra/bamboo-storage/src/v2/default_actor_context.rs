@@ -15,6 +15,8 @@ pub(super) struct DefaultWriterGuards {
         Option<super::parent_question_answer_proof::ParentQuestionAnswerProof>,
     pub(super) input: Option<super::root_actor_input::RootActorInputProof>,
     pub(super) _input_filesystem: Option<crate::session_inbox::OwnedFilesystem>,
+    pub(super) scoped_loop: Option<super::scoped_loop_control::ScopedLoopWriteProof>,
+    pub(super) scoped_input: Option<super::scoped_loop_control::ScopedLoopInputProof>,
     pub(crate) physical: Arc<DefaultWriterPhysicalGuards>,
 }
 
@@ -23,10 +25,11 @@ pub(super) struct DefaultWriterGuards {
 pub(crate) struct DefaultWriterPhysicalGuards {
     // Retain the complete acquired scope in canonical and Inbox jobs alike.
     tree: std::sync::Mutex<Option<ActorTreeWriteGuard>>,
-    _session: SessionWriteGuard,
+    _session: Option<SessionWriteGuard>,
     _root_session: Option<SessionWriteGuard>,
-    _task: TaskGuard,
-    _lifecycle: LifecycleGuard,
+    _supervisor: Option<Arc<super::supervisor_management::SupervisorFollowupGuard>>,
+    _task: Option<TaskGuard>,
+    _lifecycle: Option<LifecycleGuard>,
 }
 
 enum TaskGuard {
@@ -66,12 +69,15 @@ impl DefaultWriterGuards {
             parent_question_answer: None,
             input: None,
             _input_filesystem: None,
+            scoped_loop: None,
+            scoped_input: None,
             physical: Arc::new(DefaultWriterPhysicalGuards {
                 tree: std::sync::Mutex::new(None),
-                _session: session,
+                _session: Some(session),
                 _root_session: None,
-                _task: TaskGuard::Shared { _guard: task },
-                _lifecycle: LifecycleGuard::Shared { _guard: lifecycle },
+                _supervisor: None,
+                _task: Some(TaskGuard::Shared { _guard: task }),
+                _lifecycle: Some(LifecycleGuard::Shared { _guard: lifecycle }),
             }),
         })
     }
@@ -90,12 +96,42 @@ impl DefaultWriterGuards {
             parent_question_answer: None,
             input: None,
             _input_filesystem: None,
+            scoped_loop: None,
+            scoped_input: None,
             physical: Arc::new(DefaultWriterPhysicalGuards {
                 tree: std::sync::Mutex::new(None),
-                _session: session,
+                _session: Some(session),
                 _root_session: None,
-                _task: TaskGuard::Exclusive { _guard: task },
-                _lifecycle: LifecycleGuard::Exclusive { _guard: lifecycle },
+                _supervisor: None,
+                _task: Some(TaskGuard::Exclusive { _guard: task }),
+                _lifecycle: Some(LifecycleGuard::Exclusive { _guard: lifecycle }),
+            }),
+        })
+    }
+
+    pub(super) fn scoped_loop(
+        authority: super::supervisor_management::SupervisorFollowupGuard,
+        root_actor: Option<super::root_actor_runtime::RootActorWriteProof>,
+        proof: super::scoped_loop_control::ScopedLoopWriteProof,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            root_mode_context: None,
+            root_actor,
+            child_actor: None,
+            child_input: None,
+            root_origin: None,
+            parent_question_answer: None,
+            input: None,
+            _input_filesystem: None,
+            scoped_loop: Some(proof),
+            scoped_input: None,
+            physical: Arc::new(DefaultWriterPhysicalGuards {
+                tree: std::sync::Mutex::new(None),
+                _session: None,
+                _root_session: None,
+                _supervisor: Some(Arc::new(authority)),
+                _task: None,
+                _lifecycle: None,
             }),
         })
     }
@@ -362,10 +398,28 @@ impl SessionStoreV2 {
         guards: &Arc<DefaultWriterGuards>,
         job: impl FnOnce() -> io::Result<T> + Send + 'static,
     ) -> io::Result<T> {
+        Self::default_writer_runtime_job(guards, move |runtime| {
+            let _retained_runtime = runtime;
+            job()
+        })
+        .await
+    }
+
+    async fn default_writer_runtime_job<T: Send + 'static>(
+        guards: &Arc<DefaultWriterGuards>,
+        job: impl FnOnce(Option<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>>) -> io::Result<T>
+            + Send
+            + 'static,
+    ) -> io::Result<T> {
         let guards = Arc::clone(guards);
         tokio::task::spawn_blocking(move || {
+            let runtime = guards
+                .scoped_loop
+                .as_ref()
+                .map(|proof| proof.retain())
+                .transpose()?;
             let _guards = guards;
-            job()
+            job(runtime)
         })
         .await
         .map_err(|error| other_io_error(format!("join default Session filesystem job: {error}")))?
@@ -385,15 +439,26 @@ impl SessionStoreV2 {
         let root_origin = guards.root_origin.clone();
         let parent_question_answer = guards.parent_question_answer.clone();
         let input = guards.input.clone();
+        let scoped_input = guards.scoped_input.clone();
+        let scoped_loop = guards.scoped_loop.clone();
         #[cfg(test)]
         let hook = self.default_write_hook.lock().unwrap().clone();
-        Self::default_writer_job(guards, move || {
+        Self::default_writer_runtime_job(guards, move |runtime| {
             durable_atomic_write_blocking(&path, &bytes, |phase| {
                 #[cfg(test)]
                 if let Some(hook) = &hook {
                     hook.visit(&path, phase)?;
                 }
                 if matches!(phase, DurableWritePhase::BeforeReplace) {
+                    if let Some(proof) = &scoped_loop {
+                        proof.validate_retained(runtime.as_ref().ok_or_else(|| {
+                            io::Error::other("scoped Loop physical guard missing")
+                        })?)?;
+                    }
+
+                    if let Some(proof) = &scoped_input {
+                        proof.validate(false)?;
+                    }
                     if let Some(proof) = &root_mode_context {
                         proof.validate_actor_witnesses()?;
                     }

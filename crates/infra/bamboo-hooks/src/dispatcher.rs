@@ -41,9 +41,15 @@ pub struct HookDispatchReport {
 }
 
 /// Registry and deterministic dispatcher for programmatic and configured hooks.
+#[derive(Clone)]
+struct RegisteredHook {
+    hook: Arc<dyn AgentHook>,
+    may_suspend: bool,
+}
+
 #[derive(Clone, Default)]
 pub struct HookDispatcher {
-    hooks: Vec<Arc<dyn AgentHook>>,
+    hooks: Vec<RegisteredHook>,
 }
 
 impl HookDispatcher {
@@ -53,8 +59,10 @@ impl HookDispatcher {
 
     /// Register a hook. Lower numeric priorities run first.
     pub fn register(&mut self, hook: Arc<dyn AgentHook>) {
-        self.hooks.push(hook);
-        self.hooks.sort_by_key(|hook| hook.priority());
+        let may_suspend = hook.may_suspend();
+        self.hooks.push(RegisteredHook { hook, may_suspend });
+        self.hooks
+            .sort_by_key(|registered| registered.hook.priority());
     }
 
     /// Clone this registry and append configured handlers from a frozen config
@@ -150,7 +158,8 @@ impl HookDispatcher {
         );
         let mut pending_composite_ask = false;
 
-        for hook in &self.hooks {
+        for registered in &self.hooks {
+            let hook = &registered.hook;
             if hook.point() != point {
                 continue;
             }
@@ -176,6 +185,11 @@ impl HookDispatcher {
             for (selected_payload, restriction_only) in selected {
                 let started = Instant::now();
                 let result = hook.run(point, selected_payload, session).await;
+                let result = if registered.may_suspend {
+                    result
+                } else {
+                    enforce_non_suspending_hook(result)
+                };
                 report.executions.push(HookExecution {
                     hook_name: hook.name().to_string(),
                     point,
@@ -237,8 +251,18 @@ impl HookDispatcher {
         report
     }
 
+    /// Native control hooks are conservatively resumable unless their host
+    /// implementation explicitly declares the non-suspending contract.
+    pub fn has_suspending_hooks_for(&self, point: AgentHookPoint) -> bool {
+        self.hooks
+            .iter()
+            .any(|registered| registered.hook.point() == point && registered.may_suspend)
+    }
+
     pub fn has_hooks_for(&self, point: AgentHookPoint) -> bool {
-        self.hooks.iter().any(|hook| hook.point() == point)
+        self.hooks
+            .iter()
+            .any(|registered| registered.hook.point() == point)
     }
 
     pub fn len(&self) -> usize {
@@ -263,6 +287,19 @@ fn unwrap_context_result(mut result: HookResult) -> (HookResult, Vec<String>) {
         result = *inner;
     }
     (result, contexts)
+}
+
+fn enforce_non_suspending_hook(result: HookResult) -> HookResult {
+    match result {
+        HookResult::Suspend { reason } => HookResult::Abort {
+            reason: format!("non-suspending native hook requested suspension: {reason}"),
+        },
+        HookResult::WithContext { result, text } => HookResult::WithContext {
+            result: Box::new(enforce_non_suspending_hook(*result)),
+            text,
+        },
+        result => result,
+    }
 }
 
 #[cfg(test)]
@@ -920,3 +957,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod non_suspending_tests;

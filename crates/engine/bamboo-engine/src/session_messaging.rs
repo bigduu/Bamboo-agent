@@ -13,8 +13,9 @@ use bamboo_agent_core::storage::Storage;
 use bamboo_domain::{
     ActorSession, Session, SessionActivationDisposition, SessionActivationError,
     SessionActivationPolicy, SessionActivationPort, SessionInboxError, SessionInboxPort,
-    SessionInboxReceipt, SessionMessageBody, SessionMessageContent, SessionMessageEnvelope,
-    SessionMessageId, SessionMessageKind, SessionMessageSource, SupervisorReference,
+    SessionInboxReceipt, SessionMessageBody, SessionMessageContent, SessionMessageDeliveryIntent,
+    SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
+    SupervisorReference,
 };
 
 /// A followup is one bounded peer instruction, not a context export or file transfer.
@@ -130,6 +131,36 @@ impl SessionMessagingMetrics {
 pub struct SessionMessengerReceipt {
     pub delivery: SessionInboxReceipt,
     pub activation: SessionActivationDisposition,
+}
+
+/// A durable peer delivery receipt. No field proves context consumption,
+/// a terminal run, or an answer. None means activation was not requested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPeerDeliveryReceipt {
+    pub delivery: SessionInboxReceipt,
+    pub activation: Option<SessionActivationDisposition>,
+    pub active_delivery_notified: bool,
+}
+
+impl From<SessionMessengerReceipt> for SessionPeerDeliveryReceipt {
+    fn from(receipt: SessionMessengerReceipt) -> Self {
+        Self {
+            delivery: receipt.delivery,
+            activation: Some(receipt.activation),
+            active_delivery_notified: false,
+        }
+    }
+}
+
+impl SessionPeerDeliveryReceipt {
+    fn into_legacy(self) -> SessionMessengerReceipt {
+        SessionMessengerReceipt {
+            delivery: self.delivery,
+            activation: self
+                .activation
+                .expect("legacy peer delivery requests activation"),
+        }
+    }
 }
 
 /// Durable admission separated from activation so coordinators can commit
@@ -308,6 +339,97 @@ impl SessionMessenger {
         operation_id: &str,
         message: &str,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        self.send_peer_delivery(
+            caller_session_id,
+            target_session_id,
+            operation_id,
+            message,
+            None,
+        )
+        .await
+        .map(SessionPeerDeliveryReceipt::into_legacy)
+    }
+
+    /// Explicit scheduling over the same lifetime-fenced Inbox. Omission on
+    /// the old send_peer API keeps legacy interrupt/activation behavior.
+    pub async fn send_peer_with_intent(
+        &self,
+        caller_session_id: &str,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        intent: SessionMessageDeliveryIntent,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
+        self.send_peer_delivery(
+            caller_session_id,
+            target_session_id,
+            operation_id,
+            message,
+            Some(intent),
+        )
+        .await
+    }
+
+    /// Active-run-only peer input. The Inbox owns exact retry recovery and
+    /// retains its original authority through the runtime's publication CAS.
+    /// This never cancels a run, requests activation or reconstructs an owner.
+    pub async fn steer_peer(
+        &self,
+        caller_session_id: &str,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        expected_run_id: &str,
+    ) -> Result<bamboo_domain::SessionInboxSteerReceipt, SessionMessengerError> {
+        Self::validate_peer_input(operation_id, message)?;
+        if !bamboo_domain::valid_session_run_id(expected_run_id) {
+            return Err(SessionMessengerError::InvalidEnvelope(
+                "invalid expected run id".into(),
+            ));
+        }
+        let (caller, target) = self.peer_pair(caller_session_id, target_session_id).await?;
+        let id = Self::peer_message_id(&caller, &target, operation_id);
+        let envelope = Self::peer_envelope(
+            &caller,
+            &target,
+            operation_id,
+            message,
+            id.clone(),
+            id.to_string(),
+            None,
+        );
+        let source = ActorSession::from_session(&caller)
+            .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
+        let target = ActorSession::from_session(&target)
+            .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
+        let started = Instant::now();
+        let receipt = self
+            .inbox
+            .deliver_peer_steer(
+                &envelope,
+                &source,
+                &target,
+                expected_run_id,
+                self.activation.clone(),
+            )
+            .await
+            .map_err(|error| {
+                let error = SessionMessengerError::Inbox(error);
+                self.record_rejection(&error);
+                error
+            })?;
+        self.record_admission(envelope, receipt.delivery.clone(), started);
+        Ok(receipt)
+    }
+
+    async fn send_peer_delivery(
+        &self,
+        caller_session_id: &str,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        intent: Option<SessionMessageDeliveryIntent>,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         Self::validate_peer_input(operation_id, message)?;
         let (caller, target) = self.peer_pair(caller_session_id, target_session_id).await?;
         let id = Self::peer_message_id(&caller, &target, operation_id);
@@ -320,7 +442,7 @@ impl SessionMessenger {
             id.to_string(),
             None,
         );
-        self.send_peer_envelope(envelope, &caller, &target, None)
+        self.send_peer_envelope(envelope, &caller, &target, None, intent)
             .await
     }
 
@@ -333,6 +455,45 @@ impl SessionMessenger {
         operation_id: &str,
         message: &str,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        self.reply_peer_delivery(
+            caller_session_id,
+            received_message_id,
+            operation_id,
+            message,
+            None,
+        )
+        .await
+        .map(SessionPeerDeliveryReceipt::into_legacy)
+    }
+
+    /// Derive recipient/thread from the canonical received peer message while
+    /// opting into explicit scheduling. Reply observations never grant authority.
+    pub async fn reply_peer_with_intent(
+        &self,
+        caller_session_id: &str,
+        received_message_id: &str,
+        operation_id: &str,
+        message: &str,
+        intent: SessionMessageDeliveryIntent,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
+        self.reply_peer_delivery(
+            caller_session_id,
+            received_message_id,
+            operation_id,
+            message,
+            Some(intent),
+        )
+        .await
+    }
+
+    async fn reply_peer_delivery(
+        &self,
+        caller_session_id: &str,
+        received_message_id: &str,
+        operation_id: &str,
+        message: &str,
+        intent: Option<SessionMessageDeliveryIntent>,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         Self::validate_peer_input(operation_id, message)?;
         Self::validate_peer_session_id(caller_session_id)?;
         let received_id = SessionMessageId::parse(received_message_id)
@@ -394,7 +555,7 @@ impl SessionMessenger {
             thread,
             Some(original.id.clone()),
         );
-        self.send_peer_envelope(envelope, &caller, &target, Some(&original))
+        self.send_peer_envelope(envelope, &caller, &target, Some(&original), intent)
             .await
     }
 
@@ -531,7 +692,8 @@ impl SessionMessenger {
         caller: &Session,
         target: &Session,
         reply_to: Option<&SessionMessageEnvelope>,
-    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        intent: Option<SessionMessageDeliveryIntent>,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         let started = Instant::now();
         let source = ActorSession::from_session(caller)
             .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
@@ -540,11 +702,24 @@ impl SessionMessenger {
         // These are the same births used for the stable message id. The inbox
         // must revalidate them under its retained lifecycle authority; a fresh
         // relationship read before generic delivery would still race rebirth.
-        let delivery = match self
-            .inbox
-            .deliver_peer_message(&envelope, &source, &target, reply_to)
-            .await
-        {
+        let result = match intent {
+            Some(intent) => {
+                self.inbox
+                    .deliver_peer_message_with_intent(&envelope, &source, &target, reply_to, intent)
+                    .await
+            }
+            None => {
+                self.inbox
+                    .deliver_peer_message(&envelope, &source, &target, reply_to)
+                    .await
+                    .map(|delivery| bamboo_domain::SessionInboxDeliveryReceipt {
+                        delivery,
+                        // Preserve the historical peer activation contract.
+                        pending: true,
+                    })
+            }
+        };
+        let delivery = match result {
             Ok(receipt) => receipt,
             Err(error) => {
                 let error = SessionMessengerError::Inbox(error);
@@ -552,8 +727,199 @@ impl SessionMessenger {
                 return Err(error);
             }
         };
-        let admission = self.record_admission(envelope, delivery, started);
-        self.activate_prepared(&admission).await
+        let pending = delivery.pending;
+        let admission = self.record_admission(envelope, delivery.delivery, started);
+        // Exact explicit retries of ACKed/cancelled/dead deliveries cannot
+        // revive input or request work from a fresh router. The Inbox observed
+        // this state while retaining the original admission authority/locks.
+        if !pending {
+            return Ok(SessionPeerDeliveryReceipt {
+                delivery: admission.delivery,
+                activation: None,
+                active_delivery_notified: false,
+            });
+        }
+        if intent == Some(SessionMessageDeliveryIntent::QueueOnly) {
+            let active_delivery_notified = self
+                .activation
+                .notify_active_delivery(&admission.target_session_id, admission.delivery.generation)
+                .await;
+            return Ok(SessionPeerDeliveryReceipt {
+                delivery: admission.delivery,
+                activation: None,
+                active_delivery_notified,
+            });
+        }
+        self.activate_prepared(&admission).await.map(Into::into)
+    }
+
+    /// Original executing Supervisor control over one separately host-granted
+    /// live Root. Enqueue/notification is never a configuration application
+    /// receipt. Reads use a fresh canonical target snapshot under both fences.
+    pub async fn supervisor_loop_control(
+        &self,
+        supervisor: &SupervisorReference,
+        target_session_id: &str,
+        expected_link_revision: Option<u64>,
+        command: &bamboo_domain::LoopControlRequest,
+        receipt_operation_id: Option<&str>,
+    ) -> Result<serde_json::Value, SessionMessengerError> {
+        use bamboo_domain::{LoopControlAction, LoopControlRequest, ScopedLoopControlInput};
+        let invalid = |message: String| SessionMessengerError::InvalidEnvelope(message);
+        bamboo_domain::validate_supervisor_target_id(target_session_id)
+            .map_err(|error| invalid(error.into()))?;
+        bamboo_domain::validate_scoped_loop_control_command(command).map_err(invalid)?;
+        let status = matches!(command, LoopControlRequest::Status);
+        if expected_link_revision == Some(0)
+            || (!status && expected_link_revision.is_none())
+            || (!status && receipt_operation_id.is_some())
+        {
+            return Err(invalid("loop mutations require the exact nonzero link revision; receipt lookup is status-only".into()));
+        }
+        if let Some(operation) = receipt_operation_id {
+            uuid::Uuid::parse_str(operation)
+                .map_err(|_| invalid("receipt operation must be a UUID".into()))?;
+        }
+        let binding = self
+            .activation
+            .observe_supervisor_loop(
+                supervisor,
+                target_session_id,
+                expected_link_revision,
+                LoopControlAction::of(command),
+            )
+            .await?;
+        binding.authorize(command).map_err(invalid)?;
+        let canonical = self
+            .sessions
+            .load_scoped_loop_session(&binding, self.activation.clone())
+            .await
+            .map_err(|error| SessionMessengerError::Storage(error.to_string()))?
+            .ok_or_else(|| SessionMessengerError::TargetNotFound(target_session_id.into()))?;
+        if status {
+            let mut snapshot = serde_json::to_value(
+                crate::runtime::loop_control::inspect_loop(&canonical)
+                    .map_err(|error| SessionMessengerError::Storage(error.to_string()))?,
+            )
+            .map_err(|error| SessionMessengerError::Storage(error.to_string()))?;
+            // Bounded readback belongs to the initiating Supervisor's output
+            // budget. The target's canonical objective bytes remain unchanged.
+            for field in ["objective", "pending_objective"] {
+                let text = snapshot[field].as_str().map(str::to_owned);
+                if let Some(text) = text {
+                    let mut end = text.len().min(1024);
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    snapshot[field] = serde_json::Value::String(text[..end].into());
+                    snapshot[format!("{field}_truncated")] =
+                        serde_json::Value::Bool(end < text.len());
+                }
+            }
+            let records = bamboo_domain::scoped_loop_consumptions(&canonical)
+                .map_err(SessionMessengerError::Storage)?;
+            let partial_checkpoint = records.iter().any(|record| {
+                record.binding == binding
+                    && receipt_operation_id.is_none_or(|id| id == record.operation_id)
+                    && !canonical
+                        .session_inbox_admission()
+                        .is_some_and(|cursor| cursor.contains(&record.input_id))
+            });
+            let record = records.into_iter().rev().find(|record| {
+                record.binding == binding
+                    && receipt_operation_id.is_none_or(|id| id == record.operation_id)
+                    && canonical
+                        .session_inbox_admission()
+                        .is_some_and(|cursor| cursor.contains(&record.input_id))
+            });
+            let state = crate::runtime::counted_loop::read_loop_state(&canonical)
+                .map_err(|error| SessionMessengerError::Storage(error.to_string()))?;
+            let objective_applied_actual = record
+                .as_ref()
+                .filter(|record| record.configured)
+                .and_then(|record| record.receipt.as_ref())
+                .zip(state.as_ref())
+                .is_some_and(|(receipt, state)| {
+                    receipt["generation"].as_str() == Some(state.generation.as_str())
+                        && canonical.messages.iter().any(|message| {
+                            message.role == bamboo_domain::Role::User
+                                && message.metadata.as_ref().is_some_and(|metadata| {
+                                    metadata["runtime_kind"].as_str()
+                                        == Some("counted_loop_iteration")
+                                        && metadata["loop_generation"] == receipt["generation"]
+                                        && metadata["objective_revision"]
+                                            == receipt["objective_revision"]
+                                })
+                        })
+                        && state.control.as_ref().is_some_and(|control| {
+                            receipt["accepted_revision"]
+                                .as_u64()
+                                .is_some_and(|revision| control.applied_revision >= revision)
+                                && receipt["objective_revision"]
+                                    .as_u64()
+                                    .is_some_and(|revision| {
+                                        revision > 0
+                                            && control.iteration_objective_revision >= revision
+                                    })
+                        })
+                });
+            return Ok(serde_json::json!({
+                "action":"loop", "command":"status", "target_session_id":target_session_id,
+                "link_revision":binding.link_revision, "owner_run_id":binding.owner_run_id,
+                "execution_id":binding.execution_id, "loop":snapshot,
+                "host_max_iterations":binding.max_iterations, "host_max_total_rounds":binding.max_total_rounds,
+                "configured":record.as_ref().is_some_and(|record|record.configured),
+                "checkpoint_observation":if partial_checkpoint { "partial_or_unknown" } else if record.is_some() { "confirmed" } else { "not_observed" },
+                "operation_receipt":record, "objective_applied_actual":objective_applied_actual,
+                "note":"Configuration receipts are immutable target checkpoints; objective_applied_actual additionally requires its real iteration-admission checkpoint. Neither is a task result."
+            }));
+        }
+        let input = ScopedLoopControlInput {
+            binding,
+            command: command.clone(),
+        };
+        let envelope = input.envelope().map_err(invalid)?;
+        if let Some(record) = bamboo_domain::scoped_loop_consumptions(&canonical)
+            .map_err(SessionMessengerError::Storage)?
+            .into_iter()
+            .find(|record| record.input_id == envelope.id)
+        {
+            if !bamboo_domain::has_scoped_loop_consumption(&canonical, &envelope) {
+                return Err(invalid(
+                    "operation payload conflicts with its immutable target receipt".into(),
+                ));
+            }
+            if canonical
+                .session_inbox_admission()
+                .is_some_and(|cursor| cursor.contains(&record.input_id))
+            {
+                return Ok(serde_json::json!({
+                    "action":"loop", "target_session_id":target_session_id,
+                    "operation_id":input.operation_id(), "receipt_id":envelope.id,
+                    "admitted":true, "replayed":true, "configured":record.configured,
+                    "operation_receipt":record, "objective_applied_actual":false,
+                    "note":"The original configuration receipt is replayed; use status for current objective application."
+                }));
+            }
+            // A runtime sidecar without Main's typed cursor is a partial
+            // publication, not a confirmed application. Exact delivery below
+            // recovers its original queued receipt without claiming success.
+        }
+        let started = Instant::now();
+        let receipt = self
+            .inbox
+            .deliver_supervisor_loop_control(&input.binding, &envelope, self.activation.clone())
+            .await?;
+        self.record_admission(envelope, receipt.delivery.clone(), started);
+        Ok(serde_json::json!({
+            "action":"loop", "target_session_id":target_session_id,
+            "operation_id":input.operation_id(), "receipt_id":receipt.delivery.id,
+            "generation":receipt.delivery.generation, "admitted":true,
+            "replayed":receipt.replayed, "active_delivery_notified":receipt.active_delivery_notified,
+            "configured":false, "target_application_observed":false,
+            "objective_applied_actual":false, "operation_receipt":null,
+            "note":"Transport admission is historical on replay; the input may no longer be pending. Target application remains unobserved here; query status with receipt_operation_id. This input never starts a successor or answers a wait."
+        }))
     }
 
     /// Follow an already-attached Ordinary Root from the original executing
@@ -680,7 +1046,8 @@ impl SessionMessenger {
             | SessionMessengerError::TargetNotFound(_) => {
                 self.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
             }
-            SessionMessengerError::Inbox(SessionInboxError::AdmissionCancelled) => {}
+            SessionMessengerError::Inbox(SessionInboxError::AdmissionCancelled)
+            | SessionMessengerError::Inbox(SessionInboxError::ExpectedRunConflict(_)) => {}
             SessionMessengerError::Inbox(SessionInboxError::PayloadTooLarge { .. }) => {
                 self.metrics
                     .payload_too_large
@@ -1483,6 +1850,23 @@ mod tests {
         assert!(error
             .to_string()
             .contains("lifetime-fenced peer SessionInbox admission is unsupported"));
+        for intent in [
+            SessionMessageDeliveryIntent::QueueOnly,
+            SessionMessageDeliveryIntent::TriggerTurn,
+        ] {
+            assert!(messenger
+                .send_peer_with_intent(
+                    "peer-left",
+                    "peer-right",
+                    "unsupported-explicit",
+                    "message",
+                    intent
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("explicit peer delivery intent is unsupported"));
+        }
         assert_eq!(inbox.inspect("peer-right").await.unwrap().pending, 0);
         assert!(activation.calls.lock().await.is_empty());
     }
@@ -2186,5 +2570,117 @@ mod tests {
         assert_eq!(metrics.payload_too_large, 1);
         assert_eq!(metrics.backlog_full, 1);
         assert_eq!(activation.calls.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_peer_intent_keeps_legacy_compatibility_and_fences_changed_retry_after_ack() {
+        let (_temp, store, activation, messenger) = fixture().await;
+        seed_peer_tree(store.as_ref()).await;
+        let receipt = messenger
+            .send_peer_with_intent(
+                "peer-left",
+                "peer-right",
+                "queue-operation",
+                "input",
+                SessionMessageDeliveryIntent::QueueOnly,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.activation, None);
+        assert!(!receipt.active_delivery_notified);
+        assert!(activation.calls.lock().await.is_empty());
+        let original =
+            admit_peer_for_test(store.as_ref(), messenger.inbox().as_ref(), "peer-right").await;
+        assert_eq!(
+            messenger
+                .send_peer_with_intent(
+                    "peer-left",
+                    "peer-right",
+                    "queue-operation",
+                    "input",
+                    SessionMessageDeliveryIntent::QueueOnly
+                )
+                .await
+                .unwrap()
+                .delivery,
+            receipt.delivery
+        );
+        assert!(messenger
+            .send_peer_with_intent(
+                "peer-left",
+                "peer-right",
+                "queue-operation",
+                "input",
+                SessionMessageDeliveryIntent::TriggerTurn
+            )
+            .await
+            .is_err());
+        assert!(activation.calls.lock().await.is_empty());
+        let reply = messenger
+            .reply_peer_with_intent(
+                "peer-right",
+                original.id.as_str(),
+                "reply-operation",
+                "reply",
+                SessionMessageDeliveryIntent::TriggerTurn,
+            )
+            .await
+            .unwrap();
+        // This fixture records activation requests as reservations. Active
+        // owner delivery is covered by the real router's safe-point tests.
+        assert_eq!(
+            reply.activation,
+            Some(SessionActivationDisposition::ActivationReserved)
+        );
+        assert_eq!(
+            activation.calls.lock().await.as_slice(),
+            &[("peer-left".to_string(), reply.delivery.generation)]
+        );
+        let claims = messenger.inbox().claim("peer-left", 8).await.unwrap();
+        assert_eq!(claims[0].envelope.in_reply_to, Some(original.id));
+        assert_eq!(
+            claims[0].activation_policy,
+            SessionActivationPolicy::RespectSpecificWait
+        );
+        messenger
+            .send_peer("peer-left", "peer-right", "legacy-operation", "legacy")
+            .await
+            .unwrap();
+        let claims = messenger.inbox().claim("peer-right", 8).await.unwrap();
+        assert_eq!(
+            claims[0].activation_policy,
+            SessionActivationPolicy::InterruptSpecificWait
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_peer_intents_deny_foreign_roots_before_admission_or_wake() {
+        let (_temp, store, activation, messenger) = fixture().await;
+        seed_peer_tree(store.as_ref()).await;
+        store
+            .save_session(&Session::new("foreign-root", "model"))
+            .await
+            .unwrap();
+        for intent in [
+            SessionMessageDeliveryIntent::QueueOnly,
+            SessionMessageDeliveryIntent::TriggerTurn,
+        ] {
+            assert!(matches!(
+                messenger
+                    .send_peer_with_intent("peer-left", "foreign-root", "denied", "input", intent)
+                    .await,
+                Err(SessionMessengerError::Unauthorized { .. })
+            ));
+        }
+        assert_eq!(
+            messenger
+                .inbox()
+                .inspect("foreign-root")
+                .await
+                .unwrap()
+                .pending,
+            0
+        );
+        assert!(activation.calls.lock().await.is_empty());
     }
 }

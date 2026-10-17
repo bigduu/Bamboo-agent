@@ -1314,8 +1314,8 @@ async fn fixture_with_followups(
                     m.role == bamboo_domain::Role::Tool
                         && m.tool_call_id.as_deref() == Some("subagent-send_message")
                 });
-                if backlog.activation_pending() && delivered.is_some() {
-                    let receipt: Value = serde_json::from_str(&delivered.unwrap().content).unwrap();
+                if let (true, Some(delivered)) = (backlog.activation_pending(), delivered) {
+                    let receipt: Value = serde_json::from_str(&delivered.content).unwrap();
                     assert_eq!(receipt["message"], "CORRECTION_FROM_ACTUAL_ROOT");
                     assert_eq!(receipt["inbox_generation"], 1);
                     assert_eq!(
@@ -2205,14 +2205,8 @@ async fn finish_two_fixture(
         cold_store.clone(),
         bamboo_domain::SessionInboxLimits::default(),
     );
-    for (i, (envelope, _)) in probe
-        .deliveries
-        .lock()
-        .unwrap()
-        .clone()
-        .into_iter()
-        .enumerate()
-    {
+    let deliveries = probe.deliveries.lock().unwrap().clone();
+    for (i, (envelope, _)) in deliveries.into_iter().enumerate() {
         assert_eq!(
             cold.messages
                 .iter()
@@ -3393,7 +3387,7 @@ async fn message_only_fixture(
         .waiting_for_children
         .as_ref()
         .unwrap();
-    assert_eq!(wait.child_session_ids, [id.clone()]);
+    assert_eq!(wait.child_session_ids.as_slice(), std::slice::from_ref(&id));
     assert_eq!(wait.registered_by_tool_call_id, None);
     drop(store);
     let store = SessionStoreV2::new(data.clone()).await.unwrap();
@@ -3608,7 +3602,7 @@ async fn message_only_fixture(
         .filter(|row| row.parent_session_id.as_deref() == Some("plain-root"))
         .map(|row| row.id)
         .collect();
-    assert_eq!(indexed, [id.clone()]);
+    assert_eq!(indexed.as_slice(), std::slice::from_ref(&id));
     let answers: Vec<_> = completed
         .messages
         .iter()
@@ -3841,3 +3835,5 @@ async fn actual_message_only_tokio_actor_browser_fixture() {
     ))
     .await;
 }
+
+include!("support/completed_cold_batch_native.rs");

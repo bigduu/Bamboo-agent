@@ -239,6 +239,30 @@ pub(crate) struct ConfigApplicationState {
 }
 
 impl ConfigApplicationState {
+    /// Read only already recorded metadata. Does not inspect Config, hydrate
+    /// credentials, recompute digests, or claim desired/applied equivalence.
+    pub(crate) fn safe_observed_receipts(&self) -> Value {
+        let consumers: Vec<Value> = CONSUMERS
+            .iter()
+            .map(|consumer| {
+                let receipt = self.receipts.get(consumer);
+                let applied = receipt.and_then(|receipt| receipt.applied.as_ref());
+                json!({
+                    "consumer": consumer,
+                    "receipt_status": if applied.is_some() { "recorded" } else { "unknown" },
+                    "applied_revisions": applied.map(|receipt| &receipt.revisions),
+                    "applied_at": applied.map(|receipt| receipt.applied_at),
+                    "last_error_code": receipt.and_then(|receipt| receipt.last_error),
+                })
+            })
+            .collect();
+        json!({
+            "published_revisions": self.published_revisions,
+            "desired_vs_applied": "not_evaluated",
+            "consumers": consumers,
+        })
+    }
+
     pub(super) fn new(boot: &ApplicationInputs) -> Self {
         Self {
             published_revisions: boot.revisions.clone(),

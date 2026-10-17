@@ -29,6 +29,40 @@ pub(crate) fn sdk_runtime_active() -> bool {
     SDK_RUNTIME.try_with(|_| ()).is_ok()
 }
 
+/// Reject execution posture before legacy metadata can become ordinary prompt
+/// history. Old checkpoints need not have a canonical selected-ID mirror.
+/// Keep the original evidence intact for an explicit host correction.
+pub(super) fn validate_execution_selection(session: &Session) -> super::super::Result<()> {
+    if !session.model_orchestration_only_enabled() {
+        return Ok(());
+    }
+    let role = if session.supervisor_incarnation_id().is_some() {
+        "Supervisor delegation blocker"
+    } else {
+        "Root orchestration blocker"
+    };
+    let blocker = |reason: String| {
+        AgentError::Tool(format!(
+            "{role}: {reason}; clear the incompatible selection and delegate execution to an authorized worker"
+        ))
+    };
+    session
+        .validate_root_orchestration_compatibility()
+        .map_err(|error| blocker(error.to_string()))?;
+    if [
+        bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY,
+        bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY,
+        bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY,
+        SKILL_RUNTIME_PINNED_SNAPSHOT_KEY,
+    ]
+    .iter()
+    .any(|key| session.metadata.contains_key(*key))
+    {
+        return Err(blocker("persisted Skill or Workflow activation is incompatible with orchestration-only execution".into()));
+    }
+    Ok(())
+}
+
 pub(crate) async fn prepare_context(
     session: &mut Session,
     initial_message: &str,
@@ -37,6 +71,10 @@ pub(crate) async fn prepare_context(
     debug_logger: &DebugLogger,
     must_resume_pinned_activation: bool,
 ) -> super::super::Result<String> {
+    validate_execution_selection(session)?;
+    if session.supervisor_incarnation_id().is_some() {
+        return Ok(String::new());
+    }
     if config.sdk_skill_execution_host.is_some() || sdk_runtime_active() {
         return Ok(String::new());
     }
@@ -275,7 +313,7 @@ pub(super) fn reset_activation_state_for_new_selection(
 }
 
 pub(crate) fn explicit_activation_pending(session: &Session) -> bool {
-    if sdk_runtime_active() {
+    if sdk_runtime_active() || session.supervisor_incarnation_id().is_some() {
         return false;
     }
 
@@ -307,7 +345,7 @@ pub(crate) fn explicit_activation_pending(session: &Session) -> bool {
 /// This is a dedicated host context block, never a synthetic user message in
 /// session history and never a catalog/live-filesystem re-resolution.
 pub(crate) fn active_context_block(session: &Session) -> Option<ContextBlock> {
-    if sdk_runtime_active() {
+    if sdk_runtime_active() || session.supervisor_incarnation_id().is_some() {
         return None;
     }
 
@@ -566,6 +604,64 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    #[tokio::test]
+    async fn supervisor_delegation_first_skips_legacy_workflow_activation_and_reports_incompatible_selection(
+    ) {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for ultra in [false, true] {
+            let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+            supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+                incarnation_id: uuid::Uuid::new_v4(),
+            };
+            supervisor.set_root_orchestration_only(ultra).unwrap();
+            supervisor
+                .metadata
+                .insert(SKILL_RUNTIME_SELECTION_SOURCE_KEY.into(), "explicit".into());
+            supervisor.metadata.insert(
+                SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.into(),
+                "[\"legacy-ghost\"]".into(),
+            );
+            assert!(!explicit_activation_pending(&supervisor));
+            assert!(validate_first_step(&supervisor, &[]).unwrap().is_none());
+            assert!(
+                crate::runtime::runner::round_lifecycle::required_tool_for_session(&supervisor)
+                    .is_none()
+            );
+            let config = AgentLoopConfig::default();
+            let logger = DebugLogger::new(false);
+            let before = serde_json::to_value(&supervisor).unwrap();
+            let context = prepare_context(
+                &mut supervisor,
+                "implement now",
+                &config,
+                DEFAULT_SUPERVISOR_SESSION_ID,
+                &logger,
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(context.is_empty());
+            assert_eq!(serde_json::to_value(&supervisor).unwrap(), before);
+            supervisor.metadata.insert(
+                "selected_skill_ids".into(),
+                "[\"implementation-workflow\"]".into(),
+            );
+            let before = serde_json::to_value(&supervisor).unwrap();
+            let error = prepare_context(
+                &mut supervisor,
+                "implement now",
+                &config,
+                DEFAULT_SUPERVISOR_SESSION_ID,
+                &logger,
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("Supervisor delegation blocker"));
+            assert_eq!(serde_json::to_value(&supervisor).unwrap(), before);
+        }
+    }
 
     struct Repository {
         latest: Option<Session>,

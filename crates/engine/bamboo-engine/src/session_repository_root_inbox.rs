@@ -31,7 +31,7 @@ impl Drop for PendingClaim {
     }
 }
 
-async fn lease_request(
+pub(super) async fn lease_request(
     directory: &dyn bamboo_domain::ActorDirectoryPort,
     owner: &RootActorRuntimeWrite,
     consumer: &SessionInboxConsumerId,

@@ -118,6 +118,12 @@ fn current_input(
     {
         return Err(ActorInputCheckpointError::Unsupported);
     }
+    if intent
+        .as_ref()
+        .is_some_and(|intent| !intent.admits_run(Some(&request.fence.run_id)))
+    {
+        return Err(ActorDirectoryError::StaleFence.into());
+    }
     let proof = Bookkeeping {
         version: 1,
         envelope_id: envelope.id.as_str().into(),
@@ -678,7 +684,7 @@ impl SessionStoreV2 {
             return Err(ActorInputCheckpointError::Unsupported);
         }
         for claim in &request.claims {
-            claim_guard.verify(claim)?;
+            claim_guard.verify(claim, &request.fence.run_id)?;
         }
         let activation = actor_directory::current_live(&source.entry, &request.fence, Utc::now())?;
         if activation.status != ActorActivationStatus::Running {
@@ -702,7 +708,7 @@ impl SessionStoreV2 {
                         return Err(ActorInputCheckpointError::Unsupported);
                     }
                     for claim in &request.claims {
-                        claim_guard.verify(claim)?;
+                        claim_guard.verify(claim, &request.fence.run_id)?;
                     }
                     Ok(())
                 };

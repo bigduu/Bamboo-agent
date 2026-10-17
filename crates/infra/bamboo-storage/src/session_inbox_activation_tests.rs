@@ -1334,3 +1334,807 @@ async fn exact_promotion_rejects_wrong_pending_identity_and_cancelled_deliveries
         .is_err());
     assert!(!inbox.inspect("parent").await.unwrap().activation_pending());
 }
+
+async fn explicit_peer_fixture() -> (
+    TempDir,
+    Arc<SessionStoreV2>,
+    FileSessionInbox,
+    bamboo_domain::ActorSession,
+    bamboo_domain::ActorSession,
+) {
+    let (temp, store, inbox) = fixture().await;
+    let parent = store.load_session("parent").await.unwrap().unwrap();
+    let child = Session::new_child_of("sender", &parent, "model", "task");
+    store.save_session(&child).await.unwrap();
+    let source = bamboo_domain::ActorSession::from_session(&child).unwrap();
+    let target = bamboo_domain::ActorSession::from_session(&parent).unwrap();
+    (temp, store, inbox, source, target)
+}
+
+#[tokio::test]
+async fn queue_only_survives_reopen_and_ack_without_wake_and_binds_intent_to_digest() {
+    let (temp, _store, inbox, source, target) = explicit_peer_fixture().await;
+    let envelope = peer_envelope("sender", "parent");
+    let receipt = inbox
+        .deliver_peer_message_with_intent(
+            &envelope,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::QueueOnly,
+        )
+        .await
+        .unwrap();
+    assert!(receipt.pending);
+    let reopened = reopen(&temp).await;
+    assert_eq!(
+        reopened
+            .deliver_peer_message_with_intent(
+                &envelope,
+                &source,
+                &target,
+                None,
+                SessionMessageDeliveryIntent::QueueOnly
+            )
+            .await
+            .unwrap(),
+        receipt
+    );
+    let backlog = reopened.inspect("parent").await.unwrap();
+    assert_eq!(backlog.pending, 1);
+    assert!(!backlog.activation_pending());
+    assert!(!backlog.interrupt_pending());
+    assert_eq!(
+        reopened
+            .inspect_wake_readiness("parent", Utc::now())
+            .await
+            .unwrap()
+            .ready,
+        None
+    );
+    assert!(matches!(
+        reopened
+            .deliver_peer_message_with_intent(
+                &envelope,
+                &source,
+                &target,
+                None,
+                SessionMessageDeliveryIntent::TriggerTurn
+            )
+            .await,
+        Err(SessionInboxError::InvalidClaim(_))
+    ));
+    let claims = reopened
+        .claim_for_turn("parent", 8, Some("manual-run"))
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].envelope, envelope);
+    assert_eq!(
+        claims[0].activation_policy,
+        SessionActivationPolicy::RespectSpecificWait
+    );
+    reopened.ack("parent", &claims[0]).await.unwrap();
+    let dir = reopened.inbox_dir("parent").await.unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(
+        &tokio::fs::read(FileSessionInbox::admitted_path(&dir, &envelope.id))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw[ACTIVATION_INTENT_KEY]["delivery"], "queue_only");
+    assert_eq!(
+        raw["semantic_digest"],
+        FileSessionInbox::delivery_digest(
+            &envelope,
+            Some(SessionInboxActivationIntent::with_delivery(
+                SessionMessageDeliveryIntent::QueueOnly
+            ))
+        )
+        .unwrap()
+    );
+    assert_ne!(
+        raw["semantic_digest"],
+        FileSessionInbox::semantic_digest(&envelope).unwrap()
+    );
+    let reopened = reopen(&temp).await;
+    let replay = reopened
+        .deliver_peer_message_with_intent(
+            &envelope,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::QueueOnly,
+        )
+        .await
+        .unwrap();
+    assert!(!replay.pending);
+    assert_eq!(replay.delivery, receipt.delivery);
+    assert!(reopened
+        .deliver_peer_message_with_intent(
+            &envelope,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::TriggerTurn
+        )
+        .await
+        .is_err());
+    assert!(reopened
+        .deliver_peer_message(&envelope, &source, &target, None)
+        .await
+        .is_err());
+    assert_eq!(reopened.inspect("parent").await.unwrap().pending, 0);
+}
+
+#[tokio::test]
+async fn explicit_intents_do_not_promote_staged_siblings_or_inherit_interrupt_grants() {
+    let (_temp, _store, inbox, source, target) = explicit_peer_fixture().await;
+    let staged = staged_child();
+    inbox.deliver(&staged).await.unwrap();
+    let queued = peer_envelope("sender", "parent");
+    let queue_receipt = inbox
+        .deliver_peer_message_with_intent(
+            &queued,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::QueueOnly,
+        )
+        .await
+        .unwrap();
+    let trigger = peer_envelope("sender", "parent");
+    let trigger_receipt = inbox
+        .deliver_peer_message_with_intent(
+            &trigger,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::TriggerTurn,
+        )
+        .await
+        .unwrap();
+    let ready = inbox
+        .inspect_wake_readiness("parent", Utc::now())
+        .await
+        .unwrap()
+        .ready
+        .unwrap();
+    assert_eq!(ready.id, trigger.id);
+    assert_eq!(
+        ready.activation_policy,
+        SessionActivationPolicy::RespectSpecificWait
+    );
+    let claims = inbox
+        .claim_for_turn("parent", 8, Some("active-run"))
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 2);
+    assert_eq!(claims[0].envelope, queued);
+    assert_eq!(claims[1].envelope, trigger);
+    assert!(claims
+        .iter()
+        .all(|claim| claim.activation_policy == SessionActivationPolicy::RespectSpecificWait));
+    inbox.ack("parent", &claims[1]).await.unwrap();
+    assert!(!inbox.inspect("parent").await.unwrap().activation_pending());
+    assert_eq!(
+        inbox
+            .inspect_wake_readiness("parent", Utc::now())
+            .await
+            .unwrap()
+            .ready,
+        None
+    );
+    // A coordinator can release its own staged prefix, but cannot turn an
+    // explicit QueueOnly into a wake or upgrade either explicit wait policy.
+    inbox
+        .mark_activation_eligible(
+            "parent",
+            trigger_receipt.delivery.generation,
+            SessionActivationPolicy::InterruptSpecificWait,
+        )
+        .await
+        .unwrap();
+    assert!(inbox
+        .mark_message_activation_eligible(
+            "parent",
+            &queue_receipt.delivery,
+            SessionActivationPolicy::InterruptSpecificWait,
+        )
+        .await
+        .is_err());
+    let claims = inbox
+        .claim_for_turn("parent", 8, Some("active-run"))
+        .await
+        .unwrap();
+    let staged_claim = claims
+        .iter()
+        .find(|claim| claim.envelope.id == staged.id)
+        .unwrap();
+    inbox.ack("parent", staged_claim).await.unwrap();
+    let queued_claim = claims
+        .iter()
+        .find(|claim| claim.envelope.id == queued.id)
+        .unwrap();
+    assert_eq!(
+        queued_claim.activation_policy,
+        SessionActivationPolicy::RespectSpecificWait
+    );
+    assert!(!inbox.inspect("parent").await.unwrap().activation_pending());
+    assert_eq!(
+        inbox
+            .inspect_wake_readiness("parent", Utc::now())
+            .await
+            .unwrap()
+            .ready,
+        None
+    );
+}
+
+#[tokio::test]
+async fn queue_only_owned_claim_expiry_does_not_schedule_recovery_or_change_policy() {
+    let (temp, _store, inbox, source, target) = explicit_peer_fixture().await;
+    let envelope = peer_envelope("sender", "parent");
+    inbox
+        .deliver_peer_message_with_intent(
+            &envelope,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::QueueOnly,
+        )
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let request = bamboo_domain::SessionInboxLeaseRequest {
+        consumer: bamboo_domain::SessionInboxConsumerId::new(),
+        now,
+        duration: chrono::Duration::seconds(10),
+    };
+    let first = inbox
+        .claim_owned("parent", 1, Some("run-1"), &request)
+        .await
+        .unwrap()
+        .remove(0);
+    let later = now + chrono::Duration::seconds(20);
+    let reopened = reopen(&temp).await;
+    let readiness = reopened
+        .inspect_wake_readiness("parent", later)
+        .await
+        .unwrap();
+    assert_eq!(readiness.ready, None);
+    assert_eq!(readiness.next_due_at, None);
+    let request = bamboo_domain::SessionInboxLeaseRequest {
+        consumer: bamboo_domain::SessionInboxConsumerId::new(),
+        now: later,
+        duration: chrono::Duration::seconds(10),
+    };
+    let second = reopened
+        .claim_owned("parent", 1, Some("run-2"), &request)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(second.claim.envelope, envelope);
+    assert!(second.lease.epoch > first.lease.epoch);
+    assert_eq!(
+        second.claim.activation_policy,
+        SessionActivationPolicy::RespectSpecificWait
+    );
+    assert!(reopened.ack_owned("parent", &first, later).await.is_err());
+    reopened.ack_owned("parent", &second, later).await.unwrap();
+    assert_eq!(reopened.inspect("parent").await.unwrap().pending, 0);
+}
+
+#[tokio::test]
+async fn acknowledged_trigger_left_in_cur_cannot_wake_queue_only_backlog() {
+    let (temp, store, mut inbox, source, target) = explicit_peer_fixture().await;
+    let queued = peer_envelope("sender", "parent");
+    inbox
+        .deliver_peer_message_with_intent(
+            &queued,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::QueueOnly,
+        )
+        .await
+        .unwrap();
+    let trigger = peer_envelope("sender", "parent");
+    inbox
+        .deliver_peer_message_with_intent(
+            &trigger,
+            &source,
+            &target,
+            None,
+            SessionMessageDeliveryIntent::TriggerTurn,
+        )
+        .await
+        .unwrap();
+    let request = bamboo_domain::SessionInboxLeaseRequest {
+        consumer: bamboo_domain::SessionInboxConsumerId::new(),
+        now: Utc::now(),
+        duration: chrono::Duration::seconds(10),
+    };
+    let claims = inbox
+        .claim_owned("parent", 8, Some("manual-run"), &request)
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 2);
+    assert_eq!(claims[1].claim.envelope, trigger);
+    let mut saved = store.load_session("parent").await.unwrap().unwrap();
+    saved.add_message(trigger.to_provider_message().unwrap());
+    saved
+        .session_inbox_admission_mut()
+        .record(trigger.id.clone(), claims[1].claim.generation);
+    store.save_session(&saved).await.unwrap();
+    inbox.owned_ack_after_receipt_failure = true;
+    assert!(inbox
+        .ack_owned("parent", &claims[1], request.now)
+        .await
+        .is_err());
+    assert!(inbox.was_admitted("parent", &trigger.id).await.unwrap());
+    // The physical cur entry stays present; both wake APIs must exclude the
+    // exact durable ACK and keep the unacknowledged QueueOnly inert.
+    let reopened = reopen(&temp).await;
+    let backlog = reopened.inspect("parent").await.unwrap();
+    assert_eq!(backlog.claimed, 2);
+    assert!(!backlog.activation_pending());
+    assert!(!backlog.interrupt_pending());
+    assert_eq!(
+        reopened
+            .inspect_wake_readiness("parent", request.now)
+            .await
+            .unwrap()
+            .ready,
+        None
+    );
+    // A mismatched receipt cannot be used to suppress otherwise real work.
+    let dir = reopened.inbox_dir("parent").await.unwrap();
+    let receipt_path = FileSessionInbox::admitted_path(&dir, &trigger.id);
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&receipt_path).await.unwrap()).unwrap();
+    raw["generation"] = serde_json::json!(claims[1].claim.generation + 1);
+    tokio::fs::write(&receipt_path, serde_json::to_vec(&raw).unwrap())
+        .await
+        .unwrap();
+    assert!(reopened.inspect("parent").await.is_err());
+    assert!(reopened
+        .inspect_wake_readiness("parent", request.now)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn explicit_peer_promotion_preserves_policy_after_ack_and_reopen() {
+    for intent in [
+        SessionMessageDeliveryIntent::QueueOnly,
+        SessionMessageDeliveryIntent::TriggerTurn,
+    ] {
+        let (temp, _store, inbox, source, target) = explicit_peer_fixture().await;
+        let envelope = peer_envelope("sender", "parent");
+        let receipt = inbox
+            .deliver_peer_message_with_intent(&envelope, &source, &target, None, intent)
+            .await
+            .unwrap()
+            .delivery;
+        for after_ack in [false, true] {
+            let reopened = reopen(&temp).await;
+            for policy in [
+                SessionActivationPolicy::RespectSpecificWait,
+                SessionActivationPolicy::InterruptSpecificWait,
+            ] {
+                let allowed = intent == SessionMessageDeliveryIntent::TriggerTurn
+                    && policy == SessionActivationPolicy::RespectSpecificWait;
+                assert_eq!(
+                    reopened
+                        .mark_message_activation_eligible("parent", &receipt, policy)
+                        .await
+                        .is_ok(),
+                    allowed,
+                    "{intent:?} {policy:?} after_ack={after_ack}"
+                );
+            }
+            if !after_ack {
+                let claim = reopened
+                    .claim_for_turn("parent", 1, Some("active-run"))
+                    .await
+                    .unwrap()
+                    .remove(0);
+                reopened.ack("parent", &claim).await.unwrap();
+            }
+        }
+    }
+}
+
+struct SteerRunPort {
+    current: std::sync::Mutex<Option<String>>,
+    calls: std::sync::atomic::AtomicUsize,
+    live: Arc<std::sync::atomic::AtomicUsize>,
+    notified: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SteerRunPort {
+    fn new(run_id: Option<&str>) -> Arc<Self> {
+        Arc::new(Self {
+            current: std::sync::Mutex::new(run_id.map(str::to_owned)),
+            calls: Default::default(),
+            live: Default::default(),
+            notified: Default::default(),
+        })
+    }
+}
+
+struct SteerJobGuard {
+    target: String,
+    run_id: String,
+    live: Arc<std::sync::atomic::AtomicUsize>,
+    notified: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for SteerJobGuard {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl bamboo_domain::SessionRunDeliveryGuard for SteerJobGuard {
+    fn matches(&self, target: &str, _: chrono::DateTime<Utc>, expected: &str) -> bool {
+        self.target == target && self.run_id == expected
+    }
+    fn notify_committed_delivery(&self, _: u64) -> bool {
+        self.notified
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+}
+
+#[async_trait::async_trait]
+impl bamboo_domain::SessionActivationPort for SteerRunPort {
+    fn retain_expected_run_blocking(
+        &self,
+        target: &str,
+        _: chrono::DateTime<Utc>,
+        expected: &str,
+    ) -> Result<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>, bamboo_domain::SessionRunConflict>
+    {
+        use bamboo_domain::{SessionRunConflict, SessionRunConflictReason};
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let current = self.current.lock().unwrap();
+        if current.as_deref() != Some(expected) {
+            return Err(SessionRunConflict {
+                reason: if current.is_some() {
+                    SessionRunConflictReason::RunChanged
+                } else {
+                    SessionRunConflictReason::NoActiveRun
+                },
+                expected_run_id: expected.into(),
+                observed_run_id: current.clone(),
+            });
+        }
+        self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Arc::new(SteerJobGuard {
+            target: target.into(),
+            run_id: expected.into(),
+            live: self.live.clone(),
+            notified: self.notified.clone(),
+        }))
+    }
+    async fn notify_active_delivery(&self, _: &str, _: u64) -> bool {
+        panic!("steer must not signal an unfenced owner")
+    }
+    async fn request_activation(
+        &self,
+        _: &str,
+        _: u64,
+    ) -> Result<bamboo_domain::SessionActivationDisposition, bamboo_domain::SessionActivationError>
+    {
+        panic!("steer must not activate a successor")
+    }
+}
+
+fn steer_files(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(
+        base: &std::path::Path,
+        dir: &std::path::Path,
+        files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        if !dir.exists() {
+            return;
+        }
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                visit(base, &entry.path(), files);
+            } else {
+                files.insert(
+                    entry.path().strip_prefix(base).unwrap().to_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    visit(dir, dir, &mut files);
+    files
+}
+
+#[tokio::test]
+async fn peer_steer_replays_exact_receipt_after_replacement_and_ack_without_retargeting() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (temp, store, inbox, source, target) = explicit_peer_fixture().await;
+    let envelope = peer_envelope("sender", "parent");
+    let run = SteerRunPort::new(Some("run-a"));
+    let first = inbox
+        .deliver_peer_steer(&envelope, &source, &target, "run-a", run.clone())
+        .await
+        .unwrap();
+    assert!(!first.replayed && first.active_delivery_notified);
+    assert_eq!(run.calls.load(SeqCst), 2);
+    assert_eq!(run.live.load(SeqCst), 0);
+    *run.current.lock().unwrap() = Some("run-b".into());
+    let retry = inbox
+        .deliver_peer_steer(&envelope, &source, &target, "run-a", run.clone())
+        .await
+        .unwrap();
+    assert_eq!(retry.delivery, first.delivery);
+    assert!(retry.replayed && !retry.active_delivery_notified);
+    assert_eq!(run.calls.load(SeqCst), 2);
+    assert!(inbox
+        .claim_for_turn("parent", 1, Some("run-b"))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(inbox.claim("parent", 1).await.unwrap().is_empty());
+    assert!(!inbox.inspect("parent").await.unwrap().activation_pending());
+    assert!(inbox
+        .deliver_peer_steer(&envelope, &source, &target, "run-b", run.clone())
+        .await
+        .is_err());
+    let claim = inbox
+        .claim_for_turn("parent", 1, Some("run-a"))
+        .await
+        .unwrap()
+        .remove(0);
+    let mut checkpoint = store.load_session("parent").await.unwrap().unwrap();
+    checkpoint.add_message(envelope.to_provider_message().unwrap());
+    checkpoint
+        .session_inbox_admission_mut()
+        .record(envelope.id.clone(), claim.generation);
+    store.save_session(&checkpoint).await.unwrap();
+    inbox.ack("parent", &claim).await.unwrap();
+    let reopened = reopen(&temp).await;
+    let restarted = SteerRunPort::new(None);
+    let retry = reopened
+        .deliver_peer_steer(&envelope, &source, &target, "run-a", restarted.clone())
+        .await
+        .unwrap();
+    assert_eq!(retry.delivery, first.delivery);
+    assert!(retry.replayed && !retry.active_delivery_notified);
+    assert_eq!(restarted.calls.load(SeqCst), 0);
+    assert_eq!(run.notified.load(SeqCst), 1);
+    assert!(reopened
+        .deliver_peer_steer(&envelope, &source, &target, "run-b", restarted)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn peer_steer_stale_or_unauthorized_new_operation_has_no_logical_inbox_effects() {
+    for actual in [None, Some("replacement")] {
+        let (_temp, _store, inbox, source, target) = explicit_peer_fixture().await;
+        let envelope = peer_envelope("sender", "parent");
+        inbox.inspect("parent").await.unwrap();
+        let dir = inbox.inbox_dir("parent").await.unwrap();
+        let before = steer_files(&dir);
+        let run = SteerRunPort::new(actual);
+        assert!(matches!(
+            inbox
+                .deliver_peer_steer(&envelope, &source, &target, "run-a", run.clone())
+                .await,
+            Err(SessionInboxError::ExpectedRunConflict(_))
+        ));
+        assert_eq!(steer_files(&dir), before);
+        let mut stale = source.clone();
+        stale.session_created_at += chrono::Duration::seconds(1);
+        let calls = run.calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(inbox
+            .deliver_peer_steer(&envelope, &stale, &target, "run-a", run.clone())
+            .await
+            .is_err());
+        assert_eq!(run.calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+        assert_eq!(steer_files(&dir), before);
+    }
+}
+
+#[tokio::test]
+async fn peer_steer_rechecks_owner_at_actual_rename_after_preflight_race() {
+    let (_temp, _store, mut inbox, source, target) = explicit_peer_fixture().await;
+    let envelope = peer_envelope("sender", "parent");
+    let run = SteerRunPort::new(Some("run-a"));
+    let changed = run.clone();
+    inbox.owned_fs_hook = Some(Arc::new(move |phase, _| {
+        if phase == "maildir_replace" {
+            *changed.current.lock().unwrap() = Some("replacement".into());
+        }
+        Ok(())
+    }));
+    assert!(matches!(
+        inbox
+            .deliver_peer_steer(&envelope, &source, &target, "run-a", run.clone())
+            .await,
+        Err(SessionInboxError::ExpectedRunConflict(
+            bamboo_domain::SessionRunConflict {
+                reason: bamboo_domain::SessionRunConflictReason::RunChanged,
+                ..
+            }
+        ))
+    ));
+    let backlog = inbox.inspect("parent").await.unwrap();
+    assert_eq!((backlog.pending, backlog.claimed), (0, 0));
+    assert!(!backlog.activation_pending());
+    assert!(!inbox.was_admitted("parent", &envelope.id).await.unwrap());
+    assert_eq!(run.notified.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn peer_steer_publication_error_releases_guard_without_notification_or_delivery() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (_temp, store, mut inbox, source, target) = explicit_peer_fixture().await;
+    let envelope = peer_envelope("sender", "parent");
+    let original =
+        serde_json::to_value(store.load_session("parent").await.unwrap().unwrap()).unwrap();
+    let run = SteerRunPort::new(Some("run-a"));
+    let observed = run.clone();
+    inbox.owned_fs_hook = Some(Arc::new(move |phase, _| {
+        if phase == "expected_run_matched" {
+            assert_eq!(observed.live.load(SeqCst), 1);
+            assert_eq!(observed.notified.load(SeqCst), 0);
+            return Err(std::io::Error::other(
+                "injected final publication I/O failure",
+            ));
+        }
+        Ok(())
+    }));
+    assert!(matches!(
+        inbox
+            .deliver_peer_steer(&envelope, &source, &target, "run-a", run.clone())
+            .await,
+        Err(SessionInboxError::Storage(_))
+    ));
+    assert_eq!(run.live.load(SeqCst), 0);
+    assert_eq!(run.notified.load(SeqCst), 0);
+    let dir = inbox.inbox_dir("parent").await.unwrap();
+    assert_eq!(std::fs::read_dir(dir.join("new")).unwrap().count(), 0);
+    let backlog = inbox.inspect("parent").await.unwrap();
+    assert_eq!((backlog.pending, backlog.claimed), (0, 0));
+    assert!(!backlog.activation_pending());
+    assert!(!inbox.was_admitted("parent", &envelope.id).await.unwrap());
+    assert_eq!(
+        serde_json::to_value(store.load_session("parent").await.unwrap().unwrap()).unwrap(),
+        original
+    );
+    inbox.owned_fs_hook = None;
+    let accepted = inbox
+        .deliver_peer_steer(&envelope, &source, &target, "run-a", run.clone())
+        .await
+        .unwrap();
+    assert!(!accepted.replayed);
+    assert_eq!(accepted.delivery.generation, 2);
+    assert!(accepted.active_delivery_notified);
+    assert_eq!(run.notified.load(SeqCst), 1);
+}
+
+#[tokio::test]
+async fn peer_steer_rejects_impossible_replayed_generations_without_owner_check_or_repair() {
+    for acknowledged in [false, true] {
+        for generation in [0_u64, 20] {
+            let (_temp, store, inbox, source, target) = explicit_peer_fixture().await;
+            let envelope = peer_envelope("sender", "parent");
+            inbox
+                .deliver_peer_steer(
+                    &envelope,
+                    &source,
+                    &target,
+                    "run-a",
+                    SteerRunPort::new(Some("run-a")),
+                )
+                .await
+                .unwrap();
+            let dir = inbox.inbox_dir("parent").await.unwrap();
+            if acknowledged {
+                let claim = inbox
+                    .claim_for_turn("parent", 1, Some("run-a"))
+                    .await
+                    .unwrap()
+                    .remove(0);
+                let mut checkpoint = store.load_session("parent").await.unwrap().unwrap();
+                checkpoint.add_message(envelope.to_provider_message().unwrap());
+                checkpoint
+                    .session_inbox_admission_mut()
+                    .record(envelope.id.clone(), claim.generation);
+                store.save_session(&checkpoint).await.unwrap();
+                inbox.ack("parent", &claim).await.unwrap();
+                let path = FileSessionInbox::admitted_path(&dir, &envelope.id);
+                let mut raw: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                raw["generation"] = serde_json::json!(generation);
+                std::fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
+            } else {
+                let path = std::fs::read_dir(dir.join("new"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                let name = path.file_name().unwrap().to_string_lossy();
+                let suffix = name.split_once('-').unwrap().1;
+                std::fs::rename(
+                    &path,
+                    dir.join("new").join(format!("{generation:020}-{suffix}")),
+                )
+                .unwrap();
+            }
+            let before = steer_files(&dir);
+            let restarted = SteerRunPort::new(None);
+            assert!(inbox
+                .deliver_peer_steer(&envelope, &source, &target, "run-a", restarted.clone())
+                .await
+                .is_err());
+            assert_eq!(restarted.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(steer_files(&dir), before);
+        }
+    }
+}
+
+#[test]
+fn peer_steer_final_publication_job_retains_run_and_peer_authority_after_shutdown() {
+    use super::owned_lifetime_tests::{Fixture, Parked};
+    use std::sync::atomic::Ordering::SeqCst;
+    let fixture = Fixture::new();
+    let (source, target) = fixture.runtime.block_on(async {
+        let root = fixture.store.load_session("target").await.unwrap().unwrap();
+        let child = Session::new_child_of("sender", &root, "model", "task");
+        fixture.store.save_session(&child).await.unwrap();
+        (
+            bamboo_domain::ActorSession::from_session(&child).unwrap(),
+            bamboo_domain::ActorSession::from_session(&root).unwrap(),
+        )
+    });
+    let envelope = peer_envelope("sender", "target");
+    let wrapper = FileSessionInbox::wrapper(
+        &envelope,
+        1,
+        Some(SessionInboxActivationIntent::for_expected_run("run-a").unwrap()),
+    );
+    let path = fixture
+        .dir
+        .join("new")
+        .join(format!("{:020}-{}.json", 1, wrapper.id.0));
+    let run = SteerRunPort::new(Some("run-a"));
+    let delivery_run = run.clone();
+    let delivery = envelope.clone();
+    let mut parked = Parked::start(
+        fixture.inbox.clone(),
+        "expected_run_matched",
+        path,
+        move |inbox| async move {
+            inbox
+                .deliver_peer_steer(&delivery, &source, &target, "run-a", delivery_run)
+                .await
+                .map(|_| ())
+        },
+    );
+    parked.shutdown();
+    fixture.assert_physical_locks(true);
+    assert_eq!(run.live.load(SeqCst), 1);
+    assert_eq!(run.notified.load(SeqCst), 0);
+    parked.barrier.release();
+    let claims = fixture
+        .runtime
+        .block_on(fixture.inbox.claim_for_turn("target", 1, Some("run-a")))
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].envelope, envelope);
+    assert_eq!(run.live.load(SeqCst), 0);
+    assert_eq!(run.notified.load(SeqCst), 1);
+}

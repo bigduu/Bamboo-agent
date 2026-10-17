@@ -3,7 +3,7 @@ use bamboo_agent_core::tools::{FunctionSchema, ToolSchema};
 use bamboo_llm::api::models::ChatMessage;
 use bamboo_llm::protocol::FromProvider;
 
-use super::super::types::ResponsesToolParam;
+use super::super::types::{ResponsesToolParam, MAX_RESPONSES_TOOLS};
 
 pub(super) fn convert_messages(
     messages: Vec<ChatMessage>,
@@ -46,6 +46,15 @@ pub(super) fn convert_responses_tools(
     let Some(tools) = tools else {
         return Ok(vec![]);
     };
+
+    // Count every caller-supplied entry, including skipped/invalid types, before
+    // reserving output or inspecting the first tool. JSON parsing is separately
+    // bounded by the shared request-body limit.
+    if tools.len() > MAX_RESPONSES_TOOLS {
+        return Err(AppError::BadRequest(format!(
+            "Responses tools[] supports at most {MAX_RESPONSES_TOOLS} entries"
+        )));
+    }
 
     let mut converted = Vec::with_capacity(tools.len());
     for tool in tools {

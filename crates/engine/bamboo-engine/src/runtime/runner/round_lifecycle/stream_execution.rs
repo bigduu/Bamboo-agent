@@ -14,7 +14,7 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
     build_goal_context_block, build_history_boundary_context_block,
     build_instruction_overlay_context_block, build_plan_mode_context_block,
     build_plan_runtime_context_block, build_project_resources_context_block,
-    build_root_orchestration_context_block, build_session_identity_context_block,
+    build_root_orchestration_context_block_for_tools, build_session_identity_context_block,
     build_task_list_context_block, build_workspace_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
@@ -611,6 +611,26 @@ fn project_legacy_browser_history(messages: &mut [Message], results: &BTreeMap<S
     }
 }
 
+/// The Supervisor host context sees its complete approved logical catalog;
+/// provider measurement and dispatch see exactly the existing wire projection.
+fn provider_tool_schemas<'a>(
+    session: &Session,
+    tool_schemas: &'a [ToolSchema],
+    loading_mode: CapabilityLoadingMode,
+    required_tool: Option<&str>,
+) -> Cow<'a, [ToolSchema]> {
+    if session.supervisor_incarnation_id().is_some() {
+        super::request_tool_schemas_for_loading_mode(
+            session,
+            tool_schemas,
+            loading_mode,
+            required_tool,
+        )
+    } else {
+        Cow::Borrowed(tool_schemas)
+    }
+}
+
 /// Project the exact PromptIR message input after ledger reconciliation without
 /// mutating the live session. Context preparation uses this shadow pass to
 /// reserve space for snapshots that are created only after ordinary message
@@ -648,13 +668,14 @@ pub(super) async fn project_request_usage(
         loading_mode,
         None,
     );
+    let wire_schemas = provider_tool_schemas(
+        &shadow,
+        effective_tool_schemas.as_ref(),
+        loading_mode,
+        required_tool,
+    );
     let tool_footprint = llm
-        .provider_visible_tool_footprint(
-            &envelope.ir,
-            effective_tool_schemas.as_ref(),
-            model,
-            required_tool,
-        )
+        .provider_visible_tool_footprint(&envelope.ir, wire_schemas.as_ref(), model, required_tool)
         .await
         .map_err(|error| {
             AgentError::LLM(format!(
@@ -739,7 +760,9 @@ fn build_request_envelope_reconciled_for_loading_mode(
     // not participate in `build_compression_context_blocks`: a fork/copy must
     // never inherit a stale Session ID through generated summary text.
     let mut context_blocks = vec![build_session_identity_context_block(session)];
-    if let Some(block) = build_root_orchestration_context_block(session) {
+    if let Some(block) =
+        build_root_orchestration_context_block_for_tools(session, tool_schemas, loading_mode)
+    {
         context_blocks.push(block);
     }
     let newly_activated = activated_discoverable_tools(session)
@@ -1306,7 +1329,7 @@ pub(super) async fn execute_llm_stream(
         && responses_continuation_enabled(&responses_policy, provider_type);
     let mut checkpoint_reprepares = 0usize;
     let mut observation_progress_hint = frame.observation_progress_hint;
-    let (mut prepared_envelope, previous_response_id, final_usage) = loop {
+    let (mut prepared_envelope, previous_response_id, final_usage, loading_mode) = loop {
         let tool_schemas = effective_schemas.as_ref();
         // Owned (not borrowed) so the immutable borrow of `session` ends here and
         // the drift diagnostic below can take `&mut session`.
@@ -1332,10 +1355,12 @@ pub(super) async fn execute_llm_stream(
         // exact final IR again before checkpoint/provider dispatch. Failing closed
         // preserves the context-window contract without committing an unsendable
         // ledger candidate.
+        let wire_schemas =
+            provider_tool_schemas(session, tool_schemas, loading_mode, required_tool);
         let tool_footprint = match llm
             .provider_visible_tool_footprint(
                 &prepared_envelope.ir,
-                tool_schemas,
+                wire_schemas.as_ref(),
                 model,
                 required_tool,
             )
@@ -1426,9 +1451,20 @@ pub(super) async fn execute_llm_stream(
                 continue;
             }
         }
-        break (prepared_envelope, previous_response_id, final_usage);
+        break (
+            prepared_envelope,
+            previous_response_id,
+            final_usage,
+            loading_mode,
+        );
     };
-    let tool_schemas = effective_schemas.as_ref();
+    let wire_schemas = provider_tool_schemas(
+        session,
+        effective_schemas.as_ref(),
+        loading_mode,
+        required_tool,
+    );
+    let tool_schemas = wire_schemas.as_ref();
     // Side-channel diagnostic: record whether the cacheable stable prefix drifted
     // from the previous round (esp. shrinks, which drop cached content). Never
     // affects what is sent below.
@@ -1506,27 +1542,44 @@ pub(super) async fn execute_llm_stream(
             ));
         }
     }
-    let stream = crate::runtime::stream::handler::await_stream_bootstrap(
-        llm.chat_stream_ir(
-            &prepared_envelope.ir,
-            tool_schemas,
-            Some(max_output_tokens),
-            model,
-            Some(&planned.request_options),
-        ),
-        cancel_token,
-        session_id,
-        &timeout_context,
-    )
-    .await?
-    .map_err(|error| {
-        let message = format_provider_error(error);
-        if is_llm_overflow_error(&message) {
-            AgentError::LLMOverflow(message)
-        } else {
-            AgentError::LLM(message)
+    if cancel_token.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+    // Start only at the actual dispatch boundary: failed prompt preflight is
+    // not an LLM request. The same span remains alive through stream consumption.
+    let observation =
+        bamboo_infrastructure::telemetry::Observation::llm(provider_type, model, session_id);
+    let stream = observation
+        .scope(crate::runtime::stream::handler::await_stream_bootstrap(
+            llm.chat_stream_ir(
+                &prepared_envelope.ir,
+                tool_schemas,
+                Some(max_output_tokens),
+                model,
+                Some(&planned.request_options),
+            ),
+            cancel_token,
+            session_id,
+            &timeout_context,
+        ))
+        .await
+        .and_then(|result| {
+            result.map_err(|error| {
+                let message = format_provider_error(error);
+                if is_llm_overflow_error(&message) {
+                    AgentError::LLMOverflow(message)
+                } else {
+                    AgentError::LLM(message)
+                }
+            })
+        });
+    let stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            observation.finish(crate::runtime::runner::telemetry_error_outcome(&error));
+            return Err(error);
         }
-    })?;
+    };
 
     // A successful stream bootstrap is the first point at which the final
     // provider-visible PromptIR is known to have been accepted. Capture the
@@ -1602,27 +1655,37 @@ pub(super) async fn execute_llm_stream(
         );
     // The opt-in evidence check must publish only the final, checked answer.
     // Buffer this response until tool calls tell us whether it is a candidate.
-    let stream_output_result = if activation_pending || config.features_final_evidence_check {
-        crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
-            stream,
-            cancel_token,
-            session_id,
-            &timeout_context,
-        )
-        .await
-    } else {
-        crate::runtime::stream::handler::consume_llm_stream_with_context_and_partial(
-            stream,
-            event_tx,
-            cancel_token,
-            session_id,
-            &timeout_context,
-        )
-        .await
-    };
+    let stream_output_result = observation
+        .scope(async {
+            if activation_pending || config.features_final_evidence_check {
+                crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
+                    stream,
+                    cancel_token,
+                    session_id,
+                    &timeout_context,
+                )
+                .await
+            } else {
+                crate::runtime::stream::handler::consume_llm_stream_with_context_and_partial(
+                    stream,
+                    event_tx,
+                    cancel_token,
+                    session_id,
+                    &timeout_context,
+                )
+                .await
+            }
+        })
+        .await;
     let mut stream_output = match stream_output_result {
         Ok(output) => output,
         Err(failure) => {
+            if let Some(usage) = failure.partial_output.provider_usage {
+                observation.usage(usage.input_tokens, usage.output_tokens);
+            }
+            observation.finish(crate::runtime::runner::telemetry_error_outcome(
+                &failure.error,
+            ));
             let appended = append_interrupted_assistant_output(
                 session,
                 *failure.partial_output,
@@ -1637,6 +1700,11 @@ pub(super) async fn execute_llm_stream(
             return Err(failure.error);
         }
     };
+
+    if let Some(usage) = stream_output.provider_usage {
+        observation.usage(usage.input_tokens, usage.output_tokens);
+    }
+    observation.finish(bamboo_infrastructure::telemetry::Outcome::Success);
 
     if config.features_final_evidence_check
         && !activation_pending

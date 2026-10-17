@@ -516,6 +516,306 @@ fn single_work_closed_loop_requires_exact_submission_and_user_acceptance() {
     assert!(service.authorize_tool(&worker, "Task").is_err());
 }
 
+/// Technical rejection and rework must not mint final User acceptance.
+#[test]
+fn supervisor_rejection_rework_preserves_exact_evidence_and_user_acceptance() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = TicketService::open(dir.path(), binding()).unwrap();
+    let work = create(&service, "exact answer=42", BTreeSet::new());
+    let dependent = create(&service, "consumer", BTreeSet::from([work.clone()]));
+    let (first, first_worker) = start(&service, &work, "first-start");
+    let bad = service.store_artifact(&runtime(), b"answer=41").unwrap();
+    let good = service.store_artifact(&runtime(), b"answer=42").unwrap();
+    let submit_operation =
+        |assignment: &str, artifact: Artifact, evidence: Vec<String>| Operation::Submit {
+            assignment_id: assignment.into(),
+            temp_id: "submission".into(),
+            artifacts: vec![artifact],
+            evidence,
+        };
+    // Bytes and evidence are required before a result enters review at all.
+    for (name, artifact, evidence) in [
+        ("missing-evidence", bad.clone(), vec![]),
+        (
+            "wrong-hash",
+            Artifact {
+                uri: bad.uri.clone(),
+                sha256: good.sha256.clone(),
+            },
+            vec!["claimed".into()],
+        ),
+        (
+            "missing-object",
+            Artifact {
+                uri: format!("{}{}", store::MANAGED_ARTIFACT_PREFIX, "0".repeat(64)),
+                sha256: "0".repeat(64),
+            },
+            vec!["claimed".into()],
+        ),
+    ] {
+        let before = canonical_bytes(&service.published().unwrap()).unwrap();
+        assert!(
+            service
+                .execute(
+                    &first_worker,
+                    &command(
+                        &service,
+                        name,
+                        vec![submit_operation(&first, artifact, evidence)]
+                    )
+                )
+                .is_err(),
+            "{name}"
+        );
+        assert_eq!(
+            canonical_bytes(&service.published().unwrap()).unwrap(),
+            before,
+            "{name}"
+        );
+    }
+    let stop = |assignment: &str, id: &str| {
+        let receipt = service.published().unwrap().1.assignments[assignment]
+            .runtime
+            .clone()
+            .unwrap();
+        execute(
+            &service,
+            &runtime(),
+            id,
+            vec![Operation::RuntimeStopped {
+                assignment_id: assignment.into(),
+                receipt,
+                completed: true,
+            }],
+        );
+    };
+    stop(&first, "first-stopped");
+    let rejected_submission = execute(
+        &service,
+        &first_worker,
+        "bad-submit",
+        vec![submit_operation(
+            &first,
+            bad.clone(),
+            vec!["canonical output hash".into()],
+        )],
+    )
+    .ids["submission"]
+        .clone();
+    assert_eq!(
+        service.read_artifact(&supervisor(), &bad, 1024).unwrap(),
+        b"answer=41"
+    );
+    let reject_operation = |submission: &str, reason: &str| Operation::Reject {
+        work_id: work.clone(),
+        submission_id: submission.into(),
+        reason: reason.into(),
+    };
+    for (name, who, submission, reason) in [
+        (
+            "runtime-reject",
+            runtime(),
+            rejected_submission.as_str(),
+            "bad output",
+        ),
+        (
+            "worker-reject",
+            first_worker.clone(),
+            rejected_submission.as_str(),
+            "bad output",
+        ),
+        (
+            "wrong-submission",
+            supervisor(),
+            "not-current",
+            "bad output",
+        ),
+        (
+            "missing-reason",
+            supervisor(),
+            rejected_submission.as_str(),
+            "",
+        ),
+    ] {
+        let before = canonical_bytes(&service.published().unwrap()).unwrap();
+        assert!(
+            service
+                .execute(
+                    &who,
+                    &command(&service, name, vec![reject_operation(submission, reason)])
+                )
+                .is_err(),
+            "{name}"
+        );
+        assert_eq!(
+            canonical_bytes(&service.published().unwrap()).unwrap(),
+            before,
+            "{name}"
+        );
+    }
+    let blocked_dependency = |id: &str| {
+        let before = canonical_bytes(&service.published().unwrap()).unwrap();
+        let attempted = command(
+            &service,
+            id,
+            vec![Operation::Start {
+                work_id: dependent.clone(),
+                temp_id: "consumer".into(),
+                workspace: None,
+            }],
+        );
+        assert!(matches!(
+            service.execute(&supervisor(), &attempted),
+            Err(Error::ResourceBlocked(_))
+        ));
+        assert_eq!(
+            canonical_bytes(&service.published().unwrap()).unwrap(),
+            before
+        );
+    };
+    blocked_dependency("consumer-before-reject");
+    let rejected_history =
+        canonical_bytes(&service.published().unwrap().1.submissions[&rejected_submission]).unwrap();
+    let rejection = command(&service, "reject-bad", vec![reject_operation(&rejected_submission,
+        "Exact-byte criterion failed: expected answer=42, observed answer=41; correct only this artifact.")]);
+    let rejection_receipt = service.execute(&supervisor(), &rejection).unwrap();
+    let after_reject = service.published().unwrap().1;
+    assert_eq!(after_reject.tickets[&work].state, WorkState::Ready);
+    assert_eq!(after_reject.tickets[&work].current_submission, None);
+    assert_eq!(
+        canonical_bytes(&after_reject.submissions[&rejected_submission]).unwrap(),
+        rejected_history
+    );
+    assert_eq!(
+        service.execute(&supervisor(), &rejection).unwrap(),
+        rejection_receipt
+    );
+    blocked_dependency("consumer-during-rework");
+    let (second, second_worker) = start(&service, &work, "rework-start");
+    assert_ne!(first, second);
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(
+        snapshot.assignments[&second].generation,
+        snapshot.assignments[&first].generation + 1
+    );
+    assert!(snapshot.assignments[&first].process_stopped);
+    assert!(service.authorize_tool(&first_worker, "Task").is_err());
+    stop(&second, "rework-stopped");
+    let corrected = execute(
+        &service,
+        &second_worker,
+        "good-submit",
+        vec![submit_operation(
+            &second,
+            good.clone(),
+            vec!["canonical corrected hash".into()],
+        )],
+    )
+    .ids["submission"]
+        .clone();
+    assert_eq!(
+        service.read_artifact(&supervisor(), &good, 1024).unwrap(),
+        b"answer=42"
+    );
+    for (name, who, submission, evidence) in [
+        (
+            "stale-acceptance",
+            user(),
+            rejected_submission.clone(),
+            vec!["old result".into()],
+        ),
+        (
+            "missing-acceptance-evidence",
+            user(),
+            corrected.clone(),
+            vec![],
+        ),
+        (
+            "technical-is-not-user",
+            supervisor(),
+            corrected.clone(),
+            vec!["all technical criteria pass".into()],
+        ),
+    ] {
+        let before = canonical_bytes(&service.published().unwrap()).unwrap();
+        assert!(
+            service
+                .execute(
+                    &who,
+                    &command(
+                        &service,
+                        name,
+                        vec![Operation::Accept {
+                            work_id: work.clone(),
+                            submission_id: submission,
+                            evidence,
+                        }]
+                    )
+                )
+                .is_err(),
+            "{name}"
+        );
+        assert_eq!(
+            canonical_bytes(&service.published().unwrap()).unwrap(),
+            before,
+            "{name}"
+        );
+    }
+    let before_stale_reject = canonical_bytes(&service.published().unwrap()).unwrap();
+    assert!(service
+        .execute(
+            &supervisor(),
+            &command(
+                &service,
+                "late-rejection",
+                vec![reject_operation(
+                    &rejected_submission,
+                    "late rejection of the old result"
+                ),]
+            )
+        )
+        .is_err());
+    assert_eq!(
+        canonical_bytes(&service.published().unwrap()).unwrap(),
+        before_stale_reject
+    );
+    blocked_dependency("consumer-after-technical-verification");
+    execute(
+        &service,
+        &user(),
+        "user-exact-acceptance",
+        vec![Operation::Accept {
+            work_id: work.clone(),
+            submission_id: corrected.clone(),
+            evidence: vec![format!("User reviewed exact bytes SHA256 {}", good.sha256)],
+        }],
+    );
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(
+        snapshot.tickets[&work].accepted_submission.as_deref(),
+        Some(corrected.as_str())
+    );
+    assert!(snapshot.tickets[&work].contract.user_acceptance_required);
+    // An exact old rejection replay returns its immutable receipt, never resets newer acceptance.
+    assert_eq!(
+        service.execute(&supervisor(), &rejection).unwrap(),
+        rejection_receipt
+    );
+    assert_eq!(
+        service.published().unwrap().1.tickets[&work].state,
+        WorkState::Accepted
+    );
+    let (consumer, _) = start(&service, &dependent, "consumer-after-acceptance");
+    assert_eq!(
+        service.published().unwrap().1.assignments[&consumer].dependency_inputs[0].submission_id,
+        corrected
+    );
+    assert_eq!(
+        canonical_bytes(&service.published().unwrap().1.submissions[&rejected_submission]).unwrap(),
+        rejected_history
+    );
+}
+
 #[test]
 fn cas_receipt_replay_precedes_cas_and_checks_subject_and_payload() {
     let dir = tempfile::tempdir().unwrap();
