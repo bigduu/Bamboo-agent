@@ -267,13 +267,20 @@ async fn pending_context_live_routes_preserve_adoption_and_revalidate_original_d
                     ticket_id: "cancelled".into(),
                     project_id: project.id.clone(),
                 },
-                Operation::Cancel {
-                    work_id: "cancelled".into(),
-                },
             ],
         )
         .unwrap();
     let created = service.execute(&owner, &command).unwrap();
+    let cancel = service
+        .prepare_command(
+            &owner,
+            "live-cancel",
+            vec![Operation::Cancel {
+                work_id: created.ids["cancelled"].clone(),
+            }],
+        )
+        .unwrap();
+    service.execute(&owner, &cancel).unwrap();
     let work = created.ids["w"].clone();
     let path = workspace
         .path()
