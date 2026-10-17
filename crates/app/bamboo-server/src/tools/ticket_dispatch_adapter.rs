@@ -19,9 +19,14 @@ pub struct TicketDispatchPolicy {
     pub enabled: bool,
     pub worker_role: String,
     pub workspace: String,
+    pub max_rounds: Option<u32>,
 }
 
 impl ChildSessionAdapter {
+    pub(crate) fn supports_native_ticket_budget(&self) -> bool {
+        self.scheduler.supports_native_ticket_budget()
+    }
+
     pub async fn query_ticket_dispatch(
         &self,
         service: &TicketService,
@@ -40,7 +45,16 @@ impl ChildSessionAdapter {
         spec: &DispatchSpec,
         policy: &TicketDispatchPolicy,
     ) -> Result<DispatchObservation> {
-        let dispatch = ticket_runtime::dispatch_binding(&service, key, spec)?;
+        let mut dispatch = ticket_runtime::dispatch_binding(&service, key, spec)?;
+        if policy.max_rounds == Some(0) {
+            return Err(Error::InvalidTransition("zero Host round ceiling".into()));
+        }
+        if policy.max_rounds.is_some() && !self.supports_native_ticket_budget() {
+            return Err(Error::ScopeDenied(
+                "Ready Work requires the assembled native Tokio backend".into(),
+            ));
+        }
+        dispatch.max_rounds = policy.max_rounds;
         let (binding, parent) = ticket_runtime::verified_scope_binding(
             self.storage.as_ref(),
             &dispatch.binding.supervisor_session_id,
@@ -62,6 +76,18 @@ impl ChildSessionAdapter {
         self.scheduler.set_ticket_service(Some(service.clone()));
         let child_id = ticket_runtime::ticket_child_id(key);
         let guard = self.scheduler.lock_child_launch(&child_id).await;
+        if let (Some(cap), Some(child)) = (
+            policy.max_rounds,
+            self.storage.load_runtime_control_plane(&child_id).await?,
+        ) {
+            let canonical = ticket_runtime::read_dispatch(&child)?
+                .ok_or_else(|| Error::ScopeDenied("canonical dispatch ceiling missing".into()))?;
+            if canonical.max_rounds.is_none_or(|old| old == 0 || old > cap) {
+                return Err(Error::ScopeDenied(
+                    "pending dispatch does not retain the Host round ceiling".into(),
+                ));
+            }
+        }
         match self.query_ticket_dispatch(&service, key, spec).await? {
             DispatchObservation::Missing => {
                 ticket_runtime::require_dispatch_permission(&service, &dispatch)?;

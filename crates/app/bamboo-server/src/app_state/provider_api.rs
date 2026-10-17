@@ -85,6 +85,7 @@ impl AppState {
         // Stop the supervised MCP proxy service (issue #47) so its reconnect
         // supervisor exits cleanly instead of looping after an intended stop.
         self.mcp_proxy_shutdown.cancel();
+        self.tickets.shutdown_ready_worker().await;
         if let Err(error) = self.external_child_runner.shutdown().await {
             tracing::warn!(%error, "Child runtime shutdown did not complete cleanly");
         }

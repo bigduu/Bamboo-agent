@@ -121,6 +121,12 @@ impl CompositeExternalChildRunner {
 
 #[async_trait]
 impl ExternalChildRunner for CompositeExternalChildRunner {
+    fn supports_native_ticket_budget(&self) -> bool {
+        // Deliberately conservative for this native-only first slice. Mixed
+        // process/remote routers retain their existing explicit dispatch path.
+        self.runners.len() == 1 && self.runners[0].supports_native_ticket_budget()
+    }
+
     fn set_local_child_skill_factory(
         &self,
         factory: Option<Arc<dyn super::local_task::LocalChildSkillFactory>>,

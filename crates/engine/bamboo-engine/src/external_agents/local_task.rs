@@ -403,6 +403,10 @@ impl LocalTaskChildRunner {
 
 #[async_trait]
 impl ExternalChildRunner for LocalTaskChildRunner {
+    fn supports_native_ticket_budget(&self) -> bool {
+        true
+    }
+
     fn set_local_child_skill_factory(&self, factory: Option<Arc<dyn LocalChildSkillFactory>>) {
         lock(&self.bindings).skills = factory;
     }
@@ -749,7 +753,16 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         if let Some(effort) = session.reasoning_effort {
             request = request.reasoning_effort(effort);
         }
-        if let Some(plan) = ticket_plan { request = request.ticket_worker_plan(plan); }
+        if let Some(plan) = ticket_plan {
+            // Admission above binds this exact canonical Child/Run/dispatch.
+            // Carry its Host ceiling into the request even if queued execution
+            // observes a later relaxation of the global configuration.
+            if let Some(cap) = crate::ticket_runtime::read_dispatch(session).map_err(failure)?.and_then(|binding| binding.max_rounds) {
+                if cap == 0 { return Err(failure("zero Host round ceiling")); }
+                request = request.run_budget(bamboo_config::RunBudgetConfig { max_rounds: Some(cap), ..Default::default() });
+            }
+            request = request.ticket_worker_plan(plan);
+        }
         let mut owned_session = session.clone();
         // The question fact survives its answer for replay/deduplication. The
         // handoff is only for the run that issued that fact, not every later

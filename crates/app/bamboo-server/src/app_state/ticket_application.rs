@@ -26,11 +26,16 @@ pub struct TicketApplication {
     adapter: OnceLock<Arc<ChildSessionAdapter>>,
     messenger: OnceLock<Arc<bamboo_engine::SessionMessenger>>,
     workspace: String,
+    ready_schedule: tokio::sync::Mutex<scheduling::ReadySchedule>,
+    ready_wake: Arc<tokio::sync::Notify>,
+    ready_worker: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 mod initialization;
 pub use initialization::{ScopeInitialization, ScopeInitializationError};
 mod resolution;
+mod scheduling;
+pub use scheduling::{ReadyBlockKind, ReadyReconcile, ReadyWorkGrant, ReadyWorkPolicy};
 #[cfg(test)]
 mod tests;
 
@@ -56,6 +61,9 @@ impl TicketApplication {
                 .join(DEFAULT_SUPERVISOR_SESSION_ID)
                 .to_string_lossy()
                 .into_owned(),
+            ready_schedule: tokio::sync::Mutex::new(scheduling::ReadySchedule::default()),
+            ready_wake: Arc::new(tokio::sync::Notify::new()),
+            ready_worker: std::sync::Mutex::new(None),
         }
     }
 
@@ -272,6 +280,10 @@ impl TicketApplication {
         )?;
         expected.receipt = Some(receipt.clone());
         expected.receipt_created_at = Some(child.created_at);
+        let actual = ticket_runtime::read_dispatch(&child)?;
+        // The request ceiling is canonical Host metadata, additional to the
+        // unchanged immutable Ticket operation/spec identity.
+        expected.max_rounds = actual.as_ref().and_then(|binding| binding.max_rounds);
         if child.kind != bamboo_domain::SessionKind::Child
             || child.id != child_id
             || child.parent_session_id.as_deref()
@@ -281,7 +293,7 @@ impl TicketApplication {
                 .metadata
                 .get(bamboo_engine::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
                 != Some(&assignment.id)
-            || ticket_runtime::read_dispatch(&child)?.as_ref() != Some(&expected)
+            || actual.as_ref() != Some(&expected)
             || receipt.session_id != child.id
             || receipt.run_id.is_empty()
             || child.metadata.get("runtime.local_task.run_id") != Some(&receipt.run_id)
@@ -374,6 +386,7 @@ impl TicketApplication {
         let (service, authority) = self.authority(principal.clone()).await?;
         self.validate_project_operations(&service, command)?;
         let receipt = service.work_update(&authority, command)?;
+        self.wake_ready_work();
         self.cancel_after_commit(&service, command);
         if matches!(principal, Principal::User { .. })
             && command.operations.iter().any(|op| {
@@ -461,6 +474,16 @@ impl TicketApplication {
     /// Commit before enqueue, return admission observations without waiting for
     /// the Worker. Errors after commit are reported alongside its receipt.
     pub async fn dispatch(&self, principal: Principal, command: &Command) -> Result<Value> {
+        self.dispatch_with_round_ceiling(principal, command, None)
+            .await
+    }
+
+    async fn dispatch_with_round_ceiling(
+        &self,
+        principal: Principal,
+        command: &Command,
+        max_rounds: Option<u32>,
+    ) -> Result<Value> {
         let flags = self.config.read().await.features.clone();
         if !flags.ticket_mutation {
             return Err(Error::AuthorityUnavailable(
@@ -490,7 +513,8 @@ impl TicketApplication {
         }
         self.validate_project_operations(&service, command)?;
         let receipt = service.work_dispatch(&authority, command)?;
-        self.enqueue_receipt(&service, command, receipt).await
+        self.enqueue_receipt_with_round_ceiling(&service, command, receipt, max_rounds)
+            .await
     }
 
     /// Ticket stop proof is currently local-only. Git identity is read before
@@ -534,6 +558,17 @@ impl TicketApplication {
         command: &Command,
         receipt: OperationReceipt,
     ) -> Result<Value> {
+        self.enqueue_receipt_with_round_ceiling(service, command, receipt, None)
+            .await
+    }
+
+    async fn enqueue_receipt_with_round_ceiling(
+        &self,
+        service: &Arc<TicketService>,
+        command: &Command,
+        receipt: OperationReceipt,
+        max_rounds: Option<u32>,
+    ) -> Result<Value> {
         self.cancel_after_commit(service, command);
         let snapshot = service.published()?.1;
         let mut runtime = Vec::new();
@@ -544,9 +579,17 @@ impl TicketApplication {
             .filter(|a| receipt.ids.values().any(|id| id == &a.id))
         {
             let intent = &snapshot.intents[&assignment.dispatch_key];
-            let observation = self
-                .ensure(&assignment.dispatch_key, &intent.immutable_spec)
-                .await;
+            let observation = if max_rounds.is_some() {
+                self.ensure_with_round_ceiling(
+                    &assignment.dispatch_key,
+                    &intent.immutable_spec,
+                    max_rounds,
+                )
+                .await
+            } else {
+                self.ensure(&assignment.dispatch_key, &intent.immutable_spec)
+                    .await
+            };
             match observation {
                 Ok(observation) => runtime.push(json!({"dispatch_key":assignment.dispatch_key, "observation":observation})),
                 Err(error) => errors.push(json!({"dispatch_key":assignment.dispatch_key,"status_code":error.status_code(),"reason":error.to_string()})),
@@ -681,6 +724,15 @@ impl TicketApplication {
         key: &str,
         spec: &DispatchSpec,
     ) -> Result<ticket_runtime::DispatchObservation> {
+        self.ensure_with_round_ceiling(key, spec, None).await
+    }
+
+    async fn ensure_with_round_ceiling(
+        &self,
+        key: &str,
+        spec: &DispatchSpec,
+        max_rounds: Option<u32>,
+    ) -> Result<ticket_runtime::DispatchObservation> {
         let service = self.service()?;
         let enabled = self.config.read().await.features.ticket_dispatch;
         if enabled {
@@ -726,6 +778,7 @@ impl TicketApplication {
                     enabled,
                     worker_role: "worker".into(),
                     workspace: self.workspace.clone(),
+                    max_rounds,
                 },
             )
             .await
