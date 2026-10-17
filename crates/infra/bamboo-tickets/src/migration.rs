@@ -80,9 +80,9 @@ pub(crate) fn validate_migration(snapshot: &Snapshot) -> Result<()> {
         .assignments
         .values()
         .any(|a| a.effects.values().any(|e| e.artifact.is_some()));
-    if files && !matches!(snapshot.schema, 3..=5) {
+    if files && !matches!(snapshot.schema, 3..=6) {
         return Err(Error::AuthorityUnavailable(
-            "file effect ledger requires schema 3..=5".into(),
+            "file effect ledger requires schema 3..=6".into(),
         ));
     }
     match (&snapshot.migration, snapshot.schema) {
@@ -102,7 +102,8 @@ pub(crate) fn validate_migration(snapshot: &Snapshot) -> Result<()> {
                 }) => {}
         (None, 3 | 4) if files => {}
         (None, 5) if !snapshot.project.is_empty() => {}
-        (Some(r), 2..=5) => {
+        (None, 6) if !snapshot.sprint.is_empty() => {}
+        (Some(r), 2..=6) => {
             let activation_seq = r
                 .retired_seq
                 .checked_add(1)
