@@ -1,8 +1,16 @@
 # Explicit native Ready Work runtime slice
 
-Part of #2042 and workspace/failure isolation in #2046, after #2044 and #2045.
+Part of #2042, workspace/failure isolation in #2046, and the first bounded crate
+extraction in #2050, after #2044 and #2045. Semantic patrol remains in #2049.
 This is a trusted Rust Host embedding port, not an HTTP auto-run switch. Normal
 server startup installs no scheduling policy. No release branch is changed.
+
+Policy, typed observations, failure accounting and the finite reconciler live in
+the independent `bamboo-orchestration` crate. It depends on Domain/Tickets and
+Tokio through a `ReadyWorkHost` trait; it has no server, engine, provider or memory
+adapter dependency and creates no new durable authority. Server supplies only
+current authorization, preflight and the existing dispatch adapter. Existing
+placement scheduling and user Cron services retain their separate responsibilities.
 
 `TicketApplication::install_ready_work_policy` accepts one Project, 1–64 explicit
 Work grants, a scope capacity of 1–3, a finite round ceiling, and a lifetime up to

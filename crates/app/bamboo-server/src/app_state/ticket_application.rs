@@ -26,16 +26,14 @@ pub struct TicketApplication {
     adapter: OnceLock<Arc<ChildSessionAdapter>>,
     messenger: OnceLock<Arc<bamboo_engine::SessionMessenger>>,
     workspace: String,
-    ready_schedule: tokio::sync::Mutex<scheduling::ReadySchedule>,
-    ready_wake: Arc<tokio::sync::Notify>,
-    ready_worker: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    ready_scheduler: Arc<bamboo_orchestration::ReadyWorkScheduler>,
 }
 
 mod initialization;
 pub use initialization::{ScopeInitialization, ScopeInitializationError};
 mod resolution;
 mod scheduling;
-pub use scheduling::{ReadyBlockKind, ReadyReconcile, ReadyWorkGrant, ReadyWorkPolicy};
+pub use bamboo_orchestration::{ReadyBlockKind, ReadyReconcile, ReadyWorkGrant, ReadyWorkPolicy};
 #[cfg(test)]
 mod tests;
 
@@ -61,9 +59,7 @@ impl TicketApplication {
                 .join(DEFAULT_SUPERVISOR_SESSION_ID)
                 .to_string_lossy()
                 .into_owned(),
-            ready_schedule: tokio::sync::Mutex::new(scheduling::ReadySchedule::default()),
-            ready_wake: Arc::new(tokio::sync::Notify::new()),
-            ready_worker: std::sync::Mutex::new(None),
+            ready_scheduler: Arc::new(bamboo_orchestration::ReadyWorkScheduler::default()),
         }
     }
 
