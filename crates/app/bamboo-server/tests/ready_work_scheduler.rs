@@ -143,7 +143,7 @@ impl LLMProvider for ControlledProvider {
 }
 
 async fn wait_native_terminal(state: &AppState, child_id: &str) -> Session {
-    tokio::time::timeout(WAIT, async {
+    let terminal = tokio::time::timeout(WAIT, async {
         loop {
             let child = state.storage.load_session(child_id).await.unwrap().unwrap();
             let stopped = child
@@ -170,8 +170,29 @@ async fn wait_native_terminal(state: &AppState, child_id: &str) -> Session {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("round ceiling terminates and joins the native Child")
+    .await;
+    match terminal {
+        Ok(child) => child,
+        Err(_) => {
+            let child = state.storage.load_session(child_id).await.unwrap().unwrap();
+            let runner = state
+                .agent_runners
+                .read()
+                .await
+                .get(child_id)
+                .map(|runner| format!("{:?}", runner.status));
+            let logical_run = state
+                .session_activation_router
+                .current_run_id(child_id)
+                .await;
+            let dispatch = ticket_runtime::read_dispatch(&child).unwrap().unwrap();
+            let (_, snapshot) = state.tickets.service().unwrap().published().unwrap();
+            panic!(
+                "round ceiling did not reach terminal observation: metadata={:?}, runner={runner:?}, logical_run={logical_run:?}, assignment={:?}",
+                child.metadata, snapshot.assignments[&dispatch.assignment_id]
+            );
+        }
+    }
 }
 
 struct Work {
