@@ -50,9 +50,11 @@ sequence; ancestor snapshots retain previous values. No new audit store is added
 
 Planning edits can happen while running or submitted. They only change Ticket
 planning fields, record revision, update sequence, schema and the operation
-receipt. They do not steer a Worker, change scheduling order, replace a contract,
-invalidate submitted evidence, grant tools, move Sprint membership, clear a
-resource claim or mark work complete. Inspect and Project board return the same
+receipt. Priority and deadline do not participate in the current claim comparator.
+Like any ordinary update, changing `updated_seq` can affect its existing oldest-update
+ordering; no priority-based scheduling policy is enabled here. These edits do not
+steer a Worker, replace a contract, invalidate submitted evidence, grant tools,
+move Sprint membership, clear a resource claim or mark work complete. Inspect and Project board return the same
 Ticket fields. Sorting/filtering and fixed-as-of overdue projections remain
 separate query work; clients must not label an absent deadline as overdue.
 

@@ -132,7 +132,7 @@ async fn owner_planning_route_preserves_cas_receipts_and_board_projection() {
         test::TestRequest::post()
             .uri("/api/v1/tickets/project-board")
             .peer_addr("127.0.0.1:5700".parse().unwrap())
-            .set_json(json!({"project_id":project.id}))
+            .set_json(json!({"project_id":project.id,"limit":10}))
             .to_request(),
     )
     .await;
