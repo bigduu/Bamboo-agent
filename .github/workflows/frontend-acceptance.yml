@@ -15,6 +15,18 @@ permissions:
 
 env:
   PYTHONDONTWRITEBYTECODE: "1"
+  # This frozen batch restores existing caches without adding paid storage.
+  # The main anchor also covers its first normal promotion push.
+  BAMBOO_RELEASE_CACHE_WRITE_ALLOWED: >-
+    ${{ !(
+      startsWith(github.ref, 'refs/heads/bamboo/release/da348-') ||
+      github.ref == 'refs/heads/release/da348a63f1d019a22df547c78575c500b6b1294e' ||
+      startsWith(github.head_ref, 'bamboo/release/da348-') ||
+      github.head_ref == 'release/da348a63f1d019a22df547c78575c500b6b1294e' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+       (github.event.before == 'dbafb74522794012fc8f0a61e761817b3913989a' ||
+        contains(github.event.head_commit.message, 'release/da348a63f1d019a22df547c78575c500b6b1294e')))
+    ) }}
 
 jobs:
   lint:
@@ -58,7 +70,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-lint-${{ runner.os }}
-          save-if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'dev') }}
+          save-if: ${{ (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'dev')) && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check

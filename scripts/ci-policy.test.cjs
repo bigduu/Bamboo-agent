@@ -5,6 +5,7 @@ const { spawnSync } = require("node:child_process")
 const os = require("node:os")
 const path = require("node:path")
 const { test } = require("node:test")
+const { runInNewContext } = require("node:vm")
 
 const workflow = readFileSync(".github/workflows/ci.yml", "utf8")
 const cacheCleanupWorkflow = readFileSync(
@@ -13,6 +14,20 @@ const cacheCleanupWorkflow = readFileSync(
 )
 const codeqlWorkflow = readFileSync(".github/workflows/codeql.yml", "utf8")
 const contributing = readFileSync("CONTRIBUTING.md", "utf8")
+const frozenCacheWriteHeader = [
+  "  BAMBOO_RELEASE_CACHE_WRITE_ALLOWED: >-",
+  "    ${{ !(",
+  "      startsWith(github.ref, 'refs/heads/bamboo/release/da348-') ||",
+  "      github.ref == 'refs/heads/release/da348a63f1d019a22df547c78575c500b6b1294e' ||",
+  "      startsWith(github.head_ref, 'bamboo/release/da348-') ||",
+  "      github.head_ref == 'release/da348a63f1d019a22df547c78575c500b6b1294e' ||",
+  "      (github.event_name == 'push' && github.ref == 'refs/heads/main' &&",
+  "       (github.event.before == 'dbafb74522794012fc8f0a61e761817b3913989a' ||",
+  "        contains(github.event.head_commit.message, 'release/da348a63f1d019a22df547c78575c500b6b1294e')))",
+  "    ) }}",
+]
+const cacheSaveIf = (predicate) =>
+  `save-if: \${{ (${predicate}) && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}`
 
 const job = (id) => {
   const marker = `\n  ${id}:\n`
@@ -244,11 +259,10 @@ test("all-feature E2E tests retain the workspace test thread stack contract", ()
   assert.doesNotMatch(step, /^        (?:if|continue-on-error):/mu)
 })
 
-test("PR caches are reusable while open and scoped cleanup runs on close", () => {
-  assert.match(
-    job("test"),
-    /save-if: \$\{\{ github\.event_name == 'push' \|\| \(github\.event_name == 'pull_request' && github\.base_ref == 'dev'\) \}\}/u,
-  )
+test("ordinary PR caches remain reusable and frozen validation restores without saving", () => {
+  assert.ok(job("test").includes(cacheSaveIf(
+    "github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'dev')",
+  )))
   for (const id of [
     "msrv",
     "tls-fixture-test",
@@ -258,9 +272,8 @@ test("PR caches are reusable while open and scoped cleanup runs on close", () =>
     "docs",
     "security",
   ]) {
-    assert.match(
-      job(id),
-      /save-if: \$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' \}\}/u,
+    assert.ok(
+      job(id).includes(cacheSaveIf("github.event_name == 'push' && github.ref == 'refs/heads/main'")),
       `${id} must restore but not write PR-scoped caches`,
     )
   }
@@ -607,6 +620,64 @@ assert counts == fixture.get("counts", {"release": 2, "dev": 2, "compare": 2}), 
 const frontendWorkflow = readFileSync(
   ".github/workflows/frontend-acceptance.yml", "utf8",
 )
+test("this frozen batch cannot save cache on source, integration, promotion or main push", () => {
+  const actor = readFileSync(".github/workflows/actor-snapshot-windows.yml", "utf8")
+  const docs = readFileSync(".github/workflows/docs.yml", "utf8")
+  const sources = [workflow, frontendWorkflow, actor, docs]
+  const header = frozenCacheWriteHeader.join("\n")
+  const expression = frozenCacheWriteHeader.slice(1).join("\n").trim().slice(3, -2)
+  const cutRef = "release/da348a63f1d019a22df547c78575c500b6b1294e"
+  const anchor = "dbafb74522794012fc8f0a61e761817b3913989a"
+  const context = ({ event = "workflow_dispatch", ref = "", head = "", base = "", before = "", message = "" }) => ({
+    event_name: event, ref, head_ref: head, base_ref: base,
+    event: { before, head_commit: { message } },
+  })
+  const cases = [
+    ["original source", context({ ref: "refs/heads/bamboo/release/da348-cache-readonly" }), false],
+    ["fixed release source", context({ ref: `refs/heads/${cutRef}` }), false],
+    ["dev integration", context({ event: "pull_request", ref: "refs/pull/2037/merge", head: "bamboo/release/da348-main-ancestry", base: "dev" }), false],
+    ["main promotion", context({ event: "pull_request", ref: "refs/pull/2036/merge", head: cutRef, base: "main" }), false],
+    ["first promotion push", context({ event: "push", ref: "refs/heads/main", before: anchor }), false],
+    ["identified later promotion push", context({ event: "push", ref: "refs/heads/main", before: "changed-base", message: `Merge pull request #2036 from bigduu/${cutRef}` }), false],
+    ["batch backmerge", context({ event: "pull_request", head: "bamboo/release/da348-main-backmerge", base: "dev" }), false],
+    ["case-insensitive branch function", context({ ref: "refs/heads/BAMBOO/RELEASE/DA348-SOURCE" }), false],
+    ["other source", context({ ref: "refs/heads/bamboo/release/other-source" }), true],
+    ["similar unrelated prefix", context({ ref: "refs/heads/bamboo/release/da348x-source" }), true],
+    ["ordinary dev PR", context({ event: "pull_request", head: "feature/example", base: "dev" }), true],
+    ["other release PR", context({ event: "pull_request", head: "release/another-cut", base: "main" }), true],
+    ["later unrelated main push", context({ event: "push", ref: "refs/heads/main", before: "other-base", message: "ordinary merge" }), true],
+  ]
+  const evaluate = (value, github, allowed) => runInNewContext(value, {
+    github, env: { BAMBOO_RELEASE_CACHE_WRITE_ALLOWED: String(allowed) },
+    startsWith: (text, prefix) => String(text).toLowerCase().startsWith(prefix.toLowerCase()),
+    contains: (text, part) => String(text).toLowerCase().includes(part.toLowerCase()),
+  }, { timeout: 1000 })
+  let caches = 0
+  for (const source of sources) {
+    const actualHeader = source.match(/^  BAMBOO_RELEASE_CACHE_WRITE_ALLOWED: >-\n((?:    .*\n)+)/mu)
+    const actualExpression = actualHeader ? actualHeader[1].trim().slice(3, -2) : "true"
+    const steps = source.split(/\n      - /u).filter((step) => step.includes("uses: swatinem/rust-cache@v2"))
+    for (const step of steps) {
+      const conditions = [...step.matchAll(/^          save-if: \$\{\{ (.*) \}\}$/gmu)]
+      assert.ok(conditions.length <= 1, "a cache action cannot have conflicting save predicates")
+      const saveExpression = conditions.length ? conditions[0][1] : "true"
+      caches += 1
+      for (const [name, github, expected] of cases) {
+        const allowed = evaluate(actualExpression, github, true)
+        if (!expected) assert.equal(evaluate(saveExpression, github, allowed), false, `${name} must not save cache`)
+      }
+      assert.equal(conditions.length, 1, "each cache action must have an explicit save predicate")
+      assert.ok(saveExpression.includes("env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true'"))
+    }
+    assert.equal(source.split(header).length, 2, "one shared batch predicate must govern each workflow")
+    for (const [name, github, expected] of cases) assert.equal(evaluate(expression, github, true), expected, name)
+  }
+  assert.equal(caches, 12, "all planned source/dev/main cache actions remain covered")
+  assert.ok(actor.includes(cacheSaveIf("github.event_name == 'pull_request' && github.base_ref == 'dev'")))
+  assert.match(docs, /cache-on-failure: true\n          save-if: \$\{\{ env\.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' \}\}/u)
+  const publisher = readFileSync(".github/workflows/publish-crate.yml", "utf8")
+  assert.doesNotMatch(publisher, /(?:swatinem\/rust-cache|actions\/cache)@|\bcache-to:/u)
+})
 const frontendHead = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
 const frontendJobs = (source) => {
   const parts = source.replace(/\r\n/gu, "\n").split("\njobs:\n")
@@ -631,7 +702,7 @@ const frontendScript = (step) => {
 }
 function assertFrontendPolicy(source) {
   source = source.replace(/\r\n/gu, "\n")
-  const header = source.slice(0, source.indexOf("\njobs:\n")).split("\n").filter((line) => line.trim() && !line.startsWith("#"))
+  const header = source.slice(0, source.indexOf("\njobs:\n")).split("\n").filter((line) => line.trim() && !line.trimStart().startsWith("#"))
   assert.deepEqual(header, [
     "name: Frontend consumer acceptance",
     "on:",
@@ -647,6 +718,7 @@ function assertFrontendPolicy(source) {
     "  contents: read",
     "env:",
     "  PYTHONDONTWRITEBYTECODE: \"1\"",
+    ...frozenCacheWriteHeader,
   ], "main and manual snapshot routing binds the actual source without Cargo environment overrides")
   const lint = source.split("\n  lint:\n")[1].split("\n  build:\n")[0].replace(/^  #.*(?:\n|$)/gmu, "").trimEnd()
   assert.equal(lint, [
@@ -690,7 +762,7 @@ function assertFrontendPolicy(source) {
     "        uses: swatinem/rust-cache@v2",
     "        with:",
     "          shared-key: bamboo-ci-lint-${{ runner.os }}",
-    "          save-if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'dev') }}",
+    "          " + cacheSaveIf("github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'dev')"),
     "",
     "      - name: Check formatting",
     "        run: cargo fmt --all -- --check",
@@ -710,7 +782,7 @@ function assertFrontendPolicy(source) {
     "",
     "      - name: Require source files to remain unchanged",
     "        run: git diff --exit-code",
-  ].join("\n"), "the current lint job, snapshot guard, Clippy arguments and cache policy remain unchanged")
+  ].join("\n"), "the lint source guards and Clippy arguments remain exact; frozen validation only changes cache saving")
   const jobs = frontendJobs(source)
   source = "  build:\n" + source.split("  build:\n")[1]
   const withoutFinalConditions = source.replaceAll(

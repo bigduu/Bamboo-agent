@@ -26,6 +26,18 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: "1"
+  # This frozen batch restores existing caches without adding paid storage.
+  # The main anchor also covers its first normal promotion push.
+  BAMBOO_RELEASE_CACHE_WRITE_ALLOWED: >-
+    ${{ !(
+      startsWith(github.ref, 'refs/heads/bamboo/release/da348-') ||
+      github.ref == 'refs/heads/release/da348a63f1d019a22df547c78575c500b6b1294e' ||
+      startsWith(github.head_ref, 'bamboo/release/da348-') ||
+      github.head_ref == 'release/da348a63f1d019a22df547c78575c500b6b1294e' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+       (github.event.before == 'dbafb74522794012fc8f0a61e761817b3913989a' ||
+        contains(github.event.head_commit.message, 'release/da348a63f1d019a22df547c78575c500b6b1294e')))
+    ) }}
 
 jobs:
   validation-source:
@@ -248,7 +260,7 @@ jobs:
         with:
           shared-key: bamboo-ci-test-${{ runner.os }}
           # Keep iterative dev PR caches; main PRs restore from their base branch.
-          save-if: ${{ github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'dev') }}
+          save-if: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'dev')) && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Verify published server crate owns the frontend package
         if: github.event_name != 'pull_request' || github.base_ref == 'main'
@@ -338,7 +350,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-msrv-1.95-${{ runner.os }}
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Test MSRV graph audit
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
@@ -371,7 +383,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-tls-fixture-${{ matrix.os }}
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Verify OpenSSL
         run: openssl version
@@ -403,7 +415,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-tool-event-recorder-${{ matrix.os }}
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Run native recorder contract and lifecycle tests
         run: cargo test --locked -p bamboo-tool-event-recorder-example -- --nocapture --test-threads=1
@@ -423,7 +435,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-e2e-${{ runner.os }}
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Run all-feature library and integration tests
         run: cargo test --locked --all-features --lib --tests
@@ -447,7 +459,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-lint-${{ runner.os }}
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -511,7 +523,7 @@ jobs:
           shared-key: bamboo-ci-build-${{ matrix.os }}
           # Promotion builds do not run on main pushes; retain warm caches within
           # a live promotion PR and permit manual runs on main to seed its base.
-          save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
+          save-if: ${{ ((github.event_name == 'pull_request' && github.base_ref == 'main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Verify portable Skill source publication
         run: cargo test --locked -p bamboo-skills progressive::source_tests -- --test-threads=1
@@ -544,7 +556,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-docs-${{ runner.os }}
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Build documentation
         run: cargo doc --no-deps
@@ -564,7 +576,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-security-${{ runner.os }}
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Install cargo-audit
         # Pinned + --locked for reproducible, non-drifting CI runs (was
