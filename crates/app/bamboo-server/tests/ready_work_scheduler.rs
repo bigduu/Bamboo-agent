@@ -295,8 +295,12 @@ impl Fixture {
             HashMap::from([(PROVIDER.into(), provider.clone() as Arc<dyn LLMProvider>)]),
             PROVIDER.into(),
         ));
-        assert!(state.embedded_broker.is_none());
-        assert!(state.health_monitor.is_none());
+        {
+            let assembled_config = state.config.read().await;
+            assert!(assembled_config.subagents().broker.is_none());
+            assert!(assembled_config.cluster_fabric.nodes.is_empty());
+        }
+        assert!(!root.path().join("broker").exists());
         let mut manifest = state
             .project_store
             .create("Ready Work fixture", None)
