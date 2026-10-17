@@ -329,6 +329,13 @@ async fn pending_context_live_routes_preserve_adoption_and_revalidate_original_d
             },
         )
         .unwrap();
+    // Adding another binding changes Project metadata, not the resource
+    // counter. Advance the actual resource ledger for the stale-intent guard.
+    let updated = state
+        .project_store
+        .bump_resource_revision(&project.id, updated.revision)
+        .unwrap();
+    assert!(updated.resource_revision > adopted.resource_revision);
     let mut pending = adopted.clone();
     pending.project_revision = updated.revision;
     pending.resource_revision = updated.resource_revision;
@@ -351,7 +358,7 @@ async fn pending_context_live_routes_preserve_adoption_and_revalidate_original_d
     // Replaying reaches ensure() before any adapter/provider admission.
     let replay = state.tickets.dispatch(principal, &start).await.unwrap();
     assert_eq!(replay["runtime"], serde_json::json!([]));
-    assert_eq!(replay["errors"][0]["status_code"], 409);
+    assert_eq!(replay["errors"][0]["status_code"], 409, "{replay}");
     assert!(service.published().unwrap().1.assignments[&assignment]
         .runtime
         .is_none());
