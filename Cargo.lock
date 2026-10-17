@@ -1622,6 +1622,7 @@ name = "bamboo-tickets"
 version = "0.0.0"
 dependencies = [
  "bamboo-domain",
+ "chrono",
  "fs2",
  "hex",
  "libc",

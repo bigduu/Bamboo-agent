@@ -768,6 +768,8 @@ fn apply(
                     contract_revision: 1,
                     generation: 0,
                     contract: contract.clone(),
+                    priority: Default::default(),
+                    expected_completion_at: None,
                     state: WorkState::Draft,
                     blocked: None,
                     paused: false,
@@ -790,6 +792,19 @@ fn apply(
             }
             snapshot.graph_revision += 1;
         }
+        SetPlanningMetadata {
+            ticket_id,
+            expected_record_revision,
+            priority,
+            expected_completion_at,
+        } => crate::planning::set(
+            snapshot,
+            authority,
+            &resolve(ticket_id, ids),
+            *expected_record_revision,
+            priority,
+            expected_completion_at.as_deref(),
+        )?,
         Ready { work_id } => {
             authority.supervisor()?;
             let id = resolve(work_id, ids);
@@ -1849,7 +1864,7 @@ fn apply(
             }
             let id = allocate(temp_id, ids)?;
             snapshot.tickets.insert(id.clone(), Ticket { id, scope_id: snapshot.binding.scope_id.clone(), kind: TicketKind::Work,
-                parent: None, depends_on: BTreeSet::new(), record_revision: 1, contract_revision: 1, generation: 0, contract: contract.clone(),
+                parent: None, depends_on: BTreeSet::new(), record_revision: 1, contract_revision: 1, generation: 0, contract: contract.clone(), priority: Default::default(), expected_completion_at: None,
                 state: WorkState::Blocked, blocked: Some(BlockReason { reason: "imported legacy task requires explicit review; no runtime ownership transferred".into(), resume_state: WorkState::Submitted }),
                 paused: false, archived: false, active_assignment: None, current_submission: None, accepted_submission: None, updated_seq: seq, import_source: Some(source.clone()) });
             snapshot.graph_revision += 1;
@@ -2131,6 +2146,7 @@ fn valid_effect_transition(from: EffectState, to: EffectState) -> bool {
 pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
     crate::project::validate(snapshot)?;
     crate::sprint::validate(snapshot)?;
+    crate::planning::validate(snapshot)?;
     crate::migration::validate_migration(snapshot)?;
     crate::file_reconciliation::validate_file_intents(snapshot)?;
     crate::resolution::validate_history(snapshot)?;

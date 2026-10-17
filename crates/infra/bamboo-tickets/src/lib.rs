@@ -4,6 +4,7 @@ mod claiming;
 mod file_reconciliation;
 mod migration;
 mod model;
+mod planning;
 mod project;
 mod query;
 mod resolution;
