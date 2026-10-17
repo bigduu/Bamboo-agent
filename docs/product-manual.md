@@ -62,3 +62,34 @@ Run focused `bamboo-server` diagnostics/receipt tests and the `bamboo-skills`
 product-manual integration tests when changing this adapter. Canary tests cover
 private source paths/errors, project identifiers, arbitrary status strings and
 other-session observations, and compare sources before/after collection.
+
+## Version-bound static manual artifact
+
+`cargo run --locked -p bamboo-skills --example export_manual_site -- --output NEW_DIRECTORY`
+exports only the canonical compiled `bamboo-manual` bundle. The destination must
+not exist. It contains `<package_version>/<manifest_sha256>/index.html`, the exact
+manifest/resources, and a local lexical search index. The exporter checks the
+complete declared resource set, UTF-8, sizes, hashes and aggregate content identity
+before creating the destination. It reads no runtime configuration, credentials,
+user workspace or network. A copied executable can export without the checkout.
+This is a new implementation for #2030, not a recovered copy of an earlier draft.
+
+Serve the version/hash directory on an approved static HTTPS host (localhost HTTP
+also works). Opening `index.html` with `file://` is unsupported. The page verifies
+its manifest/index identity and every chapter's text before displaying it, renders
+reference source text without interpreting HTML, and searches locally without
+telemetry, storage or third-party assets. A missing or mixed bundle fails closed
+and directs readers to the installed Skill. Hashes detect inconsistent artifacts;
+they do not authenticate the website or establish that a checkout is clean.
+Source provenance remains exactly as declared by the compiled manifest, including
+`checkout_unverified` or unknown states. The displayed version is the bundle's
+package version, not a claim that a release has shipped.
+
+Validate an export using
+`node crates/infra/bamboo-skills/manual/publication_search_test.mjs NEW_DIRECTORY/VERSION/BUNDLE_HASH`
+and run `cargo test --locked -p bamboo-skills --test manual_publication --test product_manual`.
+Publish the complete version/hash directory atomically; do not mix files or rewrite
+it under an existing identity. The current Rustdoc Pages workflow is unchanged.
+This command creates a static artifact only: it does not deploy a website, create
+a latest-version alias, or modify Pavilion. Production hosting and the public URL
+remain a separate publication step.
