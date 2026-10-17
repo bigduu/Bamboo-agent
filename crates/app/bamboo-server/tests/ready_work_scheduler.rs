@@ -187,9 +187,14 @@ async fn wait_native_terminal(state: &AppState, child_id: &str) -> Session {
                 .await;
             let dispatch = ticket_runtime::read_dispatch(&child).unwrap().unwrap();
             let (_, snapshot) = state.tickets.service().unwrap().published().unwrap();
+            let observations = child
+                .metadata
+                .iter()
+                .filter(|(key, _)| key.starts_with("runtime.") || key.starts_with("last_run"))
+                .collect::<std::collections::BTreeMap<_, _>>();
             panic!(
                 "round ceiling did not reach terminal observation: metadata={:?}, runner={runner:?}, logical_run={logical_run:?}, assignment={:?}",
-                child.metadata, snapshot.assignments[&dispatch.assignment_id]
+                observations, snapshot.assignments[&dispatch.assignment_id]
             );
         }
     }
@@ -851,6 +856,18 @@ async fn queued_child_keeps_host_round_ceiling_after_global_budget_is_relaxed() 
                 .map(String::as_str),
             Some("max_rounds_reached")
         );
+        assert_eq!(stopped.last_run_status().as_deref(), Some("error"));
+        assert!(stopped
+            .last_run_error()
+            .unwrap()
+            .contains("Ticket run round budget exhausted"));
+        let snapshot = fixture.snapshot();
+        let dispatch = ticket_runtime::read_dispatch(&stopped).unwrap().unwrap();
+        let assignment = &snapshot.assignments[&dispatch.assignment_id];
+        assert!(assignment.process_stopped);
+        assert_eq!(assignment.state, AssignmentState::Failed);
+        assert_eq!(snapshot.tickets[&queued_work].state, WorkState::Blocked);
+        assert!(snapshot.tickets[&queued_work].current_submission.is_none());
         fixture.assert_quiet(2 + MAX_ROUNDS as usize + 1).await;
         second.complete();
         fixture.wait_submitted(&fixture.works[first_index].id).await;
