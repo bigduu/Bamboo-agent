@@ -221,6 +221,7 @@ impl BudgetPort for FakeHost {
         }
         let reservation = Reservation {
             operation: request.operation.clone(),
+            request: Box::new(request.clone()),
             receipt: "budget-receipt".into(),
         };
         self.durable.borrow_mut().charges.insert(
@@ -1171,4 +1172,41 @@ fn over_cap_usage_keeps_the_full_reservation_and_requests_host_reconciliation() 
         SupervisorReason::InvalidDiagnostic
     );
     assert_eq!(provider.submits.len(), 1);
+}
+
+#[test]
+fn orphan_reservation_cannot_authorize_changed_caps_model_input_or_deadline() {
+    for changed in 0..4 {
+        let patrol = configured();
+        let mut host = FakeHost::new();
+        let mut provider = ControlledProvider::new(&host);
+        tick(&patrol, &mut host, &mut provider, 100);
+        host.fail_save = Some(host.durable.borrow().save_count + 1);
+        assert!(patrol
+            .tick(&scope(), &FakeClock(100), &mut host, &mut provider)
+            .is_err());
+        assert_eq!(host.usage(), 120);
+        assert!(provider.submits.is_empty());
+        host.fail_save = None;
+        let mut changed_model = model();
+        let mut now = 100;
+        match changed {
+            0 => changed_model.max_input_tokens = 200,
+            1 => changed_model.model = "different-model".into(),
+            2 => host.input_bytes = 33,
+            _ => now = 101,
+        }
+        provider.identity = changed_model.clone();
+        let restarted = Patrol::new(policy(), Some(changed_model)).unwrap();
+        tick(&restarted, &mut host, &mut provider, now);
+        assert_eq!(host.incident().phase, Phase::Blocked(Block::UnknownUsage));
+        assert_eq!(host.incident().attempts, 1);
+        assert_eq!(
+            host.incident().escalation.unwrap().reason,
+            SupervisorReason::ReconcileReceipt
+        );
+        assert!(provider.submits.is_empty());
+        assert_eq!(host.usage(), 120);
+        assert_eq!(host.durable.borrow().charges.len(), 1);
+    }
 }

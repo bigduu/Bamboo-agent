@@ -177,6 +177,9 @@ pub enum BudgetBlock {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reservation {
     pub operation: OperationId,
+    /// Exact immutable request authorized by the ledger. A CAS failure followed
+    /// by a changed model/cap/input must not repurpose the old reservation.
+    pub request: Box<DiagnosticRequest>,
     pub receipt: String,
 }
 
@@ -192,7 +195,9 @@ pub enum Usage {
 /// No wallet in patrol: this port uses the authoritative cumulative Work ledger.
 /// Reserve atomically checks Work + defined daily window + total execution limits,
 /// charging the request's hard input/output caps before any provider submission.
-/// Reserve/settle are idempotent by operation. Unknown usage, cancellation or a
+/// Reserve/settle are idempotent by operation AND immutable request. A changed
+/// request for an existing operation must be refused, retaining its old charge.
+/// Unknown usage, cancellation or a
 /// crash retains the reservation; it must never become free retry credit. Prices
 /// and amounts are not inferred from rounds or these token ceilings.
 pub trait BudgetPort {
@@ -744,9 +749,21 @@ impl Patrol {
         };
         match host.reserve(&request) {
             Ok(reservation)
-                if reservation.operation == request.operation && valid_id(&reservation.receipt) =>
+                if reservation.operation == request.operation
+                    && reservation.request.operation == reservation.operation
+                    && reservation.request.input.scope == o.scope
+                    && valid_id(&reservation.receipt) =>
             {
                 incident.attempts += 1;
+                if reservation.request.as_ref() != &request {
+                    // A pre-checkpoint crash can leave an orphan reservation.
+                    // Retain its charge and reconcile it, never reuse its token
+                    // ceiling/model/input for this now-different request.
+                    settle_usage(incident, &reservation, Usage::Unknown, host);
+                    incident.phase = Phase::Blocked(Block::UnknownUsage);
+                    escalate(incident, SupervisorReason::ReconcileReceipt, o, now);
+                    return Ok(());
+                }
                 incident.last_diagnostic_evidence_revision = Some(o.evidence_revision);
                 incident.pending_settlement = Some(reservation.clone());
                 incident.phase = Phase::Diagnosing {
@@ -814,7 +831,9 @@ impl Patrol {
                     escalate(incident, SupervisorReason::BudgetBlocked, o, now);
                     return Ok(());
                 }
-                let valid = diagnosis.note.len() <= 4096
+                let valid = !diagnosis.note.is_empty()
+                    && diagnosis.note.len() <= 4096
+                    && !diagnosis.evidence.is_empty()
                     && diagnosis.evidence.len() <= request.model.max_evidence_refs
                     && diagnosis
                         .evidence
@@ -914,9 +933,11 @@ fn validate_checkpoint(cp: &Checkpoint, scope: &Scope) -> Result<(), Error> {
         || i.last_diagnostic_cursor > cp.cursor
         || i.last_diagnostic_evidence_revision
             .is_some_and(|r| r > cp.source_revision)
-        || i.pending_settlement
-            .as_ref()
-            .is_some_and(|r| !diagnostic_operation(&r.operation) || !valid_id(&r.receipt))
+        || i.pending_settlement.as_ref().is_some_and(|r| {
+            !diagnostic_operation(&r.operation)
+                || r.request.operation != r.operation
+                || !valid_id(&r.receipt)
+        })
         || i.last_diagnosis.as_ref().is_some_and(|r| {
             !diagnostic_operation(&r.operation)
                 || r.source_revision > cp.source_revision
@@ -942,6 +963,7 @@ fn validate_checkpoint(cp: &Checkpoint, scope: &Scope) -> Result<(), Error> {
             || request.operation.incident != i.id
             || request.operation.kind != OperationKind::Diagnostic(i.attempts)
             || reservation.operation != request.operation
+            || reservation.request.as_ref() != request.as_ref()
             || !valid_id(&reservation.receipt)
             || request.input.scope != *scope
             || request.input.source_revision > cp.source_revision
