@@ -753,9 +753,20 @@ async fn queued_child_keeps_host_round_ceiling_after_global_budget_is_relaxed() 
             .unwrap();
         // Each pass commits at most one Start. The real native backend has only
         // two concurrent slots, so the third durable Child remains queued.
-        for _ in 0..3 {
-            fixture.state.tickets.reconcile_ready_work().await.unwrap();
-        }
+        tokio::time::timeout(WAIT, async {
+            while fixture.snapshot().assignments.len() < 3 {
+                match fixture.state.tickets.reconcile_ready_work().await {
+                    Ok(_) | Err(bamboo_tickets::Error::RevisionConflict) => {}
+                    Err(error) => panic!("queued admission failed: {error}"),
+                }
+                // Runtime admission can advance the same scope while a Host
+                // pass is checking eligibility. A CAS loss needs a full fresh
+                // read and selection, just as the managed reconciler performs.
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("three exact Start receipts survive concurrent runtime ACKs");
         let first = fixture.next_request().await;
         let second = fixture.next_request().await;
         let first_index = (0..2).find(|index| first.is_work(*index)).unwrap();
