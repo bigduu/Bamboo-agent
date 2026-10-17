@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict")
+const { createHash } = require("node:crypto")
 const { mkdtempSync, readFileSync, rmSync, writeFileSync } = require("node:fs")
 const { spawnSync } = require("node:child_process")
 const os = require("node:os")
@@ -1002,5 +1003,108 @@ test("frontend acceptance final guards inspect actual HEAD, index and untracked 
   } finally {
     rmSync(directory, { recursive: true, force: true })
     rmSync(statusTools, { recursive: true, force: true })
+  }
+})
+
+const actorWindowsWorkflow = readFileSync(".github/workflows/actor-snapshot-windows.yml", "utf8")
+const actorWindowsController = readFileSync("scripts/actor-windows-native.ps1", "utf8")
+const actorWindowsControllerTests = readFileSync("scripts/actor-windows-native.test.ps1", "utf8")
+const actorWindowsStep = (source, name) => {
+  const marker = `      - name: ${name}\n`
+  const start = source.indexOf(marker)
+  assert.notEqual(start, -1, `missing native Windows step: ${name}`)
+  const end = source.indexOf("\n      - ", start + marker.length)
+  return source.slice(start, end === -1 ? undefined : end)
+}
+const actorWindowsCompileName = "Compile and verify all 41 selected native tests"
+const actorWindowsRunName = "Execute 9 snapshot, 3 gateway, 19 directory, 5 scoped and 5 initial process tests"
+
+const assertActorWindowsAcceptance = (source) => {
+  const compile = actorWindowsStep(source, actorWindowsCompileName)
+  const runtime = actorWindowsStep(source, actorWindowsRunName)
+  const groups = [...compile.matchAll(/Assert-TestList '([^']+)' '([^']+)' @\(([\s\S]*?)\n\s*\) '([^']+)'/gu)]
+    .map(([, packageName, filter, body, log]) => ({
+      package: packageName, filter,
+      names: [...body.matchAll(/^\s*'([^']+)'\s*$/gmu)].map(([, name]) => name), log,
+    }))
+  // The exact original EF29 selection, including every name and its scope.
+  assert.equal(createHash("sha256").update(JSON.stringify(groups)).digest("hex"),
+    "b825cd60aa10b69ce33bcb0d92fff7e9c37878d3375f8008834b7e496c90fd52")
+  assert.deepEqual(groups.map(({ names }) => names.length), [9, 3, 19, 5, 5])
+  const runs = [...runtime.matchAll(/Assert-TestRun '([^']+)' '([^']+)' ([0-9]+) '([^']+)'/gu)]
+    .map(([, packageName, filter, count]) => ({ package: packageName, filter, count: Number(count) }))
+  assert.deepEqual(runs, groups.map(({ package: packageName, filter, names }) => ({
+    package: packageName, filter, count: names.length,
+  })))
+  assert.match(compile, /timeout-minutes: 20\n/u)
+  assert.match(runtime, /timeout-minutes: 5\n/u)
+  assert.doesNotMatch(runtime, /(?:&\s*|run:\s*)cargo\b/iu)
+  assert.match(compile, /Save-ActorNativeManifest \$nativeContext/u)
+  assert.match(runtime, /Read-ActorNativeManifest \$evidence/u)
+  assert.match(runtime, /Assert-ActorNativeRun \$nativeContext \$package \$filter \$expectedCount \$logName/u)
+}
+
+test("native Windows retains the exact 41-case selection and original runtime budget", () => {
+  assertActorWindowsAcceptance(actorWindowsWorkflow)
+  assert.match(actorWindowsWorkflow, /runs-on: windows-2025\n    timeout-minutes: 30\n/u)
+  assert.match(actorWindowsWorkflow, /contents: read/u)
+  assert.match(actorWindowsWorkflow, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
+  assert.match(actorWindowsWorkflow, /RUST_MIN_STACK: '8388608'/u)
+  assert.match(actorWindowsWorkflow, /toolchain: 1\.99\.0-x86_64-pc-windows-msvc/u)
+  assert.match(actorWindowsWorkflow, /RUNNER_OS -ne 'Windows'.*RUNNER_ARCH -ne 'X64'/u)
+  assert.match(actorWindowsWorkflow, /mklink \/J/u)
+  assert.match(actorWindowsWorkflow, /\$junction\.LinkType -ne 'Junction'/u)
+  assert.match(actorWindowsWorkflow, /fsutil reparsepoint query/u)
+  assert.match(actorWindowsWorkflow, /'host: x86_64-pc-windows-msvc'/u)
+  assert.match(actorWindowsWorkflow, /'release: 1\.99\.0'/u)
+  assert.match(actorWindowsWorkflow, /Retain native Windows evidence even on failure\n        if: always\(\)/u)
+  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
+    "'background_scope_drain'", "'missing_original_case'")), "dropping or replacing a case must fail")
+  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
+    "timeout-minutes: 5\n", "timeout-minutes: 15\n")), "the runtime budget must not expand")
+  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
+    "$nativeContext = Read-ActorNativeManifest $evidence",
+    "$nativeContext = Read-ActorNativeManifest $evidence\n          & cargo test --locked")),
+  "runtime must not re-enter Cargo")
+})
+
+test("native Windows runs source-bound immutable artifacts and preserves process failures", () => {
+  const functionBody = (name) => {
+    const marker = `function ${name}(`
+    const start = actorWindowsController.indexOf(marker)
+    assert.notEqual(start, -1)
+    const end = actorWindowsController.indexOf("\nfunction ", start + marker.length)
+    return actorWindowsController.slice(start, end === -1 ? undefined : end)
+  }
+  const build = functionBody("Get-ActorNativeBinary")
+  assert.match(build, /cargo test --locked -p \$Package --lib --no-run --message-format=json-render-diagnostics/u)
+  assert.match(build, /\$Context\.packages\.ContainsKey\(\$Package\)/u)
+  assert.match(build, /'build-finished'/u)
+  assert.match(build, /\$units\.Count -ne 1/u)
+  assert.match(build, /\[IO\.File\]::Copy\(\$executable, \$snapshot, \$false\)/u)
+  for (const name of ["Invoke-ActorNativeProcess", "Assert-ActorNativeRun"]) {
+    assert.doesNotMatch(functionBody(name), /&\s*cargo\b|cargo\s+test/iu)
+  }
+  const invoke = functionBody("Invoke-ActorNativeProcess")
+  assert.ok(invoke.indexOf("Assert-ActorNativeArtifact") < invoke.indexOf("& $Invoker"))
+  assert.match(invoke, /& \$Executable @NativeArguments/u)
+  assert.match(invoke, /\$code = \$LASTEXITCODE/u)
+  assert.match(invoke, /\$result\.ExitCode -isnot \[int\] -or \$result\.ExitCode -ne 0/u)
+  assert.match(invoke, /Push-Location -LiteralPath \$Record\.workingDirectory/u)
+  assert.match(invoke, /\$env:CARGO_MANIFEST_DIR = \$Record\.workingDirectory/u)
+  assert.match(invoke, /finally \{\s*Pop-Location/u)
+  const artifact = functionBody("Assert-ActorNativeArtifact")
+  assert.match(artifact, /\$identity\.revision -cne \$Context\.revision/u)
+  assert.match(artifact, /\$identity\.tree -cne \$Context\.tree/u)
+  assert.match(artifact, /Get-FileHash -LiteralPath \$snapshot -Algorithm SHA256/u)
+  assert.match(artifact, /FileAttributes\]::ReparsePoint/u)
+  assert.match(functionBody("Get-ActorNativeIdentity"), /status --porcelain --untracked-files=all/u)
+  assert.match(functionBody("Assert-ActorNativeRun"), /0 failed; 0 ignored/u)
+  const fixture = actorWindowsStep(actorWindowsWorkflow, "Test native executable controller guards")
+  assert.match(fixture, /run: \.\/scripts\/actor-windows-native\.test\.ps1/u)
+  for (const failure of ["nonzero.*23", "counts did not prove", "no exit-code result",
+    "selection differs", "Selected tests differ", "executable is missing, replaced or changed",
+    "outside its owned directory", "source changed", "all five scopes and all 41 tests"]) {
+    assert.ok(actorWindowsControllerTests.includes(`'${failure}'`), `missing controller failure fixture: ${failure}`)
   }
 })
