@@ -66,6 +66,10 @@ struct Fixture {
 impl Fixture {
     async fn new(count: usize) -> Self {
         let directory = tempfile::tempdir().unwrap();
+        Self::new_in(count, directory).await
+    }
+
+    async fn new_in(count: usize, directory: tempfile::TempDir) -> Self {
         let skills = directory.path().join("skills");
         for index in 0..count {
             let id = format!("catalog-{index}");
@@ -1969,7 +1973,28 @@ impl Fixture {
 #[tokio::test]
 async fn skill_factory_unappended_user_preserves_message_and_existing_reader_predicate() {
     use bamboo_domain::{ImageUrlRef, MessagePart};
-    let fixture = Fixture::new(2).await;
+    let directory = tempfile::Builder::new()
+        .prefix("authorized-aux-path-")
+        .tempdir()
+        .unwrap();
+    let fixture = Fixture::new_in(2, directory).await;
+    let auxiliary_canaries = [
+        "BAMBOO_PREAPPEND_RAW_CANARY_CATALOG_0_98C2E1",
+        "BAMBOO_PREAPPEND_RAW_CANARY_CATALOG_1_98C2E1",
+    ];
+    let mut auxiliary_raw = Vec::new();
+    for (index, canary) in auxiliary_canaries.iter().enumerate() {
+        let path = fixture
+            ._directory
+            .path()
+            .join("skills")
+            .join(format!("catalog-{index}"))
+            .join("references/raw.txt");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{canary}\n{raw}")).unwrap();
+        auxiliary_raw.push(raw);
+    }
+    fixture.manager.store().reload().await.unwrap();
     let (mut user, selections) = fixture.fresh_input(&["catalog-0", "catalog-1"]).await;
     user.content_parts = Some(vec![
         MessagePart::Text {
@@ -2007,6 +2032,7 @@ async fn skill_factory_unappended_user_preserves_message_and_existing_reader_pre
     assert!(prepared.message.content.starts_with(&user.content));
     assert!(prepared.message.content.contains("PRIVATE BODY catalog-0"));
     assert!(prepared.message.content.contains("PRIVATE BODY catalog-1"));
+    assert!(prepared.message.content.contains("authorized-aux-path-"));
     assert!(!prepared.message.content.contains("aux"));
     let parts = prepared.message.content_parts.as_ref().unwrap();
     assert!(matches!(&parts[0], MessagePart::Text { text } if text == &prepared.message.content));
