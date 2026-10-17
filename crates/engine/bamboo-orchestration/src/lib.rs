@@ -4,6 +4,8 @@
 //! owns selection and wake/retry state only; the Host checks current eligibility
 //! and dispatches through its existing worker runtime. No model, broker, lease,
 //! persistence store or recovered execution grant is introduced here.
+pub mod patrol;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
