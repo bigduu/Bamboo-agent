@@ -1,5 +1,6 @@
 //! Trusted-host application service. No model, network or Worker runs under its lock.
 //! This store owns contracts, not Session transcripts or Jiandu memory.
+mod claiming;
 mod file_reconciliation;
 mod migration;
 mod model;
@@ -11,6 +12,7 @@ mod sprint;
 pub mod store;
 mod workspace_files;
 
+pub use claiming::*;
 pub use file_reconciliation::*;
 pub use migration::*;
 pub use model::*;
