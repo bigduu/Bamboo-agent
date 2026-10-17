@@ -2033,8 +2033,29 @@ async fn skill_factory_unappended_user_preserves_message_and_existing_reader_pre
     assert!(prepared.message.content.contains("PRIVATE BODY catalog-0"));
     assert!(prepared.message.content.contains("PRIVATE BODY catalog-1"));
     assert!(prepared.message.content.contains("authorized-aux-path-"));
-    assert!(!prepared.message.content.contains("aux"));
+    // An authorized source path may contain "aux"; reject actual resource content.
+    let assert_auxiliary_absent = |text: &str| {
+        assert!(
+            !text.contains("界🦀\r\n\0\"\\aux"),
+            "raw auxiliary block was preappended"
+        );
+        for canary in &auxiliary_canaries {
+            assert!(!text.contains(*canary), "auxiliary canary was preappended");
+        }
+        for raw in &auxiliary_raw {
+            assert!(
+                !text.contains(raw.as_str()),
+                "raw auxiliary content was preappended"
+            );
+        }
+    };
+    assert_auxiliary_absent(&prepared.message.content);
     let parts = prepared.message.content_parts.as_ref().unwrap();
+    for part in parts {
+        if let MessagePart::Text { text } = part {
+            assert_auxiliary_absent(text);
+        }
+    }
     assert!(matches!(&parts[0], MessagePart::Text { text } if text == &prepared.message.content));
     assert_eq!(&parts[1..], &user.content_parts.as_ref().unwrap()[1..]);
     assert_eq!(serde_json::to_value(&user).unwrap(), original);
