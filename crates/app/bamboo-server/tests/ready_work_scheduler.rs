@@ -143,7 +143,7 @@ impl LLMProvider for ControlledProvider {
 }
 
 async fn wait_native_terminal(state: &AppState, child_id: &str) -> Session {
-    tokio::time::timeout(WAIT, async {
+    let terminal = tokio::time::timeout(WAIT, async {
         loop {
             let child = state.storage.load_session(child_id).await.unwrap().unwrap();
             let stopped = child
@@ -170,8 +170,34 @@ async fn wait_native_terminal(state: &AppState, child_id: &str) -> Session {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("round ceiling terminates and joins the native Child")
+    .await;
+    match terminal {
+        Ok(child) => child,
+        Err(_) => {
+            let child = state.storage.load_session(child_id).await.unwrap().unwrap();
+            let runner = state
+                .agent_runners
+                .read()
+                .await
+                .get(child_id)
+                .map(|runner| format!("{:?}", runner.status));
+            let logical_run = state
+                .session_activation_router
+                .current_run_id(child_id)
+                .await;
+            let dispatch = ticket_runtime::read_dispatch(&child).unwrap().unwrap();
+            let (_, snapshot) = state.tickets.service().unwrap().published().unwrap();
+            let observations = child
+                .metadata
+                .iter()
+                .filter(|(key, _)| key.starts_with("runtime.") || key.starts_with("last_run"))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            panic!(
+                "round ceiling did not reach terminal observation: metadata={:?}, runner={runner:?}, logical_run={logical_run:?}, assignment={:?}",
+                observations, snapshot.assignments[&dispatch.assignment_id]
+            );
+        }
+    }
 }
 
 struct Work {
@@ -295,8 +321,12 @@ impl Fixture {
             HashMap::from([(PROVIDER.into(), provider.clone() as Arc<dyn LLMProvider>)]),
             PROVIDER.into(),
         ));
-        assert!(state.embedded_broker.is_none());
-        assert!(state.health_monitor.is_none());
+        {
+            let assembled_config = state.config.read().await;
+            assert!(assembled_config.subagents().broker.is_none());
+            assert!(assembled_config.cluster_fabric.nodes.is_empty());
+        }
+        assert!(!root.path().join("broker").exists());
         let mut manifest = state
             .project_store
             .create("Ready Work fixture", None)
@@ -723,9 +753,20 @@ async fn queued_child_keeps_host_round_ceiling_after_global_budget_is_relaxed() 
             .unwrap();
         // Each pass commits at most one Start. The real native backend has only
         // two concurrent slots, so the third durable Child remains queued.
-        for _ in 0..3 {
-            fixture.state.tickets.reconcile_ready_work().await.unwrap();
-        }
+        tokio::time::timeout(WAIT, async {
+            while fixture.snapshot().assignments.len() < 3 {
+                match fixture.state.tickets.reconcile_ready_work().await {
+                    Ok(_) | Err(bamboo_tickets::Error::RevisionConflict) => {}
+                    Err(error) => panic!("queued admission failed: {error}"),
+                }
+                // Runtime admission can advance the same scope while a Host
+                // pass is checking eligibility. A CAS loss needs a full fresh
+                // read and selection, just as the managed reconciler performs.
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("three exact Start receipts survive concurrent runtime ACKs");
         let first = fixture.next_request().await;
         let second = fixture.next_request().await;
         let first_index = (0..2).find(|index| first.is_work(*index)).unwrap();
@@ -826,6 +867,18 @@ async fn queued_child_keeps_host_round_ceiling_after_global_budget_is_relaxed() 
                 .map(String::as_str),
             Some("max_rounds_reached")
         );
+        assert_eq!(stopped.last_run_status().as_deref(), Some("error"));
+        assert!(stopped
+            .last_run_error()
+            .unwrap()
+            .contains("Ticket run round budget exhausted"));
+        let snapshot = fixture.snapshot();
+        let dispatch = ticket_runtime::read_dispatch(&stopped).unwrap().unwrap();
+        let assignment = &snapshot.assignments[&dispatch.assignment_id];
+        assert!(assignment.process_stopped);
+        assert_eq!(assignment.state, AssignmentState::Failed);
+        assert_eq!(snapshot.tickets[&queued_work].state, WorkState::Blocked);
+        assert!(snapshot.tickets[&queued_work].current_submission.is_none());
         fixture.assert_quiet(2 + MAX_ROUNDS as usize + 1).await;
         second.complete();
         fixture.wait_submitted(&fixture.works[first_index].id).await;

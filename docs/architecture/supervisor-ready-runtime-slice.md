@@ -62,6 +62,10 @@ Child's `TicketDispatchBinding.max_rounds` and carried into the native
 lose its cap when global config is later relaxed or when the same key is retried.
 The existing round limit permits one final summary turn. Rounds are neither a
 precise token allowance nor a financial budget.
+An exhausted Host-limited Ticket follows the existing budget-error delivery
+path after its owned task and resources stop. Its Assignment becomes failed and
+the Work blocked; a summary or more tool calls cannot masquerade as a completed
+Submission. The same logical run must finish delivery before activation is released.
 
 ## Boundaries still open
 

@@ -851,7 +851,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         *handle = Some(task);
         let joined = handle.as_mut().expect("owned task").await;
         handle.take();
-        let output = joined.map_err(|error| failure(format!("Agent task join failed: {error}")))?;
+        let mut output = joined.map_err(|error| failure(format!("Agent task join failed: {error}")))?;
         *session = output.session;
         let drained = output
             .resources
@@ -870,6 +870,18 @@ impl ExternalChildRunner for LocalTaskChildRunner {
             instance_id: identity.owner_id,
         };
         record_stop_metadata(session, &proof);
+        // A Host-limited Ticket which exhausted its rounds did not complete
+        // its contract. Preserve the real stop proof, then use the existing
+        // failure delivery path instead of attempting a success Submission
+        // from a summary turn which may contain only more tool calls.
+        if output.result.is_ok()
+            && session.metadata.get("runtime.completion_reason").map(String::as_str)
+                == Some("max_rounds_reached")
+            && crate::ticket_runtime::read_dispatch(session).map_err(failure)?
+                .is_some_and(|dispatch| dispatch.max_rounds.is_some())
+        {
+            output.result = Err(AgentError::Budget("Ticket run round budget exhausted".into()));
+        }
         if session.metadata.get(bamboo_subagent::proto::WORKFLOW_USAGE_REQUESTED_KEY).is_some_and(|v|v == "true") {
             if let Some(runtime) = session.agent_runtime_state.as_ref().filter(|runtime|runtime.run_id == run_id) {
                 let usage = bamboo_subagent::proto::WorkflowAgentUsage { kind: bamboo_subagent::proto::WorkflowAgentUsage::TYPE.into(), activation_run_id: run_id.clone(), child_session_id: session.id.clone(), child_created_at: session.created_at, prompt_tokens: runtime.round.total_prompt_tokens, completion_tokens: runtime.round.total_completion_tokens };

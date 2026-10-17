@@ -21,6 +21,76 @@ fn run_git(repo: &Path, args: &[&str]) {
 }
 
 #[actix_web::test]
+async fn inventory_diagnostics_keep_the_success_contract_separate_from_http_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let repo = base.join("not-yet-a-repository");
+    fs::create_dir(&repo).unwrap();
+    let state = web::Data::new(AppState::new(base.join("data")).await.unwrap());
+    let project = state
+        .project_store
+        .create_with_project_path("Inventory", None, repo.to_str().unwrap(), vec![])
+        .unwrap();
+    let uri = format!("/projects/{}/worktrees", project.id);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .route("/projects/{project_id}/worktrees", web::get().to(list)),
+    )
+    .await;
+
+    let response = test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+    assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+    let body: Value = test::read_body_json(response).await;
+    assert_eq!(body["project_id"], project.id.to_string());
+    let inventory = &body["repositories"][0];
+    assert_eq!(inventory["path"], repo.to_str().unwrap());
+    assert!(!inventory["error"].as_str().unwrap().is_empty());
+    assert_eq!(inventory["worktrees"].as_array().unwrap().len(), 0);
+    assert!(inventory.get("common_dir").is_none());
+    assert!(!repo.join(".git").exists());
+
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    let response = test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+    assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+    let body: Value = test::read_body_json(response).await;
+    let inventory = &body["repositories"][0];
+    assert!(inventory["common_dir"].is_string());
+    assert!(inventory["error"].is_null());
+    let checkout = &inventory["worktrees"][0];
+    assert_eq!(checkout["path"], repo.to_str().unwrap());
+    assert_eq!(checkout["path_encoding"], "utf-8");
+    assert_eq!(checkout["branch"], "main");
+    assert_eq!(checkout["head"].as_str().unwrap().len(), 40);
+    assert!(checkout["error"].is_null());
+    assert_eq!(checkout["dirty"], false);
+    assert_eq!(checkout["occupied"], false);
+    assert!(checkout["sessions"].as_array().unwrap().is_empty());
+
+    let missing = format!("/projects/{}/worktrees", uuid::Uuid::new_v4());
+    let response =
+        test::call_service(&app, test::TestRequest::get().uri(&missing).to_request()).await;
+    assert_eq!(response.status(), actix_web::http::StatusCode::NOT_FOUND);
+    let body: Value = test::read_body_json(response).await;
+    assert_eq!(body["error"]["type"], "api_error");
+    assert!(!body["error"]["message"].as_str().unwrap().is_empty());
+    state.shutdown().await;
+}
+
+#[actix_web::test]
 async fn directory_preferences_native_create_discovery_and_session_association_round_trip() {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path().canonicalize().unwrap();
