@@ -120,6 +120,8 @@ pub(super) struct ToolExecutionOnlyContext<'a> {
 }
 
 pub(super) struct ToolExecutionApplyContext<'a> {
+    pub policy_guard: &'a mut policy::ToolPolicyGuard,
+    pub admitted_execution_name: Option<&'a str>,
     pub tool_call: &'a ToolCall,
     pub event_tx: &'a mpsc::Sender<AgentEvent>,
     pub metrics_collector: Option<&'a MetricsCollector>,
@@ -191,6 +193,8 @@ pub(super) struct ToolExecutionOutcome {
     /// error). Pre-dispatch blocks, `Running`, and `NeedsHuman` do not represent
     /// a completed tool and must not fire `PostToolUse`.
     pub post_tool_hook_eligible: bool,
+    /// Host-only typed fault; never inferred from a model/tool result string.
+    pub managed_running_violation: bool,
     pub tool_duration: std::time::Duration,
 }
 
@@ -296,18 +300,11 @@ pub(super) async fn execute_model_requested_tool_call_only(
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: false,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::ZERO,
         });
     };
 
-    if execution_name == "ViewImage" && !ctx.vision_support {
-        return Ok(ToolExecutionOutcome {
-            output_cap: None, permission_replay_origin: None,
-            result: Err("ViewImage is unavailable: the current model does not support Vision. Select a Vision-capable model or enable supports_vision for this model in provider settings. No image was read or sent.".into()),
-            needs_human: None, portable_tool: None, post_tool_hook_eligible: false,
-            tool_duration: std::time::Duration::ZERO,
-        });
-    }
     execute_tool_call_only_with_execution_name(&execution_name, ctx).await
 }
 
@@ -321,18 +318,54 @@ pub(super) async fn execute_tool_call_only(
 
 async fn execute_tool_call_only_with_execution_name(
     execution_name: &str,
+    ctx: ToolExecutionOnlyContext<'_>,
+) -> Result<ToolExecutionOutcome, AgentError> {
+    let noninteractive = crate::runtime::loop_control::suspension::active(ctx.config);
+    let control = ctx.config.loop_control.as_ref();
+    let dispatch = execute_tool_call_only_with_execution_name_inner(execution_name, ctx);
+    if let Some(control) = control {
+        let (outcome, observation) =
+            bamboo_agent_core::tools::observe_tool_suspension(noninteractive, dispatch).await;
+        if observation.running_seen {
+            control.record_running_observed();
+        }
+        let mut outcome = outcome?;
+        if observation.forbidden_running_seen {
+            if let Some(resources) = bamboo_tools::LocalTaskResources::current() {
+                resources
+                    .record_unconfirmed(crate::runtime::loop_control::suspension::RUNNING_REFUSAL);
+            }
+            outcome.result = Err(crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into());
+            outcome.needs_human = None;
+            outcome.post_tool_hook_eligible = false;
+            outcome.managed_running_violation = true;
+        }
+        Ok(outcome)
+    } else {
+        dispatch.await
+    }
+}
+
+async fn execute_tool_call_only_with_execution_name_inner(
+    execution_name: &str,
     mut ctx: ToolExecutionOnlyContext<'_>,
 ) -> Result<ToolExecutionOutcome, AgentError> {
     // Recheck the resolved exact executor identity even if the provider cites a
     // stale schema or the round's EffectiveCallableSet predates live tightening.
     // Reject before ToolStart, hooks, replay handling, and executor entry.
-    if ctx.root_orchestration_only
-        && !bamboo_domain::orchestration_only_allows_execution_name_for_supervisor(
-            execution_name,
-            ctx.executing_supervisor.is_some()
-                && ctx.session_id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
-                && ctx.root_session_id == ctx.session_id,
-        )
+    let executing_supervisor = ctx.executing_supervisor.is_some()
+        && ctx.session_id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
+        && ctx.root_session_id == ctx.session_id;
+    // Filtering a registered exact identity out of the model catalog must
+    // not turn its spelling into a compatibility alias for another owner.
+    let reference = ctx.tool_call.function.name.trim();
+    let exact_owner_shadowed = reference != execution_name && ctx.tools.owns_exact_tool(reference);
+    if (ctx.root_orchestration_only || executing_supervisor)
+        && (exact_owner_shadowed
+            || !bamboo_domain::orchestration_only_allows_execution_name_for_supervisor(
+                execution_name,
+                executing_supervisor,
+            ))
     {
         tracing::warn!(
             "[{}][round:{}] Tool call rejected by Root authority before ToolStart: tool_call_id={}, tool_name={}, execution_name={}",
@@ -348,10 +381,15 @@ async fn execute_tool_call_only_with_execution_name(
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: false,
-            result: Err(format!(
-                "Tool '{}' is outside orchestration-only Root authority",
-                ctx.tool_call.function.name
-            )),
+            managed_running_violation: false,
+            result: Err(if executing_supervisor {
+                format!("supervisor_delegation_required: Tool '{}' is outside Supervisor orchestration authority. Delegate execution to an authorized worker. If unavailable or denied, report the actual recoverable blocker; do not self-execute or retry unchanged delegation indefinitely.", ctx.tool_call.function.name)
+            } else {
+                format!(
+                    "Tool '{}' is outside orchestration-only Root authority",
+                    ctx.tool_call.function.name
+                )
+            }),
             tool_duration: std::time::Duration::ZERO,
         });
     }
@@ -373,10 +411,31 @@ async fn execute_tool_call_only_with_execution_name(
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: false,
+            managed_running_violation: false,
             result: Err(policy_error),
             tool_duration: std::time::Duration::ZERO,
         });
     }
+
+    let vision_target = if execution_name == "ViewImage" && !ctx.vision_support {
+        match crate::runtime::runner::image_fallback::resolve_vision_target(ctx.config).await {
+            Ok(target) => Some(target),
+            Err(error) => {
+                return Ok(ToolExecutionOutcome {
+                    output_cap: None,
+                    permission_replay_origin: None,
+                    result: Err(error.to_string()),
+                    needs_human: None,
+                    portable_tool: None,
+                    post_tool_hook_eligible: false,
+                    managed_running_violation: false,
+                    tool_duration: std::time::Duration::ZERO,
+                })
+            }
+        }
+    } else {
+        None
+    };
 
     let raw_arguments = ctx.tool_call.function.arguments.trim();
     let (args, parse_warning) = parse_tool_args_best_effort(&ctx.tool_call.function.arguments);
@@ -460,6 +519,7 @@ async fn execute_tool_call_only_with_execution_name(
                 needs_human: None,
                 portable_tool: None,
                 post_tool_hook_eligible: false,
+                managed_running_violation: false,
                 tool_duration: tool_timer.elapsed(),
             });
         };
@@ -506,6 +566,7 @@ async fn execute_tool_call_only_with_execution_name(
                     needs_human: None,
                     portable_tool: None,
                     post_tool_hook_eligible: false,
+                    managed_running_violation: false,
                     tool_duration: elapsed,
                 });
             }
@@ -590,12 +651,17 @@ async fn execute_tool_call_only_with_execution_name(
         // `bash_resume_hook` AND persistence are both wired (issue #84, phase
         // 2d). On hook-less paths (e.g. the schedule loop) this is false, so the
         // auto path stays synchronous and never orphans a promoted shell.
-        ctx.config.bash_resume_hook.is_some() && ctx.config.persistence.is_some(),
+        bamboo_agent_core::tools::suspension_allowed()
+            && ctx.config.bash_resume_hook.is_some()
+            && ctx.config.persistence.is_some(),
         // Loop-facing background-Bash completion sink (issue #84 Phase 2b
         // follow-up). Threaded from the loop config so the Bash tool can push a
         // shell's result into this loop on completion. `None` on loops without
         // it wired, leaving the push inert (the poll backstop still runs).
-        ctx.config.bash_completion_sink.as_ref(),
+        ctx.config
+            .bash_completion_sink
+            .as_ref()
+            .filter(|_| bamboo_agent_core::tools::suspension_allowed()),
         // Reuse the args parsed above (for the `ToolStart` event) instead of
         // re-parsing the raw JSON string downstream in the executor (issue #106).
         // `args` came from `parse_tool_args_best_effort`, the same parser the
@@ -629,19 +695,51 @@ async fn execute_tool_call_only_with_execution_name(
         output_cap,
         dispatch,
     );
-    let (needs_human, result, post_tool_hook_eligible) =
-        match bamboo_tools::with_hook_permission_override(
+    let observation = bamboo_infrastructure::telemetry::Observation::tool(
+        execution_name,
+        &ctx.tool_call.id,
+        ctx.session_id,
+        ctx.round_id,
+    );
+    let observed_dispatch = observation
+        .scope(bamboo_tools::with_hook_permission_override(
             permission_override,
             &ctx.tool_call.id,
             dispatch,
-        )
+        ))
         .await
-        {
-            Ok(ToolOutcome::Completed(result)) => (None, Ok(result), true),
-            Ok(ToolOutcome::Running(handle)) => (None, Ok(handle.ack), false),
-            Ok(ToolOutcome::NeedsHuman { question, result }) => (Some(question), Ok(result), false),
-            Err(error) => (None, Err(error), true),
-        };
+        .map(ToolOutcome::enforce_suspension_restriction);
+    use bamboo_infrastructure::telemetry::Outcome as TraceOutcome;
+    let trace_outcome = match &observed_dispatch {
+        Ok(ToolOutcome::Completed(result)) if !result.success => TraceOutcome::ToolError,
+        Err(_) => TraceOutcome::ToolError,
+        _ => TraceOutcome::Success,
+    };
+    observation.finish(trace_outcome);
+    let (needs_human, mut result, post_tool_hook_eligible) = match observed_dispatch {
+        Ok(ToolOutcome::Completed(result)) => (None, Ok(result), true),
+        Ok(ToolOutcome::Running(handle)) => (None, Ok(handle.ack), false),
+        Ok(ToolOutcome::NeedsHuman { question, result }) => (Some(question), Ok(result), false),
+        Err(error) => (None, Err(error), true),
+    };
+
+    // Keep the auxiliary request inside the existing tool timeout/cancellation
+    // scope, after successful permission/file checks and before terminal events.
+    // Never spawn it into detached work or forward pixels to the main model.
+    if let Some(target) = vision_target {
+        if let Ok(tool_result) = result.as_mut() {
+            if tool_result.success && !tool_result.images.is_empty() {
+                if let Err(error) = crate::runtime::runner::image_fallback::describe_tool_images(
+                    &target,
+                    tool_result,
+                )
+                .await
+                {
+                    result = Err(bamboo_agent_core::ToolError::Execution(error.to_string()));
+                }
+            }
+        }
+    }
 
     let tool_duration = tool_timer.elapsed();
 
@@ -677,6 +775,7 @@ async fn execute_tool_call_only_with_execution_name(
         result: result.map_err(|error| error.to_string()),
         needs_human,
         post_tool_hook_eligible,
+        managed_running_violation: false,
         portable_tool: Some(PortableToolExecution {
             name: execution_name.to_owned(),
             input: args,
@@ -697,6 +796,17 @@ async fn hook_ask_outcome(
     runtime_state: &AgentRuntimeState,
     args: &serde_json::Value,
 ) -> Option<ToolExecutionOutcome> {
+    if !bamboo_agent_core::tools::suspension_allowed() {
+        return Some(ToolExecutionOutcome {
+            output_cap: None,
+            permission_replay_origin: None,
+            result: Err("managed loop cannot wait for hook approval; finish the loop before requesting interactive work".into()),
+            needs_human: None,
+            portable_tool: None,
+            post_tool_hook_eligible: false, managed_running_violation: false,
+            tool_duration: std::time::Duration::ZERO,
+        });
+    }
     let tool_name = tool_call.function.name.trim().to_string();
     let browser_execution = execution_name.trim().eq_ignore_ascii_case("browser");
     let focused_browser_input =
@@ -740,6 +850,7 @@ async fn hook_ask_outcome(
                 needs_human: None,
                 portable_tool: None,
                 post_tool_hook_eligible: false,
+                managed_running_violation: false,
                 tool_duration: std::time::Duration::ZERO,
             });
         }
@@ -753,6 +864,7 @@ async fn hook_ask_outcome(
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: false,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::ZERO,
         });
     }
@@ -840,6 +952,7 @@ async fn hook_ask_outcome(
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: false,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::ZERO,
         });
     }
@@ -854,6 +967,7 @@ async fn hook_ask_outcome(
         needs_human: None,
         portable_tool: None,
         post_tool_hook_eligible: false,
+        managed_running_violation: false,
         tool_duration: std::time::Duration::ZERO,
     })
 }
@@ -939,9 +1053,126 @@ fn append_post_tool_feedback(
     }
 }
 
+async fn apply_without_suspension<F>(apply: F) -> Result<bool, AgentError>
+where
+    F: std::future::Future<Output = Result<bool, AgentError>>,
+{
+    let (result, observation) =
+        bamboo_agent_core::tools::observe_tool_suspension(true, apply).await;
+    if observation.forbidden_running_seen {
+        if let Some(resources) = bamboo_tools::LocalTaskResources::current() {
+            resources.record_unconfirmed(crate::runtime::loop_control::suspension::RUNNING_REFUSAL);
+        }
+        result?;
+        return Err(AgentError::Tool(
+            crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into(),
+        ));
+    }
+    result
+}
+
 pub(super) async fn apply_tool_execution_outcome(
     ctx: ToolExecutionApplyContext<'_>,
+    outcome: ToolExecutionOutcome,
+) -> Result<bool, AgentError> {
+    let noninteractive = crate::runtime::loop_control::suspension::active(ctx.config);
+    let control = ctx.config.loop_control.as_ref();
+    let apply = apply_tool_execution_outcome_inner(ctx, outcome);
+    if let Some(control) = control {
+        let (result, observation) =
+            bamboo_agent_core::tools::observe_tool_suspension(noninteractive, apply).await;
+        if observation.running_seen {
+            control.record_running_observed();
+        }
+        if observation.forbidden_running_seen {
+            if let Some(resources) = bamboo_tools::LocalTaskResources::current() {
+                resources
+                    .record_unconfirmed(crate::runtime::loop_control::suspension::RUNNING_REFUSAL);
+            }
+            result?;
+            return Err(AgentError::Tool(
+                crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into(),
+            ));
+        }
+        result
+    } else {
+        apply.await
+    }
+}
+
+async fn apply_tool_execution_outcome_inner(
+    ctx: ToolExecutionApplyContext<'_>,
     mut outcome: ToolExecutionOutcome,
+) -> Result<bool, AgentError> {
+    // Normalize before post hooks, policy accounting or any question/wait write.
+    // An already checkpointed loop receipt never has a waiting result shape.
+    if !bamboo_agent_core::tools::suspension_allowed()
+        && (outcome.needs_human.is_some()
+            || outcome.result.as_ref().is_ok_and(|result| {
+                bamboo_agent_core::tools::tool_result_requires_suspension(result)
+                    || super::clarification::requires_suspension(ctx.tool_call, result)
+            }))
+    {
+        outcome.needs_human = None;
+        outcome.result = Err("managed loop cannot wait for a question, approval or child; finish or stop the loop before interactive work".into());
+        outcome.post_tool_hook_eligible = false;
+    }
+    // Capture the exact dispatch budget once, before owner projection or hooks.
+    let feedback_cap = outcome
+        .output_cap
+        .unwrap_or_else(|| {
+            ctx.session
+                .effective_token_budget()
+                .map(|budget| budget.max_tool_output_tokens)
+        })
+        .unwrap_or(0);
+    let mut loop_result_checkpointed = false;
+    if outcome.portable_tool.as_ref().is_some_and(|tool| {
+        tool.execution_name() == bamboo_tools::tools::loop_control::LOOP_CONTROL_TOOL_NAME
+    }) && outcome.result.as_ref().is_ok_and(|result| result.success)
+        && outcome.needs_human.is_none()
+    {
+        let command = bamboo_tools::tools::loop_control::parse_loop_control_request(
+            &ctx.tool_call.function.arguments,
+        )
+        .map_err(AgentError::Tool)?;
+        crate::runtime::runner::state_bridge::write_runtime_state(ctx.session, ctx.runtime_state);
+        let read_only = ctx.runtime_state.plan_mode.is_some()
+            || ctx.config.permission_mode == Some(bamboo_config::PermissionMode::Plan);
+        outcome.result = Ok(crate::runtime::loop_control::apply_current(
+            ctx.session,
+            ctx.config,
+            &command,
+            &ctx.tool_call.id,
+            ctx.round,
+            outcome.permission_replay_origin.is_some(),
+            read_only,
+            feedback_cap,
+        )
+        .await?);
+        loop_result_checkpointed = true;
+    }
+    // Start can install its generation during owner apply above. Re-enter
+    // the restriction now, before even its own native AfterTool hook runs.
+    let noninteractive = crate::runtime::loop_control::suspension::active(ctx.config);
+    let apply = apply_completed_tool_execution_outcome(
+        ctx,
+        outcome,
+        feedback_cap,
+        loop_result_checkpointed,
+    );
+    if noninteractive {
+        apply_without_suspension(apply).await
+    } else {
+        apply.await
+    }
+}
+
+async fn apply_completed_tool_execution_outcome(
+    ctx: ToolExecutionApplyContext<'_>,
+    mut outcome: ToolExecutionOutcome,
+    feedback_cap: u32,
+    loop_result_checkpointed: bool,
 ) -> Result<bool, AgentError> {
     let mut post_tool_feedback = Vec::new();
     let mut deferred_hook_control = None;
@@ -1021,29 +1252,48 @@ pub(super) async fn apply_tool_execution_outcome(
     // Read the shell envelope before post-hook feedback appends prose. Only
     // the admitted exact identity selects command-specific task accounting.
     let task_progress_result = task_progress_result_for_outcome(&outcome);
-    let feedback_cap = outcome
-        .output_cap
-        .unwrap_or_else(|| {
-            ctx.session
-                .effective_token_budget()
-                .map(|budget| budget.max_tool_output_tokens)
-        })
-        .unwrap_or(0);
-    append_post_tool_feedback(
-        &mut outcome.result,
-        post_tool_feedback,
-        outcome
-            .portable_tool
-            .as_ref()
-            .map(|tool| tool.execution_name()),
-        feedback_cap,
+    if loop_result_checkpointed {
+        let result = outcome.result.as_ref().expect("checkpointed owner result");
+        let feedback = crate::runtime::loop_control::output_limits::feedback_context(
+            result,
+            &ctx.tool_call.id,
+            post_tool_feedback,
+            feedback_cap,
+        );
+        crate::runtime::loop_control::finish_checkpointed_result(
+            ctx.session,
+            ctx.config,
+            &ctx.tool_call.id,
+            result,
+            ctx.runtime_state,
+            feedback,
+        )
+        .await?;
+    } else {
+        append_post_tool_feedback(
+            &mut outcome.result,
+            post_tool_feedback,
+            outcome
+                .portable_tool
+                .as_ref()
+                .map(|tool| tool.execution_name()),
+            feedback_cap,
+        );
+    }
+    // Exactly one common observation sees the final owner/compression result.
+    // Raw observation remains at dispatch, before compression and owner apply.
+    ctx.policy_guard.observe_execution_outcome(
+        ctx.tool_call,
+        &outcome,
+        ctx.admitted_execution_name,
     );
 
+    let running_violation = outcome.managed_running_violation;
     // Capture tool lifecycle metadata before the borrow-splitting match.
     let tool_name_for_meta = ctx.tool_call.function.name.clone();
     let tool_call_id_for_meta = ctx.tool_call.id.clone();
     let tool_duration_ms = outcome.tool_duration.as_millis() as u64;
-    let is_success = outcome.result.is_ok();
+    let is_success = outcome.result.as_ref().is_ok_and(|result| result.success);
 
     let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name_for_meta)
         == bamboo_tools::orchestrator::ToolMutability::Mutating;
@@ -1095,12 +1345,25 @@ pub(super) async fn apply_tool_execution_outcome(
     } else {
         match outcome.result {
             Ok(result) => {
-                let r = execution_paths::handle_successful_tool_result(
+                let loop_cancel = if loop_result_checkpointed {
+                    Some(
+                        ctx.config
+                            .loop_control
+                            .as_ref()
+                            .expect("checkpointed owner capability")
+                            .execution_cancel()?
+                            .clone(),
+                    )
+                } else {
+                    None
+                };
+                let apply_success = execution_paths::handle_successful_tool_result(
                     execution_paths::SuccessPathContext {
                         tool_call: ctx.tool_call,
                         permission_replay_origin: outcome.permission_replay_origin.as_ref(),
                         result: &result,
                         task_progress_result,
+                        loop_result_checkpointed,
                         event_tx: ctx.event_tx,
                         metrics_collector: ctx.metrics_collector,
                         session_id: ctx.session_id,
@@ -1114,9 +1377,18 @@ pub(super) async fn apply_tool_execution_outcome(
                         state: ctx.state,
                         tool_duration: outcome.tool_duration,
                     },
-                )
-                .await;
-                r
+                );
+                if let Some(cancel) = loop_cancel {
+                    // A blocked ToolComplete publisher must not outlive this
+                    // execution's cancellation. Ordinary tools keep their path.
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(AgentError::Cancelled),
+                        result = apply_success => result,
+                    }
+                } else {
+                    apply_success.await
+                }
             }
             Err(error_message) => {
                 execution_paths::handle_tool_execution_error(
@@ -1174,6 +1446,11 @@ pub(super) async fn apply_tool_execution_outcome(
         )?;
     }
 
+    if running_violation {
+        return Err(AgentError::Tool(
+            crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into(),
+        ));
+    }
     Ok(result)
 }
 
@@ -1254,6 +1531,7 @@ mod task_progress_tests {
                 source: bamboo_agent_core::PendingQuestionSource::PauseTool,
             }),
             post_tool_hook_eligible: true,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::ZERO,
         };
         let mut session = Session::new("shell-progress", "model");
@@ -1265,6 +1543,8 @@ mod task_progress_tests {
         let mut context = Some(task);
         apply_tool_execution_outcome(
             ToolExecutionApplyContext {
+                policy_guard: &mut policy::ToolPolicyGuard::default(),
+                admitted_execution_name: Some(execution_name),
                 tool_call: &call,
                 event_tx: &event_tx,
                 metrics_collector: None,
@@ -1509,6 +1789,8 @@ mod task_progress_tests {
             let mut task = Some(active_task(&[false, false]));
             apply_tool_execution_outcome(
                 ToolExecutionApplyContext {
+                    policy_guard: &mut policy::ToolPolicyGuard::default(),
+                    admitted_execution_name: Some(execution_name),
                     tool_call: &call,
                     event_tx: &event_tx,
                     metrics_collector: None,
@@ -2032,6 +2314,7 @@ mod hook_tests {
                         result: Ok(ToolResult::text(true, payload.to_string())),
                         needs_human: None,
                         post_tool_hook_eligible: true,
+                        managed_running_violation: false,
                         tool_duration: std::time::Duration::ZERO,
                     };
                     let (event_tx, _event_rx) = mpsc::channel(64);
@@ -2673,6 +2956,101 @@ mod hook_tests {
     }
 
     #[tokio::test]
+    async fn supervisor_delegation_first_final_gate_rejects_stale_execution_schemas_in_both_modes()
+    {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let names = [
+            "Read",
+            "SubAgent",
+            "Plan",
+            "Task",
+            "session_control",
+            "session_history",
+            "loop_control",
+            "work_dispatch",
+            "exec_command",
+            "write_stdin",
+            "Edit",
+            "load_skill",
+            "vendor::Read",
+            "default::Read",
+        ];
+        let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        // The supplied catalog deliberately predates any restriction.
+        let callable =
+            effective_callable_set(&names, CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        for ultra in [false, true] {
+            supervisor.set_root_orchestration_only(ultra).unwrap();
+            let observation =
+                ExecutingSupervisorObservation::capture_from_executing_session(&supervisor);
+            let concrete = Arc::new(NameRecordingExecutor::new(&names));
+            let tools: Arc<dyn ToolExecutor> = concrete.clone();
+            let (tx, mut rx) = mpsc::channel(128);
+            for name in names {
+                let call = probe_call(name);
+                let outcome = execute_model_requested_tool_call_only(
+                    &callable,
+                    ToolExecutionOnlyContext {
+                        vision_support: true,
+                        output_cap: None,
+                        executing_supervisor: observation,
+                        tool_call: &call,
+                        event_tx: &tx,
+                        metrics_collector: None,
+                        session_id: &supervisor.id,
+                        root_session_id: &supervisor.root_session_id,
+                        root_orchestration_only: ultra,
+                        round_id: "delegation-first",
+                        round: 0,
+                        tools: &tools,
+                        config: &AgentLoopConfig::default(),
+                        hook_session: None,
+                        hook_runtime_state: None,
+                        session_flags: ToolExecutionSessionFlags::from_session(&supervisor),
+                        available_tool_schemas: &[],
+                    },
+                )
+                .await
+                .unwrap();
+                let allowed = matches!(
+                    name,
+                    "Read"
+                        | "SubAgent"
+                        | "Plan"
+                        | "Task"
+                        | "session_control"
+                        | "session_history"
+                        | "work_dispatch"
+                );
+                assert_eq!(outcome.result.is_ok(), allowed, "ultra={ultra}: {name}");
+                if !allowed {
+                    assert!(!outcome.post_tool_hook_eligible);
+                    assert!(outcome.portable_tool.is_none());
+                }
+            }
+            let expected = vec![
+                "Read",
+                "SubAgent",
+                "Plan",
+                "Task",
+                "session_control",
+                "session_history",
+                "work_dispatch",
+            ];
+            assert_eq!(concrete.entered(), expected);
+            assert_eq!(
+                std::iter::from_fn(|| rx.try_recv().ok())
+                    .filter(|event| matches!(event, AgentEvent::ToolStart { .. }))
+                    .count(),
+                expected.len()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn supervisor_ultra_final_gate_uses_original_observation_and_exact_management_tool() {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
         let names = [
@@ -2999,8 +3377,14 @@ mod hook_tests {
             session,
             config.permission_mode.unwrap_or_default(),
         );
+        let admitted_execution_name = outcome
+            .portable_tool
+            .as_ref()
+            .map(|tool| tool.execution_name().to_owned());
         apply_tool_execution_outcome(
             ToolExecutionApplyContext {
+                policy_guard: &mut policy::ToolPolicyGuard::default(),
+                admitted_execution_name: admitted_execution_name.as_deref(),
                 tool_call,
                 event_tx,
                 metrics_collector: None,
@@ -3044,6 +3428,7 @@ mod hook_tests {
             }),
             portable_tool: None,
             post_tool_hook_eligible: false,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::from_millis(1),
         };
 
@@ -3108,6 +3493,84 @@ mod hook_tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_timeout_before_tool_start_has_no_dispatch_span() {
+        let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+        let executor = Arc::new(NameRecordingExecutor::new(&["probe"]));
+        let tools: Arc<dyn ToolExecutor> = executor.clone();
+        let callable =
+            effective_callable_set(&["probe"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        let call = probe_call("probe");
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .try_send(AgentEvent::Token {
+                content: "occupied".into(),
+            })
+            .unwrap();
+        let result = trace
+            .scope(bamboo_infrastructure::telemetry::with_timeout(
+                std::time::Duration::from_secs(1),
+                execute_without_hooks(&callable, &tools, &call, &event_tx),
+            ))
+            .await;
+        assert!(result.is_err());
+        assert!(executor.entered().is_empty());
+        assert!(trace.spans().is_empty());
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            AgentEvent::Token { .. }
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn telemetry_records_actual_tool_errors_without_payloads() {
+        struct ErrorExecutor(bool);
+        #[async_trait]
+        impl ToolExecutor for ErrorExecutor {
+            async fn execute(&self, _: &ToolCall) -> Result<ToolResult, ToolError> {
+                if self.0 {
+                    Err(ToolError::Execution(
+                        "PRIVATE_EXECUTOR_ERROR /Users/private".into(),
+                    ))
+                } else {
+                    Ok(ToolResult::text(
+                        false,
+                        "PRIVATE_TOOL_OUTPUT /Users/private",
+                    ))
+                }
+            }
+            fn list_tools(&self) -> Vec<ToolSchema> {
+                vec![tool_schema("probe")]
+            }
+        }
+        for error_result in [false, true] {
+            let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+            let tools: Arc<dyn ToolExecutor> = Arc::new(ErrorExecutor(error_result));
+            let callable =
+                effective_callable_set(&["probe"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+            let (event_tx, _event_rx) = mpsc::channel(16);
+            let outcome = trace
+                .scope(execute_without_hooks(
+                    &callable,
+                    &tools,
+                    &probe_call("probe"),
+                    &event_tx,
+                ))
+                .await;
+            assert!(outcome.result.is_err() || !outcome.result.as_ref().unwrap().success);
+            let spans = trace.spans();
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].name, "execute_tool probe");
+            assert!(spans[0]
+                .attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == "error.type" && kv.value.to_string() == "tool_error"));
+            assert!(!format!("{spans:?}").contains("PRIVATE_"));
+            assert!(!format!("{spans:?}").contains("/Users/"));
+        }
+    }
+
     #[tokio::test]
     async fn before_tool_hook_denies_without_dispatching_executor() {
         let mut runner = crate::runtime::hooks::HookRunner::new();
@@ -3130,27 +3593,29 @@ mod hook_tests {
         let session_flags = ToolExecutionSessionFlags::from_session(&session);
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
-        let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
-            vision_support: true,
-            output_cap: None,
-            executing_supervisor: None,
-            tool_call: &tool_call,
-            event_tx: &event_tx,
-            metrics_collector: None,
-            session_id: "hook-deny-session",
-            root_orchestration_only: false,
-            root_session_id: "hook-deny-session",
-            round_id: "round-1",
-            round: 0,
-            tools: &(tools.clone() as Arc<dyn ToolExecutor>),
-            config: &config,
-            hook_session: Some(&mut session),
-            hook_runtime_state: Some(&mut runtime_state),
-            session_flags,
-            available_tool_schemas: &[],
-        })
-        .await
-        .expect("deny is a tool outcome, not a runner error");
+        let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+        let outcome = trace
+            .scope(execute_tool_call_only(ToolExecutionOnlyContext {
+                vision_support: true,
+                output_cap: None,
+                executing_supervisor: None,
+                tool_call: &tool_call,
+                event_tx: &event_tx,
+                metrics_collector: None,
+                session_id: "hook-deny-session",
+                root_orchestration_only: false,
+                root_session_id: "hook-deny-session",
+                round_id: "round-1",
+                round: 0,
+                tools: &(tools.clone() as Arc<dyn ToolExecutor>),
+                config: &config,
+                hook_session: Some(&mut session),
+                hook_runtime_state: Some(&mut runtime_state),
+                session_flags,
+                available_tool_schemas: &[],
+            }))
+            .await
+            .expect("deny is a tool outcome, not a runner error");
 
         assert!(matches!(outcome.result, Err(ref error) if error.contains("policy hook blocked")));
         assert!(!tools.0.load(Ordering::SeqCst));
@@ -3161,6 +3626,10 @@ mod hook_tests {
             AgentEvent::HookLifecycle { hook_name, decision: HookResult::Deny { .. }, .. }
                 if hook_name == "deny_probe"
         )));
+        assert!(
+            trace.spans().is_empty(),
+            "denied before dispatch must not fabricate tool spans"
+        );
     }
 
     #[tokio::test]
@@ -3916,6 +4385,7 @@ mod hook_tests {
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: true,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::from_millis(7),
         };
 
@@ -3962,6 +4432,7 @@ mod hook_tests {
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: true,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::from_millis(3),
         };
 

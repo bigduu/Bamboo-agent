@@ -243,6 +243,22 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             "/projects/migrations/legacy/dry-run",
             web::post().to(agent::projects::legacy_dry_run),
         )
+        .route(
+            "/worktrees/preferences",
+            web::get().to(agent::worktrees::get_preferences),
+        )
+        .route(
+            "/worktrees/preferences",
+            web::put().to(agent::worktrees::set_preferences),
+        )
+        .route(
+            "/projects/{project_id}/worktrees",
+            web::get().to(agent::worktrees::list),
+        )
+        .route(
+            "/projects/{project_id}/worktrees",
+            web::post().to(agent::worktrees::create),
+        )
         .route("/projects", web::get().to(agent::projects::list_projects))
         .route("/projects", web::post().to(agent::projects::create_project))
         .route(

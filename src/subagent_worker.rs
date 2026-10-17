@@ -1420,6 +1420,14 @@ impl ChildExecutor for BambooRuntimeExecutor {
             }
         }
         let initial_deliveries = run.initial_session_messages.clone();
+        if self.initial_input_release_required
+            && initial_deliveries.len()
+                > bamboo_domain::SessionInboxLimits::default().max_claim_batch
+        {
+            return ChildOutcome::error(
+                "initial release exceeds the existing Inbox claim batch bound",
+            );
+        }
         if !initial_deliveries.is_empty()
             && expected_activation_run_id
                 .as_deref()
@@ -1873,14 +1881,15 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 }
             }
         }
-        let initial_release_deadline =
-            if self.initial_input_release_required && !initial_deliveries.is_empty() {
-                if initial_deliveries.len() != 1 {
-                    return ChildOutcome::error("initial release requires one exact typed input");
-                }
+        let mut initial_release_deadline: Option<chrono::DateTime<chrono::Utc>> = None;
+        if self.initial_input_release_required {
+            // Keep the existing exact-input v1 control and nonce for each item.
+            // No SDK/provider entry until every ordered Host ACK is released;
+            // later replies cannot extend the earliest physical lease deadline.
+            for delivery in &initial_deliveries {
                 let request = match bamboo_subagent::proto::InitialInputReleaseRequest::from_run(
                     &run,
-                    &initial_deliveries[0],
+                    delivery,
                     uuid::Uuid::new_v4().to_string(),
                 ) {
                     Ok(request) => request,
@@ -1890,12 +1899,15 @@ impl ChildExecutor for BambooRuntimeExecutor {
                     return ChildOutcome::error(error);
                 }
                 match steer.wait_initial_release(&request, &cancel, &events).await {
-                    Ok(deadline) => Some(deadline),
+                    Ok(deadline) => {
+                        initial_release_deadline = Some(
+                            initial_release_deadline.map_or(deadline, |old| old.min(deadline)),
+                        );
+                    }
                     Err(error) => return ChildOutcome::error(error),
                 }
-            } else {
-                None
-            };
+            }
+        }
 
         // In-band steering: typed ParentFrame::SessionMessage values enter the
         // worker-local durable SessionInbox. The real engine safe-turn bridge
@@ -2514,6 +2526,8 @@ mod tests {
     use bamboo_subagent::proto::{LogicalSessionIdentity, RunSecrets, SessionMessageDelivery};
     use bamboo_subagent::provision::{ChildIdentity, ModelRefSpec, ScopedCredential};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    include!("subagent_worker_cold_input_tests.rs");
 
     #[test]
     fn local_completion_preserves_message_data_and_refuses_provider_state() {

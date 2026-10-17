@@ -581,6 +581,7 @@ pub(crate) mod actor_events;
 mod agent_session_context;
 mod builder;
 mod config_application;
+pub(crate) use config_application::ConfigApplicationState;
 mod config_runtime;
 pub(crate) use config_runtime::ConfigLiveHealth;
 pub(crate) use config_runtime::ConfigSectionMutationError;

@@ -479,9 +479,10 @@ impl SessionMessageEnvelope {
                 == Some(run_id)
     }
 
-    /// A child completion admitted while its parent Run still owns the turn
-    /// belongs to that Run's successor. The coordinator writes this fence in
-    /// the durable envelope before clearing the parent's wait.
+    /// A wait-bound child completion may belong to its active parent's
+    /// successor. The coordinator keeps wait/Guardian control transitions on
+    /// that owner behind this durable fence. Background-only results remain
+    /// eligible for the active Run's next safe reasoning boundary.
     pub fn child_outcome_waits_for_run(&self, run_id: &str) -> bool {
         self.kind == SessionMessageKind::ChildOutcome
             && matches!(&self.source, SessionMessageSource::Runtime { subsystem }
@@ -776,6 +777,11 @@ impl SessionMessageEnvelope {
     /// message while retaining all correlation metadata.
     pub fn to_provider_message(&self) -> Result<Message, SessionMessageValidationError> {
         self.validate()?;
+        // Runtime control is consumed only by the registered owner. It must
+        // never become provider input or a genuine external User escape.
+        if crate::is_scoped_loop_control(self) {
+            return Err(SessionMessageValidationError::KindSourceBodyMismatch);
+        }
         let (text, parts, provider_metadata, never_compress) = match &self.body {
             SessionMessageBody::Content(content) => {
                 let (text, parts) = self
@@ -1046,6 +1052,73 @@ pub struct SessionInboxReceipt {
     pub generation: u64,
 }
 
+/// Exact delivery state observed under the same admission authority and Inbox
+/// locks as its receipt. A permanent ACK or terminal queue retry has no pending
+/// delivery; this says nothing about a model run's terminal state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInboxDeliveryReceipt {
+    pub delivery: SessionInboxReceipt,
+    pub pending: bool,
+}
+
+/// New explicit steer admission; accepted does not imply context consumption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInboxSteerReceipt {
+    pub delivery: SessionInboxReceipt,
+    pub replayed: bool,
+    pub active_delivery_notified: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRunConflictReason {
+    NoActiveRun,
+    RunChanged,
+    Finalizing,
+    NotRegistered,
+    UnboundLifetime,
+    SessionBirthChanged,
+    Unsupported,
+}
+
+/// Returned only after current peer authority has been verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("expected run admission conflict: {reason:?}")]
+pub struct SessionRunConflict {
+    pub reason: SessionRunConflictReason,
+    pub expected_run_id: String,
+    pub observed_run_id: Option<String>,
+}
+
+impl SessionRunConflict {
+    pub fn unsupported(expected_run_id: &str) -> Self {
+        Self {
+            reason: SessionRunConflictReason::Unsupported,
+            expected_run_id: expected_run_id.into(),
+            observed_run_id: None,
+        }
+    }
+}
+
+/// Retained runtime ownership, never constructed from a model argument or
+/// session metadata. The actual filesystem publication job retains this guard
+/// until rename/notification complete, even after its async caller disappears.
+/// It grants no peer, storage, permission or completion authority.
+pub trait SessionRunDeliveryGuard: Send + Sync {
+    fn matches(
+        &self,
+        target_session_id: &str,
+        target_created_at: DateTime<Utc>,
+        expected_run_id: &str,
+    ) -> bool;
+    fn notify_committed_delivery(&self, inbox_generation: u64) -> bool;
+}
+
+/// Format validation only, never an ownership check.
+pub fn valid_session_run_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
 /// How an authorized inbox prefix interacts with a durable orchestration wait.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1061,22 +1134,103 @@ pub enum SessionActivationPolicy {
     InterruptSpecificWait,
 }
 
-/// Permission to activate this specific message, published with its delivery.
-/// This never releases a coordinator's staged queue prefix.
+/// Scheduling intent for an explicit peer delivery. Neither choice releases
+/// a human, child or Bash wait or grants the receiver additional permissions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMessageDeliveryIntent {
+    /// Available at the current owner's next safe point; never starts a run.
+    QueueOnly,
+    /// May start a turn through the existing activation router.
+    TriggerTurn,
+}
+
+/// Permission to consume/activate this specific message, published with its delivery.
+/// This never releases a coordinator's staged queue prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionInboxActivationIntent {
     version: u32,
     policy: SessionActivationPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery: Option<SessionMessageDeliveryIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_run_id: Option<String>,
 }
 
 impl SessionInboxActivationIntent {
     pub fn new(policy: SessionActivationPolicy) -> Self {
-        Self { version: 1, policy }
+        Self {
+            version: 1,
+            policy,
+            delivery: None,
+            expected_run_id: None,
+        }
+    }
+
+    /// Explicit delivery is versioned separately from legacy steering. Old
+    /// readers reject v2 rather than treating QueueOnly as activation authority.
+    pub fn with_delivery(delivery: SessionMessageDeliveryIntent) -> Self {
+        Self {
+            version: 2,
+            policy: SessionActivationPolicy::RespectSpecificWait,
+            delivery: Some(delivery),
+            expected_run_id: None,
+        }
+    }
+
+    /// v3 is an active-run-only QueueOnly input. Older readers reject it.
+    pub fn for_expected_run(expected_run_id: &str) -> Result<Self, SessionInboxError> {
+        if !valid_session_run_id(expected_run_id) {
+            return Err(SessionInboxError::InvalidClaim(
+                "invalid expected run id".into(),
+            ));
+        }
+        Ok(Self {
+            version: 3,
+            policy: SessionActivationPolicy::RespectSpecificWait,
+            delivery: Some(SessionMessageDeliveryIntent::QueueOnly),
+            expected_run_id: Some(expected_run_id.into()),
+        })
+    }
+
+    pub fn expected_run_id(&self) -> Option<&str> {
+        self.expected_run_id.as_deref()
+    }
+
+    /// An accepted steer cannot be silently retargeted to another run.
+    pub fn admits_run(&self, active_run_id: Option<&str>) -> bool {
+        self.expected_run_id
+            .as_deref()
+            .is_none_or(|expected| Some(expected) == active_run_id)
+    }
+
+    pub fn delivery(&self) -> Option<SessionMessageDeliveryIntent> {
+        self.delivery
+    }
+
+    pub fn is_queue_only(&self) -> bool {
+        self.delivery == Some(SessionMessageDeliveryIntent::QueueOnly)
     }
 
     pub fn policy(&self) -> Result<SessionActivationPolicy, SessionInboxError> {
-        if self.version != 1 {
+        let supported = match (
+            self.version,
+            self.delivery,
+            self.policy,
+            self.expected_run_id.as_deref(),
+        ) {
+            (1, None, _, None)
+            | (2, Some(_), SessionActivationPolicy::RespectSpecificWait, None) => true,
+            (
+                3,
+                Some(SessionMessageDeliveryIntent::QueueOnly),
+                SessionActivationPolicy::RespectSpecificWait,
+                Some(run_id),
+            ) => valid_session_run_id(run_id),
+            _ => false,
+        };
+        if !supported {
             return Err(SessionInboxError::InvalidClaim(
                 "unsupported SessionInbox activation intent version".into(),
             ));
@@ -1338,6 +1492,8 @@ impl Default for SessionInboxLimits {
 pub enum SessionInboxError {
     #[error("session message admission was cancelled before the durable commit")]
     AdmissionCancelled,
+    #[error(transparent)]
+    ExpectedRunConflict(#[from] SessionRunConflict),
     #[error("session inbox target not found: {0}")]
     TargetNotFound(String),
     #[error("session inbox payload is {actual} bytes, limit is {limit}")]
@@ -1354,10 +1510,58 @@ pub enum SessionInboxError {
 /// but every address is a stable logical session id.
 #[async_trait]
 pub trait SessionInboxPort: Send + Sync {
+    /// Host wiring only; one live runtime may own a concrete Inbox adapter.
+    /// A weak observer never keeps a grant/runtime alive and None is no proof.
+    fn bind_scoped_transport_runtime(
+        &self,
+        _runtime: std::sync::Weak<dyn SessionActivationPort>,
+        _instance: std::sync::Arc<()>,
+    ) -> bool {
+        false
+    }
+
     /// Host-only access to the concrete durable Inbox when an Actor-fenced
     /// transcript seed must hold the same process lock as claim and ACK.
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         None
+    }
+
+    /// Admit a typed Supervisor command to this exact live owner only. Never
+    /// request activation; an observation or serialized binding is not a grant.
+    async fn deliver_supervisor_loop_control(
+        &self,
+        _binding: &crate::ScopedLoopControlBinding,
+        _envelope: &SessionMessageEnvelope,
+        _activation: std::sync::Arc<dyn SessionActivationPort>,
+    ) -> Result<SessionInboxSteerReceipt, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "scoped Loop delivery unsupported".into(),
+        ))
+    }
+
+    /// The same Inbox claim protocol, selecting only typed Loop controls.
+    /// Ordinary claim and selected User input must exclude this carrier.
+    async fn claim_scoped_loop_controls(
+        &self,
+        _target_session_id: &str,
+        _limit: usize,
+        _active_run_id: Option<&str>,
+    ) -> Result<Vec<SessionInboxClaim>, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "scoped Loop claims unsupported".into(),
+        ))
+    }
+
+    async fn claim_owned_scoped_loop_controls(
+        &self,
+        _target_session_id: &str,
+        _limit: usize,
+        _active_run_id: Option<&str>,
+        _request: &SessionInboxLeaseRequest,
+    ) -> Result<Vec<SessionInboxOwnedClaim>, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "owned scoped Loop claims unsupported".into(),
+        ))
     }
 
     /// Irreversibly opt this queue into owned claims. Legacy claim/ACK APIs
@@ -1568,6 +1772,41 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    /// Opt-in explicit peer scheduling with the same retained lifetime/tree/
+    /// Project/reply authority as deliver_peer_message. QueueOnly is claimable
+    /// at a running consumer's safe point, but is excluded from wake scans.
+    /// Both intents respect specific waits. Pending state must be observed under
+    /// the same retained admission locks; a later independent read is not proof.
+    /// Unsupported backends fail closed.
+    async fn deliver_peer_message_with_intent(
+        &self,
+        _envelope: &SessionMessageEnvelope,
+        _source: &super::ActorSession,
+        _target: &super::ActorSession,
+        _reply_to: Option<&SessionMessageEnvelope>,
+        _intent: SessionMessageDeliveryIntent,
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "explicit peer delivery intent is unsupported".into(),
+        ))
+    }
+
+    /// Atomically admit a threaded peer input for one expected active run.
+    /// Existing exact receipts replay without a new owner check or signal.
+    /// A new delivery must retain the same runtime owner through the actual
+    /// durable publication job. It never starts a turn or cancels a run.
+    /// Neither the supplied runtime port nor its guard replaces peer authority.
+    async fn deliver_peer_steer(
+        &self,
+        _envelope: &SessionMessageEnvelope,
+        _source: &super::ActorSession,
+        _target: &super::ActorSession,
+        expected_run_id: &str,
+        _activation: std::sync::Arc<dyn SessionActivationPort>,
+    ) -> Result<SessionInboxSteerReceipt, SessionInboxError> {
+        Err(SessionRunConflict::unsupported(expected_run_id).into())
+    }
+
     /// Admit one typed Supervisor peer message while retaining canonical
     /// incarnation, relationship, Project and target lifetime authority locks
     /// through the inbox receipt. An earlier link observation is not a grant.
@@ -1597,7 +1836,8 @@ pub trait SessionInboxPort: Send + Sync {
     /// Grant execution permission to one exact admitted delivery without
     /// authorizing any other queue item or changing its original delivery
     /// intent. Grants are monotonic, durable and idempotent, including after
-    /// ACK; an acknowledged item must never become pending again.
+    /// ACK; an acknowledged item must never become pending again. Explicit
+    /// peer scheduling/wait intent is immutable: conflicting promotion fails.
     async fn mark_message_activation_eligible(
         &self,
         _target_session_id: &str,
@@ -1707,6 +1947,70 @@ pub enum SessionActivationError {
 /// loop directly; it notifies the owner or reserves one successor activation.
 #[async_trait]
 pub trait SessionActivationPort: Send + Sync {
+    /// Opaque in-process runtime identity, never serialized or a model grant.
+    fn scoped_transport_runtime_instance(&self) -> Option<std::sync::Arc<()>> {
+        None
+    }
+
+    /// Disposal only: a real closed owner in this exact runtime. An absent
+    /// owner, a fresh router, contention or a failed retain is NOT a dead-run
+    /// proof. This guard must never notify, admit, resume or publish runtime.
+    fn retain_closed_scoped_transport_blocking(
+        &self,
+        binding: &crate::ScopedLoopControlBinding,
+    ) -> Result<std::sync::Arc<dyn SessionRunDeliveryGuard>, SessionRunConflict> {
+        Err(SessionRunConflict::unsupported(&binding.owner_run_id))
+    }
+
+    /// Called only from an already-owned blocking filesystem job. Retain the
+    /// exact registered non-finalizing owner across the synchronous publication
+    /// boundary. Implementations must not emulate this with a read-then-act.
+    /// Fence only this target: never retain a runtime-global state lock over
+    /// filesystem I/O. The guard must not be held across an async wait or
+    /// re-enter this router. Notification runs in the same blocking job.
+    fn retain_expected_run_blocking(
+        &self,
+        _target_session_id: &str,
+        _target_created_at: DateTime<Utc>,
+        expected_run_id: &str,
+    ) -> Result<std::sync::Arc<dyn SessionRunDeliveryGuard>, SessionRunConflict> {
+        Err(SessionRunConflict::unsupported(expected_run_id))
+    }
+
+    /// Observe the host-installed grant on a live owner. Canonical storage
+    /// independently revalidates caller/link/permissions before each use.
+    async fn observe_supervisor_loop(
+        &self,
+        _supervisor: &crate::SupervisorReference,
+        _target_session_id: &str,
+        _expected_link_revision: Option<u64>,
+        _action: crate::LoopControlAction,
+    ) -> Result<crate::ScopedLoopControlBinding, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "live Supervisor Loop observation unsupported".into(),
+        ))
+    }
+
+    /// Retain the exact owner AND the equal installed grant in a blocking job.
+    /// Like retain_expected_run_blocking, this must never cross an async wait.
+    fn retain_supervisor_loop_blocking(
+        &self,
+        binding: &crate::ScopedLoopControlBinding,
+    ) -> Result<std::sync::Arc<dyn SessionRunDeliveryGuard>, SessionRunConflict> {
+        Err(SessionRunConflict::unsupported(&binding.owner_run_id))
+    }
+
+    /// Signal only a currently running, non-finalizing owner. Never reserve a
+    /// runner or retain successor activation intent. False is not a failure of
+    /// durable admission: an idle target keeps the message until a later turn.
+    async fn notify_active_delivery(
+        &self,
+        _target_session_id: &str,
+        _inbox_generation: u64,
+    ) -> bool {
+        false
+    }
+
     async fn request_activation(
         &self,
         target_session_id: &str,
@@ -2691,5 +2995,84 @@ mod tests {
             SessionMessageId::stable("runtime", &serde_json::json!({"a": 1, "b": [2, 4]}))
         );
         assert_ne!(stable, SessionMessageId::stable("other", &left));
+    }
+
+    #[test]
+    fn explicit_delivery_intent_versions_reject_wait_escalation_and_keep_legacy_bytes() {
+        let legacy =
+            SessionInboxActivationIntent::new(SessionActivationPolicy::InterruptSpecificWait);
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap(),
+            serde_json::json!({"version":1,"policy":"interrupt_specific_wait"})
+        );
+        for delivery in [
+            SessionMessageDeliveryIntent::QueueOnly,
+            SessionMessageDeliveryIntent::TriggerTurn,
+        ] {
+            let intent = SessionInboxActivationIntent::with_delivery(delivery);
+            assert_eq!(
+                intent.policy().unwrap(),
+                SessionActivationPolicy::RespectSpecificWait
+            );
+            let raw = serde_json::to_value(&intent).unwrap();
+            assert_eq!(raw["version"], 2);
+            assert_eq!(
+                serde_json::from_value::<SessionInboxActivationIntent>(raw.clone()).unwrap(),
+                intent
+            );
+            let mut escalated = raw;
+            escalated["policy"] = serde_json::json!("interrupt_specific_wait");
+            assert!(
+                serde_json::from_value::<SessionInboxActivationIntent>(escalated)
+                    .unwrap()
+                    .policy()
+                    .is_err()
+            );
+        }
+        for raw in [
+            serde_json::json!({"version":2,"policy":"respect_specific_wait"}),
+            serde_json::json!({"version":1,"policy":"respect_specific_wait","delivery":"queue_only"}),
+            serde_json::json!({"version":3,"policy":"respect_specific_wait","delivery":"queue_only"}),
+        ] {
+            assert!(serde_json::from_value::<SessionInboxActivationIntent>(raw)
+                .unwrap()
+                .policy()
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn expected_run_intent_is_versioned_immutable_queue_only_and_consumer_bound() {
+        let intent = SessionInboxActivationIntent::for_expected_run("run-a").unwrap();
+        assert_eq!(
+            intent.policy().unwrap(),
+            SessionActivationPolicy::RespectSpecificWait
+        );
+        assert!(intent.is_queue_only());
+        assert!(intent.admits_run(Some("run-a")));
+        assert!(!intent.admits_run(Some("replacement")));
+        assert!(!intent.admits_run(None));
+        let raw = serde_json::to_value(&intent).unwrap();
+        assert_eq!(raw["version"], 3);
+        assert_eq!(raw["expected_run_id"], "run-a");
+        assert_eq!(
+            serde_json::from_value::<SessionInboxActivationIntent>(raw.clone()).unwrap(),
+            intent
+        );
+        for (field, value) in [
+            ("version", serde_json::json!(2)),
+            ("policy", serde_json::json!("interrupt_specific_wait")),
+            ("delivery", serde_json::json!("trigger_turn")),
+            ("expected_run_id", serde_json::json!("bad run")),
+        ] {
+            let mut bad = raw.clone();
+            bad[field] = value;
+            assert!(serde_json::from_value::<SessionInboxActivationIntent>(bad)
+                .unwrap()
+                .policy()
+                .is_err());
+        }
+        assert!(SessionInboxActivationIntent::for_expected_run("").is_err());
+        assert!(SessionInboxActivationIntent::for_expected_run(&"x".repeat(129)).is_err());
     }
 }

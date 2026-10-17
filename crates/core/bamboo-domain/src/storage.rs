@@ -18,6 +18,21 @@ pub struct RootActorRuntimeWrite {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Target-only transport disposal, issued by the actual registered owner.
+/// `binding` identifies bytes to retire; it is NOT a retained Supervisor grant.
+/// The callback must retain a closed exact owner and never notify or activate.
+/// This operation does not publish Session state, cursor, or control receipts.
+pub struct ScopedLoopTransportRetirement<'a> {
+    pub binding: &'a crate::ScopedLoopControlBinding,
+    pub inbox: std::sync::Arc<dyn crate::SessionInboxPort>,
+    pub owner: Option<&'a RootActorRuntimeWrite>,
+    pub retain: std::sync::Arc<
+        dyn Fn() -> std::io::Result<std::sync::Arc<dyn crate::SessionRunDeliveryGuard>>
+            + Send
+            + Sync,
+    >,
+}
+
 /// Exact native Child execution capability captured by its Host after Actor admission.
 /// This is not serialized and never recovered from Session metadata.
 #[derive(Debug, Clone)]
@@ -183,6 +198,51 @@ pub trait Storage: Send + Sync {
             std::io::ErrorKind::Unsupported,
             "storage backend does not support fenced Root input checkpoints",
         ))
+    }
+
+    /// Strict, uncached full observation under retained canonical Supervisor
+    /// authority and the exact live host grant. This read is not a write grant.
+    async fn load_scoped_loop_session(
+        &self,
+        binding: &crate::ScopedLoopControlBinding,
+        activation: std::sync::Arc<dyn crate::SessionActivationPort>,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (binding, activation);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support scoped Loop observations",
+        ))
+    }
+
+    /// Publish Loop state and typed consumption before ACK, retaining the same
+    /// canonical and exact owner guards. Err is not a rollback receipt: callers
+    /// must stop dispatch and must not save the proposed state generically.
+    async fn checkpoint_scoped_loop(
+        &self,
+        request: crate::ScopedLoopControlCheckpoint<'_>,
+    ) -> std::io::Result<()> {
+        let _ = request;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support scoped Loop checkpoints",
+        ))
+    }
+
+    /// Dispose exact closed-run Loop transports under the target's own real
+    /// writer and Inbox locks. No Supervisor capability is acquired or renewed.
+    async fn retire_scoped_loop_transport(
+        &self,
+        request: ScopedLoopTransportRetirement<'_>,
+    ) -> std::io::Result<()> {
+        let _ = request;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support target-owned Loop transport retirement",
+        ))
+    }
+
+    fn supports_scoped_loop_transport_retirement(&self) -> bool {
+        false
     }
 
     /// Probe before claiming an Actor; unsupported backends must not leave a

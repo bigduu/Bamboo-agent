@@ -75,8 +75,8 @@ use bamboo_domain::{ActorSnapshotLimits, ActorSnapshotPort, ActorSnapshotPrincip
 use serde::Deserialize;
 
 use self::envelope::{
-    decode_client_frame, pong_frame, sys_keepalive_envelope, welcome_frame, Channel, ClientFrame,
-    Encoding, OutFrame,
+    decode_client_frame, pong_frame, sys_keepalive_envelope, welcome_frame, ActorResumeRequest,
+    Channel, ClientFrame, Encoding, OutFrame,
 };
 use self::forwarders::{
     spawn_actor_forwarder, spawn_actor_tree_forwarder, spawn_agent_forwarder, spawn_feed_forwarder,
@@ -714,8 +714,12 @@ async fn handle_client_frame(
             }
             return acknowledge_hello(encoding, welcome_sent);
         }
-        ClientFrame::Subscribe { ch, since } => {
-            subscribe(
+        ClientFrame::Subscribe {
+            ch,
+            since,
+            actor_resume,
+        } => {
+            subscribe_with_actor_resume(
                 state,
                 forwarders,
                 queues,
@@ -723,6 +727,7 @@ async fn handle_client_frame(
                 encoding,
                 &ch,
                 since,
+                actor_resume,
                 *actor_host_owner,
             )
             .await;
@@ -764,6 +769,7 @@ async fn handle_client_frame(
 /// Subscribe to a channel, replacing any existing forwarder for the same `ch`
 /// (a re-subscribe with a new cursor aborts the old one first, so there is never
 /// a duplicate reader on one channel).
+#[cfg(test)]
 async fn subscribe(
     state: &web::Data<AppState>,
     forwarders: &mut HashMap<String, tokio::task::JoinHandle<()>>,
@@ -774,9 +780,48 @@ async fn subscribe(
     since: Option<u64>,
     actor_host_owner: bool,
 ) {
+    subscribe_with_actor_resume(
+        state,
+        forwarders,
+        queues,
+        batch_ms,
+        encoding,
+        ch,
+        since,
+        None,
+        actor_host_owner,
+    )
+    .await;
+}
+
+async fn subscribe_with_actor_resume(
+    state: &web::Data<AppState>,
+    forwarders: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    queues: &mut StreamMap<String, ReceiverStream<OutFrame>>,
+    batch_ms: u64,
+    encoding: Encoding,
+    ch: &str,
+    since: Option<u64>,
+    actor_resume: Option<ActorResumeRequest>,
+    actor_host_owner: bool,
+) {
     let Some(channel) = Channel::parse(ch) else {
         tracing::debug!("ws_v2: ignoring subscribe to unknown channel {ch}");
         return;
+    };
+
+    // Reject malformed or out-of-domain observation proof before replacing
+    // any existing subscription. This input grants no Actor scope.
+    if actor_resume.is_some() && !matches!(&channel, Channel::Actor(_)) {
+        return;
+    }
+    let resume_epoch = match actor_resume.as_ref().and_then(|value| value.epoch.as_ref()) {
+        None => None,
+        Some(value) if value.len() == 36 => match uuid::Uuid::parse_str(value) {
+            Ok(epoch) => Some(epoch),
+            Err(_) => return,
+        },
+        Some(_) => return,
     };
 
     // Replace any prior forwarder for this exact channel id, dropping its queue
@@ -883,7 +928,14 @@ async fn subscribe(
             {
                 return;
             }
-            let Some(subscription) = state.actor_event_hub.subscribe(&actor_id, since) else {
+            let subscription = if actor_resume.is_some() {
+                state
+                    .actor_event_hub
+                    .subscribe_resumable(&actor_id, since, resume_epoch)
+            } else {
+                state.actor_event_hub.subscribe(&actor_id, since)
+            };
+            let Some(subscription) = subscription else {
                 return;
             };
             spawn_actor_forwarder(out_tx, encoding, ch.to_string(), subscription, since)
@@ -1083,7 +1135,8 @@ mod tests {
         assert_eq!(
             UnauthorizedAction::classify(&ClientFrame::Subscribe {
                 ch: "feed".into(),
-                since: None
+                since: None,
+                actor_resume: None,
             }),
             UnauthorizedAction::Ignore
         );
@@ -1136,6 +1189,7 @@ mod tests {
         let frame = ClientFrame::Subscribe {
             ch: "feed".into(),
             since: None,
+            actor_resume: None,
         };
         let outcome = apply_auth_gate(&state, &frame, &mut authorized).await;
         // The driver keeps the socket open but does NOT dispatch (no forwarder).
@@ -1197,6 +1251,7 @@ mod tests {
         let frame = ClientFrame::Subscribe {
             ch: "feed".into(),
             since: None,
+            actor_resume: None,
         };
         let outcome = apply_auth_gate(&state, &frame, &mut authorized).await;
         assert_eq!(outcome, GateOutcome::Dispatch);
@@ -1372,6 +1427,7 @@ mod tests {
             ClientFrame::Subscribe {
                 ch: SYS_CHANNEL.into(),
                 since: None,
+                actor_resume: None,
             },
             ClientFrame::Unsubscribe {
                 ch: SYS_CHANNEL.into(),
@@ -1432,6 +1488,144 @@ mod tests {
             Some(&crate::app_state::AgentStatus::Running),
             &rx,
         ));
+    }
+
+    #[actix_web::test]
+    async fn actor_resume_requires_existing_host_scope_and_does_not_start_a_runner() {
+        use bamboo_agent_core::Storage;
+        let dir = tempdir().unwrap();
+        let state = web::Data::new(
+            AppState::new(dir.path().canonicalize().unwrap())
+                .await
+                .unwrap(),
+        );
+        let session = bamboo_agent_core::Session::new("resume-root", "test-model");
+        state.session_store.save_session(&session).await.unwrap();
+        let ch = format!("actor.{}", session.id);
+        let mut forwarders = HashMap::new();
+        let mut queues = StreamMap::new();
+        let opt_in = Some(ActorResumeRequest { epoch: None });
+        subscribe_with_actor_resume(
+            &state,
+            &mut forwarders,
+            &mut queues,
+            0,
+            Encoding::Json,
+            &ch,
+            None,
+            opt_in.clone(),
+            false,
+        )
+        .await;
+        assert!(!queues.contains_key(&ch));
+        subscribe_with_actor_resume(
+            &state,
+            &mut forwarders,
+            &mut queues,
+            0,
+            Encoding::Json,
+            "actor.unknown",
+            None,
+            opt_in.clone(),
+            true,
+        )
+        .await;
+        assert!(queues.is_empty());
+        subscribe_with_actor_resume(
+            &state,
+            &mut forwarders,
+            &mut queues,
+            0,
+            Encoding::Json,
+            &ch,
+            None,
+            opt_in,
+            true,
+        )
+        .await;
+        let mut observed = Vec::new();
+        for _ in 0..2 {
+            let (_, OutFrame::Text(raw)) =
+                tokio::time::timeout(Duration::from_secs(5), queues.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("JSON Actor frame");
+            };
+            observed.push(serde_json::from_str::<serde_json::Value>(&raw).unwrap());
+        }
+        assert_eq!(observed[0]["control"]["reason"], "initial");
+        assert_eq!(observed[1]["control"]["type"], "actor_replay_complete");
+        assert!(observed[1]["control"]["resumed_from"].is_null());
+        let cursor = observed[1]["seq"].as_u64().unwrap();
+        let epoch = observed[1]["control"]["epoch"].as_str().unwrap().to_owned();
+        let prior = forwarders[&ch].id();
+        subscribe_with_actor_resume(
+            &state,
+            &mut forwarders,
+            &mut queues,
+            0,
+            Encoding::Json,
+            &ch,
+            Some(cursor),
+            Some(ActorResumeRequest {
+                epoch: Some("malformed".into()),
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(
+            forwarders[&ch].id(),
+            prior,
+            "malformed proof must not replace a valid observer"
+        );
+        subscribe_with_actor_resume(
+            &state,
+            &mut forwarders,
+            &mut queues,
+            0,
+            Encoding::Json,
+            "feed",
+            None,
+            Some(ActorResumeRequest {
+                epoch: Some(epoch.clone()),
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(
+            forwarders.len(),
+            1,
+            "Actor proof grants no cross-channel authority"
+        );
+        subscribe_with_actor_resume(
+            &state,
+            &mut forwarders,
+            &mut queues,
+            0,
+            Encoding::Json,
+            &ch,
+            Some(cursor),
+            Some(ActorResumeRequest { epoch: Some(epoch) }),
+            true,
+        )
+        .await;
+        let (_, OutFrame::Text(raw)) = tokio::time::timeout(Duration::from_secs(5), queues.next())
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("JSON replay proof");
+        };
+        let resumed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(resumed["control"]["type"], "actor_replay_complete");
+        assert_eq!(resumed["control"]["resumed_from"], cursor);
+        assert!(state.agent_runners.read().await.is_empty());
+        for (_, handle) in forwarders {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 
     #[actix_web::test]

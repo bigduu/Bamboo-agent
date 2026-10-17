@@ -122,6 +122,7 @@ pub enum BuiltinTool {
     Sleep,
     Task,
     UpdateGoal,
+    LoopControl,
     ViewImage,
     WebFetch,
     Workspace,
@@ -130,7 +131,7 @@ pub enum BuiltinTool {
 
 impl BuiltinTool {
     /// Every built-in tool, in the canonical order of [`BUILTIN_TOOL_NAMES`].
-    pub const ALL: [BuiltinTool; 21] = [
+    pub const ALL: [BuiltinTool; 22] = [
         BuiltinTool::Bash,
         BuiltinTool::BashInput,
         BuiltinTool::BashOutput,
@@ -148,6 +149,7 @@ impl BuiltinTool {
         BuiltinTool::Sleep,
         BuiltinTool::Task,
         BuiltinTool::UpdateGoal,
+        BuiltinTool::LoopControl,
         BuiltinTool::ViewImage,
         BuiltinTool::WebFetch,
         BuiltinTool::Workspace,
@@ -174,6 +176,7 @@ impl BuiltinTool {
             BuiltinTool::Sleep => "Sleep",
             BuiltinTool::Task => "Task",
             BuiltinTool::UpdateGoal => "update_goal",
+            BuiltinTool::LoopControl => "loop_control",
             BuiltinTool::ViewImage => "ViewImage",
             BuiltinTool::WebFetch => "WebFetch",
             BuiltinTool::Workspace => "Workspace",

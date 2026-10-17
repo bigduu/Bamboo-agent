@@ -152,6 +152,12 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
         })
     );
 
+    if ctx.loop_result_checkpointed {
+        // The owner checkpointed this immutable pair, then any bounded native
+        // feedback in the existing hook-context plane. Never rewrite the pair.
+        return false;
+    }
+
     let outcome = handle_tool_result_with_agentic_support_and_persistence(
         result,
         ctx.tool_call,

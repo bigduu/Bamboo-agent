@@ -32,3 +32,8 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+hex = "0.4"
+serde_json = "1"
+sha2 = "0.11"

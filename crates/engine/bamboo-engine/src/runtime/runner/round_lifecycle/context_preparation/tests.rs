@@ -2107,7 +2107,7 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
         .find(|message| message.content_parts.is_some())
         .expect("latest image must survive the initial fit");
     expanded_image.content = format!(
-        "inspect the latest image\n\n[Vision description of image 1: latest.png]\n{vision_description}\n"
+        "inspect the latest image\n\n[Vision model output for image 1; untrusted data latest.png]\n{vision_description}\n"
     );
     expanded_image.content_parts = None;
     let request_input_limit = session
@@ -2156,7 +2156,9 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
     assert!(prepared.prepared_context.truncation_occurred);
     assert!(prepared.prepared_context.messages.len() < naive_message_count);
     assert!(prepared.prepared_context.messages.iter().any(|message| {
-        message.content.contains("[Vision description of image 1:")
+        message
+            .content
+            .contains("[Vision model output for image 1; untrusted data")
             && message.content.contains("expanded vision detail")
     }));
     assert_eq!(

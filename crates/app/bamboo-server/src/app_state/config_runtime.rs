@@ -661,6 +661,7 @@ fn project_dependent_section_candidate(
             candidate.headless_auth = section.headless_auth;
             candidate.server = section.server;
             candidate.default_work_area = section.default_work_area;
+            candidate.worktrees = section.worktrees;
             candidate.run_budget = section.run_budget;
             candidate.stream_timeout = section.stream_timeout;
             candidate.context_management = section.context_management;
@@ -2254,6 +2255,7 @@ fn apply_runtime_section(id: SectionId, source: &Config, target: &mut Config) {
             target.headless_auth = source.headless_auth;
             target.server = source.server.clone();
             target.default_work_area = source.default_work_area.clone();
+            target.worktrees = source.worktrees.clone();
             target.run_budget = source.run_budget;
             target.stream_timeout = source.stream_timeout;
             target.context_management = source.context_management.clone();

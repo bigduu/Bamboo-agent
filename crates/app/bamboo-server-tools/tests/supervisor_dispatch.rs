@@ -1,4 +1,5 @@
-//! Real Core -> Root overlay -> owned load_skill -> concrete nested Tool path.
+//! Trusted host -> Root overlay -> owned load_skill -> concrete nested Tool path.
+//! Model-issued load_skill is denied before this host-only identity contract.
 
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{
@@ -147,6 +148,27 @@ async fn core_dispatch(session: &mut Session, tools: &dyn ToolExecutor, id: &str
     .await;
 }
 
+async fn host_dispatch(session: &Session, tools: &dyn ToolExecutor, id: &str) {
+    let (tx, _rx) = mpsc::channel(128);
+    let call = load_call(id);
+    let schemas = tools.list_tools();
+    let context = ToolExecutionContext::for_dispatch(
+        &session.id,
+        &session.root_session_id,
+        &call.id,
+        &tx,
+        &schemas,
+        flags(),
+        false,
+        None,
+        None,
+    )
+    .with_executing_supervisor(
+        ExecutingSupervisorObservation::capture_from_executing_session(session),
+    );
+    tools.execute_with_context(&call, context).await.unwrap();
+}
+
 #[tokio::test]
 async fn supervisor_overlay_and_nested_load_skill_keep_original_identity_after_configuration_reload(
 ) {
@@ -227,7 +249,16 @@ Use the declared context.
         resume: resume.clone(),
     });
     let overlay = OverlayToolExecutor::new(base, paused.clone());
-    let execute = core_dispatch(&mut original_session, &overlay, "old-load");
+    // Preserve the host-owned propagation scenario below while proving that
+    // model/agentic dispatch cannot use it to self-execute a Workflow.
+    core_dispatch(&mut original_session, &overlay, "model-load-denied").await;
+    assert!(entered_rx.try_recv().is_err());
+    assert!(seen.lock().unwrap().is_empty());
+    let denied = original_session.messages.last().unwrap();
+    assert_eq!(denied.tool_call_id.as_deref(), Some("model-load-denied"));
+    assert_eq!(denied.tool_success, Some(false));
+    assert!(denied.content.contains("supervisor_delegation_required"));
+    let execute = host_dispatch(&original_session, &overlay, "old-load");
     let replace = async {
         assert_eq!(entered_rx.recv().await.unwrap(), original);
         assert!(store
@@ -247,7 +278,7 @@ Use the declared context.
         resume.add_permits(1);
         fresh
     };
-    let (_, mut fresh) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let (_, fresh) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         tokio::join!(execute, replace)
     })
     .await
@@ -268,7 +299,7 @@ Use the declared context.
         assert!(seen[0].auto && !seen[0].plan);
     }
     resume.add_permits(1);
-    core_dispatch(&mut fresh, &overlay, "fresh-load").await;
+    host_dispatch(&fresh, &overlay, "fresh-load").await;
     {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);

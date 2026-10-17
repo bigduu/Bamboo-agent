@@ -67,6 +67,22 @@ pub(crate) struct SupervisorFollowupGuard {
     sessions: Vec<SessionWriteGuard>,
     _task: RuntimeTaskTransactionReadGuard,
     _lifecycle: SessionLifecycleReadGuard,
+    // A private observation held stable by these same target Session locks.
+    // It closes only new Loop carriers, never reads or exact receipt retries.
+    scoped_loop_stopped: bool,
+    scoped_native: Option<Box<super::scoped_transport_expiry::ScopedTransportCensus>>,
+}
+
+impl SupervisorFollowupGuard {
+    pub(crate) fn scoped_native(
+        &self,
+    ) -> Option<super::scoped_transport_expiry::ScopedTransportCensus> {
+        self.scoped_native.as_deref().cloned()
+    }
+
+    pub(crate) fn scoped_loop_stopped(&self) -> bool {
+        self.scoped_loop_stopped
+    }
 }
 
 /// Management publication owns the existing locks, not a new authority grant.
@@ -169,7 +185,83 @@ impl SessionStoreV2 {
             sessions,
             _task: task,
             _lifecycle: lifecycle,
+            scoped_loop_stopped: false,
+            scoped_native: None,
         })
+    }
+
+    /// The existing sorted authority lock set, retained through the caller's
+    /// physical read/write jobs. Do not call a public writer while holding it.
+    pub(crate) async fn lock_scoped_loop_authority(
+        &self,
+        binding: &bamboo_domain::ScopedLoopControlBinding,
+    ) -> io::Result<SupervisorFollowupGuard> {
+        binding.validate().map_err(invalid)?;
+        let mut guard = self
+            .lock_supervisor_followup(&binding.supervisor, &binding.target_session_id)
+            .await?;
+        let source = self
+            .load_execution_admission_unchecked(&binding.supervisor.session_id)
+            .await?
+            .ok_or_else(|| denied("Supervisor disappeared"))?;
+        let target = self
+            .load_execution_admission_unchecked(&binding.target_session_id)
+            .await?
+            .ok_or_else(|| denied("Loop target disappeared"))?;
+        let state = source
+            .supervisor_management
+            .as_ref()
+            .ok_or_else(|| denied("Supervisor scope missing"))?;
+        let link = state
+            .links
+            .get(&binding.target_session_id)
+            .ok_or_else(|| denied("Supervisor link missing"))?;
+        let blocked = |session: &Session, tool: &str| -> io::Result<bool> {
+            let disabled: BTreeSet<String> = match session.metadata.get("disabled_tools") {
+                Some(raw) => serde_json::from_str(raw)
+                    .map_err(|_| denied("invalid disabled tools authority"))?,
+                None => BTreeSet::new(),
+            };
+            // This checks one known core capability, not a provider catalog.
+            // Unknown qualified references keep the shared denial fallback.
+            Ok(disabled.iter().any(|reference| {
+                bamboo_domain::resolve_disabled_tool_reference_name(reference, |name| name == tool)
+                    .as_deref()
+                    == Some(tool)
+            }) || session
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|runtime| runtime.read_only || runtime.plan_mode.is_some()))
+        };
+        if source.supervisor_incarnation_id() != Some(binding.supervisor.incarnation_id)
+            || source.root_tool_authority_revision != binding.supervisor_tool_authority_revision
+            || !source.allows_model_tool_execution("session_control")
+            || blocked(&source, "session_control")?
+            || blocked(&target, "loop_control")?
+            || target.root_orchestration_only_enabled()
+            || !link_authorizes_target(state, link, &target)
+            || link.revision != binding.link_revision
+            || target.created_at != binding.target_created_at
+            || target.metadata_version != binding.target_metadata_version
+            || target_project(&target)? != binding.target_project_id
+            || target
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|runtime| runtime.execution_id.as_deref())
+                != Some(binding.execution_id.as_str())
+        {
+            return Err(denied("Supervisor Loop canonical authority changed"));
+        }
+        // Read-only native physical authority: a logical slot cannot keep
+        // admitting carriers after its Actor lease expires or is superseded.
+        let census = super::scoped_transport_expiry::ScopedTransportCensus::read(
+            &self.sessions_dir.join(&target.id),
+        )?
+        .ok_or_else(|| denied("Loop target canonical census missing"))?;
+        census.require_live_binding(binding)?;
+        guard.scoped_native = Some(Box::new(census));
+        guard.scoped_loop_stopped = Self::scoped_loop_execution_stopped(&target, binding)?;
+        Ok(guard)
     }
 
     pub(super) async fn management_history(

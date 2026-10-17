@@ -49,3 +49,25 @@ pub type Result<T> = std::result::Result<T, AgentError>;
 
 #[cfg(test)]
 mod tests;
+
+/// Stable, content-free outcome categories shared by loop and provider spans.
+fn telemetry_outcome<T>(
+    result: &std::result::Result<T, AgentError>,
+) -> bamboo_infrastructure::telemetry::Outcome {
+    match result {
+        Ok(_) => bamboo_infrastructure::telemetry::Outcome::Success,
+        Err(error) => telemetry_error_outcome(error),
+    }
+}
+
+fn telemetry_error_outcome(error: &AgentError) -> bamboo_infrastructure::telemetry::Outcome {
+    use bamboo_infrastructure::telemetry::Outcome;
+    match error {
+        AgentError::Cancelled => Outcome::Cancelled,
+        AgentError::StreamTimeout(_) => Outcome::Timeout,
+        AgentError::LLMOverflow(_) => Outcome::ContextOverflow,
+        AgentError::EmptyAssistantResponse { .. } => Outcome::EmptyResponse,
+        AgentError::LLM(_) => Outcome::ProviderError,
+        _ => Outcome::ExecutionError,
+    }
+}

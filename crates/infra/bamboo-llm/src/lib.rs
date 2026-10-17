@@ -32,6 +32,7 @@ pub mod api {
 pub use bamboo_config::Config;
 pub use cache::{CacheTtl, PromptCachePlan};
 pub use error::ProxyAuthRequiredError;
+pub use image_budget::{validate_tool_image_budget, validate_tool_result_images};
 pub use model_catalog::ModelCatalogService;
 pub use models::*;
 pub use prompt_ir::{Continuation, PromptIR, Segment, SegmentRole};

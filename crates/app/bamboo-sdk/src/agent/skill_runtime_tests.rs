@@ -889,6 +889,108 @@ async fn sdk_typed_real_portable_hook_once_before_f_and_append_with_same_images(
 }
 
 #[tokio::test]
+async fn supervisor_delegation_first_sdk_denies_selected_skill_before_append_and_hides_metadata() {
+    for ultra in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        write_skill(home.path(), "sdk-supervisor", true);
+        let provider = Arc::new(PassiveProvider::default());
+        let agent = build(home.path(), provider.clone()).await;
+        let bootstrap = agent
+            .supervisor_sessions()
+            .get_or_create_default("claude-test")
+            .await
+            .unwrap();
+        let mut session = agent
+            .storage()
+            .load_session(&bootstrap.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        session.set_root_orchestration_only(ultra).unwrap();
+        let defaults = agent.sdk_skills.as_ref().unwrap();
+        defaults.sessions.save(&mut session).await.unwrap();
+        // Exercise the restored typed identity, not an SDK-only role flag.
+        session = serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        assert_eq!(
+            session.supervisor_incarnation_id(),
+            Some(bootstrap.incarnation_id)
+        );
+        let before = serde_json::to_value(&session).unwrap();
+        let cache_before = defaults
+            .sessions
+            .cache()
+            .get(&session.id)
+            .map(|entry| serde_json::to_value(&*entry.read()).unwrap());
+        let result = agent
+            .run_with_skills(
+                &mut session,
+                SdkSkillInput::new(
+                    "explicit implementation Skill must be delegated",
+                    selections(&agent, &["sdk-supervisor"]).await,
+                ),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "Supervisor Ultra={ultra}: selected Skill reached the provider"
+        );
+        assert!(result.unwrap_err().to_string().contains("delegat"));
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(
+                agent
+                    .storage()
+                    .load_session(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            before,
+            "denial must precede durable input or runtime publication",
+        );
+        assert_eq!(
+            defaults
+                .sessions
+                .cache()
+                .get(&session.id)
+                .map(|entry| serde_json::to_value(&*entry.read()).unwrap()),
+            cache_before
+        );
+        assert!(provider.0.lock().unwrap().is_empty());
+        assert!(defaults
+            .manager
+            .pinned_activation_for_workspace(&session.id, None)
+            .await
+            .unwrap()
+            .is_none());
+
+        // An ordinary typed User remains usable. Automatic Skill metadata is
+        // absent even though this defaults-backed host has a matching Skill.
+        agent
+            .run_with_skills(
+                &mut session,
+                SdkSkillInput::new("coordinate the authorized work", vec![]),
+            )
+            .await
+            .unwrap();
+        let trace = provider.0.lock().unwrap();
+        assert!(!trace.is_empty());
+        for (messages, schemas) in trace.iter() {
+            assert!(!schemas.iter().any(|name| matches!(
+                name.as_str(),
+                "skills_list" | "skills_read" | "load_skill" | "workflow_run"
+            )));
+            assert!(!messages
+                .iter()
+                .any(|message| message.content.contains("Using Skills")
+                    || message.content.contains("### Explicit Skill")
+                    || message.content.contains("MAIN_EOF_sdk-supervisor")));
+        }
+    }
+}
+
+#[tokio::test]
 async fn sdk_defaults_ultra_keeps_exact_registered_authority_intersection_and_denies_skill_input() {
     let home = tempfile::tempdir().unwrap();
     write_skill(home.path(), "sdk-ultra", true);
@@ -1125,29 +1227,18 @@ impl LLMProvider for LegacyCheckpointProvider {
     }
 }
 
-#[tokio::test]
-async fn sdk_real_loaded_instruction_converts_checkpointed_history_once_and_restart_is_inert() {
+async fn real_loaded_instruction_history(
+    agent: &Agent,
+    mut session: Session,
+) -> (Session, String, String) {
     use bamboo_agent_core::tools::Tool;
     use bamboo_skills::runtime_metadata::{
         SKILL_RUNTIME_ACTIVATION_GENERATION_KEY, SKILL_RUNTIME_PINNED_SNAPSHOT_KEY,
         SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY, SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY,
         SKILL_RUNTIME_SELECTION_SOURCE_KEY,
     };
-    let home = tempfile::tempdir().unwrap();
-    let root = home.path().join("skills/sdk-loaded-history");
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("SKILL.md"), "---\nname: sdk-loaded-history\ndescription: Historical loaded instructions.\n---\nOLD_COMPLETE_INSTRUCTION_HISTORY\n").unwrap();
-    let session_id = "sdk-loaded-history";
-    let provider = Arc::new(LegacyCheckpointProvider {
-        repository: Mutex::new(None),
-        session_id: session_id.into(),
-        saved_before_provider: Mutex::default(),
-        inner: NoCurrentProvider(Mutex::default()),
-    });
-    let agent = build(home.path(), provider.clone()).await;
     let defaults = agent.sdk_skills.as_ref().unwrap();
-    *provider.repository.lock().unwrap() = Some(defaults.sessions.clone());
-    let mut session = agent.new_session(session_id).unwrap();
+    let session_id = session.id.clone();
     session.title = "Preserve the original legacy title".into();
     session
         .metadata
@@ -1160,7 +1251,7 @@ async fn sdk_real_loaded_instruction_converts_checkpointed_history_once_and_rest
     // These are old host selection metadata, not current SDK authority/Q.
     let descriptor = defaults
         .manager
-        .pin_current_activation_for_workspace(session_id, None, &[selection.id.clone()], None)
+        .pin_current_activation_for_workspace(&session_id, None, &[selection.id.clone()], None)
         .await
         .unwrap();
     session.metadata.insert(
@@ -1199,7 +1290,7 @@ async fn sdk_real_loaded_instruction_converts_checkpointed_history_once_and_rest
     )
     .with_project_store(defaults.projects.clone());
     let mut ctx = ToolExecutionContext::none(&call.id);
-    ctx.session_id = Some(session_id);
+    ctx.session_id = Some(&session_id);
     let outcome = loader
         .invoke(json!({"skill_id":"sdk-loaded-history"}), ctx.to_tool_ctx())
         .await
@@ -1212,7 +1303,7 @@ async fn sdk_real_loaded_instruction_converts_checkpointed_history_once_and_rest
     session = defaults
         .sessions
         .storage()
-        .load_session(session_id)
+        .load_session(&session_id)
         .await
         .unwrap()
         .unwrap();
@@ -1232,6 +1323,28 @@ async fn sdk_real_loaded_instruction_converts_checkpointed_history_once_and_rest
             .contains_key(bamboo_skills::WORKFLOW_ACTIVATION_EVENT_METADATA_KEY),
         "real loader without an event sender must leave its actual pending outbox"
     );
+    (session, original_user_id, receipt_id)
+}
+
+#[tokio::test]
+async fn sdk_real_loaded_instruction_converts_checkpointed_history_once_and_restart_is_inert() {
+    use bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("skills/sdk-loaded-history");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("SKILL.md"), "---\nname: sdk-loaded-history\ndescription: Historical loaded instructions.\n---\nOLD_COMPLETE_INSTRUCTION_HISTORY\n").unwrap();
+    let session_id = "sdk-loaded-history";
+    let provider = Arc::new(LegacyCheckpointProvider {
+        repository: Mutex::new(None),
+        session_id: session_id.into(),
+        saved_before_provider: Mutex::default(),
+        inner: NoCurrentProvider(Mutex::default()),
+    });
+    let agent = build(home.path(), provider.clone()).await;
+    let (mut session, original_user_id, receipt_id) =
+        real_loaded_instruction_history(&agent, agent.new_session(session_id).unwrap()).await;
+    let defaults = agent.sdk_skills.as_ref().unwrap();
+    *provider.repository.lock().unwrap() = Some(defaults.sessions.clone());
     let original_messages = session.messages.clone();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(128);
     // This is the real run_session execution boundary, retaining its events
@@ -1403,6 +1516,148 @@ async fn sdk_real_loaded_instruction_converts_checkpointed_history_once_and_rest
     assert_eq!(provider.inner.0.lock().unwrap().requests.len(), 2);
     assert_eq!(restarted_provider.inner.0.lock().unwrap().requests.len(), 2);
 }
+
+#[tokio::test]
+async fn supervisor_delegation_first_sdk_legacy_history_rejects_before_conversion_and_restart() {
+    for (trusted_supervisor, ultra) in [(true, false), (true, true), (false, true)] {
+        for canonical_selection in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path().join("skills/sdk-loaded-history");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("SKILL.md"), "---\nname: sdk-loaded-history\ndescription: Historical loaded instructions.\n---\nOLD_COMPLETE_INSTRUCTION_HISTORY\n").unwrap();
+            let provider = Arc::new(PassiveProvider::default());
+            let agent = build(home.path(), provider.clone()).await;
+            let (legacy, _, _) = real_loaded_instruction_history(
+                &agent,
+                agent.new_session("legacy-history-fixture").unwrap(),
+            )
+            .await;
+            let (mut session, incarnation) = if trusted_supervisor {
+                let bootstrap = agent
+                    .supervisor_sessions()
+                    .get_or_create_default("claude-test")
+                    .await
+                    .unwrap();
+                let session = agent
+                    .storage()
+                    .load_session(&bootstrap.session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                (session, Some(bootstrap.incarnation_id))
+            } else {
+                (
+                    agent.new_session("ordinary-ultra-legacy-history").unwrap(),
+                    None,
+                )
+            };
+            session.set_root_orchestration_only(ultra).unwrap();
+            // Model an old trusted Supervisor checkpoint with an actually loaded
+            // Instruction episode. Current Supervisor tool admission stays on;
+            // only the historical fixture bytes come from the production loader.
+            session.messages = legacy.messages;
+            session.metadata.extend(legacy.metadata);
+            if canonical_selection {
+                session.set_selected_skill_ids(vec!["sdk-loaded-history".into()]);
+            }
+            session = serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+            assert_eq!(session.supervisor_incarnation_id(), incarnation);
+            assert_eq!(
+                session
+                    .selected_skill_ids()
+                    .is_some_and(|ids| !ids.is_empty()),
+                canonical_selection
+            );
+            let plan = bamboo_engine::session_app::plan_legacy_skill_history(
+                &session.messages,
+                &session.metadata,
+            )
+            .unwrap();
+            assert!(plan.unsupported.is_none());
+            assert!(plan
+                .message
+                .unwrap()
+                .content
+                .contains("OLD_COMPLETE_INSTRUCTION_HISTORY"));
+            let legacy_metadata = plan
+                .remove_metadata
+                .iter()
+                .map(|key| (key.clone(), session.metadata[key].clone()))
+                .collect::<BTreeMap<_, _>>();
+            let original_messages = session.messages.clone();
+            agent
+                .sdk_skills
+                .as_ref()
+                .unwrap()
+                .sessions
+                .save(&mut session)
+                .await
+                .unwrap();
+
+            // Both attempts use fresh defaults hosts and durable reloads. An
+            // error must not migrate away the evidence and make the retry pass.
+            for restart in 0..2 {
+                let resumed_agent = build(home.path(), provider.clone()).await;
+                let mut resumed = resumed_agent
+                    .storage()
+                    .load_session(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let result = resumed_agent.run_session(&mut resumed).await;
+                assert!(result.is_err(), "Supervisor={trusted_supervisor}, Ultra={ultra}, canonical={canonical_selection}, restart={restart}: legacy Skill reached the provider");
+                assert!(result.unwrap_err().to_string().contains("delegat"));
+                assert!(
+                    provider.0.lock().unwrap().is_empty(),
+                    "legacy instructions must never reach a provider"
+                );
+                let durable = resumed_agent
+                    .storage()
+                    .load_session(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let defaults = resumed_agent.sdk_skills.as_ref().unwrap();
+                let cached = defaults
+                    .sessions
+                    .cache()
+                    .get(&session.id)
+                    .map(|entry| entry.read().clone());
+                for snapshot in [&resumed, &durable].into_iter().chain(cached.as_ref()) {
+                    for (key, value) in &legacy_metadata {
+                        assert_eq!(
+                            snapshot.metadata.get(key),
+                            Some(value),
+                            "denial must precede legacy checkpoint mutation: {key}"
+                        );
+                    }
+                    for original in &original_messages {
+                        let retained = snapshot
+                            .messages
+                            .iter()
+                            .find(|message| message.id == original.id)
+                            .unwrap();
+                        assert_eq!(
+                            serde_json::to_value(retained).unwrap(),
+                            serde_json::to_value(original).unwrap()
+                        );
+                    }
+                    assert!(
+                        !snapshot
+                            .messages
+                            .iter()
+                            .any(|message| message.role == Role::Assistant
+                                && message.tool_calls.is_none()
+                                && message.content.contains("### Instructions")
+                                && message.content.contains("OLD_COMPLETE_INSTRUCTION_HISTORY")),
+                        "denial must precede ordinary Skill history insertion"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn sdk_typed_registered_router_busy_cancel_and_drop_release_before_canonical_owner_retry() {
     for drop_future in [false, true] {

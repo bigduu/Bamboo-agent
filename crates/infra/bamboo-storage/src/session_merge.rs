@@ -178,6 +178,22 @@ pub(crate) fn adopt_durable_actor_parent_question_handoff(
     Ok(())
 }
 
+/// A failed scoped checkpoint whose strict reload also failed cannot enter
+/// ordinary merge/cache publication. Keep the volatile fence in the caller;
+/// only a separately observed canonical snapshot may replace it.
+fn ensure_scoped_loop_checkpoint_known(session: &Session) -> std::io::Result<()> {
+    if session
+        .metadata
+        .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "scoped Loop checkpoint outcome is uncertain; strict canonical reload required",
+        ));
+    }
+    Ok(())
+}
+
 fn may_publish_runtime_result(result: &std::io::Result<()>) -> bool {
     !result.as_ref().err().is_some_and(|error| {
         error.get_ref().is_some_and(|cause| {
@@ -677,6 +693,7 @@ impl LockedSessionStore {
         session: &mut Session,
         runtime_only: bool,
     ) -> std::io::Result<()> {
+        ensure_scoped_loop_checkpoint_known(session)?;
         if self.child_actor_writer.is_some() {
             return self
                 .save_child_snapshot(session, runtime_only, None, None)
@@ -994,6 +1011,7 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session) + Send,
     {
+        ensure_scoped_loop_checkpoint_known(session)?;
         let _guard = self.acquire_lock(&session.id).await;
         if let Some(latest) = self.storage.load_runtime_control_plane(&session.id).await? {
             apply_authoritative_metadata(session, &latest);
@@ -1452,6 +1470,7 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
+        ensure_scoped_loop_checkpoint_known(session)?;
         let _guard = self.acquire_lock(&session.id).await;
         let latest = self.storage.load_session(&session.id).await?;
 
@@ -1729,6 +1748,7 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
+        ensure_scoped_loop_checkpoint_known(session)?;
         let _guard = self.acquire_lock(&session.id).await;
 
         // Single disk read serves BOTH the SHRINK diagnostic and the
@@ -1821,6 +1841,7 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
+        ensure_scoped_loop_checkpoint_known(session)?;
         let _guard = self.acquire_lock(&session.id).await;
         let mut incoming_audit = PermissionAuditSnapshot::from_metadata(&session.metadata)
             .ok_or_else(|| {
@@ -2172,6 +2193,81 @@ impl LockedSessionStore {
 /// not define a separate adapter layer for the same behavior.
 #[async_trait::async_trait]
 impl RuntimeSessionPersistence for LockedSessionStore {
+    async fn claim_scoped_loop_controls(
+        &self,
+        session: &Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        active_run_id: &str,
+        limit: usize,
+    ) -> std::io::Result<Vec<bamboo_domain::ScopedLoopControlClaim>> {
+        use bamboo_domain::ScopedLoopControlClaim;
+        if let Some((owner, _)) = self.root_actor_writer.as_ref() {
+            let inbox = self.storage.bind_root_actor_inbox(owner, inbox)?;
+            let request = bamboo_domain::SessionInboxLeaseRequest {
+                consumer: bamboo_domain::SessionInboxConsumerId::new(),
+                now: chrono::Utc::now(),
+                duration: chrono::Duration::seconds(5),
+            };
+            return inbox
+                .claim_owned_scoped_loop_controls(&session.id, limit, Some(active_run_id), &request)
+                .await
+                .map(|claims| {
+                    claims
+                        .into_iter()
+                        .map(ScopedLoopControlClaim::Owned)
+                        .collect()
+                })
+                .map_err(std::io::Error::other);
+        }
+        inbox
+            .claim_scoped_loop_controls(&session.id, limit, Some(active_run_id))
+            .await
+            .map(|claims| {
+                claims
+                    .into_iter()
+                    .map(ScopedLoopControlClaim::Legacy)
+                    .collect()
+            })
+            .map_err(std::io::Error::other)
+    }
+
+    async fn checkpoint_scoped_loop_control(
+        &self,
+        session: &mut Session,
+        bindings: &[bamboo_domain::ScopedLoopControlBinding],
+        activation: Arc<dyn bamboo_domain::SessionActivationPort>,
+        input: Option<(
+            Arc<dyn bamboo_domain::SessionInboxPort>,
+            bamboo_domain::ScopedLoopControlClaim,
+        )>,
+    ) -> std::io::Result<()> {
+        let _guard = self.acquire_lock(&session.id).await;
+        let publish = self
+            .root_actor_writer
+            .as_ref()
+            .map(|(_, publish)| publish.clone())
+            .unwrap_or_else(|| Arc::new(|_: &Session| {}));
+        self.storage
+            .checkpoint_scoped_loop(bamboo_domain::ScopedLoopControlCheckpoint {
+                session,
+                bindings,
+                activation,
+                owner: self.root_actor_writer.as_ref().map(|(owner, _)| owner),
+                input,
+                publish,
+            })
+            .await
+    }
+
+    async fn load_loop_control_checkpoint(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        self.storage
+            .load_execution_admission_snapshot(session_id)
+            .await
+    }
+
     async fn admit_root_inbox(
         &self,
         session: &mut Session,
@@ -3316,6 +3412,7 @@ pub async fn merge_save_session(
     storage: &Arc<dyn Storage>,
     session: &mut Session,
 ) -> std::io::Result<()> {
+    ensure_scoped_loop_checkpoint_known(session)?;
     merge_authoritative_metadata_into_stale(storage, session).await?;
     storage.save_session(session).await
 }
@@ -3328,6 +3425,75 @@ mod tests {
     use crate::v2::{RuntimeTaskTransactionFault, SessionStoreV2};
     use bamboo_domain::{session::types::Session, PermissionMode};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn scoped_unknown_checkpoint_cannot_enter_generic_merge_or_publish_callbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(
+            SessionStoreV2::new(dir.path().join("sessions"))
+                .await
+                .unwrap(),
+        );
+        let canonical = Session::new("scoped-unknown-merge", "model");
+        storage.save_session(&canonical).await.unwrap();
+        let before =
+            serde_json::to_value(storage.load_session(&canonical.id).await.unwrap().unwrap())
+                .unwrap();
+        let store = LockedSessionStore::new(storage.clone());
+        let published = AtomicUsize::new(0);
+        for mode in 0..4 {
+            let mut uncertain = canonical.clone();
+            uncertain.add_message(bamboo_domain::Message::user(
+                "Unconfirmed proposal must not be published.",
+            ));
+            uncertain.metadata.insert(
+                bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY.into(),
+                "strict reload failed".into(),
+            );
+            let result = match mode {
+                0 => {
+                    store
+                        .merge_save_runtime_and_publish(&mut uncertain, |_, _| {
+                            published.fetch_add(1, Ordering::SeqCst);
+                        })
+                        .await
+                }
+                1 => {
+                    store
+                        .save_runtime_only_and_publish(&mut uncertain, |_| {
+                            published.fetch_add(1, Ordering::SeqCst);
+                        })
+                        .await
+                }
+                2 => {
+                    store
+                        .checkpoint_runtime_session_and_publish(&mut uncertain, |_, _| {
+                            published.fetch_add(1, Ordering::SeqCst);
+                        })
+                        .await
+                }
+                _ => {
+                    store
+                        .merge_save_finalized_runtime_and_publish(&mut uncertain, |_, _| {
+                            published.fetch_add(1, Ordering::SeqCst);
+                        })
+                        .await
+                }
+            };
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            assert!(uncertain
+                .metadata
+                .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY));
+            assert_eq!(published.load(Ordering::SeqCst), 0);
+            let after =
+                serde_json::to_value(storage.load_session(&canonical.id).await.unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(
+                after, before,
+                "mode {mode} wrote or projected an unknown candidate"
+            );
+        }
+    }
 
     #[test]
     fn authority_merge_updates_ordinary_cache_but_does_not_hide_stale_incarnation() {

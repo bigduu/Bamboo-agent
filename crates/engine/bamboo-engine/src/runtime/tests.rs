@@ -330,6 +330,100 @@ impl LLMProvider for CompletedTranscriptProvider {
     }
 }
 
+struct BirthCheckedDirectProvider {
+    router: Arc<crate::session_activation::SessionActivationRouter>,
+    target: Session,
+    observed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl LLMProvider for BirthCheckedDirectProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[bamboo_agent_core::tools::ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let run_id = self.router.current_run_id(&self.target.id).await.unwrap();
+        let router = self.router.clone();
+        let target = self.target.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = bamboo_domain::SessionActivationPort::retain_expected_run_blocking(
+                router.as_ref(),
+                &target.id,
+                target.created_at,
+                &run_id,
+            )
+            .unwrap();
+            assert!(guard.matches(&target.id, target.created_at, &run_id));
+        })
+        .await
+        .unwrap();
+        self.observed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        CompletedTranscriptProvider
+            .chat_stream(messages, tools, max_output_tokens, model)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn direct_registered_execution_binds_birth_before_provider_input() {
+    let router = crate::session_activation::SessionActivationRouter::new();
+    let mut session = Session::new("birth-bound-sdk-direct", "test-model");
+    session.add_message(Message::user("complete this registered run"));
+    let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider = Arc::new(BirthCheckedDirectProvider {
+        router: router.clone(),
+        target: session.clone(),
+        observed: observed.clone(),
+    });
+    let (_temp, agent, storage) = build_direct_execute_agent_with_router(
+        provider,
+        None,
+        None,
+        bamboo_llm::Config::default(),
+        Arc::new(bamboo_skills::SkillManager::new()),
+        Some(router.clone()),
+    )
+    .await;
+    storage.save_session(&session).await.unwrap();
+    let lease = agent.begin_direct_execution(&session.id).await.unwrap();
+    let run_id = router.current_run_id(&session.id).await.unwrap();
+    let query = router.clone();
+    let target = session.clone();
+    let conflict = tokio::task::spawn_blocking(move || {
+        bamboo_domain::SessionActivationPort::retain_expected_run_blocking(
+            query.as_ref(),
+            &target.id,
+            target.created_at,
+            &run_id,
+        )
+    })
+    .await
+    .unwrap()
+    .err()
+    .unwrap();
+    assert_eq!(
+        conflict.reason,
+        bamboo_domain::SessionRunConflictReason::UnboundLifetime
+    );
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+    agent
+        .execute_direct_registered(
+            &mut session,
+            direct_request(event_tx, CancellationToken::new()),
+            lease,
+        )
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(router.current_run_id(&session.id).await, None);
+}
+
 struct PartialThenTerminalErrorProvider;
 
 #[async_trait]
@@ -727,6 +821,25 @@ async fn build_direct_execute_agent_with_config_and_skill_manager(
     config: bamboo_llm::Config,
     skill_manager: Arc<bamboo_skills::SkillManager>,
 ) -> (tempfile::TempDir, crate::runtime::Agent, Arc<dyn Storage>) {
+    build_direct_execute_agent_with_router(
+        provider,
+        persistence_override,
+        tools_override,
+        config,
+        skill_manager,
+        None,
+    )
+    .await
+}
+
+async fn build_direct_execute_agent_with_router(
+    provider: Arc<dyn LLMProvider>,
+    persistence_override: Option<Arc<dyn RuntimeSessionPersistence>>,
+    tools_override: Option<Arc<dyn ToolExecutor>>,
+    config: bamboo_llm::Config,
+    skill_manager: Arc<bamboo_skills::SkillManager>,
+    router: Option<Arc<crate::session_activation::SessionActivationRouter>>,
+) -> (tempfile::TempDir, crate::runtime::Agent, Arc<dyn Storage>) {
     let temp = tempfile::tempdir().expect("tempdir");
     let session_store = Arc::new(
         bamboo_storage::SessionStoreV2::new(temp.path().join("sessions"))
@@ -744,7 +857,7 @@ async fn build_direct_execute_agent_with_config_and_skill_manager(
         )),
         7,
     );
-    let agent = crate::runtime::Agent::builder()
+    let mut builder = crate::runtime::Agent::builder()
         .storage(storage.clone())
         .persistence(persistence)
         .attachment_reader(session_store)
@@ -752,9 +865,11 @@ async fn build_direct_execute_agent_with_config_and_skill_manager(
         .metrics_collector(metrics)
         .config(Arc::new(RwLock::new(config)))
         .provider(provider)
-        .default_tools(tools_override.unwrap_or_else(|| Arc::new(BuiltinToolExecutor::new())))
-        .build()
-        .expect("direct execute agent");
+        .default_tools(tools_override.unwrap_or_else(|| Arc::new(BuiltinToolExecutor::new())));
+    if let Some(router) = router {
+        builder = builder.activation_router(router);
+    }
+    let agent = builder.build().expect("direct execute agent");
     (temp, agent, storage)
 }
 

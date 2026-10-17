@@ -1340,6 +1340,119 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
 }
 
 #[test]
+fn supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standard_and_ultra() {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let tools = StaticToolExecutor {
+        schemas: bamboo_domain::ROOT_ORCHESTRATION_TOOLS
+            .into_iter()
+            .chain(bamboo_domain::SUPERVISOR_ORCHESTRATION_TOOLS)
+            .chain([
+                "exec_command",
+                "write_stdin",
+                "Edit",
+                "Write",
+                "load_skill",
+                "workflow_run",
+                "loop_control",
+                "vendor::Read",
+                "default::Read",
+                "vendor::session_control",
+            ])
+            .map(schema)
+            .collect(),
+    };
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    for ultra in [false, true] {
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &supervisor);
+        let names = catalog
+            .iter()
+            .map(|entry| entry.execution_name().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = bamboo_domain::ROOT_ORCHESTRATION_TOOLS
+            .into_iter()
+            .chain(bamboo_domain::SUPERVISOR_ORCHESTRATION_TOOLS)
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(names, expected, "Supervisor ultra={ultra}");
+        let provider = resolve_available_tool_schemas_for_session(&config, &tools, &supervisor)
+            .into_iter()
+            .map(|entry| entry.function.name)
+            .collect();
+        let discovery =
+            crate::capability_discovery::project_classified_tool_capability_metadata(&catalog)
+                .into_iter()
+                .map(|entry| entry.canonical_name)
+                .collect();
+        assert_eq!(names, provider);
+        assert_eq!(names, discovery);
+        assert!(
+            super::tool_schemas::effective_guide_activation(&config, &supervisor)
+                .contains("SubAgent")
+        );
+    }
+}
+
+#[test]
+fn supervisor_delegation_first_freezes_full_guide_without_user_activation_or_disabled_tool_leak() {
+    use super::tool_schemas::{effective_guide_activation, resolve_tool_schemas_for_round};
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    let tools = StaticToolExecutor {
+        schemas: ["Read", "SubAgent", "exec_command"]
+            .into_iter()
+            .map(schema)
+            .collect(),
+    };
+    let config = crate::runtime::config::AgentLoopConfig {
+        freeze_tool_exposure_for_cache: true,
+        ..Default::default()
+    };
+    for ultra in [false, true, false] {
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        let schemas = resolve_tool_schemas_for_round(&config, &tools, &mut supervisor);
+        assert_eq!(supervisor.metadata["prompt_tool_exposure_activated"], "[]");
+        let subagent = schemas
+            .iter()
+            .find(|s| s.function.name == "SubAgent")
+            .unwrap();
+        assert!(subagent
+            .function
+            .description
+            .contains("Supervisor: delegate execution"));
+        let guide = super::prompt_setup::build_tool_guide_context(
+            &config,
+            &schemas,
+            "base",
+            &supervisor.id,
+            &effective_guide_activation(&config, &supervisor),
+        );
+        assert!(guide.contains("**SubAgent**"));
+        assert!(guide.contains("A trusted Supervisor delegates execution even for simple tasks"));
+        assert!(guide.contains("From a child session"));
+    }
+    let config = crate::runtime::config::AgentLoopConfig {
+        disabled_tools: ["SubAgent".into()].into(),
+        ..Default::default()
+    };
+    let schemas = resolve_tool_schemas_for_round(&config, &tools, &mut supervisor);
+    assert_eq!(
+        schemas
+            .iter()
+            .map(|s| s.function.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Read"]
+    );
+}
+
+#[test]
 fn supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials() {
     use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
     let tools = StaticToolExecutor {
@@ -2921,4 +3034,79 @@ fn disabling_cache_freeze_restores_live_guide_expansion() {
     assert!(!session
         .metadata
         .contains_key("prompt_tool_exposure_activated"));
+}
+
+#[tokio::test]
+async fn supervisor_delegation_first_legacy_selection_refuses_before_setup_side_effects() {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    for (trusted_supervisor, ultra) in [(true, false), (true, true), (false, true)] {
+        for key in [
+            bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY,
+            bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY,
+            bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY,
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY,
+        ] {
+            let mut session = if trusted_supervisor {
+                let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+                session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: uuid::Uuid::new_v4(),
+                };
+                session
+            } else {
+                Session::new("ordinary-ultra-old-activation", "model")
+            };
+            session.set_root_orchestration_only(ultra).unwrap();
+            session.metadata.insert(key.into(), "{}".into());
+            session.metadata.insert(
+                bamboo_skills::WORKFLOW_ACTIVATION_EVENT_METADATA_KEY.into(),
+                serde_json::json!({"type":"workflow.activated", "workflow_id":"old", "revision":1})
+                    .to_string(),
+            );
+            session.add_message(Message::system("Original system\n<!-- BAMBOO_SKILL_CONTEXT_START -->old execution instructions<!-- BAMBOO_SKILL_CONTEXT_END -->"));
+            let before = serde_json::to_value(&session).unwrap();
+            let persistence = Arc::new(RecordingPersistence::default());
+            let config = crate::runtime::config::AgentLoopConfig {
+                persistence: Some(persistence.clone()),
+                ..Default::default()
+            };
+            let tools = RecordingToolExecutor::default();
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+            let session_id = session.id.clone();
+            let result = super::prepare_session_for_loop(
+                &mut session,
+                "must not append this User",
+                &config,
+                &tools,
+                None,
+                &session_id,
+                &crate::runtime::runner::logging::DebugLogger::new(false),
+                false,
+                &event_tx,
+            )
+            .await;
+            assert!(result.unwrap_err().to_string().contains("delegat"));
+            assert_eq!(serde_json::to_value(&session).unwrap(), before);
+            assert!(persistence.sessions.lock().unwrap().is_empty());
+            assert!(tools.calls.lock().unwrap().is_empty());
+            assert!(event_rx.try_recv().is_err());
+        }
+    }
+
+    // A legacy checkpoint does not invent either Supervisor identity or Ultra.
+    let mut ordinary = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    ordinary.metadata.insert("role".into(), "supervisor".into());
+    ordinary.metadata.insert(
+        bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY.into(),
+        "{}".into(),
+    );
+    let child = Session::new_child_of("legacy-worker", &ordinary, "model", "worker");
+    for mut session in [ordinary, child] {
+        session.metadata.insert(
+            bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY.into(),
+            "{}".into(),
+        );
+        let before = serde_json::to_value(&session).unwrap();
+        super::legacy_instruction::validate_execution_selection(&session).unwrap();
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+    }
 }

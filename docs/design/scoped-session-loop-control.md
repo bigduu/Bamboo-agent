@@ -1,0 +1,458 @@
+# Scoped Supervisor Session management (#1976)
+
+## Product goal and present delivery status
+
+The Supervisor exists to manage **other Sessions**. It must eventually assign
+and update their goals, observe progress, pause/resume or stop work, receive
+results, and decide which authorized work to schedule next. Executing the
+task itself or enabling an Ordinary Root's self-loop is not completion of
+that product goal.
+
+This branch is the first bounded live implementation candidate. Its original
+implementation/validation base is protected dev
+`bf6b20bab2832b45d4b0927e971cea64866f2c77`. After local validation it was
+ordinarily merged with actual dev
+`0e32f537f66a76aba6108705acf733d6058d97c5`, including the accepted ZIP9 repair.
+The review regressions are then integrated with accepted P1 dev
+`b94ff17530c91bef3215bbc4cf8844aea8300548` before both their RED and GREEN;
+that merge changes the cold-Child adapter, without another dependency update. The original pushed
+design `305735f980e4b4316924216077930e644fb69bdc` and its 15 uncompiled synthetic
+contract tests were inspected and preserved separately. #1992 is now accepted
+in dev; its old test receipts are not acceptance evidence for this candidate.
+
+The current slice connects a strict executing Supervisor to finite
+`start/status/update/stop` on **one already attached and separately host-granted,
+currently running Standard Ordinary Root**. It is not the whole #1976 feature.
+Actual compilation and focused deterministic validation now record **666 distinct
+passed tests, 0 failed, 0 ignored** on their exact recorded heads, culminating
+in `6d2e0126c31b70ac7d14c6b386477910fc09cb28` on the original base. Original-CI
+Clippy, workspace formatting and diff checks also passed there. These are
+new-slice receipts; #1992's older green receipts were not reused as acceptance.
+
+Three public target-runner cases use the real Agent/Repository/Inbox/router,
+including a Repository-issued native Root writer and owned control claims.
+They exercise real canonical/provider goal consumption with a controlled
+provider. They call the Supervisor service directly; they do not prove a
+successful model-facing `SessionControlTool` chain, the complete Server
+reservation path, or every SDK external preparation step. Tool adapter identity,
+validation, replay denials and existing Followup behavior have separate tests.
+
+The ZIP9 dependency/base integration is a different validation context.
+Its focused combination and original-CI lint require their own exact-source
+receipts; the historical 666 passes do not establish them. Rust windows are
+separately coordinated, and every owner releases after its necessary local
+commands end naturally. Current-head/base remote review and required CI remain
+independent admission gates. The PR records the latest actual gate state.
+No real model or added-fee test was run. #1976 remains open, and frozen
+Nova/release sources remain independent.
+
+## Reused interface and authority
+
+Keep `loop_control` self-only. Extend the existing Supervisor management tool:
+
+```json
+{
+  "action": "loop",
+  "target_session_id": "attached-root-a",
+  "expected_link_revision": 7,
+  "command": {
+    "action": "update",
+    "operation_id": "a4b85b5b-ba44-488d-9900-20dd7e016e88",
+    "generation": "b23bc011-5424-4b5e-8fc9-3c861b89874b",
+    "expected_revision": 4,
+    "objective": "Verify the revised finite objective"
+  }
+}
+```
+
+`status` may omit `expected_link_revision` to bootstrap its current value,
+but still requires the same current host grant, strict identity, enabled link,
+Project and target-lifetime checks. Mutations require a nonzero exact link
+revision. A status query may additionally supply `receipt_operation_id` to
+read one actual target-side control outcome. This does not grant write access.
+Unknown fields and JSON claims of caller, grant, Project, owner, or permission
+are rejected. The shared command DTO/parser moves down to Domain; the existing
+`bamboo_tools::tools::loop_control` public path re-exports it unchanged.
+
+The tool retains the original `ToolCtx.executing_supervisor` observation.
+Plan, disabled-tool, ordinary permission and exact identity gates remain.
+Loop actions are serial and nonpromotable. Permission replay, including a
+legacy replay with no generation, cannot submit a fresh Loop command; old
+Followup replay behavior is preserved. Ordinary Roots, ordinary Ultra Roots,
+reserved-id impostors and children acquire no cross-Session capability.
+Thinking posture does not replace strict Supervisor identity.
+
+The outer advertised schema has action-specific `oneOf` branches: Followup
+requires its operation/message, and Loop requires its command. Boolean-false
+property schemas reject fields belonging to the other action. Within Loop,
+mutations require a positive link revision and reserve non-null receipt queries
+for Status. The nested command projects the shared bounded fields into strict
+Status/Start/Update/Stop branches without changing the standalone self-tool API.
+Start requires its real objective/bounds; Update requires at least one non-null
+patch. Nullable optional fields preserve the existing typed DTO round-trip:
+unused Update patches and Start's expected generation may serialize as null.
+Cross-action fields remain forbidden even when null. The common seven-property
+surface stays unchanged. These schema constraints do not replace runtime byte
+bounds, live owner CAS or any execution-authority check.
+
+Nested objective strings also require at least one character outside Rust's
+Unicode White_Space set. This preserves FEFF as content and rejects NEL-only
+text, rather than using a regex whitespace shorthand with different semantics.
+This unpublished remote command contract accepts at most **4096 Unicode scalar
+values**, counting the original objective including surrounding whitespace.
+The existing **16384 UTF-8 byte** limit and non-whitespace requirement still apply.
+Standard JSON Schema `maxLength: 4096` and the Domain scoped-command validator
+enforce the same scalar limit: a scalar occupies at most four UTF-8 bytes, so
+every schema-accepted string also fits the byte ceiling. The same Domain guard
+runs before Tool and direct Messenger delivery and when validating typed Inbox
+carriers. No trimming, normalization, authority or application is implied.
+Update's null objective remains an omitted patch; another actual patch is required.
+
+This is an explicit narrowing of the earlier **unreleased remote candidate**,
+not an exact schema encoding of the original full 16 KiB language. Standalone
+self `loop_control`, its shared request DTO and its 16 KiB contract are unchanged.
+For example:
+
+| Objective | Scalars | UTF-8 bytes | Self | Remote |
+|---|---:|---:|---|---|
+| ASCII repeated 4096 | 4096 | 4096 | accepts | accepts |
+| CJK repeated 4096 | 4096 | 12288 | accepts | accepts |
+| Emoji repeated 4096 | 4096 | 16384 | accepts | accepts |
+| `aé界😀` repeated 1024 | 4096 | 10240 | accepts | accepts |
+| ASCII repeated 16384 | 16384 | 16384 | accepts | rejects |
+| CJK repeated 5000 | 5000 | 15000 | accepts | rejects |
+| `aé界😀` repeated 1638, then `abcd` | 6556 | 16384 | accepts | rejects |
+| CJK repeated 5500 | 5500 | 16500 | rejects | rejects |
+
+The remote limit is independent of live grants, finite bounds, CAS and target
+consumption checks; passing text validation supplies none of that authority.
+The historical full-byte-schema mismatch evidence remains evidence of the old
+candidate, rather than being relabelled as parity under this narrower contract.
+
+Canonical disabled-tool checks use Domain's authoritative reference resolver
+for the corresponding fixed core capability (`session_control` on the source,
+`loop_control` on the target). Storage does not possess the dynamic provider
+catalog and does not invent foreign registrations from denial strings. An
+ambiguous qualified alias of that core capability is conservatively denied;
+encoded MCP names, different suffixes and the other core capability remain
+distinct. This is a deny-only check, never a new registered/callable identity.
+
+Attachment alone, the target's self-loop opt-in, schema registration and an
+orchestration whitelist entry are each insufficient. A separate host-only
+`SupervisorLoopControlGrant` bounds the exact original Supervisor incarnation,
+source tool-authority revision, link revision, permitted actions and finite
+limits. The target host installs it through `LoopControlConfig::supervisor_control`.
+At the real execution boundary the runtime binds target id/birth/metadata
+version/Project, router registration id and pipeline execution id. These two
+execution ids are distinct. The existing ActiveOwner holds the private slot;
+there is no second registry or durable capability store. Installation and host
+revocation use the existing target publication fence. Execution cancellation
+and host stop are checked again by the actual physical publication guard.
+
+The initialized target runtime frame is checkpointed through its existing
+owner before exposing this slot. Finishing/finalizing/replacing the owner
+expires it. A persisted LoopState or Inbox envelope never reconstructs it.
+
+## Structured delivery and target application
+
+The model tool calls the existing `SessionMessenger`, which obtains only an
+observation from the live slot and revalidates canonical authority in Storage.
+The mutation travels as a registered typed RuntimeInstruction,
+`supervisor_loop_control_v1`, through the **existing Session Inbox**. It uses
+the existing expected-run QueueOnly intent and live-owner fence. It never
+calls generic `request_activation`, reserves a successor, or creates a Root.
+
+Generic delivery cannot publish this control carrier. Ordinary and selected
+input consumers exclude it; `to_provider_message` rejects it. It is not a
+genuine User, free-text followup, Skill input, or fabricated target ToolCall /
+ToolResult. Existing #2000 delivery retries, selected-input fences and input /
+output attribution semantics remain separate.
+
+The existing target owner drains only this typed control before counted
+`before_round`, objective injection and budget charge. It uses the same
+proposal/CAS/finite-bound algorithm as the self tool. Callers explicitly
+supply already charged rounds: self-tool `round + 1`, remote boundary
+`turn_counter`, including zero before the first provider round. No budget is
+reset or fictitiously charged. Self and remote changes contend on one
+generation and control revision. A pending objective still needs the existing
+next-iteration admission and enough remaining rounds for the active terminal
+answer plus that admission.
+
+Canonical validation occurs again at the actual target checkpoint, retaining
+the existing lifecycle → Task → sorted Session locks and exact live-owner
+fence through the physical write. This does not call a public checkpoint while
+holding a guard that would reacquire its target lock. The existing full writer,
+Root Actor proof and Inbox ACK protocol are reused for Root-owned and legacy
+paths. Backend defaults fail closed rather than falling back to an unrelated
+ordinary save.
+
+LoopState, source-bound immutable outcome and typed consumption evidence are
+staged in the same target checkpoint. The Main admission cursor must confirm
+that typed input before ACK or a configured readback. Runtime-sidecar bytes
+alone are not proof of a confirmed Main checkpoint. The operation identity
+includes initiator incarnation, exact target lifetime, live grant and owner;
+the payload fingerprint includes the typed command. Identical authorized
+retries recover the original receipt before CAS, while changed payloads or a
+different origin conflict. The model cannot borrow another initiator's receipt.
+
+Invalid CAS or effective bounds are checkpointed as explicit rejected outcomes
+under still-valid authority, without Loop mutation. Missing/revoked authority,
+owner replacement or an unsupported backend fail closed. A physical checkpoint
+or ACK error stops further provider admission and preserves unknown/partial
+publication evidence; it does not assert rollback. A strict canonical reload
+may recover observable bytes. If that reload also fails, a local volatile
+no-save fence prevents later generic finalization from overwriting canonical
+state with the proposal or an older snapshot. That marker is never persisted
+and grants no recovery. Started filesystem jobs retain their real guards even
+when the requesting future is dropped.
+
+Only a confirmed target checkpoint installs local Start/Stop effects. An
+observed partially committed generation can be bound solely for existing
+error/cancellation retirement, never to continue work. Independent user stop
+takes priority over acknowledgements and subsequent provider admission.
+
+## Truthful progress and receipts
+
+A mutation response confirms Inbox admission and active notification only.
+`configured: false` there means target application has not been observed in
+that delivery response, not proof that the target cannot already have raced
+ahead. The caller uses `status` with `receipt_operation_id` for actual readback.
+
+Status returns bounded canonical Loop progress, finite/remaining budgets,
+generation and separate state/control/objective revisions. A confirmed
+`operation_receipt` comes from the target's typed checkpoint plus Main cursor.
+`objective_applied_actual` additionally requires the matching real
+`counted_loop_iteration` User message in canonical history and the target's
+admitted objective/control revision. An accepted pending update, a partial
+runtime publication or the old iteration's terminal answer cannot claim this
+proof. Long objective previews are explicitly truncated; canonical goal bytes
+and the initiating Supervisor's normal output cap are preserved.
+
+A Loop `stop` command stops the current generation through its child token;
+it does not cancel the separate host-parent stop token or revoke that live
+grant. Once its durable `stop_requested` is observed for the same pipeline
+execution, typed control draining ends and the next counted boundary records
+Stopped without admitting another goal or provider call. While that same owner
+and host grant are still live, authorized `status` and exact Stop retry may read
+the immutable checkpoint. They still require every fresh authority check.
+
+For an actually configured remote Stop, its canonical checkpoint and Main
+consumption publish before the same guarded Inbox operation retires matching
+later unconsumed carriers to the existing `cancelled` queue. The original Stop
+claim remains live until that bounded cleanup succeeds, then receives its ACK.
+Retired tails acquire no typed consumption, Main cursor, configuration receipt
+or task result. Their original transport bytes remain available for immutable
+exact retries. An enqueue replay is historical admission, not a pending-work
+promise. New carrier IDs are refused for this same stopped pipeline execution
+under the existing canonical/Inbox locks; exact retries still require the live
+grant and are checked before that closure.
+
+Cleanup uses the existing Inbox backlog bound, independently of the 64-entry
+typed consumption limit. Clearly unmatched malformed/User/foreign input remains
+unchanged for the normal corruption path. A selected invalid proof, actual I/O
+error, tombstone collision or revoked/expired authority fails closed: a real
+Stop publication is not rolled back or relabelled as a successful ACK. Existing
+tombstones are never overwritten. This original remote-Stop path covers its
+normal later tail. The target-owned terminal boundary also disposes exact-run
+transports when a local Stop, ordinary completion, budget, host stop,
+cancellation, provider failure or dropped execution ends the owning pipeline,
+including an installed host grant before any Loop generation was started.
+
+The host binds a private reusable transport callback to the actual direct-run
+registration before polling the runner. A per-registration in-process instance
+prevents a stale callback from closing a replacement merely sharing a run id.
+The target closes intake under the existing publication fence, releases that
+fence before awaiting Storage, then retains the real canonical and Inbox guards
+and the closed owner across each physical disposal job. It neither consults nor
+recreates a revoked initiating Supervisor grant. Unsupported Storage refuses the
+host opt-in before publication. This port is transport disposal, not a new
+Session writer, model capability, scheduler or recovery authority.
+
+For the scoped opt-in, every inner success publication is deferred until target
+transport cleanup and the original terminal checkpoint succeed. No-Start exits
+are included. The shared successful-cleanup bit is set only after all physical
+ACK/cancel jobs finish; registration finish, abandon and Drop use the same
+callback before releasing ownership or considering a successor. An I/O or proof
+failure retains the closed owner, leaves cleanup unsuccessful and publishes no
+Complete. It does not silently grant a new owner or automatic recovery. An
+original provider/runtime error remains the result; for an otherwise successful
+run, cancellation before Complete wins over a concurrent cleanup error, while
+that cleanup error remains recorded.
+
+A full old queue cannot defer reclamation until after a successor is acquired:
+ordinary User delivery checks eligible scoped transports before backlog capacity.
+Disposal requires either the actual same-runtime already-closed owner or strict
+current native census evidence. Native evidence reads regular full Main and
+Runtime plus both current Actor record/initialization witnesses, validates their
+birth, Root lineage, Project and overlay identity, then proves current terminal
+status, current lease expiry, a different actual owner run, or a different valid
+canonical pipeline. Each started filesystem job re-reads that proof with a fresh
+clock. Delivery and scoped checkpoints likewise recheck current native liveness
+at their final retained publication boundary, so a logical slot cannot extend a
+native lease. No old physical epoch is reconstructed from the epoch-less binding.
+
+A missing/dead router, a missing or corrupt witness, a never-claimed Cold actor,
+or a legacy post-crash Running snapshot is not evidence of expiry. Same run and
+execution with only an epoch change remains unknown. These cases fail closed
+instead of restoring grants or making a persistence/restart policy decision.
+Ordinary delivery with no scoped carrier follows its existing path without a
+new Runtime sidecar or native-census requirement; Child delivery receives no
+Root-only proof requirement.
+
+A sweep only selects the fixed scoped carrier and exact target birth/run/execution.
+It validates original transport identity, intent, digest and any existing lease.
+An exact immutable consumption plus Main cursor receives its original ACK,
+including a consumed rejection. A conflicting digest or half-checkpoint is an
+error. An existing permanent admission receipt is preserved. Otherwise only the
+now-inert transport is cancelled: absent or evicted history is not relabelled as
+proof that it never executed, and no Applied result, cursor or consumption is
+invented. Parsing transport identity does not reapply a newly tightened objective
+acceptance policy to historical bytes. No goal is rewritten to satisfy a limit.
+
+Host stop, execution cancellation, or owner finalization/release/replacement
+ends this live-control capability. The Supervisor cannot use the retired grant
+to query terminal state after owner exit. Post-run readback needs a separately
+designed read capability; this branch does not weaken the shared write/admission
+retainer to provide it. Generation Stop is sticky and cannot authorize restart.
+
+The target retains its provider/model, permissions, workspace, transcript,
+context, usage and sole execution owner. A control application receipt is not
+a model task result or an input/output attribution claim. Current status is
+live-owner scoped; broader post-run result association is follow-up work.
+
+## Future admission and finite lifetime
+
+Active and pending remote objectives retain their original binding. Every
+later running admission checkpoint revalidates both through the same retained
+canonical/runtime boundary. A self objective edit inherits this origin; the
+target's self opt-in cannot silently turn revoked remote-directed work into
+self-authorized work. Detach, scope removal, a stale incarnation, permission or
+host-grant withdrawal, target replacement, and owner changes prevent further
+admission. Existing target error/cancellation finalization may retire already
+admitted work; external effects are not rolled back.
+
+The existing hard ceilings remain 100 iterations and 1000 absolute parent
+provider rounds, with stricter host and RunBudget limits, one generation per
+activation, nonincreasing edits, no consumption reset, 64 bounded operation
+receipts and the existing 128 KiB LoopState bound. The new typed consumption
+projection is also bounded to 64 entries / 64 KiB in the existing checkpoint.
+Stop is sticky and never restarts a generation or answers a human wait.
+
+## Required deterministic acceptance before admission
+
+- Actual ToolCtx identity, strict DTO, Plan/permission/disabled and typed/legacy
+  replay denials; unchanged Followup and self-loop contracts.
+- Real V2 Inbox/Repository/router: explicit host grant, target owner and attach;
+  admission → configured checkpoint → real iteration proof; no provider
+  translation, new execution, successor or context replacement.
+- Bootstrap status; finite Start including zero consumed rounds; pending
+  objective Update; immutable same-operation retries, changed payload and
+  stale CAS; self/remote revision contention; sticky Stop and cancellation.
+- Complete effective bounds when Update omits fields; no reset or extra round;
+  malformed origins and expired owner/grant/lifetime fail closed.
+- Retained-lock races for detach, Project/scope/permission/incarnation changes,
+  host revoke/cancel after a guard is acquired, target recreation and owner
+  finalization/replacement at publication and later objective admission.
+- Root-owned and legacy control consumption; Main-before/after failure and
+  ACK failure, dropped callers, canonical reload failure, partial/unknown
+  observations and no later generic write of an unconfirmed proposal.
+- A fake-provider public runner combination with controlled barriers, proving
+  the Supervisor commands another live Root and observes its real target-side
+  goal admission while provider concurrency remains one.
+- Remote scalar/byte and whitespace boundaries through the registered schema,
+  typed carrier, direct Messenger and actual counted iteration; unchanged self
+  acceptance and an explicit disclosure of the narrower remote contract.
+- Public direct-owner No-Start/active exits and real Root-terminal-before-Drop;
+  actual native pending/claimed/committed-cur reclamation before backlog capacity;
+  final-publication expiry, unknown/corrupt/live refusal, ordinary no-scope
+  controls, and cleanup-error/cancellation with no Complete or successor.
+
+The following receipts belong to the earlier implementation at the explicitly
+listed heads. They do not validate the new remote scalar contract or terminal
+retirement boundary. Those changes require their own tests-only behavioral RED,
+actual candidate GREEN and current-head review before admission. Static patch
+application or rustfmt parsing is not runtime acceptance.
+
+Recorded local acceptance uses this common test prefix:
+
+```sh
+cargo test --locked --offline --all-features -p <package> <target> <filter> -- --test-threads=1
+```
+
+| Package / target / filter | Receipt head | Passed |
+| --- | --- | ---: |
+| Engine `--lib runtime::loop_control::` | `85fee287` | 36 |
+| Engine `--lib runtime::runner::loop_execution::counted_tests::` | `85fee287` | 39 |
+| Engine `--lib runtime::runner::loop_execution::self_control_tests::` with `--skip scoped_supervisor_runner_tests::` | `85fee287` | 37 |
+| Engine `--lib session_activation::` | `85fee287` | 50 |
+| Engine `--lib scoped_supervisor_runner_tests::` | `6d2e0126` | 3 |
+| Storage `--lib v2::scoped_loop_control_tests::` | `4f8fa3fa` | 11 |
+| Storage `--lib session_merge::tests::scoped_unknown_checkpoint_cannot_enter_generic_merge_or_publish_callbacks --exact` | `4f8fa3fa` | 1 |
+| Storage `--lib session_inbox::` | `4f8fa3fa` | 96 |
+| Storage `--lib v2::root_actor_input_tests::` | `4f8fa3fa` | 8 |
+| Storage `--lib v2::supervisor_` | `4f8fa3fa` | 40 |
+| Permission `--lib replay::` | `4f8fa3fa` | 2 |
+| Tools `--lib tools::loop_control::` | `4f8fa3fa` | 13 |
+| Domain `--lib` (no filter) | `4f8fa3fa` | 321 |
+| Server Tools `--test session_control` (no filter) | `4f8fa3fa` | 9 |
+
+The package names are `bamboo-engine`, `bamboo-storage`, `bamboo-permission`,
+`bamboo-tools`, `bamboo-domain` and `bamboo-server-tools`. The exact-merge test's
+`--exact` is a test-harness argument after `--`. Every receipt records unchanged
+source, the exact command, source/tree and raw log hash. A case-name inventory
+establishes 666 distinct tests; repeated earlier public tests are not counted
+twice. The native case uses the same opaque direct lease and router run id to
+obtain the real physical writer, consumes both objectives at the provider,
+confirms three typed receipts and ACKs, observes no overlap/fourth provider or
+successor, and finishes its exact physical fence.
+
+The original CI default-member/all-features Clippy allowlist, `cargo fmt --all
+-- --check` and diff checks passed at `6d2e0126`. No `--workspace` or extra
+all-test lint suite was substituted. Since `85fee287`, the only Rust changes
+before that final validation were the owned-String Storage test fixture and
+the native public test extension; production Rust remained byte-identical.
+
+All historical failures remain evidence: the real host-stop claim race was
+RED then GREEN; the logical Stop drain regression was fixed and revalidated;
+the Storage fixture first failed compilation before executing tests. A mistaken
+Engine filter selected zero tests and was explicitly excluded from coverage.
+No ignored test, paid provider run or uncompiled prototype is counted as a pass.
+
+The later ordinary merge of dev `0e32f537` is a different dependency context.
+It leaves the first implementation's paths unchanged, but changes Cargo
+manifests and lockfile. Validate that context separately; old-base receipts
+are never promoted to new-base green. Static review/formatting never replaces
+compilation or tests.
+
+Two later review regressions add five deterministic cases. The schema cases
+use the real ToolRegistry projection and the existing locked JSON Schema
+validator (a development dependency only, no new package/version). They check
+required action fields, legal structures and cross-action/unknown denials.
+The V2 cases check qualified/case denials, distinct-name checkpoint/ACKs, and
+policy withdrawal after delivery/claim with no publication or ACK. These are
+wire/storage tests, not a claim of full model-to-tool success or a provider
+catalog in Storage. Their exact RED/GREEN source and artifacts are recorded
+separately. The bounded combination is Engine public3, ServerTools11 and
+Storage scoped14, plus the original CI lint/format contract. Only the actual
+source-bound run receipts and current PR gates establish its result.
+
+## Specific follow-up product slices (remain open)
+
+1. **Pause/resume and terminal readback:** define a durable paused status,
+   a distinct terminal read capability, remaining-budget policy,
+   safe owner handoff and fresh authority for resumption. Pause must not cancel
+   or answer a human wait; resume must not undo user Stop or reuse a dead grant.
+2. **Progress and results:** reuse #2000 P3's input/run/output ownership. Cover
+   multiple accepted inputs per run, successor-consumed inputs, partial writes,
+   restart and eviction with explicit partial/unknown result coverage. Do not
+   relabel these configuration receipts as execution outputs.
+3. **Continue scheduling:** consume authorized completion/result evidence and
+   explicitly decide the next delegated goal/Session using existing Followup
+   and attach scope. Recheck permission at that next admission. The Supervisor
+   remains the orchestrator rather than executing delegated work itself.
+4. **Dormant activation, interval/sleep/future wakes:** separate #893/#896/#897
+   lifecycle work, with bounded wakes and fresh scope/lifetime checks. This
+   live-only implementation does not implement timers or dormant startup.
+5. **Restart recovery / authority transfer:** require an explicit product and
+   persistence contract before adopting any saved live/paused generation. No
+   grant, owner or continuation is automatically restored in this slice.

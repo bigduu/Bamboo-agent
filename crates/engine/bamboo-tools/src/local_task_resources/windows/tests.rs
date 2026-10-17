@@ -42,8 +42,33 @@ fn powershell(script: &str) -> Command {
 // containment through the job. The release gate makes the fast-exit case
 // deterministic without relying on sleeps or a recycled PID lookup.
 fn tree_script(directory: &Path, exit_after_release: bool) -> String {
+    tree_script_with_trace(directory, exit_after_release, false)
+}
+
+// Fixture-only phase evidence. PIDs here are observations, never stop authority.
+fn tree_script_with_trace(directory: &Path, exit_after_release: bool, trace: bool) -> String {
+    let marker = |name: &str| {
+        if trace {
+            format!(
+                "try {{ [IO.File]::WriteAllText({}, [string]$PID) }} catch {{ Write-Output 'fixture-marker-failed:{name}' }}; ",
+                quoted(&directory.join(name))
+            )
+        } else {
+            String::new()
+        }
+    };
+    let leader_started = marker("leader-started");
+    let descendant_started = marker("descendant-started");
+    let spawn_returned = if trace {
+        format!(
+            "try {{ [IO.File]::WriteAllText({}, [string]$p.Id) }} catch {{ Write-Output 'fixture-marker-failed:spawn-returned' }}; ",
+            quoted(&directory.join("spawn-returned"))
+        )
+    } else {
+        String::new()
+    };
     let descendant = encoded(&format!(
-        "[IO.File]::WriteAllText({}, [string]$PID); Write-Output 'descendant-ready'; Start-Sleep -Seconds 30; [IO.File]::WriteAllText({}, 'escaped')",
+        "{descendant_started}[IO.File]::WriteAllText({}, [string]$PID); Write-Output 'descendant-ready'; Start-Sleep -Seconds 30; [IO.File]::WriteAllText({}, 'escaped')",
         quoted(&directory.join("ready")), quoted(&directory.join("late"))
     ));
     let tail = if exit_after_release {
@@ -55,7 +80,7 @@ fn tree_script(directory: &Path, exit_after_release: bool) -> String {
         "Start-Sleep -Seconds 30".to_string()
     };
     format!(
-        "$ErrorActionPreference='Stop'; $p=Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','{descendant}') -PassThru -NoNewWindow; while (!(Test-Path -LiteralPath {})) {{ Start-Sleep -Milliseconds 10 }}; Write-Output 'leader-ready'; {tail}",
+        "{leader_started}$ErrorActionPreference='Stop'; $p=Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','{descendant}') -PassThru -NoNewWindow; {spawn_returned}while (!(Test-Path -LiteralPath {})) {{ Start-Sleep -Milliseconds 10 }}; Write-Output 'leader-ready'; {tail}",
         quoted(&directory.join("ready"))
     )
 }
@@ -143,9 +168,10 @@ async fn local_task_resources_windows_foreground_cancel_reaps_descendants() {
 #[tokio::test]
 async fn local_task_resources_windows_background_scope_drain() {
     use crate::tools::bash_runtime;
+    use futures::FutureExt;
     let directory = tempfile::tempdir().unwrap();
     let scope = resources("background");
-    let script = encoded(&tree_script(directory.path(), false));
+    let script = encoded(&tree_script_with_trace(directory.path(), false, true));
     let command = format!("powershell.exe -NoProfile -NonInteractive -EncodedCommand {script}");
     let shell = scope
         .scope(bash_runtime::spawn_background(
@@ -158,7 +184,68 @@ async fn local_task_resources_windows_background_scope_drain() {
         ))
         .await
         .unwrap();
-    let descendant = process_from_ready(directory.path()).await;
+    let descendant = match std::panic::AssertUnwindSafe(process_from_ready(directory.path()))
+        .catch_unwind()
+        .await
+    {
+        Ok(process) => process,
+        Err(failure) => {
+            // Preserve the real failed readiness observation. Cleanup below is
+            // only this fixture's retained Job, never a discovered PID tree.
+            let reason = failure
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| failure.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string readiness panic");
+            let phases = [
+                "leader-started",
+                "spawn-returned",
+                "descendant-started",
+                "ready",
+            ]
+            .map(|name| {
+                let observed = std::fs::read_to_string(directory.path().join(name))
+                    .map(|text| text.chars().take(128).collect::<String>())
+                    .map_err(|error| (error.kind(), error.raw_os_error()));
+                (name, observed)
+            });
+            let selected = bamboo_infrastructure::process::preferred_bash_shell();
+            let before_status = shell.status().to_string();
+            let before_exit = shell.exit_code().await;
+            // close_and_drain owns its finalizer independently of this wait.
+            // A diagnostic timeout is explicitly unconfirmed, never "stopped".
+            let cleanup =
+                tokio::time::timeout(Duration::from_secs(10), scope.close_and_drain()).await;
+            let (lines, _, _) = shell.read_output_since(0, None).await;
+            let mut tail = lines.iter().rev().take(16).collect::<Vec<_>>();
+            tail.reverse();
+            let tail = tail
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .chars()
+                .take(4096)
+                .collect::<String>();
+            // This branch always fails, even if cleanup succeeds. Status and
+            // fixture PIDs are evidence, not process ownership or acceptance.
+            panic!(
+                "background readiness failed: {reason}; phases={phases:?}; shell={selected:?}; env_source={}; before_status={before_status}; before_exit={before_exit:?}; owned_cleanup={cleanup:?}; after_status={}; after_exit={:?}; command_utf16_units={}; captured_tail={tail:?}",
+                shell.environment.source.as_str(),
+                shell.status(),
+                shell.exit_code().await,
+                command.encode_utf16().count(),
+            );
+        }
+    };
+    eprintln!(
+        "background readiness observed: leader_marker={}; spawn_marker={}; descendant_marker={}; shell={:?}; command_utf16_units={}",
+        directory.path().join("leader-started").is_file(),
+        directory.path().join("spawn-returned").is_file(),
+        directory.path().join("descendant-started").is_file(),
+        bamboo_infrastructure::process::preferred_bash_shell(),
+        command.encode_utf16().count(),
+    );
     let (receipt, ()) = tokio::join!(scope.close_and_drain(), actually_stopped(descendant));
     receipt.unwrap();
     assert_eq!(shell.status(), "completed");

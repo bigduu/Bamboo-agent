@@ -50,7 +50,7 @@ enum SessionExecutionActivationOwnership {
     RegistrationPending(Arc<SessionActivationRouter>),
     /// Manual/server reservation acquired router ownership before any
     /// execution-specific mutation or external side effect.
-    Registered(SessionRunRegistration),
+    Registered(Box<SessionRunRegistration>),
 }
 
 /// One exact runner reservation plus its logical-session activation ownership.
@@ -340,7 +340,8 @@ impl SessionExecutionReservation {
         .await
         {
             Ok(registration) => {
-                self.activation = SessionExecutionActivationOwnership::Registered(registration);
+                self.activation =
+                    SessionExecutionActivationOwnership::Registered(Box::new(registration));
                 Ok(())
             }
             Err(error) => {
@@ -421,7 +422,7 @@ impl SessionExecutionReservation {
             &mut self.activation,
             SessionExecutionActivationOwnership::Unrouted,
         ) {
-            SessionExecutionActivationOwnership::Registered(registration) => Some(registration),
+            SessionExecutionActivationOwnership::Registered(registration) => Some(*registration),
             SessionExecutionActivationOwnership::Unrouted => None,
             SessionExecutionActivationOwnership::UnpublishedActivation(_) => {
                 unreachable!("unpublished activation cannot transfer to execution")
@@ -520,7 +521,7 @@ async fn cleanup_execution_reservation(
 ) {
     match activation {
         SessionExecutionActivationOwnership::Registered(registration) => {
-            registration.abandon().await;
+            (*registration).abandon().await;
         }
         SessionExecutionActivationOwnership::RegistrationPending(router) => {
             match register_reserved_activation(
@@ -1014,6 +1015,18 @@ pub fn spawn_session_execution_with_inputs(
             let admission_persistence = execution_reservation
                 .execution_persistence()
                 .unwrap_or_else(|| agent.persistence().clone());
+            if let (Some(router), Some(ownership)) = (agent.activation_router(), ownership.as_ref())
+            {
+                if !router.bind_run_lifetime(ownership, &session).await {
+                    let _ = mpsc_tx
+                        .send(AgentEvent::Error {
+                            message: "registered run Session lifetime differs".into(),
+                        })
+                        .await;
+                    execution_reservation.abandon().await;
+                    return;
+                }
+            }
             if let Err(error) = crate::runtime::counted_loop::admit_registered(
                 &mut session,
                 ownership.as_ref(),

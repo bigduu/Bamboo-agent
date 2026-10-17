@@ -709,6 +709,28 @@ impl Tool for SubAgentTool {
         let normalized = facade::normalize(args)?;
         let args = normalized.args;
         let projection = normalized.projection;
+        if !bamboo_agent_core::tools::suspension_allowed() {
+            // Normalize compact/legacy calls before selecting effects, and
+            // reject before a Host callback or owned launch task can escape
+            // the invoking task-local scope. Reads/cancel retain their gates.
+            let action = args
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(if projection.is_none() { "create" } else { "" });
+            // Even non-auto Create publishes a pending child; update
+            // and send can reset a child to pending. Deny all variants.
+            let may_wait = projection == Some(Projection::ParentQuestionAsk)
+                || matches!(
+                    action,
+                    "create" | "run" | "wait" | "update" | "send_message"
+                );
+            if may_wait {
+                return Err(ToolError::Execution(
+                    "suspension_disabled: SubAgent operation may create or wait for child work"
+                        .into(),
+                ));
+            }
+        }
         if projection == Some(Projection::Tree) {
             let parent_id = ctx.session_id().ok_or_else(|| {
                 ToolError::Execution("SubAgent requires a current session".into())
