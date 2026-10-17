@@ -3,6 +3,7 @@
 mod file_reconciliation;
 mod migration;
 mod model;
+mod project;
 mod query;
 mod resolution;
 mod service;
@@ -12,6 +13,7 @@ mod workspace_files;
 pub use file_reconciliation::*;
 pub use migration::*;
 pub use model::*;
+pub use project::*;
 pub use query::*;
 pub use resolution::*;
 pub use service::{validate_native_tool_ceiling, Authority, Principal, TicketService};
