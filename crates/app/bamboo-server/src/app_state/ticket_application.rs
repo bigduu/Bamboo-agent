@@ -421,38 +421,48 @@ impl TicketApplication {
                 }
                 _ => continue,
             };
-            let store = bamboo_projects::ProjectStore::open(self.root.clone())
-                .map_err(|e| Error::AuthorityUnavailable(e.to_string()))?;
-            let manifest = store
-                .get(project_id)
-                .map_err(|e| Error::InvalidTransition(e.to_string()))?;
-            if manifest.status != bamboo_domain::ProjectStatus::Active {
-                return Err(Error::InvalidTransition("Project is archived".into()));
+            self.validate_project_context(project_id, context, adopting)?;
+        }
+        Ok(())
+    }
+
+    fn validate_project_context(
+        &self,
+        project_id: &bamboo_domain::ProjectId,
+        context: Option<&bamboo_tickets::ProjectContextSnapshot>,
+        adopting: bool,
+    ) -> Result<()> {
+        let store = bamboo_projects::ProjectStore::open(self.root.clone())
+            .map_err(|e| Error::AuthorityUnavailable(e.to_string()))?;
+        let manifest = store
+            .get(project_id)
+            .map_err(|e| Error::InvalidTransition(e.to_string()))?;
+        if manifest.status != bamboo_domain::ProjectStatus::Active {
+            return Err(Error::InvalidTransition("Project is archived".into()));
+        }
+        if let Some(context) = context {
+            if (adopting && context.project_revision != manifest.revision)
+                || context.resource_revision != manifest.resource_revision
+                || !manifest
+                    .workspace_roots()
+                    .any(|p| p == context.workspace_binding.path)
+            {
+                return Err(Error::RevisionConflict);
             }
-            if let Some(context) = context {
-                if (adopting && context.project_revision != manifest.revision)
-                    || context.resource_revision != manifest.resource_revision
-                    || !manifest
-                        .workspace_roots()
-                        .any(|p| p == context.workspace_binding.path)
-                {
+            if let Some(binding) = manifest
+                .workspace_bindings
+                .iter()
+                .find(|b| b.path == context.workspace_binding.path)
+            {
+                if binding != &context.workspace_binding {
                     return Err(Error::RevisionConflict);
                 }
-                if let Some(binding) = manifest
-                    .workspace_bindings
-                    .iter()
-                    .find(|b| b.path == context.workspace_binding.path)
-                {
-                    if binding != &context.workspace_binding {
-                        return Err(Error::RevisionConflict);
-                    }
-                } else if context.workspace_binding.git_common_dir.is_some()
-                    || context.workspace_binding.label.is_some()
-                {
-                    return Err(Error::InvalidTransition(
-                        "primary binding has no auxiliary metadata".into(),
-                    ));
-                }
+            } else if context.workspace_binding.git_common_dir.is_some()
+                || context.workspace_binding.label.is_some()
+            {
+                return Err(Error::InvalidTransition(
+                    "primary binding has no auxiliary metadata".into(),
+                ));
             }
         }
         Ok(())
@@ -676,6 +686,27 @@ impl TicketApplication {
         }
     }
 
+    fn validate_dispatch_project_context(
+        &self,
+        snapshot: &bamboo_tickets::Snapshot,
+        spec: &DispatchSpec,
+    ) -> Result<()> {
+        if let Some(project_id) = snapshot.project.links.get(&spec.work_id) {
+            let context = spec
+                .project_context_hash
+                .as_ref()
+                .and_then(|hash| snapshot.project.contexts.get(hash))
+                .ok_or_else(|| {
+                    Error::InvalidTransition("adopted Project context missing".into())
+                })?;
+            if &context.project_id != project_id {
+                return Err(Error::InvalidTransition("adopted Project mismatch".into()));
+            }
+            self.validate_project_context(project_id, Some(context), false)?;
+        }
+        Ok(())
+    }
+
     async fn ensure(
         &self,
         key: &str,
@@ -693,21 +724,7 @@ impl TicketApplication {
                 .get(&spec.assignment_id)
                 .is_some_and(|a| a.runtime.is_none())
             {
-                self.validate_project_operations(
-                    &service,
-                    &Command {
-                        operation_id: String::new(),
-                        binding: snapshot.binding,
-                        expected_seq: snapshot.seq,
-                        expected_epoch: snapshot.authority_epoch,
-                        operations: vec![Operation::Start {
-                            work_id: spec.work_id.clone(),
-                            temp_id: String::new(),
-                            workspace: spec.workspace.clone(),
-                        }],
-                        source: None,
-                    },
-                )?;
+                self.validate_dispatch_project_context(&snapshot, spec)?;
             }
             // Also guard a previously published pending intent when operator
             // placement changes before its admission/retry.

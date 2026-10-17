@@ -6,7 +6,12 @@ async fn project_board_owner_route_uses_explicit_membership_and_rejects_unknown_
     use actix_web::{test, App};
     use std::sync::Arc;
     let root = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(root.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_with_memory_store(
+        root.path().to_path_buf(),
+        bamboo_memory::memory_store::MemoryStore::new(root.path().join("jiandu")),
+    )
+    .await
+    .unwrap();
     *state.config.write().await = serde_json::from_value(serde_json::json!({
         "provider":"openai","features":{"ticket_mutation":true},
         "providers":{"openai":{"api_key":"fixture","model":"fixture-model"}}
@@ -150,4 +155,350 @@ async fn project_board_owner_route_uses_explicit_membership_and_rejects_unknown_
     let snapshot = service.published().unwrap().1;
     assert_eq!(snapshot.project.work_contexts.len(), 1);
     assert!(snapshot.assignments.is_empty());
+}
+
+/// Real loopback routes with synthetic domain records and no provider execution.
+/// An explicit receipt path keeps the same test binary alive for Lotus QA.
+#[actix_web::test]
+async fn pending_context_live_routes_preserve_adoption_and_revalidate_original_dispatch() {
+    use actix_web::{App, HttpServer};
+    use bamboo_domain::WorkspaceBinding;
+    use bamboo_tickets::*;
+    use std::{collections::BTreeSet, sync::Arc};
+
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut state = AppState::new_with_memory_store(
+        root.path().to_path_buf(),
+        bamboo_memory::memory_store::MemoryStore::new(root.path().join("jiandu")),
+    )
+    .await
+    .unwrap();
+    *state.config.write().await = serde_json::from_value(serde_json::json!({
+        "provider":"openai", "features":{"ticket_mutation":true,"ticket_dispatch":true},
+        "providers":{"openai":{"api_key":"synthetic-unused","model":"synthetic-unused"}}
+    }))
+    .unwrap();
+    state.tickets = Arc::new(
+        bamboo_server::app_state::ticket_application::TicketApplication::open(
+            root.path(),
+            state.storage.clone(),
+            state.config.clone(),
+        )
+        .await,
+    );
+    let project = state
+        .project_store
+        .create("Context boundary fixture", None)
+        .unwrap();
+    let manifest = state
+        .project_store
+        .bind_workspace(
+            &project.id,
+            project.revision,
+            WorkspaceBinding {
+                path: workspace
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into(),
+                label: None,
+                git_common_dir: None,
+            },
+        )
+        .unwrap();
+    let principal = Principal::User {
+        user_id: "host-owner".into(),
+    };
+    let (service, owner) = state.tickets.authority(principal.clone()).await.unwrap();
+    let contract = Contract {
+        title: "Live metadata boundary".into(),
+        objective: "Synthetic context proof".into(),
+        constraints: vec!["No provider or real user data".into()],
+        acceptance: vec!["Exact adopted revision".into()],
+        user_acceptance_required: true,
+        allowed_tools: BTreeSet::from(["Task".into()]),
+    };
+    let adopted = ProjectContextSnapshot {
+        project_id: project.id.clone(),
+        project_revision: manifest.revision,
+        resource_revision: manifest.resource_revision,
+        workspace_binding: manifest.workspace_bindings[0].clone(),
+        contract_revision: 1,
+        contract: contract.clone(),
+        sources: std::collections::BTreeMap::from([("fixture-spec".into(), "v1".into())]),
+    };
+    let command = service
+        .prepare_command(
+            &owner,
+            "live-create",
+            vec![
+                Operation::Create {
+                    temp_id: "w".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: contract.clone(),
+                    depends_on: BTreeSet::new(),
+                },
+                Operation::AssociateProject {
+                    ticket_id: "w".into(),
+                    project_id: project.id.clone(),
+                },
+                Operation::SetProjectContext {
+                    work_id: "w".into(),
+                    context: adopted.clone(),
+                },
+                Operation::Ready {
+                    work_id: "w".into(),
+                },
+                Operation::Create {
+                    temp_id: "cancelled".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: Contract {
+                        title: "Cancelled fixture".into(),
+                        ..contract
+                    },
+                    depends_on: BTreeSet::new(),
+                },
+                Operation::AssociateProject {
+                    ticket_id: "cancelled".into(),
+                    project_id: project.id.clone(),
+                },
+            ],
+        )
+        .unwrap();
+    let created = service.execute(&owner, &command).unwrap();
+    let cancel = service
+        .prepare_command(
+            &owner,
+            "live-cancel",
+            vec![Operation::Cancel {
+                work_id: created.ids["cancelled"].clone(),
+            }],
+        )
+        .unwrap();
+    service.execute(&owner, &cancel).unwrap();
+    let work = created.ids["w"].clone();
+    let path = workspace
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let start = service
+        .prepare_command(
+            &owner,
+            "live-start",
+            vec![Operation::Start {
+                work_id: work.clone(),
+                temp_id: "assignment".into(),
+                workspace: Some(ExecutionWorkspace {
+                    repo: path.clone(),
+                    base_commit: "a".repeat(40),
+                    branch: "synthetic-fixture".into(),
+                    worktree: path.clone(),
+                    write_roots: vec![path.clone()],
+                    claims: BTreeSet::from([format!("worktree:{path}")]),
+                }),
+            }],
+        )
+        .unwrap();
+    let started = service.execute(&owner, &start).unwrap();
+    let assignment = started.ids["assignment"].clone();
+    let original = service.published().unwrap().1;
+    let a = &original.assignments[&assignment];
+    let dispatch_key = a.dispatch_key.clone();
+    let spec_hash = original.intents[&dispatch_key].spec_hash.clone();
+    let updated = state
+        .project_store
+        .bind_workspace(
+            &project.id,
+            manifest.revision,
+            WorkspaceBinding {
+                path: other
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into(),
+                label: None,
+                git_common_dir: None,
+            },
+        )
+        .unwrap();
+    // Adding another binding changes Project metadata, not the resource
+    // counter. Advance the actual resource ledger for the stale-intent guard.
+    let updated = state
+        .project_store
+        .bump_resource_revision(&project.id, updated.revision)
+        .unwrap();
+    assert!(updated.resource_revision > adopted.resource_revision);
+    let mut pending = adopted.clone();
+    pending.project_revision = updated.revision;
+    pending.resource_revision = updated.resource_revision;
+    let queue = service
+        .prepare_command(
+            &owner,
+            "live-queue",
+            vec![Operation::SetProjectContext {
+                work_id: work.clone(),
+                context: pending.clone(),
+            }],
+        )
+        .unwrap();
+    state
+        .tickets
+        .update(principal.clone(), &queue)
+        .await
+        .unwrap();
+    // The newer candidate must not authorize the old immutable pending intent.
+    // Replaying reaches ensure() before any adapter/provider admission.
+    let replay = state.tickets.dispatch(principal, &start).await.unwrap();
+    assert_eq!(replay["runtime"], serde_json::json!([]));
+    assert_eq!(replay["errors"][0]["status_code"], 409, "{replay}");
+    assert!(service.published().unwrap().1.assignments[&assignment]
+        .runtime
+        .is_none());
+    assert_eq!(
+        service.published().unwrap().1.project.assignment_contexts,
+        original.project.assignment_contexts
+    );
+    // Install only synthetic runtime facts for UI observation, never a real run.
+    let runtime = Authority::from_verified_host(original.binding, Principal::Runtime);
+    let command = service
+        .prepare_command(
+            &runtime,
+            "live-synthetic-running",
+            vec![
+                Operation::Admitted {
+                    assignment_id: assignment.clone(),
+                    receipt: RuntimeReceipt {
+                        dispatch_key,
+                        spec_hash,
+                        run_id: "synthetic-no-provider-run".into(),
+                        session_id: "synthetic-worker".into(),
+                    },
+                },
+                Operation::Running {
+                    assignment_id: assignment.clone(),
+                },
+            ],
+        )
+        .unwrap();
+    service.execute(&runtime, &command).unwrap();
+    state.config.write().await.features.ticket_dispatch = false;
+    let state = web::Data::new(state);
+    let address =
+        std::env::var("BAMBOO_PROJECT_BOARD_FIXTURE_ADDR").unwrap_or_else(|_| "127.0.0.1:0".into());
+    let address: std::net::SocketAddr = address.parse().unwrap();
+    assert!(address.ip().is_loopback());
+    let listener = std::net::TcpListener::bind(address).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_state = state.clone();
+    let frontend = std::env::var_os("BAMBOO_PROJECT_BOARD_FRONTEND").map(std::path::PathBuf::from);
+    let server = HttpServer::new(move || {
+        let frontend = frontend.clone();
+        App::new()
+            .app_data(server_state.clone())
+            .configure(bamboo_server::configure_routes)
+            .configure(move |cfg| {
+                if let Some(path) = frontend {
+                    cfg.service(actix_files::Files::new("/", path).index_file("index.html"));
+                }
+            })
+    })
+    .workers(1)
+    .listen(listener)
+    .unwrap()
+    .run();
+    let handle = server.handle();
+    let task = actix_web::rt::spawn(server);
+    let base = format!("http://{address}");
+    let client = reqwest::Client::new();
+    assert!(client
+        .get(format!("{base}/healthz"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    assert!(client
+        .get(format!("{base}/api/v1/projects"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    let board = client
+        .post(format!("{base}/api/v1/tickets/project-board"))
+        .json(&serde_json::json!({"project_id":project.id,"include_cancelled":true,"limit":100}))
+        .send()
+        .await
+        .unwrap();
+    assert!(board.status().is_success());
+    let board: serde_json::Value = board.json().await.unwrap();
+    assert_eq!(board["data"]["counts"]["doing"], 1);
+    assert_eq!(board["data"]["counts"]["cancelled"], 1);
+    let row = board["data"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["ticket"]["id"] == work)
+        .unwrap();
+    assert_eq!(
+        row["adopted_context"],
+        serde_json::to_value(&adopted).unwrap()
+    );
+    assert_eq!(
+        row["pending_context"],
+        serde_json::to_value(&pending).unwrap()
+    );
+    let inspect=client.post(format!("{base}/api/v1/tickets/inspect")).json(&serde_json::json!({"ids":[work],"depth":0,"budget_bytes":32768,"fixed_commit":board["snapshot"]["commit"]})).send().await.unwrap();
+    assert!(inspect.status().is_success());
+    assert!(inspect.text().await.unwrap().contains(&assignment));
+    if let Some(receipt) = std::env::var_os("BAMBOO_PROJECT_BOARD_FIXTURE_RECEIPT") {
+        let receipt = std::path::PathBuf::from(receipt);
+        let stop = receipt.with_extension("stop");
+        let pause = receipt.with_extension("pause-stop");
+        let proof = serde_json::json!({"base_url":base,"root":root.path(),"project_id":project.id,"work_id":work,"assignment_id":assignment,
+            "auth":"loopback local_bypass; no credentials","runtime":"synthetic records only; no provider execution","ticket_dispatch":false,
+            "adopted":adopted,"pending":pending,"pause_stop_marker":pause,"shutdown_marker":stop,
+            "source":std::env::var("BAMBOO_FIXTURE_SOURCE").ok(),"binary":std::env::current_exe().unwrap()});
+        std::fs::write(&receipt, serde_json::to_vec_pretty(&proof).unwrap()).unwrap();
+        let mut paused = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(900);
+        while !stop.exists() && tokio::time::Instant::now() < deadline {
+            if !paused && pause.exists() {
+                let command = service
+                    .prepare_command(
+                        &owner,
+                        "live-pause",
+                        vec![Operation::Pause {
+                            work_id: work.clone(),
+                            reason: "fixture safe boundary".into(),
+                        }],
+                    )
+                    .unwrap();
+                service.execute(&owner, &command).unwrap();
+                let command = service
+                    .prepare_command(
+                        &runtime,
+                        "live-confirm-stop",
+                        vec![Operation::ConfirmStopped {
+                            assignment_id: assignment.clone(),
+                            effects_reconciled: true,
+                        }],
+                    )
+                    .unwrap();
+                service.execute(&runtime, &command).unwrap();
+                paused = true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    handle.stop(true).await;
+    task.await.unwrap().unwrap();
 }
