@@ -1190,7 +1190,7 @@ mod tests {
     #[tokio::test]
     async fn connect_resume_consumes_approved_call_after_root_tool_tightening() {
         use crate::app_state::resume_adapter::supervisor_tests::{Fixture, CALL};
-        let fixture = Box::pin(Fixture::pending()).await;
+        let fixture = Box::pin(Fixture::ordinary_root_pending()).await;
         fixture.prepare_workspace_catalog().await;
         fixture.formal_approve().await;
         let mut selected = fixture.reload().await;

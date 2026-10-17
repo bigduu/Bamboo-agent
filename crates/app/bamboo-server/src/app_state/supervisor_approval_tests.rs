@@ -24,6 +24,8 @@ const AUTHORITY: &str = ExecutingSupervisorObservation::PERMISSION_REPLAY_METADA
 #[derive(Default)]
 struct Probe {
     next_call: AtomicBool,
+    shell_call: AtomicBool,
+    shell_entries: AtomicUsize,
     actions: AtomicUsize,
     provider_calls: AtomicUsize,
 }
@@ -43,8 +45,19 @@ impl LLMProvider for Probe {
                 id: CALL.into(),
                 tool_type: "function".into(),
                 function: FunctionCall {
-                    name: "default::exec_command".into(),
-                    arguments: json!({"cmd":"current-command"}).to_string(),
+                    name: if self.shell_call.load(Ordering::SeqCst) {
+                        "default::exec_command"
+                    } else {
+                        "default::session_control"
+                    }
+                    .into(),
+                    arguments: if self.shell_call.load(Ordering::SeqCst) {
+                        json!({"cmd":"current-command"})
+                    } else {
+                        json!({"action":"followup", "target_session_id":TARGET,
+                            "operation_id":"transport-operation", "message":"continue the authorized work"})
+                    }
+                    .to_string(),
                 },
             }])
         } else {
@@ -65,13 +78,13 @@ struct ProtectedTool {
 #[async_trait]
 impl Tool for ProtectedTool {
     fn name(&self) -> &str {
-        "exec_command"
+        "session_control"
     }
     fn description(&self) -> &str {
-        "Exercise a strict Supervisor write after approval"
+        "Exercise strict Supervisor management after the real permission gate"
     }
     fn parameters_schema(&self) -> Value {
-        json!({"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]})
+        json!({"type":"object","properties":{"action":{"type":"string"},"target_session_id":{"type":"string"},"operation_id":{"type":"string"},"message":{"type":"string"}},"required":["action","target_session_id","operation_id","message"]})
     }
     async fn invoke(&self, _args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
         assert!(!ctx.bypass_permissions && !ctx.auto_approve_permissions && !ctx.plan_read_only);
@@ -80,6 +93,8 @@ impl Tool for ProtectedTool {
             .ok_or_else(|| {
                 ToolError::Execution("original Supervisor observation missing".into())
             })?;
+        // As in the SDK fixture, this strict durable link write probes the
+        // transported identity. It is not the production followup operation.
         self.service
             .attach(&original.supervisor_reference(), 1, TARGET)
             .await
@@ -92,10 +107,34 @@ impl Tool for ProtectedTool {
     }
 }
 
+struct ShellProbeTool(Arc<Probe>);
+
+#[async_trait]
+impl Tool for ShellProbeTool {
+    fn name(&self) -> &str {
+        "exec_command"
+    }
+    fn description(&self) -> &str {
+        "Record entry into the shell fixture without executing a command"
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]})
+    }
+    async fn invoke(&self, _args: Value, _ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
+        self.0.shell_entries.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutcome::Completed(ToolResult::text(
+            true,
+            "shell probe entered",
+        )))
+    }
+}
+
 pub(crate) struct Fixture {
     directory: tempfile::TempDir,
     pub(crate) state: web::Data<AppState>,
     pub(crate) original: bamboo_domain::SupervisorReference,
+    session_id: String,
+    ordinary_root: bool,
     probe: Arc<Probe>,
 }
 
@@ -118,14 +157,19 @@ impl Fixture {
             .permission_checker
             .permission_config()
             .unwrap()
-            .set_ask_rules(["Bash(current-command)".into()]);
+            .set_ask_rules([
+                "session_control".into(),
+                "default::session_control".into(),
+                "Bash(current-command)".into(),
+            ]);
         let registry = bamboo_tools::ToolRegistry::new();
         registry
             .register(ProtectedTool {
                 service: SupervisorSessionService::new(state.session_store.clone()),
-                probe,
+                probe: probe.clone(),
             })
             .unwrap();
+        registry.register(ShellProbeTool(probe)).unwrap();
         let executor = Arc::new(
             bamboo_tools::executor::BuiltinToolExecutor::with_registry_and_permissions(
                 registry,
@@ -138,15 +182,20 @@ impl Fixture {
     }
 
     pub(crate) fn pending() -> Pin<Box<impl Future<Output = Self>>> {
-        Box::pin(Self::pending_inner())
+        Box::pin(Self::pending_inner(false))
     }
 
-    async fn pending_inner() -> Self {
+    pub(crate) fn ordinary_root_pending() -> Pin<Box<impl Future<Output = Self>>> {
+        Box::pin(Self::pending_inner(true))
+    }
+
+    async fn unparked(ordinary_root: bool) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let probe = Arc::new(Probe::default());
         let state = Self::open(directory.path(), probe.clone()).await;
         let service = SupervisorSessionService::new(state.session_store.clone());
-        let original = (&service.get_or_create_default("test-model").await.unwrap()).into();
+        let original: bamboo_domain::SupervisorReference =
+            (&service.get_or_create_default("test-model").await.unwrap()).into();
         let mut target = Session::new(TARGET, "target-model");
         target.set_project_id_meta("transport-project");
         target.add_message(Message::user("independent target history"));
@@ -155,12 +204,27 @@ impl Fixture {
             .configure_project_scope(&original, 0, ["transport-project".parse().unwrap()].into())
             .await
             .unwrap();
-        let mut fixture = Self {
-            directory: directory,
+        let session_id = if ordinary_root {
+            let root = Session::new("ordinary-transport-root", "test-model");
+            assert!(root.supervisor_incarnation_id().is_none());
+            state.storage.save_session(&root).await.unwrap();
+            root.id
+        } else {
+            original.session_id.clone()
+        };
+        probe.shell_call.store(ordinary_root, Ordering::SeqCst);
+        Self {
+            directory,
             state,
             original,
+            session_id,
+            ordinary_root,
             probe,
-        };
+        }
+    }
+
+    async fn pending_inner(ordinary_root: bool) -> Self {
+        let mut fixture = Self::unparked(ordinary_root).await;
         fixture.park().await;
         // Fresh stores, cache and permission configuration cannot inherit an
         // in-memory pending request, decision receipt or AllowOnce grant.
@@ -217,6 +281,30 @@ impl Fixture {
     }
 
     async fn park_inner(&self) {
+        assert!(self.run_call().await);
+        let pending = self.reload().await;
+        assert!(pending.pending_question.is_some());
+        let result = pending
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.tool_call_id.as_deref() == Some(CALL))
+            .unwrap();
+        if self.ordinary_root {
+            assert!(result.metadata.as_ref().unwrap().get(AUTHORITY).is_none());
+        } else {
+            let authority = &result.metadata.as_ref().unwrap()[AUTHORITY];
+            assert_eq!(
+                authority["incarnation_id"],
+                self.original.incarnation_id.to_string()
+            );
+            assert_eq!(authority["result_message_id"], result.id);
+        }
+        assert_eq!(self.probe.actions.load(Ordering::SeqCst), 0);
+        assert_eq!(self.probe.shell_entries.load(Ordering::SeqCst), 0);
+    }
+
+    async fn run_call(&self) -> bool {
         self.probe.next_call.store(true, Ordering::SeqCst);
         let mut session = self.reload().await;
         let workspace = self.directory.path().join("workspace");
@@ -246,28 +334,13 @@ impl Fixture {
             )
             .await
             .unwrap();
-        assert!(drain.await.unwrap());
-        let pending = self.reload().await;
-        assert!(pending.pending_question.is_some());
-        let result = pending
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.tool_call_id.as_deref() == Some(CALL))
-            .unwrap();
-        let authority = &result.metadata.as_ref().unwrap()[AUTHORITY];
-        assert_eq!(
-            authority["incarnation_id"],
-            self.original.incarnation_id.to_string()
-        );
-        assert_eq!(authority["result_message_id"], result.id);
-        assert_eq!(self.probe.actions.load(Ordering::SeqCst), 0);
+        drain.await.unwrap()
     }
 
     pub(crate) async fn reload(&self) -> Session {
         self.state
             .storage
-            .load_session(&self.original.session_id)
+            .load_session(&self.session_id)
             .await
             .unwrap()
             .unwrap()
@@ -308,14 +381,13 @@ impl Fixture {
 
     pub(crate) async fn formal_approve(&self) {
         let decision = self.decision().await;
-        let guard = bamboo_engine::session_app::respond::acquire_pending_response_guard(
-            &self.original.session_id,
-        )
-        .await;
+        let guard =
+            bamboo_engine::session_app::respond::acquire_pending_response_guard(&self.session_id)
+                .await;
         bamboo_engine::session_app::respond::submit_pending_permission_response_checked_guarded(
             &self.state.session_repo,
             bamboo_engine::session_app::types::RespondInput {
-                session_id: self.original.session_id.clone(),
+                session_id: self.session_id.clone(),
                 user_response: "Approve".into(),
                 model: None,
                 model_ref: None,
@@ -324,7 +396,7 @@ impl Fixture {
             },
             Some(CALL.into()),
             bamboo_tools::permission::PermissionDecisionReceipt {
-                session_id: self.original.session_id.clone(),
+                session_id: self.session_id.clone(),
                 decision,
                 decided_at: std::time::SystemTime::now().into(),
             },
@@ -342,7 +414,7 @@ impl Fixture {
                     .agent_runners
                     .read()
                     .await
-                    .get(&self.original.session_id)
+                    .get(&self.session_id)
                     .is_some_and(|runner| {
                         matches!(
                             runner.status,
@@ -354,7 +426,7 @@ impl Fixture {
                     && self
                         .state
                         .session_activation_router
-                        .current_run_id(&self.original.session_id)
+                        .current_run_id(&self.session_id)
                         .await
                         .is_none()
                 {
@@ -367,6 +439,7 @@ impl Fixture {
         .expect("adapter must finish or retire its reserved execution");
         self.state.shutdown().await;
         assert_eq!(self.probe.actions.load(Ordering::SeqCst), writes);
+        assert_eq!(self.probe.shell_entries.load(Ordering::SeqCst), 0);
         let scope = SupervisorSessionService::new(self.state.session_store.clone())
             .inspect_scope(&self.original)
             .await
@@ -386,6 +459,39 @@ impl Fixture {
             replay_retained
         );
         assert!(session.pending_question.is_none());
+        if !replay_retained {
+            assert!(!session.metadata.contains_key(
+                bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_GENERATION_METADATA_KEY,
+            ));
+        }
+        if self.ordinary_root {
+            assert!(session.supervisor_incarnation_id().is_none());
+            let decision = self.decision().await;
+            assert!(!self
+                .state
+                .permission_checker
+                .permission_config()
+                .unwrap()
+                .consume_once_for_generation(
+                    &self.session_id,
+                    CALL,
+                    &decision.request_generation,
+                    bamboo_tools::permission::PermissionType::ExecuteCommand,
+                    "current-command"
+                ));
+            let supervisor = self
+                .state
+                .storage
+                .load_session(&self.original.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!supervisor.root_orchestration_only_enabled());
+            assert_eq!(
+                supervisor.supervisor_incarnation_id(),
+                Some(self.original.incarnation_id)
+            );
+        }
         let target = self
             .state
             .storage
@@ -396,6 +502,45 @@ impl Fixture {
         assert_eq!(target.messages.len(), 1);
         assert_eq!(target.messages[0].content, "independent target history");
     }
+}
+
+#[actix_web::test]
+async fn server_supervisor_shell_never_enters_approval_or_protected_write_in_either_mode() {
+    let body = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            actix_web::rt::System::new().block_on(async {
+                for ultra in [false, true] {
+                    let fixture = Fixture::unparked(false).await;
+                    let mut supervisor = fixture.reload().await;
+                    supervisor.set_root_orchestration_only(ultra).unwrap();
+                    fixture
+                        .state
+                        .storage
+                        .save_session(&supervisor)
+                        .await
+                        .unwrap();
+                    fixture.probe.shell_call.store(true, Ordering::SeqCst);
+                    assert!(!fixture.run_call().await);
+                    let saved = fixture.reload().await;
+                    assert!(saved.pending_question.is_none());
+                    let result = saved
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+                        .unwrap();
+                    assert_eq!(result.tool_success, Some(false));
+                    assert!(result
+                        .metadata
+                        .as_ref()
+                        .is_none_or(|metadata| metadata.get(AUTHORITY).is_none()));
+                    fixture.settled(0, false).await;
+                }
+            });
+        })
+        .expect("spawn test thread");
+    body.join().expect("test thread completed");
 }
 
 #[actix_web::test]
@@ -438,7 +583,7 @@ async fn server_native_typed_supervisor_approval_fixture_replay_body() {
             .data
             .as_ref()
             .clone();
-        policy.ask_rules = vec!["Bash(current-command)".into()];
+        policy.ask_rules = vec!["session_control".into(), "default::session_control".into()];
         fixture.state.permission_section.commit(0, policy).unwrap();
         let policy = fixture.state.permission_section.snapshot();
         let permissions = fixture
@@ -515,7 +660,7 @@ async fn server_resume_consumes_approved_call_after_root_tool_tightening() {
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
             actix_web::rt::System::new().block_on(async {
-                let fixture = Box::pin(Fixture::pending()).await;
+                let fixture = Box::pin(Fixture::ordinary_root_pending()).await;
                 fixture.prepare_workspace_catalog().await;
                 fixture.formal_approve().await;
                 let mut selected = fixture.reload().await;
