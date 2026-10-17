@@ -9,6 +9,19 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+  # This frozen batch restores existing caches without adding paid storage.
+  # The main anchor also covers its first normal promotion push.
+  BAMBOO_RELEASE_CACHE_WRITE_ALLOWED: >-
+    ${{ !(
+      startsWith(github.ref, 'refs/heads/bamboo/release/da348-') ||
+      github.ref == 'refs/heads/release/da348a63f1d019a22df547c78575c500b6b1294e' ||
+      startsWith(github.head_ref, 'bamboo/release/da348-') ||
+      github.head_ref == 'release/da348a63f1d019a22df547c78575c500b6b1294e' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+       (github.event.before == 'dbafb74522794012fc8f0a61e761817b3913989a' ||
+        contains(github.event.head_commit.message, 'release/da348a63f1d019a22df547c78575c500b6b1294e')))
+    ) }}
+
 jobs:
   build-docs:
     name: Build Documentation
@@ -26,6 +39,7 @@ jobs:
         with:
           shared-key: bamboo-docs-${{ runner.os }}
           cache-on-failure: true
+          save-if: ${{ env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Build documentation
         run: cargo doc --no-deps --all-features --document-private-items
