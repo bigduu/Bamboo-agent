@@ -352,6 +352,9 @@ pub struct Snapshot {
     /// Explicit project membership and immutable adopted context; absent in legacy scopes.
     #[serde(default, skip_serializing_if = "crate::ProjectTicketState::is_empty")]
     pub project: crate::ProjectTicketState,
+    /// Scope-local planning only; schema 6 fences older writers.
+    #[serde(default, skip_serializing_if = "crate::SprintPlanningState::is_empty")]
+    pub sprint: crate::SprintPlanningState,
     pub binding: ScopeBinding,
     pub seq: u64,
     pub graph_revision: u64,
@@ -374,6 +377,7 @@ impl Snapshot {
         Self {
             schema: 1,
             project: Default::default(),
+            sprint: Default::default(),
             binding,
             seq: 0,
             graph_revision: 0,

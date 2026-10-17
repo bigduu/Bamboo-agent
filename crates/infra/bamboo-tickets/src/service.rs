@@ -2130,6 +2130,7 @@ fn valid_effect_transition(from: EffectState, to: EffectState) -> bool {
 
 pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
     crate::project::validate(snapshot)?;
+    crate::sprint::validate(snapshot)?;
     crate::migration::validate_migration(snapshot)?;
     crate::file_reconciliation::validate_file_intents(snapshot)?;
     crate::resolution::validate_history(snapshot)?;
