@@ -82,15 +82,47 @@ async fn patch(
     .await
     .unwrap();
     if response.status().is_success() {
-        // Project writes enqueue their existing durable event; wait for its
-        // confirmed journal/broadcast boundary before asserting event absence
-        // for a later rejected request.
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
-            .await
+        // HTTP success only attempts to enqueue the asynchronous event; it
+        // promises neither queue admission nor one-second journal/broadcast latency.
+        // This bounded fixture wait still requires the exact response revision and
+        // both real publication boundaries before later absence assertions.
+        let expected_revision = response
+            .headers()
+            .get(header::ETAG)
+            .expect("successful project PATCH has its actual revision")
+            .to_str()
             .unwrap()
+            .trim_matches('"')
+            .parse::<u64>()
             .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(8), feed.recv())
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "project PATCH did not reach durable/live publication: {error}; latest_seq={}, dropped={}",
+                    state.account_sink.latest_seq(),
+                    state.account_sink.dropped_count()
+                )
+            })
+            .expect("project account tail stays open and unlagged");
+        let matches_update = |event: &AgentEvent| {
+            matches!(event, AgentEvent::ProjectUpdated { project_id, revision }
+                if project_id == id.as_str() && *revision == expected_revision)
+        };
         assert!(
-            matches!(&event.event, AgentEvent::ProjectUpdated { project_id, .. } if project_id == id.as_str())
+            matches_update(&event.event),
+            "exact ProjectUpdated broadcast"
+        );
+        let replay = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            event.seq.saturating_sub(1),
+        )
+        .expect("read the actual project-event journal");
+        assert!(
+            replay
+                .iter()
+                .any(|durable| { durable.seq == event.seq && matches_update(&durable.event) }),
+            "the broadcast has its exact durable journal row"
         );
     }
     response
