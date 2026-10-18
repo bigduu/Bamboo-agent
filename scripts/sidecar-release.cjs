@@ -4,9 +4,8 @@ const assert = require('node:assert/strict')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
-const { spawnSync } = require('node:child_process')
 const { assertVersion, validateSource, readBodyReceipt, validateReceipt,
-  readAuthenticatedReceipt, assertSigningConfiguration } = require('./crate-release.cjs')
+  readAuthenticatedReceipt, assertSigningConfiguration, spawnCommand } = require('./crate-release.cjs')
 
 const REPOSITORY = 'bigduu/Bamboo-agent'
 const MANIFEST = 'bamboo-sidecars-v1.json'
@@ -57,10 +56,8 @@ function requireDigest(value, maximum, minimum = 1) {
 function createBrowserHost({ sourceRoot, outputDirectory }) {
   const output = path.resolve(outputDirectory, HOST_ASSET)
   const executable = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3')
-  const result = spawnSync(executable, [path.join(__dirname, 'sidecar-browser-host.py'),
-    path.resolve(sourceRoot), output], { encoding: 'utf8', maxBuffer: 1024 * 1024 })
-  assert.equal(result.status, 0, `Browser host packaging failed: ${result.stderr || result.error?.message || ''}`)
-  const host = JSON.parse(result.stdout)
+  const host = JSON.parse(execute(executable, [path.join(__dirname, 'sidecar-browser-host.py'),
+    path.resolve(sourceRoot), output], { maxBuffer: 1024 * 1024 }))
   assert.deepEqual(fileIdentity(output, MAX_HOST), { sha256: host.sha256, sizeBytes: host.sizeBytes })
   return host
 }
@@ -128,7 +125,9 @@ function binaryArchitecture(file, target) {
 }
 
 function execute(program, args, options = {}) {
-  const result = spawnSync(program, args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, ...options })
+  // Reuse the publisher's credential policy: only gh receives GitHub auth;
+  // signing/registry authority never reaches Git, Python, or other children.
+  const result = spawnCommand([program, ...args], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, ...options })
   assert.ok(!result.error && result.status === 0, `${program} failed (${result.status}): ${result.stderr || result.error?.message || ''}`)
   return result.stdout
 }

@@ -116,11 +116,11 @@ test('bounded file and host readers reject symlinks and refuse output replacemen
   assert.throws(() => release.fileIdentity(link))
   assert.throws(() => release.fileIdentity(real, 3))
   release.createBrowserHost(value)
-  assert.throws(() => release.createBrowserHost(value), /packaging failed/i)
+  assert.throws(() => release.createBrowserHost(value), /failed/i)
   fs.rmSync(path.join(value.outputDirectory, release.HOST_ASSET))
   const host = path.join(value.sourceRoot, release.HOST_FILES[0])
   fs.rmSync(host); fs.symlinkSync(real, host)
-  assert.throws(() => release.createBrowserHost(value), /packaging failed/i)
+  assert.throws(() => release.createBrowserHost(value), /failed/i)
 })
 
 test('native format verification detects mislabelled architecture and non-executable Mach-O/PE/ELF', (t) => {
@@ -218,6 +218,14 @@ test('Cargo never inherits publication credentials or API-only/compiler-profile 
   for (const [platform, arch, target] of [['darwin', 'arm64', release.TARGETS[0]], ['darwin', 'x64', release.TARGETS[1]],
     ['win32', 'x64', release.TARGETS[2]], ['linux', 'x64', release.TARGETS[3]]]) assert.equal(nativeTarget(platform, arch), target)
   assert.throws(() => nativeTarget('linux', 'arm64'))
+})
+
+test('real controller children retain ordinary environment but never receive signing, registry or unrelated GitHub authority', () => {
+  const output = release.execute(process.execPath, ['-e',
+    'process.stdout.write(JSON.stringify({marker:process.env.FIXTURE_MARKER,leaked:Object.keys(process.env).filter(k=>/TOKEN|SIGNING_KEY/.test(k))}))'],
+  { env: { PATH: process.env.PATH, FIXTURE_MARKER: 'retained', GH_TOKEN: 'synthetic-test-value',
+    CARGO_REGISTRY_TOKEN: 'synthetic-test-value', BAMBOO_RELEASE_SIGNING_KEY: 'synthetic-test-value' } })
+  assert.deepEqual(JSON.parse(output), { marker: 'retained', leaked: [] })
 })
 
 function publishingFixture(t) {
