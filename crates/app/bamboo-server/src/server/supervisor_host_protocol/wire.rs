@@ -313,6 +313,17 @@ mod tests {
     }
 
     #[test]
+    fn disabled_profile_is_explicit_and_never_claims_prior_owner_consent() {
+        let channel = UnadmittedChannel::new(Uuid::new_v4()).unwrap();
+        let hello = serde_json::to_value(channel.hello()).unwrap();
+        assert_eq!(hello["authority_profile"]["kind"], "bamboo_native_confirmation_v1");
+        assert_eq!(hello["authority_profile"]["confirmation_available"], false);
+        assert_eq!(hello["authority_profile"]["confirmation_required_per_request"], true);
+        assert_eq!(hello["authority_profile"]["unavailable_code"], "native_confirmation_not_enabled");
+        assert_eq!(hello["owner_authorization_available"], false);
+    }
+
+    #[test]
     fn malformed_or_wrong_launch_frame_closes_the_component() {
         let mut channel = UnadmittedChannel::new(
             Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
