@@ -1144,7 +1144,7 @@ async fn run_fixture(mode: &str) -> FixtureResult<()> {
     let mut ready_published = false;
     let lifetime = async {
         probe(&client, &base, "/healthz", None, &shutdown_marker, &mut probes).await?;
-        let setup = probe(&client, &base, "/api/v1/setup/status", None, &shutdown_marker, &mut probes).await?;
+        let setup = probe(&client, &base, "/api/v1/bamboo/setup/status", None, &shutdown_marker, &mut probes).await?;
         ensure!(setup["is_complete"] == true, "Lotus setup would block the fixture");
         probe(&client, &base, "/api/v1/projects", None, &shutdown_marker, &mut probes).await?;
         probe(&client, &base, &format!("/api/v1/projects/{}", marker.project_id), None, &shutdown_marker, &mut probes).await?;
