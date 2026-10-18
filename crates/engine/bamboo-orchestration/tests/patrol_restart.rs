@@ -137,7 +137,7 @@ impl Fixture {
             branch: "fixture".into(),
             worktree: tree.to_string_lossy().into_owned(),
             write_roots: vec![tree.to_string_lossy().into_owned()],
-            claims: BTreeSet::from(["patrol-fixture-worktree".into()]),
+            claims: BTreeSet::from([format!("worktree:{}", tree.to_string_lossy())]),
         };
         let started = fixture.apply(
             supervisor,
