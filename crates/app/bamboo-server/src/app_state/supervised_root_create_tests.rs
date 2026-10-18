@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use actix_web::{http::StatusCode, test, web, App};
+
 use bamboo_agent_core::tools::{
     ExecutingSupervisorObservation, FunctionCall, ToolCall, ToolExecutionContext, ToolOutcome,
 };
@@ -16,7 +18,7 @@ use super::AppState;
 
 struct Fixture {
     home: tempfile::TempDir,
-    state: AppState,
+    state: web::Data<AppState>,
     supervisor: SupervisorReference,
     project_id: bamboo_domain::ProjectId,
     workspace: String,
@@ -25,15 +27,17 @@ struct Fixture {
 impl Fixture {
     async fn new(ultra: bool) -> Self {
         let home = tempfile::tempdir().unwrap();
-        let state = Box::pin(AppState::new_with_provider(
-            home.path().to_path_buf(),
-            bamboo_llm::Config::default(),
-            Arc::new(super::UnconfiguredProvider {
-                message: "no external model is available in this fixture".into(),
-            }),
-        ))
-        .await
-        .unwrap();
+        let state = web::Data::new(
+            Box::pin(AppState::new_with_provider(
+                home.path().to_path_buf(),
+                bamboo_llm::Config::default(),
+                Arc::new(super::UnconfiguredProvider {
+                    message: "no external model is available in this fixture".into(),
+                }),
+            ))
+            .await
+            .unwrap(),
+        );
         let workspace = home.path().join("workspaces").join("explicit-worker");
         std::fs::create_dir_all(&workspace).unwrap();
         let workspace = workspace.to_string_lossy().into_owned();
@@ -47,10 +51,30 @@ impl Fixture {
             .await
             .unwrap();
         let supervisor = SupervisorReference::from(&original);
-        service
-            .configure_project_scope(&supervisor, 0, [project.id.clone()].into())
-            .await
-            .unwrap();
+        // Exercise the actual owner HTTP boundary, then the Host-wired model
+        // operation below. No in-process scope grant substitutes for the UI API.
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/api/v1/supervisor/default/scope")
+                .peer_addr("127.0.0.1:12345".parse().unwrap())
+                .set_json(json!({
+                    "incarnation_id":supervisor.incarnation_id,
+                    "expected_state_revision":0,"allowed_projects":[project.id.clone()],
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let receipt: Value = test::read_body_json(response).await;
+        assert_eq!(receipt["receipt"]["state_revision"], 1);
+        drop(app);
         let original = state
             .storage
             .load_root_authority(&supervisor.session_id)
