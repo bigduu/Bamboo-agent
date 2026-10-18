@@ -478,7 +478,7 @@ test('workflow retains the original successful-CI authority, one allocator/queue
   const matrix = source.split('  executables:\n')[1].split('  publish-executables:\n')[0]
   const final = source.split('  publish-executables:\n')[1]
   assert.match(source, /group: bamboo-crate-publication\n  queue: max\n  cancel-in-progress: false/)
-  assert.equal(source.split('run: node scripts/crate-release.cjs plan').length - 1, 1)
+  assert.equal(source.split('bamboo-release-controller/scripts/crate-release.cjs" plan').length - 1, 1)
   assert.match(matrix, /needs: automatic/)
   assert.doesNotMatch(matrix, /contents: write|secrets\.|api-only|cargo publish/)
   for (const target of release.TARGETS) assert.ok(matrix.includes(`target: ${target}\n`))
@@ -496,7 +496,7 @@ test('workflow retains the original successful-CI authority, one allocator/queue
   assert.ok(final.includes('EXPECTED_BUILDS: ${{ toJSON(needs.executables.outputs) }}'))
   assert.match(final, /needs: \[automatic, executables\]/)
   assert.match(final, /environment: bamboo-release\n    permissions:\n      contents: write/)
-  assert.match(final, /run: node scripts\/sidecar-release.cjs publish/)
+  assert.match(final, /bamboo-release-controller\/scripts\/sidecar-release.cjs" publish/)
   assert.doesNotMatch(final, /--clobber|cargo build|cargo publish|inputs\./)
 })
 

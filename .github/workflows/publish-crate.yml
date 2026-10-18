@@ -422,22 +422,25 @@ jobs:
               assert inputs["complete_release"] in (True, "true") and inputs["dry_run"] in (False, "false")
               source = inputs["expected_source_sha"]
               assert re.fullmatch(r"[0-9a-f]{40}", source)
-              assert source == os.environ["GITHUB_SHA"] == os.environ["GITHUB_WORKFLOW_SHA"]
+              workflow_source = os.environ["GITHUB_WORKFLOW_SHA"]
+              assert re.fullmatch(r"[0-9a-f]{40}", workflow_source)
+              assert os.environ["GITHUB_SHA"] == workflow_source
               ref = os.environ["GITHUB_REF"]
               assert ref == "refs/heads/main"
               assert os.environ["GITHUB_WORKFLOW_REF"] == f"{repository}/.github/workflows/publish-crate.yml@{ref}"
               def api(route):
                   return json.loads(subprocess.check_output(["gh", "api", f"repos/{repository}/{route}"], text=True))
-              assert api("branches/main")["commit"]["sha"] == source
+              assert api("branches/main")["commit"]["sha"] == workflow_source
               run_id = inputs["accepted_ci_run"]
               assert re.fullmatch(r"[1-9][0-9]*", run_id)
               ci = api("actions/runs/" + run_id)
               assert ci["name"] == "CI" and ci["path"] == ".github/workflows/ci.yml"
               assert ci["status"] == "completed" and ci["conclusion"] == "success" and ci["event"] == "pull_request"
               assert ci["repository"]["full_name"] == ci["head_repository"]["full_name"] == repository
+              assert source == ci["head_sha"]
               assert re.fullmatch(r"release/[0-9a-f]{40}", ci["head_branch"])
               reference = api("git/ref/heads/" + ci["head_branch"])["object"]
-              assert reference["sha"] == source and reference["type"] == "commit"
+              assert reference["type"] == "commit"
               cut = ci["head_branch"].removeprefix("release/")
               assert re.fullmatch(r"[0-9a-f]{40}", cut)
               dev = api("branches/dev")
@@ -448,14 +451,8 @@ jobs:
                   return comparison
               ancestor(cut, ci["head_sha"])
               ancestor(ci["head_sha"], dev["commit"]["sha"])
-              delta = ancestor(ci["head_sha"], source)
-              assert delta["total_commits"] <= 10 and len(delta["files"]) <= 20
-              allowed = {".github/workflows/ci.yml", ".github/workflows/publish-crate.yml",
-                         "scripts/ci-policy.test.cjs", "scripts/crate-release.cjs", "scripts/crate-release.test.cjs",
-                         "scripts/sidecar-release.cjs", "scripts/sidecar-release.test.cjs",
-                         "scripts/release-source.cjs", "scripts/release-source.test.cjs"}
-              paths = sorted(item["filename"] for item in delta["files"])
-              assert all(item["filename"] in allowed and item["status"] in ("added", "modified") for item in delta["files"])
+              ancestor(source, reference["sha"])
+              paths = []
               required = ["Validation Source", "Promotion Source", "Test", "E2E Tests", "Lint",
                           "Build (ubuntu-latest)", "Build (macos-latest)", "Build (windows-latest)"]
               jobs = api(f"actions/runs/{run_id}/jobs?per_page=100")["jobs"]
@@ -464,13 +461,14 @@ jobs:
                   assert len(matches) == 1 and matches[0]["status"] == "completed" and matches[0]["conclusion"] == "success"
               test = next(job for job in jobs if job["name"] == "Test")
               assert any(step["name"] == "Require the exact clean source after full validation" and step["conclusion"] == "success" for step in test["steps"])
-              log = subprocess.check_output(["gh", "api", f"repos/{repository}/actions/jobs/{test['id']}/logs"], text=True)
+              log = subprocess.check_output(["gh", "api", f"repos/{repository}/actions/jobs/{test['id']}/logs", "--allow-escape-sequences"], text=True)
               matches = re.findall(r"Source: ([0-9a-f]{40}) tree: ([0-9a-f]{40})", log)
               assert len(set(matches)) == 1
               revision, tree = matches[0]
               assert api("git/commits/" + revision)["tree"]["sha"] == tree
               assert api("git/commits/" + ci["head_sha"])["tree"]["sha"] == tree
               source_tree = api("git/commits/" + source)["tree"]["sha"]
+              assert source_tree == tree
               ci_identity = {key: ci[key] for key in ("id", "name", "path", "status", "conclusion", "event", "head_sha", "head_branch", "html_url")}
               ci_identity["repository"] = {"full_name": repository}
               ci_identity["head_repository"] = {"full_name": repository}
@@ -557,6 +555,26 @@ jobs:
         with:
           node-version: lts/*
 
+      - &release-controller
+        name: Install the exact workflow controller outside the product tree
+        shell: bash
+        run: |
+          node - <<'JS'
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const { execFileSync } = require('node:child_process')
+          const revision = process.env.GITHUB_WORKFLOW_SHA
+          if (!/^[0-9a-f]{40}$/.test(revision)) throw new Error('Missing exact workflow source')
+          const root = path.join(process.env.RUNNER_TEMP, 'bamboo-release-controller')
+          fs.mkdirSync(path.join(root, 'scripts'), { recursive: true })
+          for (const file of ['crate-release.cjs', 'crate-release-frontend.py', 'release-source.cjs',
+            'sidecar-release.cjs', 'sidecar-build.cjs', 'sidecar-browser-host.py']) {
+            const bytes = execFileSync('git', ['show', `${revision}:scripts/${file}`])
+            fs.writeFileSync(path.join(root, 'scripts', file), bytes, { flag: 'wx' })
+          }
+          console.log(`Controller ${revision}; product checkout remains unchanged`)
+          JS
+
       - name: Resolve exact release frontend
         id: frontend
         env:
@@ -607,7 +625,7 @@ jobs:
           BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
           FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
           FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
-        run: node scripts/crate-release.cjs plan
+        run: node "${{ runner.temp }}/bamboo-release-controller/scripts/crate-release.cjs" plan
 
       - name: Prepare workspace manifests for publish
         env:
@@ -627,7 +645,7 @@ jobs:
           BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
           FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
           FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
-        run: node scripts/crate-release.cjs publish
+        run: node "${{ runner.temp }}/bamboo-release-controller/scripts/crate-release.cjs" publish
 
   executables:
     name: Complete executable (${{ matrix.target }})
@@ -667,6 +685,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: lts/*
+      - *release-controller
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
@@ -678,7 +697,7 @@ jobs:
         env:
           # Read-only release access. Cargo never receives this token.
           GH_TOKEN: ${{ github.token }}
-        run: node scripts/sidecar-build.cjs
+        run: node "${{ runner.temp }}/bamboo-release-controller/scripts/sidecar-build.cjs"
       - name: Transport this platform's verified executable within the same run
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -708,6 +727,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: lts/*
+      - *release-controller
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
@@ -737,4 +757,4 @@ jobs:
           GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
           BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
           BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
-        run: node scripts/sidecar-release.cjs publish
+        run: node "${{ runner.temp }}/bamboo-release-controller/scripts/sidecar-release.cjs" publish

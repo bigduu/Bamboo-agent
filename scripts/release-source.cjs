@@ -1,13 +1,7 @@
 const assert = require('node:assert/strict')
 
-// The owner-requested release dispatch reuses a real completed CI snapshot.
-// Changes after that snapshot are restricted to this publication controller.
-const POLICY_PATHS = Object.freeze([
-  '.github/workflows/ci.yml', '.github/workflows/publish-crate.yml',
-  'scripts/ci-policy.test.cjs', 'scripts/crate-release.cjs', 'scripts/crate-release.test.cjs',
-  'scripts/sidecar-release.cjs', 'scripts/sidecar-release.test.cjs',
-  'scripts/release-source.cjs', 'scripts/release-source.test.cjs',
-])
+// The owner-requested dispatch publishes the original completed CI tree.
+// Updated workflow controllers execute outside that immutable product tree.
 const REQUIRED = Object.freeze(['Validation Source', 'Promotion Source', 'Test', 'E2E Tests', 'Lint',
   'Build (ubuntu-latest)', 'Build (macos-latest)', 'Build (windows-latest)'])
 const SHA = /^[0-9a-f]{40}$/
@@ -31,18 +25,17 @@ function validateDispatch(event, validation, sourceRevision, sourceTree) {
   assert.equal(run.head_repository?.full_name, 'bigduu/Bamboo-agent')
   assert.match(run.head_branch, /^release\/[0-9a-f]{40}$/)
   assert.match(run.head_sha, SHA)
+  assert.equal(sourceRevision, run.head_sha, 'Publish the original validated source')
   assert.equal(run.html_url, `https://github.com/bigduu/Bamboo-agent/actions/runs/${run.id}`)
   assert.match(validation.validatedRevision, SHA)
   assert.match(validation.validatedTree, SHA)
   assert.deepEqual(validation.requiredChecks, REQUIRED)
   assert.ok(Array.isArray(validation.policyOnlyPaths))
-  assert.equal(new Set(validation.policyOnlyPaths).size, validation.policyOnlyPaths.length)
-  assert.ok(validation.policyOnlyPaths.every(name => POLICY_PATHS.includes(name)),
-    'Runtime changes cannot reuse earlier CI')
-  if (!validation.policyOnlyPaths.length) assert.equal(sourceTree, validation.validatedTree)
+  assert.deepEqual(validation.policyOnlyPaths, [], 'No changed product source may reuse earlier CI')
+  assert.equal(sourceTree, validation.validatedTree, 'Require the exact accepted CI tree')
   // Distinct HEAD-derived metadata is recorded, never claimed byte-identical.
   assert.equal(validation.productTreeVerified, true)
   return run
 }
 
-module.exports = { POLICY_PATHS, REQUIRED, validateDispatch }
+module.exports = { REQUIRED, validateDispatch }
