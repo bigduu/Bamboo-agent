@@ -57,6 +57,36 @@ function sourceState(allowed) {
   return { paths: changes, diffSha256: sha256(execute('git', ['diff', '--binary'], { encoding: null })) }
 }
 
+function verifyStampedVersions(metadata, version, { root = process.cwd(), manifestPaths }) {
+  root = fs.realpathSync(root)
+  assert.ok(Array.isArray(manifestPaths) && manifestPaths.length, 'Require the shared stamper manifest set')
+  const expected = new Set()
+  for (const manifest of manifestPaths) {
+    assert.equal(typeof manifest, 'string')
+    assert.ok(!path.isAbsolute(manifest), 'Stamped manifests must belong to this source root')
+    const absolute = path.resolve(root, manifest)
+    assert.ok(path.relative(root, absolute).split(path.sep)[0] !== '..', 'Stamped manifest escaped this source root')
+    assert.ok(!expected.has(absolute), 'Duplicate stamped manifest')
+    expected.add(absolute)
+  }
+  const managed = new Map()
+  const members = new Set(metadata.workspace_members)
+  for (const member of metadata.packages) {
+    const manifest = fs.realpathSync(member.manifest_path)
+    if (!expected.has(manifest)) continue
+    assert.ok(!managed.has(manifest), 'Duplicate managed package in Cargo metadata')
+    assert.ok(members.has(member.id), 'Managed package is not a workspace member')
+    assert.equal(member.version, version, `Managed package ${member.name} has the wrong release version`)
+    managed.set(manifest, member)
+  }
+  assert.equal(managed.size, expected.size, 'Cargo metadata omitted a stamped package')
+  const agent = managed.get(path.resolve(root, 'Cargo.toml'))
+  const server = managed.get(path.resolve(root, 'crates/app/bamboo-server/Cargo.toml'))
+  assert.equal(agent?.name, 'bamboo-agent', 'Require the stamped Bamboo executable package')
+  assert.equal(server?.name, 'bamboo-server', 'Require the stamped Bamboo server package')
+  return server
+}
+
 async function main() {
   const identity = workflowIdentity()
   const target = process.env.BAMBOO_RELEASE_TARGET
@@ -84,14 +114,15 @@ async function main() {
   allowed.add(`${frontendRoot}/frontend-manifest.json`)
   allowed.add(`${frontendRoot}/lotus-frontend.zip`)
   const python = process.platform === 'win32' ? 'python' : 'python3'
+  const manifestPaths = JSON.parse(execute(python, ['scripts/crate-release-lock.py', 'manifests'], { env: buildEnv }))
   execute(python, ['scripts/crate-release-lock.py', 'stamp', identity.version], { env: buildEnv })
   // Resolve only local stamped versions, then reject *any* external lock drift.
   execute('cargo', ['metadata', '--format-version', '1'], { env: buildEnv, maxBuffer: 64 * 1024 * 1024 })
   execute(python, ['scripts/crate-release-lock.py'], { env: buildEnv })
   const metadata = JSON.parse(execute('cargo', ['metadata', '--format-version', '1', '--no-deps', '--locked'], { env: buildEnv }))
-  for (const member of metadata.packages) assert.equal(member.version, identity.version)
-  const server = metadata.packages.find((item) => item.name === 'bamboo-server')
-  assert.ok(server)
+  // Independent non-published examples keep their own version. Require every
+  // package actually managed by the existing stamper, including CLI and server.
+  const server = verifyStampedVersions(metadata, identity.version, { manifestPaths })
   const stamped = sourceState(allowed)
   const args = ['build', '--locked', '--release', '--bin', 'bamboo', '--target', target,
     '--message-format=json-render-diagnostics']
@@ -130,5 +161,5 @@ async function main() {
     version: identity.version, sourceRevision: identity.sourceRevision, sha256: provenance.sha256 }))
 }
 
-module.exports = { nativeTarget, buildEnvironment, verifyBuildMessages, sourceState }
+module.exports = { nativeTarget, buildEnvironment, verifyBuildMessages, sourceState, verifyStampedVersions }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1 })
