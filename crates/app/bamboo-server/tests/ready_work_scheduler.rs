@@ -1162,3 +1162,6 @@ async fn reopening_the_ticket_writer_advances_epoch_without_restoring_host_polic
     );
     assert!(snapshot.assignments.is_empty());
 }
+
+#[path = "ready_work_scheduler/admission.rs"]
+mod admission;

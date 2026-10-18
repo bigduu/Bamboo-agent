@@ -32,6 +32,62 @@ use super::runner_state::AgentRunner;
 /// reconstruct authority from a persisted job.
 pub type QueueAdmissionCheck = dyn Fn() -> Result<(), String> + Send + Sync;
 
+/// One in-memory queue slot, not an execution grant. Dropping it releases
+/// capacity without publishing a job or Start. The original cancellation gate
+/// stays bound to the reservation and cannot be replaced before commit.
+pub struct QueueCapacityReservation<'a> {
+    scheduler: &'a SpawnScheduler,
+    gate: Option<&'a AdmissionGate>,
+    permit: mpsc::Permit<'a, QueuedSpawnJob>,
+}
+
+impl QueueCapacityReservation<'_> {
+    /// A terminal original gate needs no additional Host I/O. Commit repeats
+    /// this arbitration atomically, including when preflight returned an error.
+    pub fn terminal_state(&self) -> Option<AdmissionCommit<()>> {
+        self.gate.and_then(|gate| {
+            if gate.is_committed() {
+                Some(AdmissionCommit::AlreadyCommitted)
+            } else if gate.is_cancelled() {
+                Some(AdmissionCommit::Cancelled)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The caller may perform asynchronous Host validation while holding this
+    /// slot. This method retains the final synchronous, non-I/O admission fence
+    /// and publishes Start only after that commit succeeds.
+    pub async fn enqueue_announced_for_generation_revalidated(
+        self,
+        job: SpawnJob,
+        title: Option<String>,
+        launch_generation: Option<u64>,
+        admission_check: Option<&QueueAdmissionCheck>,
+        preflight: Result<(), String>,
+    ) -> Result<AdmissionCommit<()>, String> {
+        let Self {
+            scheduler,
+            gate,
+            permit,
+        } = self;
+        let preparation_job = job.clone();
+        let commit = send_reserved(
+            permit,
+            job,
+            title.clone(),
+            gate,
+            launch_generation,
+            admission_check,
+            preflight,
+        )?;
+        scheduler
+            .finish_admission(preparation_job, title, launch_generation, commit)
+            .await
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SpawnJob {
     pub parent_session_id: String,
@@ -535,7 +591,7 @@ impl SpawnScheduler {
         admission_check: Option<&QueueAdmissionCheck>,
     ) -> Result<AdmissionCommit<()>, String> {
         let preparation_job = job.clone();
-        match reserve_and_send(
+        let commit = reserve_and_send(
             &self.tx,
             job,
             title.clone(),
@@ -543,8 +599,38 @@ impl SpawnScheduler {
             launch_generation,
             admission_check,
         )
-        .await?
-        {
+        .await?;
+        self.finish_admission(preparation_job, title, launch_generation, commit)
+            .await
+    }
+
+    /// Reserve backpressure capacity before asynchronous Host preflight. This
+    /// only reserves a Tokio queue slot: it creates no Task, lease or authority.
+    pub async fn reserve_queue_capacity<'a>(
+        &'a self,
+        gate: Option<&'a AdmissionGate>,
+    ) -> Result<AdmissionCommit<QueueCapacityReservation<'a>>, String> {
+        Ok(match reserve_queue_permit(&self.tx, gate).await? {
+            AdmissionCommit::Committed(permit) => {
+                AdmissionCommit::Committed(QueueCapacityReservation {
+                    scheduler: self,
+                    gate,
+                    permit,
+                })
+            }
+            AdmissionCommit::AlreadyCommitted => AdmissionCommit::AlreadyCommitted,
+            AdmissionCommit::Cancelled => AdmissionCommit::Cancelled,
+        })
+    }
+
+    async fn finish_admission(
+        &self,
+        preparation_job: SpawnJob,
+        title: Option<String>,
+        launch_generation: Option<u64>,
+        commit: AdmissionCommit<(oneshot::Sender<()>, Arc<AtomicBool>)>,
+    ) -> Result<AdmissionCommit<()>, String> {
+        match commit {
             AdmissionCommit::Committed((announce_ready, start_published)) => {
                 let launch_guard = if launch_generation.is_some() {
                     Some(
@@ -696,6 +782,25 @@ async fn reserve_and_send(
     launch_generation: Option<u64>,
     admission_check: Option<&QueueAdmissionCheck>,
 ) -> Result<AdmissionCommit<(oneshot::Sender<()>, Arc<AtomicBool>)>, String> {
+    match reserve_queue_permit(tx, gate).await? {
+        AdmissionCommit::Committed(permit) => send_reserved(
+            permit,
+            job,
+            title,
+            gate,
+            launch_generation,
+            admission_check,
+            Ok(()),
+        ),
+        AdmissionCommit::AlreadyCommitted => Ok(AdmissionCommit::AlreadyCommitted),
+        AdmissionCommit::Cancelled => Ok(AdmissionCommit::Cancelled),
+    }
+}
+
+async fn reserve_queue_permit<'a>(
+    tx: &'a mpsc::Sender<QueuedSpawnJob>,
+    gate: Option<&AdmissionGate>,
+) -> Result<AdmissionCommit<mpsc::Permit<'a, QueuedSpawnJob>>, String> {
     if let Some(gate) = gate {
         if gate.is_committed() {
             return Ok(AdmissionCommit::AlreadyCommitted);
@@ -713,6 +818,18 @@ async fn reserve_and_send(
         None => tx.reserve().await,
     }
     .map_err(|_| "spawn scheduler is not running".to_string())?;
+    Ok(AdmissionCommit::Committed(permit))
+}
+
+fn send_reserved(
+    permit: mpsc::Permit<'_, QueuedSpawnJob>,
+    job: SpawnJob,
+    title: Option<String>,
+    gate: Option<&AdmissionGate>,
+    launch_generation: Option<u64>,
+    admission_check: Option<&QueueAdmissionCheck>,
+    preflight: Result<(), String>,
+) -> Result<AdmissionCommit<(oneshot::Sender<()>, Arc<AtomicBool>)>, String> {
     let (announce_ready, announcement_ready) = oneshot::channel();
     let start_published = Arc::new(AtomicBool::new(false));
     let queued = QueuedSpawnJob {
@@ -723,6 +840,7 @@ async fn reserve_and_send(
         start_published: start_published.clone(),
     };
     let commit = || {
+        preflight?;
         if let Some(check) = admission_check {
             check()?;
         }
