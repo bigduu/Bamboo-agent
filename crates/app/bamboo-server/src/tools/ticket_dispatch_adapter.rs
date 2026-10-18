@@ -43,6 +43,7 @@ impl ChildSessionAdapter {
         key: &str,
         spec: &DispatchSpec,
         policy: &TicketDispatchPolicy,
+        preflight: futures::future::BoxFuture<'_, std::result::Result<(), String>>,
     ) -> Result<DispatchObservation> {
         let mut dispatch = ticket_runtime::dispatch_binding(&service, key, spec)?;
         if policy.max_rounds == Some(0) {
@@ -161,12 +162,18 @@ impl ChildSessionAdapter {
             fence.check()?;
         }
         let live_fence = policy.admission_fence.clone();
+        let admission_service = service.clone();
+        let admission_dispatch = dispatch.clone();
         let admission_check = move || {
-            live_fence
-                .as_ref()
-                .map_or(Ok(()), |fence| fence.check().map_err(|e| e.to_string()))
+            if let Some(fence) = &live_fence {
+                fence.check().map_err(|error| error.to_string())?;
+            }
+            // Bounded canonical in-memory facts only; no Host I/O or await is
+            // allowed inside this final check and the queue send.
+            ticket_runtime::require_dispatch_permission(&admission_service, &admission_dispatch)
+                .map_err(|error| error.to_string())
         };
-        self.admit_child_run_checked(&parent, &child, None, Some(&admission_check))
+        self.admit_child_run_revalidated(&parent, &child, None, Some(&admission_check), preflight)
             .await
             .map_err(|e| Error::AuthorityUnavailable(e.to_string()))?;
         self.query_ticket_dispatch(&service, key, spec).await

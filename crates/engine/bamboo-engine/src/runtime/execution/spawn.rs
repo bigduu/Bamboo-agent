@@ -1288,6 +1288,157 @@ mod launch_hook_tests {
         ));
     }
 
+    mod queue_capacity_revalidation {
+        use super::*;
+
+        async fn reserve<'a>(
+            tx: &'a mpsc::Sender<QueuedSpawnJob>,
+            gate: &AdmissionGate,
+        ) -> mpsc::Permit<'a, QueuedSpawnJob> {
+            match reserve_queue_permit(tx, Some(gate)).await.unwrap() {
+                AdmissionCommit::Committed(permit) => permit,
+                _ => panic!("fresh gate must reserve without committing"),
+            }
+        }
+
+        #[tokio::test]
+        async fn reservation_does_not_commit_the_original_gate() {
+            let (tx, mut rx) = mpsc::channel(1);
+            let gate = AdmissionGate::default();
+            let permit = reserve(&tx, &gate).await;
+            assert!(!gate.is_committed());
+            assert!(!gate.is_cancelled());
+            assert_eq!(tx.capacity(), 0);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                send_reserved(permit, job(), None, Some(&gate), Some(7), None, Ok(())).unwrap(),
+                AdmissionCommit::Committed(_)
+            ));
+            assert!(gate.is_committed());
+            assert_eq!(rx.recv().await.unwrap().launch_generation, Some(7));
+        }
+
+        #[tokio::test]
+        async fn preflight_error_keeps_pending_gate_and_releases_capacity() {
+            let (tx, mut rx) = mpsc::channel(1);
+            let gate = AdmissionGate::default();
+            let permit = reserve(&tx, &gate).await;
+            let error = send_reserved(
+                permit,
+                job(),
+                None,
+                Some(&gate),
+                Some(7),
+                None,
+                Err("fresh Host resources rejected".into()),
+            )
+            .err()
+            .expect("resource failure cannot commit");
+            assert_eq!(error, "fresh Host resources rejected");
+            assert!(!gate.is_committed());
+            assert!(!gate.is_cancelled());
+            assert_eq!(tx.capacity(), 1);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+
+        #[tokio::test]
+        async fn concurrent_commit_wins_over_a_late_preflight_error() {
+            let (tx, mut rx) = mpsc::channel(2);
+            let gate = AdmissionGate::default();
+            let late = reserve(&tx, &gate).await;
+            let first = reserve(&tx, &gate).await;
+            assert!(matches!(
+                send_reserved(first, job(), None, Some(&gate), Some(7), None, Ok(())).unwrap(),
+                AdmissionCommit::Committed(_)
+            ));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let check_calls = calls.clone();
+            let check = move || {
+                check_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            };
+            assert!(matches!(
+                send_reserved(
+                    late,
+                    job(),
+                    None,
+                    Some(&gate),
+                    Some(7),
+                    Some(&check),
+                    Err("resource check finished after another commit".into())
+                )
+                .unwrap(),
+                AdmissionCommit::AlreadyCommitted
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(rx.recv().await.unwrap().launch_generation, Some(7));
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert_eq!(tx.capacity(), 2);
+        }
+
+        #[tokio::test]
+        async fn cancellation_wins_over_a_late_preflight_error() {
+            let (tx, mut rx) = mpsc::channel(1);
+            let gate = AdmissionGate::default();
+            let permit = reserve(&tx, &gate).await;
+            gate.cancel_if_pending();
+            assert!(matches!(
+                send_reserved(
+                    permit,
+                    job(),
+                    None,
+                    Some(&gate),
+                    Some(7),
+                    None,
+                    Err("preflight observed failure after cancellation".into())
+                )
+                .unwrap(),
+                AdmissionCommit::Cancelled
+            ));
+            assert_eq!(tx.capacity(), 1);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+
+        #[tokio::test]
+        async fn successful_preflight_cannot_bypass_the_final_live_fence() {
+            let (tx, mut rx) = mpsc::channel(1);
+            let gate = AdmissionGate::default();
+            let permit = reserve(&tx, &gate).await;
+            let check = || Err("Ready policy expired during resource preflight".into());
+            let error = send_reserved(
+                permit,
+                job(),
+                None,
+                Some(&gate),
+                Some(7),
+                Some(&check),
+                Ok(()),
+            )
+            .err()
+            .expect("the final synchronous fence remains authoritative");
+            assert_eq!(error, "Ready policy expired during resource preflight");
+            assert!(!gate.is_committed());
+            assert!(!gate.is_cancelled());
+            assert_eq!(tx.capacity(), 1);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn producer_drop_after_start_publication_does_not_require_fallback_start() {
         let (announce_ready, announcement_ready) = oneshot::channel::<()>();

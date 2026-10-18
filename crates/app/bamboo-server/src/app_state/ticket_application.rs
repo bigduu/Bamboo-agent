@@ -29,6 +29,7 @@ pub struct TicketApplication {
     ready_scheduler: Arc<bamboo_orchestration::ReadyWorkScheduler>,
 }
 
+mod admission;
 mod initialization;
 pub use initialization::{ScopeInitialization, ScopeInitializationError};
 mod patrol_adapter;
@@ -437,39 +438,7 @@ impl TicketApplication {
                 }
                 _ => continue,
             };
-            let store = bamboo_projects::ProjectStore::open(self.root.clone())
-                .map_err(|e| Error::AuthorityUnavailable(e.to_string()))?;
-            let manifest = store
-                .get(project_id)
-                .map_err(|e| Error::InvalidTransition(e.to_string()))?;
-            if manifest.status != bamboo_domain::ProjectStatus::Active {
-                return Err(Error::InvalidTransition("Project is archived".into()));
-            }
-            if let Some(context) = context {
-                if (adopting && context.project_revision != manifest.revision)
-                    || context.resource_revision != manifest.resource_revision
-                    || !manifest
-                        .workspace_roots()
-                        .any(|p| p == context.workspace_binding.path)
-                {
-                    return Err(Error::RevisionConflict);
-                }
-                if let Some(binding) = manifest
-                    .workspace_bindings
-                    .iter()
-                    .find(|b| b.path == context.workspace_binding.path)
-                {
-                    if binding != &context.workspace_binding {
-                        return Err(Error::RevisionConflict);
-                    }
-                } else if context.workspace_binding.git_common_dir.is_some()
-                    || context.workspace_binding.label.is_some()
-                {
-                    return Err(Error::InvalidTransition(
-                        "primary binding has no auxiliary metadata".into(),
-                    ));
-                }
-            }
+            self.validate_project_context(project_id, context, adopting)?;
         }
         Ok(())
     }
@@ -781,7 +750,7 @@ impl TicketApplication {
         })?;
         adapter
             .ensure_ticket_dispatch(
-                service,
+                service.clone(),
                 key,
                 spec,
                 &TicketDispatchPolicy {
@@ -791,6 +760,11 @@ impl TicketApplication {
                     max_rounds,
                     admission_fence: fence.cloned(),
                 },
+                Box::pin(async {
+                    self.revalidate_ticket_dispatch_admission(&service, key, spec)
+                        .await
+                        .map_err(|error| error.to_string())
+                }),
             )
             .await
     }

@@ -35,6 +35,31 @@ commit. A rejection keeps the gate pending and publishes no queue entry or
 start announcement. The engine does not depend on orchestration; unchanged
 callers retain their existing entry point with no additional check.
 
+Host resource preflight is separate from that synchronous callback. A scoped
+Tokio queue permit is acquired before polling the server's asynchronous validator.
+The validator re-reads the original DispatchSpec/Assignment context, current
+Supervisor, Project and selected binding, local placement and exact Git workspace.
+Both newly prepared and recovered Pending admissions use it. The final callback
+still performs only the Ready fence and bounded canonical Ticket permission check;
+there is no file I/O, model call or await between it and the send.
+
+The permit is not a lease or execution grant, is not cloned or persisted, and
+retains its original cancellation gate. Failure, cancellation or dropping a
+preflight releases capacity without a queue entry or runtime Start announcement.
+A late preflight error is arbitrated by that same gate so it cannot overwrite an
+AlreadyCommitted result. The previously committed Ticket Start, exact request,
+attempt count, deadline, claims and context are retained; rejection does not refund
+the budget or mint a new identity.
+
+This closes the long queue-capacity wait between resource checks and admission.
+Project file reads release their store lock, and Git checks do not lock external
+processes: it does not promise an atomic lease across later external filesystem
+changes. Existing native admission and per-operation Ticket/claim checks remain
+in force. Four controlled cases fill the real queue and change Project archive,
+selected binding, Git branch or HEAD; separate gate cases cover terminal arbitration
+and the final synchronous fence. Their source-bound execution evidence is recorded
+separately from test definitions.
+
 Three focused queue cases cover expiry under backpressure, rejection retaining
 cancellability, and one successful commit with duplicate suppression. A separate
 production-assembly test combines explicit Ready admission, canonical native
