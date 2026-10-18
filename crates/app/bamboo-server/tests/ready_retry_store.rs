@@ -298,7 +298,7 @@ async fn concurrent_first_reader_keeps_bootstrap_under_the_stable_lock() {
 }
 
 #[tokio::test]
-async fn full_store_fails_closed_without_evicting_an_exhausted_or_live_record() {
+async fn full_store_grows_without_evicting_an_exhausted_or_live_record() {
     let root = tempfile::tempdir().unwrap();
     let store = FileReadyRetryStore::new(root.path());
     store.load(&key("seed")).await.unwrap();
@@ -318,15 +318,15 @@ async fn full_store_fails_closed_without_evicting_an_exhausted_or_live_record() 
         serde_json::to_vec(&envelope).unwrap(),
     )
     .unwrap();
-    assert!(store
+    let overflow = store
         .compare_exchange(&key("overflow"), None, initial())
         .await
-        .is_err());
+        .unwrap();
     assert_eq!(
         store.load(&key("work-0")).await.unwrap().unwrap().record,
         reserved()
     );
-    assert!(store.load(&key("overflow")).await.unwrap().is_none());
+    assert_eq!(store.load(&key("overflow")).await.unwrap(), Some(overflow));
 }
 
 #[tokio::test]
