@@ -1,16 +1,16 @@
 {
   "protocol": "bamboo_supervisor_native_scope",
   "version": 1,
-  "status": "data and lifecycle contract frozen; production admission remains unavailable",
+  "status": "Bamboo-owned per-intent native confirmation implemented locally; real positive user acceptance remains separate",
   "producer_base": "fd374b5a2067110275b955c174e29722835d4a80",
-  "bodhi_policy_head": "b203627c (owner source; separate verification pending)",
+  "bodhi_policy_head": "consumer owner records its exact verified source independently; profile/cancel contract in bamboo_native_confirmation_v1",
   "scope": "only complete Supervisor ConfigureProjectScope intent; no general RPC, Ticket or model command",
   "framing": {
     "prefix": "BAMBOO_SUPERVISOR_HOST_V1 ",
     "encoding": "UTF-8 JSON followed by LF",
     "max_frame_bytes_including_prefix_and_lf": 16384,
     "max_requests_per_launch": 64,
-    "direction": "parent-owned stdio proposed; no production startup flag or pipe loop implemented",
+    "direction": "opt-in bamboo serve --supervisor-scope-native-confirmation stdio request channel; pipe/PID are not authority",
     "stdout": "recognized frames must be suppressed from application logs; stderr never interpreted as control",
     "failure": "invalid prefix, UTF-8, size, JSON/schema or partial EOF closes channel; no automatic replay"
   },
@@ -48,14 +48,26 @@
       "launch_id": "00000000-0000-4000-8000-000000000001",
       "max_frame_bytes": 16384,
       "max_requests_per_launch": 64,
-      "owner_authorization_available": false
+      "owner_authorization_available": false,
+      "authority_profile": {
+        "kind": "bamboo_native_confirmation_v1",
+        "confirmation_available": true,
+        "confirmation_required_per_request": true,
+        "unavailable_code": null
+      }
     },
     "ready": {
       "kind": "ready",
       "version": 1,
       "launch_id": "00000000-0000-4000-8000-000000000001",
       "transport_ready": true,
-      "owner_authorization_available": false
+      "owner_authorization_available": false,
+      "authority_profile": {
+        "kind": "bamboo_native_confirmation_v1",
+        "confirmation_available": true,
+        "confirmation_required_per_request": true,
+        "unavailable_code": null
+      }
     },
     "refused": {
       "kind": "result",
@@ -68,7 +80,7 @@
         "status_code": 503
       }
     },
-    "future_committed": {
+    "committed": {
       "kind": "result",
       "version": 1,
       "launch_id": "00000000-0000-4000-8000-000000000001",
@@ -86,15 +98,27 @@
         }
       }
     },
-    "future_unconfirmed": {
+    "outcome_unconfirmed": {
       "kind": "result",
       "version": 1,
       "launch_id": "00000000-0000-4000-8000-000000000001",
       "request_id": "00000000-0000-4000-8000-000000000002",
       "outcome": {
         "kind": "outcome_unconfirmed",
-        "code": "scope_unavailable",
+        "code": "scope_outcome_unconfirmed",
         "status_code": 503
+      }
+    },
+    "cancelled": {
+      "kind": "result",
+      "version": 1,
+      "launch_id": "00000000-0000-4000-8000-000000000001",
+      "request_id": "00000000-0000-4000-8000-000000000002",
+      "outcome": {
+        "kind": "cancelled",
+        "code": "native_confirmation_cancelled",
+        "status_code": 409,
+        "not_submitted": true
       }
     }
   },
@@ -115,32 +139,32 @@
   },
   "lifecycle": {
     "handshake": "one exact-launch ack establishes transport only, never owner authorization",
-    "admission": "there is no verified native admission source in existing products; UnadmittedChannel has no method to install one from a frame",
-    "consent": "independently verified Host authority must bind complete immutable intent, launch_id and request_id; Rust callback is pure, not itself admission",
+    "admission": "Bamboo-owned native confirmation provider; ready profile only allows asking once, never existing consent or caller assertions",
+    "consent": "Bamboo own-executable main-thread UI helper returns one exact complete immutable request on its private owned output; bind launch/request/challenge and full before/after presentation",
     "single_inflight": true,
     "replay": "all structurally valid request IDs are spent before consent check or future CAS; no eviction; repeats409 native_request_replay; capacity503 native_channel_exhausted",
-    "cancel_before_submit": "native sends no apply; no mutation. No wire cancellation after an apply may claim rollback.",
+    "cancel_before_submit": "native Cancel/close/timeout returns cancelled409 not_submitted:true; JS cancellation before send emits no apply; no caller cancellation can claim rollback after issuance",
     "apply_started": "one captured non-cloneable local permit; no replacement intent",
     "reply": "after canonical result, retain in-flight state until reply actually flushed",
-    "disconnect": "in-flight or reply-pending ->sticky outcome unconfirmed; canonical read only, no retransmit. Idle is not proof about historical writes.",
+    "disconnect": "confirmation/preflight close forbids submission; issued CAS/reply-pending ->sticky unknown, no replay. Client without explicit response remains conservative unknown.",
     "restart": "new launch; all old launch frames and old per-launch consent rejected; no persisted proof or request-ID registry"
   },
   "authority_product_choice": {
-    "frozen_current": "No pipe/PID/bundle-name/ad-hoc-signature admission; production capability remains unavailable.",
-    "minimum_positive_requirement": "A proof of explicit owner consent independently verified by Bamboo, not a parent assertion. Prefer Bamboo-owned per-operation native OS user-presence/confirmation over creating persistent Host credentials.",
-    "not_yet_authorized_or_implemented": [
-      "new trust anchor/allowlist/pinned binary",
-      "new security configuration or persistent access credential",
-      "platform user-presence implementation and actual interactive verification"
+    "selected": "Root-authorized Bamboo-owned per-operation native confirmation; no persistent Host trust registration",
+    "not_added": [
+      "publisher/bundle/PID allowlist as consent",
+      "security configuration or credential",
+      "caller proof/confirmed field",
+      "HTTP verifier installation"
     ],
-    "installed_bodhi_evidence": "read-only codesign: adhoc, no TeamIdentifier; not a usable publisher trust anchor",
-    "boundary": "pure protocol/default-deny/mock work proceeds; production apply/startup installation stops at this authority-source decision"
+    "actual_interactive_positive_acceptance": "requires user on isolated one-time fixture; never auto-click or relabel mocks",
+    "ordinary_entry_points": "remain disabled; only explicit compatible native serve flag starts channel"
   },
   "owner_boundaries": {
     "bamboo": [
-      "private codec/state module",
-      "bounded default-deny channel",
-      "future minimal serve adapter only after genuine authority source is agreed; ordinary CLI/WebService remain None"
+      "private codec/state/provider/canonical CAS adapter",
+      "same-executable native UI helper",
+      "opt-in serve stdio channel; ordinary serve/WebService/SDK disabled"
     ],
     "bodhi": [
       "owned-child lifecycle and strict counterpart codec",
@@ -231,5 +255,10 @@
     "production_native": "macOS Bamboo-owned same-executable UI helper on initial main thread, NSAlert + read-only scrolling complete intent/before-after preview; Cancel is default. Other platforms default-deny until implemented. No auto click or persistent approval.",
     "limits": "existing 16KiB request framing /64 spent IDs per launch retained; full preview is bounded and never truncated; preview failure default-denies",
     "validation": "mock consent is cfg(test) only; positive actual UI approval must be by user after Root presents isolated one-time full preview"
+  },
+  "history": {
+    "pure_component_source": "ca07dc0dc921825d6b6ce3b79bdca87125f30ee4",
+    "pure_spec_sha256": "b6f490a5dd3ddc22317d68eadc0123f1fb8a76bde085120f8bfe3341fc3aae4c",
+    "pure_component_evidence": "25P component only; not relabelled as production native acceptance"
   }
 }

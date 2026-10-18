@@ -20,8 +20,9 @@ The helper is intercepted on the executable's initial main thread, before Tokio,
 configuration, AppState, networking or any model work. It cannot issue a mutation.
 It uses NSAlert with a read-only, selectable, vertically scrollable NSTextView.
 The complete intent, data directory, launch/request/challenge, previous Project
-set and selected IDs/names are shown as escaped pretty JSON. Nothing is silently
-filtered or truncated. Oversized/unrenderable previews fail closed. Cancel is
+set and selected IDs/names are shown as escaped pretty JSON. Unicode bidi/paragraph controls are escaped while normal Unicode names remain
+readable. Automatic link detection is disabled. Nothing is silently filtered or
+truncated. Oversized/unrenderable previews fail closed. Cancel is
 the first/default button; only the explicit second Allow button approves. There
 is no remembered choice. Other modal results deny. The parent enforces a
 120-second timeout and kills only its own UI-only helper on cancellation.

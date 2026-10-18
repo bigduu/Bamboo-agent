@@ -118,6 +118,7 @@ mod platform {
                 let _: () = msg_send![&*text, setEditable: false];
                 let _: () = msg_send![&*text, setSelectable: true];
                 let _: () = msg_send![&*text, setRichText: false];
+                let _: () = msg_send![&*text, setAutomaticLinkDetectionEnabled: false];
                 let _: () = msg_send![&*text, setVerticallyResizable: true];
                 let _: () = msg_send![&*text, setHorizontallyResizable: false];
                 let _: () = msg_send![&*text, setAutoresizingMask: 2_usize]; // width sizable

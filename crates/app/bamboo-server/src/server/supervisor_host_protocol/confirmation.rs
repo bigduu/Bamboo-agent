@@ -61,8 +61,32 @@ impl ConfirmationRequest {
         if json.len() > MAX_PREVIEW_BYTES {
             return Err("native_confirmation_unavailable");
         }
+        let json = escape_display_controls(&json)?;
         Ok(format!("Bamboo Supervisor Project scope\n\nReview the entire request below. The complete allowed Project set is replaced, including explicit removal. Removed Projects revoke their managed links; re-adding a Project does not re-attach old Sessions. This does not grant shell access, initialize Work, or attach Sessions.\n\n{json}"))
     }
+}
+
+fn escape_display_controls(json: &str) -> Result<String, &'static str> {
+    let mut visible = String::with_capacity(json.len());
+    for character in json.chars() {
+        // JSON already escapes ASCII controls inside strings. Keep its actual
+        // formatting newlines, but render Unicode paragraph/bidi controls as
+        // valid JSON escapes so untrusted names cannot rearrange the preview.
+        if (character >= '\u{80}' && character.is_control())
+            || matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            let mut units = [0_u16; 2];
+            for unit in character.encode_utf16(&mut units).iter() {
+                visible.push_str(&format!("\\u{unit:04x}"));
+            }
+        } else {
+            visible.push(character);
+        }
+        if visible.len() > MAX_PREVIEW_BYTES {
+            return Err("native_confirmation_unavailable");
+        }
+    }
+    Ok(visible)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
