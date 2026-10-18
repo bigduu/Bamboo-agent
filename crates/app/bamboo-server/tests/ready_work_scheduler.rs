@@ -656,6 +656,136 @@ async fn policy_wake_runs_real_child_task_and_submits_once_without_auto_acceptan
 }
 
 #[tokio::test]
+async fn pending_metadata_preserves_original_native_admission_and_resource_guard() {
+    for invalidate_resource in [false, true] {
+        let mut fixture = Fixture::new(1).await;
+        let work_id = fixture.works[0].id.clone();
+        let adopted_hash = fixture.works[0].context_hash.clone();
+        let principal = Principal::User {
+            user_id: "fixture-host-owner".into(),
+        };
+        let (service, authority) = fixture
+            .state
+            .tickets
+            .authority(principal.clone())
+            .await
+            .unwrap();
+        // Commit the actual canonical Start before runtime admission. No
+        // Assignment, DispatchSpec or RuntimeReceipt is fabricated by this seed.
+        let start = service
+            .prepare_command(
+                &authority,
+                "pending-context-start",
+                vec![Operation::Start {
+                    work_id: work_id.clone(),
+                    temp_id: "assignment".into(),
+                    workspace: Some(fixture.works[0].workspace.clone()),
+                }],
+            )
+            .unwrap();
+        let receipt = service.execute(&authority, &start).unwrap();
+        let assignment_id = receipt.ids["assignment"].clone();
+        let original = fixture.snapshot();
+        let dispatch_key = original.assignments[&assignment_id].dispatch_key.clone();
+        let original_spec = original.intents[&dispatch_key].immutable_spec.clone();
+        assert!(original.assignments[&assignment_id].runtime.is_none());
+        let manifest = fixture.state.project_store.get(&fixture.project).unwrap();
+        let mut updated = fixture
+            .state
+            .project_store
+            .update(&fixture.project, manifest.revision, |project| {
+                project.name = "Renamed while the original Start is pending".into();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(updated.resource_revision, manifest.resource_revision);
+        if invalidate_resource {
+            updated = fixture
+                .state
+                .project_store
+                .bump_resource_revision(&fixture.project, updated.revision)
+                .unwrap();
+        }
+        let mut candidate = original.project.contexts[&adopted_hash].clone();
+        candidate.project_revision = updated.revision;
+        candidate.resource_revision = updated.resource_revision;
+        let queue = service
+            .prepare_command(
+                &authority,
+                "pending-context-metadata",
+                vec![Operation::SetProjectContext {
+                    work_id: work_id.clone(),
+                    context: candidate,
+                }],
+            )
+            .unwrap();
+        fixture
+            .state
+            .tickets
+            .update(principal, &queue)
+            .await
+            .unwrap();
+        let queued = fixture.snapshot();
+        let candidate_hash = queued.project.work_contexts[&work_id].clone();
+        assert_ne!(candidate_hash, adopted_hash);
+        assert_eq!(
+            queued.project.assignment_contexts,
+            original.project.assignment_contexts
+        );
+        assert_eq!(queued.intents[&dispatch_key].immutable_spec, original_spec);
+        fixture
+            .state
+            .tickets
+            .install_ready_work_policy(fixture.policy(1))
+            .await
+            .unwrap();
+        if invalidate_resource {
+            assert!(matches!(
+                fixture.state.tickets.reconcile_ready_work().await.unwrap(),
+                ReadyReconcile::Blocked { .. }
+            ));
+            fixture.assert_quiet(0).await;
+            let snapshot = fixture.snapshot();
+            assert!(snapshot.assignments[&assignment_id].runtime.is_none());
+            assert!(snapshot.submissions.is_empty());
+        } else {
+            let request = fixture.next_request().await;
+            assert!(request.is_work(0));
+            assert_eq!(request.process_id, std::process::id());
+            let running = fixture.snapshot();
+            assert_eq!(running.assignments.len(), 1);
+            assert!(running.assignments[&assignment_id].runtime.is_some());
+            assert_eq!(running.intents[&dispatch_key].immutable_spec, original_spec);
+            request.task();
+            fixture.next_request().await.complete();
+            fixture.wait_submitted(&work_id).await;
+            fixture.assert_quiet(2).await;
+            let submitted = fixture.snapshot();
+            assert_eq!(submitted.submissions.len(), 1);
+            assert!(submitted.tickets[&work_id].accepted_submission.is_none());
+        }
+        let final_snapshot = fixture.snapshot();
+        assert_eq!(final_snapshot.assignments.len(), 1);
+        assert_eq!(final_snapshot.intents.len(), 1);
+        assert_eq!(final_snapshot.tickets[&work_id].generation, 1);
+        assert_eq!(
+            final_snapshot.project.work_contexts[&work_id],
+            candidate_hash
+        );
+        assert_eq!(
+            final_snapshot.project.assignment_contexts[&assignment_id],
+            adopted_hash
+        );
+        assert_eq!(
+            final_snapshot.intents[&dispatch_key].immutable_spec,
+            original_spec
+        );
+        fixture.state.tickets.revoke_ready_work_policy().await;
+        fixture.state.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn changed_project_resources_and_stale_grant_context_block_before_start() {
     for stale_resource in [true, false] {
         let mut fixture = Fixture::new(1).await;

@@ -724,21 +724,7 @@ impl TicketApplication {
                 .get(&spec.assignment_id)
                 .is_some_and(|a| a.runtime.is_none())
             {
-                self.validate_project_operations(
-                    &service,
-                    &Command {
-                        operation_id: String::new(),
-                        binding: snapshot.binding,
-                        expected_seq: snapshot.seq,
-                        expected_epoch: snapshot.authority_epoch,
-                        operations: vec![Operation::Start {
-                            work_id: spec.work_id.clone(),
-                            temp_id: String::new(),
-                            workspace: spec.workspace.clone(),
-                        }],
-                        source: None,
-                    },
-                )?;
+                self.validate_dispatch_project_context(&snapshot, spec)?;
             }
             // Also guard a previously published pending intent when operator
             // placement changes before its admission/retry.

@@ -45,7 +45,7 @@ impl TicketApplication {
         Ok(())
     }
 
-    fn validate_dispatch_project_context(
+    pub(super) fn validate_dispatch_project_context(
         &self,
         snapshot: &Snapshot,
         spec: &DispatchSpec,

@@ -533,7 +533,7 @@ async fn typed_transient_attempts_include_initial_dispatch_and_stop_after_three(
         fixture.host.ceilings.lock().unwrap().as_slice(),
         &[ROUNDS; 3]
     );
-    assert_eq!(fixture.host.preflights.lock().unwrap().len(), 3);
+    assert_eq!(fixture.host.preflights.lock().unwrap().len(), 1);
     assert_eq!(snapshot.assignments.len(), 1);
     assert_eq!(snapshot.intents.len(), 1);
 }
@@ -818,4 +818,184 @@ async fn one_woken_worker_can_shutdown_without_cancelling_its_host() {
         tokio::task::yield_now().await;
     }
     assert_eq!(fixture.host.authority_calls.load(Ordering::SeqCst), calls);
+}
+
+// Publish a real candidate while preserving every execution input. This uses
+// User authority and the normal Ticket CAS; no snapshot is modified in place.
+fn publish_metadata_candidate(fixture: &Fixture) -> String {
+    let service = fixture.host.service();
+    let before = service.published().unwrap().1;
+    let grant = &fixture.grants[0];
+    let mut context =
+        before.project.contexts[&before.project.work_contexts[&grant.work_id]].clone();
+    context.project_revision += 1;
+    let owner = Authority::from_verified_host(
+        before.binding,
+        Principal::User {
+            user_id: "context-metadata-owner".into(),
+        },
+    );
+    let command = service
+        .prepare_command(
+            &owner,
+            "publish-metadata-candidate",
+            vec![Operation::SetProjectContext {
+                work_id: grant.work_id.clone(),
+                context,
+            }],
+        )
+        .unwrap();
+    service.execute(&owner, &command).unwrap();
+    let after = service.published().unwrap().1;
+    let candidate_hash = after.project.work_contexts[&grant.work_id].clone();
+    assert_ne!(candidate_hash, grant.context_hash);
+    candidate_hash
+}
+
+#[tokio::test]
+async fn pending_metadata_candidate_keeps_original_grant_and_ensures_original_intent() {
+    let fixture = Fixture::new(1, true);
+    let scheduler = ReadyWorkScheduler::default();
+    scheduler
+        .install(fixture.host.as_ref(), fixture.policy(1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        scheduler.reconcile(fixture.host.as_ref()).await.unwrap(),
+        ReadyReconcile::Dispatched { .. }
+    ));
+    let started = fixture.host.service().published().unwrap().1;
+    let assignment = started.assignments.values().next().unwrap().clone();
+    let key = assignment.dispatch_key.clone();
+    let spec = started.intents[&key].immutable_spec.clone();
+    assert_eq!(assignment.state, AssignmentState::DispatchPending);
+    assert!(assignment.runtime.is_none());
+    let candidate_hash = publish_metadata_candidate(&fixture);
+    let pending = fixture.host.service().published().unwrap().1;
+    assert_eq!(pending.authority_epoch, started.authority_epoch);
+    assert_eq!(
+        pending.project.assignment_contexts[&assignment.id],
+        fixture.grants[0].context_hash
+    );
+    assert_eq!(
+        pending.project.work_contexts[&assignment.work_id],
+        candidate_hash
+    );
+    let result = scheduler.reconcile(fixture.host.as_ref()).await.unwrap();
+    assert!(
+        matches!(&result, ReadyReconcile::Dispatched { work_id, dispatch_key }
+        if work_id == &assignment.work_id && dispatch_key == &key),
+        "{result:?}"
+    );
+    assert_eq!(fixture.host.dispatches.lock().unwrap().len(), 1);
+    assert_eq!(
+        fixture.host.ensures.lock().unwrap().as_slice(),
+        &[key.clone()]
+    );
+    assert_eq!(
+        fixture.host.preflights.lock().unwrap().len(),
+        1,
+        "pending reconciliation cannot run a synthetic fresh Start preflight"
+    );
+    assert_eq!(
+        fixture.host.ceilings.lock().unwrap().as_slice(),
+        &[ROUNDS; 2]
+    );
+    let after = fixture.host.service().published().unwrap().1;
+    assert_eq!(after.assignments.len(), 1);
+    assert_eq!(after.intents.len(), 1);
+    assert_eq!(after.intents[&key].immutable_spec, spec);
+    assert_eq!(
+        canonical_bytes(&after).unwrap(),
+        canonical_bytes(&pending).unwrap(),
+        "ensure must preserve the original Start receipt, Assignment and candidate/adopted split"
+    );
+}
+
+#[tokio::test]
+async fn candidate_grant_cannot_replace_the_adopted_grant_for_a_pending_assignment() {
+    let fixture = Fixture::new(1, true);
+    let scheduler = ReadyWorkScheduler::default();
+    scheduler
+        .install(fixture.host.as_ref(), fixture.policy(1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        scheduler.reconcile(fixture.host.as_ref()).await.unwrap(),
+        ReadyReconcile::Dispatched { .. }
+    ));
+    let candidate_hash = publish_metadata_candidate(&fixture);
+    let pending = fixture.host.service().published().unwrap().1;
+    let assignment = pending.assignments.values().next().unwrap();
+    assert_eq!(
+        pending.project.assignment_contexts[&assignment.id],
+        fixture.grants[0].context_hash
+    );
+    assert_ne!(
+        pending.project.assignment_contexts[&assignment.id],
+        candidate_hash
+    );
+    scheduler.revoke().await;
+    let mut candidate_policy = fixture.policy(1);
+    candidate_policy.grants[0].context_hash = candidate_hash;
+    scheduler
+        .install(fixture.host.as_ref(), candidate_policy)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            scheduler.reconcile(fixture.host.as_ref()).await.unwrap(),
+            ReadyReconcile::Blocked {
+                kind: ReadyBlockKind::Permission,
+                ..
+            }
+        ));
+    }
+    assert_eq!(fixture.host.dispatches.lock().unwrap().len(), 1);
+    assert!(fixture.host.ensures.lock().unwrap().is_empty());
+    assert_eq!(fixture.host.preflights.lock().unwrap().len(), 1);
+    assert_eq!(fixture.host.ceilings.lock().unwrap().as_slice(), &[ROUNDS]);
+    let after = fixture.host.service().published().unwrap().1;
+    assert_eq!(after.assignments.len(), 1);
+    assert_eq!(after.intents.len(), 1);
+    assert_eq!(
+        canonical_bytes(&after).unwrap(),
+        canonical_bytes(&pending).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn fresh_generation_zero_still_requires_a_grant_for_the_current_candidate() {
+    let fixture = Fixture::new(1, true);
+    let candidate_hash = publish_metadata_candidate(&fixture);
+    let before = fixture.host.service().published().unwrap().1;
+    assert_eq!(before.tickets[&fixture.grants[0].work_id].generation, 0);
+    assert_eq!(
+        before.project.work_contexts[&fixture.grants[0].work_id],
+        candidate_hash
+    );
+    let scheduler = ReadyWorkScheduler::default();
+    scheduler
+        .install(fixture.host.as_ref(), fixture.policy(1))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            scheduler.reconcile(fixture.host.as_ref()).await.unwrap(),
+            ReadyReconcile::Blocked {
+                kind: ReadyBlockKind::Permission,
+                ..
+            }
+        ));
+    }
+    assert!(fixture.host.preflights.lock().unwrap().is_empty());
+    assert!(fixture.host.dispatches.lock().unwrap().is_empty());
+    assert!(fixture.host.ensures.lock().unwrap().is_empty());
+    assert!(fixture.host.ceilings.lock().unwrap().is_empty());
+    let after = fixture.host.service().published().unwrap().1;
+    assert!(after.assignments.is_empty());
+    assert_eq!(
+        canonical_bytes(&after).unwrap(),
+        canonical_bytes(&before).unwrap()
+    );
 }
