@@ -6,7 +6,7 @@ batches and does not include the paused Workflow #2033 work.
 
 ## Frozen inputs and order
 
-The integrator owns `bamboo/integration/ticket-orchestration-20261018`, starting
+The integrator owns `bamboo/integration/ticket-orchestration-admission-20261018`, starting
 from the freshly observed protected dev commit
 `86c549b7dcc6b15d18dc1ea026aa366296a53e97`. Original feature heads remain intact.
 
@@ -41,6 +41,17 @@ production-assembly test combines explicit Ready admission, canonical native
 submission, the actual Patrol observation/open APIs and same-root restart.
 It must prove retained retry/incident identity without a new grant, Assignment,
 acceptance or provider call after restart. Written cases are not passing evidence.
+
+Formal integration review also found that revocation could wait behind a blocked
+preflight or queue admission. Each explicit installation now captures a
+process-local cancellation generation before its first await. Revoke cancels and
+rotates that generation, interrupts its pending waits, and drains only its old
+admission calls. A new explicit installation cannot delay that completion barrier;
+old cloned fences remain revoked after it. Six controlled cases cover preflight,
+dispatch, ensure and installation waits, concurrent revokes and an abandoned
+revoke while retaining the original durable request, attempt count and deadline.
+Already queued execution keeps its canonical receipt and stop protocol;
+revocation does not fabricate a stop or undo a Start.
 
 The assembly fixture's restart boundary is a controlled child process followed
 by a successful natural exit and same-root reopen in its parent. It does not

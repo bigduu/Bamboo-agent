@@ -104,6 +104,7 @@ pub enum ReadyDispatch {
 pub struct ReadyAdmissionFence {
     expires: Instant,
     retry: Option<ready_recovery::RetryDeadline>,
+    revoked: CancellationToken,
 }
 
 impl std::fmt::Debug for ReadyAdmissionFence {
@@ -116,6 +117,11 @@ impl std::fmt::Debug for ReadyAdmissionFence {
 
 impl ReadyAdmissionFence {
     pub fn check(&self) -> Result<()> {
+        if self.revoked.is_cancelled() {
+            return Err(Error::ResourceBlocked(
+                "Host policy revoked before admission".into(),
+            ));
+        }
         if Instant::now() >= self.expires {
             return Err(Error::ResourceBlocked(
                 "Host policy expired before admission".into(),
@@ -170,6 +176,7 @@ struct InstalledPolicy {
     binding: ScopeBinding,
     epoch: u64,
     expires: Instant,
+    revoked: CancellationToken,
     failures: BTreeMap<String, u8>,
     stopped: BTreeMap<String, ReadyReconcile>,
 }
@@ -179,10 +186,27 @@ struct Worker {
     handle: JoinHandle<()>,
 }
 
+#[derive(Default)]
+struct PolicyGeneration {
+    revoked: CancellationToken,
+    active: tokio::sync::Mutex<()>,
+}
+
+#[derive(Default)]
+struct PolicyControl {
+    current: Arc<PolicyGeneration>,
+    // An aborted revoke must not orphan an older synchronous admission call.
+    // Calls hold their generation strongly until their active guard is dropped.
+    retired: Vec<Weak<PolicyGeneration>>,
+}
+
 /// Process-local policy, bounded reconciliation and one event-driven worker.
 #[derive(Default)]
 pub struct ReadyWorkScheduler {
     state: tokio::sync::Mutex<Option<InstalledPolicy>>,
+    // Captured before install's first await. Replacing this root on revoke
+    // invalidates old policies/fences without waiting for an async Host call.
+    revocation: Mutex<PolicyControl>,
     wake: Arc<Notify>,
     worker: Mutex<Option<Worker>>,
     recovery: Option<ReadyRecovery>,
@@ -229,17 +253,64 @@ impl ReadyWorkScheduler {
                 "invalid bounded Ready Work policy".into(),
             ));
         }
-        let mut state = self.state.lock().await;
-        if state.is_some() {
+        let generation = self
+            .revocation
+            .lock()
+            .expect("Ready policy revocation")
+            .current
+            .clone();
+        let revoked = generation.revoked.child_token();
+        let _active = tokio::select! {
+            biased;
+            _ = revoked.cancelled() => return Err(Error::ResourceBlocked(
+                "Host policy revoked before installation".into(),
+            )),
+            active = generation.active.lock() => active,
+        };
+        if revoked.is_cancelled() {
+            return Err(Error::ResourceBlocked(
+                "Host policy revoked before installation".into(),
+            ));
+        }
+        let mut state = tokio::select! {
+            biased;
+            _ = revoked.cancelled() => return Err(Error::ResourceBlocked(
+                "Host policy revoked before installation".into(),
+            )),
+            state = self.state.lock() => state,
+        };
+        if revoked.is_cancelled() {
+            return Err(Error::ResourceBlocked(
+                "Host policy revoked before installation".into(),
+            ));
+        }
+        if state
+            .as_ref()
+            .is_some_and(|old| !old.revoked.is_cancelled())
+        {
             return Err(Error::InvalidTransition(
                 "revoke the previous Host policy first".into(),
             ));
         }
-        let (service, _) = host.authority().await?;
-        let snapshot = service.published()?.1;
-        host.check_budget(policy.max_rounds).await?;
+        // An old revoked policy grants nothing, even while a new explicit
+        // installation is still checking current Host authority and budgets.
+        *state = None;
+        let validation = async {
+            let (service, _) = host.authority().await?;
+            let snapshot = service.published()?.1;
+            host.check_budget(policy.max_rounds).await?;
+            Ok::<_, Error>(snapshot)
+        };
+        let snapshot = tokio::select! {
+            biased;
+            _ = revoked.cancelled() => return Err(Error::ResourceBlocked(
+                "Host policy revoked before installation".into(),
+            )),
+            result = validation => result?,
+        };
         *state = Some(InstalledPolicy {
             expires: Instant::now() + policy.lifetime,
+            revoked,
             policy,
             binding: snapshot.binding,
             epoch: snapshot.authority_epoch,
@@ -251,10 +322,27 @@ impl ReadyWorkScheduler {
         Ok(())
     }
 
-    /// Barrier against this scheduler's in-flight admission. Already admitted
-    /// execution retains the Host's existing stop/ACK/resource protocol.
+    /// Cancel current/pending installs and admission waits, then drain the old
+    /// generation's in-flight synchronous commit. A new explicit install cannot
+    /// delay this barrier. Already admitted execution retains the existing
+    /// stop/ACK/resource protocol; its Task is not cancelled.
     pub async fn revoke(&self) {
-        *self.state.lock().await = None;
+        let pending = {
+            let mut control = self.revocation.lock().expect("Ready policy revocation");
+            control.retired.retain(|old| old.strong_count() > 0);
+            let previous = std::mem::take(&mut control.current);
+            previous.revoked.cancel();
+            control.retired.push(Arc::downgrade(&previous));
+            control
+                .retired
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>()
+        };
+        self.wake();
+        for generation in pending {
+            let _active = generation.active.lock().await;
+        }
     }
 
     pub fn wake(&self) {
@@ -264,20 +352,60 @@ impl ReadyWorkScheduler {
     /// At most one existing intent reconciliation or one new Start per pass.
     /// A scope conflict requires fresh eligibility, never a refreshed CAS alone.
     pub async fn reconcile(&self, host: &dyn ReadyWorkHost) -> Result<ReadyReconcile> {
-        let mut state = self.state.lock().await;
+        let generation = self
+            .revocation
+            .lock()
+            .expect("Ready policy revocation")
+            .current
+            .clone();
+        let cancelled = generation.revoked.child_token();
+        let _active = tokio::select! {
+            biased;
+            _ = cancelled.cancelled() => return Ok(ReadyReconcile::Disabled),
+            active = generation.active.lock() => active,
+        };
+        if cancelled.is_cancelled() {
+            return Ok(ReadyReconcile::Disabled);
+        }
+        let mut state = tokio::select! {
+            biased;
+            _ = cancelled.cancelled() => return Ok(ReadyReconcile::Disabled),
+            state = self.state.lock() => state,
+        };
+        // A completed lock future can win a cross-thread cancellation race.
+        // Never let that old pass use or clear a newer explicit installation.
+        if cancelled.is_cancelled() {
+            return Ok(ReadyReconcile::Disabled);
+        }
         let Some(installed) = state.as_mut() else {
             return Ok(ReadyReconcile::Disabled);
         };
-        if Instant::now() >= installed.expires {
+        if installed.revoked.is_cancelled() || Instant::now() >= installed.expires {
             *state = None;
             return Ok(ReadyReconcile::Disabled);
         }
+        let revoked = installed.revoked.clone();
+        let result = tokio::select! {
+            biased;
+            _ = revoked.cancelled() => Ok(ReadyReconcile::Disabled),
+            result = self.reconcile_installed(host, installed) => result,
+        };
+        if matches!(&result, Ok(ReadyReconcile::Disabled)) {
+            *state = None;
+        }
+        result
+    }
+
+    async fn reconcile_installed(
+        &self,
+        host: &dyn ReadyWorkHost,
+        installed: &mut InstalledPolicy,
+    ) -> Result<ReadyReconcile> {
         let policy = installed.policy.clone();
         host.check_budget(policy.max_rounds).await?;
         let (service, authority) = host.authority().await?;
         let (commit, snapshot) = service.published()?;
         if snapshot.binding != installed.binding || snapshot.authority_epoch != installed.epoch {
-            *state = None;
             return Ok(ReadyReconcile::Disabled);
         }
         let mut candidates = Vec::new();
@@ -591,6 +719,11 @@ impl ReadyWorkScheduler {
         installed: &InstalledPolicy,
         permit: Option<&RetryPermit>,
     ) -> Result<()> {
+        if installed.revoked.is_cancelled() {
+            return Err(Error::ResourceBlocked(
+                "Host policy revoked before admission".into(),
+            ));
+        }
         if Instant::now() >= installed.expires {
             return Err(Error::ResourceBlocked(
                 "Host policy expired before admission".into(),
@@ -609,6 +742,7 @@ impl ReadyWorkScheduler {
     ) -> ReadyAdmissionFence {
         ReadyAdmissionFence {
             expires: installed.expires,
+            revoked: installed.revoked.clone(),
             retry: self
                 .recovery
                 .as_ref()

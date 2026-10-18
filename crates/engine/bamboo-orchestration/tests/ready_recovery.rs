@@ -1926,3 +1926,558 @@ async fn host_internal_wait_must_recheck_the_fence_before_start_or_child_admissi
         );
     }
 }
+
+/// An old Host call stays pending forever unless its caller drops the future.
+/// The gate has no release method, so completing revoke cannot rely on freeing
+/// preflight, storage-independent Host work, or runtime admission first.
+#[derive(Default)]
+struct RevocationGate {
+    armed: std::sync::atomic::AtomicBool,
+    entered: Notify,
+    never_released: Notify,
+}
+
+impl RevocationGate {
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_if_armed(&self) {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.never_released.notified().await;
+        }
+    }
+
+    async fn reached(&self) {
+        tokio::time::timeout(Duration::from_secs(1), self.entered.notified())
+            .await
+            .expect("controlled revocation gate was never reached");
+    }
+}
+
+/// Reuse the canonical Ticket fixture and shared revision-CAS retry image. Only
+/// this wrapper's old call is stalled; installation and a later policy stay
+/// usable. There is no real provider or second Task/lease in the fixture.
+struct RevocationHost {
+    inner: Arc<Host>,
+    authority_gate: RevocationGate,
+    budget_gate: RevocationGate,
+    preflight_gate: RevocationGate,
+    dispatch_gate: RevocationGate,
+    ensure_gate: RevocationGate,
+    fences: Mutex<Vec<ReadyAdmissionFence>>,
+}
+
+impl RevocationHost {
+    fn new(inner: Arc<Host>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            authority_gate: RevocationGate::default(),
+            budget_gate: RevocationGate::default(),
+            preflight_gate: RevocationGate::default(),
+            dispatch_gate: RevocationGate::default(),
+            ensure_gate: RevocationGate::default(),
+            fences: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn last_fence(&self) -> ReadyAdmissionFence {
+        self.fences.lock().unwrap().last().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl ReadyWorkHost for RevocationHost {
+    async fn authority(&self) -> Result<(Arc<TicketService>, Authority)> {
+        self.authority_gate.wait_if_armed().await;
+        self.inner.authority().await
+    }
+
+    async fn check_budget(&self, max_rounds: u32) -> Result<()> {
+        self.budget_gate.wait_if_armed().await;
+        self.inner.check_budget(max_rounds).await
+    }
+
+    async fn preflight(&self, command: &Command) -> Result<()> {
+        self.preflight_gate.wait_if_armed().await;
+        self.inner.preflight(command).await
+    }
+
+    async fn dispatch(&self, command: &Command, max_rounds: u32) -> Result<ReadyDispatch> {
+        self.inner.dispatch(command, max_rounds).await
+    }
+
+    async fn ensure(
+        &self,
+        key: &str,
+        spec: &DispatchSpec,
+        max_rounds: u32,
+    ) -> Result<ReadyDispatch> {
+        self.inner.ensure(key, spec, max_rounds).await
+    }
+
+    async fn dispatch_fenced(
+        &self,
+        command: &Command,
+        max_rounds: u32,
+        fence: &ReadyAdmissionFence,
+    ) -> Result<ReadyDispatch> {
+        fence.check()?;
+        self.fences.lock().unwrap().push(fence.clone());
+        self.dispatch_gate.wait_if_armed().await;
+        fence.check()?;
+        self.inner.dispatch(command, max_rounds).await
+    }
+
+    async fn ensure_fenced(
+        &self,
+        key: &str,
+        spec: &DispatchSpec,
+        max_rounds: u32,
+        fence: &ReadyAdmissionFence,
+    ) -> Result<ReadyDispatch> {
+        fence.check()?;
+        self.fences.lock().unwrap().push(fence.clone());
+        self.ensure_gate.wait_if_armed().await;
+        fence.check()?;
+        self.inner.ensure(key, spec, max_rounds).await
+    }
+}
+
+async fn revoke_without_releasing_any_host_gate(scheduler: &ReadyWorkScheduler) {
+    tokio::time::timeout(Duration::from_millis(100), scheduler.revoke())
+        .await
+        .expect("revoke waited for an in-flight Host gate or the state mutex");
+}
+
+async fn cancelled_reconcile(task: tokio::task::JoinHandle<Result<ReadyReconcile>>) {
+    let report = tokio::time::timeout(Duration::from_millis(100), task)
+        .await
+        .expect("revoked reconcile still awaited an unreleased Host gate")
+        .expect("controlled reconcile task panicked")
+        .expect("revoked reconcile should return Disabled");
+    assert_eq!(report, ReadyReconcile::Disabled);
+}
+
+#[tokio::test(start_paused = true)]
+async fn revoke_cancels_blocked_preflight_without_waiting_or_publishing_start() {
+    let fixture = Fixture::new();
+    let store = Arc::new(MemoryStore::default());
+    let clock = Clock::new();
+    let host = RevocationHost::new(fixture.host.clone());
+    let scheduler = Arc::new(fixture.scheduler(&store, &clock));
+    scheduler
+        .install(host.as_ref(), fixture.policy())
+        .await
+        .unwrap();
+    host.preflight_gate.arm();
+    let running = scheduler.clone();
+    let blocked_host = host.clone();
+    let task = tokio::spawn(async move { running.reconcile(blocked_host.as_ref()).await });
+    host.preflight_gate.reached().await;
+    let checked = store.value(&fixture.key());
+    assert_eq!(checked.record.attempts, 0);
+    assert!(checked.record.request.is_none());
+    fixture.host.assert_no_execution();
+
+    revoke_without_releasing_any_host_gate(scheduler.as_ref()).await;
+    cancelled_reconcile(task).await;
+    assert_eq!(store.value(&fixture.key()), checked);
+    fixture.host.assert_no_execution();
+    assert_eq!(
+        scheduler.reconcile(host.as_ref()).await.unwrap(),
+        ReadyReconcile::Disabled
+    );
+
+    scheduler
+        .install(host.as_ref(), fixture.policy())
+        .await
+        .unwrap();
+    dispatched_key(
+        scheduler.reconcile(host.as_ref()).await.unwrap(),
+        &fixture.grant.work_id,
+    );
+    assert_eq!(store.value(&fixture.key()).record.attempts, 1);
+    assert_eq!(fixture.host.dispatches.lock().unwrap().len(), 1);
+    assert!(host.last_fence().check().is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn revoke_cancels_blocked_dispatch_and_never_revives_its_cloned_fence() {
+    let fixture = Fixture::new();
+    let store = Arc::new(MemoryStore::default());
+    let clock = Clock::new();
+    let host = RevocationHost::new(fixture.host.clone());
+    let scheduler = Arc::new(fixture.scheduler(&store, &clock));
+    scheduler
+        .install(host.as_ref(), fixture.policy())
+        .await
+        .unwrap();
+    host.dispatch_gate.arm();
+    let running = scheduler.clone();
+    let blocked_host = host.clone();
+    let task = tokio::spawn(async move { running.reconcile(blocked_host.as_ref()).await });
+    host.dispatch_gate.reached().await;
+    let old_fence = host.last_fence();
+    assert!(old_fence.check().is_ok());
+    let reserved = store.value(&fixture.key());
+    assert_eq!(reserved.record.phase, ReadyRetryPhase::Reserved);
+    assert_eq!(reserved.record.attempts, 1);
+    assert!(matches!(
+        &reserved.record.request,
+        Some(ReadyRetryRequest::Start { .. })
+    ));
+    fixture.host.assert_no_execution();
+
+    revoke_without_releasing_any_host_gate(scheduler.as_ref()).await;
+    assert!(old_fence.check().is_err());
+    cancelled_reconcile(task).await;
+    assert_eq!(store.value(&fixture.key()), reserved);
+    scheduler
+        .install(host.as_ref(), fixture.policy())
+        .await
+        .unwrap();
+    assert!(
+        old_fence.check().is_err(),
+        "new policy resurrected an old fence"
+    );
+    assert_eq!(store.value(&fixture.key()), reserved);
+    assert_deferred(
+        scheduler.reconcile(host.as_ref()).await.unwrap(),
+        &fixture.grant.work_id,
+        START_MS + 1_000,
+        1,
+    );
+    clock.advance(1_000).await;
+    assert_blocked(
+        scheduler.reconcile(host.as_ref()).await.unwrap(),
+        &fixture.grant.work_id,
+        ReadyBlockKind::OutcomeUnknown,
+    );
+    let retained = store.value(&fixture.key()).record;
+    assert_eq!(retained.attempts, 1);
+    assert_eq!(retained.request, reserved.record.request);
+    assert_eq!(retained.expires_at_ms, reserved.record.expires_at_ms);
+    fixture.host.assert_no_execution();
+    assert!(old_fence.check().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn revoke_cancels_blocked_ensure_preserving_original_intent_and_charge() {
+    let fixture = Fixture::new();
+    let store = Arc::new(MemoryStore::default());
+    let clock = Clock::new();
+    let host = RevocationHost::new(fixture.host.clone());
+    let scheduler = Arc::new(fixture.scheduler(&store, &clock));
+    scheduler
+        .install(host.as_ref(), fixture.policy())
+        .await
+        .unwrap();
+    let key = dispatched_key(
+        scheduler.reconcile(host.as_ref()).await.unwrap(),
+        &fixture.grant.work_id,
+    );
+    let snapshot = fixture.host.service().published().unwrap().1;
+    let original_spec = snapshot.intents[&key].immutable_spec.clone();
+    assert_eq!(snapshot.assignments.len(), 1);
+    clock.advance(5_000).await;
+    host.ensure_gate.arm();
+    let running = scheduler.clone();
+    let blocked_host = host.clone();
+    let task = tokio::spawn(async move { running.reconcile(blocked_host.as_ref()).await });
+    host.ensure_gate.reached().await;
+    let old_fence = host.last_fence();
+    assert!(old_fence.check().is_ok());
+    let reserved = store.value(&fixture.key());
+    assert_eq!(reserved.record.phase, ReadyRetryPhase::Reserved);
+    assert_eq!(reserved.record.attempts, 2);
+    assert_eq!(
+        reserved.record.request,
+        Some(ReadyRetryRequest::Intent {
+            dispatch_key: key.clone(),
+            spec_hash: snapshot.intents[&key].spec_hash.clone(),
+        })
+    );
+    assert!(fixture.host.ensures.lock().unwrap().is_empty());
+
+    revoke_without_releasing_any_host_gate(scheduler.as_ref()).await;
+    assert!(old_fence.check().is_err());
+    cancelled_reconcile(task).await;
+    assert_eq!(store.value(&fixture.key()), reserved);
+    assert!(fixture.host.ensures.lock().unwrap().is_empty());
+    assert_eq!(fixture.host.dispatches.lock().unwrap().len(), 1);
+    assert_eq!(
+        canonical_bytes(&fixture.host.service().published().unwrap().1).unwrap(),
+        canonical_bytes(&snapshot).unwrap(),
+    );
+    scheduler
+        .install(host.as_ref(), fixture.policy())
+        .await
+        .unwrap();
+    assert!(
+        old_fence.check().is_err(),
+        "reinstall revived the old ensure fence"
+    );
+    assert_eq!(store.value(&fixture.key()), reserved);
+
+    clock.advance(2_000).await;
+    assert_eq!(
+        dispatched_key(
+            scheduler.reconcile(host.as_ref()).await.unwrap(),
+            &fixture.grant.work_id,
+        ),
+        key
+    );
+    assert_eq!(fixture.host.dispatches.lock().unwrap().len(), 1);
+    assert_eq!(
+        *fixture.host.ensures.lock().unwrap(),
+        vec![(key, original_spec, ROUNDS)],
+    );
+    assert_eq!(
+        canonical_bytes(&fixture.host.service().published().unwrap().1).unwrap(),
+        canonical_bytes(&snapshot).unwrap(),
+    );
+    assert_eq!(store.value(&fixture.key()).record.attempts, 3);
+    assert_eq!(
+        store.value(&fixture.key()).record.expires_at_ms,
+        reserved.record.expires_at_ms
+    );
+    assert!(host.last_fence().check().is_ok());
+    assert!(old_fence.check().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn revoke_cancels_pending_install_before_authority_or_budget_can_publish_policy() {
+    for at_authority in [true, false] {
+        let fixture = Fixture::new();
+        let store = Arc::new(MemoryStore::default());
+        let clock = Clock::new();
+        let host = RevocationHost::new(fixture.host.clone());
+        let scheduler = Arc::new(fixture.scheduler(&store, &clock));
+        let gate = if at_authority {
+            &host.authority_gate
+        } else {
+            &host.budget_gate
+        };
+        gate.arm();
+        let installing = scheduler.clone();
+        let blocked_host = host.clone();
+        let policy = fixture.policy();
+        let task =
+            tokio::spawn(async move { installing.install(blocked_host.as_ref(), policy).await });
+        gate.reached().await;
+        revoke_without_releasing_any_host_gate(scheduler.as_ref()).await;
+        let result = tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("revoked install still waited for an unreleased Host gate")
+            .expect("controlled installer panicked");
+        assert!(result.is_err(), "revoked pending install reported success");
+        assert_eq!(
+            scheduler.reconcile(host.as_ref()).await.unwrap(),
+            ReadyReconcile::Disabled
+        );
+        assert!(store.data.lock().unwrap().records.is_empty());
+        fixture.host.assert_no_execution();
+
+        scheduler
+            .install(host.as_ref(), fixture.policy())
+            .await
+            .unwrap();
+        dispatched_key(
+            scheduler.reconcile(host.as_ref()).await.unwrap(),
+            &fixture.grant.work_id,
+        );
+        assert_eq!(store.value(&fixture.key()).record.attempts, 1);
+        assert_eq!(fixture.host.dispatches.lock().unwrap().len(), 1);
+        assert!(host.last_fence().check().is_ok());
+    }
+}
+
+#[derive(Default)]
+struct SyncPreflightState {
+    entered: bool,
+    released: bool,
+}
+
+/// Unlike an async Notify gate, this blocks inside one actual Host poll. The
+/// old generation's active guard cannot drain merely by cancelling its token.
+#[derive(Default)]
+struct SyncPreflightGate {
+    state: Mutex<SyncPreflightState>,
+    released: std::sync::Condvar,
+    entered: Notify,
+}
+
+impl SyncPreflightGate {
+    fn enter_and_wait(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.entered = true;
+        self.entered.notify_one();
+        while !state.released {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    fn is_blocked(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.entered && !state.released
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.released = true;
+        self.released.notify_all();
+    }
+}
+
+struct ReleaseSyncPreflightOnDrop(Arc<SyncPreflightGate>);
+
+impl Drop for ReleaseSyncPreflightOnDrop {
+    fn drop(&mut self) {
+        // A failed assertion must not leave a Tokio worker stuck in Condvar
+        // while the test runtime tries to shut down.
+        self.0.release();
+    }
+}
+
+struct SyncPreflightHost {
+    inner: Arc<Host>,
+    gate: Arc<SyncPreflightGate>,
+}
+
+#[async_trait]
+impl ReadyWorkHost for SyncPreflightHost {
+    async fn authority(&self) -> Result<(Arc<TicketService>, Authority)> {
+        self.inner.authority().await
+    }
+
+    async fn check_budget(&self, max_rounds: u32) -> Result<()> {
+        self.inner.check_budget(max_rounds).await
+    }
+
+    async fn preflight(&self, command: &Command) -> Result<()> {
+        self.gate.enter_and_wait();
+        self.inner.preflight(command).await
+    }
+
+    async fn dispatch(&self, command: &Command, max_rounds: u32) -> Result<ReadyDispatch> {
+        self.inner.dispatch(command, max_rounds).await
+    }
+
+    async fn ensure(
+        &self,
+        key: &str,
+        spec: &DispatchSpec,
+        max_rounds: u32,
+    ) -> Result<ReadyDispatch> {
+        self.inner.ensure(key, spec, max_rounds).await
+    }
+}
+
+/// Capture exactly one poll without awaiting completion. Pending proves that
+/// revoke has already rotated the root and reached the old active barrier.
+async fn poll_revoke_once<F: std::future::Future<Output = ()>>(
+    mut revoke: std::pin::Pin<&mut F>,
+) -> std::task::Poll<()> {
+    std::future::poll_fn(|context| {
+        std::task::Poll::Ready(std::future::Future::poll(revoke.as_mut(), context))
+    })
+    .await
+}
+
+async fn check_sync_revoke_barrier(abort_first_revoke: bool) {
+    let fixture = Fixture::new();
+    let store = Arc::new(MemoryStore::default());
+    let clock = Clock::new();
+    let gate = Arc::new(SyncPreflightGate::default());
+    let release_on_drop = ReleaseSyncPreflightOnDrop(gate.clone());
+    let host = Arc::new(SyncPreflightHost {
+        inner: fixture.host.clone(),
+        gate: gate.clone(),
+    });
+    let scheduler = Arc::new(fixture.scheduler(&store, &clock));
+    scheduler
+        .install(host.as_ref(), fixture.policy())
+        .await
+        .unwrap();
+    let running = scheduler.clone();
+    let blocked_host = host.clone();
+    let task = tokio::spawn(async move { running.reconcile(blocked_host.as_ref()).await });
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .expect("synchronous Host poll did not enter its controlled gate");
+    assert!(gate.is_blocked());
+    assert_eq!(store.value(&fixture.key()).record.attempts, 0);
+    fixture.host.assert_no_execution();
+    let canonical = canonical_bytes(&fixture.host.service().published().unwrap().1).unwrap();
+
+    let mut first = Some(Box::pin(scheduler.revoke()));
+    assert!(
+        poll_revoke_once(first.as_mut().unwrap().as_mut())
+            .await
+            .is_pending(),
+        "first revoke returned while the old synchronous Host poll was blocked"
+    );
+    if abort_first_revoke {
+        // Drop the already-polled future, not an unstarted request. The root
+        // was rotated above, but the old call still strongly owns its epoch.
+        drop(first.take());
+    }
+    let mut second = Box::pin(scheduler.revoke());
+    assert!(
+        poll_revoke_once(second.as_mut()).await.is_pending(),
+        "second revoke forgot a still-active retired generation"
+    );
+    assert!(
+        gate.is_blocked(),
+        "Host gate was released before checking both barriers"
+    );
+    fixture.host.assert_no_execution();
+
+    // Only after both pending assertions may the old synchronous poll exit.
+    release_on_drop.0.release();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        if let Some(first) = first.as_mut() {
+            first.as_mut().await;
+        }
+        second.as_mut().await;
+    })
+    .await
+    .expect("revocation barriers did not drain after the old poll exited");
+    let old_result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("old synchronous reconcile did not finish")
+        .expect("old synchronous reconcile panicked");
+    // Cancellation may be selected on the next poll, or the current poll may
+    // observe the revoked admission fence before returning its own error.
+    assert!(
+        matches!(
+            &old_result,
+            Ok(ReadyReconcile::Disabled) | Err(Error::ResourceBlocked(_))
+        ),
+        "revoked synchronous pass returned an unexpected result: {old_result:?}"
+    );
+    fixture.host.assert_no_execution();
+    assert_eq!(
+        canonical_bytes(&fixture.host.service().published().unwrap().1).unwrap(),
+        canonical
+    );
+    assert_eq!(
+        scheduler.reconcile(host.as_ref()).await.unwrap(),
+        ReadyReconcile::Disabled
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_revokes_both_wait_for_the_old_synchronous_host_poll() {
+    check_sync_revoke_barrier(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborted_revoke_does_not_lose_the_old_synchronous_barrier_generation() {
+    check_sync_revoke_barrier(true).await;
+}
