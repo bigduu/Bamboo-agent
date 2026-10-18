@@ -154,10 +154,11 @@ records. Such a store needs explicit trusted Host repair/cutover evidence before
 accepting new keys; there is no automatic format-2 migration or deadline reset.
 Existing bytes and charged budgets are not rewritten merely by reading them.
 
-This independent index protects entries-only loss/replay, not deletion or
-rollback of every trusted copy including the index and format state. Proving
-that history requires an external anchor; these bytes never restore execution
-authority, and missing evidence cannot be treated as a new retry window.
+This independent index detects missing keys after entries-only loss/replay.
+It does not authenticate an older valid envelope for an already-present key,
+or deletion/rollback of every trusted copy including the index and format state.
+Proving that history requires an external anchor. These bytes never restore
+execution authority, and missing evidence cannot become a new retry window.
 
 ## Admission conditions
 
